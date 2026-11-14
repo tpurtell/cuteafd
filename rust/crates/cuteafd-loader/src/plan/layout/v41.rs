@@ -49,6 +49,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     ensure!(!options.tp2_dspark_experts || (ranks == 2 && dspark),
         "--tp2-dspark-experts requires two RTX GPUs and dSpark");
     ensure!(!dspark || shape.native_layers == 3, "V4.1 dSpark retains all three stages");
+    // The TP2 draft pair forks its peer rank's expert kernels onto GPU0's
+    // stream inside the chain's GPU1 capture (shared/experts/rtx/draft/pair.rs).
+    report.cross_device_graph_kernels = options.tp2_dspark_experts;
     let manifest = options.workspace_manifest.as_deref()
         .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     let directory = manifest.parent().context("V4.1 manifest has no parent")?;

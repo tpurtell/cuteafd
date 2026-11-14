@@ -340,6 +340,11 @@ pub struct PlanReport {
     pub max_pool_tokens_no_onboard: Option<u64>,
     /// Resolved decode views, independent of prefill units in flight.
     pub decode_lanes: u8,
+    /// This layout captures CUDA graphs whose kernel nodes run on more than
+    /// one coordinator GPU (a fork onto the peer's stream inside one capture).
+    /// Declared by the family layout that builds such graphs. Launch tooling
+    /// reads it: nsys node-level graph tracing faults on these graphs (#2094).
+    pub cross_device_graph_kernels: bool,
     /// Solver-selected transport count, independent of units in flight.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_transports: Option<u64>,
@@ -1032,6 +1037,7 @@ pub(crate) fn empty_report(input: &PlanInput, options: &PlanOptions) -> anyhow::
         onboard_layers: None,
         max_pool_tokens_no_onboard: None,
         decode_lanes: 1,
+        cross_device_graph_kernels: false,
         prefill_transports: None,
         prefill_reserve_rows: None,
         experts: None,

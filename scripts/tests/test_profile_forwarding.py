@@ -255,6 +255,73 @@ def test_family_launch_forwards_nsys_graph_trace(tmp_path):
     assert '--cuda-graph-trace=node' not in out.stderr
 
 
+def test_nsys_traces_whole_graphs_when_kernels_span_coordinator_gpus(monkeypatch):
+    """#2094: nsys node-level graph tracing faults cudaGraphInstantiate on a graph
+    with kernel nodes on a second GPU (native/tests/v41_cross_device_graph_selftest.py
+    reproduces it). The rule keys on the plan's declared fact, never a family name."""
+    monkeypatch.delenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', raising=False)
+    monkeypatch.setenv('RELEASE_PROFILE_CROSS_DEVICE_GRAPHS', 'true')
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0, out.stderr
+    assert [arg for arg in wrapper if arg.startswith('--cuda-graph-trace=')] == ['--cuda-graph-trace=graph']
+    assert 'PROFILE_NSYS_GRAPH_TRACE resolved to graph' in out.stderr and '#2094' in out.stderr
+    # The rest of the command line is unchanged: CUDA, NVTX and OS runtime tracing, paused.
+    for flag in ('--trace=cuda,nvtx,osrt', '--start-later=true', '--sample=none', '--cpuctxsw=none'):
+        assert flag in wrapper
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', 'graph')
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0 and '--cuda-graph-trace=graph' in wrapper
+    assert 'resolved to graph' not in out.stderr
+    monkeypatch.setenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE', 'node')
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode != 0 and not wrapper
+    assert 'PROFILE_NSYS_GRAPH_TRACE=node is refused' in out.stderr and 'both coordinator GPUs' in out.stderr
+    # A layout without such graphs keeps per-node timing, by default and on request.
+    monkeypatch.setenv('RELEASE_PROFILE_CROSS_DEVICE_GRAPHS', 'false')
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0 and '--cuda-graph-trace=node' in wrapper
+    monkeypatch.delenv('RELEASE_PROFILE_NSYS_GRAPH_TRACE')
+    out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator')
+    assert out.returncode == 0 and '--cuda-graph-trace=node' in wrapper and 'resolved' not in out.stderr
+    # ncu and unprofiled launches are untouched by the fact.
+    monkeypatch.setenv('RELEASE_PROFILE_CROSS_DEVICE_GRAPHS', 'true')
+    out, wrapper, _ = _wrapper('ncu', '/data/prof', 'raptor', 'coordinator', 'gemm')
+    assert out.returncode == 0 and '--cuda-graph-trace=graph' not in wrapper
+    out, wrapper, _ = _wrapper('', '', 'raptor', 'coordinator')
+    assert out.returncode == 0 and not wrapper
+
+
+def test_family_launch_reads_cross_device_graphs_from_the_deployment_plan(tmp_path):
+    """The launcher takes the fact from the plan it launches, for any family."""
+    prof = tmp_path / 'prof'
+    keys = f'PROFILE=nsys\nPROFILE_DIR={prof}\n'
+    plain = _family_launch_result(tmp_path / 'plain', GLMF_TWO_LAYER, 'test/glmf', keys)
+    assert plain.returncode == 0, plain.stderr
+    assert '--cuda-graph-trace=node' in plain.stderr and '--cuda-graph-trace=graph' not in plain.stderr
+    declared = {'cross_device_graph_kernels': True}
+    forked = _family_launch_result(tmp_path / 'forked', GLMF_TWO_LAYER, 'test/glmf', keys,
+                                   deployment_overrides=declared)
+    assert forked.returncode == 0, forked.stderr
+    assert '--cuda-graph-trace=graph' in forked.stderr and '--cuda-graph-trace=node' not in forked.stderr
+    assert 'PROFILE_NSYS_GRAPH_TRACE resolved to graph' in forked.stderr
+    refused = _family_launch_result(tmp_path / 'refused', GLMF_TWO_LAYER, 'test/glmf',
+                                    keys + 'PROFILE_NSYS_GRAPH_TRACE=node\n', deployment_overrides=declared)
+    assert refused.returncode != 0 and 'PROFILE_NSYS_GRAPH_TRACE=node is refused' in refused.stderr
+    assert 'cuteafd serve-glmf' not in refused.stderr
+    unprofiled = _family_launch_result(tmp_path / 'unprofiled', GLMF_TWO_LAYER, 'test/glmf', '',
+                                       deployment_overrides=declared)
+    assert unprofiled.returncode == 0 and 'cuda-graph-trace' not in unprofiled.stderr
+
+
+def test_cross_device_graph_oracle_stays_in_the_tree():
+    """The standalone two-GPU repro the rule rests on; rerun it under a new nsys
+    (`--cuda-graph-trace=node`) before lifting the rule."""
+    oracle = (ROOT / 'native/tests/v41_cross_device_graph_selftest.py').read_text()
+    for call in ('cudaStreamBeginCapture', 'cudaStreamWaitEvent', 'cudaGraphInstantiateWithFlags', 'cudaGraphLaunch'):
+        assert call in oracle
+    assert '#2094' in (ROOT / 'scripts/lib/release-common.sh').read_text()
+
+
 def test_nsys_gpu_metrics_samples_the_named_devices():
     out, wrapper, _ = _wrapper('nsys', '/data/prof', 'raptor', 'coordinator', '', '', '', '0,1')
     assert out.returncode == 0, out.stderr

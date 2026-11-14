@@ -870,11 +870,25 @@ _release_profile_tool_wrapper() {
     # PROFILE_NSYS_CPU=on adds CPU call-stack sampling and context switches
     # (host-side stalls: reactor, gather and copy threads); off by default
     # because sampling perturbs host timing.
-    local graph_trace="${RELEASE_PROFILE_NSYS_GRAPH_TRACE:-node}"
+    # nsys node-level graph tracing faults cudaGraphInstantiate (Xid 31, MMU
+    # write fault) on a graph whose kernel nodes run on a second GPU (#2094;
+    # oracle: native/tests/v41_cross_device_graph_selftest.py). A layout that
+    # captures such graphs says so in its deployment plan
+    # (cross_device_graph_kernels); it is traced per graph, and an explicit
+    # node is refused rather than left to crash at startup.
+    local graph_trace="${RELEASE_PROFILE_NSYS_GRAPH_TRACE:-}"
     case "$graph_trace" in
-      node|graph) ;;
+      ''|node|graph) ;;
       *) release_die "${key}_NSYS_GRAPH_TRACE must be node or graph" ;;
     esac
+    if [[ "${RELEASE_PROFILE_CROSS_DEVICE_GRAPHS:-}" == true ]]; then
+      [[ "$graph_trace" != node ]] ||
+        release_die "${key}_NSYS_GRAPH_TRACE=node is refused: this layout captures CUDA graphs with kernels on both coordinator GPUs, and nsys node-level graph tracing faults when such a graph is instantiated (#2094); use graph"
+      [[ -n "$graph_trace" ]] ||
+        echo "${key}_NSYS_GRAPH_TRACE resolved to graph: this layout captures CUDA graphs with kernels on both coordinator GPUs, which nsys node-level graph tracing faults on (#2094); graph replays appear as one span each" >&2
+      graph_trace=graph
+    fi
+    graph_trace="${graph_trace:-node}"
     local cpu=(--sample=none --cpuctxsw=none)
     case "${RELEASE_PROFILE_NSYS_CPU:-}" in
       ''|off) ;;

@@ -373,7 +373,11 @@ done
 #                     wip-cards opens the window after the sweep's first warm wave and
 #                     closes it at sweep end: `--set CARD:PROFILE=nsys --levels ...`.
 #                     PROFILE_NSYS_GRAPH_TRACE=graph traces whole graphs instead of
-#                     individual nodes (default node).
+#                     individual nodes (default node). A layout whose deployment
+#                     plan declares cross_device_graph_kernels (graphs with
+#                     kernels on both coordinator GPUs: V4.1 with TP2 dSpark
+#                     experts) resolves to graph and refuses node, because nsys
+#                     node tracing faults when such a graph is instantiated (#2094).
 #                     PROFILE_NSYS_CPU=on adds CPU sampling and context switches
 #                     (host-side stalls; perturbs host timing).
 #                     PROFILE_NSYS_GPU_METRICS=all also samples every GPU's clocks,
@@ -415,7 +419,12 @@ done
 # never the container id). PROFILE_DIR=/abs/dir is created on each host, mounted
 # at the same path and passed as CUTEAFD_PROFILE_DIR; writers name files by host
 # and rank. wip-cards owns PROFILE_DIR and copies Spark files back.
+# Argument: the deployment plan JSON (its cross_device_graph_kernels fact
+# selects the nsys graph-trace level).
 shared_profile_args() {
+local profile_cross_device_graphs
+profile_cross_device_graphs="$(jq -r '.cross_device_graph_kernels // false' <<<"$1")" ||
+  release_die "deployment plan is not readable for profiling"
 release_profile_docker_args "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" "$(get PROFILE_SPARK)"
 profile_args=(${RELEASE_PROFILE_ARGS[@]+"${RELEASE_PROFILE_ARGS[@]}"})
 # Only the coordinator owns this observer; Spark workers must not subtract it.
@@ -425,6 +434,7 @@ fi
 release_profile_sample_args "$(get PROFILE)" "$(get PROFILE_EXPERT_INPUT_SAMPLE)" "$(get PROFILE_EXPERT_ROUTE_WEIGHTS)"
 profile_args+=(${RELEASE_PROFILE_SAMPLE_ARGS[@]+"${RELEASE_PROFILE_SAMPLE_ARGS[@]}"})
 RELEASE_PROFILE_NSYS_GRAPH_TRACE="$(get PROFILE_NSYS_GRAPH_TRACE)" \
+RELEASE_PROFILE_CROSS_DEVICE_GRAPHS="$profile_cross_device_graphs" \
 RELEASE_PROFILE_NSYS_CPU="$(get PROFILE_NSYS_CPU)" release_profile_wrapper "$(get PROFILE)" "$(get PROFILE_DIR)" "$(hostname -s)" coordinator \
   "$(get PROFILE_NCU_KERNEL)" "$(get PROFILE_NCU_COUNT)" "$(get PROFILE_NCU_SET)" "$(get PROFILE_NSYS_GPU_METRICS)" "$(get PROFILE_NCU_SKIP)"
 profile_wrapper=(${RELEASE_PROFILE_WRAPPER[@]+"${RELEASE_PROFILE_WRAPPER[@]}"})
@@ -962,7 +972,7 @@ shared_coordinator_env_args
 shared_bench_nonce_args
 shared_trace_args
 shared_probe_args
-shared_profile_args
+shared_profile_args "$count_plan"
 shared_graph_census_args
 shared_thermal_args
 
@@ -2936,7 +2946,7 @@ peer_args=()
 [[ -z "$peer_csv" ]] || peer_args=(--peers "$peer_csv")
 shared_api_state "$coordinator_image" "${instance:-default}"
 family_args+=("${api_args[@]}")
-shared_profile_args
+shared_profile_args "$deployment_json"
 shared_graph_census_args
 shared_bench_nonce_args
 tp2_env_args=()
