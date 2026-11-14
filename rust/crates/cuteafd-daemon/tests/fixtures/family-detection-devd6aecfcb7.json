@@ -132,6 +132,11 @@
       "family": "muse_spark"
     },
     {
+      "model": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
+      "revision": "cc5dc2537083177e3f02ea0b2d9dfc179d40425c",
+      "family": "muse_spark"
+    },
+    {
       "model": "wrldsuksgo2mars/Qwen3.8-Flash-Next-EXL3-K4.25-PLE-FP8-v1",
       "revision": "888306bd3996d6317758c07df50622829259ad17",
       "family": "qwen4"
