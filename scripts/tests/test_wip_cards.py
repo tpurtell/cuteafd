@@ -1554,6 +1554,18 @@ def test_gate_muse_cards_use_real_hosts_and_native_defaults(size, gpus, count):
         assert sum(entry.get('set', {}).get(key) == values[key] for entry in entries) == 1
 
 
+@pytest.mark.parametrize('size,count', [('min', 4), ('max', 6)])
+def test_gate_muse_mc_cards_are_separate_from_legacy_support(size, count):
+    card = cards.load_cards(ROOT / 'scripts/bench/kits/gate', [f'muse-spark-exl3-k4-mc-{size}'])[0]
+    values = {**cards.config(card['config']), **card['set']}
+    assert card['config'].endswith(f'muse-spark-exl3-k4-mc-{size}.config')
+    assert values['MODEL_ID'] == 'wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC'
+    assert values['CORE_VIEW'] == 'original'
+    assert len(card['sparks']) == count
+    if size == 'min':
+        assert values['MAX_CONTEXT_TOKENS'] == 'auto'
+
+
 def test_gate_glm53_exlr8_min_uses_real_hosts_and_pool_first_defaults():
     kit = ROOT / 'scripts/bench/kits/gate'
     card = cards.load_cards(kit, ['glm53-exlr8-min'])[0]

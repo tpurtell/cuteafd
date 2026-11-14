@@ -10,8 +10,18 @@
    "name": "muse-spark-exl3-max",
    "family": "muse_spark",
    "config": "examples/configs/muse-spark-exl3-max.config",
-   "gpus": [0, 1],
-   "sparks": ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"],
+   "gpus": [
+    0,
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi",
+    "rhea",
+    "moa"
+   ],
    "set": {
     "ADDR": "0.0.0.0:8752",
     "EXPERT_PORT": "19852",
@@ -34,8 +44,15 @@
    "name": "muse-spark-exl3-min",
    "family": "muse_spark",
    "config": "examples/configs/muse-spark-exl3-min.config",
-   "gpus": [0],
-   "sparks": ["ostrich", "dodo", "emu", "kiwi"],
+   "gpus": [
+    0
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
    "set": {
     "ADDR": "0.0.0.0:8753",
     "EXPERT_PORT": "19853",
@@ -54,8 +71,14 @@
    "name": "minimax-flash-min",
    "family": "minimax_m3",
    "config": "examples/configs/minimax-m31-flash-nvfp4-min.config",
-   "gpus": [1],
-   "sparks": ["ostrich", "dodo", "emu"],
+   "gpus": [
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu"
+   ],
    "set": {
     "ADDR": "0.0.0.0:8764",
     "EXPERT_PORT": "19864",
@@ -74,8 +97,13 @@
    "name": "mimo26-flash-min",
    "family": "mimo_v2",
    "config": "examples/configs/mimo-v26-flash-mxfp4-min.config",
-   "gpus": [1],
-   "sparks": ["ostrich", "dodo"],
+   "gpus": [
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo"
+   ],
    "set": {
     "ADDR": "0.0.0.0:8761",
     "EXPERT_PORT": "19861",
@@ -383,8 +411,15 @@
    "name": "glm53-exlr8-min",
    "family": "glm5",
    "config": "examples/configs/glm53-exlr8-min.config",
-   "gpus": [0],
-   "sparks": ["ostrich", "dodo", "emu", "kiwi"],
+   "gpus": [
+    0
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
    "set": {
     "ADDR": "0.0.0.0:8760",
     "EXPERT_PORT": "19860",
@@ -625,6 +660,67 @@
    "prefill_lengths": [
     65536
    ]
+  },
+  {
+   "name": "muse-spark-exl3-k4-mc-min",
+   "family": "muse_spark",
+   "config": "examples/configs/muse-spark-exl3-k4-mc-min.config",
+   "gpus": [
+    0
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8755",
+    "EXPERT_PORT": "19855",
+    "SPARK_COUNT": "4",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_0_LANE_A": "10.55.0.1",
+    "SPARK_1_LANE_A": "10.55.0.2",
+    "SPARK_2_LANE_A": "10.55.0.3",
+    "SPARK_3_LANE_A": "10.55.0.4"
+   }
+  },
+  {
+   "name": "muse-spark-exl3-k4-mc-max",
+   "family": "muse_spark",
+   "config": "examples/configs/muse-spark-exl3-k4-mc-max.config",
+   "gpus": [
+    0,
+    1
+   ],
+   "sparks": [
+    "ostrich",
+    "dodo",
+    "emu",
+    "kiwi",
+    "rhea",
+    "moa"
+   ],
+   "set": {
+    "ADDR": "0.0.0.0:8754",
+    "EXPERT_PORT": "19854",
+    "SPARK_COUNT": "6",
+    "SPARK_0_HOST": "ostrich",
+    "SPARK_1_HOST": "dodo",
+    "SPARK_2_HOST": "emu",
+    "SPARK_3_HOST": "kiwi",
+    "SPARK_4_HOST": "rhea",
+    "SPARK_5_HOST": "moa",
+    "SPARK_0_LANE_A": "10.55.0.1",
+    "SPARK_1_LANE_A": "10.55.0.2",
+    "SPARK_2_LANE_A": "10.55.0.3",
+    "SPARK_3_LANE_A": "10.55.0.4",
+    "SPARK_4_LANE_A": "10.55.0.5",
+    "SPARK_5_LANE_A": "10.55.0.6"
+   }
   }
  ]
 }
