@@ -248,6 +248,7 @@ impl DenseEngine<'_> {
         if !self.graphs.enabled { return Ok(()); }
         let entries = qwen35_graphs::layout(&self.graphs.variant).map_or_else(Vec::new, |layout| layout.entries.clone());
         self.graphs.warming.set(true);
+        if let Some(peer) = &self.peer { peer.graphs.warming.set(true); }
         let result = (|| {
             let request = [crate::shared::speculation::target::VerifyRow { slot: 0, position: 0, token: Some(0) }];
             let plan = rows::Rows::new(&crate::shared::speculation::target::VerifyRequest {
@@ -278,6 +279,7 @@ impl DenseEngine<'_> {
             Ok(())
         })();
         self.graphs.warming.set(false);
+        if let Some(peer) = &self.peer { peer.graphs.warming.set(false); }
         result
     }
 }
