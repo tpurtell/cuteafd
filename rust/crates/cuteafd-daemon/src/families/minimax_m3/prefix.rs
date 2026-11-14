@@ -136,7 +136,7 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
         self.validate(placement, len)?;
         if len != placement.len { return Err("MiniMax capture is not at the committed frontier".into()); }
         if let Some(draft) = &self.0.draft {
-            ensure!(draft.frontier(placement.slot)? == len,"MiniMax draft snapshot frontier differs");
+            if draft.frontier(placement.slot)? != len { return Err("MiniMax draft snapshot frontier differs".into()); }
             let planes=draft.drafter.window_planes(placement.slot)?;
             // SAFETY: retained drafter owns the planes and both producer/copy streams.
             unsafe { draft.marks.capture(mark.0 as usize,&planes,0,len)?; }
@@ -150,11 +150,11 @@ impl PrefixFamily for MiniMaxPrefix<'_> {
                     let planes=draft.drafter.window_planes(placement.slot)?;
                     // SAFETY: initialized mark and retained canonical planes survive the copies.
                     let (origin,end)=unsafe { draft.marks.restore(mark.0 as usize,&planes,len)? };
-                    ensure!(origin == 0,"MiniMax draft snapshot has a cold reconstructed origin");
+                    if origin != 0 { return Err("MiniMax draft snapshot has a cold reconstructed origin".into()); }
                     draft.frontiers.borrow_mut()[placement.slot]=end;
                 }
                 None => {
-                    ensure!(len == 0,"MiniMax speculative prefix restore requires an exact window mark");
+                    if len != 0 { return Err("MiniMax speculative prefix restore requires an exact window mark".into()); }
                     draft.frontiers.borrow_mut()[placement.slot]=0;
                     draft.drafter.reset_context(placement.slot,0)?;
                 }

@@ -366,6 +366,7 @@ impl<'a> PageBank<'a> {
     }
 
     pub fn readers(&self) -> &[Rc<Stream<'a>>] { &self.readers }
+    pub fn rotary(&self) -> Rc<Allocation<'a>> { Rc::clone(&self.cos_sin) }
     pub fn owners(&self) -> Vec<Rc<Allocation<'a>>> {
         self.planes.values().cloned().chain([Rc::clone(&self.cos_sin)]).collect()
     }

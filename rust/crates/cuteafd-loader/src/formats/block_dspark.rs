@@ -13,6 +13,7 @@ pub const fn supports_sequences(sequences: usize) -> bool {
 /// Physical native runtime owners, shared by admission and construction.
 #[derive(Debug, Clone)]
 pub struct NativeDsparkLayout {
+    pub snapshot: std::path::PathBuf,
     pub weights: crate::serving_capacity::WeightArenaLayout,
     pub buffers: Vec<(String, usize)>,
     pub host_landing: usize,
@@ -77,7 +78,7 @@ impl NativeDsparkLayout {
         let marks = cuteafd_core::prefix::mark_slots_with_host(slots as u64,prefix_entries as u64,
             mark_bytes as u64,mark_budget,host_prefix) as usize;
         if marks > 0 { add("prefix.marks".into(),mark_bytes.checked_mul(marks).context("native draft marks overflow")?); }
-        Ok(Self { weights,buffers,host_landing:rows * 8,verify_rows,mark_bytes,marks })
+        Ok(Self { snapshot:snapshot.to_owned(),weights,buffers,host_landing:rows * 8,verify_rows,mark_bytes,marks })
     }
 }
 

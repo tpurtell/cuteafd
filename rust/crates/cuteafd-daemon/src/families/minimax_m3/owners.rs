@@ -42,6 +42,9 @@ pub(crate) struct Storage<'a> {
     pub embedding: TokenEmbedding<'a>,
     pub usage: Option<ExpertUsage<'a>>,
     pub split: Option<super::engine::SplitExecution<'a>>,
+    pub draft_prefix: Option<Rc<super::prefix::DraftPrefix<'a>>>,
+    pub verify_logits: Option<crate::shared::memory::device::Allocation<'a>>,
+    pub verify_taps: Option<crate::shared::memory::device::Allocation<'a>>,
     devices: Vec<i32>,
 }
 impl Drop for Storage<'_> {
@@ -164,8 +167,8 @@ impl<'a> Owners<'a> {
             let bind = if inputs.split() { Kernels::bind_split } else { Kernels::bind };
             let kernels = bind(rank.streams.decode.device, programs, &inputs.manifest,
                 &inputs.cfg, &layout, capacity.execution_rows(), u32::try_from(inputs.context.maximum)?)?;
-            let make_unit = |stream: Rc<_>, rows, prefill| -> Result<_> {
-                if inputs.split() {
+            let make_unit = |stream: Rc<crate::shared::memory::device::Stream<'a>>, rows, prefill| -> Result<_> {
+                let mut unit = if inputs.split() {
                     let roles = (0..inputs.cfg.layers).map(|layer| inputs.roles(layer, gpu, rows))
                         .collect::<std::result::Result<Vec<_>, _>>()?;
                     ensure!(roles.iter().all(|roles| roles.iter().any(|role|
@@ -175,7 +178,13 @@ impl<'a> Owners<'a> {
                         inputs.split_wire.context("MiniMax split wire not selected")?, prefill,
                         gpu == 1 && admitted.onboard > 0)
                 } else if prefill { UnitOwner::new(&kernels, stream, &inputs.cfg, &layout, rows) }
-                else { UnitOwner::new_decode(&kernels, stream, &inputs.cfg, &layout, rows) }
+                else { UnitOwner::new_decode(&kernels, stream, &inputs.cfg, &layout, rows) }?;
+                if inputs.drafter.is_some() && gpu + 1 == inputs.gpus {
+                    let writer=super::layer::TargetTapWriter::new(Rc::clone(&unit.stream),rows as usize,
+                        vec![3,17,31,45,59])?;
+                    unit.install_target_taps(writer)?;
+                }
+                Ok(unit)
             };
             let decode = RefCell::new(make_unit(Rc::clone(&rank.streams.decode), capacity.decode.rows, false)?);
             let prefill = rank.streams.prefill.iter().map(|stream|
@@ -196,8 +205,43 @@ impl<'a> Owners<'a> {
             ranks.push(Rank { weights: rank.weights, layout, kernels, decode, prefill });
         }
         let requests = RequestState::new(&inputs.cfg, capacity, admitted, streams)?;
-        let prefix = MiniMaxPrefix::new(requests.banks(), ranks[0].prefill[0].borrow().prefix_scratch())?;
-        let head_stream = Rc::clone(&ranks.last().context("MiniMax head rank")?.decode.borrow().stream);
+        let head_rank=inputs.gpus - 1;
+        let head_stream = Rc::clone(&ranks[head_rank].decode.borrow().stream);
+        let (draft_prefix,verify_logits,verify_taps) = if let Some(draft) = &inputs.drafter {
+            use crate::shared::{memory::{device::Allocation,weight_arena::DeviceWeightArena},
+                speculation::block_dspark::{DsparkDrafter,WindowSnapshots}};
+            use cuteafd_core::memory_layout::{ArenaTag,Tag};
+            let native=&draft.native;
+            let arena=DeviceWeightArena::new(head_stream.device,native.weights.clone(),
+                ArenaTag::drafter_weights("minimax/draft"))?;
+            let rope=requests.banks()[head_rank].rotary();
+            let config=cuteafd_loader::families::minimax_m3::MiniMaxM3DsparkConfig::read(
+                native.snapshot.parent().context("MiniMax draft parent snapshot")?)?
+                .context("MiniMax bundled draft config missing")?;
+            let mask=embedding.host_rows(&[config.mask_token])?;
+            let drafter=head_stream.device.run(|| crate::shared::experts::rtx::push::load_alone(
+                &native.snapshot,&[head_stream.device],|| DsparkDrafter::load_native_with(library,programs,
+                    crate::shared::speculation::dflash::TargetProjection::Bf16,&native.snapshot,
+                    head_stream.raw,inputs.sequences as usize,inputs.sequences as usize,mask,
+                    rope.buffer,inputs.context.maximum as usize,|id,name,bytes| {
+                        ensure!(id == head_stream.device.id,"MiniMax draft weight device differs");
+                        arena.view(name,bytes)
+                    })))?;
+            drafter.prepare_workspace()?;
+            let drafter=Rc::new(drafter);
+            let planes=drafter.window_planes(0)?.iter().map(|plane| plane.bytes).collect();
+            let marks=WindowSnapshots::new(&head_stream,planes,native.marks.max(1))?;
+            ensure!(marks.mark_bytes() == native.mark_bytes,"MiniMax draft mark extent differs from admission");
+            let prefix=Rc::new(super::prefix::DraftPrefix { drafter,marks,
+                frontiers:RefCell::new(vec![0;inputs.sequences as usize]),slots:native.marks });
+            let logits=Allocation::new(head_stream.device,native.verify_rows * inputs.cfg.vocab_size * 4,
+                Tag::drafter_workspace("minimax/verify/logits"))?;
+            let taps=Allocation::new(head_stream.device,native.verify_rows * 5 * inputs.cfg.hidden * 2,
+                Tag::drafter_workspace("minimax/verify/taps"))?;
+            (Some(prefix),Some(logits),Some(taps))
+        } else { (None,None,None) };
+        let prefix = MiniMaxPrefix::with_draft(requests.banks(),ranks[0].prefill[0].borrow().prefix_scratch(),
+            draft_prefix.clone())?;
         let head = Head::new(head_stream, programs, &inputs.cfg, capacity.decode.rows as usize)?;
         // The shared Qwen scheduler constructs and owns the one admitted
         // selector. Retaining a second one here would double-charge storage.
@@ -210,7 +254,7 @@ impl<'a> Owners<'a> {
         let split = if inputs.split() { Some(super::engine::SplitExecution::new(inputs, admitted, &ranks)?) }
             else { None };
         let storage = Rc::new(Storage { ranks, requests: RefCell::new(requests), prefix, head,
-            embedding, usage, split, devices });
+            embedding, usage, split, draft_prefix, verify_logits, verify_taps, devices });
         let census = storage.inventory()?;
         reconcile(&census, &admitted.solved.facts, &contract.components, pages, retained_owner)?;
         let mut graphs = Vec::with_capacity(inputs.gpus);
@@ -380,6 +424,16 @@ impl Storage<'_> {
         let mut census = Census::default();
         census.owners(weights.receipts);
         census.owners(execution.receipts);
+        if let Some(draft)=&self.draft_prefix {
+            census.owners(draft.drafter.runtime_receipts(devices,"minimax.draft")?);
+            let mut inventory=Inventory::new(devices,"minimax.draft",Lifetime {
+                first:cuteafd_loader::placement::planner::Phase::DraftLoad,
+                last:cuteafd_loader::placement::planner::Phase::Growth },Category::Drafter,"retained draft state");
+            draft.marks.inventory(&mut inventory,"prefix.marks")?;
+            if let Some(owner)=&self.verify_logits { owner.inventory(&mut inventory,"verify.logits")?; }
+            if let Some(owner)=&self.verify_taps { owner.inventory(&mut inventory,"verify.taps")?; }
+            census.owners(inventory.receipts);
+        }
         if let Some(split) = &self.split {
             let mut transport = Inventory::new(devices, "minimax", Lifetime::TARGET,
                 Category::Transport, "retained residual hop backings");
@@ -421,7 +475,7 @@ fn validate_split_streams(streams: &RequestStreams<'_>) -> Result<()> {
 /// allowances before signalling readiness.
 fn retained_owner(id: &str) -> bool {
     ["minimax/target/", "minimax.kv.", "minimax.cache.", "minimax.rope.", "minimax.decode.",
-        "minimax.unit.", "minimax.prefix.h2d.", "minimax.head.", "minimax.hops.", "expert-usage.gpu"]
+        "minimax.unit.", "minimax.prefix.h2d.", "minimax.head.", "minimax.hops.", "minimax.draft.", "minimax/draft", "expert-usage.gpu"]
         .iter().any(|prefix| id.starts_with(prefix))
 }
 
