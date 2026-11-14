@@ -97,7 +97,7 @@ REPO = Path(__file__).resolve().parents[2]
 SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 'glmf': 'glmf-golden',
                'mimo': 'mimo-golden', 'qwen4': 'qwen4-golden', 'qwen35': 'qwen35-golden',
                'step5': 'step5-golden', 'muse': 'muse-golden', 'kimi': 'kimi-golden',
-               'minimax': 'minimax-golden'}
+               'minimax': 'minimax-golden', 'inkling2': 'inkling2-golden'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ROW_FILE = re.compile(r'row-[0-9]+\.safetensors\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
