@@ -24,6 +24,11 @@ pub enum Fp8MoeWeights {
     Nvfp4,
     /// Native BF16 row-major matrices; scale pointers are unused.
     Bf16,
+    /// Native E4M3 with UE8M0 row/K32 scales, W8A8 SiTU.
+    Mxfp8,
+    /// Native packed E2M1/E4M3 scales with dynamic activation amax.
+    /// Per-expert checkpoint amax is not a calibrated static multiplier.
+    Nvfp4Dynamic,
 }
 
 /// How the checkpoint's unchanged FP32 globals enter the NVFP4 arithmetic.
@@ -50,6 +55,8 @@ pub enum Fp8MoeActivation {
     SiluPostClampFp32Product = 2,
     /// Clamp gate/up before gate * sigmoid(alpha * gate) * (up + beta).
     SwigluOai = 3,
+    /// Uncapped-gate sigmoid, tanh softcaps 4/25, route weight before down QDQ.
+    Situ = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,9 +93,10 @@ impl Fp8MoeInfo {
         let [version, format, activation, projection] = words[0].to_le_bytes();
         ensure!(version == FP8_MOE_ABI,
             "unsupported FP8 expert package ABI {version}; expected ABI{FP8_MOE_ABI} (re-export package)");
-        ensure!(matches!(format, 1 | 2 | 4 | 5 | 8)
-            && matches!(activation, 1 | 2 | 3) && !(format == 2 && activation != 1)
-            && (activation != 3 || matches!(format, 4 | 8)) && projection == 1
+        ensure!(matches!(format, 1 | 2 | 4 | 5 | 6 | 7 | 8)
+            && matches!(activation, 1 | 2 | 3 | 4) && !(format == 2 && activation != 1)
+            && (activation != 3 || matches!(format, 4 | 8))
+            && (matches!(format, 6 | 7) == (activation == 4)) && projection == 1
             && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
@@ -105,7 +113,8 @@ impl Fp8MoeInfo {
             activation: match activation {
                 1 => Fp8MoeActivation::SiluBf16Product,
                 2 => Fp8MoeActivation::SiluPostClampFp32Product,
-                _ => Fp8MoeActivation::SwigluOai,
+                3 => Fp8MoeActivation::SwigluOai,
+                _ => Fp8MoeActivation::Situ,
             },
             projection: Fp8MoeProjection::Bf16,
             capacities: words[10..10 + count].iter().map(|&c| c as usize).collect(),
@@ -114,7 +123,9 @@ impl Fp8MoeInfo {
                 1 => Fp8MoeWeights::Fp8,
                 2 => Fp8MoeWeights::Mxfp4,
                 4 | 8 => Fp8MoeWeights::Nvfp4,
-                _ => Fp8MoeWeights::Bf16,
+                5 => Fp8MoeWeights::Bf16,
+                6 => Fp8MoeWeights::Mxfp8,
+                _ => Fp8MoeWeights::Nvfp4Dynamic,
             },
         };
         // Legacy packages store H128 exact or padded slices. Native MXFP4 may
@@ -133,7 +144,8 @@ impl Fp8MoeInfo {
             && info.swiglu_limit.is_finite() && info.swiglu_limit >= 0.0
             && info.capacities[0] > 0 && info.capacities.iter().all(|&c| c <= i32::MAX as usize)
             && info.capacities.windows(2).all(|w| w[0] < w[1])
-            && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4) || !info.wire_input),
+            && (!matches!(info.weights, Fp8MoeWeights::Bf16 | Fp8MoeWeights::Nvfp4 | Fp8MoeWeights::Nvfp4Dynamic) || !info.wire_input)
+            && (info.weights != Fp8MoeWeights::Mxfp8 || info.wire_input),
             "inconsistent FP8 expert package info {info:?}");
         ensure!(info.swiglu_alpha.is_finite() && info.swiglu_beta.is_finite()
             && if info.activation == Fp8MoeActivation::SwigluOai {
@@ -163,7 +175,9 @@ impl Fp8MoeInfo {
                 (Fp8MoeActivation::SiluPostClampFp32Product, limit, 1.0, 0.0),
             FfnActivation::SwigluOai { alpha, beta, limit } =>
                 (Fp8MoeActivation::SwigluOai, limit, alpha, beta),
-            FfnActivation::Situ { .. } => anyhow::bail!("native FP8 packages do not export Situ activation"),
+            FfnActivation::Situ { beta: 4.0, linear_beta: Some(25.0) } =>
+                (Fp8MoeActivation::Situ, 0.0, 1.0, 0.0),
+            FfnActivation::Situ { .. } => anyhow::bail!("native SiTU packages require gate/up softcaps 4/25"),
         };
         ensure!(self.activation == activation && self.swiglu_limit == limit
             && self.swiglu_alpha == alpha && self.swiglu_beta == beta && self.projection == projection,
@@ -368,7 +382,7 @@ impl Fp8MoeMetadata {
             ensure!(unsafe { segment_info(form.option(), &mut maximum, &mut minimum, &mut act_row_bytes) } == 0,
                 "FP8 segment info query failed");
             if maximum == 0 { continue; }
-            ensure!(metadata.info.wire_input && matches!(metadata.info.weights, Fp8MoeWeights::Fp8 | Fp8MoeWeights::Mxfp4)
+            ensure!(metadata.info.wire_input && matches!(metadata.info.weights, Fp8MoeWeights::Fp8 | Fp8MoeWeights::Mxfp4 | Fp8MoeWeights::Mxfp8)
                 && maximum == cuteafd_core::spark_executions::SEGMENT_MAX_ROWS
                 && minimum > 0 && minimum <= 4096 && act_row_bytes > 0,
                 "invalid segmented stream metadata");
@@ -658,11 +672,6 @@ mod metadata_tests {
     fn divisor_storage_is_explicit_and_mismatch_is_typed() {
         let mut w = words();
         w[0] = 6 | 8 << 8 | 1 << 16 | 1 << 24;
-        for format in [6, 7] {
-            let mut inkling = w;
-            inkling[0] = 6 | format << 8 | 4 << 16 | 1 << 24;
-            assert!(Fp8MoeInfo::from_words(inkling).is_err(), "Inkling has no native loader yet");
-        }
         let info = Fp8MoeInfo::from_words(w).unwrap();
         assert_eq!(info.weights, Fp8MoeWeights::Nvfp4);
         assert_eq!(info.scale_convention, Fp8MoeScaleConvention::Divisor);
@@ -809,5 +818,41 @@ mod metadata_tests {
             Ok(0)
         }).unwrap_err();
         assert!(error.to_string().contains("missing prefill workspace extent"));
+    }
+}
+
+#[cfg(test)]
+mod inkling_tests {
+    use super::*;
+    fn native(format: u32, wire: bool) -> [u32; FP8_MOE_INFO_WORDS] {
+        [6 | format << 8 | 4 << 16 | 1 << 24, 4608, 2304, 384, 8, 2304, 1,
+            if wire { 7 } else { 1 }, 0, 2, 16, 4096, 0, 0, 0, 0, 1f32.to_bits(), 0]
+    }
+    #[test]
+    fn inkling_storage_activation_and_input_are_one_native_contract() {
+        for (storage, wire, expected) in [(6, true, Fp8MoeWeights::Mxfp8),
+            (7, false, Fp8MoeWeights::Nvfp4Dynamic)] {
+            let words = native(storage, wire);
+            let info = Fp8MoeInfo::from_words(words).unwrap();
+            assert_eq!(info.weights, expected);
+            assert_eq!(info.activation, Fp8MoeActivation::Situ);
+            info.validate_activation(cuteafd_core::FfnActivation::Situ {
+                beta: 4., linear_beta: Some(25.) }, Fp8MoeProjection::Bf16).unwrap();
+            for (gate, up) in [(5., Some(25.)), (4., None), (4., Some(20.))] {
+                assert!(info.validate_activation(cuteafd_core::FfnActivation::Situ {
+                    beta: gate, linear_beta: up }, Fp8MoeProjection::Bf16).is_err());
+            }
+            let mut wrong = words;
+            wrong[7] = if wire { 1 } else { 7 };
+            assert!(Fp8MoeInfo::from_words(wrong).is_err());
+            for activation in [1, 2, 3] {
+                let mut wrong = words;
+                wrong[0] = 6 | storage << 8 | activation << 16 | 1 << 24;
+                assert!(Fp8MoeInfo::from_words(wrong).is_err());
+            }
+        }
+        for storage in [1, 2, 4, 5, 8] {
+            assert!(Fp8MoeInfo::from_words(native(storage, false)).is_err());
+        }
     }
 }
