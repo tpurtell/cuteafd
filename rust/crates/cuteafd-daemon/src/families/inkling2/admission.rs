@@ -83,7 +83,11 @@ pub(crate) fn reconcile_native(plan: &ResolvedPlan, devices: CoordinatorDevices<
     let mut projected = devices.remap_plan_weight_arenas(plan)?;
     projected.facts.allocations.retain(|a| a.view.is_none() && a.location == Location::coordinator(0));
     projected.facts.driver_page_tables.retain(|table| table.location == Location::coordinator(0));
-    let expected = projected.facts.allocations.iter().map(|a| (a.id.as_str(), a)).collect::<std::collections::BTreeMap<_, _>>();
+    projected.facts.allowances.retain(|owner| owner.location == Location::coordinator(0));
+    projected.facts.reservations.clear();
+    projected.facts.sequential.clear();
+    projected.facts.deferred.clear();
+    let expected = projected.facts.allocations.iter().map(|a| (a.id.clone(), a.clone())).collect::<std::collections::BTreeMap<_, _>>();
     let mut actual = Vec::new();
     for receipt in receipts.iter().filter(|r| r.allocation.view.is_none()) {
         let id = if receipt.allocation.group == "weight arena" { receipt.allocation.id.as_str() }
@@ -94,7 +98,19 @@ pub(crate) fn reconcile_native(plan: &ResolvedPlan, devices: CoordinatorDevices<
             "Inkling retained owner {id} bytes/location differ: actual{}/admitted{}", receipt.allocation.bytes, spec.bytes);
         // Metadata comes from the canonical pre-allocation contract after the
         // measured payload/location check, never from observed bytes.
-        actual.push(Receipt { allocation: (*spec).clone(), address: receipt.address });
+        actual.push(Receipt { allocation: spec.clone(), address: receipt.address });
+    }
+    // Alias records are independently checked against admitted arena geometry
+    // by Inventory; preserve them for shared address/backing validation without
+    // inventing a second physical residency charge.
+    for receipt in receipts.iter().filter(|r| r.allocation.view.is_some()) {
+        let view = receipt.allocation.view.as_ref().unwrap();
+        let backing = expected.get(view.backing.as_str()).context("Inkling alias backing not admitted")?;
+        anyhow::ensure!(receipt.allocation.location == backing.location
+            && view.offset.checked_add(receipt.allocation.bytes).is_some_and(|end| end <= backing.bytes),
+            "Inkling alias outside admitted backing");
+        projected.facts.allocations.push(receipt.allocation.clone());
+        actual.push(receipt.clone());
     }
     projected.budgets.retain(|budget| budget.locations.contains(&Location::coordinator(0)));
     projected.phases = evaluate(&projected.facts, &projected.budgets)?;
