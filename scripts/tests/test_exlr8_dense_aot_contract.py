@@ -208,12 +208,13 @@ def test_minimax_native_mxfp8_a8_catalog_preserves_shipping_exlr8(monkeypatch):
     triples = lambda entries: [(name, op, params) for name, op, params, _ in entries]
     shipping = catalog(monkeypatch)
     native = catalog(monkeypatch, ("minimax",))
-    assert len(native) == 12
+    assert len(native) == 20
     assert len({name for name, *_ in native}) == len(native)
     gemms = [(name, params) for name, op, params, _ in native if op == "dense_mxfp8"]
     assert {(p["input_features"], p["output_features"]) for _, p in gemms} == {
         (6144, 8192), (6144, 512), (6144, 128), (8192, 6144),
-        (6144, 12288), (12288, 6144), (6144, 3072), (3072, 6144)}
+        (6144, 12288), (12288, 6144), (6144, 3072), (3072, 6144),
+        (6144, 4096), (6144, 256), (6144, 6144), (6144, 1536), (4096, 6144), (1536, 6144)}
     for name, op, params, thunk in native:
         assert params["input_dtype"] == "bf16"
         assert params["rotation_count"] == 1 and params["max_rows"] == 4096
@@ -225,7 +226,16 @@ def test_minimax_native_mxfp8_a8_catalog_preserves_shipping_exlr8(monkeypatch):
             assert op == "dense_mxfp8_quant"
             assert name == f"quant_k{params['input_features']}_bf16_a8"
     assert {p["input_features"] for _, op, p, _ in native if op == "dense_mxfp8_quant"} == {
-        3072, 6144, 8192, 12288}
+        1536, 3072, 4096, 6144, 8192, 12288}
+    whole_shapes = ((6144, 8192), (6144, 512), (6144, 128), (8192, 6144),
+                    (6144, 12288), (12288, 6144), (6144, 3072), (3072, 6144))
+    whole_names = [f"mxfp8_k{k}_n{n}_s1_a8" for k, n in whole_shapes]
+    whole_names += [f"quant_k{k}_bf16_a8" for k in (3072, 6144, 8192, 12288)]
+    assert [name for name, *_ in native if name in whole_names] == whole_names
+    assert {name for name, *_ in native if name not in whole_names} == {
+        "mxfp8_k6144_n4096_s1_a8", "mxfp8_k6144_n256_s1_a8", "mxfp8_k6144_n6144_s1_a8",
+        "mxfp8_k6144_n1536_s1_a8", "mxfp8_k4096_n6144_s1_a8", "mxfp8_k1536_n6144_s1_a8",
+        "quant_k4096_bf16_a8", "quant_k1536_bf16_a8"}
     union = catalog(monkeypatch, ("minimax", "glmf", "glm", "minimax"))
     assert triples(union) == triples(shipping) + triples(native)
     assert len({name for name, *_ in union}) == len(union)
