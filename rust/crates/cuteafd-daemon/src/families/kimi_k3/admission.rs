@@ -1813,6 +1813,7 @@ pub(super) mod tests {
         let full = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         for context in [262144, 1048576] {
             let mut i = inputs(&cfg);
+            i.serving_context = cuteafd_loader::placement::planner::Context::pinned(context as u64);
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&full, i.rows, test_unit(i.rows, i.waves, i.unit_rows), context,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             let layout = draft_layout(i.state_slots, i.state_slots, context);
@@ -1823,6 +1824,7 @@ pub(super) mod tests {
             assert!(request.startup.contains(&peak));
             assert!(!request.fixed.iter().any(|d| d.group == peak.group));
             let mut i = inputs(&cfg);
+            i.serving_context = cuteafd_loader::placement::planner::Context::pinned(context as u64);
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&full, i.rows, test_unit(i.rows, i.waves, i.unit_rows), context,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             i.draft = Some(layout.clone());
@@ -3040,7 +3042,8 @@ pub(super) mod tests {
         let scratch = NativeScratch::from_manifest_for_config(&manifest, &full, 1)?;
         let dsa_scratch = DsaScratch::from_manifest(&manifest)?;
         let mut lane = LaneLayout::for_ranks(&full, 4096, 4096, 1_048_576, scratch, 1)?;
-        *lane = (*lane).clone().with_dsa(&full, dsa_scratch)?;
+        *lane = (*lane).clone().with_sparse_mla_rows(96)?.with_dsa(&full, dsa_scratch)?
+            .with_live_projection_rows(96, 1)?;
 
         let arch = ArchContext::for_device("sm_120", PRO_TOTAL_BYTES);
         let selected = ProgramSet::from_manifest(&manifest, &["kimik3", "kimik31"]);
@@ -3137,9 +3140,9 @@ pub(super) mod tests {
             try_prefix(63, FREE_DECODE_EAGER, true, 0).err().context("last_layer=63 decode graphs must refuse")?);
         let refusal_63_verify = format!("{:#}",
             try_prefix(63, FREE_DECODE_EAGER, true, 5).err().context("last_layer=63 verify graphs must refuse")?);
-        assert!(refusal_63_eager.contains("105269952524"), "unexpected 63 eager refusal: {refusal_63_eager}");
-        assert!(refusal_63_decode.contains("106302629132"), "unexpected 63 decode refusal: {refusal_63_decode}");
-        assert!(refusal_63_verify.contains("106302629132"), "unexpected 63 verify refusal: {refusal_63_verify}");
+        assert!(refusal_63_eager.contains("105273279020"), "unexpected 63 eager refusal: {refusal_63_eager}");
+        assert!(refusal_63_decode.contains("106305955628"), "unexpected 63 decode refusal: {refusal_63_decode}");
+        assert!(refusal_63_verify.contains("106305955628"), "unexpected 63 verify refusal: {refusal_63_verify}");
 
         let admitted_prefill = try_prefix(59, FREE_PREFILL, false, 0)?;
         let admitted_decode_eager = try_prefix(59, FREE_DECODE_EAGER, false, 0)?;

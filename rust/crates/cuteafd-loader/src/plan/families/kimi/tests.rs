@@ -1018,7 +1018,7 @@ fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<
     for rows in [64usize, 4096] {
         let mode = if rows == 64 { "decode" } else { "prefill" };
         for (name, bytes) in [
-            (format!("kimik31_kda_m{rows}"), rows * 4096),
+            (format!("kimik31_kda_m{rows}"), if rows == 64 { 8_673_280 } else { 629_464_064 }),
             (format!("kimik31_index_producer_m{rows}"), rows * 8512),
             (format!("kimik31_index_topk_{mode}_m{rows}"), rows * 256),
             (format!("kimik31_scored_index_topk_{mode}_m{rows}"), rows * 256),
@@ -1028,7 +1028,7 @@ fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<
         }
         for (suffix, heads) in [("", 48), ("_h96", 96)] {
             for cache in ["", "_fp8"] {
-                for (stem, bytes) in [("mla_producer", rows * 4096), ("sparse_mla",
+                for (stem, bytes) in [("mla_producer", cuteafd_ffi::KimiMlaProjection::scratch_bytes_for(rows, heads)?[0]), ("sparse_mla",
                     cuteafd_ffi::KimiSparseMla::scratch_bytes_for(rows, heads, false)?)] {
                     manifest["programs"].as_array_mut().unwrap().push(serde_json::json!({
                         "name":format!("kimik31_{stem}{suffix}{cache}_m{rows}"),"capacity_rows":rows,
@@ -1037,7 +1037,7 @@ fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<
             }
             manifest["programs"].as_array_mut().unwrap().push(serde_json::json!({
                 "name":format!("kimik31_mla_output{suffix}_m{rows}"),"capacity_rows":rows,
-                "scratch_bytes_at_capacity":{"scratch":rows * 4096}}));
+                "scratch_bytes_at_capacity":{"scratch":cuteafd_ffi::KimiMlaProjection::scratch_bytes_for(rows, heads)?[1]}}));
         }
         for cache in ["", "_fp8"] { for begin in [0, 48] {
             manifest["programs"].as_array_mut().unwrap().push(serde_json::json!({

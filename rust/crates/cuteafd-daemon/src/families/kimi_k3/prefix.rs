@@ -531,6 +531,7 @@ mod tests {
                 AttentionPlacement::Heads
             } else { AttentionPlacement::Layers });
             inputs.cache_format = cache_format;
+            inputs.serving_context = cuteafd_loader::placement::planner::Context::pinned(context as u64);
             let unit = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(
                 inputs.rows, inputs.waves, inputs.unit_rows)?.unit_rows as usize;
             for layouts in &mut inputs.lane_layouts {
