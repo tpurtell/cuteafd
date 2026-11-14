@@ -37,3 +37,15 @@ def test_arenas_are_single_backings_and_head_is_shared():
     assert 'cuda_logits_softcap_f32_async' in head
     assert 'drain_or_abort' in head
     assert 'drain_or_abort' in (FAMILY/'owners.rs').read_text()
+
+
+def test_owner_reconciliation_is_per_id_and_stream_slabs_are_allowances():
+    admission = (FAMILY/'admission.rs').read_text()
+    assert 'devices.remap_plan_weight_arenas(plan)' in admission
+    assert 'placement::planner::reconcile(&projected' in admission
+    assert 'ComponentKind::Allowance(Allowance' in admission
+    assert 'driver.stream-slabs: one ordered cold golden stream' in admission
+    golden = (FAMILY/'golden.rs').read_text()
+    assert 'admission::reconcile_native(&plan, devices, &receipts)' in golden
+    assert 'measured == admitted' in golden
+    assert 'measured <= admitted' not in golden
