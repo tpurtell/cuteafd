@@ -1051,7 +1051,8 @@ fn auto_cannot_flip_to_an_unqualified_executor_mode() {
         let mut req = request(2, 20 * GIB, 2, 4, Onboard::Auto);
         req.executor = executor;
         let terminal = |mode| if (mode == AttentionPlacement::Layers && !executor.runs(S0))
-            || (mode == AttentionPlacement::Heads && !executor.runs(LayerMode::HeadSplit)) {
+            || (mode == AttentionPlacement::Heads && !executor.runs(LayerMode::HeadSplit)
+                && !executor.runs(LayerMode::ContextSplit) && !executor.runs(S0)) {
             TerminalHome::AttentionOwner
         } else { TerminalHome::Replicated };
         req.hops.terminal = terminal(executor.attention_default());
