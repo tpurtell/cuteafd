@@ -130,6 +130,44 @@ def test_mc_all_views_byte_exact_and_shared_parent_copy(tmp_path, monkeypatch):
     assert package.assemble(**args) == result
 
 
+@pytest.mark.parametrize('bits', [None, 6, 8])
+def test_view_metadata_rewrites_nested_quantization_configs(bits):
+    from copy import deepcopy
+
+    inline = dict(quant_method='exl3', core_bits=6, head_bits=6,
+                  per_module_metadata='quantize_config.json:tensor_storage')
+    config = dict(quantization_config=deepcopy(inline),
+                  text_config=dict(quantization_config=deepcopy(inline)),
+                  components=[dict(text_config=dict(quantization_config=deepcopy(inline)))])
+    before = deepcopy(config)
+    filename = 'quantize_config.json' if bits is None else f'quantize_config.k{bits}.json'
+    quant, rewritten = package.view_metadata(dict(tensor_storage={}, module_include=[]),
+        config, {}, {}, bits=bits, quantize_file=filename)
+    blocks = [rewritten['quantization_config'], rewritten['text_config']['quantization_config'],
+              rewritten['components'][0]['text_config']['quantization_config']]
+    for block in blocks:
+        assert block['quant_method'] == 'exl3'
+        assert block['per_module_metadata'] == quant['per_module_metadata'] == filename + ':tensor_storage'
+        for field in ('core_bits', 'head_bits'):
+            assert (field not in block) if bits is None else block[field] == bits
+    assert config == before
+
+
+def test_mc_assembly_rewrites_multimodal_text_metadata(tmp_path, monkeypatch):
+    args = fixture(tmp_path, monkeypatch)
+    config = package.load_json(args['parent'] / 'config.json')
+    config['text_config'] = dict(quantization_config=dict(config['quantization_config'],
+        per_module_metadata='quantize_config.json:tensor_storage'))
+    dump(args['parent'], 'config.json', config)
+    package.assemble(**args)
+    for view, (_, filename, quantize, bits) in package.mc_manifest.FILES.items():
+        published = package.load_json(args['output'] / filename)
+        for block in (published['quantization_config'], published['text_config']['quantization_config']):
+            assert block['per_module_metadata'] == quantize + ':tensor_storage'
+            for field in ('core_bits', 'head_bits'):
+                assert (field not in block) if view == 'original' else block[field] == bits
+
+
 @pytest.mark.parametrize('family', ['muse', 'kimi-k31'])
 def test_restored_native_metadata_uses_safetensors_dtype(tmp_path, monkeypatch, family):
     args = fixture(tmp_path, monkeypatch, family=family)

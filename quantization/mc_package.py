@@ -254,13 +254,23 @@ def view_metadata(parent_quant, parent_config, selection, specs, *, bits, quanti
             quant['retained_native_tensors'].update({name: dict(shape=shape, dtype=dtype)
                 for name, (dtype, shape) in specs.items()})
     quant['per_module_metadata'] = quantize_file + ':tensor_storage'
-    inline = config['quantization_config']
-    inline['per_module_metadata'] = quant['per_module_metadata']
-    for key in ('core_bits', 'head_bits'):
-        if bits is None:
-            inline.pop(key, None)
-        else:
-            inline[key] = bits
+    def rewrite_inline(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == 'quantization_config':
+                    # Multimodal text configs carry their own copy of EXL3 metadata.
+                    child['per_module_metadata'] = quant['per_module_metadata']
+                    for field in ('core_bits', 'head_bits'):
+                        if bits is None:
+                            child.pop(field, None)
+                        else:
+                            child[field] = bits
+                rewrite_inline(child)
+        elif isinstance(value, list):
+            for child in value:
+                rewrite_inline(child)
+
+    rewrite_inline(config)
     return quant, config
 
 
