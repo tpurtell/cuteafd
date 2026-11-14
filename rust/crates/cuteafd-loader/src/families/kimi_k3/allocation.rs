@@ -671,6 +671,27 @@ mod tests {
         KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config()).unwrap()
     }
 
+    #[test]
+    fn k31_sparse_mla_owner_matches_live_rows_and_placed_heads() -> Result<()> {
+        let mut cfg = cfg();
+        cfg.dsa = Some(super::super::config::KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
+        let maximum = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(4096, 96, false)?;
+        for unit in [64, 1024, 2752, 4096] {
+            for heads in [48, 96] {
+                let baseline = NativeLaneLayout::new(&cfg, unit, unit, 1_048_576,
+                    NativeScratch { kda: 4096, mla: [4096, maximum, 4096] })?;
+                let exact = baseline.clone().with_sparse_mla_rows(heads)?;
+                let bytes = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(unit, heads, false)?;
+                assert_eq!(exact.operands["MLA attention scratch"], bytes);
+                assert_eq!(baseline.bytes()? - exact.bytes()?, maximum - bytes);
+                let offset = exact.arena_offsets["MLA attention scratch"];
+                assert!(offset + bytes <= exact.arena_bytes);
+                assert_eq!(exact, baseline.with_sparse_mla_rows(heads)?, "runtime and planner use the same owner layout");
+            }
+        }
+        Ok(())
+    }
+
     fn k31_manifest() -> serde_json::Value {
         let mut programs = Vec::new();
         let mut add = |name: String, rows, bytes| programs.push(serde_json::json!({

@@ -984,7 +984,7 @@ impl LayerKernels for Bindings<'_, '_, '_> {
         if self.local[0].context_dsa_diagnostic() && self.packed.is_some() {
             let members = self.packed.take().context("Kimi packed context members absent")?;
             let total = self.rows;
-            let result = (|| {
+            let result: Result<()> = (|| {
                 let mut first = 0;
                 for member in &members {
                     for local in self.local.iter_mut() { local.stage_context_member(member, first)?; }
