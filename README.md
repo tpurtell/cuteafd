@@ -201,10 +201,10 @@ concurrency point is that limit.
 <td width="27%" valign="top">pending<br><sub>needs a Release smoke card for the plain K4 repo</sub></td>
 </tr>
 <tr>
-<td width="19%" valign="top"><a href="docs/models/muse_spark.md"><b>Muse Spark</b></a><br><sub>wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC</sub><br><sub></sub></td>
+<td width="19%" valign="top"><a href="docs/models/muse_spark.md"><b>Muse Spark</b></a><br><sub>wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
 <td width="27%" valign="top">n/a<br><sub>doesn&#39;t fit</sub></td>
-<td width="27%" valign="top">pending<br><sub>needs a Release smoke card for the MC original BF16 core</sub></td>
-<td width="27%" valign="top">pending<br><sub>needs a Release smoke card for the MC original BF16 core</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/muse_spark/2026-11-14-smoke-muse-spark-open-exl3-k4-mc-1rtx-4spark-muse-spark-exl3-k4-mc-min-cand-r1/card.svg"><img src="benchmarks/muse_spark/2026-11-14-smoke-muse-spark-open-exl3-k4-mc-1rtx-4spark-muse-spark-exl3-k4-mc-min-cand-r1/card.svg" alt="wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 430 W (425–450) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/muse_spark/2026-11-14-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-spark-exl3-k4-mc-max-cand-r1/card.svg"><img src="benchmarks/muse_spark/2026-11-14-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-spark-exl3-k4-mc-max-cand-r1/card.svg" alt="wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/step5.md"><b>Step-5</b></a><br><sub>wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC</sub><br><sub>exl3-k4+exl3-k6</sub></td>

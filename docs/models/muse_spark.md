@@ -28,7 +28,19 @@ The [min](../../examples/configs/muse-spark-exl3-k4-mc-min.config) and
 frontend/backend and vocabulary head weights. Compact widths have distinct
 dispatch and exact memory charges. Their max-card comparison entries live in
 `scripts/bench/release-smoke-v51-mc-core-comparison.json`; they do not add
-release-table rows. Fresh MC Release smoke measurements are pending. The standalone Core-K6
+release-table rows. MC original Release smoke passes on the min/max cards
+(build `ac64e40ee`, 2026-11-14): C1 code 50.43/71.57 tok/s, 8K prefill
+2662.70/3361.93 tok/s, generated KL 0.00636/0.00709 and top-1
+97.27%/97.60%. Pools are 361,088/2,009,152 tokens (max context 1M on max).
+No thermal slowdown occurred; power-cap slowdown was 43.93 s on min and
+6.99/5.98 s on max's two GPUs during the baseline window (850 W shared budget).
+Busy SM clocks were 2559 MHz on min and 2727/2832 MHz on max; peak temperatures
+67 C and 64/70 C, minimum T.Limit headroom 23 C and 30/27 C. These are new
+MC original measurements, not an identical-configuration A/B against Core-K6.
+Prompt-end and turn-end restores compared byte-identically, as did cold
+recompute; the smoke's short fresh-continuation shape remains explicitly
+uncovered (informational), rather than claiming a complete prefix proof.
+The standalone Core-K6
 [min](../../examples/configs/muse-spark-exl3-min.config) and
 [max](../../examples/configs/muse-spark-exl3-max.config) configs remain supported;
 only their regular benchmark cards retire.
@@ -192,4 +204,5 @@ or `--audio rtx` requests coordinator placement directly. Qualification is on #9
 
 | Version | Date | Change | Basic eval |
 | --- | --- | --- | --- |
+| v5.1 dev | 2026-11-14 | MC original BF16 core, native pre/post-expert bridges and role-opened classification | [1 RTX + 4 Sparks](../../benchmarks/muse_spark/2026-11-14-smoke-muse-spark-open-exl3-k4-mc-1rtx-4spark-muse-spark-exl3-k4-mc-min-cand-r1/report.svg), [2 RTX + 6 Sparks](../../benchmarks/muse_spark/2026-11-14-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-spark-exl3-k4-mc-max-cand-r1/report.svg): Release smoke quality/shared-prefix panels pass; prompt/turn restores byte-identical, short fresh continuation uncovered |
 | v5 | 2026-11-10 | Published benchmarks | <a href="../../benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-1rtx-4spark-muse-spark-exl3-min/report.svg"><img src="../../benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-1rtx-4spark-muse-spark-exl3-min/card.svg" width="360" alt="Muse-Spark-Open-EXL3-K4-Core-K6 (exl3-k4) (1× RTX)"></a> <a href="../../benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max/report.svg"><img src="../../benchmarks/muse_spark/2026-11-10-smoke-muse-spark-open-exl3-k4-core-k6-2rtx-6spark-muse-spark-exl3-max/card.svg" width="360" alt="Muse-Spark-Open-EXL3-K4-Core-K6 (exl3-k4) (2× RTX)"></a> |
