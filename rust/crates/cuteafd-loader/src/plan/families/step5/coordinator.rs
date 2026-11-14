@@ -148,7 +148,7 @@ impl CoordinatorContract {
     pub(super) fn from_model(checkpoint: &Checkpoint, model: &Model) -> Result<Self> {
         checkpoint.validate_fp8_roles("Step-5", |name| {
             let attention = name.contains(".self_attn.");
-            (if attention { "attention projection" } else { "core projection" },
+            crate::formats::native_attention::Fp8Role::exact(if attention { "attention projection" } else { "core projection" },
                 name.ends_with(".self_attn.o_proj.weight"))
         })?;
         let cfg: &Config = &model.cfg;

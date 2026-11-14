@@ -866,7 +866,7 @@ impl<'a> GlmfLoader<'a> {
                     if layout.fp8 { Some(self.allocation(rank, &format!("{}.scales", layout.stem), n/128*(k/128)*4)?) } else { None }
                 )))?;
                 let records = attention_records(&self.checkpoint.snapshot, &selected, self.checkpoint.projection_view(&layout.stem),
-                    &layout, self.fp8_scales, values.buffer, scales.as_ref().map(|s| s.buffer))?;
+                    &layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true), self.fp8_scales, values.buffer, scales.as_ref().map(|s| s.buffer))?;
                 for record in records {
                     match record {
                         AttentionRecord::Operand(record) => self.dense.operand(record)?,
@@ -1629,7 +1629,7 @@ mod tests {
                         let selected = SelectedProjection { storage: ProjectionStorage::Native {
                             dtype: dtype.clone(), shape: shape.to_vec() }, tensors, source_bytes: 0 };
                         let layout = NativeLayout { stem: stem.into(), shape: [256,256], fp8, rank, ranks: 2, split };
-                        let records = attention_records(std::path::Path::new("/selected"), &selected, mode, &layout,
+                        let records = attention_records(std::path::Path::new("/selected"), &selected, mode, &layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true),
                             Fp8Scales::Pow2, buffer(256*256*2), fp8.then(|| buffer(256)));
                         if dtype == DType::F8E4M3 && mode == CoreView::Fp8Compact {
                             let error = records.err().expect("already-FP8 conversion must refuse");

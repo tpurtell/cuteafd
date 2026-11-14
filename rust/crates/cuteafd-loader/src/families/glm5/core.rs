@@ -204,7 +204,7 @@ impl CoreInventory {
             let role = if stem.ends_with("lm_head") { "vocabulary head" }
                 else if stem.contains(".self_attn.") { "attention projection" }
                 else if stem.contains(".mlp.") { "FFN projection" } else { "non-core" };
-            (role, false)
+            crate::formats::native_attention::Fp8Role::exact(role, false)
         })?;
         let projections = read_projections(checkpoint, &expected(cfg), selected,
             |stem| split(cfg, stem).map(|split| CoreContract { family: if cfg.variant.is_glm() { "GLM 5.3" } else { "Mistral Large 4" }, widths: core_widths(cfg), split,

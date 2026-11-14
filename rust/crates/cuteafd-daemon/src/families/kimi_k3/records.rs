@@ -300,7 +300,7 @@ impl<'l, 'a> KimiRecords<'l, 'a> {
                     if layout.fp8 { Some(DeviceAllocation::from_allocation(scoped.allocate(device, &format!("{name}.scales"), (n.div_ceil(128) * k.div_ceil(128) * 4).max(256))?)) } else { None },
                 )))?;
                 let records = attention_records(&scoped.checkpoint.snapshot, &selected, scoped.checkpoint.projection_view(&layout.stem),
-                    layout, crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer,
+                    layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true), crate::shared::fp8_linear::Fp8Scales::Amax, values.buffer,
                     scales.as_ref().map(|scales| scales.buffer))?;
                 let stream = scoped.streams.iter().find(|(id, _)| *id == device.id)
                     .context("Kimi native attention load stream")?.1;
@@ -583,7 +583,7 @@ mod native_record_tests {
                         bytes: local[0] / 128 * (local[1] / 128) * 4, ..Default::default() });
                     let mode = if fp8 { CoreView::Fp8Compact } else { CoreView::Original };
                     let records = attention_records(std::path::Path::new("/not-opened"), &selected, mode,
-                        &layout, crate::shared::fp8_linear::Fp8Scales::Amax, values, scales)?;
+                        &layout, cuteafd_loader::formats::native_attention::Fp8Role::exact("projection", true), crate::shared::fp8_linear::Fp8Scales::Amax, values, scales)?;
                     let mut actual = cuteafd_loader::shared::dense_read::MountLoad::default();
                     for record in records {
                         actual.merge(match record {

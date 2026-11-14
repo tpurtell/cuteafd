@@ -130,6 +130,8 @@ pub(crate) fn host_operand(operand: HostOperand, policy: super::super::push::Pus
 /// One GPU transform of a step's staged bytes (byte offsets are into the staging).
 #[derive(Clone)]
 pub(crate) enum Job {
+    /// Initialize only this admitted destination slice; no source/staging owner.
+    Zero { dst: CuteafdDeviceBuffer },
     /// Staged bytes `at..at + bytes` copied unchanged to `dst`.
     Upload { at: usize, bytes: usize, dst: CuteafdDeviceBuffer },
     /// Two staged regions must agree bit for bit before subsequent jobs publish them.
@@ -406,6 +408,12 @@ impl Step {
         };
         for job in &self.jobs {
             match *job {
+                Job::Zero { dst } => {
+                    ensure!(dst.device_id == self.device && dst.bytes > 0, "zero destination differs from step");
+                    // SAFETY: the named slice belongs to this step's admitted GPU
+                    // owner; the outer step drain preserves it through completion.
+                    unsafe { library.zero_pitched_async(dst, dst.bytes, dst.bytes, 1, stream)?; }
+                }
                 Job::ResidualGate { temperature, alpha, beta } => {
                     let (a, b) = residual_gate_bytes(&staged[..self.bytes()], temperature)?;
                     ensure!(a.len() == alpha.bytes && b.len() == beta.bytes,

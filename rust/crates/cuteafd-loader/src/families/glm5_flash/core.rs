@@ -83,7 +83,7 @@ impl CoreInventory {
             let role = if stem == "lm_head" { "vocabulary head" }
                 else if stem.contains(".self_attn.") { "attention projection" }
                 else if stem.contains(".mlp.") { "dense/shared FFN" } else { "non-core" };
-            (role, split(cfg, stem).is_some() && name.ends_with(".weight"))
+            crate::formats::native_attention::Fp8Role::exact(role, split(cfg, stem).is_some() && name.ends_with(".weight"))
         })?;
         let selected = |name: &str| name.starts_with("lm_head.") || name.strip_prefix(PREFIX)
             .and_then(|rest| rest.split_once('.'))

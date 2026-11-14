@@ -163,13 +163,14 @@ impl Checkpoint {
 
     /// Families declare executable roles, never a second conversion selection.
     pub fn validate_fp8_roles(&self, family: &str,
-        role: impl Fn(&str) -> (&'static str, bool)) -> Result<()> {
+        role: impl Fn(&str) -> crate::formats::native_attention::Fp8Role) -> Result<()> {
         for name in self.view.iter().flat_map(|view| view.fp8_tensors()) {
-            let (role, supported) = role(name);
+            let declaration = role(name);
+            let (role, supported) = (declaration.name, declaration.supported);
             ensure!(supported, "{name}: role {role} cannot execute block FP8 in family {family}");
             let header = self.header(name).with_context(|| format!("{name}: role {role} in family {family}: selected BF16 header missing"))?;
             ensure!(header.dtype == cuteafd_core::DType::Bf16 && header.shape.len() == 2
-                && header.shape.iter().all(|dim| *dim > 0 && dim % 128 == 0),
+                && declaration.stored_shape([header.shape[0], header.shape[1]]).is_ok(),
                 "{name}: role {role} in family {family}: fp8-compact requires a BF16 matrix with whole 128x128 blocks, found {:?} {:?}",
                 header.dtype, header.shape);
         }
