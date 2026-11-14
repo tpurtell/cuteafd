@@ -355,7 +355,7 @@ fn placement_inputs<'a>(args: &EngineArgs, admission: QwenAdmissionInputs<'a>, s
     (available, total): (u64, u64), pending: u64, context: cuteafd_loader::placement::planner::Context,
     host: qwen4::QwenHost) -> qwen4::QwenInputs<'a> {
     qwen4::QwenInputs {
-        arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
+        experts: None, onboard: cuteafd_loader::placement::Onboard::Auto,        arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
         blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         loaded_weights: Default::default(),
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), context, admission, capacity_bytes: total,
@@ -925,7 +925,7 @@ mod tests {
             let onboard = Onboard::Auto;
             {
                 let mut inputs = qwen4::QwenDualInputs {
-        blas_head: cuteafd_loader::placement::planner::serving::BlasHead::Native,
+        experts: None,        blas_head: cuteafd_loader::placement::planner::serving::BlasHead::Native,
         resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072),
                     owner_manifests: [None; 2],
                     admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 48, mtp: false,
@@ -1161,7 +1161,7 @@ mod tests {
                 u64::try_from(cuteafd_loader::families::qwen4::weight_layout::embedding_table_bytes(&checkpoint)?)?
             } else { 0 };
             let runtime = qwen4::dual_placement(&qwen4::QwenDualInputs {
-        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
+        experts: None,        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         resident_weight_limit: None, context: cuteafd_loader::placement::planner::Context::pinned(131_072), owner_manifests: manifests.each_ref().map(Some), admission,
                 gpus: [0, 1].map(|rank| GpuBudget { capacity_bytes: capacities[rank],
                     reserve_bytes: 3 << 30, baseline: Baseline::Measured { free_bytes: capacities[rank]
@@ -1251,7 +1251,7 @@ mod tests {
                     .checked_add(qwen4::single_expert_weights(&catalog, cfg.layers, true, false)?)?;
                 let inputs = super::inputs(&args, &cfg, cfg.layers, false, None, None, 0)?;
                 let planned = qwen4::QwenInputs {
-                    arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
+        experts: None, onboard: cuteafd_loader::placement::Onboard::Auto,                    arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
         blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
                     loaded_weights, resident_weight_limit: Some(ResidentWeights::DEFAULT_LIMIT),
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: cuteafd_loader::placement::planner::Context::pinned(context), admission: inputs, capacity_bytes: capacity,

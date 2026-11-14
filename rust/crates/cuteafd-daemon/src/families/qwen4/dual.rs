@@ -88,7 +88,7 @@ impl Opened {
             ple_info.map(|(row_bytes, _)| row_bytes), host_embedding,
             dense_envelope.iter().map(|envelope| ("qwen.host.push.dual", envelope.clone())).collect())?;
         let (placement, solved) = qwen4::dual_admitted(&qwen4::QwenDualInputs {
-        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
+        experts: None,        blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), context,
             owner_manifests: manifests.each_ref().map(Some),
             mark_slots: inputs.mark_bytes / mark_bytes, admission: inputs,

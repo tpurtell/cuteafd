@@ -24,7 +24,9 @@ use cuteafd_core::spark_reply::{SparkReplyFormat, SparkReplyFormats};
 use std::collections::BTreeMap;
 
 pub mod encoder;
+pub mod experts;
 pub mod host;
+pub use experts::{ExpertCandidate, QwenExperts};
 pub use encoder::QwenEncoders;
 pub use host::QwenHost;
 
@@ -43,6 +45,8 @@ pub fn check_dual_layer_owners(owners: &[usize]) -> anyhow::Result<()> {
 }
 
 pub struct QwenInputs<'a> {
+    pub experts: Option<QwenExperts>,
+    pub onboard: Onboard,
     pub resident_weight_limit: Option<ResidentWeights>,
     /// Checkpoint owners already charged to the physical baseline.
     pub loaded_weights: ResidentWeights,
@@ -261,7 +265,7 @@ impl<'a> QwenSingle<'a> {
         let inputs = self.inputs;
         let policy = single_policy(inputs);
         Ok(Request { context: inputs.context, pool: pool_pin(&policy, QWEN_UNIT_ROWS as u64)?,
-            onboard: Pin::Auto, prefill: Pin::Exact(prefill_of(&inputs.admission)),
+            onboard: QwenExperts::pin(inputs.onboard), prefill: Pin::Exact(prefill_of(&inputs.admission)),
             operation: Operation::Serving, resident_weight_limit: inputs.resident_weight_limit,
             spark_reply_formats: reply_formats(inputs.spark_reply_format, inputs.spark_ranks) })
     }
@@ -312,12 +316,16 @@ impl<'a> QwenSingle<'a> {
             by_kind.insert(if kind == Qwen4Attention::Full { AttentionClass::Gqa }
                 else { AttentionClass::Gdn }, AttentionPlacement::Heads);
         }
+        let local = &solved.decisions.onboard_layers[0];
+        if let Some(experts) = &inputs.experts { experts.selected(local)?; }
         Ok(Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
             attention_placement: AttentionPlacement::Heads,
             attention_by_kind: by_kind.into_iter().collect(),
-            peer_row_bytes: 0, onboard_layers: 0, max_pool_tokens_no_onboard: None,
-            layers: modes.iter().map(|&mode| LayerAssignment { mode,
-                experts: if inputs.spark_ranks > 0 { ExpertHome::Spark } else { ExpertHome::RtxWhole { gpu: 0 } } })
+            peer_row_bytes: 0, onboard_layers: local.len(), max_pool_tokens_no_onboard: None,
+            layers: modes.iter().enumerate().map(|(layer, &mode)| LayerAssignment { mode,
+                experts: if local.contains(&layer) || inputs.spark_ranks == 0 {
+                    ExpertHome::RtxWhole { gpu: 0 }
+                } else { ExpertHome::Spark } })
                 .collect(),
             movables: Vec::new(),
             expert_ranges: vec![ExpertRange { first: 0, layers: 0, peak_bytes: 0 }],
@@ -436,12 +444,18 @@ impl Recipe for QwenSingle<'_> {
             .map(|layer| Variable::Attention { layer, values: vec![WHOLE_OWNER_0] })
             .chain([Variable::Prefill(vec![prefill_of(a)]), Variable::Lanes(vec![1])])
             .collect();
+        let mut requires = Vec::new();
+        if let Some(experts) = &inputs.experts {
+            let variable = variables.len();
+            experts.extend(&mut variables, &mut components, self.maximum_pages)?;
+            requires.extend(experts.requirements(inputs.spark_ranks, variable));
+        }
         inputs.encoders.extend(&mut variables, &mut components, 1, inputs.blas_head, self.maximum_pages)?;
         Ok(Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT,
             spark_reply_formats: (inputs.spark_ranks > 0)
                 .then(|| reply_formats(inputs.spark_reply_format, inputs.spark_ranks)),
             resident_weight_limit: request.resident_weight_limit, page_rows: page, pool_page_multiple: 1,
-            maximum_pages: self.maximum_pages, gpus: 1, variables, requires: vec![], components })
+            maximum_pages: self.maximum_pages, gpus: 1, variables, requires, components })
     }
 }
 
@@ -741,6 +755,7 @@ pub fn dual_peer_diagnostics(enabled: bool) -> Vec<Demand> {
         "expert peer diagnostics", 256, Basis::Exact)).to_vec()
 }
 pub struct QwenDualInputs<'a> {
+    pub experts: Option<QwenExperts>,
     pub resident_weight_limit: Option<ResidentWeights>,
     /// Shared model extent and optional operator context pin.
     pub context: crate::placement::planner::Context,
@@ -864,8 +879,8 @@ impl<'a> QwenDual<'a> {
         {
             return Err(Refusal::InvalidFact("Qwen dual demands must name every backbone layer".into()));
         }
-        if inputs.spark_ranks != 0 {
-            return Err(Refusal::InvalidFact("Qwen dual is a dense RTX route and takes no Spark ranks".into()));
+        if inputs.spark_ranks != 0 && inputs.experts.is_none() {
+            return Err(Refusal::InvalidFact("Qwen Spark layouts require declared routed-prefix owners".into()));
         }
         if a.future_expert_bytes != 0 {
             return Err(Refusal::InvalidFact("Qwen dual experts must be solver-owned TP2 halves".into()));
@@ -876,11 +891,13 @@ impl<'a> QwenDual<'a> {
             return Err(Refusal::InvalidFact(
                 "Qwen dual requires TP2 expert packages on every routed layer".into()));
         }
-        match inputs.onboard {
-            Onboard::Auto => {}
-            Onboard::Layers(count) if count == a.layers => {}
-            Onboard::Layers(count) => return Err(Refusal::InvalidFact(format!(
-                "Qwen dual TP2 onboards all {} routed layers, not {count}", a.layers))),
+        if inputs.experts.is_none() {
+            match inputs.onboard {
+                Onboard::Auto => {}
+                Onboard::Layers(count) if count == a.layers => {}
+                Onboard::Layers(count) => return Err(Refusal::InvalidFact(format!(
+                    "Qwen dual needs declared prefix owners for {count} of {} layers", a.layers))),
+            }
         }
         let owners = dual_owners(a.layers);
         check_dual_layer_owners(&owners).map_err(|error| Refusal::InvalidFact(error.to_string()))?;
@@ -909,7 +926,7 @@ impl<'a> QwenDual<'a> {
         let inputs = self.inputs;
         let policy = dual_policy(inputs);
         Ok(Request { context: inputs.context, pool: pool_pin(&policy, QWEN_UNIT_ROWS as u64)?,
-            onboard: Pin::Auto, prefill: Pin::Exact(prefill_of(&inputs.admission)),
+            onboard: QwenExperts::pin(inputs.onboard), prefill: Pin::Exact(prefill_of(&inputs.admission)),
             operation: Operation::Serving, resident_weight_limit: inputs.resident_weight_limit,
             spark_reply_formats: reply_formats(SparkReplyFormat::Bf16, inputs.spark_ranks) })
     }
@@ -945,9 +962,27 @@ impl<'a> QwenDual<'a> {
             return Err(Refusal::InvalidFact(
                 "resolved Qwen prefill differs from the prepared shape".into()));
         }
-        if solved.decisions.onboard_layers.iter().any(|layers| layers.len() != a.layers) {
-            return Err(Refusal::InvalidFact("Qwen dual requires full TP2 onboarding".into()));
+        let local = &solved.decisions.onboard_layers[0];
+        if solved.decisions.onboard_layers[1] != *local {
+            return Err(Refusal::InvalidFact("Qwen TP2 halves disagree on routed layer IDs".into()));
         }
+        let peak = if let Some(experts) = &self.inputs.experts {
+            let candidate = experts.selected(local)?;
+            let mut peak = [0; 2];
+            for (rank, arena) in &candidate.arenas { peak[*rank] += arena.bytes() as u64; }
+            for allocation in candidate.workspace.iter().filter(|allocation| allocation.view.is_none()) {
+                if let crate::placement::planner::Device::Coordinator(rank) = allocation.location.device {
+                    if !allocation.id.starts_with("qwen.experts.rank") { continue; }
+                    peak[rank as usize] += allocation.bytes;
+                }
+            }
+            peak
+        } else {
+            if local.len() != a.layers {
+                return Err(Refusal::InvalidFact("Qwen dual has no declared partial owner".into()));
+            }
+            self.arena
+        };
         if self.hop_spec.storage != HopStorage::ReceiveSlots {
             return Err(Refusal::InvalidFact("Qwen dual hops require receive slots".into()));
         }
@@ -963,14 +998,15 @@ impl<'a> QwenDual<'a> {
         Ok(Placement { pool_tokens: solved.pool_tokens, pool_limits: PoolLimits(vec![]),
             attention_placement: AttentionPlacement::Layers,
             attention_by_kind: by_kind.into_iter().collect(),
-            peer_row_bytes: 0, onboard_layers: a.layers, max_pool_tokens_no_onboard: None,
-            layers: modes.iter().map(|&mode| LayerAssignment { mode, experts: ExpertHome::RtxTp2 })
+            peer_row_bytes: 0, onboard_layers: local.len(), max_pool_tokens_no_onboard: None,
+            layers: modes.iter().enumerate().map(|(layer, &mode)| LayerAssignment { mode,
+                experts: if local.contains(&layer) { ExpertHome::RtxTp2 } else { ExpertHome::Spark } })
                 .collect(),
             movables: Vec::new(),
             expert_ranges: (0..2).map(|_| ExpertRange { first: 0, layers: 0, peak_bytes: 0 })
                 .collect(),
             residual, hops,
-            tp2: Some(Tp2Range { first: 0, layers: a.layers, peak_bytes: self.arena }),
+            tp2: (!local.is_empty()).then_some(Tp2Range { first: 0, layers: local.len(), peak_bytes: peak }),
             items: (0..2).map(|gpu| solved.items(Location::coordinator(gpu as u8)))
                 .collect::<Result<Vec<_>, Refusal>>()? })
     }
@@ -1080,11 +1116,21 @@ impl Recipe for QwenDual<'_> {
                 components.push(owner(format!("qwen.owner{gpu}.step.{index}"), location, bytes,
                     category, group, PlanLifetime::RESIDENT, self.maximum_pages));
             }
-            let group = format!("TP2 expert layer halves 0..{}", a.layers);
-            components.push(owner(format!("qwen.tp2.{gpu}"), location, self.arena[gpu],
-                Category::Experts, &group, PlanLifetime::RESIDENT, self.maximum_pages));
-            components.push(weights(format!("qwen.tp2.{gpu}"), location,
-                ResidentWeights(self.resident[gpu]), self.maximum_pages));
+            if inputs.experts.is_none() {
+                let group = format!("TP2 expert layer halves 0..{}", a.layers);
+                components.push(owner(format!("qwen.tp2.{gpu}"), location, self.arena[gpu],
+                    Category::Experts, &group, PlanLifetime::RESIDENT, self.maximum_pages));
+                components.push(weights(format!("qwen.tp2.{gpu}"), location,
+                    ResidentWeights(self.resident[gpu]), self.maximum_pages));
+            }
+            if inputs.spark_ranks > 0 {
+                let bytes = crate::serving_capacity::prefill_return_bytes_with_format(
+                    prefill_of(a).waves, prefill_of(a).rows, inputs.spark_ranks as u64,
+                    cfg.hidden as u64, SparkReplyFormat::Bf16)
+                    .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+                components.push(owner(format!("qwen.spark.intake.{gpu}"), location, bytes,
+                    Category::Transport, "Spark intake planes", PlanLifetime::RESIDENT, self.maximum_pages));
+            }
             components.push(graph_reserve_owner(
                 QwenGraphShapeKey::resolve(2, inputs.spark_ranks > 0), gpu, location,
                 self.maximum_pages)?);
@@ -1132,12 +1178,20 @@ impl Recipe for QwenDual<'_> {
         }
         variables.push(Variable::Prefill(vec![prefill_of(a)]));
         variables.push(Variable::Lanes(vec![1]));
-        variables.push(Variable::Onboard { layers: (0..a.layers).collect(),
-            destination: vec![0, 1], counts: vec![a.layers] });
+        let mut requires = Vec::new();
+        if let Some(experts) = &inputs.experts {
+            let variable = variables.len();
+            experts.extend(&mut variables, &mut components, self.maximum_pages)?;
+            requires.extend(experts.requirements(inputs.spark_ranks, variable));
+        } else {
+            variables.push(Variable::Onboard { layers: (0..a.layers).collect(),
+                destination: vec![0, 1], counts: vec![a.layers] });
+        }
         inputs.encoders.extend(&mut variables, &mut components, 2, inputs.blas_head, self.maximum_pages)?;
-        Ok(Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT, spark_reply_formats: None,
+        Ok(Contract { floor_fallback: None, phase_order: PhaseOrder::TARGET_THEN_DRAFT,
+            spark_reply_formats: (inputs.spark_ranks > 0).then(|| reply_formats(SparkReplyFormat::Bf16, inputs.spark_ranks)),
             resident_weight_limit: request.resident_weight_limit, page_rows: page, pool_page_multiple: 1,
-            maximum_pages: self.maximum_pages, gpus: 2, variables, requires: vec![], components })
+            maximum_pages: self.maximum_pages, gpus: 2, variables, requires, components })
     }
 }
 
@@ -1261,7 +1315,7 @@ mod tests {
         let experts = vec![Some(tp2_cost()); 4];
         let gib = 1u64 << 30;
         let inputs = QwenDualInputs {
-            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
+        experts: None,            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
                 mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0 },
@@ -1564,7 +1618,7 @@ mod tests {
         let extra = vec![vec![]; cfg.layers];
         check_spark_encoder_budgets(|encoders| {
             let inputs = QwenDualInputs {
-                blas_head: crate::placement::planner::serving::BlasHead::Native,
+        experts: None,                blas_head: crate::placement::planner::serving::BlasHead::Native,
                 resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp: false,
                     kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
@@ -1816,7 +1870,7 @@ mod tests {
                 let mut host = QwenHost::ample(&cfg, 2, 4096).unwrap();
                 host.host_embedding = bytes;
                 let inputs = QwenDualInputs {
-                    blas_head: crate::placement::planner::serving::BlasHead::Native,
+        experts: None,                    blas_head: crate::placement::planner::serving::BlasHead::Native,
                     resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                     admission: single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
                         0, None, ResidentWeights(0), None).admission,
@@ -1893,7 +1947,7 @@ mod tests {
             half: costs, tp2: true, whole_supported: true, spark_ok: true })).collect();
         let gib = 1u64 << 30;
         let build = || QwenDualInputs {
-            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
+        experts: None,            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
                 mark_bytes: 0,  ple: None, future_expert_bytes: 0, headroom: 0 },
