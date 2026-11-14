@@ -270,6 +270,12 @@
       "core_view": "fp8-compact",
       "status": "na",
       "reason": "Step-5 executes block FP8 only for O projections; the MC core also selects q/k/v, FFNs and the head."
+    },
+    {
+      "family": "muse_spark",
+      "core_view": "fp8-compact",
+      "status": "na",
+      "reason": "Selected vocabulary head and pre/post-expert roles require whole-core FP8 executors (#1796)."
     }
   ]
 }
