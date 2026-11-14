@@ -213,9 +213,8 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     for required in ("self.decode_workspace_of(rank)", "self.pipelined()", "self.prefill_waves",
                      "self.prefill_slots_of(rank, lanes)", "drafter.prepare_workspace()", "self.synchronize()"):
         assert required in prepare
-    # Scoring (`--full-prefill-logits`) precreates the same lanes: a serial prefill runs in lane 0.
-    scoring = source.split("pub fn prepare_scoring_prefill(", 1)[1].split("fn step_plan(", 1)[0]
-    assert "self.prefill_slots_of(rank, lanes)" in scoring and "self.workspace(" not in scoring
+    # Scoring borrows ordinary lazy prefill lanes; it has no startup-only owner.
+    assert "pub fn prepare_scoring_prefill(" not in source
     # Retained handles are named owners, not a mixed per-workspace residual.
     graphs = (ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/glmf_graphs.rs").read_text()
     assert "WORKSPACE_RUNTIME_OVERHEAD_BYTES" not in graphs
@@ -240,10 +239,8 @@ def test_glm_serving_admits_and_precreates_all_reachable_workspaces():
     assert ("engine.configure_graph_cache(&admitted_graphs.charged, &admitted_graphs.reserves, "
             "&admitted_graphs.bootstraps, admitted_graphs.extra)?") in flat
     assert "engine.warm_decode_graphs(sequences.min(args.decode_rows), speculation)?" in opening
-    assert 'full_prefill_logits_bytes(' not in opening
     startup = opening.index("let result = with_startup_graphs(")
     assert opening.index("engine.prepare_serving_workspaces()") < startup
-    assert opening.index("engine.prepare_scoring_prefill()") < startup
     assert startup < opening.index("|| body(&engine)")
     assert "if args.serving_graph_policy.is_some()" in opening
     drafter = (root / "../shared/speculation/dflash.rs").read_text()

@@ -110,8 +110,7 @@ impl HookBuffers {
         };
         for (index, kind) in ["decode", "prefill"].into_iter().enumerate() {
             // Decode hooks live in the workspace the startup warm pass allocates.
-            // Prefill hooks live in the lanes the first prefill allocates: during
-            // startup only when scoring, otherwise from live traffic after Ready.
+            // Prefill hooks live in lanes allocated by the first live prefill after Ready.
             let workspace = Lifetime {
                 first: if kind == "prefill" {
                     Phase::Growth

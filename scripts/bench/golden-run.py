@@ -114,7 +114,7 @@ GPU_CHECK_EXIT = 86
 # --help omits them, so the help-derived schema adds them here. Booleans take no
 # operand; the rest take one. scripts/tests/test_golden_run.py checks this list
 # against every `hide = true` field in rust/crates/cuteafd-daemon/src.
-HIDDEN_FLAGS = ('--skip-routed-experts', '--skip-experts', '--full-prefill-logits', '--resume-cold',
+HIDDEN_FLAGS = ('--skip-routed-experts', '--skip-experts', '--resume-cold',
                 '--resume-poison-unit0', '--independent-decode-lanes')
 HIDDEN_OPTIONS = ('--save-logits', '--kda-nvfp4-gate', '--draft-window-marks')
 WRITERS = ('--dump-dir', '--save-logits', '--bench-dump', '--replay-dump', '--geometry-trace')

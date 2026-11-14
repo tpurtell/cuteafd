@@ -4303,7 +4303,7 @@ def test_mimo_media_plan_keeps_ingress_onboarding_and_graph_contract(tmp_path, i
     assert "--rtx-expert-layers 0" in preflight and "--onboard 0" in launch
     assert "--max-context-tokens 262144" in preflight and "--max-context-tokens 262144" in launch
     assert "--mimo-decode-graphs on" in preflight and "--decode-graphs true" in launch
-    assert "--full-prefill-logits" in preflight and "--full-prefill-logits" in launch
+    assert "--full-prefill-logits" not in preflight and "--full-prefill-logits" not in launch
 
 
 @pytest.mark.parametrize("graphs", [None, "on", "off"])
