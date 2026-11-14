@@ -84,8 +84,9 @@ def export_jobs():
     # The current release cells also include Qwen Next, whose old example path
     # has retired cards. Its live checkpoint still needs native workspace inputs.
     experts.add("qwen4:exl3-k45")
-    # Inkling 2 has no live example config yet; its MXFP8 W8A8 package is registered here.
-    experts.add("inkling2:mxfp8")
+    # Inkling 2 has no live example config yet; its MXFP8 W8A8 and native dynamic-amax
+    # NVFP4 W4A4 packages are registered here.
+    experts.update(("inkling2:mxfp8", "inkling2:nvfp4a4"))
     geometries = [*compare.GEOMETRIES, "kimik3", "kimik31", "muse", "muse2", "ml4",
                   "dense_trellis_k6", "kimi_split", "expert_partial", "expert_reply",
                   "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "exlr8", "exlr8_dense", "minimax", "inkling2"]
@@ -108,9 +109,9 @@ def export_jobs():
             jobs.append((f"fp8/fp8-{family}{suffix}", "package_fp8_moe_aot.py", [
                 "--geometry", geometry, "--capacities", native_capacities,
                 "--layouts", "tp1,tp2", "--role", "coordinator"]))
-        elif kind == "mxfp8":
-            jobs.append((f"fp8/fp8-{family}-mxfp8", "package_fp8_moe_aot.py", [
-                "--geometry", f"{family}_mxfp8", "--capacities", native_capacities,
+        elif family == "inkling2" and kind in ("mxfp8", "nvfp4a4"):
+            jobs.append((f"fp8/fp8-{family}-{kind}", "package_fp8_moe_aot.py", [
+                "--geometry", f"{family}_{kind.removesuffix('a4')}", "--capacities", native_capacities,
                 "--layouts", "tp1,tp2", "--role", "coordinator"]))
     jobs.extend([
         ("v41-fp8", "export_b12x_v41_fp8_aot.py", ["--rows", compare.V41_PROJECTION_CAPACITIES]),

@@ -1673,7 +1673,8 @@ def test_installed_placement_export_jobs_cover_live_native_families_and_packages
                 compare_sm.V41_PROJECTION_CAPACITIES if name == 'v41-fp8' else
                 compare_sm.V41_DRAFT_CAPACITIES if name in ('v41-experts', 'v41-dspark_tp2') else
                 compare_sm.V41_CAPACITIES)
-    assert not any('nvfp4' in name for name in names)
+    # ModelOpt NVFP4 is deprecated; Inkling 2's native dynamic-amax NVFP4 is a different package.
+    assert [name for name in names if 'nvfp4' in name] == ['fp8/fp8-inkling2-nvfp4a4']
     # Step-5 FP8 is retired for v5 (TJ 2026-10-31), so its packages are not exported.
     assert not any(name.startswith('fp8/fp8-step5') for name in names)
     args = jobs[0][2]
@@ -1820,7 +1821,8 @@ def test_inkling2_groups_select_its_attention_programs_and_coordinator_mxfp8_pac
     jobs = {name: (script, args) for name, script, args in compare_sm.jobs("all")}
     assert jobs["inkling2-attention"] == ("export_b12x_dsv4_aot.py", [
         "--geometry", "inkling2", "--decode-rows", "64", "--prefill-rows", "4096"])
-    assert jobs["routed-inkling2_mxfp8"] == ("package_fp8_moe_aot.py", [
-        "--geometry", "inkling2_mxfp8", "--capacities", compare_sm.CAPACITIES, "--layouts", "tp1,tp2"])
+    for geometry in ("inkling2_mxfp8", "inkling2_nvfp4"):
+        assert jobs[f"routed-{geometry}"] == ("package_fp8_moe_aot.py", [
+            "--geometry", geometry, "--capacities", compare_sm.CAPACITIES, "--layouts", "tp1,tp2"])
     # No Spark-role MXFP8 package is registered until the engine's MXFP8 expert format lands.
     assert not any(name.startswith("routed-inkling2") and "spark" in name for name in jobs)

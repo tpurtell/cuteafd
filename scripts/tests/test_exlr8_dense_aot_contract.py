@@ -657,14 +657,16 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     spec = importlib.util.spec_from_file_location("inkling2_fp8_package", ROOT / "python/tools/aot/package_fp8_moe_aot.py")
     packager = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(packager)
-    assert packager.STORAGE == {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5, "mxfp8": 6}
+    assert packager.STORAGE == {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5, "mxfp8": 6, "nvfp4dyn": 7}
     assert packager.ACTIVATION == {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2, "swigluoai": 3, "situ": 4}
     # W8A8: FP8 K32 wire rows on every role, including the coordinator.
     assert packager.input_kind("coordinator", "mxfp8") == packager.input_kind("spark", "mxfp8") == "wire"
     with pytest.raises(ValueError, match="wire"):
         packager.input_kind("coordinator", "mxfp8", "bf16")
     assert packager.activation_params("situ", "mxfp8", None, None, 0.0) == (1.0, 0.0)
-    for activation, weights in (("situ", "fp8"), ("silu_bf16_product", "mxfp8")):
+    assert packager.activation_params("situ", "nvfp4", None, None, 0.0) == (1.0, 0.0)
+    assert packager.input_kind("coordinator", "nvfp4") == "bf16"
+    for activation, weights in (("situ", "fp8"), ("situ", "mxfp4"), ("silu_bf16_product", "mxfp8")):
         with pytest.raises(ValueError, match="SiTU"):
             packager.activation_params(activation, weights, None, None, 0.0)
     g = types.SimpleNamespace(kind="mxfp8", weights="mxfp8", activation="situ", projection="bf16", swiglu_limit=0.0,
@@ -672,6 +674,10 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     words = packager.info_words(g, [1, 16, 80, 256, 1024, 4096], True)
     assert words[0] == packager.ABI_VERSION | 6 << 8 | 4 << 16 | 1 << 24
     assert words[1:8] == [4608, 1152, 384, 8, 2304, 2, 7] and len(words) == packager.INFO_WORDS
+    g = types.SimpleNamespace(kind="nvfp4dyn", weights="nvfp4", activation="situ", projection="bf16", swiglu_limit=0.0,
+                              hidden=4608, slice=2304, experts=384, top_k=8, intermediate=2304, tp=1)
+    words = packager.info_words(g, [1, 16, 80, 256, 1024, 4096], False)
+    assert words[0] == packager.ABI_VERSION | 7 << 8 | 4 << 16 | 1 << 24 and words[7] == 1
 
     from test_wip_scope_exports import aot, cmake_flags
     _, scopes = aot.config_scopes(dict(FAMILY="inkling2", MODEL_ID="fixture/Inkling-2-Small-MXFP8", SPARK_COUNT="4"))
@@ -704,9 +710,12 @@ def test_inkling2_dispatch_package_codes_cmake_and_placement_scopes_agree(monkey
     args = jobs["programs"][1]
     geometries = args[args.index("--geometry") + 1].split(",")
     assert geometries[-2:] == ["minimax", "inkling2"]
-    assert jobs["fp8/fp8-inkling2-mxfp8"] == ("package_fp8_moe_aot.py", [
-        "--geometry", "inkling2_mxfp8", "--capacities", placement.fp8_capacities(),
-        "--layouts", "tp1,tp2", "--role", "coordinator"])
+    for package, geometry in (("fp8-inkling2-mxfp8", "inkling2_mxfp8"), ("fp8-inkling2-nvfp4a4", "inkling2_nvfp4")):
+        assert jobs["fp8/" + package] == ("package_fp8_moe_aot.py", [
+            "--geometry", geometry, "--capacities", placement.fp8_capacities(),
+            "--layouts", "tp1,tp2", "--role", "coordinator"])
+        assert f'set(package "${{CMAKE_CURRENT_BINARY_DIR}}/fp8/{package}")' in (
+            ROOT / "native/cmake/shared/fp8_moe.cmake").read_text()
 
     for flags, expected in (({"CUTEAFD_ENABLE_INKLING2_AOT": "ON"}, "inkling2,expert_reply"),
                             ({"CUTEAFD_ENABLE_MINIMAX_AOT": "ON", "CUTEAFD_ENABLE_INKLING2_AOT": "ON"},

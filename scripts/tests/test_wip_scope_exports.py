@@ -279,10 +279,11 @@ def test_minimax_scope_uses_only_native_w4a4_expert_package():
 
 
 def test_inkling2_scope_exports_attention_and_the_coordinator_mxfp8_package():
-    for model in ('Inkling-2-Small-MXFP8', 'Inkling-2-Small'):
+    for model, experts in (('Inkling-2-Small-MXFP8', 'inkling2:mxfp8'),
+                           ('Inkling-2-Small', 'inkling2:mxfp8;inkling2:nvfp4a4')):
         derived = scopes('inkling2', model, 4)
         assert derived['CUTEAFD_WIP_INKLING2_AOT'] == 'ON'
-        assert derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'] == 'inkling2:mxfp8'
+        assert derived['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'] == experts
         # Spark MXFP8 packages follow the engine's MXFP8 expert format; none ships yet.
         assert derived['CUTEAFD_WIP_EXPERT_FAMILIES'] == ''
         assert derived['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == ''

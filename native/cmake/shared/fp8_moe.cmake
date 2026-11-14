@@ -68,6 +68,13 @@ foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)
     set(geometry "inkling2_mxfp8")
     set(count_family "inkling2")
     set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-inkling2-mxfp8")
+  elseif(entry STREQUAL "inkling2:nvfp4a4")
+    if(CUTEAFD_FP8_MOE_ROLE STREQUAL "spark")
+      continue()  # coordinator tp1/tp2 only until the Spark dynamic NVFP4 format lands
+    endif()
+    set(geometry "inkling2_nvfp4")
+    set(count_family "inkling2")
+    set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-inkling2-nvfp4a4")
   elseif(entry MATCHES "^(glm|glmf|glmfdense|qwen4):(nvfp4|nvfp4a4)$")
     if(CMAKE_MATCH_1 STREQUAL "glmfdense" AND CUTEAFD_FP8_MOE_ROLE STREQUAL "spark")
       continue()  # dense MLPs run on the coordinator only
@@ -77,7 +84,7 @@ foreach(entry IN LISTS CUTEAFD_FP8_MOE_ENTRIES)
     set(package "${CMAKE_CURRENT_BINARY_DIR}/fp8/fp8-${CMAKE_MATCH_1}-${CMAKE_MATCH_2}")
   else()
     message(FATAL_ERROR "FP8 expert family ${entry} must be (mimo|mimop|mimof|glm|glmf|qwen4):fp8 (mimof/mimop: MXFP4 weights) \
-or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts) or inkling2:mxfp8 (MXFP8 W8A8)")
+or (glm|glmf|qwen4):nvfp4[a4] (ModelOpt NVFP4, calibrated W4A4 at all row counts) or inkling2:mxfp8 (MXFP8 W8A8) or inkling2:nvfp4a4 (native dynamic-amax NVFP4 W4A4)")
   endif()
   # Both roles carry exact layouts where TP slices differ in width; RTX TP2
   # uses the same whole-H128 contract as the Spark backend.

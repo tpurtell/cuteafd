@@ -74,7 +74,7 @@ os.environ.setdefault("B12X_COMPILE_MEMORY_CACHE", "0")
 SCHEMA = "cuteafd.fp8moe-package.v1"
 ROLE_LAYOUTS = {"coordinator": ("tp1", "tp2")}
 ABI_VERSION = 6
-STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5, "mxfp8": 6}
+STORAGE = {"fp8": 1, "mxfp4": 2, "nvfp4a4": 4, "bf16": 5, "mxfp8": 6, "nvfp4dyn": 7}
 ACTIVATION = {"silu_bf16_product": 1, "silu_post_clamp_fp32_product": 2, "swigluoai": 3, "situ": 4}
 PROJECTION = {"bf16": 1}
 ROLE_COMPUTE = {"spark": (12, 1), "coordinator": (12, 0)}
@@ -507,8 +507,9 @@ def activation_params(activation, weights, alpha, beta, limit) -> tuple[float, f
 
     if not math.isfinite(limit) or limit < 0:
         raise ValueError("SwiGLU limit must be finite and nonnegative")
-    if (activation == "situ") != (weights == "mxfp8"):
-        raise ValueError("SiTU is the MXFP8 expert activation, and its only one")
+    # SiTU is the Inkling contract: MXFP8 W8A8 always, NVFP4 only as its dynamic-amax W4A4.
+    if (activation == "situ" and weights not in ("mxfp8", "nvfp4")) or (weights == "mxfp8" and activation != "situ"):
+        raise ValueError("SiTU is the Inkling expert activation: MXFP8 W8A8 or dynamic-amax NVFP4 W4A4")
     if activation == "swigluoai":
         if (weights != "nvfp4" or alpha is None or beta is None
                 or not math.isfinite(alpha) or alpha <= 0 or not math.isfinite(beta) or limit <= 0):
@@ -758,7 +759,7 @@ def main() -> None:
     create.add_argument("--geometry", choices=("mimo", "mimop", "mimof", "glm", "glmf", "qwen4", "glm_nvfp4", "glmf_nvfp4",
                                                "qwen4_nvfp4", "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4",
                                                "glmfdense_nvfp4", "glmfdense_nvfp4a4", "step5", "step5_bf16", "step5_nvfp4", "minimax_nvfp4a4",
-                                               "inkling2_mxfp8"),
+                                               "inkling2_mxfp8", "inkling2_nvfp4"),
                         required=True)
     create.add_argument("--layouts", help="comma list (default: tp4,tp2,tp6 where they split for spark, "
                         "tp1 for coordinator)")
