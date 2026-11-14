@@ -219,10 +219,11 @@ class Native:
 
 
 def expert_boundary_oracle(x, layer, cfg):
-    """Separate counterfactual: native kernel BF16 FC1/SiTU and route-sum boundary.
+    """Pinned vLLM serving boundaries, separate from the #1915 F32 oracle.
 
-    #1915 already includes both MXFP8 A8 QDQs. This diagnostic adds the BF16
-    projection/SiTU materialization documented by #294, without replacing it.
+    d664cd1e trtllm_bmm.py:183 allocates FC1/FC2 BF16; activation.py:78
+    rounds weighted SiTU BF16; ops/moe.py:1077 combines BF16 slots in F32.
+    #1915 already includes both MXFP8 A8 QDQs and remains unchanged.
     """
     logits = linear(x, layer["mlp.gate.weight"].float())
     ids, gamma = oracle.route(logits, layer["mlp.gate.bias"], cfg.num_experts_per_tok, cfg.route_scale)
@@ -235,9 +236,12 @@ def expert_boundary_oracle(x, layer, cfg):
         del w13
         activation = oracle.capped_swiglu(gate_up, gamma[rows, choices], cfg.mlp_gate_softcap, cfg.mlp_up_softcap).bfloat16().float()
         down = oracle.dequant_mxfp8(layer["mlp.experts.w2_weight"][expert], layer["mlp.experts.w2_weight_scale"][expert])
-        slots[rows, choices] = linear(oracle.quantize_mxfp8(activation), down)
+        slots[rows, choices] = linear(oracle.quantize_mxfp8(activation), down).bfloat16().float()
         del down
-    return slots.sum(1).bfloat16().float()
+    combined = torch.zeros_like(slots[:, 0])
+    for choice in range(cfg.num_experts_per_tok):
+        combined += slots[:, choice]
+    return combined.bfloat16().float()
 
 
 def stage_probe(native, hidden, layer, cfg, index, weights, report):
