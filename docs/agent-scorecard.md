@@ -18,6 +18,7 @@ Rubric, each 1–5 (5 best), plus wall time:
 |---|---|---|---|---|
 | Sol 6.1 (Codex) | default engineering, numerics, A/B, lossless fixes | thorough, keeps gates honest, strong root-causing (#163, #190, #171) | over-literal on tooling rules; commits mid-gate (head-moved failures ×3 on 2026-10-14); verbose reports | ~15 tasks |
 | Astra 6 (Codex) | hard kernel design | bounded packed native FP8 consumer; qualified per-contract gains (#2068, fork #303) | broad kernel wins need selective gates; ancillary inspection can burn time waiting for CPU slots | FP8 R2: three landed decode contracts; earlier evidence below |
+| Claude Fable 5.2 | bounded kernel design and SASS interpretation | native numerical correctness; load-overlap diagnosis and occupancy-aware final pipeline (#2068) | no whole deferred shape qualifies after three rounds; extra CPU probe after seal needed disclosure | FP8 duel R1-R3 measured null, strict SM121 gates green |
 | DeepSeek Flash | drivers; direct analysis and measurement | reliable verifier as driver; strong quantitative reasoning (DiD on existing data, #193); cheap and fast | — | drivers ×10, direct ×1 |
 | Claude Opus 5.5 (orchestrator) | design, review, merges, decisions | fast cross-task diagnosis (#191 Spark regression, stale CMake cache) | pushed a red commit once (61256a22); held agents for an answer while GPUs idled; wrong guesses before evidence (masked-V, cold-start) | this session |
 | Grok 4.7 (xAI, CLI `grok`) | bounded fixes, tests, races; design analysis with precise citations | found a real race behind a "flaky test"; challenged a wrong brief premise (#180 named V4.1/MiMo, but only GLM 5.3 uses the lane path); exact file:line citations (14/14 verified); caught a latent copies_pending bug | context fills fast (72% of 256K on a design task; needed a wrap-up nudge) | 6 tasks (1 kernel duel, lost) |
@@ -25,6 +26,52 @@ Rubric, each 1–5 (5 best), plus wall time:
 | Gemini 4 Carbon High (Antigravity, CLI `agy`) | default Gemini since 2026-11-11: reviews, duels, research | — | — | 1 review (3/6/1 verified/corrected/wrong-premise; strong mechanism leads, fabricates values and symbols) and 2 kernel duels (D1 tied the winner bitwise on 134/134 cells; D2 found the only +3.2% beyond the shipped route). Weak: own GPU launchers hang under `docker -it`; long unmeasured analysis |
 
 ## Log
+
+### 2026-11-14 Native FP8 Decode Duel: Fable Final Null
+
+Fable 5.2 (`claude-fable-5-2`) completed three bounded kernel-only rounds:
+`955b0123` native K64 partials, `87daffc0` load-ahead/NC thin, and final
+`d3f08383` packed load-ahead with restored base thin and MLA late-fold source
+scheduling. Scores: Correct 5, Judgement 4, Quality 4, Creative 4. Roughly
+R1 23 minutes to seal/35 to CPU handoff, R2 35 minutes, R3 27 minutes;
+organizer hardware waits are separate. No entrant GPU, benchmark/oracle
+edits or push.
+
+No deferred shape qualifies. Final SM121 395-cell screen latency geometric
+mean is 1.00420; Qwen width64 is 1.73670 and MLA width64 is 1.1574.
+q_b 16384x1536 initially looked promising (all five screen widths at or
+below production), but the full-grid same-session spread check rejects it:
+width32 production repeats 133.120/133.040 us versus candidate 140.304 us,
+5.40% above production high against 0.06% spread. Width24 also loses;
+width64 wins but cannot qualify the shape. Screen near-wins always need
+the complete live-row grid and spread checks, including the mid-band.
+
+R1/R2 correctness gates pass both architectures. Final R3 SM121 has 105
+passes plus four intentional expanded-layout skips, strict native F32 and
+real/synthetic expert oracles, tail memcheck zero errors, and queried
+resident CTA counts equal to master (Qwen10, MLA5, q_b12). Fifteen CPU AOT
+compile/exports per architecture pass. Final RTX gate was cancelled while
+still queued after decisive SM121 failure; no RTX R3 result is claimed.
+All completed final SM121 screen slowdown counters have zero increments;
+sampled max temperature55C/minimum headroom41C, not continuous peaks.
+
+Useful diagnosis: removing conversion work exposes load-to-use latency.
+The single isolated ncu pair has fewer native instructions/registers and
+better occupancy but higher long-scoreboard stalls. Fable's load-ahead
+wins isolated widths; deeper pipelines trade register residency and high
+widths for low-width overlap. Its final packed pipeline preserves residency
+but still misses the whole-shape bar. It accurately distinguished source
+late-fold order from the compiled per-chunk FMA sequence and disclosed a
+moot post-seal CPU-only q_b landing probe; no source changed. That probe
+also confirms an unrelated direct-widen M16 codegen change would need its
+own qualification if reused. No fourth Fable round; Astra declines its
+bonus round rather than chase partial cells.
+
+All three original NC shapes remain wholly deferred. Astra's separate
+three-contract native-base win is already scored below and landed in fork
+#303. Closing tables and profile explanation: #2068 comment6874525152.
+Receipts: `~/.cache/cuteafd/builds/fp8wide-duel/receipts/`. Entrant worktrees
+and task targets are cleaned; commits and receipts remain available.
 
 ### 2026-11-14 Native FP8 Decode Duel: Astra R2 Partial Win
 
