@@ -927,7 +927,7 @@ fn k31_native_indexer_headers_are_required_and_never_core_quantized() -> Result<
 }
 
 #[test]
-fn k31_original_core_plan_charges_index_records_once_and_refuses_compact_core() -> Result<()> {
+fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<()> {
     use crate::families::kimi_k3::config::KimiK3Config;
     use cuteafd_core::memory_layout::{Category, DeviceKind};
 
@@ -984,7 +984,8 @@ fn k31_original_core_plan_charges_index_records_once_and_refuses_compact_core() 
     }
     assert!(placed.pool_tokens > 0);
 
-    // Compact K6 core view remains fail-closed until Stage 2 (#1777).
+    // Unqualified compact views still report their complete memory plan;
+    // RuntimeStatus::Planned keeps serving fail-closed (#1777).
     let k6_dir = tempfile::tempdir()?;
     testing::write_kimi_core_snapshot(k6_dir.path(), true);
     std::fs::write(k6_dir.path().join("config.json"), cfg.to_string())?;
@@ -997,8 +998,12 @@ fn k31_original_core_plan_charges_index_records_once_and_refuses_compact_core() 
     std::fs::write(&k6_index_path, k6_index.to_string())?;
     options.attention_placement = None;
     let k6_report = testing::BudgetedPlanInput::open(k6_dir.path())?.plan(&options)?;
-    assert!(!k6_report.placement_supported);
-    assert!(k6_report.hints.iter().any(|h| h.what.contains("compact core views")),
+    assert!(k6_report.placement_supported, "{:?}", k6_report.hints);
+    assert!(k6_report.memory_layout.as_ref().is_some_and(|memory| memory.pool_tokens > 0));
+    assert!(k6_report.fits);
+    assert_eq!(k6_report.runtime, Some(crate::plan::RuntimeStatus::Planned));
+    assert!(!k6_report.wip_launchable());
+    assert!(k6_report.hints.iter().any(|h| h.what.contains("K6/K8 core views unqualified")),
         "{:?}", k6_report.hints);
     Ok(())
 }
