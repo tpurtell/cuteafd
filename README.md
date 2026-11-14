@@ -218,6 +218,12 @@ concurrency point is that limit.
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-1rtx-1spark-glmf-exlr8-k4-min/card.svg"><img src="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-1rtx-1spark-glmf-exlr8-k4-min/card.svg" alt="kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 on 1× RTX PRO 6000 @ gpu-powerd 455 W (450–600) + 1× DGX Spark"></a><br><sub>1× RTX + 1× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-2rtx-glmf-exlr8-k4-max/card.svg"><img src="benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-2rtx-glmf-exlr8-k4-max/card.svg" alt="kindlingai/glm-5.3-flash-exlr8-k2-k3-k4 on 2× RTX PRO 6000 @ gpu-powerd 445/445 W (300–550)"></a><br><sub>2× RTX</sub></td>
 </tr>
+<tr>
+<td width="19%" valign="top"><a href="docs/models/minimax_m3.md"><b>minimax_m3</b></a><br><sub>MiniMaxAI/MiniMax-M3.1-Flash</sub><br><sub>nvfp4-g16-divisor</sub></td>
+<td width="27%" valign="top">pending<br><sub>not measured (#1856)</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-flash-min-cand-r1/card.svg"><img src="benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-flash-min-cand-r1/card.svg" alt="MiniMaxAI/MiniMax-M3.1-Flash on 1× RTX PRO 6000 @ gpu-powerd 435 W (425–450) + 3× DGX Spark"></a><br><sub>1× RTX + 3× Spark</sub></td>
+<td width="27%" valign="top">pending<br><sub>FP32 split serving qualification pending (#1856, #2101)</sub></td>
+</tr>
 </table>
 
 Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and drafts and reads higher), cold exactly-8,192-token prefill, logit fidelity against the family golden reference, prefix-cache restore exactness and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).

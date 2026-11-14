@@ -52,7 +52,7 @@ def _flag(line: str, flag: str) -> str | None:
     return tokens[tokens.index(flag) + 1] if flag in tokens else None
 
 
-def test_minimax_qualification_card_is_one_rtx_three_sparks_and_wip_only(tmp_path: Path) -> None:
+def test_minimax_qualified_card_opens_one_rtx_three_sparks_public_launch(tmp_path: Path) -> None:
     config = {"model_type": "minimax_m3_vl", "text_config": {
         "num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}}
     three = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(3))
@@ -65,9 +65,13 @@ def test_minimax_qualification_card_is_one_rtx_three_sparks_and_wip_only(tmp_pat
     assert _flag(serve, "--split-wire") == "fp32"
     assert _flag(serve, "--host-cache-bytes") == "auto"
     assert "--split-device" not in serve.split()
-    refused = _family_launch_result(tmp_path / "release", config, "MiniMaxAI/MiniMax-M3.1-Flash", keys,
+    release = _family_launch_result(tmp_path / "release", config, "MiniMaxAI/MiniMax-M3.1-Flash", keys,
         encoder_plan=PLANNED)
-    assert refused.returncode != 0 and "WIP-only" in refused.stderr
+    assert release.returncode == 0
+    assert "--split-device" not in _line(release, "serve-minimax --snapshot").split()
+    pair = _family_launch_result(tmp_path / "pair", config, "MiniMaxAI/MiniMax-M3.1-Flash",
+        keys.replace("RTX_GPUS=1", "RTX_GPUS=2"), encoder_plan=PLANNED)
+    assert pair.returncode != 0 and "one coordinator GPU" in pair.stderr
     matrix = json.loads((ROOT / "scripts/bench/kits/gate/matrix-gate.json").read_text())
     entry = next(entry for entry in matrix["entries"] if entry["name"] == "minimax-flash-min")
     assert entry["family"] == "minimax_m3" and len(entry["gpus"]) == 1 and len(entry["sparks"]) == 3

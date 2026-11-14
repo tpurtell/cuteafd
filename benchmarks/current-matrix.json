@@ -304,6 +304,22 @@
         "status": "current",
         "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exlr8-k2-k3-k4-2rtx-glmf-exlr8-k4-max"
       }
+    },
+    {
+      "family": "minimax_m3",
+      "checkpoint": "MiniMaxAI/MiniMax-M3.1-Flash",
+      "5090": {
+        "status": "pending",
+        "reason": "not measured (#1856)"
+      },
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-flash-min-cand-r1"
+      },
+      "2rtx": {
+        "status": "pending",
+        "reason": "FP32 split serving qualification pending (#1856, #2101)"
+      }
     }
   ],
   "retired": [

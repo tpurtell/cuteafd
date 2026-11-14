@@ -19,12 +19,13 @@ pub(crate) const FAMILIES: &[(&str, &str, Option<&str>)] = &[
     ("kimi_k3", "serve-kimi", Some("kimi-golden")),
     ("step5", "serve-step5", Some("step5-golden")),
     ("muse_spark", "serve-muse", Some("muse-golden")),
+    ("minimax_m3", "serve-minimax", Some("minimax-golden")),
 ];
 
 #[derive(Debug, clap::Args)]
 #[command(disable_help_flag = true)]
 pub(crate) struct FamilyArgs {
-    /// Family id: deepseek_v41, deepseek_v4, glm5, glm5_flash, mimo_v2, qwen4, qwen3_5, kimi_k3, step5 or muse_spark.
+    /// Family id: deepseek_v41, deepseek_v4, glm5, glm5_flash, mimo_v2, qwen4, qwen3_5, kimi_k3, step5, muse_spark or minimax_m3.
     /// Detected from --snapshot's config.json when omitted.
     #[arg(long)]
     pub(crate) family: Option<String>,
@@ -110,12 +111,6 @@ pub(crate) fn resolve(kind: Kind, args: FamilyArgs) -> Result<Option<ResolvedFam
         }
         (None, None) => bail!("cuteafd {}: pass --snapshot DIR (the family is read from it) or --family ID", kind.name()),
     };
-    if family == "minimax_m3" {
-        anyhow::ensure!(kind == Kind::Golden,
-            "MiniMax serving remains refused until full-model qualification");
-        return Ok(Some(ResolvedFamily { argv: ["cuteafd", "minimax-golden"].into_iter()
-            .map(String::from).chain(args.args).collect(), view }));
-    }
     let Some(&(_, serve, golden)) = FAMILIES.iter().find(|(id, _, _)| *id == family) else {
         bail!("unknown family {family}; known: {}",
             FAMILIES.iter().map(|(id, ..)| *id).collect::<Vec<_>>().join(", "));
@@ -142,11 +137,11 @@ mod tests {
     }
 
     #[test]
-    fn minimax_qualifies_without_opening_serving() {
+    fn minimax_public_dispatch_preserves_family_arguments() {
         let golden = argv(Kind::Golden, args(Some("minimax_m3"), &["--nll"])).unwrap().unwrap();
         assert_eq!(golden, ["cuteafd", "minimax-golden", "--nll"]);
-        assert!(argv(Kind::Serve, args(Some("minimax_m3"), &[])).unwrap_err()
-            .to_string().contains("serving remains refused"));
+        let serve = argv(Kind::Serve, args(Some("minimax_m3"), &["--device", "1"])).unwrap().unwrap();
+        assert_eq!(serve, ["cuteafd", "serve-minimax", "--device", "1"]);
     }
 
     #[test]

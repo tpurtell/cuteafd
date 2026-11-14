@@ -146,6 +146,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         expert_usage: usage_enabled, resident_weight_limit: options.resident_weights }, &samples, options.onboard)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &admitted.solved.served_context().to_string());
+    publish_deployment(options.device, options.peers);
     let config = TcpTransportConfig::default();
     let endpoint = SparkEndpoint { ring_depth: None, capacity: capacity.prefill.rows,
         ingress: SparkIngress::Bf16, partial_reply_bytes: None };
@@ -220,6 +221,14 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         admission_free: samples.iter().map(|sample| sample.free).collect(), host_prefix })
 }
 
+fn publish_deployment(device: i32, peers: &[SocketAddr]) {
+    // Hardware reporting reads the admitted endpoint order, not launch inventory
+    // or a hidden command's absent public-family argument capture.
+    cuteafd_bench::context::ResolvedSettings::default()
+        .value("peers", peers.iter().map(ToString::to_string).collect::<Vec<_>>().join(","))
+        .value("device", device).publish();
+}
+
 fn publish_provenance(native_lib: &Path, manifest: &Path, runtime: &RuntimeInventory,
     admitted: &AdmittedMiniMax, spark_world: usize, sequences: u64) -> Result<()> {
     use sha2::{Digest, Sha256};
@@ -247,6 +256,23 @@ fn publish_provenance(native_lib: &Path, manifest: &Path, runtime: &RuntimeInven
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admitted_peer_order_reaches_benchmark_hardware_metadata() -> Result<()> {
+        let peers = ["192.0.2.3:19441".parse()?, "192.0.2.1:19441".parse()?, "192.0.2.2:19441".parse()?];
+        let (_, settings) = cuteafd_bench::context::capture_resolved(|| publish_deployment(1, &peers));
+        let mut context = cuteafd_bench::context::ServerContext::default();
+        settings.apply(&mut context);
+        let hardware = cuteafd_bench::server::hardware(&context.settings);
+        assert_eq!(hardware.sparks.len(), peers.len());
+        for (rank, spark) in hardware.sparks.iter().enumerate() {
+            assert_eq!(spark.rank as usize, rank);
+            assert_eq!(spark.address, peers[rank].ip().to_string());
+        }
+        assert!(context.settings.iter().any(|setting| setting.name == "device"
+            && setting.value.as_deref() == Some("1") && setting.source == "resolved"));
+        Ok(())
+    }
 
     #[test]
     fn process_geometry_refuses_a_conflicting_family_without_replacement() -> Result<()> {

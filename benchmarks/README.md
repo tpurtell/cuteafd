@@ -406,6 +406,11 @@ historical recipe; new release launches use the v5 matrix.
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 2× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-2rtx-4spark/report.svg)
 - 2026-10-02 · Release smoke · XiaomiMiMo/MiMo-V2-Flash · 1× RTX PRO 6000 @ 325 W + 4× DGX Spark · build v0.1.0 · [report](mimo_v2/2026-10-02-smoke-mimo-v2-flash-1rtx-4spark/report.svg)
 
+## minimax_m3
+
+- 2026-11-14 · Release smoke · MiniMaxAI/MiniMax-M3.1-Flash · 1× RTX PRO 6000 @ gpu-powerd 435 W (425–450) + 3× DGX Spark · build 3a70a37689dd · [report](minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-1rtx-3spark-minimax-flash-min-cand-r1/report.svg)
+- 2026-11-14 · Custom · MiniMaxAI/MiniMax-M3.1-Flash · 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 3× DGX Spark · build 3a70a37689dd · [report](minimax_m3/2026-11-14-custom-minimax-m3-1-flash-1rtx-3spark-minimax-flash-min-cand-r1/report.svg)
+
 ## Mistral Large 4
 
 - 2026-11-10 · Release smoke · wrldsuksgo2mars/Mistral-Large-4-EXL3-K4-Core-K6-HQA · 2× RTX PRO 6000 @ gpu-powerd 450/450 W (300–550) + 6× DGX Spark · build v5.0.0-rc1 · [report](mistral_large4/2026-11-10-smoke-mistral-large-4-exl3-k4-core-k6-hqa-2rtx-6spark-ml4-exl3-max-hqa/report.svg)

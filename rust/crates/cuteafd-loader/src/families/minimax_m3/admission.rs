@@ -43,8 +43,9 @@ impl Coordinator {
         match self {
             Self::Planned { cards } => shared::planned_budget(gpu as u8, cards[gpu].physical_bytes,
                 cards[gpu].logical_bytes, ArchContext::for_device("sm_120", cards[gpu].physical_bytes).context_bytes),
+            // The sampled occupancy is a named recipe owner; leave no second subtraction.
             Self::Measured { samples, .. } => shared::measured_budget(gpu as u8, samples[gpu].0, samples[gpu].1,
-                samples[gpu].2),
+                samples[gpu].0),
         }
     }
 }
@@ -161,6 +162,29 @@ pub fn spark_charges(checkpoint: &crate::plan::Checkpoint, catalog: &crate::Offi
     }).collect()
 }
 
+fn measured_graph_base(gpus: usize, sequences: u64) -> (u64, u64) {
+    if gpus == 1 && sequences == 16 {
+        (41_943_040, 2 << 20)
+    } else { (0, 0) }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    #[test]
+    fn measured_c16_whole_graph_base_has_one_standard_tail_and_no_arena_margin() {
+        let (base, tail) = measured_graph_base(1, 16);
+        assert_eq!((base, tail), (41_943_040, 2_097_152));
+        let resolved = crate::placement::graph_reserve::resolve(None, 0, false, base, tail).unwrap();
+        assert_eq!(resolved.base_bytes, 44_040_192);
+        assert_eq!(resolved.bytes, 88_080_384);
+        for shape in [(2, 16), (1, 64), (1, 3)] {
+            assert_eq!(measured_graph_base(shape.0, shape.1), (0, 0));
+        }
+    }
+}
+
 /// Gather every admitted owner fact into the shared recipe.
 pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     let cfg = request.cfg;
@@ -256,11 +280,19 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
             // The measured sample follows module loading: only what it has not seen.
             Coordinator::Measured { loaded_code, .. } => loaded_code.get(gpu).copied().unwrap_or(0),
         });
-        // No traced MiniMax prewarm layout yet: base zero, the shared runtime
-        // headroom is the whole canonical reserve (graph-cache stream, H11).
-        graph_reserve.push(crate::placement::graph_reserve::current(gpu, false, 0, 0)
+        // SM120 whole-rank C16 + TP3 trace e78eb75b0 (#1856): all reachable
+        // rows 1/4/16 prewarmed; C1/C16 decode had zero captures/evictions.
+        // Untraced rank/concurrency shapes borrow neither this base nor pins.
+        let (base, tail) = measured_graph_base(gpus, request.sequences);
+        graph_reserve.push(crate::placement::graph_reserve::current(gpu, false, base, tail)
             .map_err(|error| refused(format!("MiniMax graph reserve refused: {error}"), "Fix GPU_GRAPH_RESERVE."))?.bytes);
     }
+    let measured_context = match &request.coordinator {
+        Coordinator::Planned { .. } => vec![0; gpus],
+        Coordinator::Measured { samples, .. } => samples.iter().map(|&(total, _, free)|
+            total.checked_sub(free).ok_or_else(|| refused("MiniMax sampled free bytes exceed physical capacity",
+                "Provide a valid post-module CUDA memory sample."))).collect::<Result<Vec<_>, _>>()?,
+    };
     let mut budgets = (0..gpus).map(|gpu| request.coordinator.budget(gpu)).collect::<Vec<_>>();
     budgets.extend((0..ranks).map(|rank| shared::spark_budget(rank as u8, request.spark_bytes)));
     let (host_total, host_available) = request.host;
@@ -284,7 +316,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         context: Context::resolve(context, (request.context_tokens > 0).then_some(request.context_tokens)),
         maximum_pool_tokens, prefill: shape, sequences: request.sequences, targets, owners,
         manifest: request.manifest.clone(), routed: routed.clone(), expert_backings, local, spark, links,
-        spark_reply_formats: request.replies, drafter: None, vision: None, budgets, code, graph_reserve,
+        spark_reply_formats: request.replies, drafter: None, vision: None, budgets, code, measured_context, graph_reserve,
         head: request.head, host_prefix, device_sampling: true,
         expert_usage: request.expert_usage.then(|| cuteafd_core::expert_usage::Geometry { layers: cfg.layers,
             experts: cfg.experts, topk: cfg.topk, routed_layers: routed }),

@@ -706,9 +706,7 @@ fn attention_selectors_follow_declared_executor_capabilities() {
     for executor in families::EXECUTORS {
         // Auto is the recorded default on two peer GPUs (GLM 5.3: context, K3; GLM Flash: context,
         // #57; V4: context, #58), heads on one.
-        let recorded = if ["qwen4", "deepseek_v41", "kimi_k3", "step5"].contains(&executor.family) { AttentionPlacement::Layers }
-            else if ["glm5", "glm5_flash", "deepseek_v4"].contains(&executor.family) { AttentionPlacement::Context }
-            else { AttentionPlacement::Heads };
+        let recorded = executor.attention_default();
         assert_eq!(executor.check_attention(None, 2, true).unwrap(), recorded);
         assert_eq!(executor.check_attention(None, 1, false).unwrap(), AttentionPlacement::Heads);
         for mode in [AttentionPlacement::Context, AttentionPlacement::Layers] {
@@ -1052,8 +1050,9 @@ fn auto_cannot_flip_to_an_unqualified_executor_mode() {
     for executor in families::EXECUTORS {
         let mut req = request(2, 20 * GIB, 2, 4, Onboard::Auto);
         req.executor = executor;
-        let terminal = |mode| if !executor.runs(LayerMode::HeadSplit)
-            || (mode == AttentionPlacement::Layers && !executor.runs(S0)) {
+        let terminal = |mode| if (mode == AttentionPlacement::Layers && !executor.runs(S0))
+            || (mode == AttentionPlacement::Heads && !executor.runs(LayerMode::HeadSplit)
+                && !executor.runs(LayerMode::ContextSplit) && !executor.runs(S0)) {
             TerminalHome::AttentionOwner
         } else { TerminalHome::Replicated };
         req.hops.terminal = terminal(executor.attention_default());

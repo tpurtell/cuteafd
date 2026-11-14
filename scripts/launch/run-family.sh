@@ -1342,9 +1342,8 @@ if [[ "$family" == mistral_large4 ]]; then
   esac
 fi
 if [[ "$family" == minimax_m3 ]]; then
-  [[ -n "$wip_slot" ]] || release_die "MiniMax serving is WIP-only until full-model qualification (#1856)"
   [[ "$(get RTX_GPUS 1)" != 2 && "$(get COORDINATOR_GPUS)" != *,* ]] ||
-    release_die "MiniMax WIP currently qualifies one coordinator GPU only"
+    release_die "MiniMax currently qualifies one coordinator GPU only (#1856)"
 fi
 if [[ -n "$(get RTX_EXPERT_LAYERS)" ]]; then
   cfg[RTX_EXPERT_LAYERS]="$(release_onboard "$(get RTX_EXPERT_LAYERS)" "$model" "$revision")" || exit 2
