@@ -1,6 +1,7 @@
 #include "cuteafd_native.h"
 #include "xgrammar_v41_tools.h"
 #include "xgrammar_muse_tools.h"
+#include "xgrammar_minimax_tools.h"
 
 #include <dlpack/dlpack.h>
 #include <picojson.h>
@@ -70,7 +71,8 @@ void ExpandResponseSchemas(picojson::value& node) {
   if (type != object.end() && type->second.is<std::string>() &&
       (type->second.get<std::string>() == "ds41_json_schema" ||
        type->second.get<std::string>() == "ds41_tool_schema" ||
-       type->second.get<std::string>() == "muse_tool_schema")) {
+       type->second.get<std::string>() == "muse_tool_schema" ||
+       type->second.get<std::string>() == "minimax_tool_schema")) {
     auto schema = object.find("json_schema");
     auto strict = object.find("strict");
     if (schema == object.end() || strict == object.end() || !strict->second.is<bool>())
@@ -79,6 +81,8 @@ void ExpandResponseSchemas(picojson::value& node) {
     const auto& kind = type->second.get<std::string>();
     auto grammar = kind == "ds41_tool_schema"
         ? xgrammar::V41ToolSchemaToEBNF(schema->second, strict->second.get<bool>())
+        : kind == "minimax_tool_schema"
+        ? xgrammar::MiniMaxToolSchemaToEBNF(schema->second, strict->second.get<bool>())
         : kind == "muse_tool_schema"
         ? xgrammar::MuseToolSchemaToEBNF(schema->second, strict->second.get<bool>())
         : xgrammar::Grammar::FromJSONSchema(schema->second.serialize(false),

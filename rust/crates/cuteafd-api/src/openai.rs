@@ -2147,9 +2147,7 @@ mod tests {
 
     #[tokio::test]
     async fn minimax_rejects_unsupported_modes_before_admission() {
-        for extra in [json!({"thinking":{"type":"disabled"}}), json!({"tool_choice":"required"}),
-            json!({"tool_choice":{"type":"function","function":{"name":"lookup"}}}),
-            json!({"tool_decoding_assistance":true})] {
+        for extra in [json!({"thinking":{"type":"disabled"}})] {
             let (tx, mut rx) = mpsc::channel::<NativeRequest>(1);
             let profile = ModelProfile::new("minimax-test", ModelEncoding::MiniMax(Arc::new(minimax::fixtures::encoding())));
             let app = router_for_model(tx, NativeLimits::default(), Arc::new(Mutex::new(Value::Null)),
@@ -2164,7 +2162,7 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{}", String::from_utf8_lossy(&bytes));
             assert!(rx.try_recv().is_err());
             let error = String::from_utf8_lossy(&bytes);
-            assert!(error.contains("does not support disabling thinking") || error.contains("MiniMax constrained tool decoding not yet available"), "{error}");
+            assert!(error.contains("does not support disabling thinking"), "{error}");
         }
     }
 

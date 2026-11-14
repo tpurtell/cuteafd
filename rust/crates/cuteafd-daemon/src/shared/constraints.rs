@@ -402,6 +402,91 @@ mod tests {
         }
     }
 
+    /// CPU constrained decoding uses the actual checkpoint tokenizer and native
+    /// matcher mask. Every emitted call round-trips through the API's parser
+    /// and validator, including required/named/parallel and triggered tools.
+    #[tokio::test]
+    async fn minimax_native_constraints_round_trip_schema_arguments() {
+        use cuteafd_api::openai::{self, ModelEncoding, ModelProfile, NativeLimits, NativeRequest};
+        use axum::{body::Body, http::Request};
+        use serde_json::{json, Value};
+        use tower::ServiceExt;
+        let Some(path) = std::env::var_os("CUTEAFD_NATIVE_LIB") else { return };
+        let snapshot = std::path::Path::new("/mnt/sparknest/hf-home/hub/models--MiniMaxAI--MiniMax-M3.1-Flash/snapshots/54e4e69dfc452b1e94a426c24a4fdeeaa8e3ad5e");
+        if !snapshot.exists() { return; }
+        // SAFETY: the native DSO outlives its compiler, grammars and matchers.
+        let library = unsafe { NativeLibrary::load(path).unwrap() };
+        let encoding = Arc::new(openai::chat::minimax::MiniMaxEncoding::from_snapshot(snapshot).unwrap());
+        let tokenizer = cuteafd_loader::cached_tokenizer(snapshot).unwrap();
+        let n = "]<]minimax[>[";
+        let args = json!({"s":"001", "i":3, "f":1.25, "b":true, "cfg":{"code":"002"}, "rows":[1,2], "union":"007"});
+        let schema = json!({"type":"object", "properties":{
+            "s":{"type":"string"}, "i":{"anyOf":[{"type":"integer","maximum":7},{"type":"null"}]}, "f":{"type":"number"},
+            "b":{"type":"boolean"}, "cfg":{"type":"object","properties":{"code":{"type":"string"}},"required":["code"],"additionalProperties":false},
+            "rows":{"type":"array","items":{"type":"integer"}}, "union":{"type":["string","integer"]},
+            "nil":{"type":"null"}}, "required":["s","i","f","b","cfg","rows","union"],"additionalProperties":false});
+        let xml = format!("{n}<s>001{n}</s>{n}<i>3{n}</i>{n}<f>1.25{n}</f>{n}<b>true{n}</b>{n}<cfg>{n}<code>002{n}</code>{n}</cfg>{n}<rows>{n}<item>1{n}</item>{n}<item>2{n}</item>{n}</rows>{n}<union>007{n}</union>");
+        for (choice, assisted, parallel, reasoning) in [
+            (json!("required"), false, false, "<mm:think>Plan</mm:think>"),
+            (json!({"type":"function","function":{"name":"lookup"}}), false, false, ""),
+            (json!("auto"), true, true, "</mm:think>Checking."),
+        ] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<NativeRequest>(1);
+            let profile = ModelProfile::new("minimax-native", ModelEncoding::MiniMax(encoding.clone()));
+            let app = openai::router_for_model(tx, NativeLimits::default(), Arc::new(std::sync::Mutex::new(Value::Null)),
+                std::time::Duration::from_secs(25), openai::ConsoleHub::disabled(), profile);
+            let body = json!({"model":"minimax-native","messages":[{"role":"user","content":"Look it up"}],
+                "tool_choice":choice,"tool_decoding_assistance":assisted,"parallel_tool_calls":parallel,
+                "tools":[{"type":"function","function":{"name":"lookup","strict":true,"parameters":schema}}]});
+            let task = tokio::spawn(async move { app.oneshot(Request::post("/v1/chat/completions")
+                .header("content-type","application/json").body(Body::from(body.to_string())).unwrap()).await.unwrap() });
+            let request = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await.unwrap().unwrap();
+            let spec = request.constraint.as_ref().unwrap();
+            assert!(spec.0.contains("minimax_tool_schema") && !spec.0.contains("style"));
+            let invoke = format!("{n}<invoke name=\"lookup\">{xml}{n}</invoke>");
+            let calls = if parallel { format!("{invoke}\n{invoke}") } else { invoke };
+            let wire = format!("{reasoning}{n}<tool_call>\n{calls}\n{n}</tool_call>");
+            let mut compiler = Compiler::with_vocab(&library, snapshot.join("tokenizer.json"), 200064, vec![200020]);
+            let mut state = compiler.matcher(spec).unwrap();
+            let mut generated = Vec::new();
+            // Deterministic candidate logits: prefer the reference token if legal,
+            // otherwise fail. This exercises exactly the serving mask/commit path.
+            for token in tokenizer.encode_ids(&wire).unwrap() {
+                if let Some(mask) = state.mask().unwrap() {
+                    assert_ne!(mask[token as usize / 32] & (1 << (token % 32)), 0, "masked reference token {token}");
+                }
+                state.accept(token).unwrap();
+                generated.push(token);
+            }
+            assert!(state.matcher.is_completed().unwrap());
+            state.accept(200020).unwrap();
+            let decoded = tokenizer.decode_ids(&generated, false).unwrap().text;
+            assert_eq!(decoded, wire);
+            let mut invalid = compiler.matcher(spec).unwrap();
+            assert!(tokenizer.encode_ids(&wire.replace("<i>3", "<i>9")).unwrap().into_iter().any(|id| invalid.accept(id).is_err()));
+            let mut wrong_name = compiler.matcher(spec).unwrap();
+            assert!(tokenizer.encode_ids(&wire.replace("name=\"lookup\"", "name=\"other\"")).unwrap().into_iter().any(|id| wrong_name.accept(id).is_err()));
+            request.events.send(Ok(openai::InferenceChunk::Ready { system_fingerprint:None,
+                prompt_usage:openai::PromptUsage {prompt_tokens:10,prompt_cache_hit_tokens:0} })).unwrap();
+            for ch in decoded.chars() {
+                request.events.send(Ok(openai::InferenceChunk::Text {content:ch.to_string(),content_tokens:1})).unwrap();
+            }
+            request.events.send(Ok(openai::InferenceChunk::Finish {finish_reason:openai::InferenceFinishReason::Stop})).unwrap();
+            let response = task.await.unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+            assert_eq!(status, axum::http::StatusCode::OK, "{}", String::from_utf8_lossy(&bytes));
+            let result: Value = serde_json::from_slice(&bytes).unwrap();
+            let calls = result["choices"][0]["message"]["tool_calls"].as_array().unwrap();
+            assert_eq!(calls.len(), if parallel {2} else {1});
+            for call in calls {
+                let value: Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+                assert_eq!(value, args);
+                // HTTP success already passed the API strict JSON-schema validator.
+            }
+        }
+    }
+
     /// Mistral: optional token-delimited `[THINK]` block, then an answer or back-to-back
     /// `[TOOL_CALLS]NAME[ARGS]{json}` calls closed by the JSON object, compiled natively.
     #[tokio::test]

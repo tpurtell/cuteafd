@@ -129,16 +129,75 @@ fn optional_reasoning_constraint_uses_native_minimax_tokens() {
 }
 
 #[test]
-fn strict_tool_decoding_refuses_until_a_native_xml_grammar_lands() {
+fn strict_tool_decoding_uses_native_recursive_xml_grammar() {
     use crate::openai::tools::{ToolConstraints, ToolSyntax};
     use deepseek_recipe_core::tools::ToolChoice;
     let mut tool = lookup();
     assert!(ToolConstraints::new(&[tool.clone()], ToolChoice::Auto, false, true, false,
         ToolSyntax::MiniMaxXml).unwrap().unwrap().format.is_none());
     tool.strict = Some(true);
-    let error = ToolConstraints::new(&[tool], ToolChoice::Auto, false, true, false,
-        ToolSyntax::MiniMaxXml).err().unwrap();
-    assert!(error.to_string().contains("MiniMax constrained tool decoding not yet available"));
+    let constraints = ToolConstraints::new(&[tool.clone()], ToolChoice::Auto, false, true, false,
+        ToolSyntax::MiniMaxXml).unwrap().unwrap();
+    let grammar = constraints.format.unwrap().to_string();
+    assert!(grammar.contains("minimax_tool_schema"));
+    assert!(!grammar.contains("muse_tool_schema") && !grammar.contains("style"));
+    tool.strict = Some(false);
+    let assisted = ToolConstraints::new(&[tool.clone()], ToolChoice::Auto, false, true, true,
+        ToolSyntax::MiniMaxXml).unwrap().unwrap();
+    let format = assisted.format.unwrap();
+    assert_eq!(format["content"]["tags"][0]["content"]["json_schema"], tool.parameters,
+        "MiniMax keeps declared types even for non-strict assistance");
+    assert_eq!(assisted.triggered.unwrap()["triggers"][0], CALL_OPEN);
+}
+
+#[test]
+fn coding_agent_optional_nullable_schema_is_constrained_and_oneof_falls_back() {
+    use crate::openai::tools::{ToolConstraints, ToolSyntax};
+    use deepseek_recipe_core::tools::ToolChoice;
+    let mut tool = lookup();
+    tool.parameters = json!({"type":"object", "properties":{"command":{"type":"string"},
+        "timeout_ms":{"anyOf":[{"type":"integer"},{"type":"null"}]}},"required":["command","timeout_ms"]});
+    let supported = ToolConstraints::new(&[tool.clone()], ToolChoice::Auto, false, true, true,
+        ToolSyntax::MiniMaxXml).unwrap().unwrap();
+    assert!(supported.format.unwrap().to_string().contains("minimax_tool_schema"));
+    tool.parameters["properties"]["timeout_ms"] = json!({"oneOf":[{"type":"integer"},{"type":"null"}]});
+    let fallback = ToolConstraints::new(&[tool.clone()], ToolChoice::Auto, false, true, true,
+        ToolSyntax::MiniMaxXml).unwrap().unwrap();
+    assert!(fallback.format.is_none() && fallback.triggered.is_none());
+    let required = ToolConstraints::new(&[tool], ToolChoice::Auto, true, true, true,
+        ToolSyntax::MiniMaxXml).unwrap().unwrap();
+    assert!(required.format.unwrap().to_string().contains("oneOf"), "native build clearly refuses required unsupported schemas");
+}
+
+#[test]
+fn tuple_and_inferred_container_types_round_trip_without_stringification() {
+    let n = NAMESPACE;
+    let tool = ToolDefinition { name:"lookup".into(), description:None, strict:None,
+        parameters:json!({"type":"object", "properties":{
+            "v":{"type":"array", "prefixItems":[{"type":"integer"},{"type":"boolean"}],"items":{"type":"string"}},
+            "o":{"properties":{}}, "a":{"items":{"type":"integer"}}}}) };
+    let wire = format!("{CALL_OPEN}{n}<invoke name=\"lookup\">{n}<v>{n}<item>1{n}</item>{n}<item>true{n}</item>{n}<item>002{n}</item>{n}</v>{n}<o>{n}</o>{n}<a>{n}</a>{n}</invoke>{CALL_CLOSE}");
+    for split in wire.char_indices().map(|(i, _)| i).chain([wire.len()]) {
+        let mut parser = MiniMaxOutputParser::new(MiniMaxParserOptions { tools:Some(vec![tool.clone()]),stop_sequences:vec![] });
+        let mut chunks = parser.push(&wire[..split]);
+        chunks.extend(parser.push(&wire[split..]));
+        chunks.extend(parser.finish());
+        assert_eq!(parser.tool_calls(), 1);
+        let call = chunks.into_iter().find_map(|chunk| match chunk {
+            OutputChunk::ToolCall {arguments,..} => Some(serde_json::from_str::<Value>(&arguments).unwrap()), _ => None,
+        }).unwrap();
+        assert_eq!(call, json!({"v":[1,true,"002"],"o":{},"a":[]}));
+    }
+}
+
+#[test]
+fn optional_assistance_falls_back_for_unsupported_assertion_siblings() {
+    use crate::openai::tools::{ToolConstraints,ToolSyntax};
+    use deepseek_recipe_core::tools::ToolChoice;
+    let mut tool = lookup();
+    tool.parameters = json!({"type":"object","properties":{"mode":{"type":"string","enum":["yes","no"],"pattern":"^yes$"}}});
+    assert!(ToolConstraints::new(&[tool], ToolChoice::Auto,false,true,true,ToolSyntax::MiniMaxXml)
+        .unwrap().unwrap().format.is_none());
 }
 
 #[test]

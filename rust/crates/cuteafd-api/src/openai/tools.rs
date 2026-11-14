@@ -74,6 +74,58 @@ pub(super) fn muse_attribute(name: &str) -> String {
         .replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// Optional non-strict assistance may fall back to native parsing for schema
+/// forms the recursive XML grammar cannot represent. Other families widen a
+/// non-strict schema to an unrestricted object; MiniMax cannot pair arbitrary
+/// additional XML names, so it keeps the declaration but omits that grammar.
+fn minimax_schema_supported(schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else { return schema == &Value::Bool(true) };
+    if ["oneOf", "allOf", "patternProperties", "propertyNames", "dependentRequired", "dependentSchemas",
+        "if", "then", "else", "not", "contains", "minContains", "maxContains", "uniqueItems", "multipleOf", "unevaluatedProperties"]
+        .iter().any(|key| object.contains_key(*key)) { return false; }
+    for primary in ["$ref", "anyOf", "enum", "const"] {
+        if !object.contains_key(primary) { continue; }
+        if object.keys().any(|key| key != primary && !["title", "description", "default", "examples", "$defs", "definitions",
+            "$schema", "$id", "$comment", "deprecated"].contains(&key.as_str())
+            && !(key == "type" && matches!(primary, "enum" | "const"))) { return false; }
+        if let Some(kind) = object.get("type").and_then(Value::as_str) {
+            let matches = |value: &Value| match kind {
+                "string" => value.is_string(), "boolean" => value.is_boolean(), "number" => value.is_number(),
+                "integer" => value.as_f64().is_some_and(|n| n.fract() == 0.0), "null" => value.is_null(), _ => false,
+            };
+            if object.get("enum").and_then(Value::as_array).is_some_and(|values| values.iter().any(|v| !matches(v)))
+                || object.get("const").is_some_and(|v| !matches(v)) { return false; }
+        }
+    }
+    if object.get("type").and_then(Value::as_array).is_some_and(|types| types.iter().any(|t| t == "object" || t == "array")) {
+        return false;
+    }
+    if let Some(branches) = object.get("anyOf").and_then(Value::as_array) {
+        if branches.iter().any(|branch| branch.get("$ref").is_some() || matches!(branch["type"].as_str(), Some("object" | "array"))
+            || (branch["type"] != "null" && !minimax_schema_supported(branch))) { return false; }
+    }
+    if object.contains_key("format") && object.contains_key("pattern") { return false; }
+    if object.get("type").is_some_and(|v| v == "null") { return false; }
+    let properties = object.get("properties").and_then(Value::as_object);
+    if let Some(required) = object.get("required").and_then(Value::as_array) {
+        for name in required {
+            let Some(property) = name.as_str().and_then(|name| properties.and_then(|p| p.get(name))) else { return false };
+            if property["type"] == "null" || property.get("const") == Some(&Value::Null) { return false; }
+        }
+    }
+    if object.get("minProperties").and_then(Value::as_u64).is_some_and(|n| n as usize > properties.map_or(0, |p| p.len())) {
+        return false;
+    }
+    if properties.is_some_and(|p| p.values().any(|v| !minimax_schema_supported(v))) { return false; }
+    if object.get("items").is_some_and(|v| !minimax_schema_supported(v)) { return false; }
+    if object.get("prefixItems").and_then(Value::as_array).is_some_and(|items| items.iter().any(|v| !minimax_schema_supported(v))) { return false; }
+    // Refs, container constants and enums need native resolution/validation;
+    // optional non-strict mode conservatively leaves them unconstrained.
+    if object.contains_key("$ref") || object.get("const").is_some_and(|v| v.is_array() || v.is_object()) { return false; }
+    if object.get("enum").and_then(Value::as_array).is_some_and(|v| v.iter().any(|v| v.is_array() || v.is_object())) { return false; }
+    true
+}
+
 impl ToolConstraints {
     pub fn new(tools: &[ToolDefinition], choice: ToolChoice, required: bool, parallel: bool, assistance: bool,
         syntax: ToolSyntax) -> Result<Option<Self>> {
@@ -81,20 +133,22 @@ impl ToolConstraints {
         let mut validators = BTreeMap::new();
         let mut tags = Vec::new();
         let mut strict_requested = false;
+        let optional_minimax_fallback = syntax == ToolSyntax::MiniMaxXml && !required
+            && !tools.iter().any(|tool| tool.strict.unwrap_or(false))
+            && tools.iter().any(|tool| !minimax_schema_supported(&tool.parameters));
         for tool in tools {
             let strict = tool.strict.unwrap_or(false);
             strict_requested |= strict;
-            let schema = if strict { tool.parameters.clone() }
+            let schema = if strict || syntax == ToolSyntax::MiniMaxXml { tool.parameters.clone() }
                 else { json!({"type":"object", "additionalProperties":true}) };
             let validator = if strict { Some(super::constraints::compile_schema(&schema)
                 .with_context(|| format!("invalid parameters for tool {}", tool.name))?) } else { None };
             validators.insert(tool.name.clone(), validator);
-            if syntax == ToolSyntax::MiniMaxXml {
-                ensure!(!(assistance || strict || required), "MiniMax constrained tool decoding not yet available");
-                continue;
-            }
             tags.push(match syntax {
-                ToolSyntax::MiniMaxXml => unreachable!("MiniMax constraints refused before grammar construction"),
+                ToolSyntax::MiniMaxXml => json!({"type":"tag",
+                    "begin":format!("]<]minimax[>[<invoke name=\"{}\">", tool.name),
+                    "content":{"type":"minimax_tool_schema", "strict":true, "json_schema":schema},
+                    "end":"]<]minimax[>[</invoke>"}),
                 ToolSyntax::KimiXtml => json!({"type":"tag",
                     "begin":format!("<|open|>call tool=\"{}\" index=\"", tool.name.replace('&', "&amp;").replace('"', "&quot;")),
                     "content":{"type":"sequence", "elements":[
@@ -130,11 +184,19 @@ impl ToolConstraints {
                     "end":"</atem:invoke>\n</atem:function_calls>"}),
             });
         }
-        if !(assistance || strict_requested || required) {
+        if optional_minimax_fallback || !(assistance || strict_requested || required) {
             return Ok(Some(Self { required, format: None, triggered: None, parallel, validators }));
         }
         let (format, triggered) = match syntax {
-            ToolSyntax::MiniMaxXml => anyhow::bail!("MiniMax constrained tool decoding not yet available"),
+            ToolSyntax::MiniMaxXml => {
+                let calls = json!({"type":"tag", "begin":"]<]minimax[>[<tool_call>\n",
+                    "content":{"type":"tags_with_separator", "tags":tags, "separator":"\n",
+                        "at_least_one":true, "stop_after_first":!parallel},
+                    "end":"\n]<]minimax[>[</tool_call>"});
+                let triggered = json!({"type":"triggered_tags", "triggers":["]<]minimax[>[<tool_call>"],
+                    "tags":[calls.clone()], "at_least_one":false, "stop_after_first":true});
+                (calls, triggered)
+            }
             // Parallel calls are consecutive tool messages; the response
             // composition (`muse_response_constraint`) owns the optional branch.
             ToolSyntax::MuseAtem => {
