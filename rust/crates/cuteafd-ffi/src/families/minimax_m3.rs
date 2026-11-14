@@ -605,7 +605,7 @@ mod tests {
                 .join(".cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json"));
         let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
         let entries = manifest["programs"].as_array().expect("installed programs array");
-        assert_eq!(entries.len(), 1742);
+        assert_eq!(entries.len(), 1746);
         let dense_slices = [
             "exlr8_dense_mxfp8_k6144_n4096_s1_a8",
             "exlr8_dense_mxfp8_k6144_n256_s1_a8",
@@ -621,6 +621,23 @@ mod tests {
             assert_eq!(selected.len(), 1, "missing or duplicate rank-local dense stem {name}");
             assert_eq!(selected[0]["family"], "minimax");
             assert_eq!(selected[0]["op"], if name.contains("_quant_") { "dense_mxfp8_quant" } else { "dense_mxfp8" });
+        }
+        // Inkling 2 Small attention: exactly these four stems, appended after every other program.
+        let inkling2 = [
+            "inkling2_local_attention_decode_m64",
+            "inkling2_local_attention_prefill_m4096",
+            "inkling2_global_attention_decode_m64",
+            "inkling2_global_attention_prefill_m4096",
+        ];
+        let installed = entries.iter().filter(|entry| entry["family"] == "inkling2"
+            || entry["name"].as_str().is_some_and(|name| name.starts_with("inkling2")))
+            .map(|entry| entry["name"].as_str().expect("installed program name")).collect::<Vec<_>>();
+        assert_eq!(installed, inkling2);
+        assert_eq!(entries[entries.len() - inkling2.len()..].iter()
+            .map(|entry| entry["name"].as_str().unwrap()).collect::<Vec<_>>(), inkling2);
+        for entry in &entries[entries.len() - inkling2.len()..] {
+            assert_eq!(entry["family"], "inkling2");
+            assert_eq!(entry["op"], "attention");
         }
         let mut partition = Vec::new();
         for entry in entries {
@@ -668,11 +685,11 @@ mod tests {
         let library = fixture.load()?;
         fixture.register_programs(&library, entries)?;
         let programs = library.programs()?.with_manifest(&path)?;
-        assert_eq!(programs.names().count(), 1742);
+        assert_eq!(programs.names().count(), 1746);
         for entry in entries {
             assert!(programs.contains(entry["name"].as_str().unwrap()));
         }
-        println!("validated 1742 installed stems; MiniMax: 8 MSA, 10 Producer, 4 Forward, 1 gather");
+        println!("validated 1746 installed stems; MiniMax: 8 MSA, 10 Producer, 4 Forward, 1 gather");
         Ok(())
     }
 

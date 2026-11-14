@@ -233,7 +233,7 @@ wip_native_key() {
     printf 'image %s\n' "${CUTEAFD_WIP_DEV_IMAGE_ID:?the native cache needs the dev image ID}"
     # Every scope switch that reaches CMake or an exporter.
     env | grep -E '^CUTEAFD_WIP_[A-Z0-9_]+=' |
-      grep -vE '^CUTEAFD_WIP_(KIMIK3|MUSE|ML4)_AOT=OFF$' |
+      grep -vE '^CUTEAFD_WIP_(KIMIK3|MUSE|ML4|INKLING2)_AOT=OFF$' |
       grep -vE '^CUTEAFD_WIP_(CARGO_FEATURES|EXPORT_LOCKS|EXPORT_LOCK_FILES|HOST_EXPORT_TURN|SEED_WAIT_S|EXPORT_WAIT_S|NATIVE_STORE|NATIVE_CACHE|EXPORT_CACHE|NATIVE_REQUIRE_HIT|DEV_IMAGE_ID)=' |
       LC_ALL=C sort
     printf 'audio %s exl3 %s nvfp4 %s coordinator_aot %s xgrammar %s v41 %s %s %s vision %s\n' "$audio_aot" "$exl3_aot" "$nvfp4_aot" \
@@ -342,6 +342,7 @@ cmake \
   -DCUTEAFD_ENABLE_MUSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_MUSE_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_ML4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_ML4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_MINIMAX_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_MINIMAX_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_INKLING2_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_WIP_INKLING2_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="$exlr8_aot" \
   -DCUTEAFD_EXLR8_FAMILIES="${CUTEAFD_WIP_EXLR8_FAMILIES:-}" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$v41_coordinator_aot" \
@@ -412,7 +413,7 @@ for wip_family in "${wip_fp8_list[@]}"; do
     step5:bf16) wip_package="fp8-step5-bf16-weights" ;;
     step5:nvfp4) wip_package="fp8-step5-nvfp4a4" ;;
     # ModelOpt NVFP4 calibrated W4A4 share the fp8_moe programs.
-    *:nvfp4|*:nvfp4a4) wip_package="fp8-${wip_family%%:*}-${wip_family#*:}" ;;
+    *:nvfp4|*:nvfp4a4|*:mxfp8) wip_package="fp8-${wip_family%%:*}-${wip_family#*:}" ;;
     *) continue ;;
   esac
   mkdir -p "$output_dir/fp8"
@@ -502,7 +503,7 @@ fi
 # optional package flags use that same codec table.
 if ((${native_hit:-0})); then
   :
-elif [[ ( "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF};${CUTEAFD_WIP_KIMIK3_AOT:-OFF};${CUTEAFD_WIP_MUSE_AOT:-OFF};${CUTEAFD_WIP_ML4_AOT:-OFF};${CUTEAFD_WIP_MINIMAX_AOT:-OFF}" == *ON* ) || "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON \
+elif [[ ( "$role" == coordinator && "${CUTEAFD_WIP_DSV4_AOT:-OFF};${CUTEAFD_WIP_GLM_AOT:-OFF};${CUTEAFD_WIP_MIMO_AOT:-OFF};${CUTEAFD_WIP_GLMF_AOT:-OFF};${CUTEAFD_WIP_QWEN4_AOT:-OFF};${CUTEAFD_WIP_QWEN_DENSE_AOT:-OFF};${CUTEAFD_WIP_STEP5_AOT:-OFF};${CUTEAFD_WIP_KIMIK3_AOT:-OFF};${CUTEAFD_WIP_MUSE_AOT:-OFF};${CUTEAFD_WIP_ML4_AOT:-OFF};${CUTEAFD_WIP_MINIMAX_AOT:-OFF};${CUTEAFD_WIP_INKLING2_AOT:-OFF}" == *ON* ) || "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON \
     || ( "$role" == expert && ( -n "${expert_families:-}${bf16_families:-}" || "${exl3_aot:-OFF}" == ON || "${v41_nvfp4_aot:-OFF}" == ON || "${v41_expert_aot:-OFF}" == ON ) ) ]]; then
   install -m 0644 "$build_dir/native/dsv4_programs/dsv4_programs.json" "$output_dir/PROGRAMS.json"
 else

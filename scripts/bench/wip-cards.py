@@ -2464,6 +2464,8 @@ def package_dir(scope):
         return 'fp8/fp8-' + family
     if fmt in ('nvfp4', 'nvfp4a4'):
         return f'fp8/fp8-{family}-nvfp4a4'
+    if fmt == 'mxfp8':
+        return f'fp8/fp8-{family}-mxfp8'
     if fmt.startswith('exl3-k'):
         return f'exl3/exl3-{family}-{fmt[5:]}'
     return None

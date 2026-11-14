@@ -275,6 +275,7 @@ cmake \
   -DCUTEAFD_ENABLE_MUSE_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_MUSE_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_ML4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_ML4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_MINIMAX_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_MINIMAX_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_INKLING2_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_INKLING2_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
   -DCUTEAFD_EXLR8_FAMILIES="${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \
@@ -333,7 +334,7 @@ for release_family in "${release_family_list[@]}"; do
     step5:bf16) release_package="fp8-step5-bf16-weights" ;;
     step5:nvfp4) release_package="fp8-step5-nvfp4a4" ;;
     # ModelOpt NVFP4 calibrated W4A4 share the fp8_moe programs.
-    *:nvfp4|*:nvfp4a4) release_package="fp8-${release_family%%:*}-${release_family#*:}" ;;
+    *:nvfp4|*:nvfp4a4|*:mxfp8) release_package="fp8-${release_family%%:*}-${release_family#*:}" ;;
     *) continue ;;
   esac
   # GLM 5.3 Flash's NVFP4 dense MLP runs on the coordinator only (fp8_moe.cmake
