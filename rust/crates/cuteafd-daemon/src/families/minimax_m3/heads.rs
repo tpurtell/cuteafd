@@ -145,6 +145,11 @@ impl<'a> Heads<'a> {
         })
     }
 
+    pub fn publish_routed(&self, units: [&UnitOwner<'a>; 2], bytes: usize) -> Result<()> {
+        routed_publication(|| units[0].join_boundary(),
+            || self.replicate(units, "routed", bytes), || units[1].join_boundary())
+    }
+
     /// The next paired reduction orders the receiving stream's last read before
     /// the same per-unit destination can be reused. No new peer planes exist.
     pub fn replicate(&self, units: [&UnitOwner<'a>; 2], plane: &str, bytes: usize) -> Result<()> {
@@ -154,9 +159,52 @@ impl<'a> Heads<'a> {
     }
 }
 
+fn routed_publication(ready: impl FnOnce() -> Result<()>, publish: impl FnOnce() -> Result<()>,
+    peer_ready: impl FnOnce() -> Result<()>) -> Result<()> {
+    ready()?;
+    publish()?;
+    peer_ready()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routed_ready_wait_precedes_replication_in_prefill_and_decode() -> Result<()> {
+        use std::cell::RefCell;
+        for path in ["prefill", "decode"] {
+            let events = RefCell::new(Vec::new());
+            routed_publication(|| { events.borrow_mut().push((0, "join-ready-wait")); Ok(()) },
+                || { events.borrow_mut().extend([(0, "routed-copy"), (0, "peer-signal"), (1, "peer-wait")]); Ok(()) },
+                || { events.borrow_mut().push((1, "join-ready")); Ok(()) })?;
+            assert_eq!(*events.borrow(), [(0, "join-ready-wait"), (0, "routed-copy"),
+                (0, "peer-signal"), (1, "peer-wait"), (1, "join-ready")], "{path}");
+        }
+        let source = include_str!("engine.rs");
+        let prefill = source.split_once("    fn join(&mut self, layer: usize, unit: &Unit)").unwrap().1
+            .split_once("    fn head(").unwrap().0;
+        let decode = source.split_once("    fn decode_heads(").unwrap().1
+            .split_once("    fn decode_split(").unwrap().0;
+        for body in [prefill, decode] {
+            assert!(body.contains("heads.publish_routed("));
+            assert!(!body.contains("heads.replicate([&a, &b], \"routed\""));
+        }
+        let layers = source.split_once("    fn meet(&self, storage:").unwrap().1
+            .split_once("    pub(crate) fn decode_stage(").unwrap().0;
+        assert!(layers.find("units[0].meet_ffn(").unwrap() < layers.find("self.routed(").unwrap());
+        let layers_decode = source.split_once("    pub(crate) fn decode_meet(").unwrap().1
+            .split_once("    fn release(").unwrap().0;
+        assert!(layers_decode.find("fold_boundary(shared)?").unwrap() < layers_decode.find("let work = ||").unwrap());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_routed_ready_wait_never_publishes_peer_data() {
+        let result = routed_publication(|| anyhow::bail!("ready failed"),
+            || panic!("copy before ready"), || panic!("peer before copy"));
+        assert_eq!(result.unwrap_err().to_string(), "ready failed");
+    }
 
     fn tag(layer: usize) -> Tag { Tag { unit: 0, layer, rows: 16, kind: Reduction::Attention } }
 

@@ -649,9 +649,7 @@ impl<F: FnMut(usize, Range<usize>, DeviceLogits) -> Result<()>> SlotArithmetic f
         if let Some(heads) = &self.storage.heads {
             let a = self.storage.ranks[0].prefill[unit.slot].borrow();
             let b = self.storage.ranks[1].prefill[unit.slot].borrow();
-            heads.replicate([&a, &b], "routed", unit.rows.len() * self.cfg.hidden * 2)?;
-            a.join_boundary()?;
-            b.join_boundary()?;
+            heads.publish_routed([&a, &b], unit.rows.len() * self.cfg.hidden * 2)?;
             let tag = super::heads::Tag { unit: unit.slot, layer, rows: unit.rows.len(),
                 kind: super::heads::Reduction::Ffn { shared: true } };
             heads.reduce(&self.storage.ranks, [&a, &b], [tag; 2])?;
@@ -1090,9 +1088,7 @@ impl<'a> ServingPrefill<'a> {
                 let a = storage.ranks[0].decode.borrow();
                 let b = storage.ranks[1].decode.borrow();
                 if shared {
-                    heads.replicate([&a, &b], "routed", rows * cfg.hidden * 2)?;
-                    a.join_boundary()?;
-                    b.join_boundary()?;
+                    heads.publish_routed([&a, &b], rows * cfg.hidden * 2)?;
                 }
                 let tag = super::heads::Tag { unit: usize::MAX, layer, rows, kind: super::heads::Reduction::Ffn { shared } };
                 heads.reduce(&storage.ranks, [&a, &b], [tag; 2])?;
