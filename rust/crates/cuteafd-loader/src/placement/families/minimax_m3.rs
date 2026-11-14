@@ -750,8 +750,7 @@ impl MiniMaxInputs {
             out.extend(producers.workspace_components(&format!("{prefix}.attention"), gpu as u8, Lifetime::TARGET, maximum)?);
         }
         if self.heads() {
-            let mut slot_rows = vec![decode_rows];
-            slot_rows.extend((0..self.prefill.waves).map(|_| rows));
+            let slot_rows = HeadsLayout::serialized_peer_rows(decode_rows, rows)?;
             out.extend(HeadsLayout::peer_components(gpu as u8, &slot_rows, false,
                 &format!("minimax.heads.peer.{gpu}"), maximum)?);
         }
