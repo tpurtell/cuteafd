@@ -8,3 +8,4 @@ pub(crate) mod mistral_large4;
 pub(crate) mod kimi_k3;
 pub(crate) mod kimi_k3_split;
 pub mod minimax_m3;
+pub mod inkling2;
