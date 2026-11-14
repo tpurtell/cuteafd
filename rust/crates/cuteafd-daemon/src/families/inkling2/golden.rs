@@ -96,7 +96,8 @@ fn run(args: GoldenArgs) -> Result<()> {
     let logits = head.project(&kernels, &owner, &weights, &cfg, rows, candidates)?;
     stream.drain()?;
     let mut bytes = vec![0u8; rows*cfg.unpadded_vocab_size*4];
-    device.run(|| library.copy_d2h(&mut bytes, raw(logits, bytes.len())?))?;
+    let download_bytes = bytes.len();
+    device.run(|| library.copy_d2h(&mut bytes, raw(logits, download_bytes)?))?;
     let values = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
     ensure!(values.iter().all(|v| v.is_finite()), "Inkling golden nonfinite logits");
     let mut nll = 0f64;
@@ -121,7 +122,16 @@ fn run(args: GoldenArgs) -> Result<()> {
         let rms = (square/norm.max(1e-30)).sqrt();
         let cosine = dot/(norm*actual_norm).sqrt().max(1e-30);
         ensure!(rms<=0.02 && cosine>=0.999, "Inkling partial logits fail RMS/cosine bar: {rms}/{cosine}");
-        serde_json::json!({"normalized_rms":rms,"cosine":cosine})
+        let mut reference_nll = 0f64;
+        for (row, &next) in expected.chunks_exact(cfg.unpadded_vocab_size*4).zip(&tokens[1..]) {
+            let row = row.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()) as f64).collect::<Vec<_>>();
+            let maximum = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            reference_nll += maximum + row.iter().map(|&v| (v-maximum).exp()).sum::<f64>().ln() - row[next as usize];
+        }
+        reference_nll /= rows as f64;
+        ensure!((nll-reference_nll).abs() <= 0.03, "Inkling partial NLL exceeds0.03 bar: {nll}/{reference_nll}");
+        serde_json::json!({"normalized_rms":rms,"cosine":cosine,"reference_nll":reference_nll,
+            "nll_delta":nll-reference_nll})
     } else { serde_json::Value::Null };
     std::fs::create_dir(&args.save_logits)?;
     std::fs::write(args.save_logits.join("logits.bin"), bytes)?;
