@@ -760,7 +760,6 @@ def test_deployment_wip_still_requires_matching_launch_family(tmp_path, family, 
 @pytest.mark.parametrize("keys,diagnostic", [
     ("SPARK_COUNT=1\n", "no Spark layout"),
     ("SPARK_COUNT=0\nEXPERT_BACKEND=spark\n", "no Spark layout"),
-    ("SPARK_COUNT=0\nRTX_GPUS=2\n", "two-RTX layer ranges are not qualified"),
     ("SPARK_COUNT=0\nVISION=rtx\n", "media execution is not qualified"),
     ("SPARK_COUNT=0\nEMBEDDING=host\n", "requires device token embedding"),
 ])
@@ -5578,3 +5577,29 @@ def test_glmf_auto_replay_records_follow_admitted_expert_world(
         assert serve[serve.index("--vision-peer-ranks") + 1] == str(vision_rank)
         assert "--peers" not in serve
 
+
+
+@pytest.mark.parametrize("attention", ["auto", "layers"])
+def test_dense_qwen_two_rtx_uses_native_layer_owners(tmp_path, attention):
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        f"SPARK_COUNT=0\nSPECULATOR=off\nRTX_GPUS=2\nCOORDINATOR_GPUS=0,1\nATTENTION_PLACEMENT={attention}\n",
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode == 0, result.stderr
+    launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
+    assert "--device 0 --split-device 1" in launch
+    assert "CUTEAFD_QWEN35_GRAPHS=1" in launch
+    assert "cuteafd expertd-native" not in result.stderr
+    plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line)
+    assert "--rtx 2" in plan and "--attention-placement layers" in plan
+
+
+@pytest.mark.parametrize("attention", ["heads", "context"])
+def test_dense_qwen_sharded_modes_name_unbuilt_native_exports(tmp_path, attention):
+    result = _family_launch_result(tmp_path, DENSE_CONFIG, "Qwen/Qwen3.5-9B",
+        f"SPARK_COUNT=0\nSPECULATOR=off\nRTX_GPUS=2\nCOORDINATOR_GPUS=0,1\nATTENTION_PLACEMENT={attention}\n",
+        extra_args=("--wip", "dense-test"),
+        encoder_plan={"placement_supported": True, "fits": True, "spark_ranks": 0})
+    assert result.returncode != 0
+    assert "unbuilt" in result.stderr and "exports" in result.stderr and "2133" in result.stderr
+    assert "serve-qwen35 --snapshot" not in result.stderr

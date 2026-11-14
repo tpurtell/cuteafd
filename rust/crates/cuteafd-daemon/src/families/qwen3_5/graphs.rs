@@ -105,35 +105,39 @@ impl DenseEngine<'_> {
     }
 
     pub(super) fn graph_layer(&self, index: usize, step: &Step) -> Result<()> {
-        let segment = || Blocks { programs: self.programs, admitted: &self.admitted,
-            cfg: &self.cfg, homes: &self.homes, bank: &self.bank, stream: self.stream.raw }
-            .run(index, &self.weights.layers[index], self.planes,
-                self.kv[index].as_ref().map(|allocation| allocation.buffer), step);
+        self.enter_layer(index, step.rows)?;
+        let rank = self.homes.layers[index].owner;
+        let segment = || self.owner_stream(rank).device.run(|| self.layer_blocks(index)
+            .run(index, &self.weights.layers[index], self.owner_planes(rank),
+                self.kv[index].as_ref().map(|allocation| allocation.buffer), step));
         if !self.graphs.enabled || !self.graphs.capture_ready.get() { return segment(); }
+        let stream = self.owner_stream(rank);
+        let _device = stream.device.enter()?;
+        let graphs = if rank == 0 { &self.graphs } else { &self.peer.as_ref().expect("admitted graph owner").graphs };
         let key = Key { segment: index, rows: step.rows, table_stride: step.table_stride, spec: step.speculative };
-        let library = self.stream.device.library;
-        if let Some(raw) = self.graphs.bank.borrow_mut().cached_launch(&key).map(|exec| exec.raw) {
+        let library = stream.device.library;
+        if let Some(raw) = graphs.bank.borrow_mut().cached_launch(&key).map(|exec| exec.raw) {
             // SAFETY: all captured pointers retain the same engine-owned backing.
-            return unsafe { crate::shared::decode_graph::launch(&library, raw, self.stream.raw) };
+            return unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw) };
         }
-        let pinned = qwen35_graphs::layout(&self.graphs.variant).is_some_and(|layout|
+        let pinned = qwen35_graphs::layout(&graphs.variant).is_some_and(|layout|
             layout.traced && layout.entries.iter().any(|entry|
                 entry.pin && entry.rows == key.rows && entry.table_stride == key.table_stride && entry.spec == key.spec));
-        let Some(ticket) = self.graphs.bank.borrow_mut().cache_ticket(&key, pinned, None) else {
+        let Some(ticket) = graphs.bank.borrow_mut().cache_ticket(&key, pinned, None) else {
             return segment();
         };
         // SAFETY: blocks only enqueue launches over persistent engine storage.
-        if let Err(error) = unsafe { crate::shared::decode_graph::begin_capture(&library, self.stream.raw, &ticket) } {
-            if self.graphs.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
+        if let Err(error) = unsafe { crate::shared::decode_graph::begin_capture(&library, stream.raw, &ticket) } {
+            if graphs.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
                 tracing::warn!(%error, "Dense Qwen capture unavailable; eager fallback");
             }
             return segment();
         }
         let captured = segment();
         // SAFETY: ends capture on the same stream even when enqueue failed.
-        let ended = unsafe { library.cuda_graph_end_capture_topology(self.stream.raw) };
+        let ended = unsafe { library.cuda_graph_end_capture_topology(stream.raw) };
         if let Err(error) = captured {
-            self.graphs.bank.borrow_mut().cache_ticket_failed(ticket, ended.as_ref().err().unwrap_or(&error));
+            graphs.bank.borrow_mut().cache_ticket_failed(ticket, ended.as_ref().err().unwrap_or(&error));
             if let Ok((raw, ..)) = ended {
                 // SAFETY: this executable has never been launched.
                 unsafe { let _ = library.cuda_graph_exec_destroy(raw); }
@@ -143,35 +147,40 @@ impl DenseEngine<'_> {
         let (raw, nodes, width, spans, inspection) = match ended {
             Ok(info) => info,
             Err(error) => {
-                if self.graphs.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
+                if graphs.bank.borrow_mut().cache_ticket_failed(ticket, &error) {
                     tracing::warn!(%error, "Dense Qwen instantiate unavailable; eager fallback");
                 }
                 return segment();
             }
         };
         // SAFETY: engine field order drains the stream, then drops graphs before backing.
-        let exec = unsafe { GraphOwner::new(library, self.stream.device.id, raw, ())? };
+        let exec = unsafe { GraphOwner::new(library, stream.device.id, raw, ())? };
         // Unknown topology or a singleton is not useful enough to retain.
         if inspection.is_some() || nodes < 2 {
             drop(exec);
             drop(ticket);
             return segment();
         }
-        self.graphs.bank.borrow_mut().cache_commit(key, exec, ticket, nodes as u64, width, spans);
+        graphs.bank.borrow_mut().cache_commit(key, exec, ticket, nodes as u64, width, spans);
         // SAFETY: successful insertion retains the executable until a drained boundary.
-        unsafe { crate::shared::decode_graph::launch(&library, raw, self.stream.raw) }
+        unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw) }
     }
 
     pub(super) fn graph_completed(&self) -> Result<()> {
-        if !self.graphs.bank.borrow().cache_needs_boundary() {
-            self.graphs.bank.borrow_mut().cache_tick();
+        let mut banks = vec![(self.stream.device.id, &self.graphs)];
+        banks.extend(self.peer.iter().map(|peer| (peer.stream.device.id, &peer.graphs)));
+        if !banks.iter().any(|(_, graphs)| graphs.bank.borrow().cache_needs_boundary()) {
+            for (_, graphs) in banks { graphs.bank.borrow_mut().cache_tick(); }
             return Ok(());
         }
-        self.stream.drain()?;
-        // SAFETY: the single target stream is drained; the bank owns no captured
-        // backing, and persistent weights/state/planes outlive every executable.
-        unsafe { device::observe_completed(self.stream.device.library, |visit|
-            visit(self.stream.device.id, "qwen3_5.segment", false, &mut *self.graphs.bank.borrow_mut())) }
+        self.drain()?;
+        // SAFETY: both streams are drained; all banks retain rank-local resources.
+        unsafe { device::observe_completed(self.stream.device.library, |visit| {
+            for (device, graphs) in &banks {
+                visit(*device, "qwen3_5.segment", false, &mut *graphs.bank.borrow_mut())?;
+            }
+            Ok(())
+        }) }
     }
 
     /// Qualification only: compare identical decode shapes without changing the
@@ -239,6 +248,7 @@ impl DenseEngine<'_> {
         if !self.graphs.enabled { return Ok(()); }
         let entries = qwen35_graphs::layout(&self.graphs.variant).map_or_else(Vec::new, |layout| layout.entries.clone());
         self.graphs.warming.set(true);
+        if let Some(peer) = &self.peer { peer.graphs.warming.set(true); }
         let result = (|| {
             let request = [crate::shared::speculation::target::VerifyRow { slot: 0, position: 0, token: Some(0) }];
             let plan = rows::Rows::new(&crate::shared::speculation::target::VerifyRequest {
@@ -247,8 +257,9 @@ impl DenseEngine<'_> {
             self.verify_rows(plan, 1, &[], true)?;
             self.verification.pending = None;
             self.reset_slot(0)?;
-            device::observe_device(self.stream.device.library, self.stream.device.id)?;
+            for id in self.devices() { device::observe_device(self.stream.device.library, id)?; }
             self.graphs.capture_ready.set(true);
+            if let Some(peer) = &self.peer { peer.graphs.capture_ready.set(true); }
             for Geometry { rows, table_stride, spec, .. } in entries {
                 if table_stride * 64 > self.cfg.max_context || rows > 64 { continue; }
                 let position = (table_stride - 1) * 64;
@@ -268,6 +279,7 @@ impl DenseEngine<'_> {
             Ok(())
         })();
         self.graphs.warming.set(false);
+        if let Some(peer) = &self.peer { peer.graphs.warming.set(false); }
         result
     }
 }

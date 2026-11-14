@@ -107,16 +107,23 @@ pub fn admit(request: Request, mut budgets: Vec<Budget>, facts: DenseFacts<'_>)
         return Err(Refusal::InvalidFact(
             "dense geometry or operation differs from allocation recipe".into()));
     }
-    let mut contract = facts.prepare(&request)?;
+    let contract = facts.prepare(&request)?;
+    admit_contract(request, std::mem::take(&mut budgets), contract)
+}
+
+pub(super) fn admit_contract(request: Request, mut budgets: Vec<Budget>, mut contract: Contract)
+    -> Result<ResolvedPlan, Refusal> {
     for budget in &mut budgets {
-        if budget.locations != [Location::coordinator(0)] { continue; }
+        let [location] = budget.locations.as_slice() else { continue; };
+        if !matches!(location.device, Device::Coordinator(_)) { continue; }
+        let location = *location;
         let Baseline::Sampled { free, source, .. } = &budget.baseline else { continue; };
         let occupied = budget.physical_bytes.checked_sub(*free)
             .ok_or_else(|| Refusal::InvalidFact("dense Qwen sample exceeds physical capacity".into()))?;
         if occupied > 0 {
             contract.components.push(Component { activation: Activation::always(),
                 bytes: ByteCurve::fixed(occupied, contract.maximum_pages),
-                kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(0),
+                kind: ComponentKind::Allowance(Allowance { location,
                     bytes: occupied, lifetime: Lifetime::RESIDENT, assumed: false,
                     source: crate::placement::sampled_baseline::source(&format!(
                         "Dense Qwen context and selected modules; {occupied} B occupied at the \

@@ -1280,3 +1280,36 @@ fn installed_kimi_tp1_automatic_plan_finishes_within_ten_seconds() {
     }
     eprintln!("real K6 TP1 automatic plan: {elapsed:?}");
 }
+
+
+#[test]
+fn installed_dense_qwen_one_and_two_rtx_publish_exact_native_owners() {
+    use cuteafd_loader::plan::{testing::BudgetedPlanInput, layout::LayoutOptions,
+        ExpertPlacement, MediaMode, PlanOptions};
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+    let hf = require_installed_hf_home("installed_dense_qwen_one_and_two_rtx_publish_exact_native_owners",
+        std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME"));
+    let programs = installed_example_programs(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_PROGRAMS").map(Into::into), &home);
+    let snapshot = require_installed_snapshot("installed dense Qwen", "Qwen/Qwen3.8-27B",
+        Some("1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"), &hf);
+    let input = BudgetedPlanInput::open(&snapshot).unwrap();
+    for ranks in [1, 2] {
+        let report = input.plan(&PlanOptions { placement: ExpertPlacement::Local,
+            vision: MediaMode::Off, audio: MediaMode::Off,
+            layout: Some(LayoutOptions { rtx_bytes: vec![95 << 30; ranks], head_split: ranks == 2,
+                concurrency: 16, native_mtp_layers: 0, host_cache_bytes: Some(0),
+                host_memory: Some((256 << 30, 256 << 30)), workspace_manifest: Some(programs.clone()),
+                ..Default::default() }), ..Default::default() }).unwrap();
+        assert!(report.executable(), "{}", cuteafd_loader::plan::render(&report));
+        let memory = report.memory_layout.as_ref().unwrap();
+        assert_eq!(memory.devices.len(), ranks);
+        assert_eq!(memory.devices.iter().flat_map(|device| &device.items)
+            .filter(|item| item.group == "weight arena").count(), ranks);
+        assert!(report.phase_ledger.as_ref().unwrap().phases.iter().all(|phase|
+            phase.owned + phase.opaque <= phase.available));
+        if ranks == 2 {
+            assert_eq!(report.attention_placement, cuteafd_loader::placement::AttentionPlacement::Layers);
+            assert!(memory.devices.iter().all(|device| device.items.iter().any(|item| item.group == "residual hops")));
+        }
+    }
+}

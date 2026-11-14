@@ -1632,6 +1632,7 @@ coordinator_gpu_count=auto
 if [[ "$split" != off ]]; then
   if [[ "$rtx_gpus" == 2 || "$split" == heads ]]; then coordinator_gpu_count=2
   elif [[ "$rtx_gpus" == 1 ]]; then coordinator_gpu_count=1
+  elif [[ "$family" == qwen3_5 && "$explicit_coordinator_gpus" != *,* ]]; then coordinator_gpu_count=1
   fi
 fi
 release_resolve_coordinator_gpus "$explicit_coordinator_gpus" "$coordinator_gpu_count"
@@ -2045,13 +2046,11 @@ explicit_split=0
 if [[ "$rtx_gpus" == 2 || "$explicit_coordinator_gpus" == *,* || "$split" == heads ]]; then
   explicit_split=1
 fi
-[[ "$family" != qwen3_5 || "$explicit_split" == 0 ]] ||
-  release_die "dense Qwen two-RTX layer ranges are not qualified"
 split_hint=""
 split_opt_in=""
 case "$family:$model_type" in
   deepseek_v4:*|glm5:*|glm5_flash:*|mimo_v2:mimo_v2|mimo_v2:mimo_v2_flash|kimi_k3:*|step5:*|muse_spark:*|minimax_m3:*) ;;
-  qwen4:*) ;; # Shared admission selects whole/TP2 experts and Spark fallback.
+  qwen4:*|qwen3_5:*) ;; # Shared admission selects contiguous whole-layer owners.
   mimo_v2:*) split_hint="add MiMo head-split attention/projection kernels for $model_type" ;;
   *) split_hint="add coordinator head-split kernels for $model_type" ;;
 esac
@@ -2069,6 +2068,9 @@ coordinator_uuids=("$RELEASE_COORDINATOR_GPU_UUID")
 head_split=0
 if [[ -n "$second" && "$split" != off ]]; then
   if [[ -z "$split_hint" ]]; then
+    if [[ "$family" == qwen3_5 ]]; then
+      attention_placement=layers
+    fi
     if [[ "$family" == qwen4 ]]; then
       [[ "$attention_placement" != heads ]] || release_die "Qwen dual owns whole layers; head-split attention is not implemented"
       attention_placement=layers
@@ -2082,7 +2084,7 @@ if [[ -n "$second" && "$split" != off ]]; then
 fi
 [[ "$tp2_dflash" != on || "$head_split" == 1 ]] ||
   release_die "TP2_DFLASH requires an active two-GPU target split"
-if [[ "$family" == qwen4 && "$attention_placement" == layers && "$head_split" != 1 ]]; then
+if [[ ( "$family" == qwen4 || "$family" == qwen3_5 ) && "$attention_placement" == layers && "$head_split" != 1 ]]; then
   release_die "Qwen whole-layer attention requires a coordinator pair"
 fi
 if [[ "$family" == deepseek_v4 ]]; then

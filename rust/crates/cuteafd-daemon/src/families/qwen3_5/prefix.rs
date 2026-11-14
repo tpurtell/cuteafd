@@ -45,13 +45,17 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
         ensure!(mark.bytes > 0 && !target.kv.iter().flatten().collect::<Vec<_>>().is_empty(),
             "dense prefix requires recurrent and full-attention layers");
         ensure!(target.prefix_arena.as_ref().map_or(0, |arena| arena.buffer.bytes)
+            + target.peer.as_ref().and_then(|peer| peer.prefix.as_ref()).map_or(0, |arena| arena.buffer.bytes)
             == target.prefix_marks * mark.bytes, "dense prefix marks differ from admission");
         let layout = FamilyLayout { page_rows: 64, pages: target.pool_tokens / 64,
             page_bytes: 64 * target.cfg.full_kv_bytes_per_token(target.kv_format),
             mark_bytes: mark.bytes, draft_bytes: 0, rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena, page_owners: Default::default() };
-        let copies = crate::shared::prefix::PrefixCopies::new(target.stream.device.library,
-            vec![vec![crate::shared::prefix::Reader { device: target.stream.device.id, stream: target.stream.raw }]])?;
+        let readers = (0..target.homes.gdn_layers.len()).map(|rank| {
+            let stream = target.owner_stream(rank);
+            vec![crate::shared::prefix::Reader { device: stream.device.id, stream: stream.raw }]
+        }).collect();
+        let copies = crate::shared::prefix::PrefixCopies::new(target.stream.device.library, readers)?;
         drop(target);
         Ok(Self { engine, layout, mark, drafter, mtp: None, copies })
     }
@@ -66,19 +70,24 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
 
     pub fn snapshot_owners(&self) -> Vec<Rc<Allocation<'a>>> {
         let target = self.engine.borrow();
-        target.kv.iter().flatten().cloned().chain(target.prefix_arena.iter().cloned()).collect()
+        target.kv.iter().flatten().cloned().chain(target.prefix_arena.iter().cloned())
+            .chain(target.peer.iter().flat_map(|peer| peer.prefix.iter().cloned())).collect()
     }
 
     fn state(target: &DenseEngine<'_>, slot: usize) -> Vec<CuteafdDeviceBuffer> {
-        (0..target.homes.gdn_layers[0]).flat_map(|ordinal| target.bank.slot_regions(ordinal, slot)).collect()
+        target.state_regions(slot)
     }
 
     fn mark_buffers(&self, slot: MarkSlot) -> Result<Vec<CuteafdDeviceBuffer>> {
         let target = self.engine.borrow();
         ensure!((slot.0 as usize) < target.prefix_marks, "dense prefix mark outside admitted arena");
-        let arena = target.prefix_arena.as_ref().context("dense prefix arena disabled")?;
-        self.mark.regions.iter().map(|&(_, offset, bytes)|
-            view(arena.buffer, slot.0 as usize * self.mark.bytes + offset, bytes)).collect()
+        self.mark.regions.iter().map(|&(owner, offset, bytes)| {
+            let (device, stride) = self.mark.owners[owner];
+            let arena = if device == target.stream.device.id { target.prefix_arena.as_ref() }
+                else { target.peer.as_ref().and_then(|peer| peer.prefix.as_ref()) }
+                .context("dense prefix arena disabled")?;
+            view(arena.buffer, slot.0 as usize * stride + offset, bytes)
+        }).collect()
     }
 
     fn move_mark(&self, mark: MarkSlot, state: usize, capture: bool) -> Result<()> {
@@ -86,7 +95,10 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
         let target = self.engine.borrow();
         ensure!(state < target.slots.len(), "dense prefix state outside admitted slots");
         let copies: Vec<_> = Self::state(&target, state).into_iter().zip(marks)
-            .map(|(live, saved)| if capture { (0, saved, live) } else { (0, live, saved) }).collect();
+            .map(|(live, saved)| {
+                let rank = usize::from(live.device_id != target.stream.device.id);
+                if capture { (rank, saved, live) } else { (rank, live, saved) }
+            }).collect();
         // SAFETY: admitted arena and live bank outlive the shared prefix cache's drain.
         unsafe { self.copies.copy_d2d(&copies) }
     }
@@ -101,7 +113,7 @@ impl<'e, 'a> DensePrefix<'e, 'a> {
 
 pub(crate) fn packed_state(engine: &RefCell<DenseEngine<'_>>, placement: &Placement) -> Result<Vec<u8>> {
     let target = engine.borrow();
-    target.stream.drain()?;
+    target.drain()?;
     let mut regions = DensePrefix::state(&target, placement.slot);
     let record = target.kv_format.record_bytes(target.cfg.kv_heads, target.cfg.head_dim);
     for (i, &page) in placement.units.iter().enumerate().take(placement.len.div_ceil(64)) {
@@ -128,7 +140,7 @@ pub(crate) fn check(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result
     let continuation = tokens.iter().copied().cycle().take(3).collect::<Vec<_>>();
     let state = || -> Result<Vec<Vec<u8>>> {
         let target = engine.borrow();
-        target.stream.drain()?;
+        target.drain()?;
         DensePrefix::state(&target, 0).into_iter().map(|region| {
             let mut bytes = vec![0; region.bytes];
             target.stream.device.library.copy_d2h(&mut bytes, region)?;
@@ -184,7 +196,7 @@ pub(crate) fn check_backend_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens:
     let boxed = |error: BoxError| anyhow::anyhow!("dense direct prefix check: {error}");
     let snapshot = |placement: &Placement| -> Result<Vec<Vec<u8>>> {
         let target = engine.borrow();
-        target.stream.drain()?;
+        target.drain()?;
         let mut regions = DensePrefix::state(&target, placement.slot);
         drop(target);
         for (index, &page) in placement.units.iter().enumerate().take(placement.len.div_ceil(64)) {
@@ -440,7 +452,9 @@ impl PrefixFamily for DensePrefix<'_, '_> {
     fn copy_rows(&self, copy: TailCopy) -> Result<(), BoxError> {
         let source = self.page_buffers(copy.from, copy.rows)?;
         let destination = self.page_buffers(copy.to, copy.rows)?;
-        let copies: Vec<_> = destination.into_iter().zip(source).map(|(dst, src)| (0, dst, src)).collect();
+        let primary = self.engine.borrow().stream.device.id;
+        let copies: Vec<_> = destination.into_iter().zip(source)
+            .map(|(dst, src)| (usize::from(dst.device_id != primary), dst, src)).collect();
         // SAFETY: shared pool owns both page views until this family drains.
         Ok(unsafe { self.copies.copy_d2d(&copies) }?)
     }

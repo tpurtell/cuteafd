@@ -94,7 +94,7 @@ impl Blocks<'_, '_> {
         step.validate()?;
         ensure!(self.cfg.attention.get(index) == Some(&layer.attention), "dense layer/checkpoint type mismatch");
         let home = self.homes.layers.get(index).ok_or_else(|| anyhow::anyhow!("dense layer has no state owner"))?;
-        ensure!(home.owner == 0 && self.homes.gdn_layers.len() == 1, "single-device dense block cannot use peer state");
+        ensure!(home.owner < self.homes.gdn_layers.len(), "dense block has no admitted state owner");
         let bytes = step.rows * self.cfg.hidden * 2;
         let query = step.rows * self.cfg.heads * self.cfg.head_dim * 2;
         for buffer in [p.residual, p.norm, p.delta] {

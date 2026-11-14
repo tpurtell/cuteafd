@@ -1,4 +1,4 @@
-//! Dense Qwen3.5/3.8: recognized header contract, not yet an executable family.
+//! Dense Qwen3.5/3.8 native whole-layer execution and shared admission.
 use crate::families::qwen::HybridAttention;
 use crate::families::qwen3_5::Qwen35Checkpoint;
 use crate::plan::{checkpoint::Checkpoint, family::*, format, names::indexed, spec::*};
@@ -37,7 +37,7 @@ impl Family for Qwen35 {
                 "Transformers 5.13.0 reference: GDN SiLU, full-attention sigmoid; output_gate_type=swish is not a GQA gate selector".into(),
                 format!("BF16 full KV {} bytes/token; exact FP32 GDN + BF16 convolution state {} bytes/sequence or retained mark; native context {} tokens",
                     cfg.full_kv_bytes_per_token(crate::families::qwen4::Qwen4KvCache::Bf16), cfg.recurrent_state_bytes(), cfg.max_context),
-                "Native single-GPU BF16 allocation planning is available with matching exports; serving remains unqualified, with BF16 KV and no captured graphs".into()],
+                "Native BF16/block-FP8 whole layers on one or two RTX ranks; exact owner-local KV/GDN, prefix marks and rank-local decode graphs. Head/context sharding needs native exports (#2133)".into()],
         };
         Ok(Box::new(Model { header, spec }))
     }
@@ -96,14 +96,18 @@ impl FamilyModel for Model {
     fn cache_geometry(&self, options: crate::serving_capacity::CacheOptions)
         -> Result<Option<crate::serving_capacity::FamilyCacheGeometry>, crate::serving_capacity::CacheGeometryError> {
         use crate::serving_capacity::*;
-        if options.coordinator_ranks != 1 {
-            return Err(CacheGeometryError::Unsupported { family: "qwen3_5", what: "dense target currently owns one GPU" });
+        if !(1..=2).contains(&options.coordinator_ranks) {
+            return Err(CacheGeometryError::Unsupported { family: "qwen3_5", what: "native whole-layer execution needs one or two RTX ranks" });
         }
         let cfg = &self.header.config;
         let buffers = crate::placement::families::qwen3_5::NativeBuffers::new(cfg, 0, 1, 0)
             .map_err(|_| CacheGeometryError::Overflow("dense native cache"))?;
         let state = buffers.mark_bytes as u64;
         let gdn = cfg.attention.iter().filter(|&&kind| kind == HybridAttention::Gdn).count() as u64;
+        if options.coordinator_ranks == 2 {
+            return Err(CacheGeometryError::Unsupported { family: "qwen3_5",
+                what: "whole-layer cache owners depend on the solved contiguous cut; see the per-rank phase ledger" });
+        }
         Ok(Some(FamilyCacheGeometry { logical_unit_rows: 64, placement: KvPlacement::SingleDevice,
             ranks: vec![RankCacheGeometry { persistent_unit_bytes: 64 * cfg.full_kv_bytes_per_token(options.dense_qwen_kv) as u64,
                 active_state_per_sequence_bytes: state, retained_mark_bytes: state,
@@ -124,8 +128,23 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     use cuteafd_core::memory_layout::{DeviceKind, DeviceLayout, MemoryLayout};
     let spark_vision = matches!(report.vision, crate::plan::MediaMode::Spark(Some(_)))
         || (matches!(report.vision, crate::plan::MediaMode::Spark(_)) && report.spark_ranks > 0);
-    ensure!(options.rtx_bytes.len() == 1 && (report.spark_ranks == 0 || spark_vision),
-        "dense Qwen currently requires one coordinator GPU and zero Sparks");
+    let ranks = options.rtx_bytes.len();
+    ensure!((1..=2).contains(&ranks) && (report.spark_ranks == 0 || spark_vision),
+        "dense Qwen needs one or two coordinator GPUs and zero expert Sparks");
+    if ranks == 1 && report.requested_attention == Some(crate::placement::AttentionPlacement::Layers) {
+        report.refuse_placement("dense Qwen layer ranges need two coordinator GPUs".into(),
+            "Select two RTX ranks or automatic single-rank placement.");
+        return Ok(MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![] });
+    }
+    if ranks == 2 {
+        if matches!(report.requested_attention, Some(crate::placement::AttentionPlacement::Heads | crate::placement::AttentionPlacement::Context)) {
+            let mode = report.requested_attention.expect("explicit attention");
+            report.refuse_placement(format!("dense Qwen {mode} attention is an unbuilt feature"),
+                "Add native half-head GDN, GQA producer/output and row-parallel dense FFN exports, sliced checkpoint operands, and shared peer reductions; context additionally needs owner-partitioned KV and shared softmax merge. Select layers for the native whole-layer executor; native sharding is tracked in #2133.");
+            return Ok(MemoryLayout { devices: vec![], pool_tokens: 0, waste: vec![], notes: vec![] });
+        }
+        report.attention_placement = crate::placement::AttentionPlacement::Layers;
+    }
     ensure!(!options.host_embedding, "dense Qwen requires device token embedding");
     ensure!((report.vision == crate::plan::MediaMode::Off || spark_vision)
         && report.audio == crate::plan::MediaMode::Off,
@@ -196,7 +215,14 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
     } else { drafter };
     let host = options.host_memory.map(Ok)
         .unwrap_or_else(crate::formats::mapped_preload::host_memory_before_process)?;
-    let budgets = qwen3_5::forecast_budgets(physical, capacity, set.module_bytes(), host)?;
+    let mut budgets = qwen3_5::forecast_budgets(physical, capacity, set.module_bytes(), host)?;
+    if ranks == 2 {
+        let mut peer = qwen3_5::forecast_budgets(ArchContext::for_device("sm_120", options.rtx_bytes[1]),
+            options.rtx_bytes[1], set.module_bytes(), host)?.remove(0);
+        peer.id = "rtx1".into();
+        peer.locations = vec![Location::coordinator(1)];
+        budgets.insert(1, peer);
+    }
     let operation = Operation::Serving;
     let onboard = match options.onboard.unwrap_or_default().resolve(0) {
         Onboard::Auto => Pin::Auto,
@@ -226,20 +252,45 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         serving: Some(ServingFacts { capacity: qwen3_5::VERIFY_ROWS as u32, device_sampling: true }),
         host_prefix: crate::placement::planner::serving::HostPrefixOwners {
             quota_bytes: quota, chunk_bytes: chunk.min(quota) }, verify_check: false };
-    let plan = qwen3_5::admit(request, budgets, facts)?;
+    let plan = if ranks == 2 { qwen3_5::dual::admit_dual(request, budgets, facts)?.plan }
+        else { qwen3_5::admit(request, budgets, facts)? };
     let pool_tokens = plan.pool_tokens;
-    let items = plan.items(Location::coordinator(0))?;
+    if ranks == 2 {
+        use crate::serving_capacity::{FamilyCacheGeometry, RankCacheGeometry, KvPlacement};
+        let owner_geometry = (0..2).map(|rank| {
+            let kinds = cfg.attention.iter().zip(&plan.decisions.attention).filter_map(|(&kind, &mode)|
+                matches!(mode, crate::placement::LayerMode::Whole { gpu, .. } if gpu == rank).then_some(kind)).collect::<Vec<_>>();
+            let recurrent = kinds.iter().filter(|&&kind| kind == HybridAttention::Gdn).count() as u64;
+            let full = kinds.len() as u64 - recurrent;
+            RankCacheGeometry { persistent_unit_bytes: 64 * full * record_bytes,
+                active_state_per_sequence_bytes: recurrent * buffers.state_per_layer as u64,
+                retained_mark_bytes: recurrent * buffers.state_per_layer as u64,
+                speculative_replay_bytes: recurrent * buffers.replay_per_layer as u64, ..Default::default() }
+        }).collect();
+        if let Some(cache) = report.cache_requirements.as_mut() {
+            cache.target_only_layouts.retain(|layout| layout.ranks.len() != 2);
+            cache.target_only_layouts.push(FamilyCacheGeometry { logical_unit_rows: 64,
+                placement: KvPlacement::PartitionedLayers, ranks: owner_geometry });
+            cache.unavailable_layouts.retain(|failure| failure.coordinator_ranks != 2);
+        }
+    }
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&plan));
     report.host_budget_bytes = quota;
     let mut notes = vec![
-        format!("Native dense admission: {} KV, exact GDN state, bounded decode/verify graph reserve; text-only single GPU; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv),
+        format!("Native dense admission: {} KV, exact GDN state, bounded decode/verify graph reserve; text-only native whole layers; fixed slots and prefix marks do not grow when the pool cap frees memory", options.dense_qwen_kv),
         format!("shared planner: pool {pool_tokens} tokens ({} pages of {} rows), {} prefill row unit, {} lanes, {} resident weight bytes, {} physical owners",
             pool_tokens / qwen3_5::PAGE_ROWS, qwen3_5::PAGE_ROWS, prefill.unit_rows, prefill.waves,
             plan.facts.resident_weights.iter().map(|owner| owner.weights.0).sum::<u64>(),
             plan.facts.allocations.iter().filter(|owner| owner.view.is_none()).count()),
     ];
-    let mut devices = vec![DeviceLayout { kind: DeviceKind::Rtx, index: 0,
-        capacity_bytes: capacity.saturating_sub(crate::placement::reserve::gpu("qwen3_5")), worker_budget_bytes: 0, items, kv_tokens: pool_tokens }];
+    if ranks == 2 {
+        notes.push(format!("native whole-layer ranges: {}; shared residual boundary/return hops; memory capacity, not parallel attention compute; rank-local lazy graphs (untraced bootstrap)",
+            plan.decisions.attention.iter().enumerate().map(|(layer, mode)| format!("{layer}:{mode:?}")).collect::<Vec<_>>().join(",")));
+    }
+    let mut devices = (0..ranks).map(|rank| Ok(DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32,
+        capacity_bytes: options.rtx_bytes[rank].saturating_sub(crate::placement::reserve::gpu("qwen3_5")),
+        worker_budget_bytes: 0, items: plan.items(Location::coordinator(rank as u8))?, kv_tokens: pool_tokens }))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     if spark_vision {
         let mut sparks = Vec::new();
         for rank in 0..report.spark_ranks {

@@ -53,7 +53,11 @@ impl<'a> Verification<'a> {
     }
 
     pub(super) fn new(device: Device<'a>, cfg: &Qwen35Config, slots: usize) -> Result<Self> {
-        let mut layout = Self::layout(cfg, slots)?;
+        Self::new_placed(device, cfg, cfg, slots)
+    }
+
+    pub(super) fn new_placed(device: Device<'a>, cfg: &Qwen35Config, local: &Qwen35Config, slots: usize) -> Result<Self> {
+        let mut layout = Self::layout(local, slots)?;
         for owner in &mut layout.owners { owner.0 = device.id; }
         let mark = Rc::new(Allocation::new(device, layout.bytes.max(256), Tag::kv("qwen35/verify-mark"))?);
         let logits = Allocation::new(device, REPLAY_ROWS * cfg.vocab * 4, Tag::workspace("qwen35/verify-logits"))?;
@@ -95,9 +99,9 @@ impl<'a> DenseEngine<'a> {
             Ok(bytes)
         }).collect::<Result<Vec<_>>>()?;
         let reset = |engine: &mut Self| -> Result<()> {
-            engine.stream.drain()?;
+            engine.drain()?;
             for (region, bytes) in engine.mark_regions().into_iter().zip(&initial) { engine.put(region, bytes)?; }
-            engine.stream.drain()?;
+            engine.drain()?;
             engine.position = 0;
             engine.slots[0].position = 0;
             engine.verification.invalidate()?;
@@ -163,7 +167,7 @@ impl<'a> DenseEngine<'a> {
             self.verify(&mark, VerifyRequest { rows: &rows, tap_layers: &[] })?;
             self.commit(&mark, &[AcceptedPrefix { slot: 0, rows: keep }])?;
             // The commit stays queued on the target stream; host reads use the default stream.
-            self.stream.drain()?;
+            self.drain()?;
             let mut replay = Vec::new();
             for region in self.mark_regions() {
                 let mut bytes = vec![0; region.bytes];
@@ -212,10 +216,10 @@ impl<'a> DenseEngine<'a> {
             for (slot, sequence) in sequences.iter().enumerate() {
                 engine.prefill_device(slot, &sequence[..3], 1)?;
             }
-            engine.stream.drain()
+            engine.drain()
         };
         let state = |engine: &Self| -> Result<Vec<Vec<u8>>> {
-            engine.stream.drain()?;
+            engine.drain()?;
             engine.mark_regions().into_iter().map(|region| {
                 let mut bytes = vec![0; region.bytes];
                 library.copy_d2h(&mut bytes, region)?;
@@ -303,22 +307,27 @@ impl<'a> DenseEngine<'a> {
     }
 
     fn mark_regions(&self) -> Vec<CuteafdDeviceBuffer> {
-        self.homes.layers.iter().filter_map(|home| home.gdn_ordinal)
-            .flat_map(|ordinal| (0..self.slots.len()).flat_map(move |slot| self.bank.slot_regions(ordinal, slot))).collect()
+        self.homes.layers.iter().filter_map(|home| home.gdn_ordinal.map(|ordinal| (home.owner, ordinal)))
+            .flat_map(|(owner, ordinal)| (0..self.slots.len()).flat_map(move |slot|
+                self.owner_bank(owner).slot_regions(ordinal, slot))).collect()
     }
 
     fn move_mark(&self, mark: &DenseMark<'_>, capture: bool) -> Result<()> {
         let regions = self.mark_regions();
-        ensure!(regions.len() == self.verification.layout.regions.len(), "dense mark geometry changed");
-        for (index, (region, &(owner, offset, bytes))) in regions.into_iter().zip(&self.verification.layout.regions).enumerate() {
+        let layout = MarkLayout::new(&regions.iter().map(|region| (region.device_id, region.bytes)).collect::<Vec<_>>())?;
+        for (index, (region, &(owner, offset, bytes))) in regions.into_iter().zip(&layout.regions).enumerate() {
             let slot = (index / 2) % self.slots.len();
             if !mark.slots.iter().any(|(marked, _)| *marked == slot) { continue; }
-            ensure!(owner == 0 && bytes == region.bytes && region.device_id == mark.storage.buffer.device_id,
-                "dense mark region does not match its owner");
-            let saved = view(mark.storage.buffer, offset, bytes)?;
+            let device = layout.owners[owner].0;
+            let rank = usize::from(device != self.stream.device.id);
+            let storage = if rank == 0 { &mark.storage } else { &self.peer.as_ref().context("dense mark peer")?.mark };
+            let saved = view(storage.buffer, offset, bytes)?;
             let (dst, src) = if capture { (saved, region) } else { (region, saved) };
-            // SAFETY: mark storage and the live bank are retained until the enclosing drain.
-            unsafe { crate::shared::memory::device::copy_device_ordered(self.stream.device.library, dst, src, bytes, self.stream.raw)?; }
+            let stream = self.owner_stream(rank);
+            // SAFETY: owner-local mark and live bank retain their storage through drain.
+            stream.device.run(|| unsafe {
+                crate::shared::memory::device::copy_device_ordered(stream.device.library, dst, src, bytes, stream.raw)
+            })?;
         }
         // Every reader and writer of the mark and the live bank runs on this stream.
         Ok(())
@@ -368,6 +377,7 @@ impl<'a> DenseEngine<'a> {
     fn enqueue_verify_rows(&mut self, mut plan: rows::Rows, rows: usize, layers: &[usize], speculative: bool) -> Result<()> {
         self.healthy = false;
         self.graphs.cycle(speculative);
+        if let Some(peer) = &self.peer { peer.graphs.cycle(speculative); }
         if self.graphs.enabled && plan.stride > 0 {
             let stride = plan.stride.next_power_of_two().min(self.cfg.max_context.div_ceil(64));
             if stride != plan.stride {
@@ -399,15 +409,17 @@ impl<'a> DenseEngine<'a> {
             for index in 0..self.weights.layers.len() {
                 self.graph_layer(index, &step)?;
                 if let Some(tap) = layers.iter().position(|&layer| layer == index) {
+                    let hidden = self.primary_tap(index, tokens.len())?;
                     let width = self.cfg.hidden * 2;
                     for (active, &row) in physical.iter().enumerate() {
                         let dst = view(self.verification.hidden.buffer, (tap * rows + row) * width, width)?;
-                        let src = view(self.planes.residual, active * width, width)?;
+                        let src = view(hidden, active * width, width)?;
                         // SAFETY: both admitted row slices outlive this ordered stream copy.
                         unsafe { crate::shared::memory::device::copy_device_ordered(library, dst, src, width, self.stream.raw)?; }
                     }
                 }
             }
+            self.finish_layers(tokens.len())?;
             let norm = self.programs.program(&format!("{}_norm", self.admitted.prefix), &["x", "weight", "out"])?;
             // SAFETY: normalized active rows and head outputs match the admitted geometry.
             unsafe {
@@ -478,7 +490,8 @@ impl<'a> BlockVerifyTarget for DenseEngine<'a> {
         let table = verified.accepted(accepted)?;
         self.restore_mark(mark)?;
         self.healthy = false;
-        let result = self.bank.commit(&table, accepted.len());
+        let result = (0..self.homes.gdn_layers.len()).try_for_each(|rank|
+            self.owner_stream(rank).device.run(|| self.owner_bank(rank).commit(&table, accepted.len())));
         if let Err(error) = result {
             self.restore_mark(mark).context("restoring dense checkpoint after failed commit")?;
             return Err(error);
