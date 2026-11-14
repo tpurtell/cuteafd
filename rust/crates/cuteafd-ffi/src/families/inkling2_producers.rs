@@ -139,14 +139,7 @@ impl<'a> Producer<'a> {
 }
 
 fn validate_geometry_value(actual: &serde_json::Value, expected: &serde_json::Value, name: &str) -> Result<()> {
-    // The manifest serializes Python F64 constants, but every kernel scalar is
-    // F32. serde_json without float_roundtrip can move the last F64 bit; require
-    // identical effective F32 bits, not an unrelated decimal tolerance.
-    let same = if expected.is_f64() {
-        actual.as_f64().zip(expected.as_f64()).is_some_and(|(a, b)|
-            a.is_finite() && b.is_finite() && (a as f32).to_bits() == (b as f32).to_bits())
-    } else { actual == expected };
-    ensure!(same, "Inkling producer geometry {name} differs: actual={actual}, expected={expected}");
+    ensure!(actual == expected, "Inkling producer geometry {name} differs: actual={actual}, expected={expected}");
     Ok(())
 }
 
@@ -154,7 +147,7 @@ fn validate_geometry_value(actual: &serde_json::Value, expected: &serde_json::Va
 mod tests {
     use super::*;
     #[test]
-    fn serialized_clip_constants_require_identical_kernel_f32_bits() {
+    fn serialized_clip_constants_roundtrip_exactly_and_reject_wrong_values() {
         let parsed: serde_json::Value = serde_json::from_str("22.627416997969522").unwrap();
         validate_geometry_value(&parsed, &serde_json::json!(128f64.sqrt()*2.), "threshold").unwrap();
         assert!(validate_geometry_value(&serde_json::json!(22.63), &parsed, "threshold").is_err());
