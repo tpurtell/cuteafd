@@ -693,7 +693,6 @@ mod tests {
             lanes: 1,
             waves: 1,
             unit_rows: Some(4096),
-            full_prefill_logits: false,
             lane_layouts: vec![[lane]],
             fixed: vec![cuteafd_loader::families::kimi_k3::allocation::code_demand(0, pending, 1)?],
             startup: cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(KimiCoreFormat::Bf16, 1)?,
