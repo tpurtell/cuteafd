@@ -201,6 +201,45 @@ pub(crate) fn concurrency_matrix_snapshot() -> (tempfile::TempDir, std::path::Pa
 }
 
 #[test]
+fn only_optional_bundled_components_keep_missing_execution_hints() {
+    let missing = [Component::Embedding, Component::LmHead, Component::Norm, Component::Attention,
+        Component::Indexer, Component::Router, Component::SharedExpert, Component::RoutedExpert,
+        Component::DenseFfn, Component::Vision, Component::Speculator].into_iter()
+        .filter(|&component| MINIMAX_M3.component_hint(component).is_some()).collect::<Vec<_>>();
+    assert_eq!(missing, [Component::Vision, Component::Speculator]);
+}
+
+#[test]
+fn whole_rank_wip_admission_does_not_open_public_or_split_serving() {
+    use crate::placement::OnboardSetting;
+    let (dir, inputs) = heads_recipe_fixture_with_experts(128);
+    let manifest = dir.path().join("PROGRAMS.json");
+    std::fs::write(&manifest, inputs.manifest.to_string()).unwrap();
+    let options = PlanOptions { vision: crate::plan::MediaMode::Off,
+        audio: crate::plan::MediaMode::Off,
+        placement: plan::ExpertPlacement::Sparks { ranks: 4 },
+        layout: Some(plan::layout::LayoutOptions {
+            rtx_bytes: vec![96 << 30], spark_bytes: 100 << 30,
+            workspace_manifest: Some(manifest), host_memory: Some((512 << 30, 480 << 30)),
+            host_cache_bytes: Some(0), context_tokens: 32768, pool_tokens: Some(32768),
+            prefill_unit_rows: Some(1024), prefill_waves: 3, concurrency: 16,
+            onboard: Some(OnboardSetting::Layers(0)), ..Default::default()
+        }), ..Default::default() };
+    let report = plan::plan(dir.path(), &options).unwrap();
+    assert!(report.native_serving_admitted && report.wip_launchable(), "{:?}", report.hints);
+    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+    assert!(!report.executable());
+    let mut no_admission = report.clone();
+    no_admission.native_serving_admitted = false;
+    assert!(!no_admission.wip_launchable());
+    let mut pair = options;
+    pair.layout.as_mut().unwrap().rtx_bytes.push(96 << 30);
+    let unsupported = plan::plan(dir.path(), &pair).unwrap();
+    assert!(!unsupported.native_serving_admitted && !unsupported.wip_launchable()
+        && !unsupported.executable());
+}
+
+#[test]
 fn minimax_native_inventory_is_planned_not_executable() {
     let (dir, _, _) = fixture();
     let report = plan::plan(dir.path(), &PlanOptions::default()).unwrap();

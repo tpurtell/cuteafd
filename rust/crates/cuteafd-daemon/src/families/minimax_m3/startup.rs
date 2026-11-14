@@ -71,6 +71,13 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     ensure!(matches!(args.token_io.embed_placement, crate::shared::token_io::EmbedPlacement::Gpu)
         && args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device,
         "MiniMax serving requires admitted GPU embedding and device selection");
+    cuteafd_bench::context::set(cuteafd_bench::context::ServerContext {
+        command: "serve-minimax".into(), family: Some("minimax_m3".into()), snapshot: Some(args.snapshot.clone()),
+        supports_thinking_off: Some(false), ..Default::default()
+    });
+    cuteafd_bench::context::ResolvedSettings::default().value("max-sequences", args.max_sequences)
+        .value("prefill-packing", format!("{:?}", args.prefill_packing).to_lowercase())
+        .value("draft-mode", "no speculation").value("expert-usage", args.expert_usage).publish();
     args.prefix.resolve_entries(usize::from(args.max_sequences));
     let prefill = args.prefill()?;
     let api = args.api.load()?;
@@ -275,6 +282,8 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
         prefix_entries: options.prefix.prefix_cache_entries as u64, replies,
         head: crate::shared::target_head::TargetHead::configured().blas_head(true),
         expert_usage: usage_enabled, resident_weight_limit: options.resident_weights }, &samples, options.onboard)?;
+    cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
+    cuteafd_bench::context::set_resolved("max-context-tokens", &admitted.solved.served_context().to_string());
     let config = TcpTransportConfig::default();
     let endpoint = SparkEndpoint { ring_depth: None, capacity: capacity.prefill.rows,
         ingress: SparkIngress::Bf16, partial_reply_bytes: None };
@@ -376,6 +385,23 @@ fn publish_provenance(native_lib: &Path, manifest: &Path, runtime: &RuntimeInven
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_serve_cli_and_runtime_settings_have_a_cpu_seam() -> Result<()> {
+        use clap::Parser;
+        let argv = ["cuteafd", "serve-minimax", "--snapshot", "/fixture", "--native-lib", "/native",
+            "--max-sequences", "16", "--prefill-rows", "2752", "--prefill-waves", "3"];
+        let crate::cli::Commands::ServeMinimax(mut args) = crate::cli::Cli::try_parse_from(argv)?.command else {
+            panic!("MiniMax serve command");
+        };
+        crate::commands::bench::assert_resolved_family_seam("serve-minimax", &[], || {
+            args.prefix.resolve_entries(16);
+            args.prefill()?;
+            cuteafd_bench::context::ResolvedSettings::default().value("max-context-tokens", 131072)
+                .value("pool-tokens", 2097152).value("rtx-expert-layers", 0).publish();
+            Ok(())
+        })
+    }
 
     #[test]
     fn process_geometry_refuses_a_conflicting_family_without_replacement() -> Result<()> {

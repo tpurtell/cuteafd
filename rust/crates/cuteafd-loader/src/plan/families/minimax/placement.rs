@@ -120,6 +120,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             return empty(notes);
         }
     };
+    // Hidden WIP serving consumes exactly this whole-rank contract. Public
+    // serving remains Planned; split layouts wait for their executor handoff.
+    report.native_serving_admitted = gpus == 1 && !inputs.split() && !inputs.heads();
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
     report.host_budget_bytes = inputs.host_prefix.quota_bytes;
     let placed = admitted.placement;
