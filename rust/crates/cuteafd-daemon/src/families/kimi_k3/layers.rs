@@ -923,6 +923,9 @@ impl LayerKernels for Bindings<'_, '_, '_> {
             }
         }
         context_pair_with(&mut Pair { binding: self, layer })?;
+        // Diagnostic only: both peers must have issued their waits/pushes before
+        // an opted-in readback can drain either producer stream.
+        self.local[0].context_dsa_dump(layer, self.rows)?;
         // Both whole-step replays must be queued before ordinary producer
         // joins, otherwise rank 0's device wait can block rank 1's publication.
         if self.local[0].native_attention(layer)? {

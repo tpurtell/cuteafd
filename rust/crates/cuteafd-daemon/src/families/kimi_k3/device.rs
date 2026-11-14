@@ -681,8 +681,8 @@ impl<'a> LocalLane<'a> {
 
     pub(crate) fn bind_context(&mut self, owner: Rc<super::context::ContextOwner<'a>>,
         programs: Rc<super::context::Programs<'a>>) -> Result<()> {
-        ensure!(self.context.is_none() && self.graphs.is_none() && self.mla.parity(),
-            "Kimi context binding requires admitted parity cache before capture");
+        ensure!(self.context.is_none() && self.graphs.is_none() && self.mla.parity() && self.lane_index == 0,
+            "Kimi context binding requires admitted parity cache on the single target lane before capture");
         owner.ranks[self.rank].check_reader(self.stream())?;
         ensure!(owner.ranks[self.rank].extent() == self.max_context(), "Kimi context binding extent differs");
         self.context = Some((owner, programs));
@@ -1252,6 +1252,19 @@ impl<'a> LocalLane<'a> {
                 context.exchange.wait_query(self.rank, slot)?;
             }
             Ok(())
+        })
+    }
+
+    pub(crate) fn context_dsa_dump(&self, layer: usize, rows: usize) -> Result<()> {
+        let Some(dump) = self.dsa_dump.as_deref().filter(|_| self.rank == 0 && self.programs.dsa.is_some()) else {
+            return Ok(());
+        };
+        let owner = &self.context.as_ref().context("Kimi context dump without owner")?.0.ranks[self.rank];
+        let lengths = if self.context_units[self.lane.metadata_bank].is_some() {
+            owner.metadata("DSA merged lengths", self.lane.metadata_bank)?
+        } else { self.lane.buffer("DSA selected lengths")? };
+        super::dsa_dump::record_selected(Some(dump), self.rank, self.stream(), layer, rows, || {
+            Ok((self.lane.buffer("DSA positions")?, lengths, owner.buffer("DSA merged indices")?))
         })
     }
 
