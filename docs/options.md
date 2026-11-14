@@ -94,7 +94,11 @@ Shared launch keys keep their usual meanings. The WIP edge accepts
 `EXPERT_USAGE=on|off` (default on), `GPU_GRAPH_RESERVE` and its extra/cap keys,
 and `GRAPH_TRACE`. Only BF16 Spark replies are supported; compressed reply
 formats refuse before loading. Native checkpoint API encoding is mandatory.
-The public family tables exclude this still-unqualified edge.
+The traced one-RTX boot-C16 graph base is 41,943,040 bytes plus the standard
+2,097,152-byte tail; shared bounded runtime extra gives 88,080,384 bytes total
+by default. C1/C16 decode on that bank records no steady-state captures or
+evictions. Untraced rank/concurrency shapes keep an unpinned bootstrap with no
+borrowed measured base. The public family tables exclude this still-unqualified edge.
 
 `./run.sh` options:
 

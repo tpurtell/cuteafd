@@ -161,6 +161,29 @@ pub fn spark_charges(checkpoint: &crate::plan::Checkpoint, catalog: &crate::Offi
     }).collect()
 }
 
+fn measured_graph_base(gpus: usize, sequences: u64) -> (u64, u64) {
+    if gpus == 1 && sequences == 16 {
+        (41_943_040, 2 << 20)
+    } else { (0, 0) }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    #[test]
+    fn measured_c16_whole_graph_base_has_one_standard_tail_and_no_arena_margin() {
+        let (base, tail) = measured_graph_base(1, 16);
+        assert_eq!((base, tail), (41_943_040, 2_097_152));
+        let resolved = crate::placement::graph_reserve::resolve(None, 0, false, base, tail).unwrap();
+        assert_eq!(resolved.base_bytes, 44_040_192);
+        assert_eq!(resolved.bytes, 88_080_384);
+        for shape in [(2, 16), (1, 64), (1, 3)] {
+            assert_eq!(measured_graph_base(shape.0, shape.1), (0, 0));
+        }
+    }
+}
+
 /// Gather every admitted owner fact into the shared recipe.
 pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
     let cfg = request.cfg;
@@ -256,9 +279,11 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
             // The measured sample follows module loading: only what it has not seen.
             Coordinator::Measured { loaded_code, .. } => loaded_code.get(gpu).copied().unwrap_or(0),
         });
-        // No traced MiniMax prewarm layout yet: base zero, the shared runtime
-        // headroom is the whole canonical reserve (graph-cache stream, H11).
-        graph_reserve.push(crate::placement::graph_reserve::current(gpu, false, 0, 0)
+        // SM120 whole-rank C16 + TP3 trace e78eb75b0 (#1856): all reachable
+        // rows 1/4/16 prewarmed; C1/C16 decode had zero captures/evictions.
+        // Untraced rank/concurrency shapes borrow neither this base nor pins.
+        let (base, tail) = measured_graph_base(gpus, request.sequences);
+        graph_reserve.push(crate::placement::graph_reserve::current(gpu, false, base, tail)
             .map_err(|error| refused(format!("MiniMax graph reserve refused: {error}"), "Fix GPU_GRAPH_RESERVE."))?.bytes);
     }
     let mut budgets = (0..gpus).map(|gpu| request.coordinator.budget(gpu)).collect::<Vec<_>>();
