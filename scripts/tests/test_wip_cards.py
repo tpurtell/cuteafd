@@ -856,6 +856,7 @@ repo_root={str(ROOT)!r}
 sync_seed_source() {{ :; }}
 release_die() {{ exit 2; }}
 slot=test seed_host=rhea spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
+wip_spark_image_layers='[]'; declare -A wip_spark_image_ids=([rhea]=image)
 wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
 wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
@@ -2550,6 +2551,7 @@ repo_root={str(ROOT)!r}
 sync_seed_source() {{ :; }}
 release_die() {{ exit 2; }}
 slot=test seed_host=kakapo spark_container=owned SPARK_EXPERT_DOCKER_DEV=image
+wip_spark_image_layers='[]'; declare -A wip_spark_image_ids=([kakapo]=image)
 wip_spark_tp_roles='tp3;tp6' bf16_families= audio_aot=OFF
 CUTEAFD_WIP_EXPORT_LOCKS=on wip_export_locks=on
 wip_build_resource_dir={str(lease)!r} wip_build_resource_pid=$$
