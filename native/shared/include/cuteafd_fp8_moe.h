@@ -13,8 +13,9 @@ extern "C" {
 
 // words (18): [0] packed contract (all bytes required):
 //   bits 0..7: ABI version 6 (old unversioned contracts are rejected)
-//   bits 8..15: storage 1=FP8 block128, 2=MXFP4, 4=NVFP4 W4A4, 5=BF16,
-//                       6=MXFP8 W8A8, 7=dynamic-amax NVFP4 W4A4 (both exported; no native loader yet)
+//   bits 8..15: storage 1=FP8 block128, 2=MXFP4, 4=NVFP4 multiplier W4A4, 5=BF16,
+//                       6=MXFP8 W8A8, 7=dynamic-amax NVFP4 W4A4 (both exported; no native loader yet),
+//                       8=NVFP4 checkpoint-native divisor W4A4
 //   bits 16..23: activation 1=pre-SiLU clamp + BF16 SiLU/product rounding,
 //                          2=post-SiLU clamp + FP32 product/final BF16 rounding,
 //                          3=SwiGLU-OAI FP32 gate*sigmoid(alpha*gate)*(up+beta),

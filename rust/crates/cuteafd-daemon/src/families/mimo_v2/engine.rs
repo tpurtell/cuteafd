@@ -4100,7 +4100,7 @@ mod tests {
             intermediate: 2048, tp: 1, wire_input: false, swiglu_limit: 0.0, swiglu_alpha: 1.0, swiglu_beta: 0.0,
             activation: cuteafd_ffi::fp8_moe::Fp8MoeActivation::SiluBf16Product,
             projection: cuteafd_ffi::fp8_moe::Fp8MoeProjection::Bf16,
-            capacities: vec![16, 64, 4096], weights: Fp8MoeWeights::Fp8 };
+            capacities: vec![16, 64, 4096], scale_convention: cuteafd_ffi::fp8_moe::Fp8MoeScaleConvention::Multiplier, weights: Fp8MoeWeights::Fp8 };
         for prefill in [1, 16, 32, 63, 64, 128, 4096] {
             // Local load/scratch, SparkLink negotiation/intake, and warmup
             // all consume this common extent; the native program must fit it.

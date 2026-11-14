@@ -764,3 +764,20 @@ def test_oai_info_words_keep_capacity_slots_and_explicit_params():
         setattr(bad, field, value)
         with pytest.raises(ValueError):
             package_tool.info_words(bad, [16], False)
+
+
+def test_nvfp4_divisor_storage_is_distinct_without_changing_abi_or_capacity_slots():
+    g = SimpleNamespace(kind="nvfp4a4", weights="nvfp4", activation="swigluoai", projection="bf16",
+                        swiglu_limit=7.0, swiglu_alpha=1.702, swiglu_beta=1.0, scale_convention="divisor",
+                        hidden=6144, slice=3072, experts=128, top_k=4, intermediate=3072, tp=1)
+    divisor = package_tool.info_words(g, [1, 16, 80, 256, 1024, 4096], False)
+    g.scale_convention = "multiplier"
+    multiplier = package_tool.info_words(g, [1, 16, 80, 256, 1024, 4096], False)
+    assert len(divisor) == len(multiplier) == 18
+    assert divisor[0] == 6 | 8 << 8 | 3 << 16 | 1 << 24
+    assert multiplier[0] == 6 | 4 << 8 | 3 << 16 | 1 << 24
+    assert divisor[1:] == multiplier[1:]
+    assert ((divisor[0] >> 8) & 255) not in (1, 2, 4, 5)  # old reader refuses
+    g.scale_convention = "unknown"
+    with pytest.raises(ValueError, match="scale convention"):
+        package_tool.info_words(g, [16], False)

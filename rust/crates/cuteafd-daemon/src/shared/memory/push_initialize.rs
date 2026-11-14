@@ -154,11 +154,7 @@ pub(crate) fn initialize<'a>(
                         let mut image = vec![0; range.len()];
                         arena.device().run(|| arena.device().library.copy_d2h(
                             &mut image, arena.buffer(range.clone())?))?;
-                        scalar_convention.normalize_bytes(&mut image)?;
-                        if *scalar_convention == cuteafd_loader::formats::fp8_experts::Nvfp4ScaleConvention::Divisor {
-                            arena.device().run(|| arena.device().library.copy_h2d(
-                                arena.buffer(range.clone())?, &image))?;
-                        }
+                        scalar_convention.validate_bytes(&image)?;
                     }
                     for range in widen { widen_scales(arena, range.clone(), 1024 * 1024)?; }
                     // Packed grids (widened above when BF16) spread to their row pitch.

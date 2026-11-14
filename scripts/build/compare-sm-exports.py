@@ -110,7 +110,7 @@ EXL3_CAPACITIES_KIMIK3 = EXL3_CAPACITIES + ",5504,8256"
 ROUTED_GEOMETRIES = ("mimo", "mimop", "mimof", "glm", "glmf", "qwen4",
                      "glm_nvfp4", "glmf_nvfp4", "qwen4_nvfp4", "glmfdense_nvfp4",
                      "glm_nvfp4a4", "glmf_nvfp4a4", "qwen4_nvfp4a4", "glmfdense_nvfp4a4",
-                     "step5", "step5_nvfp4", "step5_bf16")
+                     "step5", "step5_nvfp4", "step5_bf16", "minimax_nvfp4a4")
 EXL3_GEOMETRIES = ("dsv4p", "glm", "glmf", "qwen4", "kimik3", "ml4")
 
 
@@ -557,6 +557,7 @@ def export_routed(extra, output, selected_objects=None):
             "input": "wire" if wire else "bf16",
             "abi_version": package.ABI_VERSION, "activation": g.activation,
             "projection": g.projection, "swiglu_limit": g.swiglu_limit,
+            **({"scale_convention": g.scale_convention} if g.weights == "nvfp4" else {}),
             **dict(zip(("swiglu_alpha", "swiglu_beta"), package.activation_params(
                 g.activation, g.weights, getattr(g, "swiglu_alpha", None),
                 getattr(g, "swiglu_beta", None), g.swiglu_limit))),

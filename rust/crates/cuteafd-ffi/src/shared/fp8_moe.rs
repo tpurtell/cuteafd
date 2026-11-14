@@ -26,6 +26,20 @@ pub enum Fp8MoeWeights {
     Bf16,
 }
 
+/// How the checkpoint's unchanged FP32 globals enter the NVFP4 arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fp8MoeScaleConvention {
+    Multiplier,
+    Divisor,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("NVFP4 package scale convention {package:?} disagrees with checkpoint {checkpoint:?}")]
+pub struct Nvfp4ScaleMismatch {
+    pub package: Fp8MoeScaleConvention,
+    pub checkpoint: Fp8MoeScaleConvention,
+}
+
 /// Clamp order and intermediate rounding, independent of projection precision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -63,6 +77,7 @@ pub struct Fp8MoeInfo {
     pub capacities: Vec<usize>,
     /// The weight format; MXFP4 also supports exact K32 slices.
     pub weights: Fp8MoeWeights,
+    pub scale_convention: Fp8MoeScaleConvention,
 }
 
 impl Fp8MoeInfo {
@@ -71,9 +86,9 @@ impl Fp8MoeInfo {
         let [version, format, activation, projection] = words[0].to_le_bytes();
         ensure!(version == FP8_MOE_ABI,
             "unsupported FP8 expert package ABI {version}; expected ABI{FP8_MOE_ABI} (re-export package)");
-        ensure!(matches!(format, 1 | 2 | 4 | 5)
+        ensure!(matches!(format, 1 | 2 | 4 | 5 | 8)
             && matches!(activation, 1 | 2 | 3) && !(format == 2 && activation != 1)
-            && (activation != 3 || format == 4) && projection == 1
+            && (activation != 3 || matches!(format, 4 | 8)) && projection == 1
             && matches!(words[7], 1 | 7) && (1..=6).contains(&count),
             "unsupported FP8 expert package ABI {words:?}");
         let info = Self {
@@ -94,10 +109,11 @@ impl Fp8MoeInfo {
             },
             projection: Fp8MoeProjection::Bf16,
             capacities: words[10..10 + count].iter().map(|&c| c as usize).collect(),
+            scale_convention: if format == 8 { Fp8MoeScaleConvention::Divisor } else { Fp8MoeScaleConvention::Multiplier },
             weights: match format {
                 1 => Fp8MoeWeights::Fp8,
                 2 => Fp8MoeWeights::Mxfp4,
-                4 => Fp8MoeWeights::Nvfp4,
+                4 | 8 => Fp8MoeWeights::Nvfp4,
                 _ => Fp8MoeWeights::Bf16,
             },
         };
@@ -125,6 +141,14 @@ impl Fp8MoeInfo {
             } else { info.swiglu_alpha == 1.0 && info.swiglu_beta == 0.0 },
             "inconsistent FP8 expert activation parameters {info:?}");
         Ok(info)
+    }
+
+    pub fn validate_scale_convention(&self, checkpoint: Fp8MoeScaleConvention)
+        -> std::result::Result<(), Nvfp4ScaleMismatch> {
+        if self.scale_convention != checkpoint {
+            return Err(Nvfp4ScaleMismatch { package: self.scale_convention, checkpoint });
+        }
+        Ok(())
     }
 
     /// Check checkpoint semantics on static metadata before allocating device storage.
@@ -628,6 +652,31 @@ mod metadata_tests {
     fn words() -> [u32; FP8_MOE_INFO_WORDS] {
         // ABI 6, MXFP4, pre-SiLU clamp, BF16 projection and input.
         [0x01010206, 6144, 2048, 256, 8, 2048, 1, 1, 0, 2, 16, 4096, 0, 0, 0, 0, 1.0f32.to_bits(), 0]
+    }
+
+    #[test]
+    fn divisor_storage_is_explicit_and_mismatch_is_typed() {
+        let mut w = words();
+        w[0] = 6 | 8 << 8 | 1 << 16 | 1 << 24;
+        for format in [6, 7] {
+            let mut inkling = w;
+            inkling[0] = 6 | format << 8 | 4 << 16 | 1 << 24;
+            assert!(Fp8MoeInfo::from_words(inkling).is_err(), "Inkling has no native loader yet");
+        }
+        let info = Fp8MoeInfo::from_words(w).unwrap();
+        assert_eq!(info.weights, Fp8MoeWeights::Nvfp4);
+        assert_eq!(info.scale_convention, Fp8MoeScaleConvention::Divisor);
+        info.validate_scale_convention(Fp8MoeScaleConvention::Divisor).unwrap();
+        let error = info.validate_scale_convention(Fp8MoeScaleConvention::Multiplier).unwrap_err();
+        assert_eq!(error.package, Fp8MoeScaleConvention::Divisor);
+        // The previous ABI6 reader allowed only storage IDs 1, 2, 4 and 5.
+        // A new raw-divisor package must fail that predicate, not look like ID4.
+        let storage = w[0].to_le_bytes()[1];
+        assert!(!matches!(storage, 1 | 2 | 4 | 5));
+        w[0] = 6 | 4 << 8 | 1 << 16 | 1 << 24;
+        let multiplier = Fp8MoeInfo::from_words(w).unwrap();
+        assert_eq!(multiplier.scale_convention, Fp8MoeScaleConvention::Multiplier);
+        assert!(multiplier.validate_scale_convention(Fp8MoeScaleConvention::Divisor).is_err());
     }
 
     #[test]
