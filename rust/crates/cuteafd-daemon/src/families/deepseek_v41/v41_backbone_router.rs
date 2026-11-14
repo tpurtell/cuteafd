@@ -294,9 +294,13 @@ mod reuse_tests {
                     let captured: Vec<u8> = ids.iter().flatten().flat_map(|v| v.to_ne_bytes()).collect();
                     assert_eq!(captured,bytes(&library,reference.ids)?);
                     assert_eq!(unsafe { actual.download_request(&library) }.is_err(),local);
-                    let handle = lane.graphs.get(layer,&weights[layer]).unwrap().0;
+                    // Two-node router/quantizer graphs may remain eager under
+                    // the shared tiny-graph policy; retained handles stay stable.
+                    let handle = lane.graphs.get(layer,&weights[layer]).map(|entry| entry.0);
                     if let Some(previous) = handles.insert((local,layer),handle) { assert_eq!(previous,handle); }
-                    if let Some(other) = handles.get(&(!local,layer)) { assert_ne!(*other,handle); }
+                    if let (Some(handle), Some(Some(other))) = (handle, handles.get(&(!local,layer))) {
+                        assert_ne!(*other,handle);
+                    }
                 }
             }
         }
@@ -392,7 +396,7 @@ mod reuse_tests {
                             .chunks_exact(4)
                             .all(|b| f32::from_ne_bytes(b.try_into().unwrap()).is_finite()));
                     }
-                    let handle = lane.graphs.get(layer, &weights[layer]).unwrap().0;
+                    let handle = lane.graphs.get(layer, &weights[layer]).map(|entry| entry.0);
                     if cycle == 0 {
                         handles.insert(layer, handle);
                     } else {
@@ -1064,6 +1068,44 @@ mod host_order_tests {
         assert!(finish.contains("exchange.land(self.ticket, self.stream.raw)?"));
         assert!(finish.contains("finish_or_wait(self.stream, false).await?"),
             "non-deferred staging and rebinds retain their final lifetime fence");
+    }
+
+    #[test]
+    fn device_landing_retains_independent_slots_and_failure_release() {
+        let coordinator = include_str!("v41_experts/coordinator.rs");
+        let slots = &coordinator[coordinator.find("    pub fn unlinked(").unwrap()..];
+        let slots = &slots[..slots.find("    pub(crate) fn bootstrap(").unwrap()];
+        assert!(slots.contains("raw: library.cuda_stream_create()?"));
+        let collect = &coordinator[coordinator.find("    pub(crate) async unsafe fn collect_unit<'w>(").unwrap()..];
+        let collect = &collect[..collect.find("    pub(crate) async unsafe fn unit_shared(").unwrap()];
+        assert!(collect.contains("stream: &self.stream"));
+        let units = include_str!("v41_target_pass/encoder_units.rs");
+        let land = &units[units.find("    async fn land_experts(&mut self,").unwrap()..];
+        let land = &land[..land.find("    async fn end_unit(").unwrap()];
+        assert!(land.contains("self.slots[unit.slot].pass.unit_chain()?"));
+        assert!(land.contains("chain.scope(self.land_experts_inner"));
+        let pass = include_str!("v41_target_pass.rs");
+        let chain = &pass[pass.find("    pub(super) fn unit_chain(").unwrap()..];
+        assert!(chain[..chain.find("    pub(super) fn library(").unwrap()]
+            .contains("chain.set_device_order(true)"));
+        assert!(pass.contains("chain::watchdog("));
+        assert!(pass.contains("and_then(|()| crate::shared::spark_waves::healthy())"));
+        let wait = include_str!("../../shared/memory.rs");
+        let wait = &wait[wait.find("    pub(crate) async fn wait(&self)").unwrap()..];
+        let wait = &wait[..wait.find("impl Drop for LoadStream").unwrap()];
+        assert!(wait.contains("cuda_stream_query(self.raw)?"));
+        assert!(wait.contains("tokio::task::yield_now().await"));
+        let waves = include_str!("../../shared/spark_waves.rs");
+        assert!(waves.contains("since.elapsed() < timeout"));
+        let failure = &waves[waves.find("fn finish_worker<").unwrap()..];
+        let failure = &failure[..failure.find("/// A reply frame").unwrap()];
+        assert!(failure.contains("health::record_failure"));
+        assert!(failure.contains("release_until_closed(native, inbox, highest)"));
+        let release = &waves[waves.find("    fn fail(&mut self, sequence: u32) {\n        // Descriptors first:").unwrap()..];
+        let release = &release[..release.find("\n    }\n").unwrap()];
+        for required in ["self.pulls.clear", "Counter::Arrived(rank)", "self.publish(sequence)"] {
+            assert!(release.contains(required), "failed link must release queued waits: {required}");
+        }
     }
 
     #[test]
