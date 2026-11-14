@@ -235,8 +235,6 @@ pub(crate) struct EngineArgs {
     /// E4M3 scales) at load and run them as BF16: `rtn` (amax/6) or `search`.
     #[arg(long, hide = true)]
     pub kda_nvfp4_gate: Option<String>,
-    /// Keep every prefill row's logits (glmf-golden --nll; 2.5 GiB at 4096 rows).
-    #[arg(long, hide = true)]
     /// Most EXL3 expert layers resident at once (about 3 GiB each; the free
     /// memory decides first).
     #[arg(long, default_value_t = 64)]
@@ -885,6 +883,7 @@ mod draft_cli_tests {
 
     #[test]
     fn fp8_prefill_defaults_to_w8a8_mla_ffn_and_kda_stays_opt_in() {
+        assert!(!<Parse as clap::CommandFactory>::command().get_arguments().find(|arg| arg.get_id() == "exl3_window").unwrap().is_hide_set());
         let policy = |extra: &[&str], kda: bool| { let p = fp8_prefill_policy(&parse(extra), kda); (p.mla, p.ffn, p.kda_bits) };
         // Default (TJ 2026-11-13): FP8 weights are an explicit choice, so MLA and dense/shared FFN
         // prefill run W8A8 over them; KDA W8A8 stays opt-in even over FP8 KDA weights.
