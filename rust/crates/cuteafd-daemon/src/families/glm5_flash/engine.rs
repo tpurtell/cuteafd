@@ -5846,7 +5846,10 @@ mod prefill_lane_tests {
             // rounding scaled weights to BF16; whole NC shapes retain the old arithmetic. Re-audited
             // decode routes: caps 16/64, shipped warps, groups and wide selection are unchanged,
             // and thin/wide tiles must agree on native-scale arithmetic.
-            ("integration/cuteafd/_fp8_weights.py", 0x7cebefad8cc230ce_u64),
+            // Fork #303 selects packed native consumers only for (N,K) 6784x4096,
+            // 7424x4096 and 8192x2048. No GLM Flash shape selected; registered
+            // arithmetic, routes and thresholds are unchanged (export audit: zero GLM Flash changes).
+            ("integration/cuteafd/_fp8_weights.py", 0x79d7_b9c1_b570_7812_u64),
             // The #252 NC rewrite preserves scaled BF16 operands, per-warp K/MMA order,
             // FP32 accumulation and ascending-warp fold. It changes load/prefetch scheduling,
             // grid order and vectorized fold/store pairs, not per-output arithmetic.
