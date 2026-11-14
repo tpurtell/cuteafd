@@ -235,11 +235,29 @@ def stage_probe(native, hidden, layer, cfg, index, weights, report):
     native_mix, native_input = mlp_inputs(native_attention)
     check(f"layer{index}/residual_mix", native_mix, reference_mix, report, enforce=False)
     check(f"layer{index}/mlp_in", native_input, reference_input, report, enforce=False)
+    logits = [linear(x, layer["mlp.gate.weight"].float()) for x in [reference_input, native_input]]
+    routes = [oracle.route(x, layer["mlp.gate.bias"], cfg.num_experts_per_tok, cfg.route_scale) for x in logits]
+    changed = (routes[0][0] != routes[1][0]).any(-1)
+    set_changed = (routes[0][0].sort(-1).values != routes[1][0].sort(-1).values).any(-1)
+    scores = logits[0].sigmoid() + layer["mlp.gate.bias"]
+    ordered = scores.sort(-1, descending=True).values
+    margins = ordered[:, cfg.num_experts_per_tok-1] - ordered[:, cfg.num_experts_per_tok]
+    route_report = dict(changed_order_rows=int(changed.sum()), changed_set_rows=int(set_changed.sum()),
+        topk_boundary_margins=margins[set_changed].cpu().tolist(),
+        changed_rows=torch.where(set_changed)[0].cpu().tolist(),
+        reference_ids=routes[0][0][set_changed].cpu().tolist(), native_ids=routes[1][0][set_changed].cpu().tolist(),
+        max_abs_router_logit_diff=float((logits[0]-logits[1]).abs().max()))
+    print(f"layer{index}/route_changes", json.dumps(route_report), flush=True)
+    report[f"layer{index}/route_changes"] = route_report
     reference_mlp = oracle.moe_forward(reference_input, layer, cfg)
+    # Counterfactual isolates upstream amplification from native expert math.
+    reference_on_native_input = oracle.moe_forward(native_input, layer, cfg)
+    check(f"layer{index}/reference_mlp_upstream_sensitivity", reference_on_native_input, reference_mlp, report, enforce=False)
     native_same_input = native.moe(reference_input, layer, weights)
     check(f"layer{index}/mlp_out_same_reference_input", native_same_input, reference_mlp, report, enforce=False)
     native_mlp = native.moe(native_input, layer, weights)
     check(f"layer{index}/mlp_out", native_mlp, reference_mlp, report, enforce=False)
+    check(f"layer{index}/native_expert_same_native_input", native_mlp, reference_on_native_input, report, enforce=False)
     reference_tail = oracle.short_conv(reference_mlp, layer["mlp_sconv.weight"])
     native_tail = native.short_conv(native_mlp, layer["mlp_sconv.weight"])
     check(f"layer{index}/mlp_conv", native_tail, reference_tail, report, enforce=False)
