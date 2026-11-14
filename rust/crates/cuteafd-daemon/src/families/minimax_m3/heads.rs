@@ -182,7 +182,7 @@ mod tests {
                 (0, "peer-signal"), (1, "peer-wait"), (1, "join-ready")], "{path}");
         }
         let source = include_str!("engine.rs");
-        let prefill = source.split_once("    fn join(&mut self, layer: usize, unit: &Unit)").unwrap().1
+        let prefill = source.split_once("    fn join(&mut self, layer: usize, unit: &Unit) -> Result<()> {").unwrap().1
             .split_once("    fn head(").unwrap().0;
         let decode = source.split_once("    fn decode_heads(").unwrap().1
             .split_once("    fn decode_split(").unwrap().0;
