@@ -94,7 +94,8 @@ pub(crate) fn reconcile_native(plan: &ResolvedPlan, devices: CoordinatorDevices<
             else { receipt.allocation.id.strip_prefix("inkling2.").unwrap_or(&receipt.allocation.id) };
         let id = if id == "experts.scratch" { "expert.scratch" } else { id };
         let spec = expected.get(id).with_context(|| format!("Inkling unadmitted retained owner {id}"))?;
-        anyhow::ensure!(receipt.allocation.bytes == spec.bytes && receipt.allocation.location == spec.location,
+        anyhow::ensure!(receipt.allocation.bytes == spec.bytes && receipt.allocation.location == spec.location
+            && receipt.allocation.lifetime == spec.lifetime && receipt.allocation.category == spec.category,
             "Inkling retained owner {id} bytes/location differ: actual{}/admitted{}", receipt.allocation.bytes, spec.bytes);
         // Metadata comes from the canonical pre-allocation contract after the
         // measured payload/location check, never from observed bytes.

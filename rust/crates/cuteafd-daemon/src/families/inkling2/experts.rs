@@ -96,6 +96,9 @@ impl<'a> Mxfp8<'a> {
     }
     pub fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()> {
         for (index, owner) in self.planes.iter().enumerate() { owner.inventory(inventory, &format!("{prefix}.{index}"))?; }
+        Ok(())
+    }
+    pub fn workspace_inventory(&self, inventory: &mut Inventory<'_>) -> Result<()> {
         self.scratch.inventory(inventory, "expert.scratch")
     }
 }

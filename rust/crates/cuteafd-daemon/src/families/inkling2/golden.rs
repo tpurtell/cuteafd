@@ -113,6 +113,7 @@ fn run(args: GoldenArgs) -> Result<()> {
             cuteafd_core::memory_layout::Category::Workspace, "cold native workspaces");
         owner.inventory(&mut working, "unit")?;
         head.inventory(&mut working, "head")?;
+        experts.workspace_inventory(&mut working)?;
         let measured = inventory.receipts.iter().chain(&working.receipts)
             .filter(|r| r.allocation.view.is_none() && r.allocation.location == cuteafd_loader::placement::planner::Location::coordinator(0))
             .map(|r| r.allocation.bytes).sum::<u64>();
