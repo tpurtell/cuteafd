@@ -178,7 +178,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 .transpose()?.unwrap_or(0);
             let mut demands = allocation::baseline_demands_for_ranks(cfg, manifest, rows, shape, context as usize,
                 usize::try_from(slots)?, verify, &model.core, matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context),
-                ranks, gpus, opts.resolved_spark_reply_format(false), if attention == AttentionPlacement::Heads && gpus == 2 { 48 } else { 96 })?;
+                ranks, gpus, opts.resolved_spark_reply_format(false), if matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context) && gpus == 2 { 48 } else { 96 })?;
             if let Some(context) = &context_layout {
                 // Validate the context key inventory; the graph reserve is the
                 // configured arena, charged once by the recipe.
