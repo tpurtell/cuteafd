@@ -1045,6 +1045,18 @@ fn k31_core_plans_charge_index_records_once_without_unlocking_serve() -> Result<
                 "scratch_bytes_at_capacity":{"scratch":cuteafd_ffi::KimiSparseMla::scratch_bytes_for(rows, 96, true)?}}));
         }}
     }
+    for program in manifest["programs"].as_array_mut().unwrap() {
+        let name = program["name"].as_str().unwrap_or("").to_owned();
+        if name.starts_with("kimik31_index_producer_") {
+            program["geometry"]["sparse_mla_row_chunk_size"] = serde_json::json!(64);
+        }
+        if name.starts_with("kimik31_sparse_mla") {
+            let heads = if name.contains("_h96_") || name.contains("_partial") { 96 } else { 48 };
+            program["geometry"]["row_chunk_size"] = serde_json::json!(64);
+            program["scratch_bytes_at_capacity"]["scratch"] = serde_json::json!(
+                cuteafd_ffi::KimiSparseMla::scratch_bytes_for(64, heads, name.contains("_partial"))?);
+        }
+    }
     std::fs::write(&programs_path, manifest.to_string())?;
     options.layout.as_mut().unwrap().workspace_manifest = Some(programs_path);
     options.attention_placement = Some(crate::placement::AttentionPlacement::Layers);

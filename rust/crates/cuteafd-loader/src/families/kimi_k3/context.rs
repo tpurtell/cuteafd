@@ -164,6 +164,16 @@ impl ContextLayout {
             && (1..=super::allocation::LANE_ROWS_MAX).contains(&metadata_banks),
             "Kimi context allocation capacity outside supported geometry");
         let programs = manifest["programs"].as_array().context("Kimi context program inventory missing")?;
+        let descriptor_chunk = if dsa {
+            let chunks = [64, 4096].into_iter().map(|rows| -> Result<usize> {
+                let name = format!("kimik31_index_producer_m{rows}");
+                let entries = programs.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
+                ensure!(entries.len() == 1, "Kimi context requires one {name} descriptor");
+                Ok(cuteafd_ffi::KimiSparseMla::descriptor_chunk_size(&entries[0]["geometry"])?)
+            }).collect::<Result<Vec<_>>>()?;
+            ensure!(chunks[0] == chunks[1], "Kimi context mixed descriptor chunks");
+            Some(chunks[0])
+        } else { None };
         let mut scratch = 0;
         let mut tiles = None;
         for name in variant_program_names(format, dsa) {
@@ -192,6 +202,7 @@ impl ContextLayout {
                     let begin = if name.contains("_h0_") { 0 } else { HEADS };
                     ensure!(geometry["heads"] == 96 && geometry["head_begin"] == begin
                         && geometry["head_count"] == HEADS && geometry["max_rows"] == ROWS
+                        && geometry["row_chunk_size"].as_u64() == Some(ROWS.min(descriptor_chunk.unwrap()) as u64)
                         && geometry["page_size"] == 1 && geometry["topk"] == 2048
                         && geometry["num_splits"] == 16 && geometry["lse_base"] == 2
                         && geometry["norm_eps"] == 1e-5 && geometry["kv_cache"] == format.label(),
@@ -208,8 +219,9 @@ impl ContextLayout {
                         && geometry["lse_base"] == 2,
                         "Kimi context {name} requires runtime splits (capacity 16) and base-2 LSE");
                 }
-                let expected = (ROWS * HEADS * 16 * 512 * 2).next_multiple_of(1024)
-                    + ROWS * HEADS * 16 * 4;
+                let scratch_rows = descriptor_chunk.map_or(ROWS, |chunk| ROWS.min(chunk));
+                let expected = (scratch_rows * HEADS * 16 * 512 * 2).next_multiple_of(1024)
+                    + scratch_rows * HEADS * 16 * 4;
                 ensure!(bytes == expected, "Kimi context {name} scratch extent {bytes} differs from native {expected}");
                 scratch = scratch.max(bytes);
             }
@@ -448,9 +460,14 @@ mod tests {
                 serde_json::json!({"name":name,"scratch_bytes_at_capacity":{"scratch":scratch},
                     "geometry":{"heads":96,"head_begin":begin,"head_count":HEADS,"max_rows":ROWS,
                         "page_size":1,"topk":2048,"num_splits":16,"lse_base":2,"norm_eps":1e-5,
-                        "kv_cache":format.label(),"unit_rows":ROWS}})
+                        "kv_cache":format.label(),"unit_rows":ROWS,"row_chunk_size":ROWS}})
             }).collect::<Vec<_>>();
             let mut manifest = serde_json::json!({"programs":entries});
+            for rows in [64, 4096] {
+                manifest["programs"].as_array_mut().unwrap().push(serde_json::json!({
+                    "name":format!("kimik31_index_producer_m{rows}"),
+                    "geometry":{"sparse_mla_row_chunk_size":ROWS}}));
+            }
             manifest["programs"][0]["geometry"] = serde_json::json!({"heads":HEADS,"has_sink":false});
             manifest["programs"][2]["geometry"] = serde_json::json!({"row_bytes":format.record_bytes(),
                 "page_rows":ROWS,"page_bytes":ROWS * format.record_bytes()});

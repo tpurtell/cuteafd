@@ -185,7 +185,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             let mut lane = allocation::NativeLaneLayout::for_ranks(cfg, rows, unit, context as usize,
                 allocation::NativeScratch::from_manifest_for_config(manifest, cfg, gpus)?, gpus)?;
             if cfg.dsa.is_some() {
-                lane = lane.with_sparse_mla_rows(attention_heads)?.with_dsa(cfg,
+                lane = lane.with_sparse_mla_rows(attention_heads, allocation::sparse_mla_chunk(manifest)?)?.with_dsa(cfg,
                     allocation::DsaScratch::from_manifest(manifest)?)?
                     .with_live_projection_rows(attention_heads, gpus)?;
             }

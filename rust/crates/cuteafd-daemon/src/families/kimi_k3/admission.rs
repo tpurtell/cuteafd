@@ -3042,7 +3042,7 @@ pub(super) mod tests {
         let scratch = NativeScratch::from_manifest_for_config(&manifest, &full, 1)?;
         let dsa_scratch = DsaScratch::from_manifest(&manifest)?;
         let mut lane = LaneLayout::for_ranks(&full, 4096, 4096, 1_048_576, scratch, 1)?;
-        *lane = (*lane).clone().with_sparse_mla_rows(96)?.with_dsa(&full, dsa_scratch)?
+        *lane = (*lane).clone().with_sparse_mla_rows(96, cuteafd_loader::families::kimi_k3::allocation::sparse_mla_chunk(&manifest)?)?.with_dsa(&full, dsa_scratch)?
             .with_live_projection_rows(96, 1)?;
 
         let arch = ArchContext::for_device("sm_120", PRO_TOTAL_BYTES);

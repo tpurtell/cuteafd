@@ -479,7 +479,7 @@ pub struct KimiSparseBatch {
 /// emits natural-log LSE; Context partials emit base2 for the shared peer combine.
 pub struct KimiSparseMla<'a> {
     program: Program<'a>, heads: usize, rows: usize, partial: bool,
-    scratch: usize, format: MlaCacheFormat,
+    scratch: usize, row_chunk_size: usize, format: MlaCacheFormat,
 }
 impl<'a> KimiSparseMla<'a> {
     pub fn load(programs: &'a Programs<'a>, heads: usize, rows: usize, format: MlaCacheFormat,
@@ -491,11 +491,31 @@ impl<'a> KimiSparseMla<'a> {
             let h = if heads == 48 { "" } else { "_h96" };
             format!("kimik31_sparse_mla{h}{suffix}_m{rows}")
         };
-        let scratch = validate_sparse_manifest(programs.spec(&name)?, heads, rows, format, context_head_begin)?;
+        let policy = Self::policy_chunk_size(programs)?;
+        let spec = programs.spec(&name)?;
+        if spec.geometry["row_chunk_size"].as_u64() != Some(rows.min(policy) as u64) {
+            return Err(KimiMlaError::Invalid("selected MLA chunk disagrees with descriptor"));
+        }
+        let scratch = validate_sparse_manifest(spec, heads, rows, format, context_head_begin)?;
         Ok(Self { program: programs.program(&name, SPARSE_ATTENTION)?, heads, rows,
-            partial: context_head_begin.is_some(), scratch, format })
+            partial: context_head_begin.is_some(), scratch, row_chunk_size: rows.min(policy), format })
     }
     pub fn scratch_bytes(&self) -> usize { self.scratch }
+
+    /// The compiled index descriptor is the family policy, never a Rust constant.
+    pub fn policy_chunk_size(programs: &Programs<'_>) -> Result<usize> {
+        let first = Self::descriptor_chunk_size(&programs.spec("kimik31_index_producer_m64")?.geometry)?;
+        let second = Self::descriptor_chunk_size(&programs.spec("kimik31_index_producer_m4096")?.geometry)?;
+        if first != second { return Err(KimiMlaError::Invalid("mixed selected MLA descriptor chunks")); }
+        Ok(first)
+    }
+
+    pub fn descriptor_chunk_size(geometry: &serde_json::Value) -> Result<usize> {
+        let chunk = geometry["sparse_mla_row_chunk_size"].as_u64()
+            .filter(|n| (1..=4096).contains(n))
+            .ok_or(KimiMlaError::Invalid("selected MLA descriptor chunk missing or invalid"))?;
+        Ok(chunk as usize)
+    }
 
     /// The native sparse kernel derives partial/LSE offsets from live rows,
     /// unlike the index selector whose prepared offsets are capacity-baked.
@@ -511,7 +531,7 @@ impl<'a> KimiSparseMla<'a> {
     /// Indices are preselected, causal, valid local slots; each query is one
     /// request. Empty local lengths are permitted only for a Context partial.
     pub fn launch(&self, b: KimiSparseBatch, stream: *mut c_void) -> Result<()> {
-        let scratch = Self::scratch_bytes_for(b.rows, self.heads, self.partial)?;
+        let scratch = Self::scratch_bytes_for(b.rows.min(self.row_chunk_size), self.heads, self.partial)?;
         validate_sparse_batch(b, self.heads, self.rows, self.partial, scratch, self.format)?;
         let partial_scalars = [Scalar::I32(b.rows as i32), Scalar::I64(2048), Scalar::I32(16)];
         let full_scalars = [Scalar::I32(b.rows as i32), Scalar::I32(b.rows as i32), Scalar::I64(2048), Scalar::I32(16)];
@@ -557,7 +577,9 @@ fn validate_sparse_manifest(spec: &ProgramSpec, heads: usize, rows: usize, forma
         return Err(KimiMlaError::Invalid("selected MLA manifest geometry/LSE units/ABI"));
     }
     let align = |n: usize| n.div_ceil(1024) * 1024;
-    let n = rows * if partial { 48 } else { heads } * 16;
+    let chunk = g["row_chunk_size"].as_u64().filter(|n| (1..=rows as u64).contains(n))
+        .ok_or(KimiMlaError::Invalid("selected MLA manifest chunk missing or invalid"))? as usize;
+    let n = chunk * if partial { 48 } else { heads } * 16;
     let scratch = align(n * 512 * 2) + if partial { n * 4 } else { align(n * 4) };
     if spec.scratch.len() != 1 || spec.scratch.get("scratch").copied() != Some(scratch as u64) {
         return Err(KimiMlaError::Invalid("selected MLA manifest scratch"));
@@ -1731,6 +1753,7 @@ mod tests {
                 geometry["kv_cache"] = serde_json::json!(format.label());
                 geometry["max_rows"] = serde_json::json!(rows);
                 geometry["topk"] = serde_json::json!(2048);
+                geometry["row_chunk_size"] = serde_json::json!(rows);
                 geometry["page_size"] = serde_json::json!(1);
                 geometry["lse_base"] = if begin.is_some() { serde_json::json!(2) } else { serde_json::json!("e") };
                 if let Some(begin) = begin {

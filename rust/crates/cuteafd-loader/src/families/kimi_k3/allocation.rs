@@ -109,6 +109,39 @@ impl DsaScratch {
     }
 }
 
+/// Read the K3.1 compiled descriptor and validate every sparse specialization.
+pub fn sparse_mla_chunk(manifest: &serde_json::Value) -> Result<usize> {
+    let programs = manifest["programs"].as_array().context("Kimi program inventory missing")?;
+    let mut policy = None;
+    for rows in [64, 4096] {
+        let name = format!("kimik31_index_producer_m{rows}");
+        let entries = programs.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
+        ensure!(entries.len() == 1, "Kimi requires one {name} descriptor");
+        let chunk = cuteafd_ffi::KimiSparseMla::descriptor_chunk_size(&entries[0]["geometry"])?;
+        ensure!(policy.is_none_or(|p| p == chunk), "Kimi mixed sparse MLA descriptor chunks");
+        policy = Some(chunk);
+    }
+    let chunk = policy.context("Kimi sparse MLA descriptor absent")?;
+    for rows in [64usize, 4096] { for cache in ["", "_fp8"] {
+        for suffix in ["", "_h96", "_partial_h0", "_partial_h48"] {
+            let name = if let Some(head) = suffix.strip_prefix("_partial_") {
+                format!("kimik31_sparse_mla_partial{cache}_{head}_m{rows}")
+            } else { format!("kimik31_sparse_mla{suffix}{cache}_m{rows}") };
+            let entries = programs.iter().filter(|p| p["name"] == name).collect::<Vec<_>>();
+            ensure!(entries.len() == 1, "Kimi requires one {name} chunk inventory");
+            let entry = entries[0];
+            ensure!(entry["geometry"]["row_chunk_size"].as_u64() == Some(rows.min(chunk) as u64),
+                "Kimi {name} chunk disagrees with descriptor");
+            let partial = suffix.starts_with("_partial");
+            let heads = if suffix.is_empty() { 48 } else { 96 };
+            let expected = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(rows.min(chunk), heads, partial)?;
+            ensure!(program_scratch(manifest, &name, rows)? == expected,
+                "Kimi {name} scratch disagrees with chunk");
+        }
+    }}
+    Ok(chunk)
+}
+
 fn program_scratch(manifest: &serde_json::Value, name: &str, rows: usize) -> Result<usize> {
     let entries = manifest["programs"].as_array().context("Kimi program inventory missing")?;
     let mut found = entries.iter().filter(|entry| entry["name"] == name);
@@ -220,8 +253,9 @@ impl NativeLaneLayout {
 
     /// Sparse MLA uses runtime row offsets. Each placed layer's head width
     /// shares this one serialized attention scratch owner on its rank.
-    pub fn with_sparse_mla_rows(mut self, heads: usize) -> Result<Self> {
-        let bytes = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(self.unit.max(64), heads, false)?;
+    pub fn with_sparse_mla_rows(mut self, heads: usize, chunk: usize) -> Result<Self> {
+        ensure!((1..=4096).contains(&chunk), "Kimi sparse MLA chunk outside exported bounds");
+        let bytes = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(self.unit.max(64).min(chunk), heads, false)?;
         let old = self.operands.insert("MLA attention scratch", bytes).context("Kimi MLA attention scratch absent")?;
         ensure!(old >= bytes, "Kimi sparse attention scratch exceeds validated exported capacity");
         self.arena_offsets.clear();
@@ -372,6 +406,7 @@ impl NativeScratch {
     pub fn from_manifest_for_config(manifest: &serde_json::Value, cfg: &KimiK3Config,
         ranks: usize) -> Result<Self> {
         if cfg.dsa.is_none() { return Self::from_manifest_for_ranks(manifest, ranks); }
+        sparse_mla_chunk(manifest)?;
         ensure!(matches!(ranks, 1 | 2), "Kimi native scratch physical rank count");
         let mut mla = Vec::new();
         for rows in [64, 4096] { for suffix in ["", "_h96"] { for cache in ["", "_fp8"] {
@@ -677,7 +712,7 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
     let mut layout = NativeLaneLayout::for_ranks(cfg, rows, unit, context,
         NativeScratch::from_manifest_for_config(manifest, cfg, physical_ranks)?, physical_ranks)?;
     if cfg.dsa.is_some() {
-        layout = layout.with_sparse_mla_rows(attention_heads)?
+        layout = layout.with_sparse_mla_rows(attention_heads, sparse_mla_chunk(manifest)?)?
             .with_dsa(cfg, DsaScratch::from_manifest(manifest)?)?
             .with_live_projection_rows(attention_heads, physical_ranks)?;
     }
@@ -726,7 +761,7 @@ mod tests {
             mla: [168_296_448, 6_467_616_768, 201_326_592] };
         for heads in [48, 96] {
             let old = NativeLaneLayout::new(&cfg, 8256, 2752, 1_048_576, scratch)?
-                .with_sparse_mla_rows(heads)?.with_dsa(&cfg,
+                .with_sparse_mla_rows(heads, 4096)?.with_dsa(&cfg,
                     DsaScratch { producer: 34_865_152, selector: 742_556_672 })?;
             let live = old.clone().with_live_projection_rows(heads, 2)?;
             for name in ["MLA query", "MLA attention", "MLA LSE"] {
@@ -754,13 +789,13 @@ mod tests {
             for heads in [48, 96] {
                 let baseline = NativeLaneLayout::new(&cfg, unit, unit, 1_048_576,
                     NativeScratch { kda: 4096, mla: [4096, maximum, 4096] })?;
-                let exact = baseline.clone().with_sparse_mla_rows(heads)?;
+                let exact = baseline.clone().with_sparse_mla_rows(heads, 4096)?;
                 let bytes = cuteafd_ffi::KimiSparseMla::scratch_bytes_for(unit, heads, false)?;
                 assert_eq!(exact.operands["MLA attention scratch"], bytes);
                 assert_eq!(baseline.bytes()? - exact.bytes()?, maximum - bytes);
                 let offset = exact.arena_offsets["MLA attention scratch"];
                 assert!(offset + bytes <= exact.arena_bytes);
-                assert_eq!(exact, baseline.with_sparse_mla_rows(heads)?, "runtime and planner use the same owner layout");
+                assert_eq!(exact, baseline.with_sparse_mla_rows(heads, 4096)?, "runtime and planner use the same owner layout");
             }
         }
         // Isolate this owner's effect in the real pool solver: fixed BF16
@@ -788,7 +823,7 @@ mod tests {
         }
         let old = NativeLaneLayout::new(&cfg, 2752, 2752, 1_048_576,
             NativeScratch { kda: 4096, mla: [4096, maximum, 4096] })?;
-        let exact = old.clone().with_sparse_mla_rows(96)?;
+        let exact = old.clone().with_sparse_mla_rows(96, 4096)?;
         let request = p::Request { context: p::Context::resolve(1_048_576, None), pool: p::Pin::Auto,
             onboard: p::Pin::Auto, prefill: p::Pin::Auto, operation: p::Operation::Serving,
             resident_weight_limit: None, spark_reply_formats: Default::default() };
@@ -826,7 +861,40 @@ mod tests {
                 }
             }
         }
+        for program in &mut programs {
+            let name = program["name"].as_str().unwrap().to_owned();
+            if name.starts_with("kimik31_index_producer_") {
+                program["geometry"] = serde_json::json!({"sparse_mla_row_chunk_size": 64});
+            }
+            if name.starts_with("kimik31_sparse_mla") {
+                let heads = if name.contains("_h96_") || name.contains("_partial") { 96 } else { 48 };
+                program["geometry"] = serde_json::json!({"row_chunk_size": 64});
+                program["scratch_bytes_at_capacity"]["scratch"] = serde_json::json!(
+                    cuteafd_ffi::KimiSparseMla::scratch_bytes_for(64, heads, name.contains("_partial")).unwrap());
+            }
+        }
         serde_json::json!({"programs": programs})
+    }
+
+    #[test]
+    fn k31_sparse_chunk_descriptor_refuses_missing_mixed_and_wrong_scratch() -> Result<()> {
+        let manifest = k31_manifest();
+        assert_eq!(sparse_mla_chunk(&manifest)?, 64);
+        for key in ["sparse_mla_row_chunk_size", "row_chunk_size"] {
+            for value in [serde_json::Value::Null, serde_json::json!(0), serde_json::json!(512)] {
+                let mut wrong = manifest.clone();
+                let entry = wrong["programs"].as_array_mut().unwrap().iter_mut()
+                    .find(|p| p["geometry"].get(key).is_some()).unwrap();
+                entry["geometry"][key] = value;
+                assert!(sparse_mla_chunk(&wrong).is_err(), "{key}");
+            }
+        }
+        let mut wrong = manifest.clone();
+        let entry = wrong["programs"].as_array_mut().unwrap().iter_mut()
+            .find(|p| p["geometry"].get("row_chunk_size").is_some()).unwrap();
+        entry["scratch_bytes_at_capacity"]["scratch"] = serde_json::json!(1);
+        assert!(sparse_mla_chunk(&wrong).is_err());
+        Ok(())
     }
 
     #[test]
@@ -836,7 +904,7 @@ mod tests {
         let manifest = k31_manifest();
         for ranks in [1, 2] {
             let scratch = NativeScratch::from_manifest_for_config(&manifest, &cfg, ranks)?;
-            assert_eq!(scratch, NativeScratch { kda: 4096, mla: [4096 * 2048, 4096 * 4096, 4096 * 1024] });
+            assert_eq!(scratch, NativeScratch { kda: 4096, mla: [4096 * 2048, 64 * 96 * 16 * 1028, 4096 * 1024] });
         }
         assert_eq!(DsaScratch::from_manifest(&manifest)?, DsaScratch { producer: 4096 * 8512, selector: 4096 * 256 });
         assert!(NativeScratch::from_manifest_for_ranks(&manifest, 2).is_err());
