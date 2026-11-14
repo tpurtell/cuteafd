@@ -1068,6 +1068,19 @@ mod tests {
     }
 
     #[test]
+    fn pairing_accepts_shared_fp8_policy_but_keeps_unknown_controls_fixed() {
+        let mut baseline=run(3,8);
+        baseline.settings=serde_json::json!({"model":"checkpoint","settings":[
+            {"name":"CUTEAFD_FP8_PREFILL","value":"auto","source":"env"}]});
+        let mut candidate=baseline.clone();
+        candidate.settings["settings"][0]["value"]=serde_json::json!("off");
+        assert!(compare(&candidate,&baseline,0.005,0.005,100,1).unwrap().pass);
+        candidate.settings["settings"].as_array_mut().unwrap().push(
+            serde_json::json!({"name":"CUTEAFD_UNRELATED","value":"changed","source":"env"}));
+        assert!(compare(&candidate,&baseline,0.005,0.005,100,1).is_err());
+    }
+
+    #[test]
     fn pairing_allows_only_precision_switches_to_change() {
         let mut b = run(3, 8);
         b.settings = serde_json::json!({"model": "checkpoint", "settings": [
