@@ -91,6 +91,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let checkpoint = Checkpoint::coordinator_view(&view, false, false)?;
             let cfg = MiniMaxM3Config::from_hf(&checkpoint.config)?;
             cuteafd_bench::context::set_family("minimax_m3");
+            cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::MINIMAX_M3)
+                .map_err(|previous| anyhow::anyhow!("MiniMax serving needs an isolated process: expert geometry already fixed to {previous:?}"))?;
             // SAFETY: all native owners and the scheduler retire inside this worker
             // before the library and installed program manifest are dropped.
             let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&worker_args.native_lib)? });
@@ -149,6 +151,17 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn serve_fixes_expert_geometry_before_any_native_library_load() {
+        let source = include_str!("serve.rs").split_once("pub(crate) async fn run(").unwrap().1
+            .split_once("#[cfg(test)]").unwrap().0;
+        let fixed = source.find("cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::MINIMAX_M3)").unwrap();
+        let native = source.find("cuteafd_ffi::NativeLibrary::load(").unwrap();
+        assert!(fixed < native, "native loading syncs expert hidden size and fixes the process default");
+        assert_eq!(source.matches("set_expert_geometry(").count(), 1);
+        assert!(source.contains("super::startup::load("), "constructor still validates the same fixed geometry");
+    }
+
     #[test]
     fn hidden_serve_cli_and_runtime_settings_have_a_cpu_seam() -> Result<()> {
         use clap::Parser;
