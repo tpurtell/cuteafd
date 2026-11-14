@@ -719,7 +719,9 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let skip_routed_experts = inputs.skip_routed_experts;
     let unit_rows = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(inputs.rows, inputs.waves,
         inputs.unit_rows)?.unit_rows as usize;
-    let lane_layouts = inputs.lane_layouts.iter().map(|pair| pair.to_vec()).collect::<Vec<_>>();
+    let mut lane_layouts = inputs.lane_layouts.iter().map(|pair| pair.to_vec()).collect::<Vec<_>>();
+    let mut shaped = lane_layouts.iter().enumerate().flat_map(|(lane, pair)| pair.iter().enumerate()
+        .map(move |(rank, layout)| layout.shaped_owner(rank as u8, lane))).collect::<Result<Vec<_>>>()?;
     let state_slots = inputs.state_slots;
     let legacy_marks = inputs.prefix_marks;
     let global_layouts = GlobalLayout::ranks_with_core(cfg, &core, devices.len())?;
@@ -819,8 +821,11 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             }
         }
     }
-    let mut fixed = request.fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
-    fixed.extend(request.context_buffers.demands()?.iter().filter(|demand| demand.bytes > 0).map(FixedOwner::ready));
+    let mut fixed = request.fixed.iter().filter(|d| !(0..lanes).any(|lane|
+        d.group == format!("Kimi lane {lane} native operands"))).map(FixedOwner::ready).collect::<Vec<_>>();
+    if let Some(layout) = &context {
+        shaped.push(kimi::ShapedOwner::Context { layout: layout.clone() });
+    }
     // The post-module sample is declared once as an existing physical owner;
     // budgets are full capacities, not a second free-memory subtraction.
     for rank in 0..RANKS {
@@ -850,7 +855,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_core::spark_reply::requested())?,
         draft: draft.as_ref().map(|layout| kimi::draft_facts(layout, page_rows, maximum_pages, (RANKS - 1) as u8)).transpose()?,
-        fixed, owners: Vec::new(),
+        fixed, shaped, owners: Vec::new(),
     };
     recipe.arena_padding(cfg, &core)?;
     recipe.blas_owners(crate::shared::target_head::TargetHead::configured().blas_head(
@@ -909,6 +914,9 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
     let mark_selection = MarkSelection { legacy_slots: legacy_marks as u64, slots: legacy_marks as u64, reduction_reason: None };
     let pool_tokens = usize::try_from(placement.pool_tokens)?;
+    let served = usize::try_from(admitted.solved.served_context())?;
+    let context = context.map(|layout| layout.with_served_context(served)).transpose()?;
+    for layout in lane_layouts.iter_mut().flatten() { layout.resolve_context(served)?; }
     let draft = draft.map(|layout| layout.with_pool_tokens(pool_tokens)).transpose()?;
     let graph_set = if graph_reserve && RANKS == 2 && placement_mode == AttentionPlacement::Layers {
         Some(super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows, graph_slots,
@@ -1523,6 +1531,38 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn automatic_context_resolves_real_workspace_staging_and_lane_tables() -> Result<()> {
+        let cfg = cfg();
+        let mut i = inputs(&cfg);
+        i.lanes = 1;
+        i.lane_layouts.truncate(1);
+        i.cache_format = cuteafd_core::MlaCacheFormat::Fp8;
+        i.attention = Some(AttentionPlacement::Context);
+        let initial = context_layout(i.cache_format)?;
+        i.context = Some(initial.clone());
+        i.serving_context = cuteafd_loader::placement::planner::Context::automatic(1_048_576);
+        i.requested_pool = Some(262_144);
+        let admitted = admit(i)?;
+        assert_eq!(admitted.placement.pool_tokens, 262_144);
+        let resolved = initial.with_served_context(262_144)?;
+        assert_eq!(admitted.context_layout(), Some(&resolved));
+        assert!(resolved.buffers().workspace_bytes < initial.buffers().workspace_bytes);
+        for demand in resolved.buffers().demands()? {
+            let items = admitted.placement.items[demand.gpu as usize].iter()
+                .filter(|item| item.group == demand.group).collect::<Vec<_>>();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].bytes, demand.bytes);
+        }
+        for (rank, layout) in admitted.lane_layouts[0].iter().enumerate() {
+            assert_eq!(layout.max_context(), 262_144);
+            let demand = layout.demand(rank as u8, 0)?;
+            assert_eq!(admitted.placement.items[rank].iter().filter(|item| item.group == demand.group)
+                .map(|item| item.bytes).sum::<u64>(), demand.bytes);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn auto_pair_charges_exactly_explicit_context_and_single_stays_layers() -> Result<()> {
         let cfg = cfg();
         let pair = |attention| -> Result<_> {
@@ -1773,6 +1813,7 @@ pub(super) mod tests {
         let full = KimiK3Config::from_hf(&cuteafd_loader::plan::testing::kimi_k3_config())?;
         for context in [262144, 1048576] {
             let mut i = inputs(&cfg);
+            i.serving_context = cuteafd_loader::placement::planner::Context::pinned(context as u64);
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&full, i.rows, test_unit(i.rows, i.waves, i.unit_rows), context,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             let layout = draft_layout(i.state_slots, i.state_slots, context);
@@ -1783,6 +1824,7 @@ pub(super) mod tests {
             assert!(request.startup.contains(&peak));
             assert!(!request.fixed.iter().any(|d| d.group == peak.group));
             let mut i = inputs(&cfg);
+            i.serving_context = cuteafd_loader::placement::planner::Context::pinned(context as u64);
             i.lane_layouts = vec![std::array::from_fn(|_| LaneLayout::new(&full, i.rows, test_unit(i.rows, i.waves, i.unit_rows), context,
                 super::super::device::NativeScratch { kda: 1024, mla: [512, 0, 1024] }).unwrap()); i.lanes];
             i.draft = Some(layout.clone());
@@ -3000,7 +3042,8 @@ pub(super) mod tests {
         let scratch = NativeScratch::from_manifest_for_config(&manifest, &full, 1)?;
         let dsa_scratch = DsaScratch::from_manifest(&manifest)?;
         let mut lane = LaneLayout::for_ranks(&full, 4096, 4096, 1_048_576, scratch, 1)?;
-        *lane = (*lane).clone().with_dsa(&full, dsa_scratch)?;
+        *lane = (*lane).clone().with_sparse_mla_rows(96)?.with_dsa(&full, dsa_scratch)?
+            .with_live_projection_rows(96, 1)?;
 
         let arch = ArchContext::for_device("sm_120", PRO_TOTAL_BYTES);
         let selected = ProgramSet::from_manifest(&manifest, &["kimik3", "kimik31"]);
@@ -3097,9 +3140,9 @@ pub(super) mod tests {
             try_prefix(63, FREE_DECODE_EAGER, true, 0).err().context("last_layer=63 decode graphs must refuse")?);
         let refusal_63_verify = format!("{:#}",
             try_prefix(63, FREE_DECODE_EAGER, true, 5).err().context("last_layer=63 verify graphs must refuse")?);
-        assert!(refusal_63_eager.contains("105269952524"), "unexpected 63 eager refusal: {refusal_63_eager}");
-        assert!(refusal_63_decode.contains("106302629132"), "unexpected 63 decode refusal: {refusal_63_decode}");
-        assert!(refusal_63_verify.contains("106302629132"), "unexpected 63 verify refusal: {refusal_63_verify}");
+        assert!(refusal_63_eager.contains("105273279020"), "unexpected 63 eager refusal: {refusal_63_eager}");
+        assert!(refusal_63_decode.contains("106305955628"), "unexpected 63 decode refusal: {refusal_63_decode}");
+        assert!(refusal_63_verify.contains("106305955628"), "unexpected 63 verify refusal: {refusal_63_verify}");
 
         let admitted_prefill = try_prefix(59, FREE_PREFILL, false, 0)?;
         let admitted_decode_eager = try_prefix(59, FREE_DECODE_EAGER, false, 0)?;
@@ -3120,13 +3163,15 @@ pub(super) mod tests {
                 .collect()
         };
 
-        assert_eq!(total_bytes(&admitted_decode_eager), 99_699_916_812);
-        assert_eq!(total_bytes(&admitted_prefill), 99_699_982_348);
-        assert_eq!(total_bytes(&admitted_decode), 100_732_593_420);
-        assert_eq!(total_bytes(&admitted_verify), 100_732_593_420);
+        // Independently rounding the actual lane requests adds 3,326,496 B
+        // versus the former fictional single-allocation lane tail.
+        assert_eq!(total_bytes(&admitted_decode_eager), 99_703_243_308);
+        assert_eq!(total_bytes(&admitted_prefill), 99_703_308_844);
+        assert_eq!(total_bytes(&admitted_decode), 100_735_919_916);
+        assert_eq!(total_bytes(&admitted_verify), 100_735_919_916);
 
-        // The 65,536 B (64 KiB) difference between prefill (99,699,982,348) and decode_eager
-        // (99,699,916,812) is owned 100% by CONTEXT_MEASURED ("CUDA context and loaded modules"),
+        // The 65,536 B (64 KiB) difference between prefill and decode_eager
+        // is owned 100% by CONTEXT_MEASURED ("CUDA context and loaded modules"),
         // reflecting one 64 KiB CUDA driver page-table/context slab in PreWeight cuMemGetInfo_v2;
         // every weight, KV, workspace and 2 MiB CUmem granularity item is byte-identical.
         assert_eq!(context_item(&admitted_prefill)?, 678_756_352);

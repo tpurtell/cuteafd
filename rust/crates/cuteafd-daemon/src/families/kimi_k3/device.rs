@@ -413,7 +413,8 @@ impl<'a> NativePrograms<'a> {
         let mut layout=LaneLayout { base: cuteafd_loader::families::kimi_k3::allocation::NativeLaneLayout::for_ranks(
             cfg, rows, unit, max_context, self.scratch, self.ranks)?, core: None };
         if let Some(dsa) = &self.dsa {
-            layout.base = layout.base.with_sparse_mla_rows(attention_heads)?.with_dsa(cfg, dsa.scratch)?;
+            layout.base = layout.base.with_sparse_mla_rows(attention_heads)?.with_dsa(cfg, dsa.scratch)?
+                .with_live_projection_rows(attention_heads, self.ranks)?;
         }
         if let Some(core)=&self.core {
             layout.core=core.layouts[rank].clone();
@@ -472,6 +473,22 @@ impl LaneLayout {
     pub(crate) fn rows(&self) -> usize { self.rows }
 
     pub(crate) fn max_context(&self) -> usize { self.max_context }
+
+    pub(crate) fn shaped_owner(&self, rank: u8, lane: usize)
+        -> Result<cuteafd_loader::placement::families::kimi::ShapedOwner> {
+        let extra_requests = self.core.as_ref().map(|core| -> Result<Vec<usize>> {
+            let layout = cuteafd_loader::formats::trellis_core::ProjectionScratchLayout {
+                extents: core.extents.clone(), rows: core.rows };
+            Ok(layout.storage()?.owners.values().copied().collect())
+        }).transpose()?.unwrap_or_default();
+        Ok(cuteafd_loader::placement::families::kimi::ShapedOwner::Lane {
+            rank, lane, layout: self.base.clone(), extra_requests })
+    }
+
+    pub(crate) fn resolve_context(&mut self, context: usize) -> Result<()> {
+        self.base = self.base.with_served_context(context)?;
+        Ok(())
+    }
 
     pub(crate) fn demand(&self, rank: u8, lane: usize) -> Result<Demand> {
         ensure!(rank < 2 && lane < 2, "Kimi lane rank/index outside TP2 two-lane executor");

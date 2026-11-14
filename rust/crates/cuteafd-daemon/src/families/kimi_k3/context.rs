@@ -819,7 +819,9 @@ mod tests {
                 // Isolate cases so the fixture's bounded event pool does not accumulate.
                 let library = fixture.load()?;
                 fixture.extent_only(&library)?;
-                let layout = ContextLayout::from_manifest(&manifest, format, extent, 2752, 3)?;
+                let prepared = ContextLayout::from_manifest(&manifest, format, 1_048_576, 2752, 3)?;
+                let layout = prepared.with_served_context(extent)?;
+                assert_eq!(layout, ContextLayout::from_manifest(&manifest, format, extent, 2752, 3)?);
                 let streams = [0, 1].map(|id| Rc::new(Stream::new(
                     crate::shared::memory::device::Device { library: &library, id }).unwrap()));
                 let before = fixture.mapped_bytes(&library)?;

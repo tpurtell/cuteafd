@@ -239,6 +239,37 @@ impl NativeLaneLayout {
         Ok(self)
     }
 
+    /// Projection offsets use live rows; sparse selection still retains its
+    /// AOT-baked selector and recurrence workspaces at their declared capacity.
+    pub fn with_live_projection_rows(mut self, heads: usize, ranks: usize) -> Result<Self> {
+        let rows = self.unit.max(64);
+        for (name, stride) in [("MLA query", heads * 576 * 2), ("MLA attention", heads * 512 * 2),
+            ("MLA LSE", heads * 4)] {
+            self.operands.insert(name, self.unit * stride);
+        }
+        let [producer, output] = cuteafd_ffi::KimiMlaProjection::scratch_bytes_for(rows, heads)?;
+        for (name, bytes) in [("MLA producer scratch", producer), ("MLA output scratch", output),
+            ("DSA producer scratch", cuteafd_ffi::KimiIndexProducer::scratch_bytes_for(rows)?)] {
+            let old = self.operands.insert(name, bytes).context("Kimi projection owner absent")?;
+            ensure!(old >= bytes, "Kimi live projection exceeds exported scratch");
+        }
+        let old = self.operands["KDA scratch"];
+        self.operands.insert("KDA scratch", cuteafd_ffi::KimiKda::scratch_bytes_for(rows, 4096, 96 / ranks, old)?);
+        self.arena_offsets.clear();
+        self.arena_bytes = 0;
+        for phase in SCRATCH_PHASES {
+            let mut end = 0usize;
+            for &name in phase {
+                let offset = end.next_multiple_of(ARENA_ALIGNMENT);
+                self.arena_offsets.insert(name, offset);
+                end = offset.checked_add(self.operands[name]).context("Kimi live phase extent overflow")?;
+            }
+            self.arena_bytes = self.arena_bytes.max(end);
+        }
+        self.bytes()?;
+        Ok(self)
+    }
+
     /// Add exact index owners without changing any existing BF16 or core phase
     /// offsets. Context candidate exchange/partial owners are admitted separately.
     pub fn with_dsa(mut self, cfg: &KimiK3Config, scratch: DsaScratch) -> Result<Self> {
@@ -263,6 +294,21 @@ impl NativeLaneLayout {
         }
         self.bytes()?;
         Ok(self)
+    }
+
+    /// Page-table banks follow the served extent; kernel phase offsets stay fixed.
+    pub fn with_served_context(&self, context: usize) -> Result<Self> {
+        ensure!((1..=self.max_context).contains(&context), "Kimi lane context exceeds prepared extent");
+        let mut layout = self.clone();
+        for name in ["MLA page table", "DSA page table"] {
+            if let Some(bytes) = layout.operands.get_mut(name) {
+                *bytes = (self.unit.min(64) * context.div_ceil(64) * 4)
+                    .max(16).next_multiple_of(16) * self.metadata_banks();
+            }
+        }
+        layout.max_context = context;
+        layout.bytes()?;
+        Ok(layout)
     }
 
     /// Preserve every BF16 offset. Place transient K6 operands into holes whose
@@ -632,7 +678,8 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
         NativeScratch::from_manifest_for_config(manifest, cfg, physical_ranks)?, physical_ranks)?;
     if cfg.dsa.is_some() {
         layout = layout.with_sparse_mla_rows(attention_heads)?
-            .with_dsa(cfg, DsaScratch::from_manifest(manifest)?)?;
+            .with_dsa(cfg, DsaScratch::from_manifest(manifest)?)?
+            .with_live_projection_rows(attention_heads, physical_ranks)?;
     }
     let owners = crate::placement::attention::alternating_owners(
         cfg.attention.iter().map(|kind| (*kind == KimiAttention::Mla, None)), 0)?;
@@ -669,6 +716,33 @@ mod tests {
 
     fn cfg() -> KimiK3Config {
         KimiK3Config::from_hf(&crate::plan::testing::kimi_k3_config()).unwrap()
+    }
+
+    #[test]
+    fn k31_live_lane_inventory_uses_placed_heads_and_unit_rows() -> Result<()> {
+        let mut cfg = cfg();
+        cfg.dsa = Some(super::super::config::KimiDsaConfig { heads: 32, head_dim: 128, topk: 2048 });
+        let scratch = NativeScratch { kda: 629_464_064,
+            mla: [168_296_448, 6_467_616_768, 201_326_592] };
+        for heads in [48, 96] {
+            let old = NativeLaneLayout::new(&cfg, 8256, 2752, 1_048_576, scratch)?
+                .with_sparse_mla_rows(heads)?.with_dsa(&cfg,
+                    DsaScratch { producer: 34_865_152, selector: 742_556_672 })?;
+            let live = old.clone().with_live_projection_rows(heads, 2)?;
+            for name in ["MLA query", "MLA attention", "MLA LSE"] {
+                assert_eq!(live.operands[name] * 96, old.operands[name] * heads);
+            }
+            assert_eq!(live.operands["MLA attention scratch"], 2752 * heads * 16 * 1028);
+            assert_eq!(live.operands["DSA selector scratch"], 742_556_672);
+            assert_eq!(live.operands["DSA producer scratch"],
+                cuteafd_ffi::KimiIndexProducer::scratch_bytes_for(2752)?);
+            assert!(live.bytes()? < old.bytes()?);
+            println!("h{heads}: before={} after={} arena={}", old.bytes()?, live.bytes()?, live.arena_bytes);
+            for (name, bytes) in &live.operands {
+                println!("h{heads} {name}: {bytes} arena_offset={:?}", live.arena_offsets.get(name));
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -802,6 +876,16 @@ mod tests {
                 assert_eq!(lane.metadata_extent(name, 1)?, (stride, stride));
             }
             assert_eq!(lane.metadata_extent("DSA lengths", 0)?.1, unit * 4);
+            for context in [1usize, 65, 8192, 997_376, 1_048_576] {
+                let resolved = lane.with_served_context(context)?;
+                assert_eq!(resolved.arena_offsets, lane.arena_offsets);
+                assert_eq!(resolved.arena_bytes, lane.arena_bytes);
+                for name in ["MLA page table", "DSA page table"] {
+                    assert_eq!(resolved.operands[name],
+                        (unit.min(64) * context.div_ceil(64) * 4).max(16).next_multiple_of(16) * lane.metadata_banks());
+                }
+                for name in DSA_SCRATCH { assert_eq!(resolved.operands[name], lane.operands[name]); }
+            }
             let extra = DSA_METADATA.into_iter().chain(DSA_SCRATCH).map(|name| lane.operands[name]).sum::<usize>();
             assert_eq!(lane.bytes()? - base.bytes()?, extra);
             assert!(lane.with_dsa(&cfg, index).is_err());

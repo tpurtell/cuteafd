@@ -69,16 +69,23 @@ pub fn package_lane_extents(manifest: &serde_json::Value, rows: usize, unit: usi
 
 pub fn package_lane_extents_for_ranks(manifest: &serde_json::Value, rows: usize, unit: usize,
     ranks: usize) -> Result<BTreeMap<&'static str,usize>> {
-    package_lane_extents_with_dsa(manifest, rows, unit, ranks, false)
+    package_lane_extents_with_dsa(manifest, rows, unit, ranks, false, None)
 }
 
 pub fn package_lane_extents_for_config(manifest: &serde_json::Value, cfg: &KimiK3Config, rows: usize,
     unit: usize, ranks: usize) -> Result<BTreeMap<&'static str,usize>> {
-    package_lane_extents_with_dsa(manifest, rows, unit, ranks, cfg.dsa.is_some())
+    package_lane_extents_with_dsa(manifest, rows, unit, ranks, cfg.dsa.is_some(), None)
+}
+
+pub fn package_lane_extents_with_base(manifest: &serde_json::Value, cfg: &KimiK3Config,
+    rows: usize, unit: usize, ranks: usize, base: &super::allocation::NativeLaneLayout)
+    -> Result<BTreeMap<&'static str, usize>> {
+    package_lane_extents_with_dsa(manifest, rows, unit, ranks, cfg.dsa.is_some(),
+        Some((base.operands["KDA scratch"], base.operands["MLA producer scratch"])))
 }
 
 fn package_lane_extents_with_dsa(manifest: &serde_json::Value, rows: usize, unit: usize,
-    ranks: usize, dsa: bool) -> Result<BTreeMap<&'static str,usize>> {
+    ranks: usize, dsa: bool, live_base: Option<(usize, usize)>) -> Result<BTreeMap<&'static str,usize>> {
     ensure!(matches!(ranks, 1 | 2), "Kimi K6 package physical rank count");
     let programs=manifest["programs"].as_array().context("Kimi K6 package program list")?;
     let scratch=|name: &str| -> Result<usize> {
@@ -103,6 +110,7 @@ fn package_lane_extents_with_dsa(manifest: &serde_json::Value, rows: usize, unit
             }}
         }
     }
+    let (base_kda, base_mla) = live_base.unwrap_or((base_kda, base_mla));
     lane_extents_for_ranks(rows,unit,base_kda,base_mla,split_kda,split_mla,ranks)
 }
 

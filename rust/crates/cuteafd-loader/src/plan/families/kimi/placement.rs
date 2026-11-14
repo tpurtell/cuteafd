@@ -169,6 +169,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }
     let mut baseline = vec![Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }; gpus];
     let mut tp2_workspace = [0; 2];
+    let mut shaped = Vec::new();
     if let Some(manifest) = &manifest {
         let extra = (|| -> anyhow::Result<_> {
             use crate::families::kimi_k3::{allocation, core};
@@ -176,9 +177,19 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot|
                 crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
                 .transpose()?.unwrap_or(0);
+            let attention_heads = if matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context)
+                && gpus == 2 { 48 } else { 96 };
             let mut demands = allocation::baseline_demands_for_ranks(cfg, manifest, rows, shape, context as usize,
                 usize::try_from(slots)?, verify, &model.core, matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context),
-                ranks, gpus, opts.resolved_spark_reply_format(false), if matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context) && gpus == 2 { 48 } else { 96 })?;
+                ranks, gpus, opts.resolved_spark_reply_format(false), attention_heads)?;
+            let mut lane = allocation::NativeLaneLayout::for_ranks(cfg, rows, unit, context as usize,
+                allocation::NativeScratch::from_manifest_for_config(manifest, cfg, gpus)?, gpus)?;
+            if cfg.dsa.is_some() {
+                lane = lane.with_sparse_mla_rows(attention_heads)?.with_dsa(cfg,
+                    allocation::DsaScratch::from_manifest(manifest)?)?
+                    .with_live_projection_rows(attention_heads, gpus)?;
+            }
+            demands.retain(|d| d.group != "Kimi lane 0 native operands");
             if let Some(context) = &context_layout {
                 // Validate the context key inventory; the graph reserve is the
                 // configured arena, charged once by the recipe.
@@ -202,8 +213,21 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             }
             if !model.core.projections.is_empty() {
                 // The baseline already includes the full peer receive allocation.
-                demands.extend(core::CoreCharges::from_package_with_native(cfg, &model.core, rows, unit, manifest, &native_manifest, gpus)?.demands()?
-                    .into_iter().filter(|d| d.group != "Kimi K6 peer receive"));
+                let charges = core::CoreCharges::from_package_with_native(cfg, &model.core, rows, unit,
+                    manifest, &native_manifest, gpus)?;
+                let mut stages = core::package_lane_extents_with_base(manifest, cfg, rows, unit, gpus, &lane)?;
+                stages.extend(model.core.native_stages_from_manifest(&native_manifest, rows, unit, gpus)?);
+                lane = lane.with_core_stages(stages)?;
+                for rank in 0..gpus {
+                    let extra_requests = charges.projection[rank].as_ref().map(|layout|
+                        layout.storage().map(|storage| storage.owners.values().copied().collect::<Vec<_>>()))
+                        .transpose()?.unwrap_or_default();
+                    shaped.push(kimi::ShapedOwner::Lane { rank: rank as u8, lane: 0,
+                        layout: lane.clone(), extra_requests });
+                }
+            } else {
+                shaped.extend((0..gpus).map(|rank| kimi::ShapedOwner::Lane { rank: rank as u8,
+                    lane: 0, layout: lane.clone(), extra_requests: Vec::new() }));
             }
             if opts.onboard != Some(OnboardSetting::Layers(0)) {
                 let package = allocation::expert_package_for_ranks(path, gpus)?;
@@ -400,13 +424,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 overhead: if active { owners } else { 0 } });
         }
     }
-    let mut fixed_owners = fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
-    if context_split {
-        match context_buffers.demands() {
-            Ok(demands) => fixed_owners.extend(demands.iter().map(FixedOwner::ready)),
-            Err(error) => { report.refuse_placement(format!("Kimi context buffers refused: {error:#}"),
-                "Check the context program geometry."); return memory; }
-        }
+    let fixed_owners = fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
+    if let Some(layout) = context_layout {
+        shaped.push(kimi::ShapedOwner::Context { layout });
     }
     let peer_row_bytes = if context_split {
         context_buffers.query_row_bytes.saturating_add(context_buffers.partial_row_bytes)
@@ -463,7 +483,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         experts: Some(ExpertProfile { layers: spark_budget.layers.clone(),
             destination: if gpus == 2 { vec![0, 1] } else { vec![0] },
             counts, rank_sets: if ranks > 0 { vec![(0..ranks as u8).collect()] } else { Vec::new() } }),
-        arenas, spark, links, draft, fixed: fixed_owners, owners: Vec::new(),
+        arenas, spark, links, draft, fixed: fixed_owners, shaped, owners: Vec::new(),
     };
     if let Err(error) = recipe.arena_padding(cfg, &model.core) {
         report.refuse_placement(format!("Kimi packed arena inventory refused: {error:#}"),
@@ -564,6 +584,14 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             let served = selection.solved.request.context.served(selection.solved.pool_tokens);
             memory.notes.retain(|note| !note.starts_with("Kimi API max context:"));
             memory.notes.push(format!("Kimi API max context: {served} tokens; compiled max context: {COMPILED_CAPACITY} tokens"));
+            if context_split {
+                memory.notes.retain(|note| !note.starts_with("Kimi context gathered-prefill staging"));
+                let staging = |extent: u64| 2 * extent.div_ceil(PAGE) * PAGE * opts.mla_kv.record_bytes() as u64;
+                memory.notes.push(format!("Kimi context gathered-prefill staging per GPU: configured {served} tokens = {} B ({:.4} GiB); \
+                    compiled cap {COMPILED_CAPACITY} tokens = {} B ({:.4} GiB); two full-history planes, bounded by served context and pool",
+                    staging(served), staging(served) as f64 / GIB as f64,
+                    staging(COMPILED_CAPACITY), staging(COMPILED_CAPACITY) as f64 / GIB as f64));
+            }
             let placed = &selection.placement;
             memory.notes.push(format!("Kimi retained prefix marks are a fixed charge: {legacy_marks} slots per rank"));
             memory.notes.push(format!("Kimi selected RTX expert layers: {}; retained marks: {}", placed.onboard_layers, legacy_marks));

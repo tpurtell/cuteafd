@@ -114,6 +114,7 @@ pub struct ContextLayout {
     buffers: ContextBuffers,
     workspace: Vec<(&'static str, usize)>,
     metadata_banks: usize,
+    metadata_rows: usize,
     decode: DecodeBuckets,
     tiles: Option<TilePolicy>,
     dsa: bool,
@@ -244,7 +245,7 @@ impl ContextLayout {
         ensure!(dsa || tiles.is_some(), "Kimi context tile policy missing");
         let decode = DecodeBuckets::from_manifest(manifest)?;
         let decode = if dsa { decode.for_dsa() } else { decode };
-        Ok(Self { buffers, workspace, metadata_banks, decode, tiles, dsa })
+        Ok(Self { buffers, workspace, metadata_banks, metadata_rows, decode, tiles, dsa })
     }
 
     pub fn decode(&self) -> &DecodeBuckets { &self.decode }
@@ -252,6 +253,25 @@ impl ContextLayout {
     pub fn dsa(&self) -> bool { self.dsa }
     pub fn buffers(&self) -> ContextBuffers { self.buffers }
     pub fn workspace(&self) -> Vec<(&'static str, usize)> { self.workspace.clone() }
+
+    /// Preserve validated programs and row banks, shrinking only history owners.
+    pub fn with_served_context(&self, context: usize) -> Result<Self> {
+        ensure!((1..=self.buffers.compiled_extent as usize).contains(&context),
+            "Kimi context exceeds prepared extent");
+        let mut layout = self.clone();
+        let half_pages = context.div_ceil(ROWS).div_ceil(2);
+        for (name, bytes) in &mut layout.workspace {
+            let raw = match *name {
+                "compact page tables" => self.metadata_rows * half_pages * 4,
+                "gather tables" => 2 * half_pages * 4,
+                _ => continue,
+            };
+            *bytes = raw.max(256).next_multiple_of(256) * self.metadata_banks;
+        }
+        layout.buffers.compiled_extent = context as u64;
+        layout.buffers.workspace_bytes = layout.workspace.iter().map(|(_, bytes)| *bytes as u64).sum();
+        Ok(layout)
+    }
 
     /// Each unit keeps its compact/gather/commit metadata until the wave drains.
     pub fn metadata_extent(&self, name: &str, bank: usize) -> Result<(usize, usize)> {
@@ -453,6 +473,18 @@ mod tests {
                 assert_eq!(layout.metadata_extent("DSA merged lengths", 2)?, (2 * unit * 4, unit * 4));
                 assert_eq!(layout.metadata_extent("compact page tables", 0)?.1, unit * 64 * 4);
             }
+            let prepared = ContextLayout::from_variant(&manifest, format, 1_048_576, 2752, 3, true)?;
+            for extent in [1, 65, 8192, 131_201, 997_376, 1_048_576] {
+                let resolved = prepared.with_served_context(extent)?;
+                let fresh = ContextLayout::from_variant(&manifest, format, extent, 2752, 3, true)?;
+                assert_eq!(resolved, fresh, "resolved history must equal fresh layout at {extent}");
+                assert_eq!(resolved.metadata_extent("compact page tables", 0)?.1,
+                    (2752 * extent.div_ceil(64).div_ceil(2) * 4).max(256).next_multiple_of(256));
+                assert_eq!(resolved.buffers().demands()?[0].bytes,
+                    2 * extent.div_ceil(64) as u64 * 64 * format.record_bytes() as u64);
+            }
+            assert!(prepared.with_served_context(0).is_err());
+            assert!(prepared.with_served_context(1_048_577).is_err());
             assert_eq!(layout.buffers().workspace_bytes,
                 layout.workspace().iter().map(|(_, bytes)| *bytes as u64).sum::<u64>());
             assert!(ContextLayout::from_manifest(&manifest, format, 8192, 2752, 3).is_err());
