@@ -85,10 +85,22 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         .min(opts.spark_bytes);
     let sequences = opts.resolved_concurrency("minimax_m3");
     let physical_devices = (0..gpus as i32).collect::<Vec<_>>();
+    let drafter=if opts.minimax_dspark {
+        match crate::formats::block_dspark::NativeDsparkLayout::new(&input.checkpoint().snapshot.join("dspark"),
+            sequences as usize,shape.rows as usize,shape.waves as usize,
+            opts.physical_sms.unwrap_or(crate::placement::ArchContext::for_device("sm_120",
+                cards.last().map_or(96 << 30,|card| card.physical_bytes)).sms) as usize,
+            opts.prefix_entries("minimax_m3") as usize,opts.mimo_prefix_mark_bytes,
+            opts.host_cache_bytes != Some(0)) {
+            Ok(layout) => Some(layout),
+            Err(error) => { report.refuse_placement(format!("MiniMax bundled DSpark inventory refused: {error:#}"),
+                "Supply the bundled dspark/config.json and native safetensors headers.");return empty(notes); }
+        }
+    } else { None };
     let request = FactsRequest { checkpoint: input.checkpoint(), cfg, catalog, manifest_path: &manifest_path,
         manifest: manifest.clone(), attention: Some(attention), split_wire: opts.minimax_split_wire, physical_devices: &physical_devices, coordinator: Coordinator::Planned { cards: cards.clone() }, spark_ranks: ranks,
         spark_bytes, prefill: shape, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
-        host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("minimax_m3"), drafter:None,
+        host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("minimax_m3"), drafter,
         replies: opts.spark_reply_formats, head: opts.bf16_target_head, expert_usage: opts.expert_usage,
         resident_weight_limit: ResidentWeights(opts.weight_budget_bytes) };
     let inputs = match gather(&request) {

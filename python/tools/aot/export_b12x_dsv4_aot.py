@@ -1796,7 +1796,7 @@ def main() -> None:
                                            "programs": [f"{family}_{item[0]}" for item in exlr8_work]}
             work += [(family, *item) for item in exlr8_work]
     # Append shared drafter exports after all existing objects: table indices stay stable.
-    if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "kimik31", "ml4", "muse", "muse2", "step5", "step52")):
+    if any(name in geometries for name in ("glm", "glm2", "glmf", "glmf2", "mimo", "mimo2", "mimop", "mimop2", "mimof", "mimof2", "qwen4", "qwen35", "qwen38", "kimik3", "kimik31", "ml4", "muse", "muse2", "step5", "step52", "minimax")):
         work += [("draft_bf16", f"k{k}_n{n}", "bf16_projection",
                   {"max_rows": 4096 if (k, n) in flash_native_bf16_shapes()
                       or "native-core" in draft_bf16_shapes()[(k, n)] else 2048},
