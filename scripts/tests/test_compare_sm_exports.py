@@ -313,6 +313,23 @@ def test_kimi_k31_sparse_mla_has_an_exact_scoped_export_gate(scope):
     assert set(selected) == expected
 
 
+@pytest.mark.parametrize("scope", ["suspects", "all"])
+def test_minimax_dense_has_an_exact_scoped_export_gate(scope):
+    job, = (job for job in compare_sm.jobs(scope) if job[0] == "minimax-dense")
+    _, exporter, args = job
+    assert exporter == "export_b12x_dsv4_aot.py"
+    assert args[:3] == ["--geometry", "minimax", "--only"]
+    selected = args[3].split(",")
+    shapes = {(6144, 8192), (6144, 512), (6144, 128), (8192, 6144),
+              (6144, 12288), (12288, 6144), (6144, 3072), (3072, 6144),
+              (6144, 4096), (6144, 256), (6144, 6144), (6144, 1536),
+              (4096, 6144), (1536, 6144)}
+    expected = {f"mxfp8_k{k}_n{n}_s1_a8" for k, n in shapes}
+    expected |= {f"quant_k{k}_bf16_a8" for k in (1536, 3072, 4096, 6144, 8192, 12288)}
+    assert len(selected) == len(set(selected)) == 20
+    assert set(selected) == expected
+
+
 def test_ml4_context_fc_has_a_scoped_cross_sm_gate():
     for scope in ("suspects", "all"):
         job = next(job for job in compare_sm.jobs(scope) if job[0] == "ml4-draft-context-fc")
