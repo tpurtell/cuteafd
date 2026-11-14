@@ -100,6 +100,22 @@ The C16 trace covers 531 / 360 sections across rows 1/4/16, with the same zero
 steady-capture result. Real-weight dense/shared FFN padding is byte-exact at
 live/bucket boundaries for both BF16 and FP32 partial wires. TP1 is unchanged.
 
+The [canonical TP2 smoke](../../benchmarks/minimax_m3/2026-11-14-smoke-minimax-m3-1-flash-2rtx-4spark-minimax-flash-tp2-graphs/report.svg)
+uses shipping prefix and shared graph-reserve defaults at `a5f41e113`. Generated
+aggregate fidelity passes on 2076 rows (KL 0.0234624, top-1 95.2312%); prompt
+9740 / turn 9340 restores and cold recomputation are byte-identical, tool
+re-render passes, and greedy C1/C4 is 4/4. Readiness is 74.001 s, including
+0.159 s of explicitly measured graph prewarm. The earlier 13.5 s A/B launch-time
+difference is not attributable to graph prewarm. C1/C8/C16 are
+18.661 / 83.352 / 127.724 tok/s and 8K prefill is 2221 tok/s. Ready and
+first-request memory deltas are +8,260,411 / +7,334,523 bytes. Default reserves
+are 128 / 88 MiB, measured arenas remain 62 / 42 MiB, and steady decode has
+zero captures, eager runs or evictions. Basic power-cap/thermal slowdown is
+zero on both GPUs, busy clocks 2796.7 / 2850.1 MHz, maximum temperature 63 C
+and minimum T.Limit headroom 33 C. One distinct-C4 timing point reports host
+page reclaim, so this smoke is correctness/default coverage, not paired speed
+evidence.
+
 ## Changelog
 
 | Date | Change | Evidence |
