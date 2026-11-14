@@ -265,6 +265,20 @@ impl NativeLaneLayout {
         Ok(self)
     }
 
+    /// Page-table banks follow the served extent; kernel phase offsets stay fixed.
+    pub fn with_served_context(&self, context: usize) -> Result<Self> {
+        ensure!((1..=self.max_context).contains(&context), "Kimi lane context exceeds prepared extent");
+        let mut layout = self.clone();
+        for name in ["MLA page table", "DSA page table"] {
+            if let Some(bytes) = layout.operands.get_mut(name) {
+                *bytes = (self.unit.min(64) * context.div_ceil(64) * 4)
+                    .max(16).next_multiple_of(16) * self.metadata_banks();
+            }
+        }
+        layout.max_context = context;
+        Ok(layout)
+    }
+
     /// Preserve every BF16 offset. Place transient K6 operands into holes whose
     /// previous reader has completed on the same lane stream. Peer meet outputs
     /// remain separate allocations because the exchange stream reads them.

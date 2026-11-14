@@ -169,6 +169,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     }
     let mut baseline = vec![Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }; gpus];
     let mut tp2_workspace = [0; 2];
+    let mut shaped = Vec::new();
     if let Some(manifest) = &manifest {
         let extra = (|| -> anyhow::Result<_> {
             use crate::families::kimi_k3::{allocation, core};
@@ -176,9 +177,20 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
             let verify = opts.kimi_drafter_snapshot.as_ref().map(|snapshot|
                 crate::formats::dflash::MlaDflashConfig::read(snapshot).map(|draft| draft.block))
                 .transpose()?.unwrap_or(0);
+            let attention_heads = if matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context)
+                && gpus == 2 { 48 } else { 96 };
             let mut demands = allocation::baseline_demands_for_ranks(cfg, manifest, rows, shape, context as usize,
                 usize::try_from(slots)?, verify, &model.core, matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context),
-                ranks, gpus, opts.resolved_spark_reply_format(false), if matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context) && gpus == 2 { 48 } else { 96 })?;
+                ranks, gpus, opts.resolved_spark_reply_format(false), attention_heads)?;
+            let mut lane = allocation::NativeLaneLayout::for_ranks(cfg, rows, unit, context as usize,
+                allocation::NativeScratch::from_manifest_for_config(manifest, cfg, gpus)?, gpus)?;
+            if cfg.dsa.is_some() {
+                lane = lane.with_sparse_mla_rows(attention_heads)?.with_dsa(cfg,
+                    allocation::DsaScratch::from_manifest(manifest)?)?;
+            }
+            demands.retain(|d| d.group != "Kimi lane 0 native operands");
+            shaped.extend((0..gpus).map(|rank| kimi::ShapedOwner::Lane { rank: rank as u8,
+                lane: 0, layout: lane.clone(), extra_requests: Vec::new() }));
             if let Some(context) = &context_layout {
                 // Validate the context key inventory; the graph reserve is the
                 // configured arena, charged once by the recipe.
@@ -400,13 +412,9 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 overhead: if active { owners } else { 0 } });
         }
     }
-    let mut fixed_owners = fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
-    if context_split {
-        match context_buffers.demands() {
-            Ok(demands) => fixed_owners.extend(demands.iter().map(FixedOwner::ready)),
-            Err(error) => { report.refuse_placement(format!("Kimi context buffers refused: {error:#}"),
-                "Check the context program geometry."); return memory; }
-        }
+    let fixed_owners = fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
+    if let Some(layout) = context_layout {
+        shaped.push(kimi::ShapedOwner::Context { layout });
     }
     let peer_row_bytes = if context_split {
         context_buffers.query_row_bytes.saturating_add(context_buffers.partial_row_bytes)
@@ -463,7 +471,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         experts: Some(ExpertProfile { layers: spark_budget.layers.clone(),
             destination: if gpus == 2 { vec![0, 1] } else { vec![0] },
             counts, rank_sets: if ranks > 0 { vec![(0..ranks as u8).collect()] } else { Vec::new() } }),
-        arenas, spark, links, draft, fixed: fixed_owners, owners: Vec::new(),
+        arenas, spark, links, draft, fixed: fixed_owners, shaped, owners: Vec::new(),
     };
     if let Err(error) = recipe.arena_padding(cfg, &model.core) {
         report.refuse_placement(format!("Kimi packed arena inventory refused: {error:#}"),

@@ -473,6 +473,22 @@ impl LaneLayout {
 
     pub(crate) fn max_context(&self) -> usize { self.max_context }
 
+    pub(crate) fn shaped_owner(&self, rank: u8, lane: usize)
+        -> Result<cuteafd_loader::placement::families::kimi::ShapedOwner> {
+        let extra_requests = self.core.as_ref().map(|core| -> Result<Vec<usize>> {
+            let layout = cuteafd_loader::formats::trellis_core::ProjectionScratchLayout {
+                extents: core.extents.clone(), rows: core.rows };
+            Ok(layout.storage()?.owners.values().copied().collect())
+        }).transpose()?.unwrap_or_default();
+        Ok(cuteafd_loader::placement::families::kimi::ShapedOwner::Lane {
+            rank, lane, layout: self.base.clone(), extra_requests })
+    }
+
+    pub(crate) fn resolve_context(&mut self, context: usize) -> Result<()> {
+        self.base = self.base.with_served_context(context)?;
+        Ok(())
+    }
+
     pub(crate) fn demand(&self, rank: u8, lane: usize) -> Result<Demand> {
         ensure!(rank < 2 && lane < 2, "Kimi lane rank/index outside TP2 two-lane executor");
         Ok(Demand::new(rank, Category::Workspace, format!("Kimi lane {lane} native operands"),

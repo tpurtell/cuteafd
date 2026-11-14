@@ -719,7 +719,9 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     let skip_routed_experts = inputs.skip_routed_experts;
     let unit_rows = cuteafd_loader::families::kimi_k3::allocation::prefill_shape_with(inputs.rows, inputs.waves,
         inputs.unit_rows)?.unit_rows as usize;
-    let lane_layouts = inputs.lane_layouts.iter().map(|pair| pair.to_vec()).collect::<Vec<_>>();
+    let mut lane_layouts = inputs.lane_layouts.iter().map(|pair| pair.to_vec()).collect::<Vec<_>>();
+    let mut shaped = lane_layouts.iter().enumerate().flat_map(|(lane, pair)| pair.iter().enumerate()
+        .map(move |(rank, layout)| layout.shaped_owner(rank as u8, lane))).collect::<Result<Vec<_>>>()?;
     let state_slots = inputs.state_slots;
     let legacy_marks = inputs.prefix_marks;
     let global_layouts = GlobalLayout::ranks_with_core(cfg, &core, devices.len())?;
@@ -819,8 +821,11 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             }
         }
     }
-    let mut fixed = request.fixed.iter().map(FixedOwner::ready).collect::<Vec<_>>();
-    fixed.extend(request.context_buffers.demands()?.iter().filter(|demand| demand.bytes > 0).map(FixedOwner::ready));
+    let mut fixed = request.fixed.iter().filter(|d| !(0..lanes).any(|lane|
+        d.group == format!("Kimi lane {lane} native operands"))).map(FixedOwner::ready).collect::<Vec<_>>();
+    if let Some(layout) = &context {
+        shaped.push(kimi::ShapedOwner::Context { layout: layout.clone() });
+    }
     // The post-module sample is declared once as an existing physical owner;
     // budgets are full capacities, not a second free-memory subtraction.
     for rank in 0..RANKS {
@@ -850,7 +855,7 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
             crate::shared::placement::spark_rings(cuteafd_transport::TcpTransportConfig::default().max_frame_bytes)?,
             cuteafd_core::spark_reply::requested())?,
         draft: draft.as_ref().map(|layout| kimi::draft_facts(layout, page_rows, maximum_pages, (RANKS - 1) as u8)).transpose()?,
-        fixed, owners: Vec::new(),
+        fixed, shaped, owners: Vec::new(),
     };
     recipe.arena_padding(cfg, &core)?;
     recipe.blas_owners(crate::shared::target_head::TargetHead::configured().blas_head(
@@ -909,6 +914,9 @@ pub(crate) fn admit<'a, const RANKS: usize>(mut inputs: Inputs<'_, RANKS>) -> Re
     cuteafd_bench::context::ResolvedSettings::placement(&placement).publish();
     let mark_selection = MarkSelection { legacy_slots: legacy_marks as u64, slots: legacy_marks as u64, reduction_reason: None };
     let pool_tokens = usize::try_from(placement.pool_tokens)?;
+    let served = usize::try_from(admitted.solved.served_context())?;
+    let context = context.map(|layout| layout.with_served_context(served)).transpose()?;
+    for layout in lane_layouts.iter_mut().flatten() { layout.resolve_context(served)?; }
     let draft = draft.map(|layout| layout.with_pool_tokens(pool_tokens)).transpose()?;
     let graph_set = if graph_reserve && RANKS == 2 && placement_mode == AttentionPlacement::Layers {
         Some(super::graphs::inventory_with_context(cfg, lanes as usize, graph_rows, graph_slots,

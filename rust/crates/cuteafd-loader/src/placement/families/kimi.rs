@@ -13,6 +13,9 @@ use crate::formats::dflash::MlaDraftRuntimeLayout;
 use cuteafd_core::memory_layout::{Basis, Category};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 
+mod shaped;
+pub use shaped::ShapedOwner;
+
 /// One shared decode/prefill endpoint per lane, using the same finite probe
 /// candidates as execution. Its GPU intake is separately owned by the lane.
 pub fn production_links(gpu: u8, ranks: usize, lanes: u64, prefill: PrefillShape,
@@ -315,6 +318,7 @@ pub struct KimiRecipe {
     pub links: Vec<crate::placement::PreparedSparkLink>,
     pub draft: Option<Draft>,
     pub fixed: Vec<FixedOwner>,
+    pub shaped: Vec<ShapedOwner>,
     /// Additional physical owners (context, host retention and loaded code).
     pub owners: Vec<Component>,
 }
@@ -353,7 +357,8 @@ impl KimiRecipe {
             request.onboard == Pin::Exact(profile.layers.len() as u64)) {
             return Err(LOCAL_ONLY_REFUSAL);
         }
-        let solved = solve(request, budgets, self)?;
+        let mut solved = solve(request, budgets, self)?;
+        self.refine_shaped(&mut solved)?;
         let placement = self.execution(&solved)?;
         if self.spark_links && self.experts.is_some()
             && !placement.layers.iter().any(|layer| layer.experts == ExpertHome::Spark) {
@@ -940,6 +945,7 @@ impl Recipe for KimiRecipe {
         crate::placement::planner::fixed_request_tails(&mut contract.components, self.maximum_pages,
             &[allocation::GRAPH_RESERVE, allocation::CODE_OWNER,
                 allocation::CONTEXT_ESTIMATE, allocation::CONTEXT_MEASURED])?;
+        contract.components.extend(self.shaped_components(request)?);
         Ok(contract)
     }
 }
@@ -1126,6 +1132,7 @@ mod tests {
     fn recipe() -> KimiRecipe {
         let mut recipe = KimiRecipe {
             expert_usage: None,
+            shaped: Vec::new(),
             context: 256,
             gpus: 1,
             placement: AttentionPlacement::Heads,

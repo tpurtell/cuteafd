@@ -114,6 +114,7 @@ pub struct ContextLayout {
     buffers: ContextBuffers,
     workspace: Vec<(&'static str, usize)>,
     metadata_banks: usize,
+    metadata_rows: usize,
     decode: DecodeBuckets,
     tiles: Option<TilePolicy>,
     dsa: bool,
@@ -244,7 +245,7 @@ impl ContextLayout {
         ensure!(dsa || tiles.is_some(), "Kimi context tile policy missing");
         let decode = DecodeBuckets::from_manifest(manifest)?;
         let decode = if dsa { decode.for_dsa() } else { decode };
-        Ok(Self { buffers, workspace, metadata_banks, decode, tiles, dsa })
+        Ok(Self { buffers, workspace, metadata_banks, metadata_rows, decode, tiles, dsa })
     }
 
     pub fn decode(&self) -> &DecodeBuckets { &self.decode }
@@ -252,6 +253,25 @@ impl ContextLayout {
     pub fn dsa(&self) -> bool { self.dsa }
     pub fn buffers(&self) -> ContextBuffers { self.buffers }
     pub fn workspace(&self) -> Vec<(&'static str, usize)> { self.workspace.clone() }
+
+    /// Preserve validated programs and row banks, shrinking only history owners.
+    pub fn with_served_context(&self, context: usize) -> Result<Self> {
+        ensure!((1..=self.buffers.compiled_extent as usize).contains(&context),
+            "Kimi context exceeds prepared extent");
+        let mut layout = self.clone();
+        let half_pages = context.div_ceil(ROWS).div_ceil(2);
+        for (name, bytes) in &mut layout.workspace {
+            let raw = match *name {
+                "compact page tables" => self.metadata_rows * half_pages * 4,
+                "gather tables" => 2 * half_pages * 4,
+                _ => continue,
+            };
+            *bytes = raw.max(256).next_multiple_of(256) * self.metadata_banks;
+        }
+        layout.buffers.compiled_extent = context as u64;
+        layout.buffers.workspace_bytes = layout.workspace.iter().map(|(_, bytes)| *bytes as u64).sum();
+        Ok(layout)
+    }
 
     /// Each unit keeps its compact/gather/commit metadata until the wave drains.
     pub fn metadata_extent(&self, name: &str, bank: usize) -> Result<(usize, usize)> {
