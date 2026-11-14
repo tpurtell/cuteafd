@@ -15,11 +15,11 @@ impl Drop for Graph<'_> {
 #[test]
 #[ignore = "requires EXL3 target+MTP checkpoint, coordinator packages and one CUDA device"]
 fn independently_backed_target_and_draft_share_serial_scratch_exactly() -> Result<()> {
-    let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
-    library.cuda_set_device(0)?;
     let catalog = cuteafd_loader::read_expert_catalog(Path::new(&std::env::var("CUTEAFD_SNAPSHOT")?))?;
     let geometry = catalog.routed_experts().geometry()?;
     cuteafd_core::set_expert_geometry(geometry).map_err(|_| anyhow::anyhow!("expert geometry already selected"))?;
+    let library = unsafe { NativeLibrary::load(std::env::var("CUTEAFD_NATIVE_LIB")?)? };
+    library.cuda_set_device(0)?;
     let root = PathBuf::from(std::env::var("CUTEAFD_EXL3_AOT")?);
     let rows = 64usize;
     let paths = cuteafd_core::Exl3RowPolicy::for_geometry(geometry).capacities(rows)?

@@ -1611,7 +1611,8 @@ def capture_qwen4_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     assert devices[0]["kv_tokens"] == layout["pool_tokens"], devices
     groups = {item["group"] for item in devices[0]["items"]}
     # The shared Recipe filled the layout: pool, step workspaces and graphs.
-    assert {"records", "state", "decode step", "prefill step", "startup graphs"} <= groups, groups
+    assert {"records", "state", "decode step", "prefill step", "weight arena"} <= groups, groups
+    assert "graph reserve: qwen4.graphs.0" in groups, groups
     report = deployment["report"]
     # The tower is the solve's choice: at the automatic 2M target one RTX keeps
     # the pool and Auto turns vision off (pool first), no pre-solve guess.
@@ -1642,7 +1643,7 @@ def capture_qwen4_real_spark_launch(snapshot: Path, example: Path, binary: Path,
     """Installed EXL3 + four Sparks must keep expert roles through launcher dispatch."""
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
-        "test/qwen-real-sparks", "RTX_GPUS=1\nSPARK_COUNT=4\nEXPERT_BACKEND=spark\nVISION=off\nAUDIO=off\n",
+        "test/qwen-real-sparks", "RTX_GPUS=1\nGPU_MEMORY_CAP=31.8GiB\nSPARK_COUNT=4\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\n",
         physical_gpus=(0,), root_launcher=True, execute_workers=True,
         extra_args=("--wip", "qwen-real-sparks"), extra_env={
             "STUB_REAL_PLANNER": str(binary), "STUB_REAL_SNAPSHOT": str(snapshot),
