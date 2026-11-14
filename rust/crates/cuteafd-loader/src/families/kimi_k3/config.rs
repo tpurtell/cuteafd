@@ -342,6 +342,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn k31_drafter_compatibility_is_independent_of_target_serving_qualification() -> Result<()> {
+        let target = KimiK3Config::from_hf(&k31_config())?;
+        target.validate_attention_role(true)?;
+        target.validate_speculation(false)?;
+        let error = target.validate_speculation(true).unwrap_err().to_string();
+        assert!(error.contains("hidden-state compatibility is unqualified"), "{error}");
+        assert!(error.contains("speculation off"), "{error}");
+        assert!(error.contains("#1777"), "{error}");
+        // Matching dimensions and a qualified target do not qualify K3 draft taps.
+        let k3 = KimiK3Config::from_hf(&release_config())?;
+        assert_eq!((target.hidden, target.layers, target.vocab_size),
+            (k3.hidden, k3.layers, k3.vocab_size));
+        k3.validate_speculation(true)?;
+        Ok(())
+    }
+
+    #[test]
     fn release_config_parses_with_one_based_schedule() {
         let cfg = KimiK3Config::from_hf(&release_config()).unwrap();
         cfg.release_geometry().unwrap();
