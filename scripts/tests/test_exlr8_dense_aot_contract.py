@@ -367,10 +367,10 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
     module = types.ModuleType("b12x.integration.cuteafd.minimax")
     for compiler in ("compile_minimax_norm_aot", "compile_minimax_router_scores_aot",
                      "compile_minimax_kv_pack_aot"):
-        setattr(module, compiler, lambda: None)
+        setattr(module, compiler, lambda **kwargs: kwargs)
     monkeypatch.setitem(sys.modules, module.__name__, module)
     module = types.ModuleType("b12x.integration.cuteafd.index_cache")
-    module.compile_index_cache_gather_aot = lambda: None
+    module.compile_index_cache_gather_aot = lambda: {}
     monkeypatch.setitem(sys.modules, module.__name__, module)
     namespace = {"geometries": ["minimax"], "manifest": {"families": {}, "family_capacities": {}},
                  "work": [], "CHECKPOINT_CONTEXTS": {},
@@ -397,6 +397,34 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
     assert custom[0][3]() == dict(max_rows=16, max_pages=33, mode="decode")
     assert custom[1][3]() == dict(max_rows=2048, max_pages=33, mode="prefill")
     assert custom[3][3]() == dict(max_rows=2048, max_batch=16, mode="extend")
+    assert [(suffix, op, params, thunk()) for suffix, op, params, thunk in custom[4:]] == [
+        ("index_decode_h2", "minimax_index",
+         dict(max_rows=16, max_pages=33, mode="decode", heads=2),
+         dict(max_rows=16, max_pages=33, mode="decode", heads=2)),
+        ("index_prefill_h2", "minimax_index",
+         dict(max_rows=2048, max_pages=33, mode="prefill", heads=2),
+         dict(max_rows=2048, max_pages=33, mode="prefill", heads=2)),
+        ("attention_decode_h32", "minimax_attention",
+         dict(max_rows=16, max_batch=16, mode="decode", query_heads=32, kv_heads=2),
+         dict(max_rows=16, max_batch=16, mode="decode", query_heads=32, kv_heads=2)),
+        ("attention_extend_h32", "minimax_attention",
+         dict(max_rows=2048, max_batch=16, mode="extend", query_heads=32, kv_heads=2),
+         dict(max_rows=2048, max_batch=16, mode="extend", query_heads=32, kv_heads=2)),
+    ]
+    producers = namespace["minimax_producer_programs"](2048)
+    assert len(producers) == 10
+    assert [(suffix, op, params, thunk()) for suffix, op, params, thunk in producers[5:]] == [
+        ("norm_rope_h32", "minimax_norm_rope", dict(heads=32, max_rows=2048), dict(heads=32)),
+        ("norm_rope_h2", "minimax_norm_rope", dict(heads=2, max_rows=2048), dict(heads=2)),
+        ("index_producer_h2", "minimax_index_producer", dict(heads=2, max_rows=2048), dict(heads=2)),
+        ("oai_split_i1536", "minimax_oai_split", dict(width=1536, max_rows=2048), dict(width=1536)),
+        ("oai_split_i6144", "minimax_oai_split", dict(width=6144, max_rows=2048), dict(width=6144)),
+    ]
+    forward = namespace["minimax_forward_programs"](2048)
+    assert len(forward) == 5
+    suffix, op, params, thunk = forward[-1]
+    assert (suffix, op, params, thunk()) == (
+        "kv_pack_h2", "minimax_kv_pack", dict(heads=2, max_rows=2048), dict(heads=2))
     stem = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
                 and any(isinstance(target, ast.Name) and target.id == "stem" for target in node.targets)
                 and "kimi_split" in ast.unparse(node.value))
@@ -408,13 +436,19 @@ def test_minimax_dispatch_cmake_release_and_placement_scopes_agree(monkeypatch, 
     assert names[:len(native)] == ["exlr8_dense_" + name for name, *_ in native]
     assert names[len(native):] == ["minimax_index_decode", "minimax_index_prefill",
                                   "minimax_attention_decode", "minimax_attention_extend",
+                                  "minimax_index_decode_h2", "minimax_index_prefill_h2",
+                                  "minimax_attention_decode_h32", "minimax_attention_extend_h32",
                                   "minimax_norm_rope_h64", "minimax_norm_rope_h4",
                                   "minimax_index_producer", "minimax_oai_split_i3072",
-                                  "minimax_oai_split_i12288", "minimax_residual_norm",
+                                  "minimax_oai_split_i12288", "minimax_norm_rope_h32",
+                                  "minimax_norm_rope_h2", "minimax_index_producer_h2",
+                                  "minimax_oai_split_i1536", "minimax_oai_split_i6144",
+                                  "minimax_residual_norm",
                                   "minimax_router_scores", "minimax_kv_pack",
-                                  "minimax_index_cache_gather"]
-    assert all(params == {"max_rows": 4096} and thunk() is None
-               for _, _, _, params, thunk in namespace["work"][-4:])
+                                  "minimax_index_cache_gather", "minimax_kv_pack_h2"]
+    assert len(names) == len(set(names))
+    assert all(params == {"max_rows": 4096} and thunk() == {}
+               for _, _, _, params, thunk in namespace["work"][-5:-1])
     namespace.update(family="glmf", suffix="sentinel", op="attention")
     exec(compile(ast.Module(body=[stem], type_ignores=[]), "stem", "exec"), namespace)
     assert namespace["stem"] == "glmf_sentinel"
@@ -497,12 +531,12 @@ def minimax_forward_fixture():
     exporter = ast.parse((ROOT / "python/tools/aot/export_b12x_dsv4_aot.py").read_text())
     helper = next(node for node in exporter.body if isinstance(node, ast.FunctionDef)
                   and node.name == "minimax_forward_programs")
-    dispatch = {}
+    dispatch = {"partial": partial}
     exec(compile(ast.Module(body=[helper], type_ignores=[]), "forward", "exec"), dispatch)
     import unittest.mock
     expected = []
     with unittest.mock.patch.dict(sys.modules, modules):
-        for suffix, op, params, thunk in dispatch["minimax_forward_programs"](4096):
+        for suffix, op, params, thunk in dispatch["minimax_forward_programs"](4096)[:4]:
             program = thunk()
             expected.append(dict(name="minimax_" + suffix, family="minimax", op=op,
                 params=params, capacity_rows=4096, geometry=program["geometry"],
@@ -546,7 +580,7 @@ def test_minimax_producer_fixture_matches_pinned_fork_without_cuda():
         if name.startswith("compile_minimax_"): setattr(module, name, fn)
     expected = []
     with unittest.mock.patch.dict(sys.modules, {module.__name__: module}):
-        for suffix, op, params, thunk in dispatch["minimax_producer_programs"](4096):
+        for suffix, op, params, thunk in dispatch["minimax_producer_programs"](4096)[:5]:
             program = thunk()
             expected.append(dict(name="minimax_" + suffix, family="minimax", op=op,
                 params=params, capacity_rows=4096, geometry=program["geometry"],

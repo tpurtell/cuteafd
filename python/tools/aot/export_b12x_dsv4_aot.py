@@ -274,6 +274,14 @@ def minimax_sparse_programs(decode_rows: int, prefill_rows: int, max_context: in
         params = dict(max_rows=rows, max_batch=decode_rows, mode=mode)
         result.append((f"attention_{mode}", "minimax_attention", params,
                        partial(compile_minimax_attention_aot, **params)))
+    for mode, rows in (("decode", decode_rows), ("prefill", prefill_rows)):
+        params = dict(max_rows=rows, max_pages=max_pages, mode=mode, heads=2)
+        result.append((f"index_{mode}_h2", "minimax_index", params,
+                       partial(compile_minimax_index_aot, **params)))
+    for mode, rows in (("decode", decode_rows), ("extend", prefill_rows)):
+        params = dict(max_rows=rows, max_batch=decode_rows, mode=mode, query_heads=32, kv_heads=2)
+        result.append((f"attention_{mode}_h32", "minimax_attention", params,
+                       partial(compile_minimax_attention_aot, **params)))
     return result
 
 
@@ -295,22 +303,37 @@ def minimax_producer_programs(prefill_rows: int):
         result.append((f"oai_split_i{width}", "minimax_oai_split",
                        dict(width=width, max_rows=prefill_rows),
                        partial(compile_minimax_oai_split_aot, width=width)))
+    for heads in (32, 2):
+        result.append((f"norm_rope_h{heads}", "minimax_norm_rope",
+                       dict(heads=heads, max_rows=prefill_rows),
+                       partial(compile_minimax_norm_rope_aot, heads=heads)))
+    result.append(("index_producer_h2", "minimax_index_producer",
+                   dict(heads=2, max_rows=prefill_rows),
+                   partial(compile_minimax_index_producer_aot, heads=2)))
+    for width in (1536, 6144):
+        result.append((f"oai_split_i{width}", "minimax_oai_split",
+                       dict(width=width, max_rows=prefill_rows),
+                       partial(compile_minimax_oai_split_aot, width=width)))
     return result
 
 
 def minimax_forward_programs(prefill_rows: int):
+    from functools import partial
     from b12x.integration.cuteafd.minimax import (
         compile_minimax_norm_aot, compile_minimax_router_scores_aot,
         compile_minimax_kv_pack_aot,
     )
     from b12x.integration.cuteafd.index_cache import compile_index_cache_gather_aot
 
-    return [(suffix, op, dict(max_rows=prefill_rows), compiler) for suffix, op, compiler in (
+    result = [(suffix, op, dict(max_rows=prefill_rows), compiler) for suffix, op, compiler in (
         ("residual_norm", "minimax_residual_norm", compile_minimax_norm_aot),
         ("router_scores", "minimax_router_scores", compile_minimax_router_scores_aot),
         ("kv_pack", "minimax_kv_pack", compile_minimax_kv_pack_aot),
         ("index_cache_gather", "index_cache_gather", compile_index_cache_gather_aot),
     )]
+    result.append(("kv_pack_h2", "minimax_kv_pack", dict(heads=2, max_rows=prefill_rows),
+                   partial(compile_minimax_kv_pack_aot, heads=2)))
+    return result
 
 
 def validate_table_residency(stem: str, geometry: dict, *, diagnostic: bool = False) -> None:
