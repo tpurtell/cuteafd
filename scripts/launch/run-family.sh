@@ -114,6 +114,21 @@ done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "${SPARK_COUNT:-}" ]] || { cfg[SPARK_COUNT]="$SPARK_COUNT"; cfg_file[SPARK_COUNT]=1; }
 [[ -z "${SPARK_HOSTS:-}" ]] || { cfg[SPARK_HOSTS]="$SPARK_HOSTS"; cfg_file[SPARK_HOSTS]=1; }
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
+# Validate precision syntax before planner containers, SSH, or namespace work.
+fp8_prefill="$(get FP8_PREFILL auto)"
+case "$fp8_prefill" in
+  auto|off) ;;
+  *)
+    declare -A fp8_groups_seen=()
+    IFS=',' read -r -a fp8_groups <<<"$fp8_prefill"
+    [[ -n "$fp8_prefill" && "$fp8_prefill" != *, ]] || release_die "FP8_PREFILL must be auto, off or a projection group list"
+    for group in "${fp8_groups[@]}"; do
+      case "$group" in mla|index|attention|ffn|kda-in|kda-o|experts) ;; *) release_die "FP8_PREFILL invalid group: $group" ;; esac
+      [[ -z "${fp8_groups_seen[$group]:-}" ]] || release_die "FP8_PREFILL repeats group: $group"
+      fp8_groups_seen[$group]=1
+    done ;;
+esac
+export CUTEAFD_FP8_PREFILL="$fp8_prefill"
 # Refused before anything starts: a release never serves pages from a checkout.
 case "$(get CONSOLE_ASSETS off)" in
   on) [[ -n "$wip_slot" ]] || release_die "CONSOLE_ASSETS=on serves pages from a checkout and needs --wip SLOT; release images serve their compiled-in pages" ;;
@@ -271,20 +286,6 @@ for phase in prefill decode; do
   key="spark_${phase}_reply_format"
   case "${!key}" in ""|bf16|fp8|nvfp4) ;; *) release_die "SPARK_${phase^^}_REPLY_FORMAT must be bf16, fp8 or nvfp4" ;; esac
 done
-fp8_prefill="$(get FP8_PREFILL auto)"
-case "$fp8_prefill" in
-  auto|off) ;;
-  *)
-    declare -A fp8_groups_seen=()
-    IFS=',' read -r -a fp8_groups <<<"$fp8_prefill"
-    [[ -n "$fp8_prefill" && "$fp8_prefill" != *, ]] || release_die "FP8_PREFILL must be auto, off or a projection group list"
-    for group in "${fp8_groups[@]}"; do
-      case "$group" in mla|index|attention|ffn|kda-in|kda-o|experts) ;; *) release_die "FP8_PREFILL invalid group: $group" ;; esac
-      [[ -z "${fp8_groups_seen[$group]:-}" ]] || release_die "FP8_PREFILL repeats group: $group"
-      fp8_groups_seen[$group]=1
-    done ;;
-esac
-export CUTEAFD_FP8_PREFILL="$fp8_prefill"
 attention_plan_rows="$(get ATTENTION_PLAN_ROWS auto)"
 if [[ $attention_plan_rows != auto && ! $attention_plan_rows =~ ^[1-9][0-9]*$ ]]; then
   release_die "ATTENTION_PLAN_ROWS must be auto or a positive integer"
