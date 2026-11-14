@@ -406,7 +406,7 @@ ensure_seed_image() (
     release_validate_path_setting remote_source "$remote_source"
     trap 'release_ssh "$seed_host" "rm -rf $remote_source" >/dev/null 2>&1 || true' EXIT
     tar -C "$staging_dir" -cf - docker/Dockerfile.dev docker/entrypoint.sh \
-      scripts/build/install-dev-cache-tools.sh scripts/build/dev-toolchain.py \
+      scripts/build/install-dev-cache-tools.sh scripts/build/install-nsys.sh scripts/build/dev-toolchain.py \
       scripts/build/select-dev-image.py scripts/build/assert-build-filesystem.py .dockerignore |
       release_ssh "$seed_host" "tar -C $remote_source -xf -"
     release_ssh "$seed_host" setsid --wait bash -s -- "$remote_source" "$SPARK_EXPERT_DOCKER_DEV" \
