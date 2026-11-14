@@ -119,7 +119,7 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
     }
     assert exporter.native_attention_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192),(6144,4096),
                                                         (6144,12288),(6144,3072)}
-    assert exporter.native_attention_bf16_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192)}
+    assert exporter.native_attention_bf16_f32_shapes() == {(7168,6144),(4096,6144),(8192,4096),(6144,8192),(8192,2048)}
     programs = exporter.native_attention_programs()
     expected = {f"n{n}_k{k}_m{rows}{suffix}"
                 for n,k in set().union(*shapes.values()) for rows in (64,4096)
@@ -130,7 +130,7 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
         ["--geometry", "native_attention", "--only", ",".join(p[0] for p in programs)])
     stems = {f"k{k}_n{n}" for family, family_shapes in shapes.items() if family != "ml4"
              for n,k in family_shapes}
-    stems |= {"k6144_n512", "k6144_n576", "k8192_n512", "k8192_n1024", "k8192_n4096"}
+    stems |= {"k6144_n512", "k6144_n576", "k8192_n512", "k8192_n1024", "k8192_n4096", "k8192_n2048"}
     assert exporter.native_attention_bf16_shapes() == {
         (int(stem.split("_")[0][1:]), int(stem.split("_")[1][1:])) for stem in stems}
     assert all("native-core" in exporter.draft_bf16_shapes()[shape]
@@ -152,7 +152,7 @@ def test_native_attention_groups_cover_checkpoint_shapes_and_f32_partials():
     native_bf16 = {(k,n) for family, family_shapes in shapes.items() if family != "ml4"
                    for n,k in family_shapes}
     native_bf16.update((6144, n) for n in (512, 576))
-    native_bf16.update((8192, n) for n in (512, 1024, 4096))
+    native_bf16.update((8192, n) for n in (512, 1024, 2048, 4096))
     assert native_bf16 <= namespace["shapes"]().keys()
     assert namespace["F32_SHAPES"] == {(k,n) for n,k in exporter.native_attention_bf16_f32_shapes()}
 
