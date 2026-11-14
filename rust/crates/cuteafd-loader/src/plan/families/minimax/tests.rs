@@ -108,6 +108,41 @@ fn execution_inventory_is_exact_recipe_partition_before_shared_finalization() {
     }
 }
 
+#[test]
+fn coordinator_and_peer_spark_charges_use_the_canonical_operand_headers() -> Result<()> {
+    use crate::families::minimax_m3::admission::{spark_checkpoint, spark_charges};
+    use crate::plan::checkpoint::{CheckpointView, CoreView};
+    use crate::placement::planner::PrefillShape;
+    let (dir, config, _) = fixture_with_experts(128);
+    let view = CheckpointView::select(dir.path(), CoreView::Original)?;
+    let full = Checkpoint::open_view(&view)?;
+    let coordinator = Checkpoint::coordinator_view(&view, false, false)?;
+    let cfg = MiniMaxM3Config::from_hf(&config)?;
+    let catalog = crate::read_expert_catalog_view(&view)?;
+    let routed = (0..cfg.layers).filter(|&layer| cfg.moe[layer]).collect::<Vec<_>>();
+    let scalar = "language_model.model.layers.3.block_sparse_moe.experts.0.w1.input_global_scale";
+    assert!(full.header(scalar).is_some() && coordinator.header(scalar).is_none());
+    assert!(spark_checkpoint(&full, &catalog, &routed)?.is_none(),
+        "complete planner headers must not reopen the checkpoint");
+    let canonical = spark_checkpoint(&coordinator, &catalog, &routed)?.expect("role view needs canonical headers");
+    assert!(canonical.header(scalar).is_some());
+    let shape = PrefillShape { rows: 1024, waves: 3 };
+    for world in 2..=8 {
+        let recipe = |checkpoint: &Checkpoint| plan::experts::checkpoint_spark_recipe(checkpoint, world, &routed);
+        assert_eq!(recipe(&canonical)?, recipe(&full)?);
+        assert_eq!(spark_charges(&coordinator, &catalog, &routed, world, shape)?,
+            spark_charges(&full, &catalog, &routed, world, shape)?);
+    }
+    // Original callers without a selected view use the same canonical HF source.
+    let mut original = Checkpoint::coordinator_view(&view, false, false)?;
+    original.view = None;
+    assert_eq!(spark_charges(&original, &catalog, &routed, 3, shape)?,
+        spark_charges(&full, &catalog, &routed, 3, shape)?);
+    assert_eq!(spark_charges(&coordinator, &catalog, &routed, 0, shape)?,
+        vec![Vec::new(); routed.len() + 1]);
+    Ok(())
+}
+
 fn fixture() -> (tempfile::TempDir, serde_json::Value, Vec<testing::Tensor>) {
     fixture_with_experts(4)
 }
