@@ -1569,6 +1569,10 @@ def logits_files(directory):
     return sorted(str(p.relative_to(directory)) for p in Path(directory).rglob('*logits*.bin') if p.is_file())
 
 
+def logits_digest_files(directory):
+    return {str(p.relative_to(directory)): p for p in Path(directory).rglob('logits-sha256.json') if p.is_file()}
+
+
 def row_dump_dirs(directory):
     """Relative directories holding a per-row safetensors dump (row-NNNNNNNN.safetensors).
 
@@ -1645,6 +1649,21 @@ def compare_pairs(state, pairs, repeats):
                 out = Path(state['root']) / f'compare-{a}-{b}-r{repeat}-{name.replace("/", "_")}-rows.json'
                 args = [str(da / name), str(db / name), '--json', str(out)]
                 results.append(compare_one(state, python, tool, args, out, dict(a=a, b=b, repeat=repeat, file=name)))
+            # Width/accepted-prefix oracles can retain just a digest receipt
+            # rather than a potentially large dump of every F32 row.
+            left, right = logits_digest_files(da), logits_digest_files(db)
+            for name in sorted(left.keys() | right.keys()):
+                dumped = True
+                record = dict(a=a, b=b, repeat=repeat, file=name)
+                if name not in left or name not in right:
+                    results.append(dict(record, error='logit digest receipt present in one arm only'))
+                    continue
+                try:
+                    same = json.loads(left[name].read_text()) == json.loads(right[name].read_text())
+                except (OSError, ValueError) as error:
+                    results.append(dict(record, error=f'invalid logit digest receipt: {error}'))
+                    continue
+                results.append(dict(record, path_a=str(left[name]), path_b=str(right[name]), rows=0, byte_identical=same))
             if not dumped:
                 results.append(dict(a=a, b=b, repeat=repeat, file=None,
                                     error='no saved logits common to both arms'))

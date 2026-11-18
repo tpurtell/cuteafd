@@ -3,6 +3,7 @@ use super::{cache::Placement, engine::Execution, golden::GoldenArgs, owners::{Un
 use crate::shared::{prefill_pipeline::{Unit,UnitSegment}, speculation::target::{BlockVerifyTarget,VerifyRequest,VerifyRow}};
 use anyhow::{ensure,Context,Result};
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
+use sha2::{Digest,Sha256};
 use std::{cell::RefCell,collections::BTreeMap,sync::Arc};
 
 #[derive(Default)]
@@ -105,6 +106,7 @@ fn state_difference(actual:&BTreeMap<String,Vec<u8>>,expected:&BTreeMap<String,V
             "actual":bytes.get(first),"reference":reference.get(first)}))
     })
 }
+fn digest(bytes:&[u8])->String { format!("{:x}",Sha256::digest(bytes)) }
 fn commit_sweep(execution:&mut Execution<'_>,saved:&Placement,tokens:&[u32],widths:&[usize])->Result<serde_json::Value>{
     let mut passes=Vec::new();let mut clean=true;
     execution.width_trace=None;
@@ -118,7 +120,7 @@ fn commit_sweep(execution:&mut Execution<'_>,saved:&Placement,tokens:&[u32],widt
         let actual=state(execution,&candidate)?;let difference=state_difference(&actual,&expected);
         let next=decode(execution,&mut candidate,&tokens[keep..keep+1])?;
         let next_equal=next==next_reference;clean&=difference.is_none()&&next_equal;
-        let result=serde_json::json!({"width":width,"accepted":keep,"first_state_difference":difference,"next_logits_equal":next_equal});
+        let result=serde_json::json!({"width":width,"accepted":keep,"first_state_difference":difference,"next_logits_equal":next_equal,"next_logits_sha256":digest(&next)});
         println!("Inkling commit: {}",result);passes.push(result);
     }}Ok(serde_json::json!({"pass":clean,"passes":passes}))
 }
@@ -241,12 +243,18 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
         let trace=execution.width_trace.take().unwrap().into_inner();
         let differences=compare(&trace,&reference[..width],&logits,&base_logits[..width],cfg.unpadded_vocab_size)?;
         println!("Inkling width {width}: {}",serde_json::to_string(&differences)?);
-        clean&=differences.is_empty();passes.push(serde_json::json!({"width":width,"differences":differences}));
+        clean&=differences.is_empty();passes.push(serde_json::json!({"width":width,"differences":differences,"logits_sha256":digest(&logits)}));
     }
     let commits=if args.commit_invariance{Some(commit_sweep(&mut execution,&saved,&tokens[args.prefill..],&args.width_invariance)?)}else{None};
     clean&=commits.as_ref().is_none_or(|result|result["pass"]==true);
     let report=serde_json::json!({"commits":commits,"prefill":args.prefill,"pool_tokens":admitted.solved.pool_tokens,"onboard":admitted.onboard,
         "target":"served startup/push/Spark path","reference":"serial width1 decode from exact prompt state","passes":passes,"pass":clean});
+    let digests=serde_json::json!({
+        "widths": report["passes"].as_array().unwrap().iter().map(|p| serde_json::json!([p["width"],p["logits_sha256"]])).collect::<Vec<_>>(),
+        "accepted_prefix": report["commits"]["passes"].as_array().into_iter().flatten()
+            .map(|p| serde_json::json!([p["width"],p["accepted"],p["next_logits_sha256"]])).collect::<Vec<_>>()
+    });
+    std::fs::write(args.save_logits.join("logits-sha256.json"),serde_json::to_vec_pretty(&digests)?)?;
     std::fs::write(args.save_logits.join("width-invariance.json"),serde_json::to_vec_pretty(&report)?)?;
     ensure!(clean,"Inkling width invariance failed; first layer/stage operands in width-invariance.json");Ok(())
 }
