@@ -107,6 +107,39 @@ impl DecodeShareArgs {
     }
 }
 
+/// Always-on prefill-round counters.
+///
+/// The round is where these quantities exist, so [`PrefillQueue`] records them itself: every
+/// family that prefills through the queue exports the same numbers, and a caller cannot forget
+/// to. They are read only by the 1 Hz `/v1/stats` publisher, never on the hot path.
+///
+/// **Basis.** Three relaxed `fetch_add`s per round at ~20 ns each = ~60 ns, against a round's
+/// own floor of one engine prefill call (>= 100 us) — <= 0.06 %. Nothing here allocates.
+pub(crate) mod round_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Wall time of every prefill round (the whole round, exchange included).
+    static ROUND_NS: AtomicU64 = AtomicU64::new(0);
+    static ROUNDS: AtomicU64 = AtomicU64::new(0);
+    /// Prompts that ran a chunk (finished ones plus the ones rotated back to wait).
+    static PROMPTS: AtomicU64 = AtomicU64::new(0);
+
+    /// One round: its wall time in seconds and the prompts that ran a chunk in it.
+    pub(super) fn record_round(seconds: f64, prompts: u64) {
+        ROUND_NS.fetch_add((seconds.max(0.0) * 1e9) as u64, Ordering::Relaxed);
+        ROUNDS.fetch_add(1, Ordering::Relaxed);
+        PROMPTS.fetch_add(prompts, Ordering::Relaxed);
+    }
+
+    pub(crate) fn round_ns() -> u64 { ROUND_NS.load(Ordering::Relaxed) }
+    pub(crate) fn rounds() -> u64 { ROUNDS.load(Ordering::Relaxed) }
+    pub(crate) fn prompts() -> u64 { PROMPTS.load(Ordering::Relaxed) }
+
+    /// The counters are process-global atomics; the delta tests must not race each other.
+    #[cfg(test)]
+    pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
 /// A chunk's outcome for [`PrefillQueue::round`].
 pub(crate) enum Chunk {
     /// More of the prompt remains.
@@ -205,8 +238,10 @@ impl<P> PrefillQueue<P> {
                 break;
             }
         }
+        let prompts = (out.len() + ran.len()) as u64;
         self.waiting.extend(ran);
         self.last_round = started.elapsed().as_secs_f64();
+        round_stats::record_round(self.last_round, prompts);
         out
     }
 
@@ -243,8 +278,10 @@ impl<P> PrefillQueue<P> {
             for prompt in unfinished.into_iter().rev() { self.waiting.push_front(prompt); }
             steps += 1;
         }
+        let prompts = (out.len() + ran.len()) as u64;
         self.waiting.extend(ran);
         self.last_round = started.elapsed().as_secs_f64();
+        round_stats::record_round(self.last_round, prompts);
         out
     }
 
@@ -292,8 +329,10 @@ impl<P> PrefillQueue<P> {
             for prompt in unfinished.into_iter().rev() { self.waiting.push_front(prompt); }
             steps += 1;
         }
+        let prompts = (out.len() + ran.len()) as u64;
         self.waiting.extend(ran);
         self.last_round = started.elapsed().as_secs_f64();
+        round_stats::record_round(self.last_round, prompts);
         out
     }
 
@@ -462,6 +501,38 @@ mod tests {
         assert_eq!(log, vec![0, 0, 0, 1, 1]);
         queue.settle(true);
         assert!(!queue.due(true));
+    }
+
+    /// Driving a round moves the exported counters: one round, its own wall time, and the
+    /// prompts that actually ran a chunk — finished ones plus the ones rotated back to wait.
+    #[test]
+    fn a_round_moves_the_exported_counters() {
+        let _guard = round_stats::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (rounds, prompts, ns) = (round_stats::rounds(), round_stats::prompts(), round_stats::round_ns());
+        let mut queue = PrefillQueue::new(0.0);
+        queue.push(Prompt { id: 0, left: 1 });
+        queue.push(Prompt { id: 1, left: 1 });
+        let mut log = Vec::new();
+        assert_eq!(run(&mut queue, &mut log, 0), vec![0, 1]);
+        assert_eq!(round_stats::rounds() - rounds, 1, "one round ran");
+        assert_eq!(round_stats::prompts() - prompts, 2, "both prompts ran a chunk");
+        assert_eq!(round_stats::round_ns() - ns, (queue.last_round * 1e9) as u64,
+            "the round's own wall time is what was recorded");
+    }
+
+    /// A prompt that runs several chunks in one round is still one prompt: the counter
+    /// counts prompts, not chunks.
+    #[test]
+    fn a_round_counts_prompts_not_chunks() {
+        let _guard = round_stats::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (rounds, prompts) = (round_stats::rounds(), round_stats::prompts());
+        let mut queue = PrefillQueue::new(0.0);
+        queue.push(Prompt { id: 0, left: 3 });
+        let mut log = Vec::new();
+        assert_eq!(run(&mut queue, &mut log, 0), vec![0]);
+        assert_eq!(log, vec![0, 0, 0], "three chunks in one round");
+        assert_eq!(round_stats::rounds() - rounds, 1);
+        assert_eq!(round_stats::prompts() - prompts, 1, "one prompt, not three chunks");
     }
 
     #[test]

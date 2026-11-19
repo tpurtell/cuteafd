@@ -3,6 +3,45 @@ use anyhow::Result;
 use cuteafd_ffi::NativeLibrary;
 use std::ffi::c_void;
 
+/// Always-on expert-side counters.
+///
+/// The per-request `Spark expert compute` debug line wrote a line per request to syslog when
+/// `CUTEAFD_EXPERT_TIMING=1`. These counters carry the same quantities — execute time, the GPU
+/// gap (pace wait), waves and rows — for a few relaxed atomic adds per unit, and the expert
+/// serve loop prints them on ONE bounded line per second instead of one line per request.
+///
+/// **Basis.** The CUDA-event measurement is the cost, so it stays behind its existing gate
+/// (`CUTEAFD_EXPERT_TIMING` / the `cuteafd::expert_timing` debug target); what changes is that
+/// enabling it now fills counters and one line/second instead of one line/request. The counters
+/// themselves are four relaxed `fetch_add`s at ~20 ns each = ~80 ns per unit, against a unit's
+/// own GPU compute floor of >= 100 us — <= 0.08 %, and they allocate nothing.
+pub(crate) mod expert_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static EXECUTE_NS: AtomicU64 = AtomicU64::new(0);
+    static PACE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    static WAVES: AtomicU64 = AtomicU64::new(0);
+    static ROWS: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn record_unit(compute_us: f64, gpu_gap_us: Option<f64>, rows: u64) {
+        EXECUTE_NS.fetch_add((compute_us.max(0.0) * 1000.0) as u64, Ordering::Relaxed);
+        if let Some(gap) = gpu_gap_us {
+            PACE_WAIT_NS.fetch_add((gap.max(0.0) * 1000.0) as u64, Ordering::Relaxed);
+        }
+        WAVES.fetch_add(1, Ordering::Relaxed);
+        ROWS.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot() -> serde_json::Value {
+        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        serde_json::json!({
+            "expert_ns_total": {"execute": get(&EXECUTE_NS), "pace_wait": get(&PACE_WAIT_NS)},
+            "expert_waves_total": get(&WAVES),
+            "expert_rows_total": get(&ROWS),
+        })
+    }
+}
+
 pub(crate) struct Event<'a> {
     library: &'a NativeLibrary,
     raw: *mut c_void,
@@ -320,17 +359,16 @@ impl<'a> WorkerTiming<'a> {
                 .map(|ms| ms * 1000.0)
         }).transpose()?;
         let unix_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos().min(u64::MAX as u128) as u64;
+        // The same quantities as counters, always (no per-request log line).
+        expert_stats::record_unit(compute_us as f64, gpu_gap_us.map(f64::from), rows as u64);
         if let Some(output) = &mut self.output {
             WorkerSample { event: "expert_compute", host: &self.host, rank: self.rank,
                 request_id, layer, rows, executor_id, format, completed_unix_ns: unix_ns,
                 compute_us, previous_request_id: self.previous.map(|p| p.0),
                 previous_layer: self.previous.map(|p| p.1), gpu_gap_us }.write_to(output)?;
-        } else {
-            tracing::debug!(target: "cuteafd::expert_timing", host=%self.host, rank=self.rank,
-                request_id, layer, rows, executor_id, format, compute_us, completed_unix_ns=unix_ns,
-                previous_request_id=?self.previous.map(|p| p.0), previous_layer=?self.previous.map(|p| p.1), ?gpu_gap_us,
-                "Spark expert compute");
         }
+        // The per-request `Spark expert compute` debug line is gone: the counters above carry
+        // it, and the serve loop prints them once a second.
         self.previous = Some((request_id, layer));
         state.previous_end = Some(end.clone());
         state.queued.pop_front();
@@ -579,5 +617,52 @@ impl<'a> ExpertTiming<'a> {
                         .cuda_event_elapsed_ms(kernel_end.raw, compact_end.raw)?,
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod expert_stats_tests {
+    use super::expert_stats;
+
+    /// The counters are process-global atomics; the delta tests must not race each other.
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // These two tests are counter-level, not behavioural, and that is deliberate: the only
+    // caller of `record_unit` is `WorkerTiming::publish`, which reads CUDA events through a
+    // real `NativeLibrary`. The crate's only fake library
+    // (`cuteafd_ffi::native_library_lifetime_fixture::Fixture`) needs an allocated CPU build
+    // slot and an NVMe fixture directory, so every test that drives `publish` is `#[ignore]`d
+    // and cannot run in CI. There is no GPU-free seam to drive, so the unit conversion
+    // (microseconds in, nanoseconds out) is what is asserted here.
+
+    /// One unit moves execute time, pace wait, waves and rows — the quantities the
+    /// per-request `Spark expert compute` log line used to carry.
+    #[test]
+    fn a_unit_moves_every_expert_counter() {
+        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let before = expert_stats::snapshot();
+        expert_stats::record_unit(250.0, Some(40.0), 12);
+        let after = expert_stats::snapshot();
+        assert_eq!(after["expert_ns_total"]["execute"].as_u64().unwrap()
+            - before["expert_ns_total"]["execute"].as_u64().unwrap(), 250_000);
+        assert_eq!(after["expert_ns_total"]["pace_wait"].as_u64().unwrap()
+            - before["expert_ns_total"]["pace_wait"].as_u64().unwrap(), 40_000);
+        assert_eq!(after["expert_waves_total"].as_u64().unwrap()
+            - before["expert_waves_total"].as_u64().unwrap(), 1);
+        assert_eq!(after["expert_rows_total"].as_u64().unwrap()
+            - before["expert_rows_total"].as_u64().unwrap(), 12);
+    }
+
+    /// A unit with no previous fence has no GPU gap: pace wait stays put, the rest still moves.
+    #[test]
+    fn a_first_unit_contributes_no_pace_wait() {
+        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let before = expert_stats::snapshot();
+        expert_stats::record_unit(100.0, None, 4);
+        let after = expert_stats::snapshot();
+        assert_eq!(after["expert_ns_total"]["pace_wait"].as_u64().unwrap()
+            - before["expert_ns_total"]["pace_wait"].as_u64().unwrap(), 0);
+        assert_eq!(after["expert_waves_total"].as_u64().unwrap()
+            - before["expert_waves_total"].as_u64().unwrap(), 1);
     }
 }

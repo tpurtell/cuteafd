@@ -23,6 +23,10 @@ pub(in crate::families::deepseek_v41::v41_native_serve) struct Queued<T, C> {
     pub slot: usize,
     pub request: Option<T>,
     pub cursor: C,
+    /// When the prompt entered the queue (`prefill_queue_wait_ns_total`).
+    pub queued_at: std::time::Instant,
+    /// Whether its first chunk has run; the wait is recorded exactly once.
+    pub started: bool,
 }
 
 impl<T, C> Queued<T, C> {
@@ -75,6 +79,11 @@ pub(in crate::families::deepseek_v41::v41_native_serve) fn recover_packed<'q, T:
 pub(in crate::families::deepseek_v41::v41_native_serve) fn chunk<T, C, H: Host<T, C>>(host: &mut H,
     entry: &mut Queued<T, C>) -> Result<Chunk> {
     let request = entry.request.as_mut().context("a queued prompt already left")?;
+    // The prompt's wait in the queue, recorded once at its first chunk.
+    if !entry.started {
+        entry.started = true;
+        super::phase_stats::record_prefill_queue_wait(entry.queued_at.elapsed().as_nanos() as u64);
+    }
     // A packed group's stored result first, so a packed fault is reported as
     // itself; then a client that left, at this drained boundary (no call of
     // this prompt is in flight between chunks).
@@ -207,7 +216,7 @@ mod tests {
         for (id, &tokens) in prompts.iter().enumerate() {
             host.leases.insert(id);
             queue.push(Queued { slot: 10 + id, request: Some(Prompt { id, tokens, closed: closed.clone(), packed: None }),
-                cursor: Cursor::default() });
+                cursor: Cursor::default(), queued_at: std::time::Instant::now(), started: false });
         }
         queue
     }
@@ -216,6 +225,29 @@ mod tests {
             result.unwrap();
             assert!(entry.request.is_none() && entry.cursor.suffix.is_none(), "a left prompt holds nothing");
         }
+    }
+
+    /// A prompt's wait in the queue is charged once, at its first chunk — not once per chunk,
+    /// and not again when it rotates back for a later round.
+    #[test]
+    fn a_prompt_charges_its_queue_wait_once_at_its_first_chunk() {
+        let _guard = super::super::phase_stats::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut host = host(0.2, 2752, 3);
+        let closed = Rc::default();
+        let mut queue = queue(&mut host, 0.2, &[20000, 20000], &closed);
+        // Both prompts have been waiting 5 ms when the first round runs.
+        for entry in queue.iter_mut() {
+            entry.queued_at = std::time::Instant::now() - Duration::from_millis(5);
+        }
+        let wait = || super::super::phase_stats::snapshot()["prefill_queue_wait_ns_total"].as_u64().unwrap();
+        let before = wait();
+        round(&mut queue, &mut host);
+        let after_first = wait();
+        assert!(after_first - before >= 10_000_000,
+            "both prompts charged their wait: {} ns", after_first - before);
+        // A second round runs more chunks of the same prompts: nothing new is charged.
+        round(&mut queue, &mut host);
+        assert_eq!(wait(), after_first, "a prompt's wait is charged once, not per chunk");
     }
 
     /// Share 0 makes the previous calls in the previous order: each prompt

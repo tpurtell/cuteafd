@@ -341,6 +341,53 @@ fn answer_census<B: Backend>(backend: &B, idle: bool,
     let _ = reply.send(census);
 }
 
+/// Always-on exchange counters.
+///
+/// The `CUTEAFD_PROTOCOL_V2_TCP_TIMING` profile printed one `spark exchange wave` line per wave
+/// at load. These counters carry the same three quantities — staging, post and the
+/// post-to-landing wait — plus the wave's payload bytes, for four relaxed atomic adds per wave,
+/// and are read only by the 1 Hz `/v1/stats` publisher.
+///
+/// **Basis.** Four `fetch_add`s at ~20 ns each = ~80 ns per wave. The smallest wave this bounds
+/// is a decode wave: one decode step's own floor is >= 1 ms, and a wave is a whole step's
+/// exchange, so 80 ns is <= 0.008 % of it. Nothing here allocates and no clock is read that the
+/// worker did not already read.
+///
+/// **Not per-rank.** The exchange is wave-parallel: one wave carries every rank's rows at once
+/// (`Backend::post` fans out to all ranks), so there is no per-rank post/wait to split and no
+/// `slowest_rank`/`rank_spread` to compute. The wave is the unit.
+pub(crate) mod exchange_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// From the engine's send until the wave's staged copies completed.
+    static STAGING_NS: AtomicU64 = AtomicU64::new(0);
+    /// Request build and post.
+    static POST_NS: AtomicU64 = AtomicU64::new(0);
+    /// From the post until the last rank's rows arrived (and were copied).
+    static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    /// Payload bytes carried by landed waves.
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static WAVES: AtomicU64 = AtomicU64::new(0);
+
+    /// One landed wave: its three host times and its payload.
+    pub(crate) fn record_wave(times: &super::WaveTimes, payload_bytes: u64) {
+        STAGING_NS.fetch_add((times.staged.max(0.0) * 1e9) as u64, Ordering::Relaxed);
+        POST_NS.fetch_add((times.posted.max(0.0) * 1e9) as u64, Ordering::Relaxed);
+        WAIT_NS.fetch_add((times.received.max(0.0) * 1e9) as u64, Ordering::Relaxed);
+        BYTES.fetch_add(payload_bytes, Ordering::Relaxed);
+        WAVES.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn snapshot() -> serde_json::Value {
+        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        serde_json::json!({
+            "exchange_ns_total": {"staging": get(&STAGING_NS), "post": get(&POST_NS), "wait": get(&WAIT_NS)},
+            "exchange_bytes_total": get(&BYTES),
+            "exchange_waves_total": get(&WAVES),
+        })
+    }
+}
+
 /// Host seconds of one wave on the worker (the transport-timing profile).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct WaveTimes {
@@ -525,6 +572,9 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                     Pace::add(&mut pace.round_trip, done.times.received);
                     last_landed = Instant::now();
                     backend.publish(done.info.sequence);
+                    // The wave's three host times and its payload, always (the
+                    // `spark exchange wave` log line below stays behind its own flag).
+                    exchange_stats::record_wave(&done.times, done.info.payload_bytes as u64);
                     if timing {
                         tracing::info!(target: "cuteafd::timing", sequence = done.info.sequence, slot = done.info.slot,
                             rows = done.info.rows, staged_us = (done.times.staged * 1e6) as u64,

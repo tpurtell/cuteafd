@@ -655,6 +655,8 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let idle_wait = Duration::from_millis(100);
     let mut last_activity = Instant::now();
     let mut idle_cursor = 0usize;
+    // The expert counters' 1 Hz publish clock.
+    let mut stats_published = Instant::now();
     // One steady-state memory observation per admission event: after the owned
     // connection set changes, the next successful request triggers a single
     // sample. This is "first success after the admission event", not a proof
@@ -924,6 +926,15 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         }
         if progressed {
             last_activity = Instant::now();
+        }
+        // The expert-side counters, on ONE bounded line per second (the per-request
+        // `Spark expert compute` line is gone). 1 s matches the coordinator's stats cadence, so a
+        // scrape and a log line describe the same interval.
+        if stats_published.elapsed() >= Duration::from_secs(1) {
+            stats_published = Instant::now();
+            tracing::info!(target: "cuteafd::expert_stats", rank = config.rank,
+                stats = %crate::shared::experts::execution::timing::expert_stats::snapshot(),
+                "Spark expert stats");
         }
         if waiting {
             idle_cursor = idle_cursor.wrapping_add(1);

@@ -2025,3 +2025,35 @@ fn native_wait_guard_reuses_preweight_load_on_each_device() -> Result<()> {
     assert_eq!(fixture.native_initializations(&library)?, 2);
     Ok(())
 }
+
+/// A landed wave moves the exchange counters: the worker records the wave's three host times
+/// and its payload as it lands it, so `/v1/stats` `exchange` describes the same interval the
+/// `spark exchange wave` log line used to.
+/// The counters are process-global atomics, so the delta test takes a lock.
+#[test]
+fn a_landed_wave_moves_the_exchange_counters() -> Result<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let before = exchange_stats::snapshot();
+    let world = World::new(1);
+    let (jobs, inbox) = mpsc::channel();
+    std::thread::scope(|scope| -> Result<()> {
+        let mut backend = Fake { world: world.clone() };
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
+        world.store(Counter::Staged(0), 1);
+        jobs.send(Command::Wave(job(1, 0, 0))).map_err(|_| anyhow::anyhow!("worker command channel closed"))?;
+        wait(&world, Counter::Landed, 1)?;
+        drop(jobs);
+        let (result, _) = worker.join().unwrap();
+        result.map(|_| ())
+    })?;
+    let after = exchange_stats::snapshot();
+    let d = |key: &str, sub: &str| after[key][sub].as_u64().unwrap() - before[key][sub].as_u64().unwrap();
+    assert_eq!(after["exchange_waves_total"].as_u64().unwrap()
+        - before["exchange_waves_total"].as_u64().unwrap(), 1, "one landed wave");
+    assert_eq!(after["exchange_bytes_total"].as_u64().unwrap()
+        - before["exchange_bytes_total"].as_u64().unwrap(), 64, "the wave's payload");
+    assert!(d("exchange_ns_total", "staging") + d("exchange_ns_total", "post")
+        + d("exchange_ns_total", "wait") > 0, "the wave's host times were recorded");
+    Ok(())
+}
