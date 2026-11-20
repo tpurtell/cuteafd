@@ -20,7 +20,8 @@ import torch.nn.functional as F
 from inkling2 import numerical
 from kimi_k3.uniform_k2.storage import atomic_json, fsync_directory, verify_receipt
 from . import gates, recipe
-from .export import DirectMCWriter, verify_original_discovery
+from .export import DirectMCWriter
+from .seal import seal_package
 from .forward import AttentionTap, Drafter, Layer, Model, Reader, native_projection, recalled_context, reference
 from .prepare_corpus import load_token_batches
 from .source import HeaderSource
@@ -33,7 +34,7 @@ CODE = (
     "quantization/hy4_flash/gates.py", "quantization/hy4_flash/recipe.py", "quantization/hy4_flash/forward.py",
     "quantization/hy4_flash/source.py", "quantization/hy4_flash/prepare_corpus.py",
     "quantization/hy4_flash/parity.py", "quantization/hy4_flash/engram.py",
-    "quantization/hy4_flash/export.py", "quantization/core_export.py",
+    "quantization/hy4_flash/export.py", "quantization/hy4_flash/seal.py", "quantization/core_export.py",
     "quantization/inkling2/numerical.py",
     "quantization/inkling2/export.py", "quantization/kimi_k3/core_k6/storage.py",
     "quantization/kimi_k3/uniform_k2/storage.py", "quantization/kimi_k3/prepare_corpus.py",
@@ -356,8 +357,9 @@ class Runner:
                             receipt=str(self.root / "gates" / f"{label}.json"))
 
     def source_group(self, prefix, *, exclude=()):
-        original = {recipe.source_tensor(name)[0] for name in self.core if name.startswith(prefix) and name not in self.native_modules}
         native = {name for name in self.header.specs if name.startswith(prefix)}
+        selected = {recipe.source_tensor(name)[0] for name in self.core if name not in self.native_modules}
+        original = native & selected
         native -= original | set(exclude) | recipe.ENGRAM_TABLES.keys()
         return self.header.source_entries(native), self.header.source_entries(original)
 
@@ -916,24 +918,9 @@ class Runner:
         error_csv = self.write_error_csv()
         tables = self.export_engram()
         self.progress.event("package_audit")
-        result = self.writer.finalize(core_selection=self.selected_core(), engram=tables, document=self.header.document,
-                                      error_csv=error_csv, card_path=self.root / "README.md",
-                                      k6_drafter_bits=self.policy["k6_drafter_bits"],
-                                      retained_by_gate=self.native_modules)
-        state = read_json(self.output / "package-state.json")
-        discovery = verify_original_discovery(self.output, state["direct_expected_mappings"]["original"])
-        complete = dict(status="passed", identity=self.identity, output=str(self.output),
-                        revision=recipe.BASE_REVISION, repository=recipe.TARGET_REPO,
-                        completed_target_layers=recipe.LAYER_COUNT,
-                        completed_drafter_layers=recipe.MTP_LAYER_COUNT,
-                        completed_encodes=self.total, error_csv=str(error_csv),
-                        task_intermediates=[str(self.stages.root)],
-                        package_validation=str(self.output / "package-validation.json"),
-                        package_status=result["status"], original_discovery=discovery)
-        atomic_json(self.root / "numerical-complete.json", complete)
-        atomic_json(self.root / "status.json", dict(self.progress.base, status="passed",
-                    phase="numerical_complete", updated_at=datetime.now(timezone.utc).isoformat()))
-        return complete
+        return seal_package(self.root, self.writer, self.identity, self.header.document,
+                            self.selected_core(), self.native_modules, tables,
+                            self.policy["k6_drafter_bits"], error_csv, self.progress.base)
 
 
 def main():
