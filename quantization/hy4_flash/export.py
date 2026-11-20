@@ -108,7 +108,7 @@ def model_card(path, engram, *, k6_drafter_bits, selection, identity, view_bytes
     text = f"""---
 library_name: cuteafd
 license: other
-license_name: Tencent Hy License, Version 1.0
+license_name: tencent-hy-license
 license_link: LICENSE
 base_model: tencent/Hy4-flash
 datasets:
