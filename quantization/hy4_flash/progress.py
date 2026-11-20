@@ -126,6 +126,9 @@ def main():
     if cleanup.get("status") == handoff.get("status") == "passed":
         forecast = dict(remaining_seconds=0, completion_time=cleanup.get("time", now.isoformat()))
     publication = read(PRODUCTION / "publication-complete.json")
+    handoff_hold = (PRODUCTION / "sparknest-handoff.hold").is_file()
+    waiting_for_handoff = (handoff_hold and publication.get("status") == "passed"
+                           and handoff.get("status") != "passed")
     if status.get("phase") == "numerical_complete":
         for receipt, label in ((cleanup, "complete"), (handoff, "cleanup"),
                                (publication, "placement")):
@@ -134,10 +137,13 @@ def main():
                 break
         else:
             status.update(phase="publication", status="running")
+    if waiting_for_handoff:
+        status.update(phase="sparknest_handoff", status="paused",
+                      pause_reason="TJ requested a hold after the verified Hugging Face upload")
     snapshot = dict(as_of=now.isoformat(), status=status, completed_layer_receipts=completed,
                     forecast=forecast, engram=engram_progress(now),
                     publication={k: publication[k] for k in ("status", "url", "revision") if k in publication},
-                    handoff=handoff.get("status"), cleanup=cleanup.get("status"))
+                    handoff=handoff.get("status"), handoff_hold=handoff_hold, cleanup=cleanup.get("status"))
     path = ROOT / "progress-updates/latest.json"
     temporary = path.with_suffix(f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps(snapshot, indent=2) + "\n")
@@ -153,12 +159,18 @@ def main():
         "/home/tj/Developer/cuteafd/hy4-flash-k4-mc-quant.md with full v2 preflight and production gates. "
         "No separate pilot. After a reboot, report status only until TJ explicitly asks to resume. Do not duplicate live work or restart completed jobs."
     )
+    if handoff_hold:
+        message += (" TJ has paused SparkNest import, placement, and cleanup until explicitly resumed."
+                    " Finish and verify the Hugging Face upload, then report its receipt and hold.")
     subprocess.run([os.environ.get("CODEX_CLI", "codex"), "queue", "--thread",
                     os.environ["CODEX_THREAD_ID"], "--message", message],
                    check=True, timeout=45)
     if cleanup.get("status") == handoff.get("status") == "passed":
         subprocess.run(["systemctl", "--user", "disable", "--now",
                         "cuteafd-hy4-flash-progress.timer"], check=True, timeout=20)
+    elif waiting_for_handoff:
+        subprocess.run(["systemctl", "--user", "stop", "cuteafd-hy4-flash-progress.timer"],
+                       check=True, timeout=20)
 
 
 if __name__ == "__main__":
