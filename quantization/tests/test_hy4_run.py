@@ -274,3 +274,14 @@ def test_live_activation_writer_keeps_ownership_of_partial_tail(tmp_path):
         yield 1, {"v": torch.zeros(2)}
     store.write_activations("wave", produce, 2)
     assert torch.equal(store.read_batch("wave", 0)["v"], torch.ones(2))
+
+
+def test_source_group_separates_bf16_head_from_compact_views():
+    runner = run.Runner.__new__(run.Runner)
+    runner.core = {"lm_head": {}}
+    runner.header = SimpleNamespace(specs={"lm_head.weight": ("BF16", [4, 2])},
+                                    source_entries=set)
+    runner.native_modules = set()
+    assert runner.source_group("lm_head.") == (set(), {"lm_head.weight"})
+    runner.native_modules = {"lm_head"}
+    assert runner.source_group("lm_head.") == ({"lm_head.weight"}, set())
