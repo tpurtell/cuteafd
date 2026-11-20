@@ -107,7 +107,9 @@ def model_card(path, engram, *, k6_drafter_bits, selection, identity, view_bytes
     gib = {view: count / (1 << 30) for view, count in view_bytes.items()}
     text = f"""---
 library_name: cuteafd
-license: tencent-hy-license
+license: other
+license_name: Tencent Hy License, Version 1.0
+license_link: LICENSE
 base_model: tencent/Hy4-flash
 datasets:
 - {dataset['repo_id']}
