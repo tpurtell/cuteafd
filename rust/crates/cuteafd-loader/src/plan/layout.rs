@@ -1260,7 +1260,7 @@ pub(crate) fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyMod
     // Display labels name the checkpoint tier; the decoder can include an
     // adjacent tier too (Pro K2 uses its k23 package). Read the catalog contract.
     let catalog = input.expert_catalog().ok()?;
-    let tiers = catalog.exl3()?.decoder_tiers().iter().map(usize::to_string).collect::<String>();
+    let exl3 = catalog.exl3()?;
     let family = match report.family.as_deref()? {
         "qwen4" => "qwen4",
         "deepseek_v4" if model.spec().hidden == 4096 => "dsv4f",
@@ -1268,7 +1268,7 @@ pub(crate) fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyMod
         _ => return None,
     };
     let parent = manifest.unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json")).parent()?;
-    let stem = format!("exl3-{family}-k{tiers}");
+    let stem = exl3.package_name(family);
     let root = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
         .into_iter().find(|p| p.join("rtx-tp1/m4096/v41_exl3.json").is_file())?;
     let maximum = if family.starts_with("dsv4") { rows.max(64) } else { rows.max(1) };
@@ -1278,7 +1278,8 @@ pub(crate) fn expert_workspace(report: &PlanReport, model: &dyn super::FamilyMod
             &std::fs::read(root.join(format!("rtx-tp1/m{capacity}/v41_exl3.json"))).ok()?).ok())
         .collect::<Option<Vec<_>>>()?;
     let moe = model.spec().moe.as_ref()?;
-    if manifests.iter().any(|m| m["hidden"].as_u64() != Some(model.spec().hidden as u64)
+    if manifests.iter().any(|m| exl3.codebook().check_aot_manifest(m).is_err()
+        || m["hidden"].as_u64() != Some(model.spec().hidden as u64)
         || m["intermediate"].as_u64() != Some(moe.intermediate as u64)
         || m["experts"].as_u64() != Some(moe.experts as u64)) { return None; }
     crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum).ok()?

@@ -337,7 +337,7 @@ pub(super) fn dual_experts(args: &EngineArgs, catalog: &cuteafd_loader::Official
     let costs = qwen4::dual_expert_costs(catalog, layers)?;
     let wire = catalog.exl3().is_some();
     let (packages, backend_workspace) = if let Some(exl3) = catalog.exl3() {
-        let name = crate::shared::experts::exl3::package_name("qwen4", exl3.decoder_tiers());
+        let name = exl3.package_name("qwen4");
         let root = args.native_lib.parent().unwrap_or(std::path::Path::new(".")).join("exl3").join(name);
         let packages = [0, 1].map(|rank| root.join(format!("rtx-tp2-rank{rank}")));
         let workspace = [Exl3Tp2::workspace_bytes_for(&packages[0], catalog.routed_experts().hidden, rows)?,
@@ -727,7 +727,7 @@ mod tests {
             "--native-lib", "/absent/native.so", "--prefill-rows", "16"])?.engine;
         args.native_lib = dir.path().join("libcuteafd_native.so");
         // Qwen admits at least the 64-row decode shape, hence m80 as well.
-        let package = crate::shared::experts::exl3::package_name("qwen4", catalog.exl3().unwrap().decoder_tiers());
+        let package = catalog.exl3().unwrap().package_name("qwen4");
         for (rank, width) in [384, 256].into_iter().enumerate() {
             for capacity in [1, 16, 80] {
                 let path = dir.path().join("exl3").join(&package)

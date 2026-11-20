@@ -54,8 +54,9 @@ impl<'a> Resident<'a> {
                 Box::new(Whole::from_pushed(device, &tensors, &package, backing.layers.clone(), rows, budget, layers)?)
             }
             crate::shared::experts::rtx::push::PushedExperts::Exl3(layers) => {
+                let stem = catalog.exl3().context("Inkling EXL3 pushed catalog absent")?.package_name("inkling2");
                 let package = native_lib.parent().context("Inkling native lib directory absent")?
-                    .join("exl3/exl3-inkling2-k45/rtx-tp1");
+                    .join("exl3").join(stem).join("rtx-tp1");
                 Box::new(Exl3Tp2::pushed_whole_weights(device, catalog, &package, backing.layers.clone(), rows,
                     budget, RtxSelectionPolicy::CanonicalDecode, layers)?.execution()?)
             }
@@ -136,7 +137,9 @@ pub(crate) fn serving_dispatchers<'a>(stream: Rc<Stream<'a>>, peer: Option<Rc<St
                         .map(|rank| Box::new(rank) as Box<dyn RtxExpertLayer>)
                 }
                 (PushedExperts::Exl3(left), PushedExperts::Exl3(right)) => {
-                    let dir = native.parent().context("Inkling native directory missing")?.join("exl3/exl3-inkling2-k45/rtx-tp2");
+                    let stem = catalog.exl3().context("Inkling EXL3 pushed catalog missing")?.package_name("inkling2");
+                    let dir = native.parent().context("Inkling native directory missing")?
+                        .join("exl3").join(stem).join("rtx-tp2");
                     let [left, right] = Exl3Tp2::pushed_pair_weights(devices, catalog, cuteafd_core::ExpertGeometry::INKLING2,
                         [&dir, &dir], layers.clone(), rows, budgets, RtxSelectionPolicy::CanonicalDecode, [left, right])?;
                     [Box::new(left.execution()?), Box::new(right.execution()?)]

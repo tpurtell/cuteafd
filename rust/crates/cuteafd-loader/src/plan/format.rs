@@ -278,11 +278,26 @@ impl QuantOperand {
                 && s.direction == ScaleDirection::Multiply && matches!(s.rows, RowTiling::Uniform { rows: 1 }))
     }
 
-    /// MCG trellis bits for the existing routed-expert kernel contracts.
-    /// Dense native loaders select their codebook independently from headers.
+    /// MCG trellis bits for dense-core contracts that require MCG.
+    /// Dense native loaders that support multiple codebooks read headers directly.
     pub fn exl3_bits(&self) -> Option<usize> {
         match self.encoding {
             Encoding::Exl3 { bits } if !self.companions.iter().any(|s|s=="mul1") => Some(bits),
+            _ => None,
+        }
+    }
+
+    /// EXL3 trellis bits and codebook (`mcg` or `mul1`) for routed-expert contracts.
+    pub fn exl3_routed(&self) -> Option<(usize, crate::formats::exl3_storage::Exl3Codebook)> {
+        match self.encoding {
+            Encoding::Exl3 { bits } => {
+                let codebook = if self.companions.iter().any(|s| s == "mul1") {
+                    crate::formats::exl3_storage::Exl3Codebook::Mul1
+                } else {
+                    crate::formats::exl3_storage::Exl3Codebook::Mcg
+                };
+                Some((bits, codebook))
+            }
             _ => None,
         }
     }

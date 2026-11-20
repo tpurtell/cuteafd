@@ -178,6 +178,7 @@ pub(super) struct Model {
     pub(super) core: exl3::CoreInventory,
     /// Per routed target layer, the EXL3 width its experts are stored at.
     pub(super) expert_bits: BTreeMap<usize, usize>,
+    pub(super) expert_codebook: crate::formats::exl3_storage::Exl3Codebook,
 }
 
 impl Model {
@@ -196,7 +197,11 @@ impl Model {
     }
 
     pub(super) fn exl3_package(&self) -> Option<String> {
-        Some(format!("exl3-k{}", self.exl3_tiers()?.iter().map(usize::to_string).collect::<String>()))
+        Some(format!(
+            "exl3-k{}{}",
+            self.exl3_tiers()?.iter().map(usize::to_string).collect::<String>(),
+            self.expert_codebook.package_suffix(),
+        ))
     }
 
     pub fn is_exl3(&self) -> bool { !self.expert_bits.is_empty() }
@@ -227,6 +232,13 @@ impl Model {
         let _construction = tracing::debug_span!("step5_model_open").entered();
         let cfg = Config::parse(checkpoint)?;
         let exl3 = exl3::is_exl3(checkpoint);
+        let classified_codebook = classify_routed_codebook(checkpoint)?;
+        let shared_codebook = if exl3 {
+            Some(classified_codebook.context("Step-5 EXL3 checkpoint has no routed EXL3 expert projections")?)
+        } else {
+            ensure!(classified_codebook.is_none(), "Step-5 non-EXL3 checkpoint carries routed EXL3 expert markers");
+            None
+        };
         let core = exl3::CoreInventory::from_checkpoint(&cfg, checkpoint)?;
         let mut tensors = BTreeMap::new();
         // A header-native EXL3 projection replaces the `.weight` contract of its
@@ -251,6 +263,7 @@ impl Model {
         add("model.norm.weight".into(), Component::Norm, None, vec![h], DType::F32);
         let mut formats = Vec::new();
         let mut expert_bits = BTreeMap::new();
+        let mut expert_codebook = None;
         let mut experts: Vec<(String, Tensor)> = Vec::new();
         for layer in 0..cfg.layers + cfg.mtp {
             let base = format!("model.layers.{layer}");
@@ -283,11 +296,16 @@ impl Model {
                 vec![("moe", i, Component::RoutedExpert, true), ("share_expert", cfg.shared, Component::SharedExpert, false)]
             } else { vec![("mlp", cfg.dense, role(Component::DenseFfn), false)] } {
                 if stacked && exl3 {
-                    // Per-expert standard EXL3 modules; the width is the checkpoint's own.
-                    let bits = exl3_expert_bits(checkpoint, &format!("{base}.moe.experts.0.gate_proj"))?;
+                    // Per-expert standard EXL3 modules; the width and codebook are the checkpoint's own.
+                    let codebook = shared_codebook.expect("validated above for Step-5 EXL3");
+                    let (bits, first_codebook) = exl3_expert_module(checkpoint, &format!("{base}.moe.experts.0.gate_proj"))?;
+                    ensure!(first_codebook == codebook,
+                        "{base}: Step-5 routed experts mix MCG and MUL1 codebooks");
                     ensure!(exl3::declared_expert_bits(checkpoint, layer).is_none_or(|declared| declared == bits),
                         "{base}: routed experts are K{bits}; quantization_config declares K{:?}",
                         exl3::declared_expert_bits(checkpoint, layer));
+                    ensure!(*expert_codebook.get_or_insert(codebook) == codebook,
+                        "{base}: Step-5 routed experts mix MCG and MUL1 codebooks");
                     expert_bits.insert(layer, bits);
                     let label = format!("exl3-k{bits}");
                     if !formats.contains(&label) { formats.push(label); }
@@ -295,7 +313,8 @@ impl Model {
                         for (proj,n,k) in [("gate",inter,h), ("up",inter,h), ("down",h,inter)] {
                             let stem = format!("{base}.moe.experts.{expert}.{proj}_proj");
                             for (suffix, dtype, shape) in [("trellis", DType::I16, vec![k/16, n/16, 16*bits]),
-                                ("suh", DType::F16, vec![k]), ("svh", DType::F16, vec![n]), ("mcg", DType::I32, vec![])] {
+                                ("suh", DType::F16, vec![k]), ("svh", DType::F16, vec![n]),
+                                (codebook.marker(), DType::I32, vec![])] {
                                 experts.push((format!("{stem}.{suffix}"), Tensor { role: TensorRole::expert(component, layer, expert), shape, dtype }));
                             }
                         }
@@ -374,7 +393,12 @@ impl Model {
         for (name, contract) in &tensors {
             ensure!(checkpoint.contains_tensor(name), "Step-5 checkpoint lacks required tensor {name}");
             if let Some(actual) = header(checkpoint, name) {
-                ensure!(actual.meta.shape == contract.shape && actual.meta.dtype == contract.dtype,
+                let shape_ok = if name.ends_with(".mcg") || name.ends_with(".mul1") {
+                    crate::formats::exl3_storage::mcg_marker_shape(&actual.meta.shape)
+                } else {
+                    actual.meta.shape == contract.shape
+                };
+                ensure!(shape_ok && actual.meta.dtype == contract.dtype,
                     "{name}: expected {:?} {:?}, found {:?} {:?}", contract.dtype, contract.shape, actual.meta.dtype, actual.meta.shape);
             }
         }
@@ -422,7 +446,10 @@ impl Model {
                 }
             }
         }
-        Ok(Self { cfg, spec, tensors, bytes, complete, formats, core, expert_bits })
+        Ok(Self {
+            cfg, spec, tensors, bytes, complete, formats, core, expert_bits,
+            expert_codebook: expert_codebook.unwrap_or(crate::formats::exl3_storage::Exl3Codebook::Mcg),
+        })
     }
 }
 
@@ -447,6 +474,39 @@ fn exl3_expert_bits(checkpoint: &Checkpoint, stem: &str) -> Result<usize> {
     ensure!(shape.len() == 3 && shape[2] % 16 == 0 && (2..=6).contains(&(shape[2] / 16)),
         "{name}: EXL3 trellis shape {shape:?} is not K2..K6");
     Ok(shape[2] / 16)
+}
+
+fn is_routed_expert_tensor(name: &str) -> bool {
+    let Some((layer, rest)) = indexed(name, "model.layers.") else {
+        return false;
+    };
+    (3..91).contains(&layer)
+        && (indexed(rest, "moe.experts.").is_some()
+            || rest.starts_with("moe.gate_proj.")
+            || rest.starts_with("moe.up_proj.")
+            || rest.starts_with("moe.down_proj."))
+}
+
+pub fn classify_routed_codebook(checkpoint: &Checkpoint) -> Result<Option<crate::formats::exl3_storage::Exl3Codebook>> {
+    crate::formats::exl3_storage::classify_routed_exl3_codebook(
+        checkpoint, "Step-5", is_routed_expert_tensor,
+    )
+}
+
+fn exl3_expert_module(
+    checkpoint: &Checkpoint,
+    stem: &str,
+) -> Result<(usize, crate::formats::exl3_storage::Exl3Codebook)> {
+    let bits = exl3_expert_bits(checkpoint, stem)?;
+    let has_mcg = checkpoint.contains_tensor(&format!("{stem}.mcg"));
+    let has_mul1 = checkpoint.contains_tensor(&format!("{stem}.mul1"));
+    ensure!(has_mcg != has_mul1, "Step-5 EXL3 {stem} must carry exactly one .mcg or .mul1 marker");
+    let codebook = if has_mul1 {
+        crate::formats::exl3_storage::Exl3Codebook::Mul1
+    } else {
+        crate::formats::exl3_storage::Exl3Codebook::Mcg
+    };
+    Ok((bits, codebook))
 }
 
 impl Family for Step5 {
@@ -526,7 +586,15 @@ impl FamilyModel for Model {
             && !self.tensors.contains_key(&format!("{stem}.trellis")) {
             return Err(format!("{stem}: unknown Step-5 tensor; add a validated header contract"));
         }
-        if let Some(bits) = operand.exl3_bits() {
+        if role.component == Component::RoutedExpert {
+            if let Some((bits, codebook)) = operand.exl3_routed() {
+                if codebook != self.expert_codebook {
+                    return Err(format!("{stem}: routed EXL3 codebook {} differs from {}",
+                        codebook.marker(), self.expert_codebook.marker()));
+                }
+                return self.accepts_exl3(role, stem, operand, bits);
+            }
+        } else if let Some(bits) = operand.exl3_bits() {
             return self.accepts_exl3(role, stem, operand, bits);
         }
         if role.component == Component::RoutedExpert {
@@ -584,7 +652,10 @@ impl FamilyModel for Model {
         Err(format!("{stem}: Step-5 {:?} operand is outside the validated native contract", role.component))
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
-        if operand.exl3_bits().is_some() {
+        if let Some((_, codebook)) = operand.exl3_routed() {
+            if codebook != self.expert_codebook {
+                return None;
+            }
             let package = format!("step5:{}", self.exl3_package()?);
             return Some(ExpertContract {
                 spark_worlds: crate::plan::experts::spark_worlds(&package, self.cfg.intermediate),

@@ -7,7 +7,7 @@ use cuteafd_loader::{
 };
 
 pub(crate) struct ValidationLayout {
-    names: Vec<String>,
+    entries: Vec<(String, cuteafd_loader::Exl3Codebook)>,
     base: u64,
 }
 impl ValidationLayout {
@@ -16,16 +16,16 @@ impl ValidationLayout {
         base: u64,
         admitted_host_bytes: usize,
     ) -> Result<Self> {
-        let names = residencies
+        let entries = residencies
             .iter()
-            .flat_map(|r| &r.loads)
-            .filter_map(|load| {
+            .flat_map(|r| r.loads.iter().map(move |load| (r.codebook, load)))
+            .filter_map(|(codebook, load)| {
                 load.tensor
                     .strip_suffix(".trellis")
-                    .map(|prefix| format!("{prefix}.mcg"))
+                    .map(|prefix| (format!("{prefix}.{}", codebook.marker()), codebook))
             })
             .collect::<Vec<_>>();
-        let bytes = names
+        let bytes = entries
             .len()
             .checked_mul(4)
             .context("EXL3 validation size overflow")?;
@@ -33,10 +33,10 @@ impl ValidationLayout {
             bytes <= admitted_host_bytes && base.checked_add(bytes as u64).is_some(),
             "EXL3 validation image exceeds admission"
         );
-        Ok(Self { names, base })
+        Ok(Self { entries, base })
     }
     pub fn bytes(&self) -> usize {
-        self.names.len() * 4
+        self.entries.len() * 4
     }
     pub fn base(&self) -> u64 {
         self.base
@@ -47,7 +47,7 @@ impl ValidationLayout {
         catalog: &OfficialV41Catalog,
         rank: u32,
     ) -> Result<()> {
-        for (index, name) in self.names.iter().enumerate() {
+        for (index, (name, _)) in self.entries.iter().enumerate() {
             let source = Builder::v41_source(catalog, name)?;
             ensure!(source.bytes == 4, "EXL3 multiplier is not a scalar");
             builder.contiguous(
@@ -68,10 +68,11 @@ impl ValidationLayout {
             image.len() == self.bytes(),
             "EXL3 validation image length mismatch"
         );
-        for (name, bytes) in self.names.iter().zip(image.chunks_exact(4)) {
+        for ((name, codebook), bytes) in self.entries.iter().zip(image.chunks_exact(4)) {
             ensure!(
-                u32::from_le_bytes(bytes.try_into().unwrap()) == 0xcbac1fed,
-                "unsupported EXL3 MCG multiplier for {name}"
+                u32::from_le_bytes(bytes.try_into().unwrap()) == codebook.multiplier(),
+                "unsupported EXL3 {} multiplier for {name}",
+                codebook.marker().to_ascii_uppercase()
             );
         }
         Ok(())
@@ -84,13 +85,21 @@ mod tests {
     #[test]
     fn validation_image_is_exact_and_semantic_not_a_checksum() -> Result<()> {
         let layout = ValidationLayout {
-            names: vec!["projection.mcg".into()],
+            entries: vec![("projection.mcg".into(), cuteafd_loader::Exl3Codebook::Mcg)],
             base: 4096,
         };
         assert!(layout.validate(&[0; 4]).is_err());
         assert!(layout.validate(&[]).is_err());
+        assert!(layout.validate(&0x83dcd12du32.to_le_bytes()).is_err());
         layout.validate(&0xcbac1fedu32.to_le_bytes())?;
         assert_eq!(layout.base(), 4096);
+
+        let mul1_layout = ValidationLayout {
+            entries: vec![("projection.mul1".into(), cuteafd_loader::Exl3Codebook::Mul1)],
+            base: 8192,
+        };
+        assert!(mul1_layout.validate(&0xcbac1fedu32.to_le_bytes()).is_err());
+        mul1_layout.validate(&0x83dcd12du32.to_le_bytes())?;
         Ok(())
     }
 }

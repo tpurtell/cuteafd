@@ -476,7 +476,8 @@ impl FamilyModel for Model {
                             F32 per-expert amax and outer denominator, found {}", super::describe(operand))),
                     (ExpertStorage::Exl3 { bits }, Some(projection)) => {
                         let rows = if projection == "down_proj" { n } else { n / 2 };
-                        super::require(operand.exl3_bits() == Some(bits) && operand.logical == vec![rows, k],
+                        super::require(operand.exl3_routed().is_some_and(|(actual, _)| actual == bits)
+                            && operand.logical == vec![rows, k],
                             || format!("{stem}: expected EXL3 K{bits} [{rows}, {k}] (interleaved w13 split by row parity), found {}",
                                 super::describe(operand)))
                     }
@@ -488,16 +489,16 @@ impl FamilyModel for Model {
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         let (package, block) = if operand.is_fp8_row_groups(32, &[ScaleEncoding::Ue8m0]) {
-            ("inkling2:mxfp8", 32)
+            ("inkling2:mxfp8".to_owned(), 32)
         } else if operand.is_inkling_nvfp4() {
-            ("inkling2:nvfp4a4", 16)
-        } else if operand.exl3_bits().is_some_and(|bits| bits == 4) {
-            ("inkling2:exl3-k45", 128)
+            ("inkling2:nvfp4a4".to_owned(), 16)
+        } else if let Some((4, codebook)) = operand.exl3_routed() {
+            (format!("inkling2:exl3-k45{}", codebook.package_suffix()), 128)
         } else { return None; };
         Some(ExpertContract {
-            package: package.into(), block,
-            spark_worlds: crate::plan::experts::spark_worlds(package, self.cfg.intermediate),
+            spark_worlds: crate::plan::experts::spark_worlds(&package, self.cfg.intermediate),
             local: Ok(format!("Inkling 2 RTX expert onboarding ({package} whole/TP2 package)")),
+            package, block,
         })
     }
     fn contract_admission(&self) -> bool { true }

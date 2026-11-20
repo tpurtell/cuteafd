@@ -2182,7 +2182,7 @@ pub(super) mod tests {
         ensure!(report.fits && report.placement_supported && report.executable(), "{:?}", report.hints);
         let catalog = plan_input.expert_catalog()?;
         let mut rtx = plan_rtx_for_ranks(&cfg, &catalog,
-            allocation::expert_package_for_ranks(&path, 1)?, unit, 92, 1)?;
+            allocation::expert_package_for_ranks_codebook(&path, 1, catalog.exl3().unwrap().codebook())?, unit, 92, 1)?;
         rtx.layers = Onboard::Auto;
         let working = SparkWorkingSet { rtx_layers: vec![], spark_layers: (1..93).collect(),
             spark_ranks: 6, prefill_lanes: 1 };
@@ -2406,7 +2406,7 @@ pub(super) mod tests {
             assert_eq!((report.prefill_unit_rows, report.prefill_waves, report.prefill_span_rows),
                 (Some(unit as u64), Some(waves as u64), Some(rows as u64)));
             let catalog = plan_input.expert_catalog()?;
-            let package = allocation::expert_package(&manifest_path)?;
+            let package = allocation::expert_package_for_ranks_codebook(&manifest_path, 2, catalog.exl3().unwrap().codebook())?;
             // Startup charges hook-local owners (TP2 workspace, Spark endpoint,
             // peer exchange, graphs) at the unit; row planes at the lane.
             let mut rtx = plan_rtx(&cfg, &catalog, package, unit, 92)?;

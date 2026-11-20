@@ -29,11 +29,17 @@ pub struct V41Exl3Load {
     pub destinations: Vec<(usize, usize)>,
 }
 
+fn is_mcg_codebook(codebook: &crate::formats::exl3_storage::Exl3Codebook) -> bool {
+    *codebook == crate::formats::exl3_storage::Exl3Codebook::Mcg
+}
+
 #[derive(Debug, Serialize)]
 pub struct V41Exl3Residency {
     pub layer: V41Exl3Layer,
     pub world: usize,
     pub rank: usize,
+    #[serde(skip_serializing_if = "is_mcg_codebook")]
+    pub codebook: crate::formats::exl3_storage::Exl3Codebook,
     pub intermediate_start: usize,
     pub experts: usize,
     pub intermediate: usize,
@@ -107,17 +113,18 @@ impl V41Exl3Residency {
             .get(index)
             .context("EXL3 load index out of range")?;
         if let Some(prefix) = load.tensor.strip_suffix(".trellis") {
-            let mut mcg = [0u8; 4];
+            let mut marker = [0u8; 4];
             catalog.read_exl3_tensor_into(
-                &format!("{prefix}.mcg"),
+                &format!("{prefix}.{}", self.codebook.marker()),
                 self.world,
                 self.rank,
-                &mut mcg,
+                &mut marker,
                 &mut [],
             )?;
             ensure!(
-                u32::from_le_bytes(mcg) == 0xcbac1fed,
-                "unsupported EXL3 MCG multiplier for {prefix}"
+                u32::from_le_bytes(marker) == self.codebook.multiplier(),
+                "unsupported EXL3 {} multiplier for {prefix}",
+                self.codebook.marker().to_ascii_uppercase()
             );
         }
         let bytes = if let Some(map) = &self.unit_map {
@@ -181,6 +188,7 @@ pub(crate) struct ResidentBytesCache(std::sync::Mutex<std::collections::BTreeMap
 struct ResidentBytesKey {
     world: usize,
     rank: usize,
+    codebook: crate::formats::exl3_storage::Exl3Codebook,
     hidden: usize,
     intermediate: usize,
     experts: usize,
@@ -236,7 +244,7 @@ impl V41Exl3Manifest {
                     V41Exl3ProjectionKind::Up => 1, V41Exl3ProjectionKind::Down => 2 };
                 Ok((kind, p.bits, p.input_features, p.output_features))
             }).collect::<Result<Vec<_>>>()?;
-        Ok(ResidentBytesKey { world, rank, hidden: self.experts.hidden,
+        Ok(ResidentBytesKey { world, rank, codebook: self.codebook, hidden: self.experts.hidden,
             intermediate: self.experts.intermediate, experts, tiers: self.decoder_tiers.clone(),
             compact_layer: (balanced && self.experts.intermediate / 128 % world != 0).then_some(index), balanced, projections })
     }
@@ -496,6 +504,7 @@ impl V41Exl3Manifest {
             layer,
             world,
             rank,
+            codebook: self.codebook,
             intermediate_start: partition.start,
             experts,
             intermediate: width,
@@ -717,6 +726,7 @@ pub(super) mod tests {
                     V41Exl3Projection {
                         name,
                         kind,
+                        codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
                         bits: tiers[(expert + index) % tiers.len()],
                         input_features: if index == 2 { intermediate } else { hidden },
                         output_features: if index == 2 { hidden } else { intermediate },
@@ -727,6 +737,7 @@ pub(super) mod tests {
         V41Exl3Manifest {
             experts: shape,
             naming: crate::V41Exl3Naming::CheckpointNative,
+            codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
             decoder_tiers: crate::families::deepseek_v41::v41_exl3::decoder_family(&projections).unwrap(),
             projections,
             storage: crate::formats::exl3_storage::Exl3StorageSource::GptqModel,
@@ -756,6 +767,7 @@ pub(super) mod tests {
                         V41Exl3Projection {
                             name,
                             kind,
+                            codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
                             bits: 2 + tier,
                             input_features: if down { 3072 } else { 3584 },
                             output_features: if down { 3584 } else { 3072 },
@@ -951,5 +963,22 @@ pub(super) mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn residency_serialization_omits_mcg_and_records_mul1_codebook() {
+        let mcg_manifest = fixture_geometry(&[4, 5], 512, 256, 2);
+        let mcg_plan = mcg_manifest.residency(V41Exl3Layer::Backbone(0), 1, 0).unwrap();
+        let mcg_json: serde_json::Value = serde_json::to_value(&mcg_plan).unwrap();
+        assert!(mcg_json.get("codebook").is_none());
+
+        let mut mul1_manifest = fixture_geometry(&[4, 5], 512, 256, 2);
+        mul1_manifest.codebook = crate::formats::exl3_storage::Exl3Codebook::Mul1;
+        for projection in mul1_manifest.projections.values_mut() {
+            projection.codebook = crate::formats::exl3_storage::Exl3Codebook::Mul1;
+        }
+        let mul1_plan = mul1_manifest.residency(V41Exl3Layer::Backbone(0), 1, 0).unwrap();
+        let mul1_json: serde_json::Value = serde_json::to_value(&mul1_plan).unwrap();
+        assert_eq!(mul1_json["codebook"], serde_json::json!("mul1"));
     }
 }

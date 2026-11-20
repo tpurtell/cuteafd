@@ -909,7 +909,7 @@ mod tests {
             &env("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
         cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
             .map_err(|_| anyhow::anyhow!("Kimi push regression requires an isolated test process"))?;
-        startup::preflight(&manifest, &native)?;
+        startup::preflight(&checkpoint, &manifest, &native)?;
         // SAFETY: golden-run supplies the sealed library; all borrowers drop before it.
         let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&native)? });
         let programs = library.programs()?.with_manifest(&manifest)?;
@@ -1000,7 +1000,7 @@ mod tests {
             &env("CUTEAFD_GOLDEN_EXPERT_LAYERS")?)?;
         cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
             .map_err(|_| anyhow::anyhow!("native MLA proof requires an isolated test process"))?;
-        startup::preflight(&manifest, &native)?;
+        startup::preflight(&checkpoint, &manifest, &native)?;
         // SAFETY: golden-run supplies the sealed library; all borrowers drop before it.
         let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&native)? });
         let programs = library.programs()?.with_manifest(&manifest)?;

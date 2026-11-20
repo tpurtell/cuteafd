@@ -635,6 +635,7 @@ pub(crate) fn is_quantization_tensor(name: &str) -> bool {
         || name.ends_with(".su")
         || name.ends_with(".sv")
         || name.ends_with(".mcg")
+        || name.ends_with(".mul1")
 }
 
 pub(crate) fn classify_tensor(

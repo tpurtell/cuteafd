@@ -291,19 +291,25 @@ pub struct MissingLocalPackage(pub String);
 pub fn local_package(catalog: &crate::OfficialV41Catalog, manifest: &std::path::Path, gpus: usize, rows: u64)
     -> Result<(std::path::PathBuf, u64)> {
     let exl3 = catalog.exl3().context("Muse onboarding needs EXL3 expert headers")?;
-    let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
-    let stem = format!("exl3-muse-k{tiers}");
+    let stem = exl3.package_name("muse");
     let layout = if gpus == 2 { "rtx-tp2" } else { "rtx-tp1" };
     let parent = manifest.parent().context("Muse program manifest parent")?;
-    let package = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)].into_iter()
-        .map(|p| p.join(layout)).find(|p| p.is_dir())
-        .ok_or_else(|| anyhow::Error::new(MissingLocalPackage(format!("{stem}/{layout}"))))?;
+    let exl3_roots = [parent.join("exl3"), parent.join("../lib/exl3")];
+    let package = exl3_roots.iter().map(|r| r.join(&stem).join(layout)).find(|p| p.is_dir())
+        .ok_or_else(|| anyhow::Error::new(MissingLocalPackage(
+            if exl3.codebook() == crate::Exl3Codebook::Mul1 {
+                exl3.codebook().missing_package_detail("muse", exl3.decoder_tiers(), layout, &exl3_roots)
+            } else {
+                format!("{stem}/{layout}")
+            }
+        )))?;
     let capacities = cuteafd_core::EXL3_CAPACITIES.map(u64::from);
     let compiled = capacities.into_iter().find(|&c| c >= rows).context("Muse onboarded rows beyond EXL3 capacities")?;
     let shape = catalog.routed_experts();
     let manifests = capacities.into_iter().filter(|&c| c <= compiled).map(|capacity| {
         let directory = package.join(format!("m{capacity}"));
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        exl3.codebook().check_aot_manifest(&value)?;
         ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
             && value["intermediate"].as_u64() == Some(shape.intermediate as u64 / gpus as u64)
             && value["experts"].as_u64() == Some(shape.experts as u64) && value["top_k"].as_u64() == Some(shape.topk as u64)

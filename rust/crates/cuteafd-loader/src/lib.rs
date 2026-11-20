@@ -21,6 +21,7 @@ pub use families::deepseek_v41::v41_exl3_residency::{V41Exl3Layer, V41Exl3Load, 
 pub use families::deepseek_v41::v41_exl3_staging::{V41Exl3TensorGather, V41Exl3TensorSlice};
 pub use families::deepseek_v41::v41_exl3::{V41Exl3Manifest, V41Exl3Naming, V41Exl3Projection,
     V41Exl3ProjectionKind};
+pub use formats::exl3_storage::Exl3Codebook;
 pub use families::deepseek_v41::v41_nvfp4::{
     is_v41_nvfp4_publication, read_v41_nvfp4_contract, V41Nvfp4Contract, V41Nvfp4ExpertLayout,
 };

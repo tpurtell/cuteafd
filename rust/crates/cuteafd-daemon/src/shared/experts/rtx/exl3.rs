@@ -217,8 +217,17 @@ fn validate_whole_package(package: &Path, rows: usize, policy: Exl3RowPolicy,
 
 fn validate_shard_package(package: &Path, rows: usize, policy: Exl3RowPolicy,
     selection: RtxSelectionPolicy, geometry: ExpertGeometry, intermediate: u64) -> Result<()> {
+    let expected_codebook = if package.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str())
+        .is_some_and(|s| s.ends_with("-mul1")) {
+        cuteafd_loader::Exl3Codebook::Mul1
+    } else {
+        cuteafd_loader::Exl3Codebook::Mcg
+    };
     for path in selected_directories(package, rows, policy, selection)? {
-        let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(path.join("v41_exl3.json"))?)?;
+        let meta: serde_json::Value = serde_json::from_slice(
+            &crate::shared::experts::exl3::read_export_manifest_bytes(&path, Some(expected_codebook))?
+        )?;
+        expected_codebook.check_aot_manifest(&meta)?;
         ensure!(meta["hidden"].as_u64() == Some(geometry.hidden as u64)
             && meta["intermediate"].as_u64() == Some(intermediate)
             && meta["experts"].as_u64() == Some(geometry.experts as u64)
@@ -594,7 +603,7 @@ impl<'a> Exl3Tp2<'a> {
         let policy = Exl3RowPolicy::for_geometry(geometry);
         let directories = selected_directories(package, rows, policy, selection)?;
         let manifests = directories.iter().map(|path| -> Result<serde_json::Value> {
-            Ok(serde_json::from_slice(&std::fs::read(path.join("v41_exl3.json"))?)?)
+            Ok(serde_json::from_slice(&crate::shared::experts::exl3::read_export_manifest_bytes(path, None)?)?)
         }).collect::<Result<Vec<_>>>()?;
         let physical = Exl3WorkspaceLayout::from_manifests(&manifests, true, Exl3Epilogue::Sum)?;
         let capacities = selected_capacities(rows, policy, selection)?;

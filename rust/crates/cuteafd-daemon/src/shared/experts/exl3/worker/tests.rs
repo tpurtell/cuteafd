@@ -34,7 +34,7 @@ fn exl3_worker_rank_bounds_include_tp1() -> Result<()> {
 
 fn sparse_layout(layer: cuteafd_loader::V41Exl3Layer) -> cuteafd_loader::V41Exl3Residency {
     cuteafd_loader::V41Exl3Residency {
-        layer, world: 4, rank: 3,
+        layer, world: 4, rank: 3, codebook: cuteafd_loader::Exl3Codebook::Mcg,
         intermediate_start: 1536, experts: 256, intermediate: 512, tiers: vec![4],
         projection_counts: vec![[256; 3]], unit_map: None, buffers: vec![], loads: vec![],
     }

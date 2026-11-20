@@ -1526,7 +1526,7 @@ def test_build_config_is_staging_only_with_card_overrides_and_tagged_images(tmp_
 @pytest.mark.parametrize('audio,enabled', [(None, True), ('auto', True), ('on', True), ('off', False)])
 def test_muse_audio_scope_matches_card_request(tmp_path, audio, enabled):
     cfg = tmp_path / 'muse.config'
-    cfg.write_text('FAMILY=muse_spark\nSPARK_COUNT=4\n')
+    cfg.write_text('FAMILY=muse_spark\nMODEL_ID=wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-Core-K6\nSPARK_COUNT=4\n')
     card = dict(family='muse_spark', config=str(cfg), gpus=[0], sparks=['ostrich', 'dodo', 'emu', 'kiwi'],
                 set={} if audio is None else dict(AUDIO=audio))
     scopes = cards.build_scopes([card])
@@ -2000,7 +2000,9 @@ def test_v41_tp_role_matches_the_launcher_derivation(tmp_path, keys, role):
     config.write_text('MODEL_ID=deepseek-ai/DeepSeek-V4.1-Flash\n')
     card = dict(name='v', family='deepseek_v41', config=str(config), set=keys, sparks=[])
     assert cards.slot_needs(card)['tp_role'] == role
-    assert cards.slot_needs({**card, 'family': 'glm5_flash'})['tp_role'] is None
+    glmf_keys = ({**keys, 'MODEL_ID': 'wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC'}
+                 if keys.get('EXPERT_FORMAT') == 'exl3' else keys)
+    assert cards.slot_needs({**card, 'family': 'glm5_flash', 'set': glmf_keys})['tp_role'] is None
 
 
 def test_seal_check_reports_attested_roles_from_the_slot(tmp_path, monkeypatch):
@@ -3454,7 +3456,7 @@ def test_ml4_min_max_scope_union_includes_both_counts():
 
 def test_scope_and_package_needs_share_global_arm_settings(entry, tmp_path):
     entry.update(family='mistral_large4')
-    Path(entry['config']).write_text('SPARK_COUNT=4\nSPARK_TP=4\n')
+    Path(entry['config']).write_text('MODEL_ID=wrldsuksgo2mars/Mistral-Large-4-EXL3-K4\nSPARK_COUNT=4\nSPARK_TP=4\n')
     variant = cards.resolved_card(entry, {'SPARK_COUNT': '5'}, {'SPARK_TP'})
     assert variant['resolved_values']['SPARK_COUNT'] == '5'
     assert 'SPARK_TP' not in variant['resolved_values']
@@ -3517,6 +3519,7 @@ def test_seal_inventory_reads_libraries_not_registered_directories(tmp_path):
 
 def test_global_count_override_builds_and_launches_same_topology(entry, tmp_path, monkeypatch):
     entry['family'] = 'mistral_large4'
+    Path(entry['config']).write_text('MODEL_ID=wrldsuksgo2mars/Mistral-Large-4-EXL3-K4\nBENCH_SIMULATED=on\n')
     kit = _kit(tmp_path, entry)
     state = tmp_path / 'state'
     seen = []

@@ -31,6 +31,7 @@ pub enum V41Exl3ProjectionKind {
 pub struct V41Exl3Projection {
     pub name: String,
     pub kind: V41Exl3ProjectionKind,
+    pub codebook: crate::formats::exl3_storage::Exl3Codebook,
     pub bits: usize,
     pub input_features: usize,
     pub output_features: usize,
@@ -76,10 +77,10 @@ impl V41Exl3Projection {
                 vec![self.output_features],
                 self.output_features * 2,
             ),
-            "mcg" => (DType::I32, vec![], 4),
+            marker if marker == self.codebook.marker() => (DType::I32, vec![], 4),
             _ => anyhow::bail!("unexpected EXL3 tensor {}", tensor.name),
         };
-        let shape_ok = if suffix == "mcg" { mcg_marker_shape(&tensor.shape) } else { tensor.shape == shape };
+        let shape_ok = if suffix == self.codebook.marker() { mcg_marker_shape(&tensor.shape) } else { tensor.shape == shape };
         ensure!(
             tensor.dtype == dtype && shape_ok && tensor.byte_length == bytes as u64,
             "EXL3 manifest/header mismatch for {}",
@@ -197,6 +198,7 @@ pub struct V41Exl3Manifest {
     /// Routed-expert extents of every target and draft layer.
     pub experts: crate::RoutedExpertShape,
     pub naming: V41Exl3Naming,
+    pub codebook: crate::formats::exl3_storage::Exl3Codebook,
     pub projections: BTreeMap<String, V41Exl3Projection>,
     /// One checkpoint-wide family, shared by all target and draft layers.
     pub(crate) decoder_tiers: Vec<usize>,
@@ -206,8 +208,16 @@ pub struct V41Exl3Manifest {
 }
 
 impl V41Exl3Manifest {
+    pub fn codebook(&self) -> crate::formats::exl3_storage::Exl3Codebook {
+        self.codebook
+    }
+
     pub fn decoder_tiers(&self) -> &[usize] {
         &self.decoder_tiers
+    }
+
+    pub fn package_name(&self, family: &str) -> String {
+        self.codebook.package_name(family, &self.decoder_tiers)
     }
 }
 
@@ -347,7 +357,17 @@ pub(crate) fn read_deepseek_v4_exl3_manifest_view<'a>(
     if compact.get("native_quantization_config").is_some() {
         crate::plan::families::mistral_large4::check_native_headers(snapshot, &config, &derived, &headers)?;
     }
-    build_deepseek_v4_manifest(source, &derived, backbone, tiers)
+    let manifest = build_deepseek_v4_manifest(source, &derived, backbone, tiers)?;
+    if let Some(declared) = compact.get("codebook").and_then(Value::as_str) {
+        if let Some(codebook) = crate::formats::exl3_storage::Exl3Codebook::from_marker(declared) {
+            ensure!(
+                derived.values().any(|module| module.codebook == codebook),
+                "quantization_config.codebook={declared:?} disagrees with the safetensors headers ({})",
+                manifest.codebook.marker()
+            );
+        }
+    }
+    Ok(manifest)
 }
 
 /// Which storage map the snapshot carries, checked against `derived`: a
@@ -461,6 +481,7 @@ fn build_deepseek_v4_manifest(
         .count();
     let (hidden, intermediate) = (backbone.hidden, backbone.intermediate);
     let mut projections = BTreeMap::new();
+    let mut routed_codebook = None;
     for (draft, layers, experts) in [
         (false, backbone.first_layer..backbone.layers, backbone.experts),
         (true, 0..draft_stages, draft_experts),
@@ -485,8 +506,13 @@ fn build_deepseek_v4_manifest(
                         module.input_features,
                         module.output_features
                     );
-                    ensure!(module.codebook == crate::formats::exl3_storage::Exl3Codebook::Mcg,
-                        "projection {name}: routed expert kernels require MCG, found {}", module.codebook.marker());
+                    let expected_codebook = *routed_codebook.get_or_insert(module.codebook);
+                    ensure!(
+                        module.codebook == expected_codebook,
+                        "projection {name}: mixed EXL3 routed codebooks ({} vs {}) are not supported",
+                        expected_codebook.marker(),
+                        module.codebook.marker()
+                    );
                     ensure!(
                         (2..=6).contains(&module.bits),
                         "projection {name} is K{}; the expert kernels run K2..K6",
@@ -498,7 +524,14 @@ fn build_deepseek_v4_manifest(
                     );
                     projections.insert(
                         name.clone(),
-                        V41Exl3Projection { name, kind, bits: module.bits, input_features: input, output_features: output },
+                        V41Exl3Projection {
+                            name,
+                            kind,
+                            codebook: module.codebook,
+                            bits: module.bits,
+                            input_features: input,
+                            output_features: output,
+                        },
                     );
                 }
             }
@@ -515,6 +548,7 @@ fn build_deepseek_v4_manifest(
     Ok(V41Exl3Manifest {
         experts: crate::RoutedExpertShape { draft_stages, draft_experts, ..backbone },
         naming,
+        codebook: routed_codebook.unwrap_or(crate::formats::exl3_storage::Exl3Codebook::Mcg),
         decoder_tiers: decoder_family_preferring(&projections, tiers)?,
         projections,
         storage,
@@ -955,14 +989,26 @@ mod tests {
     }
 
     #[test]
-    fn routed_mul1_is_rejected_after_shared_header_derivation() {
-        let (config, _, shape, mut headers) = deepseek_v4_publication();
+    fn routed_mixed_codebooks_are_rejected_and_uniform_mul1_is_accepted() {
+        let (mut config, _, shape, mut headers) = deepseek_v4_publication();
         let marker = headers.iter_mut().find(|tensor| tensor.name.ends_with(".mcg")).unwrap();
         let stem = marker.name.strip_suffix(".mcg").unwrap().to_owned();
         marker.name = format!("{stem}.mul1");
         let error = read_publication(&config, &[], shape, &headers, &[]).unwrap_err();
         let text = format!("{error:#}");
-        assert!(text.contains(&stem) && text.contains("routed expert kernels require MCG"), "{text}");
+        assert!(text.contains("mixed EXL3 routed codebooks"), "{text}");
+
+        for tensor in &mut headers {
+            if let Some(stem) = tensor.name.strip_suffix(".mcg") {
+                tensor.name = format!("{stem}.mul1");
+            }
+        }
+        if config["quantization_config"].get("codebook").is_some() {
+            config["quantization_config"]["codebook"] = Value::from("mul1");
+        }
+        let parsed = read_publication(&config, &[], shape, &headers, &[]).unwrap();
+        assert_eq!(parsed.codebook(), crate::Exl3Codebook::Mul1);
+        assert_eq!(parsed.package_name("dsv4p"), "exl3-dsv4p-k23-mul1");
     }
 
     #[test]
@@ -1131,11 +1177,36 @@ mod tests {
         compact["quantization_config"]["bits"] = serde_json::json!(3.0);
         let error = read_publication(&compact, &[("quantize_config.json", &manifest)], shape, &headers, &[]);
         assert!(format!("{:#}", error.unwrap_err()).contains("disagree"));
-        // Unsupported variants stay unsupported without a map, by name.
+        // Unsupported variants and header/config disagreements fail closed, while
+        // MUL1 routed checkpoints select Exl3Codebook::Mul1 from .mul1 headers.
         let standard = |quant: Value| serde_json::json!({"quantization_config": quant});
         let error = read_publication(&standard(serde_json::json!({"quant_method": "exl3", "bits": 2, "codebook": "mul1"})),
             &[], shape, &headers, &[]).unwrap_err();
-        assert!(format!("{error:#}").contains("codebook=\"mul1\""), "{error:#}");
+        assert!(format!("{error:#}").contains("codebook=\"mul1\"") && format!("{error:#}").contains("disagrees"), "{error:#}");
+        let error = read_publication(&standard(serde_json::json!({"quant_method": "exl3", "bits": 2, "codebook": "3inst"})),
+            &[], shape, &headers, &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("codebook=\"3inst\""), "{error:#}");
+        let mul1_headers: Vec<_> = headers.iter().map(|t| {
+            let mut copy = t.clone();
+            if let Some(stem) = copy.name.strip_suffix(".mcg") {
+                copy.name = format!("{stem}.mul1");
+            }
+            copy
+        }).collect();
+        for quant in [
+            serde_json::json!({"quant_method": "exl3", "bits": 2, "codebook": "mul1"}),
+            serde_json::json!({"quant_method": "exl3", "bits": 2}),
+        ] {
+            let parsed = read_publication(&standard(quant), &[], shape, &mul1_headers, &[]).unwrap();
+            assert_eq!(parsed.codebook(), crate::formats::exl3_storage::Exl3Codebook::Mul1);
+            assert_eq!(parsed.package_name("dsv4p"), "exl3-dsv4p-k23-mul1");
+        }
+        let mut mixed_codebook = mul1_headers;
+        mixed_codebook.iter_mut().find(|t| t.name == "mtp.0.mlp.experts.1.down_proj.mul1").unwrap().name =
+            "mtp.0.mlp.experts.1.down_proj.mcg".into();
+        let error = read_publication(&standard(serde_json::json!({"quant_method": "exl3", "bits": 2})),
+            &[], shape, &mixed_codebook, &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("mixed EXL3 routed codebooks"), "{error:#}");
         let mut three_inst = headers.clone();
         three_inst.retain(|t| t.name != "mtp.0.mlp.experts.1.down_proj.mcg");
         let error = read_publication(&standard(serde_json::json!({"quant_method": "exl3", "bits": 2})),
@@ -1172,6 +1243,7 @@ mod tests {
             let p = V41Exl3Projection {
                 name: "test".into(),
                 kind,
+                codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
                 bits: 3,
                 input_features: input,
                 output_features: output,
@@ -1193,7 +1265,8 @@ mod tests {
                 } else {
                     (5120, intermediate)
                 };
-                let p = V41Exl3Projection { name: "test".into(), kind, bits: 4,
+                let p = V41Exl3Projection { name: "test".into(), kind,
+                    codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg, bits: 4,
                     input_features, output_features };
                 for world in [1, 5] {
                     if intermediate / 128 < world {
@@ -1224,7 +1297,8 @@ mod tests {
         // GLM 5.3 / GLM 5.3 Flash / MiMo: 16 H128 blocks -> 3, 3, 3, 3, 2, 2.
         for kind in [V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down] {
             let (input, output) = if kind == V41Exl3ProjectionKind::Down { (2048, 6144) } else { (6144, 2048) };
-            let p = V41Exl3Projection { name: "test".into(), kind, bits: 4, input_features: input, output_features: output };
+            let p = V41Exl3Projection { name: "test".into(), kind,
+                codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg, bits: 4, input_features: input, output_features: output };
             let mut cursor = 0;
             for (rank, width) in [384, 384, 384, 384, 256, 256].into_iter().enumerate() {
                 assert_eq!(p.intermediate_partition(6, rank).unwrap(), cursor..cursor + width);
@@ -1249,6 +1323,7 @@ mod tests {
             let p = V41Exl3Projection {
                 name: "test".into(),
                 kind,
+                codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
                 bits: 3,
                 input_features: input,
                 output_features: output,

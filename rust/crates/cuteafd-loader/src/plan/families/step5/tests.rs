@@ -2297,3 +2297,98 @@ fn default_vision_and_native_fp8_single_gpu_use_joint_admission() -> anyhow::Res
     }
     Ok(())
 }
+
+#[test]
+fn partial_step5_exl3_snapshot_with_extra_conflicting_mul1_fails_closed() -> anyhow::Result<()> {
+    use crate::plan::checkpoint::CheckpointTensor;
+    let fixture = exl3_snapshot();
+    // Standard exllamav3 snapshots without quantize_config.json rely on index + headers.
+    let _ = std::fs::remove_file(fixture.path().join("quantize_config.json"));
+
+    // Split layer 4's expert 1 onto an absent shard so the snapshot is genuinely partial
+    // while layer 4's expert 0 remains on its present shard (`model-00005-of-00096.safetensors`).
+    let present_shard = "model-00005-of-00096.safetensors";
+    let missing_shard = "model-00097-of-00097.safetensors";
+    let present_path = fixture.path().join(present_shard);
+    let kept_tensors = crate::read_safetensors_metadata(&present_path)?
+        .into_iter()
+        .filter(|meta| !meta.name.starts_with("model.layers.4.moe.experts.1."))
+        .map(|meta| {
+            let dtype = match meta.dtype {
+                DType::Bf16 => "BF16",
+                DType::F16 => "F16",
+                DType::F32 => "F32",
+                DType::I16 => "I16",
+                DType::I32 => "I32",
+                DType::U8 => "U8",
+                other => panic!("{other:?}"),
+            };
+            testing::t(&meta.name, dtype, &meta.shape)
+        })
+        .collect::<Vec<_>>();
+    testing::write_safetensors(&present_path, &kept_tensors);
+
+    let index_path = fixture.path().join("model.safetensors.index.json");
+    let base_index: Value = serde_json::from_slice(&std::fs::read(&index_path)?)?;
+    let mut base_map = base_index["weight_map"].as_object().unwrap().clone();
+    for (name, shard) in &mut base_map {
+        if name.starts_with("model.layers.4.moe.experts.1.") {
+            *shard = Value::String(missing_shard.into());
+        }
+    }
+    std::fs::write(&index_path, serde_json::to_vec(&serde_json::json!({"weight_map": base_map}))?)?;
+
+    // Baseline: the valid partial MCG snapshot opens cleanly with missing_shards recorded.
+    let valid_partial = Checkpoint::open(fixture.path())?;
+    assert_eq!(valid_partial.missing_shards, vec![missing_shard.to_string()]);
+    let valid_model = Model::open(&valid_partial)?;
+    assert!(!valid_model.complete);
+    assert_eq!(valid_model.exl3_package().as_deref(), Some("exl3-k46"));
+
+    // Case 1: extra conflicting `.mul1` alongside `.mcg` on the missing shard in weight_map.
+    let mut extra_mul1_map = base_map.clone();
+    extra_mul1_map.insert(
+        "model.layers.4.moe.experts.1.gate_proj.mul1".into(),
+        Value::String(missing_shard.into()),
+    );
+    std::fs::write(&index_path, serde_json::to_vec(&serde_json::json!({"weight_map": extra_mul1_map}))?)?;
+    let cp_extra = Checkpoint::open(fixture.path())?;
+    let err_extra = format!("{:#}", Model::open(&cp_extra).err().expect("extra .mul1 must fail closed"));
+    assert!(err_extra.contains("both .mcg and .mul1"), "{err_extra}");
+    let report_extra = plan::plan(fixture.path(), &PlanOptions::default())?;
+    assert!(
+        report_extra.config_error.as_deref().is_some_and(|e| e.contains("both .mcg and .mul1")),
+        "{:?}", report_extra.config_error
+    );
+    assert!(!report_extra.wip_launchable());
+
+    // Case 2: conflicting `.mul1` replacing `.mcg` on the missing shard in weight_map.
+    let mut mixed_map = base_map.clone();
+    mixed_map.remove("model.layers.4.moe.experts.1.gate_proj.mcg");
+    mixed_map.insert(
+        "model.layers.4.moe.experts.1.gate_proj.mul1".into(),
+        Value::String(missing_shard.into()),
+    );
+    std::fs::write(&index_path, serde_json::to_vec(&serde_json::json!({"weight_map": mixed_map}))?)?;
+    let cp_mixed = Checkpoint::open(fixture.path())?;
+    let err_mixed = format!("{:#}", Model::open(&cp_mixed).err().expect("mixed partial snapshot must fail closed"));
+    assert!(err_mixed.contains("mix MCG and MUL1"), "{err_mixed}");
+
+    // Case 3: extra unindexed `.mul1` in a visible shard header of the partial snapshot.
+    std::fs::write(&index_path, serde_json::to_vec(&serde_json::json!({"weight_map": base_map}))?)?;
+    let mut cp_unindexed = Checkpoint::open(fixture.path())?;
+    cp_unindexed.tensors.push(CheckpointTensor {
+        shard: present_shard.into(),
+        meta: crate::SafetensorsTensorMetadata {
+            name: "model.layers.4.moe.experts.0.gate_proj.mul1".into(),
+            dtype: DType::I32,
+            shape: vec![],
+            byte_offset: 0,
+            byte_length: 4,
+        },
+    });
+    cp_unindexed.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+    let err_unindexed = format!("{:#}", Model::open(&cp_unindexed).err().expect("unindexed header .mul1 must fail closed"));
+    assert!(err_unindexed.contains("absent from checkpoint index"), "{err_unindexed}");
+    Ok(())
+}

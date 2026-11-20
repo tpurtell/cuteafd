@@ -146,12 +146,13 @@ class PackageProfileTests(unittest.TestCase):
     expected_rank_count = {'tp2-rank': 2, 'tp3-rank': 3}
 
     def build_fixture(self, root, role, bits, require=(), tiles=(), geometry='dsv4p',
-                      capacities=(1, 80), compact=False, profiles=(), segments=False):
+                      capacities=(1, 80), compact=False, profiles=(), segments=False,
+                      codebook='mcg'):
         args = argparse.Namespace(
             output=root / 'package', build_dir=root / 'build', role=role, geometry=geometry,
             bits=list(bits), capacities=','.join(map(str, capacities)),
             require_layout=list(require), tile=list(tiles),
-            compact_companions=compact, profile=list(profiles),
+            compact_companions=compact, profile=list(profiles), codebook=codebook,
             cxx='unused-cxx', cuda_include=root, cuda_libdir=root,
             cuda_driver=root / 'libcuda.so', runtime=root / 'libcute_dsl_runtime.so')
         args.runtime.write_bytes(b'runtime fixture')
@@ -194,8 +195,11 @@ class PackageProfileTests(unittest.TestCase):
                                                 'hidden', 'swiglu_limit', 'decode_schedule',
                                                 'compact_weights', 'token_major_rotation', 'warp_specialized',
                                                 'wire_input', 'ws_input_stages', 'ws_dynamic_tiles', 'activation',
-                                                'row_addresses'},
+                                                'row_addresses', 'codebook'},
                                  'unexpected option consumed by the fake export')
+            if 'codebook' in options:
+                self.assertEqual(options['codebook'], 'mul1')
+                meta['codebook'] = options['codebook']
             if options.get('compact_weights'):
                 self.assertEqual(len(tiers), 2)
                 meta.update(descriptor_rows=7, native_info_version=3)
@@ -1561,6 +1565,35 @@ class PackageProfileTests(unittest.TestCase):
                 _, manifest, calls, capacities = self.build_fixture(Path(temporary), 'coordinator', bits)
                 self.assert_layouts(manifest, capacities, expected, bits)
                 self.assertEqual(len(calls), 2 * len(capacities))
+
+    def test_mul1_codebook_tracks_distinct_cache_and_manifest_while_mcg_stays_omitted(self):
+        with tempfile.TemporaryDirectory() as mcg_dir, tempfile.TemporaryDirectory() as mul1_dir:
+            mcg_out, mcg_manifest, mcg_calls, _ = self.build_fixture(
+                Path(mcg_dir), 'spark', (4, 5), geometry='glm',
+                capacities=(1, 1024), profiles=('tp4-width512',), segments=True, codebook='mcg')
+            mul1_out, mul1_manifest, mul1_calls, _ = self.build_fixture(
+                Path(mul1_dir), 'spark', (4, 5), geometry='glm',
+                capacities=(1, 1024), profiles=('tp4-width512',), segments=True, codebook='mul1')
+            self.assertNotIn('codebook', mcg_manifest)
+            self.assertEqual(mul1_manifest['codebook'], 'mul1')
+            self.assertTrue(all('codebook' not in v for v in mcg_manifest['variants']))
+            self.assertTrue(all(v.get('codebook') == 'mul1' for v in mul1_manifest['variants']))
+            self.assertTrue(all('codebook' not in c.kwargs for c in mcg_calls))
+            self.assertTrue(all(c.kwargs.get('codebook') == 'mul1' for c in mul1_calls))
+            mcg_caches = {c.args[0].parent.name for c in mcg_calls}
+            mul1_caches = {c.args[0].parent.name for c in mul1_calls}
+            self.assertFalse(mcg_caches & mul1_caches)
+            # Re-sign a variant with mismatched codebook to verify semantic rejection.
+            variant = mul1_manifest['variants'][0]
+            path = mul1_out / variant['directory'] / 'v41_exl3.json'
+            meta = json.loads(path.read_text())
+            meta.pop('codebook', None)
+            path.write_text(json.dumps(meta))
+            name = str(path.relative_to(mul1_out))
+            mul1_manifest['files'][name] = {'bytes': path.stat().st_size, 'sha256': package.digest(path)}
+            (mul1_out / 'manifest.json').write_text(json.dumps(mul1_manifest))
+            with self.assertRaisesRegex(ValueError, 'variant codebook mismatch'):
+                package.verify(mul1_out)
 
 
 if __name__ == '__main__':

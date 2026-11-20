@@ -484,6 +484,18 @@ def jobs(scope):
     return result
 
 
+def opt_in_jobs(scope="all"):
+    if scope == "suspects":
+        return []
+    result = [(f"{name}-mul1", exporter, [*args, "--codebook", "mul1"])
+              for name, exporter, args in jobs(scope)
+              if exporter == "package_exl3_aot.py"]
+    result.append(("exl3-inkling2-k45-mul1", "package_exl3_aot.py",
+                   ["--geometry", "inkling2", "--capacities", EXL3_CAPACITIES,
+                    "--bits", "4,5", "--codebook", "mul1"]))
+    return result
+
+
 def routed_package_layouts(package, geometry, base, role):
     """Evaluate this checkout's shipped layout policy without entering its compiler."""
     requested = None
@@ -669,11 +681,51 @@ def _policy_role_args(policy, role):
     return (role,) if getattr(getattr(policy, "__code__", None), "co_argcount", 0) >= 3 else ()
 
 
+def sparkinfer_supports_routed_mul1(checkout_root: Path) -> tuple[bool, str]:
+    override_src = os.environ.get("CUTEAFD_SPARKINFER_SOURCE_DIR")
+    override_lock = os.environ.get("CUTEAFD_SPARKINFER_LOCK_FILE")
+    if checkout_root.resolve() == ROOT.resolve() and override_src:
+        source = Path(override_src).expanduser().resolve()
+        lock = Path(override_lock).expanduser().resolve() if override_lock else checkout_root / "third_party/sparkinfer.lock.json"
+    else:
+        source = checkout_root / "third_party/sparkinfer"
+        lock = checkout_root / "third_party/sparkinfer.lock.json"
+    revision = json.loads(lock.read_text()).get("revision", "unknown") if lock.is_file() else "unknown"
+    codebooks = source / "b12x/moe/_shared/trellis_codebooks.py"
+    mixed = source / "b12x/moe/_shared/kernels/w4a16/mixed_trellis.py"
+    if not codebooks.is_file() or not mixed.is_file():
+        return False, str(revision)
+    spec = importlib.util.spec_from_file_location("_compare_sm_trellis_codebooks_probe", codebooks)
+    if spec is None or spec.loader is None:
+        return False, str(revision)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    supported = (getattr(module, "MUL1", None) == "mul1"
+                 and "mul1" in getattr(module, "CODEBOOKS", ())
+                 and "MUL1" in mixed.read_text(encoding="utf-8"))
+    return bool(supported), str(revision)
+
+
+def require_routed_mul1_pin(checkout_root: Path) -> None:
+    supported, revision = sparkinfer_supports_routed_mul1(checkout_root)
+    if not supported:
+        raise ValueError(
+            f"EXL3 routed-expert MUL1 requires a newer SparkInfer pin (current revision {revision})"
+        )
+
+
 def export_exl3(extra, output):
     """Follow production coordinator profiles and tuning, but allocate no CUDA buffers."""
+    if "--codebook" in extra and extra[extra.index("--codebook") + 1] == "mul1":
+        require_routed_mul1_pin(ROOT)
     import torch
+    from b12x.moe._shared import trellis_codebooks
     from b12x.moe._shared.kernels.w4a16 import mixed_trellis
-    with cpu_trellis_luts((mixed_trellis,), torch.device("cpu")):
+    luts = [mixed_trellis]
+    if getattr(trellis_codebooks, "MUL1", None) == "mul1":
+        from b12x.moe._shared.kernels.w4a16 import mixed_trellis4
+        luts.append(mixed_trellis4)
+    with cpu_trellis_luts(tuple(luts), torch.device("cpu")):
         _export_exl3(extra, output)
 
 
@@ -685,6 +737,9 @@ def _export_exl3(extra, output):
     capacities = (package.package_capacities(geometry, requested) if hasattr(package, "package_capacities")
                   else sorted({int(item) for item in requested.split(",")}))
     bits = tuple(int(item) for item in extra[extra.index("--bits") + 1].split(",")) if "--bits" in extra else (3, 4)
+    codebook = extra[extra.index("--codebook") + 1] if "--codebook" in extra else "mcg"
+    if codebook not in ("mcg", "mul1"):
+        raise ValueError(f"unsupported EXL3 codebook: {codebook}")
     compact = "--compact-companions" in extra
     role = extra[extra.index("--role") + 1] if "--role" in extra else "coordinator"
     if compact:
@@ -698,6 +753,8 @@ def _export_exl3(extra, output):
     for profile, width, experts, topk, dtype, _ in profiles:
         for rows in capacities:
             options = {"compile_only": True}
+            if codebook != "mcg":
+                options["codebook"] = codebook
             if compact:
                 options["compact_weights"] = True
             tile = (64, 128, 64, 128) if compact else None
@@ -760,7 +817,9 @@ def _export_exl3(extra, output):
                            dtype, **{**options, **schedule_options})
         # Baselines before row-address support must still export ordinary cells.
         if hasattr(package, 'segment_export_options') and 'row_addresses' in inspect.signature(export).parameters:
-            options = package.segment_export_options(geometry, role, width, compact=compact)
+            options = package.segment_export_options(
+                geometry, role, width, compact=compact,
+                **({'codebook': codebook} if codebook != 'mcg' else {}))
             if options is not None:
                 recorded_construction(export, output / profile / f'm{package.SEGMENT_MAX_ROWS}-segments',
                                       width, experts, package.SEGMENT_MAX_ROWS, bits, 'auto', topk,
@@ -1316,14 +1375,15 @@ def main():
         parser.error(str(exc))
     selected_jobs = jobs(args.scope)
     if args.list:
-        print("\n".join(name for name, _, _ in selected_jobs))
+        print("\n".join(name for name, _, _ in [*selected_jobs, *opt_in_jobs(args.scope)]))
         return 0
     if args.groups:
+        available_jobs = [*selected_jobs, *opt_in_jobs(args.scope)]
         selected = set(args.groups.split(","))
-        unknown = selected - {name for name, _, _ in selected_jobs}
+        unknown = selected - {name for name, _, _ in available_jobs}
         if unknown:
             parser.error(f"unknown groups: {sorted(unknown)}")
-        selected_jobs = [job for job in selected_jobs if job[0] in selected]
+        selected_jobs = [job for job in available_jobs if job[0] in selected]
     selected_jobs = [(name, exporter, comparison_job_args(exporter, extra, args.role))
                      for name, exporter, extra in selected_jobs]
     output = args.output_dir.expanduser().resolve()
@@ -1335,6 +1395,15 @@ def main():
     baseline_source = resolve_source_root(args.baseline_source) if args.baseline_source else None
     if baseline_source and not (baseline_source / "third_party/sparkinfer.lock.json").is_file():
         parser.error("--baseline-source must be an engine checkout with a pinned SparkInfer tree")
+    if not args.compare_only and any(
+        "--codebook" in extra and extra[extra.index("--codebook") + 1] == "mul1"
+        for _, _, extra in selected_jobs
+    ):
+        for target_root in ([baseline_source, ROOT] if baseline_source else [ROOT]):
+            try:
+                require_routed_mul1_pin(target_root)
+            except ValueError as exc:
+                parser.error(str(exc))
 
     def export_group(job):
         name, exporter, extra = job

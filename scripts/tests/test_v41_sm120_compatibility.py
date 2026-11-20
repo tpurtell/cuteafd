@@ -306,6 +306,69 @@ def test_exl3_export_refuses_multitier_before_cuda(monkeypatch, tmp_path, bits):
         exporter.export(tmp_path, 384, 256, 16, bits=bits, routing="packed")
 
 
+def test_exl3_export_validates_and_threads_codebook_while_keeping_mcg_manifest_identical(
+        monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    monkeypatch.setitem(sys.modules, "_pinned_sparkinfer", SimpleNamespace(
+        REVISION="qual", export_target=lambda props: "SM120"))
+    spec = importlib.util.spec_from_file_location(
+        "codebook_test_exl3_export", ROOT / "python/tools/aot/export_b12x_exl3_aot.py")
+    exporter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(exporter)
+    with pytest.raises(ValueError, match="EXL3 codebook must be mcg or mul1"):
+        exporter.export(tmp_path / "bad", 384, 256, 16, bits=(3, 4), routing="direct", codebook="3inst")
+
+    observed = []
+
+    class Compiled:
+        def export_to_c(self, directory, label, symbol):
+            path = Path(directory)
+            (path / f"{label}.o").write_bytes(b"object")
+            (path / f"{label}.h").write_text(f"static inline int32_t cute_dsl_{label}_wrapper(void *input) {{")
+
+    class Lut:
+        def __init__(self, payload: bytes):
+            self.payload = payload
+        def contiguous(self): return self
+        def view(self, dtype): return self
+        def cpu(self): return self
+        def numpy(self): return self
+        def tobytes(self): return self.payload
+
+    def compile_kernel(**kwargs):
+        observed.append(kwargs)
+        lut = b"mcg-lut" if kwargs["trellis_codebook"] == "mcg" else b"mul1-lut"
+        return SimpleNamespace(compiled=Compiled(), topk_sum=SimpleNamespace(compiled=Compiled()),
+                               trellis_lut=Lut(lut), blocks_per_sm=1, shared_memory_bytes=0)
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        int32="int32", uint8="uint8", device=lambda *a: "meta",
+        cuda=SimpleNamespace(get_device_properties=lambda _: SimpleNamespace(
+            major=12, minor=0, multi_processor_count=170, shared_memory_per_block_optin=101376))))
+    monkeypatch.setitem(sys.modules, "b12x.moe._shared.kernels.w4a16.host", SimpleNamespace(
+        route_pack_capacity=lambda *a, **k: (0, 128)))
+    monkeypatch.setitem(sys.modules, "b12x.moe._shared.kernels.w4a16.mixed_trellis", SimpleNamespace(
+        EXL3_AOT_MAX_SMS={(12, 0): 188}, compile_mixed_trellis=compile_kernel,
+        make_mixed_trellis_buffers=lambda *a, **k: SimpleNamespace()))
+    monkeypatch.setitem(sys.modules, "b12x.moe.fused_moe._impl", SimpleNamespace(
+        _projection_mixed_direct_topk_routes=lambda *a, **k: True,
+        _projection_mixed_tile_config=lambda *a, **k: (64, 128, 64, 128)))
+    monkeypatch.setattr(exporter, "fields", lambda _: ())
+    monkeypatch.setattr(exporter, "write_bridge", lambda output, manifest: None)
+
+    mcg_meta = exporter.export(tmp_path / "mcg", 384, 256, 1, bits=(3, 4), routing="direct",
+                               compile_only=True)
+    mul1_meta = exporter.export(tmp_path / "mul1", 384, 256, 1, bits=(3, 4), routing="direct",
+                                compile_only=True, codebook="mul1")
+    assert observed[0]["trellis_codebook"] == "mcg"
+    assert observed[1]["trellis_codebook"] == "mul1"
+    assert "codebook" not in mcg_meta
+    assert mul1_meta["codebook"] == "mul1"
+    assert (tmp_path / "mcg" / "trellis_lut.bin").read_bytes() == b"mcg-lut"
+    assert (tmp_path / "mul1" / "trellis_lut.bin").read_bytes() == b"mul1-lut"
+
+
 @pytest.mark.parametrize("bits,compact", [((3, 4), True), ((3, 4), False)])
 def test_exl3_export_forwards_pure_l2_schedule_before_cuda(monkeypatch, tmp_path, bits, compact):
     from types import SimpleNamespace

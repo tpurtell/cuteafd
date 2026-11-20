@@ -23,7 +23,7 @@ impl OnboardBudget {
         match (self, format) {
             (Self::Whole(_), super::experts::StepExperts::Native(_)) =>
                 anyhow::bail!("Step-5 native whole-layer RTX expert onboarding on one GPU is unimplemented (#2429); use EXL3 whole-layer or native TP2 onboarding"),
-            (_, super::experts::StepExperts::Exl3(_)) => Ok(format.package_manifest(native_lib)?
+            (_, super::experts::StepExperts::Exl3(..)) => Ok(format.package_manifest(native_lib)?
                 .parent().context("EXL3 package")?.join(if matches!(self, Self::Whole(_)) { "rtx-tp1" } else { "rtx-tp2" })),
             (Self::Tp2(_), super::experts::StepExperts::Native(expert)) =>
                 Ok(crate::shared::experts::fp8::package_directory(native_lib, 2, *expert)),

@@ -270,7 +270,7 @@ impl FamilyModel for QwenModel {
                     .ok_or("not a routed projection (gate/up/down_proj)")?;
                 require(operand.logical == shape, || format!("experts are {shape:?}, found {}", describe(operand)))?;
                 require(operand.is_fp8_block(128, &[ScaleEncoding::F32, ScaleEncoding::Bf16])
-                    || matches!(operand.exl3_bits(), Some(4..=5))
+                    || matches!(operand.exl3_routed(), Some((4..=5, _)))
                     || operand.is_nvfp4() && operand.scale.as_ref().is_some_and(|s| s.cols == 16), || {
                     format!("routed experts run EXL3 K4/K5 (qwen4:exl3-k45), E4M3 with 128x128 scales (qwen4:fp8) or \
                         ModelOpt NVFP4 group 16 (qwen4:nvfp4); found {}", describe(operand))
@@ -301,11 +301,12 @@ impl FamilyModel for QwenModel {
         if !geometry.same_shape(&cuteafd_core::ExpertGeometry::QWEN4) {
             return None;
         }
-        if operand.exl3_bits().is_some() {
+        if let Some((_, codebook)) = operand.exl3_routed() {
+            let package = format!("qwen4:exl3-k45{}", codebook.package_suffix());
             return Some(ExpertContract {
-                package: "qwen4:exl3-k45".into(),
+                spark_worlds: spark_worlds(&package, moe.intermediate),
+                package,
                 block: 128,
-                spark_worlds: spark_worlds("qwen4:exl3-k45", moe.intermediate),
                 local: Ok("serve-qwen4 --local-experts (TP1 EXL3 package)".into()),
             });
         }

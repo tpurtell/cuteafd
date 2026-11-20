@@ -207,6 +207,7 @@ def no_live_cache(tmp_path_factory):
     hub = root / ".cache/huggingface"
     seed_checkpoint_metadata(hub)
     patch.setenv("HF_HOME", str(hub))
+    patch.setenv("HF_HUB_OFFLINE", "1")
     yield root
     patch.undo()
 

@@ -9,7 +9,7 @@
 #[path = "local/shared_tp2_tests.rs"]
 mod shared_tp2_tests;
 use crate::shared::experts::exl3::{
-    aot_layout_directory,
+    aot_layout_directory_for,
     execution::{Exl3Epilogue, Exl3Execution, Exl3InputFormat, Exl3ReductionPlan, Exl3RowPolicy, Exl3Workspace},
     Exl3Weights,
 };
@@ -127,7 +127,7 @@ pub(crate) fn workspace_bytes(library: &NativeLibrary, native_lib: &Path, catalo
     let shape = *catalog.routed_experts();
     let capacities = capacities(max_rows);
     let workspace = if let Some(manifest) = catalog.exl3() {
-        let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
+        let directory = aot_layout_directory_for(native_lib, manifest.decoder_tiers(), manifest.codebook(), "rtx-tp1");
         let directories: Vec<_> = Exl3RowPolicy::active().capacities(max_rows)?.iter()
             .map(|c| directory.join(format!("m{c}"))).collect();
         Exl3ReductionPlan::new(&directories)?;
@@ -161,7 +161,7 @@ pub(crate) fn plan(library: &NativeLibrary, native_lib: &Path, catalog: &Officia
     if backbone.is_empty() && draft_stages == 0 { return Ok(empty()); }
     let capacities = capacities(max_rows);
     let workspace = if let Some(manifest) = catalog.exl3() {
-        let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
+        let directory = aot_layout_directory_for(native_lib, manifest.decoder_tiers(), manifest.codebook(), "rtx-tp1");
         let directories: Vec<_> = Exl3RowPolicy::active().capacities(max_rows)?.iter()
             .map(|c| directory.join(format!("m{c}"))).collect();
         Exl3ReductionPlan::new(&directories)?;
@@ -397,7 +397,7 @@ impl<'a> LocalExperts<'a> {
     fn exl3_package(native_lib: &Path, catalog: &OfficialV41Catalog, max_rows: usize)
         -> Result<Option<(Vec<std::path::PathBuf>, Vec<u32>, Exl3RowPolicy)>> {
         let manifest = catalog.exl3().context("EXL3 local experts need an EXL3 checkpoint")?;
-        let directory = aot_layout_directory(native_lib, manifest.decoder_tiers(), "rtx-tp1");
+        let directory = aot_layout_directory_for(native_lib, manifest.decoder_tiers(), manifest.codebook(), "rtx-tp1");
         let row_policy = Exl3RowPolicy::active();
         let capacities = row_policy.capacities(max_rows)?;
         let directories: Vec<_> = capacities.iter().map(|c| directory.join(format!("m{c}"))).collect();
@@ -495,7 +495,7 @@ impl<'a> LocalExperts<'a> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("local-experts");
         let Some((selections, weights_budget)) = Self::exl3_selections(native_lib, catalog, draft_stages, backbone,
             max_rows, budget)? else { return Ok(None) };
-        let directory = catalog.exl3().map(|m| aot_layout_directory(native_lib, m.decoder_tiers(), "rtx-tp1"));
+        let directory = catalog.exl3().map(|m| aot_layout_directory_for(native_lib, m.decoder_tiers(), m.codebook(), "rtx-tp1"));
         tracing::info!(budget, package = ?directory, layers = selections.len(), "loading coordinator EXL3 expert layers");
         if selections.is_empty() { return Ok(None); }
         let device = crate::shared::memory::device::Device { library, id: library.cuda_get_device()? };

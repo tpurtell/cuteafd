@@ -211,6 +211,7 @@ fn exl3_semantics_reject_nonfinite_and_upload_exact_descriptors() -> Result<()> 
         layer: V41Exl3Layer::Backbone(0),
         world: 1,
         rank: 0,
+        codebook: cuteafd_loader::Exl3Codebook::Mcg,
         intermediate_start: 0,
         experts: 1,
         intermediate: 128,

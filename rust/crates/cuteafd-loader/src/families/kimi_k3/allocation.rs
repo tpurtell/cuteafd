@@ -666,11 +666,18 @@ pub fn expert_workspace_for_ranks(package: &std::path::Path, rows: usize, ranks:
 pub(crate) fn expert_workspace_for_ranks_with(package: &std::path::Path, rows: usize, ranks: usize,
     read: impl Fn(&std::path::Path) -> Result<std::sync::Arc<serde_json::Value>>) -> Result<u64> {
     ensure!(matches!(ranks, 1 | 2), "Kimi expert workspace physical rank count");
+    let expected_codebook = if package.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str())
+        .is_some_and(|s| s.ends_with("-mul1")) {
+        crate::Exl3Codebook::Mul1
+    } else {
+        crate::Exl3Codebook::Mcg
+    };
     let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
         .capacities(rows)?;
     let manifests = capacities.into_iter().map(|capacity| -> Result<std::sync::Arc<serde_json::Value>> {
         let path = package.join(format!("m{capacity}/v41_exl3.json"));
         let manifest = read(&path)?;
+        expected_codebook.check_aot_manifest(&manifest)?;
         ensure!(manifest["hidden"] == 3584 && manifest["intermediate"] == 3072 / ranks
             && manifest["experts"] == 896 && manifest["top_k"] == 16
             && manifest["capacity"] == capacity && manifest["output_dtype"] == "fp32",
@@ -685,9 +692,17 @@ pub fn expert_package(manifest: &std::path::Path) -> Result<std::path::PathBuf> 
 }
 
 pub fn expert_package_for_ranks(manifest: &std::path::Path, ranks: usize) -> Result<std::path::PathBuf> {
+    expert_package_for_ranks_codebook(manifest, ranks, crate::Exl3Codebook::Mcg)
+}
+
+pub fn expert_package_for_ranks_codebook(
+    manifest: &std::path::Path,
+    ranks: usize,
+    codebook: crate::Exl3Codebook,
+) -> Result<std::path::PathBuf> {
     ensure!(matches!(ranks, 1 | 2), "Kimi expert package physical rank count");
     let parent = manifest.parent().context("Kimi manifest has no parent")?;
-    let role = format!("exl3/exl3-kimik3-k23/rtx-tp{ranks}");
+    let role = format!("exl3/{}/rtx-tp{ranks}", codebook.package_name("kimik3", &[2, 3]));
     [parent.join(&role), parent.join("../lib").join(&role)].into_iter()
         .find(|path| path.is_dir()).context("Kimi installed expert workspace manifests missing")
 }

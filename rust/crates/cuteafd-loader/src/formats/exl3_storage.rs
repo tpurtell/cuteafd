@@ -11,15 +11,19 @@
 //!
 //! `config.json` `quantization_config` carries only `quant_method`, `version`,
 //! `bits` (the checkpoint-wide average), `head_bits`, `codebook`, `out_scales`
-//! and `calibration`. A storage map (`tensor_storage`) lists every module's
-//! stored tensors with `quant_format`, `bits_per_weight` (the trellis's last
-//! dimension / 16) and the marker multiplier: GPTQModel writes one to
-//! `quantize_config.json` (`{shape, torch_dtype}` entries), exllamav3's
+//! and `calibration`. For sharded checkpoints, `model.safetensors.index.json`
+//! (`weight_map`) is the authoritative tensor inventory and visible shard
+//! headers must agree with it without adding unindexed tensors; single-file
+//! checkpoints without an index take their inventory from the sole
+//! `model.safetensors` header. A storage map (`tensor_storage`) lists every
+//! module's stored tensors with `quant_format`, `bits_per_weight` (the
+//! trellis's last dimension / 16) and the marker multiplier: GPTQModel writes
+//! one to `quantize_config.json` (`{shape, torch_dtype}` entries), exllamav3's
 //! `create_quantization_config_json` to `quantization_config.json`
-//! (`{dtype: "torch.*", n_bytes, shape}`). Everything in it but the multiplier
-//! value is in the safetensors headers, so the map is derived from them, and a
-//! map that is present must agree with the derivation. The multiplier is
-//! checked where the payload is read (`V41Exl3Residency::read_into`).
+//! (`{dtype: "torch.*", n_bytes, shape}`). Tensor dtypes, shapes and widths
+//! come from the validated safetensors headers, and any storage map that is
+//! present must agree with that derivation. The multiplier payload is checked
+//! where the payload is read (`V41Exl3Residency::read_into`).
 use crate::SafetensorsTensorMetadata;
 use cuteafd_core::DType;
 use serde_json::Value;
@@ -29,15 +33,164 @@ use std::collections::BTreeMap;
 pub const EXL3_MCG_MULTIPLIER: u64 = 0xcbac_1fed;
 pub const EXL3_MUL1_MULTIPLIER: u64 = 0x83dc_d12d;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Exl3Codebook { Mcg, Mul1 }
 impl Exl3Codebook {
     pub fn marker(self) -> &'static str { match self { Self::Mcg => "mcg", Self::Mul1 => "mul1" } }
+    pub fn from_marker(marker: &str) -> Option<Self> {
+        match marker {
+            "mcg" => Some(Self::Mcg),
+            "mul1" => Some(Self::Mul1),
+            _ => None,
+        }
+    }
     pub fn multiplier(self) -> u32 { match self { Self::Mcg => EXL3_MCG_MULTIPLIER as u32, Self::Mul1 => EXL3_MUL1_MULTIPLIER as u32 } }
+    pub fn package_suffix(self) -> &'static str { match self { Self::Mcg => "", Self::Mul1 => "-mul1" } }
+    pub fn package_name(self, family: &str, tiers: &[usize]) -> String {
+        let tag: String = tiers.iter().map(|b| b.to_string()).collect();
+        format!("exl3-{family}-k{tag}{}", self.package_suffix())
+    }
+    pub fn check_aot_manifest(self, manifest: &Value) -> anyhow::Result<()> {
+        let actual = match manifest.get("codebook") {
+            None => Self::Mcg,
+            Some(Value::String(s)) if s == "mul1" => Self::Mul1,
+            Some(other) => anyhow::bail!("invalid EXL3 AOT manifest codebook {other}"),
+        };
+        anyhow::ensure!(
+            actual == self,
+            "EXL3 AOT manifest codebook ({}) differs from checkpoint ({})",
+            actual.marker(),
+            self.marker()
+        );
+        Ok(())
+    }
+    pub fn missing_package_detail(
+        self,
+        family: &str,
+        tiers: &[usize],
+        layout: &str,
+        exl3_roots: &[std::path::PathBuf],
+    ) -> String {
+        let stem = self.package_name(family, tiers);
+        if self == Self::Mul1 {
+            let mcg_stem = Self::Mcg.package_name(family, tiers);
+            let mcg_installed = exl3_roots.iter().any(|root| root.join(&mcg_stem).exists());
+            if mcg_installed {
+                return format!(
+                    "EXL3 MUL1 routed-expert programs are not exported ({stem}/{layout} missing; \
+                     only MCG package {mcg_stem} is installed — refusing fallback to MCG; \
+                     export and install {stem} with --codebook mul1)"
+                );
+            }
+            return format!(
+                "EXL3 MUL1 routed-expert programs are not exported ({stem}/{layout} missing; \
+                 export and install {stem} with --codebook mul1)"
+            );
+        }
+        format!("missing {stem}/{layout} package")
+    }
 }
 
 /// Tensor suffixes that belong to an EXL3 module (`bias` aside).
 pub const EXL3_SUFFIXES: [&str; 7] = ["trellis", "suh", "svh", "mcg", "mul1", "su", "sv"];
+
+/// Strictly classify the uniform routed-expert EXL3 codebook across `checkpoint`.
+///
+/// When `checkpoint.weight_map` is present (`model.safetensors.index.json`),
+/// the index is authoritative for tensor membership and every visible shard
+/// header is cross-checked against it (any unindexed routed header tensor is
+/// rejected; missing shards in a partial snapshot are still checked via the
+/// index). Single-file checkpoints without an index classify from their sole
+/// `model.safetensors` header, with no fallback between the two modes.
+///
+/// Returns `Ok(None)` only when zero routed EXL3 tensors exist (e.g. a native
+/// BF16/FP8 checkpoint). Fails closed on mixed `.mcg`/`.mul1` markers, missing
+/// markers (`3inst` or `.trellis` without `.mcg`/`.mul1`), duplicate markers on
+/// one stem, orphan companions without `.trellis`, or header/index disagreement.
+pub fn classify_routed_exl3_codebook(
+    checkpoint: &crate::plan::Checkpoint,
+    family: &str,
+    is_routed_expert_tensor: impl Fn(&str) -> bool,
+) -> anyhow::Result<Option<Exl3Codebook>> {
+    #[derive(Default)]
+    struct StemState {
+        trellis: bool,
+        mcg: bool,
+        mul1: bool,
+        companion: bool,
+    }
+
+    let mut stems = BTreeMap::<String, StemState>::new();
+    let has_index = !checkpoint.weight_map.is_empty();
+    let mut record = |name: &str, from_header: bool| -> anyhow::Result<()> {
+        if !is_routed_expert_tensor(name) {
+            return Ok(());
+        }
+        let Some((stem, suffix)) = name.rsplit_once('.') else {
+            return Ok(());
+        };
+        if from_header && has_index {
+            anyhow::ensure!(
+                checkpoint.weight_map.contains_key(name),
+                "{name}: {family} routed EXL3 header tensor is absent from checkpoint index"
+            );
+        }
+        match suffix {
+            "3inst" => anyhow::bail!("{name}: unsupported {family} routed EXL3 3INST codebook marker"),
+            "su" | "sv" => anyhow::bail!("{name}: unsupported {family} packed EXL3 sign bitfield"),
+            "trellis" | "mcg" | "mul1" | "suh" | "svh" => {
+                let entry = stems.entry(stem.to_owned()).or_default();
+                match suffix {
+                    "trellis" => entry.trellis = true,
+                    "mcg" => entry.mcg = true,
+                    "mul1" => entry.mul1 = true,
+                    _ => entry.companion = true,
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+
+    for tensor in &checkpoint.tensors {
+        record(&tensor.meta.name, true)?;
+    }
+    for name in checkpoint.weight_map.keys() {
+        record(name, false)?;
+    }
+
+    let mut resolved: Option<(String, Exl3Codebook)> = None;
+    for (stem, state) in stems {
+        anyhow::ensure!(
+            !(state.mcg && state.mul1),
+            "{stem}: {family} routed EXL3 projection carries both .mcg and .mul1 markers"
+        );
+        anyhow::ensure!(
+            state.trellis,
+            "{stem}: {family} routed EXL3 companion without .trellis"
+        );
+        let codebook = match (state.mcg, state.mul1) {
+            (true, false) => Exl3Codebook::Mcg,
+            (false, true) => Exl3Codebook::Mul1,
+            (false, false) => anyhow::bail!(
+                "{stem}.trellis: {family} routed EXL3 projection lacks a .mcg or .mul1 marker"
+            ),
+            (true, true) => unreachable!(),
+        };
+        if let Some((first_stem, first_codebook)) = &resolved {
+            anyhow::ensure!(
+                *first_codebook == codebook,
+                "{stem}.{}: {family} routed experts mix MCG and MUL1 codebooks (conflicts with {first_stem}.{})",
+                codebook.marker(),
+                first_codebook.marker()
+            );
+        } else {
+            resolved = Some((stem, codebook));
+        }
+    }
+    Ok(resolved.map(|(_, codebook)| codebook))
+}
 
 /// Where a checkpoint's EXL3 storage map came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -189,7 +342,7 @@ pub fn exl3_module<'a>(
 
 /// The storage map of every EXL3 module in `headers`: each stem with an EXL3
 /// member (`trellis`, `suh`, `svh`, `mcg`, `mul1`, `su`, `sv`) must be a
-/// complete MCG module.
+/// complete MCG or MUL1 module.
 pub fn derive_storage_map<'a>(
     headers: impl IntoIterator<Item = &'a SafetensorsTensorMetadata>,
 ) -> Result<Exl3StorageMap, Exl3StorageError> {
@@ -499,7 +652,7 @@ pub fn check_quantization_config(quant: &Value) -> Result<(), Exl3StorageError> 
     for (key, value) in object {
         let ok = match key.as_str() {
             "method" | "format" | "checkpoint_format" => value == "exl3",
-            "codebook" => value == "mcg",
+            "codebook" => matches!(value.as_str(), Some("mcg" | "mul1")),
             // Whether the quantizer folded output scales into svh; the
             // kernels apply svh per channel either way.
             "out_scales" => matches!(value.as_str(), Some("auto" | "never")),
@@ -515,7 +668,7 @@ pub fn check_quantization_config(quant: &Value) -> Result<(), Exl3StorageError> 
         };
         if !ok {
             let reason = match key.as_str() {
-                "codebook" => "this build runs the MCG codebook only",
+                "codebook" => "this build runs the MCG or MUL1 codebook",
                 "tensor_storage" => "an inline storage map belongs in quantize_config.json",
                 _ => "unsupported EXL3 storage contract",
             };
@@ -762,9 +915,13 @@ mod tests {
             "codebook": "mcg", "calibration": {"rows": 250, "cols": 2048}, "out_scales": "auto",
             "scope": "routed_experts_only"});
         check_quantization_config(&standard).unwrap();
+        let mut mul1 = standard.clone();
+        mul1["codebook"] = serde_json::json!("mul1");
+        check_quantization_config(&mul1).unwrap();
+        assert_eq!(Exl3Codebook::Mcg.package_name("glm", &[4, 5]), "exl3-glm-k45");
+        assert_eq!(Exl3Codebook::Mul1.package_name("glm", &[4, 5]), "exl3-glm-k45-mul1");
         for (key, value, text) in [
-            ("codebook", serde_json::json!("mul1"), "MCG codebook only"),
-            ("codebook", serde_json::json!("3inst"), "MCG codebook only"),
+            ("codebook", serde_json::json!("3inst"), "MCG or MUL1 codebook"),
             ("out_scales", serde_json::json!("always"), "storage contract"),
             ("bits", serde_json::json!(12), "1..=8"),
             ("quant_method", serde_json::json!("gptq"), "not an EXL3"),

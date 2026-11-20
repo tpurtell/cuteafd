@@ -836,11 +836,14 @@ mod tests {
         let one = config(1, 0);
         assert_eq!(one.selection(7).unwrap(), ExpertLayer::BackboneExl3Tp { layer: 7, rank: 0, world: 1 });
         assert!(one.selection(7).unwrap().role() > 7);
-        assert!(one.exl3_directory_for(&[4, 5], "tp1-rank0").ends_with("tp1-rank0"));
-        assert!(one.exl3_directory_for(&[4, 5], "tp6-compact-rank0").ends_with("tp6-compact-rank0"));
+        assert!(one.exl3_directory_for(&[4, 5], cuteafd_loader::Exl3Codebook::Mcg, "tp1-rank0").ends_with("tp1-rank0"));
+        assert!(one.exl3_directory_for(&[4, 5], cuteafd_loader::Exl3Codebook::Mcg, "tp6-compact-rank0").ends_with("tp6-compact-rank0"));
+        let mul1 = one.exl3_directory_for(&[4, 5], cuteafd_loader::Exl3Codebook::Mul1, "tp1-rank0");
+        assert!(mul1.ends_with("tp1-rank0") && mul1.parent().unwrap().file_name().unwrap().to_str().unwrap().ends_with("-mul1"));
         let mut explicit = one;
         explicit.exl3_aot_dir = Some("/custom-export".into());
-        assert_eq!(explicit.exl3_directory_for(&[4, 5], "tp6-compact-rank0"), PathBuf::from("/custom-export"));
+        assert_eq!(explicit.exl3_directory_for(&[4, 5], cuteafd_loader::Exl3Codebook::Mcg, "tp6-compact-rank0"), PathBuf::from("/custom-export"));
+        assert_eq!(explicit.exl3_directory_for(&[4, 5], cuteafd_loader::Exl3Codebook::Mul1, "tp6-compact-rank0"), PathBuf::from("/custom-export"));
     }
 
     #[test]
@@ -869,7 +872,7 @@ mod tests {
         for rank in 0..3 {
             assert_eq!(config(3, rank).exl3_selection(7).unwrap(),
                 ExpertLayer::BackboneExl3Tp { layer: 7, rank, world: 3 });
-            assert!(config(3, rank).exl3_directory_for(&[2, 3], &format!("tp3-rank{rank}")).ends_with(format!("tp3-rank{rank}")));
+            assert!(config(3, rank).exl3_directory_for(&[2, 3], cuteafd_loader::Exl3Codebook::Mcg, &format!("tp3-rank{rank}")).ends_with(format!("tp3-rank{rank}")));
         }
         let geometry = cuteafd_core::expert_geometry();
         for family in ["v41", "dsv4f", "dsv4p"] {
@@ -1491,10 +1494,15 @@ impl NativeExpertServiceConfig {
     }
 
     /// Resolve this rank's EXL3 AOT package for the running checkpoint's
-    /// decoder tiers and family. An explicit --exl3-aot-dir is used verbatim.
-    fn exl3_directory_for(&self, tiers: &[usize], layout: &str) -> PathBuf {
+    /// decoder tiers, codebook and family. An explicit --exl3-aot-dir is used verbatim.
+    fn exl3_directory_for(
+        &self,
+        tiers: &[usize],
+        codebook: cuteafd_loader::Exl3Codebook,
+        layout: &str,
+    ) -> PathBuf {
         self.exl3_aot_dir.clone().unwrap_or_else(|| {
-            crate::shared::experts::exl3::aot_layout_directory(&self.library, tiers, layout)
+            crate::shared::experts::exl3::aot_layout_directory_for(&self.library, tiers, codebook, layout)
         })
     }
 
@@ -1503,7 +1511,7 @@ impl NativeExpertServiceConfig {
             .context("EXL3 package selection requires a resident layer")?;
         let plan = crate::shared::experts::exl3::planned_residency(catalog,
             self.exl3_selection(layer)?)?;
-        Ok(self.exl3_directory_for(&plan.tiers, &plan.aot_layout()))
+        Ok(self.exl3_directory_for(&plan.tiers, plan.codebook, &plan.aot_layout()))
     }
 
     fn validate_exl3_residency(&self, catalog: &OfficialV41Catalog, directory: &std::path::Path) -> Result<()> {

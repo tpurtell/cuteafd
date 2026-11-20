@@ -140,7 +140,7 @@ fn k31_raw_and_streamed_scoring_match_ordinary_c16() -> Result<()> {
             }), ..Default::default()
         })?;
     let offline_pool = offline.memory_layout.as_ref().context("offline proof memory layout")?.pool_tokens;
-    startup::preflight(&args.manifest, &args.native_lib)?;
+    startup::preflight(&checkpoint, &args.manifest, &args.native_lib)?;
     // SAFETY: golden-run supplies the sealed library; all borrowers drop first.
     let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
     let programs = library.programs()?.with_manifest(&args.manifest)?;

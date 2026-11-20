@@ -235,7 +235,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                     lane: 0, layout: lane.clone(), extra_requests: Vec::new() }));
             }
             if opts.onboard != Some(OnboardSetting::Layers(0)) {
-                let package = allocation::expert_package_for_ranks(path, gpus)?;
+                let package = allocation::expert_package_for_ranks_codebook(path, gpus, model.expert_codebook)?;
                 tp2_workspace = [allocation::expert_workspace_for_ranks_with(&package, unit, gpus, |path| input.manifest(path))?; 2];
             }
             Ok(demands)

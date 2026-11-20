@@ -108,9 +108,9 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
                 // across sampling and final backend binding, no weight storage.
                 module_pins.push(unsafe { cuteafd_ffi::fp8_moe::Fp8MoeModule::load(&directory)? });
             }
-        } else if catalog.exl3().is_some() {
+        } else if let Some(exl3) = catalog.exl3() {
             let directory = options.native_lib.parent().context("Inkling native library directory absent")?
-                .join(format!("exl3/exl3-inkling2-k45/rtx-tp{gpus}"));
+                .join("exl3").join(exl3.package_name("inkling2")).join(format!("rtx-tp{gpus}"));
             let preload = if gpus == 2 { crate::shared::experts::rtx::exl3::Exl3Tp2::preload_tp2_modules }
                 else { crate::shared::experts::rtx::exl3::Exl3Tp2::preload_whole_modules };
             exl3_modules.extend(preload(

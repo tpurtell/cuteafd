@@ -114,7 +114,7 @@ impl Exl3ReductionPlan {
         let package = directories.first().context("empty EXL3 reduction package")?;
         let manifests = directories.iter().map(|directory| -> Result<serde_json::Value> {
             let path = directory.join("v41_exl3.json");
-            serde_json::from_slice(&std::fs::read(&path)
+            serde_json::from_slice(&super::read_export_manifest_bytes(directory, None)
                 .with_context(|| format!("EXL3 reduction manifest {}", path.display()))?)
                 .with_context(|| format!("invalid EXL3 reduction manifest {}", path.display()))
         }).collect::<Result<Vec<_>>>()?;
@@ -140,9 +140,15 @@ impl Exl3ReductionPlan {
             };
             ensure!(route_block == 8 || (route_block > 0 && route_block % 16 == 0),
                 "EXL3 export has unsupported route block");
+            let codebook = match meta.get("codebook") {
+                None => "mcg",
+                Some(value) if value.as_str() == Some("mul1") => "mul1",
+                Some(other) => anyhow::bail!("EXL3 export has invalid codebook {other}"),
+            };
             let mut result = vec![meta["tile"].clone(), serde_json::Value::Array(threads),
                 route_block.into(),
-                meta["input_format"].as_str().unwrap_or("bf16").into()];
+                meta["input_format"].as_str().unwrap_or("bf16").into(),
+                codebook.into()];
             for key in ["direct", "warp_specialized", "fused_input_rotation", "token_major_rotation"] {
                 result.push(meta[key].as_bool().unwrap_or(false).into());
             }
@@ -208,6 +214,9 @@ struct Manifest {
     capacity: usize,
     top_k: usize,
     bits: Vec<usize>,
+    /// Absent for default MCG; `"mul1"` for MUL1 exports.
+    #[serde(default)]
+    codebook: Option<String>,
     /// `null` for an unclamped SwiGLU (GLM).
     swiglu_limit: Option<f32>,
     /// Absent for SiLU; otherwise the family's expert arithmetic (`situ`, `silu_post_clamp`).
@@ -294,7 +303,16 @@ impl Manifest {
             Some(other) => anyhow::bail!("unknown EXL3 input format {other}"),
         }
     }
+    fn codebook(&self) -> Result<cuteafd_loader::Exl3Codebook> {
+        match self.codebook.as_deref() {
+            None => Ok(cuteafd_loader::Exl3Codebook::Mcg),
+            Some("mul1") => Ok(cuteafd_loader::Exl3Codebook::Mul1),
+            Some("mcg") => anyhow::bail!("EXL3 export must omit default mcg codebook"),
+            Some(other) => anyhow::bail!("unknown EXL3 codebook {other}"),
+        }
+    }
     fn validate_native_contract(&self) -> Result<()> {
+        self.codebook()?;
         let legacy = self.descriptor_rows.is_none_or(|rows| rows == 3)
             && self.native_info_version.is_none_or(|version| version == 2);
         let compact = self.descriptor_rows == Some(7) && self.native_info_version == Some(3)
@@ -305,6 +323,10 @@ impl Manifest {
     fn validate_residency(&self, layout: &cuteafd_loader::V41Exl3Residency,
         geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
         self.validate_native_contract()?;
+        let codebook = self.codebook()?;
+        ensure!(codebook == layout.codebook,
+            "EXL3 export codebook ({}) differs from checkpoint ({})",
+            codebook.marker(), layout.codebook.marker());
         let rows = self.descriptor_rows.unwrap_or(3);
         ensure!(layout.unit_map.is_some() == (rows == 7),
             "EXL3 compact storage/native contract mismatch");
@@ -371,7 +393,7 @@ impl<'a> Exl3Workspace<'a> {
     }
     fn layout(directories: &[PathBuf], epilogue: Exl3Epilogue) -> Result<BTreeMap<String, (usize, String)>> {
         let manifests = directories.iter().map(|directory| -> Result<serde_json::Value> {
-            Ok(serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?)
+            Ok(serde_json::from_slice(&super::read_export_manifest_bytes(directory, None)?)?)
         }).collect::<Result<Vec<_>>>()?;
         let physical = cuteafd_loader::serving_capacity::Exl3WorkspaceLayout::from_manifests(
             &manifests, false, epilogue)?;
@@ -386,7 +408,7 @@ impl<'a> Exl3Workspace<'a> {
     pub(crate) fn plan(directories: &[PathBuf], format: Exl3InputFormat,
         epilogue: Exl3Epilogue) -> Result<usize> {
         let manifests = directories.iter().map(|directory| -> Result<serde_json::Value> {
-            Ok(serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?)
+            Ok(serde_json::from_slice(&super::read_export_manifest_bytes(directory, None)?)?)
         }).collect::<Result<Vec<_>>>()?;
         Ok(usize::try_from(cuteafd_loader::serving_capacity::exl3_workspace_bytes(&manifests,
             format == Exl3InputFormat::Fp8K32, epilogue)?)?)
@@ -572,7 +594,7 @@ impl<'a> Exl3Modules<'a> {
     pub(crate) unsafe fn load(
         library: &'a NativeLibrary, directory: &Path, format: Exl3InputFormat,
     ) -> Result<Self> {
-        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        let meta: Manifest = serde_json::from_slice(&super::read_export_manifest_bytes(directory, None)?)?;
         let paths = Exl3ModulePaths {
             core: directory.join("libcuteafd_exl3.so"),
             routes: meta.route_preparation.as_ref().map(|route| directory.join(&route.manifest)
@@ -587,7 +609,7 @@ impl<'a> Exl3Modules<'a> {
     /// are trusted for the current device. Assets always come from `directory`.
     pub(crate) unsafe fn load_from(library: &'a NativeLibrary, directory: &Path,
         format: Exl3InputFormat, paths: Exl3ModulePaths) -> Result<Self> {
-        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        let meta: Manifest = serde_json::from_slice(&super::read_export_manifest_bytes(directory, None)?)?;
         // SAFETY: caller supplies the trusted module ABI; only parsing is factored out.
         unsafe { Self::load_manifest(library, directory, format, paths, meta) }
     }
@@ -721,12 +743,12 @@ impl<'a> Exl3Execution<'a> {
     /// A segments program's verified arena geometry, read from its manifest
     /// without loading code (planner and worker admission).
     pub(crate) fn segment_geometry(directory: &Path) -> Result<cuteafd_core::spark_executions::Exl3SegmentGeometry> {
-        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        let meta: Manifest = serde_json::from_slice(&super::read_export_manifest_bytes(directory, None)?)?;
         meta.segment_geometry()
     }
 
     pub(crate) fn validate_artifact(directory: &Path) -> Result<()> {
-        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        let meta: Manifest = serde_json::from_slice(&super::read_export_manifest_bytes(directory, None)?)?;
         meta.validate_native_contract()
     }
 
@@ -735,7 +757,7 @@ impl<'a> Exl3Execution<'a> {
     pub(crate) fn validate_planned_residency(directory: &Path,
         layout: &cuteafd_loader::V41Exl3Residency,
         geometry: cuteafd_core::ExpertGeometry) -> Result<()> {
-        let meta: Manifest = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        let meta: Manifest = serde_json::from_slice(&super::read_export_manifest_bytes(directory, Some(layout.codebook))?)?;
         meta.validate_residency(layout, geometry)
     }
 
@@ -744,7 +766,7 @@ impl<'a> Exl3Execution<'a> {
     pub(crate) fn plan(directory: &Path, format: Exl3InputFormat,
         epilogue: Exl3Epilogue) -> Result<usize> {
         let meta: Manifest =
-            serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+            serde_json::from_slice(&super::read_export_manifest_bytes(directory, None)?)?;
         meta.workspace_bytes(format, epilogue)
     }
 
@@ -1310,6 +1332,7 @@ mod tests {
             let rows = if compact { 7 } else { 3 };
             let mut layout = V41Exl3Residency {
                 layer: V41Exl3Layer::Backbone(3), world: 6, rank: 0,
+                codebook: cuteafd_loader::Exl3Codebook::Mcg,
                 intermediate_start: 0, experts: geometry.experts as usize, intermediate: 384,
                 tiers: vec![4, 5], projection_counts: vec![], loads: vec![],
                 unit_map: compact.then(|| RankUnits::new(UnitRule::Rotated,
@@ -1330,6 +1353,16 @@ mod tests {
             let path = root.path().join("v41_exl3.json");
             std::fs::write(&path, serde_json::to_vec(&metadata)?)?;
             Exl3Execution::validate_planned_residency(root.path(), &layout, geometry)?;
+            // Codebook mismatch between export manifest and resident checkpoint layout fails closed.
+            layout.codebook = cuteafd_loader::Exl3Codebook::Mul1;
+            assert!(Exl3Execution::validate_planned_residency(root.path(), &layout, geometry).is_err());
+            let mut mul1_meta = metadata.clone();
+            mul1_meta["codebook"] = serde_json::json!("mul1");
+            std::fs::write(&path, serde_json::to_vec(&mul1_meta)?)?;
+            Exl3Execution::validate_planned_residency(root.path(), &layout, geometry)?;
+            layout.codebook = cuteafd_loader::Exl3Codebook::Mcg;
+            assert!(Exl3Execution::validate_planned_residency(root.path(), &layout, geometry).is_err());
+            std::fs::write(&path, serde_json::to_vec(&metadata)?)?;
             // Exercise the worker's full capacity preflight with only metadata:
             // no native library, weight files, or device arenas exist here.
             let worker = root.path().join("worker");
@@ -1365,6 +1398,108 @@ mod tests {
             layout.buffers[0].initial_words.pop();
             assert!(Exl3Execution::validate_planned_residency(root.path(), &layout, geometry).is_err());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn mul1_checkpoint_with_only_installed_mcg_programs_fails_closed_with_actionable_error() -> Result<()> {
+        use cuteafd_loader::{V41Exl3Layer, V41Exl3Residency, V41Exl3ResidentBuffer};
+        let root = tempfile::tempdir()?;
+        let lib_dir = root.path().join("lib");
+        let native_lib = lib_dir.join("libcuteafd_native.so");
+        std::fs::create_dir_all(&lib_dir)?;
+        std::fs::write(&native_lib, b"")?;
+
+        let geometry = cuteafd_core::expert_geometry();
+        let family = geometry.family().unwrap();
+        let tiers = [4usize, 5usize];
+        let mcg_pkg = super::super::package_name_for(family, &tiers, cuteafd_loader::Exl3Codebook::Mcg);
+        let mul1_pkg = super::super::package_name_for(family, &tiers, cuteafd_loader::Exl3Codebook::Mul1);
+        assert_eq!(mul1_pkg, format!("{mcg_pkg}-mul1"));
+
+        // Install a complete MCG package tree on disk (both Spark TP6 and RTX TP1),
+        // with NO -mul1 package installed.
+        let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"), "/../../../third_party/sparkinfer.lock.json")))?;
+        for (sublayout, out_dtype, width) in [("tp6-rank0", "bf16", 384), ("rtx-tp1", "fp32", geometry.intermediate)] {
+            for capacity in cuteafd_core::EXL3_CAPACITIES {
+                let dir = lib_dir.join("exl3").join(&mcg_pkg).join(sublayout).join(format!("m{capacity}"));
+                std::fs::create_dir_all(&dir)?;
+                let meta = serde_json::json!({
+                    "schema": "cuteafd.v41-exl3-aot.v1",
+                    "sparkinfer_revision": lock["revision"],
+                    "hidden": geometry.hidden,
+                    "intermediate": width,
+                    "experts": geometry.experts,
+                    "capacity": capacity,
+                    "top_k": geometry.topk,
+                    "bits": tiers,
+                    "output_dtype": out_dtype,
+                    "swiglu_limit": serde_json::Value::Null,
+                    "direct": false,
+                    "sms": 48,
+                    "blocks_per_sm": 1,
+                    "tile": [64, 128, 64, 128],
+                    "objects": [],
+                    "buffers": {
+                        "output": {"bytes": capacity as usize * geometry.hidden as usize * 4,
+                                   "allocation": "output", "dtype": "f32", "zero_on_create": false}
+                    },
+                    "trellis_lut": {"file": "lut", "bytes": 16, "sha256": "test"}
+                });
+                std::fs::write(dir.join("v41_exl3.json"), serde_json::to_vec(&meta)?)?;
+            }
+        }
+
+        let mul1_spark_dir = super::super::aot_layout_directory_for(
+            &native_lib, &tiers, cuteafd_loader::Exl3Codebook::Mul1, "tp6-rank0");
+        assert!(mul1_spark_dir.to_string_lossy().contains(&mul1_pkg));
+        assert!(!mul1_spark_dir.exists(), "MUL1 package must not exist");
+
+        let mul1_residency = V41Exl3Residency {
+            layer: V41Exl3Layer::Backbone(3),
+            world: 6,
+            rank: 0,
+            codebook: cuteafd_loader::Exl3Codebook::Mul1,
+            intermediate_start: 0,
+            experts: geometry.experts as usize,
+            intermediate: 384,
+            tiers: tiers.to_vec(),
+            projection_counts: vec![],
+            loads: vec![],
+            unit_map: None,
+            buffers: vec![V41Exl3ResidentBuffer {
+                name: "descriptor_map".into(),
+                bytes: 4 * 3 * 2 * geometry.experts as usize,
+                initial_words: vec![0; 3 * 2 * geometry.experts as usize],
+            }],
+        };
+
+        let worker_err = super::super::worker::Exl3Worker::validate_planned_residency(
+            &mul1_spark_dir, 80, Exl3Schedule::Default, &mul1_residency, geometry,
+        ).unwrap_err();
+        let worker_msg = format!("{worker_err:#}");
+        assert!(worker_msg.contains("EXL3 MUL1 routed-expert programs are not exported"), "{worker_msg}");
+        assert!(worker_msg.contains(&format!("only MCG package {mcg_pkg} is installed")), "{worker_msg}");
+        assert!(worker_msg.contains("refusing fallback to MCG"), "{worker_msg}");
+        assert!(worker_msg.contains("--codebook mul1"), "{worker_msg}");
+
+        let plan_err = super::super::worker::Exl3Worker::plan(
+            &mul1_spark_dir, 80, Exl3Schedule::Default, Exl3Epilogue::Sum,
+        ).unwrap_err();
+        let plan_msg = format!("{plan_err:#}");
+        assert!(plan_msg.contains("EXL3 MUL1 routed-expert programs are not exported"), "{plan_msg}");
+        assert!(plan_msg.contains("refusing fallback to MCG"), "{plan_msg}");
+
+        let mul1_rtx_dir = super::super::aot_layout_directory_for(
+            &native_lib, &tiers, cuteafd_loader::Exl3Codebook::Mul1, "rtx-tp1");
+        let rtx_err = crate::shared::experts::rtx::exl3::Exl3Tp2::whole_workspace_bytes(
+            &mul1_rtx_dir, 80, geometry, crate::shared::experts::rtx::RtxSelectionPolicy::CanonicalDecode,
+        ).unwrap_err();
+        let rtx_msg = format!("{rtx_err:#}");
+        assert!(rtx_msg.contains("EXL3 MUL1 routed-expert programs are not exported"), "{rtx_msg}");
+        assert!(rtx_msg.contains(&format!("only MCG package {mcg_pkg} is installed")), "{rtx_msg}");
+        assert!(rtx_msg.contains("refusing fallback to MCG"), "{rtx_msg}");
         Ok(())
     }
 

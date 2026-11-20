@@ -117,9 +117,20 @@ pub(super) fn check_hosted_layers(setting: cuteafd_loader::placement::OnboardSet
 }
 
 /// Run before loading native programs, whose card selection can query the GPU.
-pub(crate) fn preflight(manifest: &Path, native_lib: &Path) -> Result<()> {
-    let package = crate::shared::experts::exl3::aot_layout_directory(native_lib, &[2, 3], "");
-    cuteafd_loader::families::kimi_k3::validate_expert_inventory(manifest, &package)
+/// Validates only the selected checkpoint codebook's sibling package so an
+/// installed stale/corrupt unselected sibling cannot break startup.
+pub(crate) fn preflight(
+    checkpoint: &cuteafd_loader::plan::Checkpoint,
+    manifest: &Path,
+    native_lib: &Path,
+) -> Result<()> {
+    let codebook = cuteafd_loader::plan::families::kimi::routed_exl3_codebook(checkpoint)?;
+    let exl3_root = native_lib.parent().unwrap_or(Path::new(".")).join("exl3");
+    cuteafd_loader::families::kimi_k3::validate_selected_expert_inventory(
+        manifest,
+        &exl3_root,
+        codebook,
+    )
 }
 
 pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeLibrary>,
@@ -219,9 +230,9 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         cuteafd_loader::families::kimi_k3::spark::reserve_bytes(spark_ranks, options.waves as u64, unit as u64)?)?;
     spark_budget.rank_budgets = cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?;
     let rtx = if onboard.layers(routed) == Some(0) { None } else {
-        let tiers = catalog.exl3().context("Kimi TP2 experts require EXL3 checkpoint")?.decoder_tiers();
-        let package = crate::shared::experts::exl3::aot_layout_directory(
-            options.native_lib, tiers, &format!("rtx-tp{RANKS}"));
+        let exl3 = catalog.exl3().context("Kimi TP2 experts require EXL3 checkpoint")?;
+        let package = crate::shared::experts::exl3::aot_layout_directory_for(
+            options.native_lib, exl3.decoder_tiers(), exl3.codebook(), &format!("rtx-tp{RANKS}"));
         let mut inventory = admission::plan_rtx_for_ranks(cfg, &catalog, package, unit, routed, RANKS)?;
         inventory.layers = onboard;
         Some(inventory)
@@ -681,16 +692,22 @@ mod tests {
         let root = std::env::var_os("CUTEAFD_KIMI_RUNTIME_ROOT")
             .ok_or_else(|| anyhow::anyhow!("Kimi runtime root required"))?;
         let root = std::path::Path::new(&root);
+        let snap = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_snapshot(snap.path(), false);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(snap.path(), false, false)?;
         cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
             .map_err(|_| anyhow::anyhow!("run this mounted preflight test in an isolated process"))?;
         assert!(!root.join("share/exl3").exists());
-        super::preflight(&root.join("share/PROGRAMS.json"), &root.join("lib/libcuteafd_native.so"))
+        super::preflight(&checkpoint, &root.join("share/PROGRAMS.json"), &root.join("lib/libcuteafd_native.so"))
     }
 
     #[test]
     fn missing_inventory_is_refused_without_native_or_device_access() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(super::preflight(&dir.path().join("share/absent.json"), &dir.path().join("lib/native.so")).is_err());
+        let snap = tempfile::tempdir().unwrap();
+        cuteafd_loader::plan::testing::write_kimi_snapshot(snap.path(), false);
+        let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(snap.path(), false, false).unwrap();
+        assert!(super::preflight(&checkpoint, &dir.path().join("share/absent.json"), &dir.path().join("lib/native.so")).is_err());
     }
 
     #[test]
@@ -936,6 +953,50 @@ mod decode_extent_tests {
                     .into_iter().all(|width| width <= rows));
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_validates_only_selected_codebook_sibling_and_faults_invalid_selected_sibling() -> Result<()> {
+        let snap_dir = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_snapshot(snap_dir.path(), false);
+        let mcg_checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(snap_dir.path(), false, false)?;
+
+        let pkg_dir = tempfile::tempdir()?;
+        let manifest = cuteafd_loader::plan::testing::write_kimi_installed_inventory(pkg_dir.path(), false);
+        let native_lib = pkg_dir.path().join("lib/libcuteafd_native.so");
+        let mcg_pkg = pkg_dir.path().join("lib/exl3/exl3-kimik3-k23");
+        let mul1_pkg = pkg_dir.path().join("lib/exl3/exl3-kimik3-k23-mul1");
+
+        // Install a stale/corrupt MUL1 sibling next to the valid MCG package: MCG preflight must pass.
+        std::fs::create_dir_all(&mul1_pkg)?;
+        std::fs::write(
+            mul1_pkg.join("manifest.json"),
+            r#"{"schema":"cuteafd.exl3-package.v1","geometry":"kimik3","codebook":"mul1","sparkinfer_revision":"0000000000000000000000000000000000000000"}"#,
+        )?;
+        preflight(&mcg_checkpoint, &manifest, &native_lib)?;
+
+        // Flip checkpoint index markers to MUL1: now the stale MUL1 sibling IS selected and must fault.
+        let index_path = snap_dir.path().join("model.safetensors.index.json");
+        let raw_index = std::fs::read_to_string(&index_path)?;
+        let mul1_snap = tempfile::tempdir()?;
+        cuteafd_loader::plan::testing::write_kimi_snapshot(mul1_snap.path(), false);
+        std::fs::write(
+            mul1_snap.path().join("model.safetensors.index.json"),
+            raw_index.replace(".mcg\"", ".mul1\""),
+        )?;
+        let mul1_checkpoint = cuteafd_loader::plan::Checkpoint::coordinator(mul1_snap.path(), false, false)?;
+        let stale_err = preflight(&mul1_checkpoint, &manifest, &native_lib).unwrap_err().to_string();
+        assert!(stale_err.contains("revision mismatch"), "{stale_err}");
+
+        // Missing MUL1 sibling with valid MCG sibling installed must fault with actionable wording.
+        std::fs::remove_dir_all(&mul1_pkg)?;
+        let missing_err = preflight(&mul1_checkpoint, &manifest, &native_lib).unwrap_err().to_string();
+        assert!(missing_err.contains("EXL3 MUL1 routed-expert programs are not exported"), "{missing_err}");
+
+        // Corrupting the selected MCG sibling must still fault MCG preflight.
+        std::fs::remove_file(mcg_pkg.join("rtx-tp2/m80/libcuteafd_exl3.so"))?;
+        assert!(preflight(&mcg_checkpoint, &manifest, &native_lib).is_err());
         Ok(())
     }
 }

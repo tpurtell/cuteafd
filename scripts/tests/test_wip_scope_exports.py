@@ -10,6 +10,8 @@ import sys
 
 import pytest
 
+from launcher_sandbox import seed_exl3_index
+
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts/lib'))
 import wip_aot_scopes as aot  # noqa: E402
@@ -19,6 +21,8 @@ SCOPE_KEYS = ('V41_AOT', 'VISION_ATTENTION_AOT', 'KIMIK3_AOT', 'GLMF_AOT', 'MUSE
 
 
 def scopes(family, model, count, **extra):
+    if 'EXL3' in model or family in ('kimi_k3', 'muse_spark', 'mistral_large4'):
+        seed_exl3_index(os.environ['HF_HOME'], 'test/' + model)
     _, derived = aot.config_scopes(dict(FAMILY=family, MODEL_ID='test/' + model, SPARK_COUNT=str(count),
                                         RTX_GPUS='1', **extra))
     return derived
@@ -60,6 +64,7 @@ def test_towers_without_shared_vision_attention_request_none(family, model):
 
 
 def test_card_union_carries_each_cards_switches():
+    seed_exl3_index(os.environ['HF_HOME'], 'test/Kimi-K3-EXL3-K2')
     cards = [dict(family='kimi_k3', name='kimi', config='k'), dict(family='deepseek_v41', name='v41', config='v'),
              dict(family='glm5_flash', name='glmf', config='g')]
     configs = dict(k=dict(MODEL_ID='test/Kimi-K3-EXL3-K2', SPARK_COUNT='6'),

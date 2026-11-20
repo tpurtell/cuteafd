@@ -591,19 +591,25 @@ fn local_inventory_world(cfg: &GlmDsaConfig, catalog: &crate::OfficialV41Catalog
             cfg.program_family());
         return nvfp4_inventory(catalog, manifest, selected_layers, rows, lanes, exchange_f32, a4);
     };
-    let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
-    let stem = format!("exl3-{}-k{tiers}", cfg.program_family());
+    let stem = exl3.package_name(cfg.program_family());
     let layout = format!("rtx-tp{world}");
     let parent = manifest.parent().ok_or_else(|| anyhow::anyhow!("GLM program manifest parent"))?;
-    let package = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
-        .into_iter().map(|p| p.join(&layout)).find(|p| p.is_dir())
-        .ok_or_else(|| anyhow::Error::new(MissingLocalPackage(format!("{stem}/{layout}"))))?;
+    let exl3_roots = [parent.join("exl3"), parent.join("../lib/exl3")];
+    let package = exl3_roots.iter().map(|r| r.join(&stem).join(&layout)).find(|p| p.is_dir())
+        .ok_or_else(|| anyhow::Error::new(MissingLocalPackage(
+            if exl3.codebook() == crate::Exl3Codebook::Mul1 {
+                exl3.codebook().missing_package_detail(cfg.program_family(), exl3.decoder_tiers(), &layout, &exl3_roots)
+            } else {
+                format!("{stem}/{layout}")
+            }
+        )))?;
     let capacities = cuteafd_core::EXL3_CAPACITIES.map(u64::from);
     let max_rows = rows.max(DECODE_ROWS);
     let compiled = capacities.into_iter().find(|&c| c >= max_rows).unwrap();
     let manifests = capacities.into_iter().filter(|&c| c <= compiled).map(|capacity| {
         let directory = package.join(format!("m{capacity}"));
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.join("v41_exl3.json"))?)?;
+        exl3.codebook().check_aot_manifest(&value)?;
         anyhow::ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
             && value["intermediate"].as_u64() == Some(shape.intermediate as u64 / world as u64)
             && value["experts"].as_u64() == Some(shape.experts as u64)

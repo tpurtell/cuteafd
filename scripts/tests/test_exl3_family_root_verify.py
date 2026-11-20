@@ -147,6 +147,31 @@ def test_nested_family_root_verifies_every_family(tmp_path, recorded):
     assert len(manifests) == 2
 
 
+def test_nested_family_root_verifies_mul1_suffix_agreement(tmp_path, monkeypatch):
+    tool = load_tool()
+    assert tool.package_name("glm", [4, 5]) == "exl3-glm-k45"
+    assert tool.package_name("glm", [4, 5], "mul1") == "exl3-glm-k45-mul1"
+
+    def fake_verify(package, revision=None, runtime=None, role=None):
+        return json.loads((Path(package) / "manifest.json").read_text())
+
+    monkeypatch.setattr(tool, "verify", fake_verify)
+    mcg = tmp_path / "exl3-glm-k45"
+    mul1 = tmp_path / "exl3-glm-k45-mul1"
+    mcg.mkdir()
+    mul1.mkdir()
+    (mcg / "manifest.json").write_text(json.dumps({"schema": "cuteafd.exl3-package.v1", "role": "spark"}))
+    (mul1 / "manifest.json").write_text(json.dumps({
+        "schema": "cuteafd.exl3-package.v1", "role": "spark", "codebook": "mul1",
+    }))
+    assert len(tool.verify_root(tmp_path)) == 2
+
+    # Installing an MCG manifest into a -mul1 directory (or vice versa) fails closed.
+    (mul1 / "manifest.json").write_text(json.dumps({"schema": "cuteafd.exl3-package.v1", "role": "spark"}))
+    with pytest.raises(ValueError, match="disagrees with manifest codebook"):
+        tool.verify_root(tmp_path)
+
+
 def test_missing_family_manifest_fails_closed(tmp_path, recorded):
     """A broken sibling must fail the whole root, not be skipped."""
     tool, calls = recorded
@@ -367,3 +392,65 @@ def test_compact_package_accepts_only_pure_l2_schedule(tmp_path, monkeypatch, sc
     else:
         with pytest.raises(ValueError, match="invalid compact geometry or execution contract"):
             tool.verify(tmp_path)
+
+
+def test_mul1_fails_early_on_older_sparkinfer_pin_while_default_mcg_is_unaffected(tmp_path, monkeypatch):
+    import argparse
+    from types import SimpleNamespace
+    import sys
+
+    before_modules = set(sys.modules)
+    try:
+        lib_dir = str(REPO / "python" / "tools" / "lib")
+        aot_dir = str(REPO / "python" / "tools" / "aot")
+        monkeypatch.syspath_prepend(lib_dir)
+        monkeypatch.syspath_prepend(aot_dir)
+        for mod in ("_pinned_sparkinfer", "export_b12x_exl3_aot", "package_exl3_aot"):
+            sys.modules.pop(mod, None)
+
+        import _pinned_sparkinfer
+        if _pinned_sparkinfer.supports_routed_mul1():
+            pytest.skip("current SparkInfer pin already provides routed MUL1")
+
+        exporter = importlib.import_module("export_b12x_exl3_aot")
+        packager = load_tool()
+
+        # MUL1 fails early before touching CUDA/torch, naming the pin requirement explicitly.
+        with pytest.raises(ValueError, match="MUL1 requires a newer SparkInfer pin"):
+            exporter.export(tmp_path / "mul1-raw", 512, 256, 1, (4, 5), "auto", codebook="mul1")
+
+        mul1_args = argparse.Namespace(
+            output=tmp_path / "exl3-glm-k45-mul1",
+            build_dir=tmp_path / "build-mul1",
+            role="coordinator",
+            geometry="glm",
+            bits=[4, 5],
+            capacities="1",
+            require_layout=["rtx-tp1"],
+            tile=[],
+            compact_companions=False,
+            profile=["rtx-tp1"],
+            codebook="mul1",
+            cxx="unused",
+            cuda_include=tmp_path,
+            cuda_libdir=tmp_path,
+            cuda_driver=tmp_path / "libcuda.so",
+            runtime=tmp_path / "libcute_dsl_runtime.so",
+        )
+        with pytest.raises(ValueError, match="MUL1 requires a newer SparkInfer pin"):
+            packager.build(mul1_args)
+
+        # Default MCG passes capability validation unaffected (stopping only at the stubbed torch check).
+        sentinel_torch = SimpleNamespace(
+            cuda=SimpleNamespace(
+                get_device_properties=lambda _: (_ for _ in ()).throw(RuntimeError("reached_mcg_gpu_probe"))
+            )
+        )
+        monkeypatch.setitem(sys.modules, "torch", sentinel_torch)
+        mcg_args = argparse.Namespace(**(vars(mul1_args) | {"output": tmp_path / "exl3-glm-k45", "codebook": "mcg"}))
+        with pytest.raises(RuntimeError, match="reached_mcg_gpu_probe"):
+            packager.build(mcg_args)
+    finally:
+        for added in set(sys.modules) - before_modules:
+            sys.modules.pop(added, None)
+

@@ -526,8 +526,8 @@ pub(crate) fn with_engine<T>(
             && (args.tp2_dspark_experts || onboard.layers(loaded.cfg.n_layers) != Some(0)) {
             use crate::shared::experts::rtx::{native::NativeTp2, exl3::Exl3Tp2};
             let measured = if let Some(manifest) = loaded.catalog.exl3() {
-                let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
-                    manifest.decoder_tiers(), "rtx-tp2");
+                let package = crate::shared::experts::exl3::aot_layout_directory_for(&args.native_lib,
+                    manifest.decoder_tiers(), manifest.codebook(), "rtx-tp2");
                 Exl3Tp2::workspace_bytes_for(&package, loaded.cfg.dim, max_rows)
             } else { NativeTp2::workspace_bytes_for(&loaded.library, max_rows) };
             match measured {
@@ -754,8 +754,8 @@ pub(crate) fn with_engine<T>(
                 policy.committed(pushed)?
             } else { None };
             let ranks: [Box<dyn RtxExpertLayer>; 2] = if let Some(manifest) = loaded.catalog.exl3() {
-                let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib,
-                    manifest.decoder_tiers(), "rtx-tp2");
+                let package = crate::shared::experts::exl3::aot_layout_directory_for(&args.native_lib,
+                    manifest.decoder_tiers(), manifest.codebook(), "rtx-tp2");
                 if let Some(pushed) = pushed {
                     let weights = pushed.into_iter().map(|w| w.exl3()).collect::<Result<Vec<_>>>()?;
                     let weights = weights.try_into().map_err(|_| anyhow::anyhow!("TP2 pushed rank count differs"))?;

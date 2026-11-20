@@ -42,8 +42,7 @@ impl QwenExperts {
         let shape = catalog.routed_experts();
         ensure!(shape.first_layer == 0 && layers <= shape.layers, "Qwen routed prefix outside checkpoint");
         let packages = if let Some(exl3) = catalog.exl3() {
-            let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
-            let root = root.join("exl3").join(format!("exl3-qwen4-k{tiers}"));
+            let root = root.join("exl3").join(exl3.package_name("qwen4"));
             (0..gpus).map(|rank| root.join(if gpus == 1 { "rtx-tp1".into() }
                 else { format!("rtx-tp2-rank{rank}") })).collect::<Vec<_>>()
         } else if gpus == 2 { dual_packages(catalog, native_lib)?.to_vec() }
@@ -64,8 +63,26 @@ impl QwenExperts {
                 } else { Vec::new() };
                 let manifests = capacities.iter().map(|capacity| -> anyhow::Result<serde_json::Value> {
                     let path = packages[rank].join(format!("m{capacity}/v41_exl3.json"));
-                    let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)
-                        .with_context(|| format!("read Qwen expert package {}", path.display()))?)?;
+                    let raw = match std::fs::read(&path) {
+                        Ok(bytes) => bytes,
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound
+                            && exl3.codebook() == crate::Exl3Codebook::Mul1 =>
+                        {
+                            let layout = packages[rank].file_name().and_then(|s| s.to_str()).unwrap_or("rtx");
+                            anyhow::bail!(
+                                "{}",
+                                exl3.codebook().missing_package_detail(
+                                    "qwen4",
+                                    exl3.decoder_tiers(),
+                                    layout,
+                                    &[root.join("exl3")],
+                                )
+                            );
+                        }
+                        Err(err) => return Err(err).with_context(|| format!("read Qwen expert package {}", path.display())),
+                    };
+                    let manifest: serde_json::Value = serde_json::from_slice(&raw)?;
+                    exl3.codebook().check_aot_manifest(&manifest)?;
                     let width = exl3.residency(crate::V41Exl3Layer::Backbone(0), gpus, rank)?.intermediate;
                     ensure!(manifest["hidden"].as_u64() == Some(shape.hidden as u64)
                         && manifest["intermediate"].as_u64() == Some(width as u64)

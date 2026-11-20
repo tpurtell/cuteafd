@@ -2085,7 +2085,7 @@ impl Opened {
                         tensors, &package, &[tensors.shape().first_layer], rank, args.expert_rows())?.workspace_bytes as u64; }
                 } else {
                     let exl3 = catalog.exl3().context("EXL3 inventory")?;
-                    let package = crate::shared::experts::exl3::aot_layout_directory(&args.native_lib, exl3.decoder_tiers(), "rtx-tp2");
+                    let package = crate::shared::experts::exl3::aot_layout_directory_for(&args.native_lib, exl3.decoder_tiers(), exl3.codebook(), "rtx-tp2");
                     tp2_workspace = [crate::shared::experts::rtx::exl3::Exl3Tp2::workspace_bytes_for(&package,
                         self.cfg.hidden, args.expert_rows())? as u64; 2];
                 }
@@ -2536,8 +2536,8 @@ impl Opened {
             let budgets = placement.tp2.context("TP2 arena admission")?.peak_bytes;
             Ok([usize::try_from(budgets[0])?, usize::try_from(budgets[1])?])
         };
-        let tp2_package = |manifest: &cuteafd_loader::V41Exl3Manifest| crate::shared::experts::exl3::aot_layout_directory(
-            &args.native_lib, manifest.decoder_tiers(), "rtx-tp2");
+        let tp2_package = |manifest: &cuteafd_loader::V41Exl3Manifest| crate::shared::experts::exl3::aot_layout_directory_for(
+            &args.native_lib, manifest.decoder_tiers(), manifest.codebook(), "rtx-tp2");
         let execution = cuteafd_loader::placement::LayerExecutionPlan::new(&placement,
             cuteafd_loader::placement::HopSpec {
                 storage: cuteafd_loader::placement::HopStorage::ReceiveSlots,

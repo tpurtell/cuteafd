@@ -529,7 +529,7 @@ fn expert_admission(args: &GoldenArgs, view: &cuteafd_loader::plan::checkpoint::
             );
             super::serve::package_exports(&serde_json::json!({"layouts": {"tp": layout.clone()}}))?
         }
-        super::experts::StepExperts::Exl3(_) => format.exports(&metadata)?,
+        super::experts::StepExperts::Exl3(..) => format.exports(&metadata)?,
     };
     let unit = args.prefill_units.unwrap_or(rows);
     let config = TcpTransportConfig::default();
@@ -1202,7 +1202,8 @@ fn checkpoint_identity(revision: Option<&str>, format: &super::experts::StepExpe
     let pinned = match format {
         StepExperts::Native(ExpertFormat::Fp8Block128) => revision == Some(FP8_REVISION),
         StepExperts::Native(ExpertFormat::Nvfp4) => revision == Some(NVFP4_REVISION),
-        StepExperts::Exl3(tiers) => tiers == &[4, 6]
+        StepExperts::Exl3(tiers, codebook) => tiers == &[4, 6]
+            && *codebook == cuteafd_loader::Exl3Codebook::Mcg
             && matches!(revision, Some(EXL3_REVISION | HQA_REVISION)),
         StepExperts::Native(_) => false,
     };
@@ -1998,8 +1999,8 @@ mod tests {
         checkpoint_identity(Some(FP8_REVISION), &native(ExpertFormat::Fp8Block128), false)?;
         checkpoint_identity(Some(FP8_REVISION), &native(ExpertFormat::Fp8Block128), true)?;
         checkpoint_identity(Some(NVFP4_REVISION), &native(ExpertFormat::Nvfp4), false)?;
-        checkpoint_identity(Some(EXL3_REVISION), &StepExperts::Exl3(vec![4, 6]), false)?;
-        checkpoint_identity(Some(HQA_REVISION), &StepExperts::Exl3(vec![4, 6]), false)?;
+        checkpoint_identity(Some(EXL3_REVISION), &StepExperts::Exl3(vec![4, 6], cuteafd_loader::Exl3Codebook::Mcg), false)?;
+        checkpoint_identity(Some(HQA_REVISION), &StepExperts::Exl3(vec![4, 6], cuteafd_loader::Exl3Codebook::Mcg), false)?;
         for (revision, format, diagnostic) in [
             (Some(FP8_REVISION), native(ExpertFormat::Nvfp4), false),
             (Some(NVFP4_REVISION), native(ExpertFormat::Fp8Block128), false),
@@ -2008,12 +2009,13 @@ mod tests {
             (Some("unpinned"), native(ExpertFormat::Nvfp4), false),
             (None, native(ExpertFormat::Fp8Block128), false),
             // Only the published revision and matching expert tiers qualify.
-            (Some("0123456789abcdef0123456789abcdef01234567"), StepExperts::Exl3(vec![4, 6]), false),
-            (Some(EXL3_REVISION), StepExperts::Exl3(vec![4, 6]), true),
-            (Some(HQA_REVISION), StepExperts::Exl3(vec![4, 6]), true),
-            (Some(HQA_REVISION), StepExperts::Exl3(vec![3, 4]), false),
-            (Some(EXL3_REVISION), StepExperts::Exl3(vec![3, 4]), false),
-            (None, StepExperts::Exl3(vec![4, 6]), false),
+            (Some("0123456789abcdef0123456789abcdef01234567"), StepExperts::Exl3(vec![4, 6], cuteafd_loader::Exl3Codebook::Mcg), false),
+            (Some(EXL3_REVISION), StepExperts::Exl3(vec![4, 6], cuteafd_loader::Exl3Codebook::Mcg), true),
+            (Some(HQA_REVISION), StepExperts::Exl3(vec![4, 6], cuteafd_loader::Exl3Codebook::Mcg), true),
+            (Some(HQA_REVISION), StepExperts::Exl3(vec![3, 4], cuteafd_loader::Exl3Codebook::Mcg), false),
+            (Some(EXL3_REVISION), StepExperts::Exl3(vec![3, 4], cuteafd_loader::Exl3Codebook::Mcg), false),
+            (Some(EXL3_REVISION), StepExperts::Exl3(vec![4, 6], cuteafd_loader::Exl3Codebook::Mul1), false),
+            (None, StepExperts::Exl3(vec![4, 6], cuteafd_loader::Exl3Codebook::Mcg), false),
         ] {
             assert!(checkpoint_identity(revision, &format, diagnostic).is_err());
         }

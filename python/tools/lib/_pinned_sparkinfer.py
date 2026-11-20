@@ -113,6 +113,29 @@ def export_target(properties) -> str:
     return f"sm{properties.major}{properties.minor}"
 
 
+def supports_routed_mul1(source: Path = SOURCE) -> bool:
+    """True when the verified SparkInfer tree exports routed-expert MUL1 kernels."""
+    codebooks = source / "b12x" / "moe" / "_shared" / "trellis_codebooks.py"
+    mixed = source / "b12x" / "moe" / "_shared" / "kernels" / "w4a16" / "mixed_trellis.py"
+    if not codebooks.is_file() or not mixed.is_file():
+        return False
+    with _export_cache_paused():
+        spec = importlib.util.spec_from_file_location("_cuteafd_trellis_codebooks_probe", codebooks)
+        if spec is None or spec.loader is None:
+            return False
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        has_mul1 = getattr(module, "MUL1", None) == "mul1" and "mul1" in getattr(module, "CODEBOOKS", ())
+        return bool(has_mul1 and "MUL1" in mixed.read_text(encoding="utf-8"))
+
+
+def require_routed_mul1(source: Path = SOURCE, revision: str = REVISION) -> None:
+    if not supports_routed_mul1(source):
+        raise ValueError(
+            f"EXL3 routed-expert MUL1 requires a newer SparkInfer pin (current revision {revision})"
+        )
+
+
 # Every exporter imports this module before first CUDA use. Admission holds a
 # host RAM/context reservation until exit, including sequential FP8 packages.
 from _export_jobs import install_context_admission

@@ -1072,7 +1072,8 @@ impl<'a> ExpertWeights<'a> {
                     catalog.expert_staging(V41ExpertSelection::BackboneTp2 { layer, expert, rank }))
                     .collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
                 let plans = full_plans.iter().map(|plan| plan.tensor_names().iter().enumerate().map(|(slot, name)| {
-                    Projection::new(catalog, name.clone(), plan.tensor_ranges()[slot].start,
+                    Projection::new(catalog, name.clone(), cuteafd_loader::Exl3Codebook::Mcg,
+                        plan.tensor_ranges()[slot].start,
                         [catalog.backbone_tp2_slice(name, 0)?, catalog.backbone_tp2_slice(name, 1)?])
                 }).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
                 paired_load::trace_overlap(&streams, "read_start", layer, first)?;

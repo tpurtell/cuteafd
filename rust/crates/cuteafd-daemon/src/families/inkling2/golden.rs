@@ -138,8 +138,9 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     ensure!(geometry == cuteafd_core::ExpertGeometry::INKLING2, "Inkling golden expert geometry differs from the released model");
     cuteafd_core::set_expert_geometry(geometry).map_err(|previous| anyhow::anyhow!("Inkling golden requires isolated expert geometry: {previous:?}"))?;
     let native_dir = args.native_lib.parent().context("Inkling native library directory")?;
-    let package = if catalog.exl3().is_some() { native_dir.join("exl3/exl3-inkling2-k45/rtx-tp1") }
-        else { native_dir.join("fp8/fp8-inkling2-mxfp8/tp1") };
+    let package = if let Some(exl3) = catalog.exl3() {
+        native_dir.join("exl3").join(exl3.package_name("inkling2")).join("rtx-tp1")
+    } else { native_dir.join("fp8/fp8-inkling2-mxfp8/tp1") };
     // SAFETY: trusted generated package ABI metadata; no live buffer access.
     let metadata = if catalog.exl3().is_none() { Some(unsafe { Fp8MoeMetadata::read(&package)? }) } else { None };
     let selection = RtxSelectionPolicy::CanonicalDecode;

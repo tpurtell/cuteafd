@@ -1895,7 +1895,9 @@ mod tests {
         let packages = std::env::var_os("CUTEAFD_KIMI_SPARK_PACKAGE")
             .context("set CUTEAFD_KIMI_SPARK_PACKAGE to the sealed Spark package")?;
         let packages = Path::new(&packages);
-        crate::families::kimi_k3::validate_expert_inventory(spark_manifest, packages)?;
+        crate::families::kimi_k3::validate_expert_inventory_for_codebook(
+            spark_manifest, packages, manifest.codebook(),
+        )?;
         for rank in 0..6 {
             recipe.validate_installed(&packages, rank, recipe.slicing, 512)?;
         }
@@ -2044,9 +2046,11 @@ mod tests {
                     shape: vec![128], byte_offset: 0, byte_length: 256 },
             }).collect(), exl3: Some(crate::V41Exl3Manifest {
                 experts: shape, naming: crate::V41Exl3Naming::CheckpointNative,
+                codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
                 projections: names[..2].iter().map(|name| {
                     let name = name.strip_suffix(".weight").unwrap().to_owned();
                     (name.clone(), crate::V41Exl3Projection { name, kind: crate::V41Exl3ProjectionKind::Gate,
+                        codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
                         bits: 4, input_features: 128, output_features: 128 })
                 }).collect(), decoder_tiers: vec![4],
                 storage: crate::formats::exl3_storage::Exl3StorageSource::Headers,

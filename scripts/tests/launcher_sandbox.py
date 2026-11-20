@@ -275,12 +275,30 @@ class SimCluster:
         return fake_gpus(self.gpus, total_mib=self.gpu_bytes >> 20)
 
 
+def seed_exl3_index(hf, model, revision="fixture", codebook="mcg"):
+    root = Path(hf) / "hub" / ("models--" + model.replace("/", "--"))
+    snapshot = root / "snapshots" / revision
+    snapshot.mkdir(parents=True, exist_ok=True)
+    stem = "model.layers.1.mlp.experts.0.gate_proj"
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {
+            f"{stem}.trellis": "model-00001-of-00001.safetensors",
+            f"{stem}.{codebook}": "model-00001-of-00001.safetensors",
+        }
+    }))
+    if not (root / "refs/main").is_file():
+        (root / "refs").mkdir(parents=True, exist_ok=True)
+        (root / "refs/main").write_text(revision)
+    return snapshot
+
+
 def seed_checkpoint_metadata(hf):
     """Build-scope tests consume a shared miniature hub, never installed models."""
     import copy
-    from test_example_configs import CHECKPOINTS, GLM5, GLMF, MIMO, QWEN
+    from test_example_configs import CHECKPOINTS, DSV4, GLM5, GLMF, MIMO, QWEN
     checkpoints = copy.deepcopy(CHECKPOINTS)
     aliases = {
+        "wrldsuksgo2mars/DeepSeek-V4-Pro-EXL3-K2-Core-K6": {**DSV4, "quantization_config": {"quant_method": "exl3"}},
         "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC": GLM5,
         "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC": GLMF,
         "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC": GLMF,
@@ -323,6 +341,8 @@ def seed_checkpoint_metadata(hf):
         (snapshot / "config.json").write_text(json.dumps(config))
         (root / "refs").mkdir(exist_ok=True)
         (root / "refs/main").write_text("fixture")
+        if "EXL3" in name or (config.get("quantization_config") or {}).get("quant_method") == "exl3":
+            seed_exl3_index(hf, name, revision="fixture", codebook="mcg")
     repo = Path(__file__).resolve().parents[2]
     for path in (repo / "examples/configs").glob("*.config"):
         values = dict(line.split("=", 1) for line in path.read_text().splitlines()

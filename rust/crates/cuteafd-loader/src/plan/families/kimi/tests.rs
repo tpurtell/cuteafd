@@ -333,6 +333,27 @@ fn header_acceptance_is_independent_of_runtime_inventory() {
     let package = dir.path().join("lib/exl3/exl3-kimik3-k23");
     assert!(validate_expert_inventory(&path, &package).unwrap_err().to_string().contains("kimik3_router_scores"));
     assert!(validate_expert_inventory(&dir.path().join("absent.json"), &package).is_err());
+
+    // Selected-codebook validation ignores an installed stale sibling and faults on an invalid selected sibling.
+    let sibling_dir = tempfile::tempdir().unwrap();
+    let manifest_path = installed_inventory(sibling_dir.path(), false);
+    let exl3_root = sibling_dir.path().join("lib/exl3");
+    let stale_mul1 = exl3_root.join("exl3-kimik3-k23-mul1");
+    std::fs::create_dir_all(&stale_mul1).unwrap();
+    std::fs::write(
+        stale_mul1.join("manifest.json"),
+        r#"{"schema":"cuteafd.exl3-package.v1","geometry":"kimik3","codebook":"mul1","sparkinfer_revision":"0000000000000000000000000000000000000000"}"#,
+    ).unwrap();
+    crate::families::kimi_k3::validate_selected_expert_inventory(
+        &manifest_path, &exl3_root, crate::Exl3Codebook::Mcg,
+    ).unwrap();
+    assert!(crate::families::kimi_k3::validate_selected_expert_inventory(
+        &manifest_path, &exl3_root, crate::Exl3Codebook::Mul1,
+    ).is_err());
+    std::fs::remove_file(exl3_root.join("exl3-kimik3-k23/rtx-tp1/m1/libcuteafd_exl3.so")).unwrap();
+    assert!(crate::families::kimi_k3::validate_selected_expert_inventory(
+        &manifest_path, &exl3_root, crate::Exl3Codebook::Mcg,
+    ).is_err());
 }
 
 #[test]

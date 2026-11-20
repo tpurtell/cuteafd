@@ -98,7 +98,7 @@ fn tensor_gather(p: &V41Exl3Projection, suffix: &str,
             ranges.into_iter().map(|r| r.start * 2..r.end * 2).collect()),
         "suh" => (1, p.input_features * 2, vec![0..p.input_features * 2]),
         "svh" => (1, p.output_features * 2, vec![0..p.output_features * 2]),
-        "mcg" => (1, 4, vec![0..4]),
+        marker if marker == p.codebook.marker() => (1, 4, vec![0..4]),
         _ => anyhow::bail!("unsupported EXL3 tensor suffix {suffix}"),
     };
     let selected_row_bytes = columns.iter().map(|r| r.end - r.start).sum();
@@ -179,7 +179,7 @@ fn tensor_slice(
         "svh" if !down => contiguous(p.output_features * 2, range.start * 2, width * 2),
         "suh" => contiguous(p.input_features * 2, 0, p.input_features * 2),
         "svh" => contiguous(p.output_features * 2, 0, p.output_features * 2),
-        "mcg" => contiguous(4, 0, 4),
+        marker if marker == p.codebook.marker() => contiguous(4, 0, 4),
         _ => anyhow::bail!("unsupported EXL3 tensor suffix {suffix}"),
     })
 }
@@ -384,7 +384,8 @@ mod tests {
                     for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down] {
                         for bits in 2..=6 {
                             let down = kind == V41Exl3ProjectionKind::Down;
-                            let projection = V41Exl3Projection { name: "test".into(), kind, bits,
+                            let projection = V41Exl3Projection { name: "test".into(), kind,
+                                codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg, bits,
                                 input_features: if down { intermediate } else { 128 },
                                 output_features: if down { 128 } else { intermediate } };
                             for suffix in ["trellis", "suh", "svh", "mcg"] {
@@ -440,6 +441,7 @@ mod tests {
         let path = root.path().join("trellis");
         let file = File::options().create_new(true).write(true).read(true).open(&path)?;
         let p = V41Exl3Projection { name: "test".into(), kind: V41Exl3ProjectionKind::Gate,
+            codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
             bits: 4, input_features: 6144, output_features: 2048 };
         let payload: Vec<u8> = (0..p.trellis_bytes()).map(|i| (i * 31 + i / 251) as u8).collect();
         let offset = (1u64 << 31) + 128;
@@ -466,6 +468,7 @@ mod tests {
     fn gathered_units_reject_wrong_rotation_axis_and_noncanonical_order() -> Result<()> {
         use cuteafd_core::tp_units::{RankUnits, UnitRule};
         let projection = V41Exl3Projection { name: "test".into(), kind: V41Exl3ProjectionKind::Gate,
+            codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
             bits: 4, input_features: 128, output_features: 2048 };
         let mut map = RankUnits::new(UnitRule::Rotated, 1, 2048, 128, 3, 6, 0)?;
         assert!(tensor_gather(&projection, "trellis", &map, 0).is_ok());
@@ -486,7 +489,8 @@ mod tests {
         for kind in [V41Exl3ProjectionKind::Gate, V41Exl3ProjectionKind::Up, V41Exl3ProjectionKind::Down] {
             for bits in 2..=6 {
                 let (input, output) = if kind == V41Exl3ProjectionKind::Down { (2304, 128) } else { (128, 2304) };
-                let projection = V41Exl3Projection { name: "test".into(), kind, bits,
+                let projection = V41Exl3Projection { name: "test".into(), kind,
+                    codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg, bits,
                     input_features: input, output_features: output };
                 for suffix in ["trellis", "suh", "svh", "mcg"] {
                     let full = tensor_slice(&projection, suffix, 1, 0)?;
@@ -551,6 +555,7 @@ mod tests {
                 let p = V41Exl3Projection {
                     name: "test".into(),
                     kind,
+                    codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
                     bits,
                     input_features: input,
                     output_features: output,

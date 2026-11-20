@@ -2096,3 +2096,127 @@ def test_v4_placement_inputs_export_native_expert_segments():
         assert families == ["dsv4f", "dsv4p"]
     exl3 = [job for job in jobs if job[0] == "exl3"]
     assert len(exl3) == 1 and exl3[0][1] == "package_exl3_aot.py"
+
+
+def test_opt_in_exl3_mul1_groups_stay_out_of_default_jobs_and_cover_all_geometries(tmp_path, monkeypatch):
+    default_all = compare_sm.jobs("all")
+    assert not any(name.endswith("-mul1") or "--codebook" in args for name, _, args in default_all)
+    assert not any(name.endswith("-mul1") or "--codebook" in args for name, _, args in compare_sm.jobs("suspects"))
+    assert compare_sm.opt_in_jobs("suspects") == []
+
+    opt_in = compare_sm.opt_in_jobs("all")
+    opt_in_names = [name for name, _, _ in opt_in]
+    default_names = {name for name, _, _ in default_all}
+    assert len(opt_in_names) == len(set(opt_in_names))
+    assert not (set(opt_in_names) & default_names)
+    assert all(name.startswith("exl3-") and name.endswith("-mul1") for name in opt_in_names)
+    assert all(exporter == "package_exl3_aot.py" and args[-2:] == ["--codebook", "mul1"]
+               for _, exporter, args in opt_in)
+
+    geometries = {args[args.index("--geometry") + 1] for _, _, args in opt_in}
+    assert geometries == {"dsv4p", "glm", "glmf", "qwen4", "kimik3", "step5", "muse", "ml4", "inkling2"}
+    assert {"exl3-compact-glmf-k34-mul1", "exl3-glmf-spark-mul1", "exl3-glm-k45-spark-mul1",
+            "exl3-inkling2-k45-mul1", "exl3-step5-k46-mul1", "exl3-muse-k45-mul1"} <= set(opt_in_names)
+
+    for name, exporter, extra in opt_in:
+        args = compare_sm.comparison_job_args(exporter, extra, "coordinator")
+        expected_cap = (12, 1) if (name.startswith("exl3-compact-") or name.endswith("-spark-mul1")) else (12, 0)
+        assert compare_sm.worker_capability({"exporter": exporter, "args": args, "role": "coordinator"}) == expected_cap
+
+    listed = subprocess.run([sys.executable, str(ROOT / "scripts/build/compare-sm-exports.py"), "--list"],
+                            check=True, capture_output=True, text=True).stdout.splitlines()
+    assert listed.count("exl3-glmf-mul1") == 1
+    assert listed.count("exl3-glmf-spark-mul1") == 1
+    assert listed.count("exl3-inkling2-k45-mul1") == 1
+
+    # Un-grouped runs keep the default MCG inventory only; --groups opts into MUL1.
+    real_load = compare_sm.load_file
+    monkeypatch.setattr(compare_sm, "load_file", lambda name, path:
+        SimpleNamespace(check_path=lambda _: None) if name == "cuteafd_build_filesystem" else real_load(name, path))
+    monkeypatch.setattr(compare_sm, "jobs", lambda _: [("exl3-glmf", "package_exl3_aot.py", ["--geometry", "glmf"])])
+    monkeypatch.setattr(compare_sm, "opt_in_jobs", lambda _: [
+        ("exl3-glmf-mul1", "package_exl3_aot.py", ["--geometry", "glmf", "--codebook", "mul1"])])
+    for name in ("exl3-glmf", "exl3-glmf-mul1"):
+        (tmp_path / name).mkdir()
+    observed = []
+    def fake_compare(left, right):
+        observed.append(left.parent.name)
+        return {"programs": [], "added_programs": [], "removed_programs": []}
+    monkeypatch.setattr(compare_sm, "compare", fake_compare)
+    monkeypatch.setattr(compare_sm.sys, "argv", [
+        "compare-sm-exports.py", "--compare-only", "--output-dir", str(tmp_path)])
+    assert compare_sm.main() == 0
+    assert observed == ["exl3-glmf"]
+
+    observed.clear()
+    monkeypatch.setattr(compare_sm.sys, "argv", [
+        "compare-sm-exports.py", "--compare-only", "--groups", "exl3-glmf-mul1", "--output-dir", str(tmp_path)])
+    assert compare_sm.main() == 0
+    assert observed == ["exl3-glmf-mul1"]
+
+
+def test_exl3_mul1_threads_codebook_to_direct_schedule_and_segment_exports_and_omits_mcg(tmp_path, monkeypatch):
+    fixture = compare_sm.load_file(
+        "gate_mul1_package_fixture", ROOT / "python/tests/test_package_v41_exl3_profiles.py")
+    package = fixture.package
+    capacities = (1, 80, 1024)
+    build_root = tmp_path / "build-mul1"
+    build_root.mkdir()
+    _, _, calls, _ = fixture.PackageProfileTests().build_fixture(
+        build_root, "spark", (3, 4), geometry="glmf", capacities=capacities,
+        segments=True, codebook="mul1",
+        profiles=tuple(p[0] for p in package.profiles_for_role("spark", "glmf")))
+    expected = [(call.args[1], call.args[3], call.kwargs) for call in calls]
+
+    recorded = []
+    monkeypatch.setitem(sys.modules, "package_exl3_aot", package)
+    def record_export(*values, row_addresses=False, **options):
+        if row_addresses:
+            options["row_addresses"] = True
+        recorded.append((values, options))
+    monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(export=record_export))
+    monkeypatch.setattr(compare_sm, "recorded_construction", lambda fn, *a, **kw: fn(*a, **kw))
+
+    compare_sm._export_exl3(
+        ["--geometry", "glmf", "--bits", "3,4", "--role", "spark",
+         "--capacities", "1,80,1024", "--codebook", "mul1"],
+        tmp_path / "gate-mul1")
+    assert any(str(values[0]).endswith("m1-gb10") for values, _ in recorded)
+    assert any(str(values[0]).endswith("m8192-segments") for values, _ in recorded)
+    assert any(options.get("warp_specialized") and not options.get("row_addresses") for _, options in recorded)
+    for values, options in recorded:
+        assert options["codebook"] == "mul1"
+        assert options.pop("compile_only") is True
+        assert (values[1], values[3], options) in expected
+
+    # Default and explicit MCG omit `codebook`, preserving baseline signature compatibility.
+    for extra in ([], ["--codebook", "mcg"]):
+        mcg_calls = []
+        def baseline_export(*values, row_addresses=False, **options):
+            assert "codebook" not in options
+            mcg_calls.append((values, options))
+        monkeypatch.setitem(sys.modules, "export_b12x_exl3_aot", SimpleNamespace(export=baseline_export))
+        compare_sm._export_exl3(
+            ["--geometry", "glmf", "--bits", "3,4", "--role", "spark",
+             "--capacities", "1,1024", *extra],
+            tmp_path / "gate-mcg")
+        assert mcg_calls
+
+    with pytest.raises(ValueError, match="unsupported EXL3 codebook"):
+        compare_sm._export_exl3(
+            ["--geometry", "glmf", "--capacities", "1", "--codebook", "3inst"],
+            tmp_path / "gate-bad")
+
+    supported, _ = compare_sm.sparkinfer_supports_routed_mul1(ROOT)
+    if not supported:
+        with pytest.raises(ValueError, match="MUL1 requires a newer SparkInfer pin"):
+            compare_sm.require_routed_mul1_pin(ROOT)
+        real_load = compare_sm.load_file
+        monkeypatch.setattr(compare_sm, "load_file", lambda name, path:
+            SimpleNamespace(check_path=lambda _: None) if name == "cuteafd_build_filesystem" else real_load(name, path))
+        monkeypatch.setattr(compare_sm.sys, "argv", [
+            "compare-sm-exports.py", "--groups", "exl3-glmf-mul1", "--output-dir", str(tmp_path / "pin-refused")])
+        with pytest.raises(SystemExit) as refused:
+            compare_sm.main()
+        assert refused.value.code == 2
+

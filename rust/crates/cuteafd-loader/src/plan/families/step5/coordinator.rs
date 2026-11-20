@@ -246,7 +246,7 @@ pub struct RankWeightLayout {
 }
 
 fn is_exl3_member(name: &str) -> bool {
-    matches!(crate::plan::format::split_stem(name).1, "trellis" | "suh" | "svh" | "mcg")
+    matches!(crate::plan::format::split_stem(name).1, "trellis" | "suh" | "svh" | "mcg" | "mul1")
 }
 
 /// Program and allocation prefix of the target's rotary tables.

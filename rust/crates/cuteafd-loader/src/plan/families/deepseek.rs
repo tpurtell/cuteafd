@@ -387,14 +387,14 @@ impl DeepSeekModel {
         let moe = self.spec.moe.as_ref().ok_or("no MoE geometry")?;
         let geometry = self.geometry().ok_or_else(|| format!("no expert kernels at hidden {} / intermediate {} / {} \
             experts / top-{} (cuteafd_core::ExpertGeometry)", self.spec.hidden, moe.intermediate, moe.experts, moe.top_k))?;
-        if operand.exl3_bits().is_some() && matches!(geometry, "v41" | "dsv4f") {
+        if operand.exl3_routed().is_some() && matches!(geometry, "v41" | "dsv4f") {
             return Err("unsupported: EXL3 for DeepSeek V4/V4.1 Flash".into());
         }
         let shape = routed_shape(stem, self.spec.hidden, moe.intermediate)
             .ok_or_else(|| format!("not a routed projection (w1/w2/w3 or gate/up/down_proj)"))?;
         require(operand.logical == shape, || format!("{geometry} experts are {shape:?}, found {}", describe(operand)))?;
         let nvfp4 = self.id == "deepseek_v41" && operand.is_nvfp4();
-        require(operand.is_mxfp4(32) || matches!(operand.exl3_bits(), Some(2..=4)) || nvfp4, || {
+        require(operand.is_mxfp4(32) || matches!(operand.exl3_routed(), Some((2..=4, _))) || nvfp4, || {
             format!("{geometry} experts run MXFP4 (E2M1 + UE8M0 per 32), EXL3 K2-K4{}; found {}",
                 if self.id == "deepseek_v41" { " or ModelOpt NVFP4" } else { "" }, describe(operand))
         })
@@ -484,12 +484,12 @@ impl FamilyModel for DeepSeekModel {
 
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         let geometry = self.geometry()?;
-        let format = match operand.exl3_bits() {
+        let format = match operand.exl3_routed() {
             // The decoder-tier package the runtime loads, not the checkpoint
             // tier: Pro K2/K3 serve the shipped k23 pair (v41_catalog
             // exl3_catalog_or_read(.., &[2, 3])), a uniform tier its adjacent pair.
-            Some(2 | 3) => "exl3-k23".into(),
-            Some(bits) => format!("exl3-k{bits}{}", if bits == 6 { 5 } else { bits + 1 }),
+            Some((2 | 3, codebook)) => format!("exl3-k23{}", codebook.package_suffix()),
+            Some((bits, codebook)) => format!("exl3-k{bits}{}{}", if bits == 6 { 5 } else { bits + 1 }, codebook.package_suffix()),
             None if operand.is_mxfp4(32) => "mxfp4".into(),
             None if operand.is_nvfp4() => "nvfp4".into(),
             None => return None,

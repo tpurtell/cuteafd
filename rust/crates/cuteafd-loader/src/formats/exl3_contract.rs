@@ -207,7 +207,7 @@ pub(crate) fn check_gptqmodel_manifest(
     // regexes, determine inventory. calibration and meta record how weights were
     // produced, not runtime transforms; retain them only as publication provenance.
     // out_scales describes whether the quantizer folded scales into svh.
-    ensure!(manifest["codebook"] == "mcg"
+    ensure!(matches!(manifest["codebook"].as_str(), Some("mcg" | "mul1"))
         && matches!(manifest["out_scales"].as_str(), Some("never" | "auto"))
         && manifest["group_size"] == -1 && manifest["desc_act"] == false
         && manifest.get("pack_dtype").is_none_or(|v| v == "int32")
@@ -222,15 +222,28 @@ pub(crate) fn check_gptqmodel_manifest(
             "bits" | "checkpoint_format" | "codebook" | "core_bits" | "head_bits" | "mtp_bits"
             | "desc_act" | "format" | "group_size" | "lm_head" | "meta" | "method" | "module_include"
             | "out_scales" | "pack_dtype" | "quant_method" | "tensor_storage" | "per_module_metadata"
-            | "sym" | "calibration" | "native_quantization_config" | "mcg_multiplier" | "expert_bits" | "expert_bits_by_layer"
+            | "sym" | "calibration" | "native_quantization_config" | "mcg_multiplier" | "mul1_multiplier"
+            | "expert_bits" | "expert_bits_by_layer"
             | "kept_tensors" | "fused_expert_layout" | "retained_native_tensors"), "EXL3 manifest has unexpected key {key}");
     }
     if let Some(layout) = manifest.get("fused_expert_layout") {
         check_fused_expert_layout(layout, derived, backbone_layers)?;
     }
     if let Some(multiplier) = manifest.get("mcg_multiplier") {
+        ensure!(manifest["codebook"] == "mcg", "EXL3 mcg_multiplier requires codebook=mcg");
         ensure!(multiplier.as_u64() == Some(super::exl3_storage::EXL3_MCG_MULTIPLIER),
             "EXL3 mcg_multiplier {multiplier} (the decoders implement 0xCBAC1FED)");
+    }
+    if let Some(multiplier) = manifest.get("mul1_multiplier") {
+        ensure!(manifest["codebook"] == "mul1", "EXL3 mul1_multiplier requires codebook=mul1");
+        ensure!(multiplier.as_u64() == Some(super::exl3_storage::EXL3_MUL1_MULTIPLIER),
+            "EXL3 mul1_multiplier {multiplier} (the decoders implement 0x83DCD12D)");
+    }
+    if let Some(declared) = manifest.get("codebook").and_then(Value::as_str) {
+        if let Some(codebook) = super::exl3_storage::Exl3Codebook::from_marker(declared) {
+            ensure!(derived.is_empty() || derived.values().any(|module| module.codebook == codebook),
+                "EXL3 manifest codebook={declared:?} disagrees with the safetensors headers");
+        }
     }
     if let Some(kept) = manifest.get("kept_tensors") {
         ensure!(kept.is_object(), "EXL3 kept_tensors must map tensor names to native dtypes/shapes");

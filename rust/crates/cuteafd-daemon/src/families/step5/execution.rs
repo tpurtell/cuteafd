@@ -2076,7 +2076,7 @@ mod tests {
         use super::super::experts::StepExperts;
         use cuteafd_loader::formats::fp8_experts::ExpertFormat;
         for (format, dtype, row_bytes) in [
-            (StepExperts::Exl3(vec![4, 6]), ExpertV2Dtype::Fp8E4m3Ue8m0K32, H + H / 32),
+            (StepExperts::Exl3(vec![4, 6], cuteafd_loader::Exl3Codebook::Mcg), ExpertV2Dtype::Fp8E4m3Ue8m0K32, H + H / 32),
             (StepExperts::Native(ExpertFormat::Fp8Block128), ExpertV2Dtype::Bf16, H * 2),
             (StepExperts::Native(ExpertFormat::Nvfp4), ExpertV2Dtype::Bf16, H * 2),
         ] {

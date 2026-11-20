@@ -111,18 +111,23 @@ fn exl3_workspace(catalog: &crate::OfficialV41Catalog, manifest: Option<&std::pa
     let shape = catalog.routed_experts();
     let geometry = shape.geometry()?;
     let family = geometry.family().context("EXL3 routed geometry has no expert package family")?;
-    let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
-    let stem = format!("exl3-{family}-k{tiers}");
+    let stem = exl3.package_name(family);
     let lib = inventory::image_lib(manifest);
     let parent = manifest.unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json")).parent()
         .context("program manifest directory")?;
-    let root = [parent.join("exl3").join(&stem), lib.join("exl3").join(&stem)]
-        .into_iter().find(|p| p.join(format!("rtx-tp{tp}")).is_dir())
-        .with_context(|| format!("missing {stem}/rtx-tp{tp} package"))?;
+    let layout = format!("rtx-tp{tp}");
+    let exl3_roots = [parent.join("exl3"), lib.join("exl3")];
+    let root = exl3_roots.iter().map(|r| r.join(&stem))
+        .find(|p| p.join(&layout).is_dir())
+        .ok_or_else(|| anyhow::anyhow!(
+            "{}",
+            exl3.codebook().missing_package_detail(family, exl3.decoder_tiers(), &layout, &exl3_roots)
+        ))?;
     let capacities = cuteafd_core::Exl3RowPolicy::for_geometry(geometry).capacities(usize::try_from(rows)?)?;
     let manifests = capacities.into_iter().map(|capacity| -> Result<serde_json::Value> {
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(
             root.join(format!("rtx-tp{tp}/m{capacity}/v41_exl3.json")))?)?;
+        exl3.codebook().check_aot_manifest(&value)?;
         ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
             && value["intermediate"].as_u64() == Some((shape.intermediate / tp) as u64)
             && value["experts"].as_u64() == Some(shape.experts as u64), "{stem} package geometry mismatch");

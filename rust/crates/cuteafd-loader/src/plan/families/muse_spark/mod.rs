@@ -49,10 +49,28 @@ pub(super) struct Model {
     complete: bool,
     /// Routed formats observed (`exl3-k4`, `bf16-fused`, ...).
     expert_formats: Vec<String>,
+    expert_codebook: crate::formats::exl3_storage::Exl3Codebook,
     core: CoreInventory,
 }
 
 fn text(name: &str) -> Option<&str> { name.strip_prefix(TEXT) }
+
+pub fn is_routed_expert_tensor(name: &str) -> bool {
+    let Some(rest) = text(name) else { return false };
+    let Some((_, rest)) = indexed(rest, "layers.") else { return false };
+    if rest == "mlp.experts.post_expert_norm.weight" {
+        return false;
+    }
+    rest.strip_prefix("mlp.experts.")
+        .and_then(|tail| tail.split_once('.'))
+        .is_some_and(|(expert, proj)| !proj.is_empty() && expert.parse::<usize>().is_ok())
+}
+
+pub fn classify_routed_codebook(checkpoint: &Checkpoint) -> Result<Option<crate::formats::exl3_storage::Exl3Codebook>> {
+    crate::formats::exl3_storage::classify_routed_exl3_codebook(
+        checkpoint, "Muse Spark", is_routed_expert_tensor,
+    )
+}
 
 impl Model {
     fn open(checkpoint: &Checkpoint) -> Result<Self> {
@@ -107,7 +125,7 @@ impl Model {
                 *bytes.entry(role.component).or_default() += tensor.meta.byte_length;
             }
             let name = tensor.meta.name.as_str();
-            if let Some(stem) = name.strip_suffix(".trellis").filter(|n| n.contains(".mlp.experts.")) {
+            if let Some(stem) = name.strip_suffix(".trellis").filter(|_| is_routed_expert_tensor(name)) {
                 let bits = tensor.meta.shape.get(2).map_or(0, |packed| packed / 16);
                 ensure!(stem.ends_with("_proj"), "{name}: unexpected routed trellis tensor");
                 formats.insert(format!("exl3-k{bits}"));
@@ -115,7 +133,14 @@ impl Model {
                 formats.insert("bf16-fused".to_string());
             }
         }
-        Ok(Self { cfg, spec, tensors, bytes, complete, expert_formats: formats.into_iter().collect(), core })
+        let expert_codebook = classify_routed_codebook(checkpoint)?
+            .unwrap_or(crate::formats::exl3_storage::Exl3Codebook::Mcg);
+        Ok(Self {
+            cfg, spec, tensors, bytes, complete,
+            expert_formats: formats.into_iter().collect(),
+            expert_codebook,
+            core,
+        })
     }
 
     pub(super) fn cfg(&self) -> &MuseSparkConfig { &self.cfg }
@@ -288,7 +313,13 @@ impl FamilyModel for Model {
                 "down_proj" => [self.cfg.expert_hidden, self.cfg.moe_intermediate],
                 _ => return Err(format!("{stem}: unknown Muse Spark routed projection")),
             };
-            return super::require(operand.exl3_bits().is_some_and(|bits| (4..=5).contains(&bits))
+            if let Some((_, codebook)) = operand.exl3_routed() {
+                if codebook != self.expert_codebook {
+                    return Err(format!("{stem}: Muse Spark routed EXL3 codebook {} differs from {}",
+                        codebook.marker(), self.expert_codebook.marker()));
+                }
+            }
+            return super::require(operand.exl3_routed().is_some_and(|(bits, _)| (4..=5).contains(&bits))
                 && operand.logical == expected, ||
                 format!("{stem}: Muse Spark experts run EXL3 K4/K5 {expected:?}, found {}", super::describe(operand)));
         }
@@ -309,10 +340,16 @@ impl FamilyModel for Model {
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
         // The per-expert output norm (BF16 [moe_hidden]) ships with the package.
         let norm = operand.is_plain(&[format::Encoding::Bf16]) && operand.logical == [self.cfg.expert_hidden];
-        (operand.exl3_bits().is_some_and(|bits| (4..=5).contains(&bits)) || norm).then(|| ExpertContract {
-            package: PACKAGE.into(),
+        let codebook = match operand.exl3_routed() {
+            Some((4..=5, codebook)) if codebook == self.expert_codebook => codebook,
+            _ if norm => self.expert_codebook,
+            _ => return None,
+        };
+        let package = format!("{PACKAGE}{}", codebook.package_suffix());
+        Some(ExpertContract {
+            spark_worlds: crate::plan::experts::spark_worlds(&package, self.cfg.moe_intermediate),
+            package,
             block: 128,
-            spark_worlds: crate::plan::experts::spark_worlds(PACKAGE, self.cfg.moe_intermediate),
             local: Ok("Muse EXL3 RTX expert onboarding package".into()),
         })
     }

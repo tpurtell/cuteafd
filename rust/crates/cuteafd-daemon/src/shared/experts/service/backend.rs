@@ -259,7 +259,7 @@ impl<'a> Weights<'a> {
                     weights.clone(),
                     &{
                         let plan = &weights.first().context("EXL3 worker has no resident weights")?.layout;
-                        config.exl3_directory_for(&plan.tiers, &plan.aot_layout())
+                        config.exl3_directory_for(&plan.tiers, plan.codebook, &plan.aot_layout())
                     },
                     config.capacity,
                     remaining,

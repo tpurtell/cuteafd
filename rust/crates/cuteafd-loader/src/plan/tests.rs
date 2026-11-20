@@ -2676,12 +2676,71 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
     let direct = plan(snapshot(config.clone(), &with_bf16_projection).path(), &quant_options(4)).unwrap();
     assert_eq!(component(&direct, Component::RoutedExpert).status, Status::Ready);
     assert_eq!(component(&direct, Component::DenseFfn).status, Status::Ready, "{}", render(&direct));
-    // An unsupported codebook in config.json stays unsupported, by key.
+    // Unsupported codebooks and config/header codebook disagreements fail closed,
+    // while .mul1 routed expert headers select glmf:exl3-k34-mul1 without changing dense core rules.
+    let mut three_inst = config.clone();
+    three_inst["quantization_config"]["codebook"] = json!("3inst");
+    let report = plan(snapshot(three_inst, &tensors).path(), &quant_options(4)).unwrap();
+    let reason = &rejected(&report, Component::RoutedExpert)[0];
+    assert!(reason.contains("quantization_config.codebook=\"3inst\": this build runs the MCG or MUL1 codebook"), "{reason}");
+
     let mut mul1 = config.clone();
     mul1["quantization_config"]["codebook"] = json!("mul1");
-    let report = plan(snapshot(mul1, &tensors).path(), &quant_options(4)).unwrap();
+    let report = plan(snapshot(mul1.clone(), &tensors).path(), &quant_options(4)).unwrap();
     let reason = &rejected(&report, Component::RoutedExpert)[0];
-    assert!(reason.contains("quantization_config.codebook=\"mul1\": this build runs the MCG codebook only"), "{reason}");
+    assert!(reason.contains("quantization_config.codebook=\"mul1\" disagrees with the safetensors headers (mcg)"), "{reason}");
+
+    let mul1_tensors: Vec<_> = tensors.iter().map(|(name, dtype, shape)| {
+        let name = if name.contains(".mlp.experts.") {
+            name.strip_suffix(".mcg").map(|stem| format!("{stem}.mul1")).unwrap_or_else(|| name.clone())
+        } else {
+            name.clone()
+        };
+        (name, dtype.clone(), shape.clone())
+    }).collect();
+    let mul1_dir = snapshot(mul1, &mul1_tensors);
+    let mul1_report = plan(mul1_dir.path(), &quant_options(4)).unwrap();
+    assert!(mul1_report.executable(), "{}", render(&mul1_report));
+    assert_eq!(mul1_report.experts.as_ref().unwrap().package, "glmf:exl3-k34-mul1");
+    let mul1_catalog = crate::read_expert_catalog(mul1_dir.path()).unwrap();
+    assert_eq!(mul1_catalog.exl3().unwrap().codebook(), crate::Exl3Codebook::Mul1);
+    // A MUL1 routed checkpoint with only installed MCG programs (exl3-glmf-k34)
+    // fails closed with an actionable programs-not-exported error and never
+    // falls back to MCG or consults unindexed side files.
+    std::fs::write(mul1_dir.path().join("codebook.json"), r#"{"codebook":"mcg"}"#).unwrap();
+    let reopened = crate::read_expert_catalog(mul1_dir.path()).unwrap();
+    assert_eq!(reopened.exl3().unwrap().codebook(), crate::Exl3Codebook::Mul1);
+    let missing_err = crate::placement::families::glm5_flash::expert_workspace(
+        &reopened, Some(&share.join("PROGRAMS.json")), 1, 1,
+    ).unwrap_err();
+    let missing_msg = format!("{missing_err:#}");
+    assert!(missing_msg.contains("EXL3 MUL1 routed-expert programs are not exported"), "{missing_msg}");
+    assert!(missing_msg.contains("only MCG package exl3-glmf-k34 is installed"), "{missing_msg}");
+    assert!(missing_msg.contains("refusing fallback to MCG"), "{missing_msg}");
+    assert!(missing_msg.contains("--codebook mul1"), "{missing_msg}");
+    let mul1_root = share.join("exl3/exl3-glmf-k34-mul1/rtx-tp1/m1");
+    std::fs::create_dir_all(&mul1_root).unwrap();
+    // Missing "codebook": "mul1" in v41_exl3.json fails closed.
+    let mut aot_manifest = json!({"hidden":4096,"intermediate":2048,"experts":288,
+        "capacity":1,"input_format":"e4m3_k32","trellis_lut":{"bytes":32},
+        "buffers":{"scratch":{"bytes":16,"allocation":"scratch","dtype":"f32","zero_on_create":false},
+            "state":{"bytes":256,"allocation":"state","dtype":"i32","zero_on_create":true}}});
+    std::fs::write(mul1_root.join("v41_exl3.json"), aot_manifest.to_string()).unwrap();
+    assert!(crate::placement::families::glm5_flash::expert_workspace(&mul1_catalog,
+        Some(&share.join("PROGRAMS.json")), 1, 1).is_err());
+    aot_manifest["codebook"] = json!("mul1");
+    std::fs::write(mul1_root.join("v41_exl3.json"), aot_manifest.to_string()).unwrap();
+    assert!(crate::placement::families::glm5_flash::expert_workspace(&mul1_catalog,
+        Some(&share.join("PROGRAMS.json")), 1, 1).is_ok());
+
+    // Dense core remains MCG-only for GLM (no dense feature/schema drift).
+    let mut mul1_dense = mul1_tensors;
+    mul1_dense.retain(|(name, ..)| !name.starts_with("model.language_model.layers.0.mlp.gate_proj."));
+    let mut dense_proj = exl3("model.language_model.layers.0.mlp.gate_proj", 12288, 4096, 6);
+    dense_proj[3].0 = "model.language_model.layers.0.mlp.gate_proj.mul1".into();
+    mul1_dense.extend(dense_proj);
+    let dense_report = plan(snapshot(config, &mul1_dense).path(), &quant_options(4)).unwrap();
+    assert_eq!(component(&dense_report, Component::DenseFfn).status, Status::MissingKernel);
 }
 
 #[test]
@@ -7047,4 +7106,57 @@ fn missing_native_wave_program_is_a_named_unsupported_result() {
     let reasons = report.hints.iter().map(|h| h.what.as_str()).collect::<Vec<_>>().join("; ");
     assert!(reasons.contains("missing native_experts_dsv4f_w1024_segments in PROGRAMS.json; republish placement inputs"), "{reasons}");
     assert!(!reasons.contains("checkpoint tensors or required package artifacts unavailable"), "{reasons}");
+}
+
+#[test]
+fn partially_available_mixed_codebook_snapshot_fails_closed_for_kimi_and_muse() {
+    use crate::plan::testing::{write_kimi_snapshot, write_muse_spark_snapshot};
+
+    // 1. Kimi: layer 1 shard is readable on disk with .mcg headers, while missing shard
+    //    model-00099.safetensors in model.safetensors.index.json indexes layer 2 with .mul1.
+    let kimi_dir = tempfile::tempdir().unwrap();
+    write_kimi_snapshot(kimi_dir.path(), false);
+    let kimi_index_path = kimi_dir.path().join("model.safetensors.index.json");
+    let mut kimi_index: Value = serde_json::from_slice(&std::fs::read(&kimi_index_path).unwrap()).unwrap();
+    let kimi_map = kimi_index["weight_map"].as_object_mut().unwrap();
+    for suffix in ["trellis", "suh", "svh", "mul1"] {
+        kimi_map.insert(
+            format!("language_model.model.layers.2.block_sparse_moe.experts.0.w1.{suffix}"),
+            json!("model-00099.safetensors"),
+        );
+    }
+    std::fs::write(&kimi_index_path, kimi_index.to_string()).unwrap();
+    let kimi_ckpt = checkpoint::Checkpoint::open(kimi_dir.path()).unwrap();
+    assert!(!kimi_ckpt.missing_shards.is_empty());
+    let kimi_err = crate::plan::families::kimi::classify_routed_codebook(&kimi_ckpt).unwrap_err().to_string();
+    assert!(kimi_err.contains("mix MCG and MUL1 codebooks"), "{kimi_err}");
+    let kimi_report = plan(kimi_dir.path(), &sparks(6)).unwrap();
+    assert!(
+        kimi_report.config_error.as_deref().is_some_and(|e| e.contains("mix MCG and MUL1 codebooks")),
+        "{:?}", kimi_report.config_error
+    );
+    assert!(!kimi_report.fits && !kimi_report.executable());
+
+    // 2. Muse Spark: layer 0 shard is readable on disk with .mcg headers, while layers 1..62
+    //    are missing shards indexed in model.safetensors.index.json; flip one missing-shard
+    //    projection from .mcg to .mul1 (past the first marker) and verify strict rejection.
+    let muse_dir = tempfile::tempdir().unwrap();
+    write_muse_spark_snapshot(muse_dir.path(), &[0]);
+    let muse_index_path = muse_dir.path().join("model.safetensors.index.json");
+    let mut muse_index: Value = serde_json::from_slice(&std::fs::read(&muse_index_path).unwrap()).unwrap();
+    let muse_map = muse_index["weight_map"].as_object_mut().unwrap();
+    let target_mcg = "model.language_model.layers.61.mlp.experts.255.down_proj.mcg";
+    let shard = muse_map.remove(target_mcg).expect("missing Muse indexed tail expert");
+    muse_map.insert("model.language_model.layers.61.mlp.experts.255.down_proj.mul1".to_string(), shard);
+    std::fs::write(&muse_index_path, muse_index.to_string()).unwrap();
+    let muse_ckpt = checkpoint::Checkpoint::open(muse_dir.path()).unwrap();
+    assert!(!muse_ckpt.missing_shards.is_empty());
+    let muse_err = crate::plan::families::muse_spark::classify_routed_codebook(&muse_ckpt).unwrap_err().to_string();
+    assert!(muse_err.contains("mix MCG and MUL1 codebooks"), "{muse_err}");
+    let muse_report = plan(muse_dir.path(), &sparks(6)).unwrap();
+    assert!(
+        muse_report.config_error.as_deref().is_some_and(|e| e.contains("mix MCG and MUL1 codebooks")),
+        "{:?}", muse_report.config_error
+    );
+    assert!(!muse_report.fits && !muse_report.executable());
 }

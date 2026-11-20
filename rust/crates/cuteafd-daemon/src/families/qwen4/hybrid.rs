@@ -26,7 +26,7 @@ pub(super) fn push_plan(catalog: &OfficialV41Catalog, layers: &[usize], gpus: us
 fn whole_package(args: &EngineArgs, catalog: &OfficialV41Catalog) -> Result<std::path::PathBuf> {
     let root = args.native_lib.parent().unwrap_or(Path::new("."));
     if let Some(exl3) = catalog.exl3() {
-        Ok(root.join("exl3").join(crate::shared::experts::exl3::package_name("qwen4", exl3.decoder_tiers())).join("rtx-tp1"))
+        Ok(root.join("exl3").join(exl3.package_name("qwen4")).join("rtx-tp1"))
     } else {
         Ok(args.fp8_package.clone().unwrap_or_else(|| crate::shared::experts::fp8::package_directory(
             &args.native_lib, 1, catalog.fp8().expect("validated catalog").format())))

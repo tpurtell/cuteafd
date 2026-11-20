@@ -299,7 +299,7 @@ impl Model {
         let shape = routed_shape(&self.cfg, stem).ok_or("not a routed projection (w1/w3/w2)")?;
         require(operand.logical == shape, || format!("experts are {shape:?}, found {}", describe(operand)))?;
         require(operand.is_fp8_block(128, &[ScaleEncoding::F32])
-            || operand.exl3_bits().is_some_and(|bits| (4..=5).contains(&bits)), || format!(
+            || operand.exl3_routed().is_some_and(|(bits, _)| (4..=5).contains(&bits)), || format!(
             "routed experts run EXL3 K4/K5 (served) or the official E4M3 with FP32 128x128 scales (source); found {}",
             describe(operand)))
     }
@@ -427,11 +427,15 @@ impl FamilyModel for Model {
         let moe = self.spec.moe.as_ref()?;
         let geometry = cuteafd_core::ExpertGeometry { hidden: self.spec.hidden as u32, experts: moe.experts as u32,
             topk: moe.top_k as u32, intermediate: moe.intermediate as u32, layers: 0 };
-        (geometry.same_shape(&cuteafd_core::ExpertGeometry::MISTRAL_LARGE4)
-            && operand.exl3_bits().is_some_and(|bits| (4..=5).contains(&bits))).then(|| ExpertContract {
-            package: PACKAGE.into(),
+        if !geometry.same_shape(&cuteafd_core::ExpertGeometry::MISTRAL_LARGE4) {
+            return None;
+        }
+        let (_, codebook) = operand.exl3_routed().filter(|&(bits, _)| (4..=5).contains(&bits))?;
+        let package = format!("{PACKAGE}{}", codebook.package_suffix());
+        Some(ExpertContract {
+            spark_worlds: crate::plan::experts::spark_worlds(&package, moe.intermediate),
+            package,
             block: 128,
-            spark_worlds: crate::plan::experts::spark_worlds(PACKAGE, moe.intermediate),
             local: Ok("Mistral Large 4 EXL3 RTX expert onboarding package".into()),
         })
     }

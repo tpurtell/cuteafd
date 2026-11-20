@@ -1162,10 +1162,42 @@ release_spark_host_rows() {
 # can therefore clean every host it names.
 # The family of the checkpoint a config names (scripts/lib/checkpoint-family.py
 # on its config.json). A config without MODEL_ID, or a snapshot not present
+release_hf_home() {
+  local helper
+  helper="$(dirname "${BASH_SOURCE[0]}")/wip_aot_scopes.py"
+  if [[ -f "$helper" ]]; then
+    python3 "$helper" --print-hf-home
+    return
+  fi
+  printf '%s\n' "${HF_HOME:-$HOME/.cache/huggingface}"
+}
+
+release_resolve_model_revision() {
+  local model="$1" explicit="${2:-}" hf_home="${3:-}" helper
+  helper="$(dirname "${BASH_SOURCE[0]}")/wip_aot_scopes.py"
+  if [[ -f "$helper" ]]; then
+    local -a cmd=(python3 "$helper" --resolve-revision --model "$model")
+    [[ -z "$explicit" ]] || cmd+=(--revision "$explicit")
+    [[ -z "$hf_home" ]] || cmd+=(--hf-home "$hf_home")
+    "${cmd[@]}"
+    return
+  fi
+  if [[ -n "$explicit" ]]; then
+    printf '%s\n' "$explicit"
+    return
+  fi
+  local root="${hf_home:-${HF_HOME:-$HOME/.cache/huggingface}}/hub/models--${model//\//--}"
+  [[ -s "$root/refs/main" ]] || return 1
+  local rev
+  rev="$(release_trim "$(<"$root/refs/main")")"
+  [[ -n "$rev" ]] || return 1
+  printf '%s\n' "$rev"
+}
+
 # here, is DeepSeek V4.1, the release default; its own validation reports a
 # missing snapshot.
 release_config_family() {
-  local config="$1" model="" revision="" attention="original" line key value hub dir
+  local config="$1" model="" revision="" attention="original" line key value hf_home hub dir
   [[ -f "$config" ]] || { printf 'deepseek_v41\n'; return 0; }
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="$(release_trim "${line%%#*}")"
@@ -1178,9 +1210,10 @@ release_config_family() {
     esac
   done < "$config"
   [[ -n "$model" ]] || { printf 'deepseek_v41\n'; return 0; }
-  hub="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+  hf_home="$(release_hf_home)"
+  hub="$hf_home/hub"
   dir="$hub/models--${model//\//--}"
-  [[ -n "$revision" || ! -f "$dir/refs/main" ]] || revision="$(<"$dir/refs/main")"
+  [[ -n "$revision" ]] || revision="$(release_resolve_model_revision "$model" "" "$hf_home" 2>/dev/null)" || revision=""
   [[ -z "${2:-}" ]] || attention="$2"
   local selected_config=config.json
   case "$attention" in
@@ -1256,9 +1289,10 @@ PY
 
 # Resolve fixed onboarding from the checkpoint's sparse layers.
 release_onboard() {
-  local value="$1" model="$2" revision="${3:-}" hub snapshot
-  hub="${HF_HOME:-$HOME/.cache/huggingface}/hub/models--${model//\//--}"
-  [[ -n "$revision" || ! -f "$hub/refs/main" ]] || revision="$(<"$hub/refs/main")"
+  local value="$1" model="$2" revision="${3:-}" hf_home hub snapshot
+  hf_home="$(release_hf_home)"
+  hub="$hf_home/hub/models--${model//\//--}"
+  [[ -n "$revision" ]] || revision="$(release_resolve_model_revision "$model" "" "$hf_home" 2>/dev/null)" || revision=""
   snapshot="$hub/snapshots/$revision/config.json"
   local -a args=(--onboard "$value")
   [[ ! -f "$snapshot" ]] || args+=("$snapshot")
@@ -1642,9 +1676,8 @@ release_resolve_local_model_revision() {
   local hf_home="$1"
   local model_root="$hf_home/hub/models--${RELEASE_MODEL_ID//\//--}"
   if [[ -z "$RELEASE_MODEL_REVISION" ]]; then
-    [[ -s "$model_root/refs/main" ]] ||
+    RELEASE_MODEL_REVISION="$(release_resolve_model_revision "$RELEASE_MODEL_ID" "" "$hf_home" 2>/dev/null)" ||
       release_die "MODEL_REVISION is empty and $RELEASE_MODEL_ID has no local refs/main"
-    RELEASE_MODEL_REVISION="$(<"$model_root/refs/main")"
   fi
   [[ "$RELEASE_MODEL_REVISION" =~ ^[0-9a-f]{40,64}$ ]] ||
     release_die "resolved model revision is not 40..64 lowercase hex: $RELEASE_MODEL_REVISION"

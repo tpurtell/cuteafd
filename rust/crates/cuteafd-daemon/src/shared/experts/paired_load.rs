@@ -7,26 +7,27 @@ use crate::shared::memory::Tag;
 
 pub(crate) struct Projection {
     pub name: String,
+    pub codebook: cuteafd_loader::Exl3Codebook,
     pub offset: usize,
     pub bytes: usize,
     pub slices: [V41Exl3TensorSlice; 2],
 }
 
 impl Projection {
-    pub fn new(catalog: &OfficialV41Catalog, name: String, offset: usize,
-        slices: [V41Exl3TensorSlice; 2]) -> Result<Self> {
+    pub fn new(catalog: &OfficialV41Catalog, name: String, codebook: cuteafd_loader::Exl3Codebook,
+        offset: usize, slices: [V41Exl3TensorSlice; 2]) -> Result<Self> {
         let bytes = usize::try_from(catalog.tensor(&name)?.metadata.byte_length)?;
         V41Exl3TensorSlice::validate_pair(slices, bytes)?;
-        Ok(Self { name, offset, bytes, slices })
+        Ok(Self { name, codebook, offset, bytes, slices })
     }
 
     pub fn read(&self, catalog: &OfficialV41Catalog, destination: &mut [u8]) -> Result<usize> {
         let mut read = 0;
         if let Some(prefix) = self.name.strip_suffix(".trellis") {
-            let mut mcg = [0; 4];
-            read += catalog.read_projection_once(&format!("{prefix}.mcg"), &mut mcg)?;
-            ensure!(u32::from_le_bytes(mcg) == 0xcbac1fed,
-                "unsupported EXL3 MCG multiplier for {prefix}");
+            let mut marker = [0; 4];
+            read += catalog.read_projection_once(&format!("{prefix}.{}", self.codebook.marker()), &mut marker)?;
+            ensure!(u32::from_le_bytes(marker) == self.codebook.multiplier(),
+                "unsupported EXL3 {} multiplier for {prefix}", self.codebook.marker().to_ascii_uppercase());
         }
         read += catalog.read_projection_once(&self.name, destination)?;
         if self.name.ends_with(".suh") || self.name.ends_with(".svh") {
@@ -222,16 +223,16 @@ mod tests {
     fn projection_slots_are_disjoint_and_preserve_padding() -> Result<()> {
         let slice = V41Exl3TensorSlice { rows: 1, source_row_bytes: 4,
             column_start_bytes: 0, selected_row_bytes: 4 };
-        let plans = [Projection { name: "a".into(), offset: 0, bytes: 4, slices: [slice; 2] },
-            Projection { name: "b".into(), offset: 8, bytes: 4, slices: [slice; 2] }];
+        let plans = [Projection { name: "a".into(), codebook: cuteafd_loader::Exl3Codebook::Mcg, offset: 0, bytes: 4, slices: [slice; 2] },
+            Projection { name: "b".into(), codebook: cuteafd_loader::Exl3Codebook::Mcg, offset: 8, bytes: 4, slices: [slice; 2] }];
         let mut bank = [7; 16];
         for (job, destination) in projection_slots(&plans, &mut bank)? {
             destination.fill(if job.offset == 0 { 1 } else { 2 });
         }
         assert_eq!(bank, [1,1,1,1,7,7,7,7,2,2,2,2,7,7,7,7]);
         assert!(projection_slots(&plans, &mut [0; 11]).is_err());
-        let overlap = [Projection { name: "a".into(), offset: 0, bytes: 8, slices: [slice; 2] },
-            Projection { name: "b".into(), offset: 4, bytes: 4, slices: [slice; 2] }];
+        let overlap = [Projection { name: "a".into(), codebook: cuteafd_loader::Exl3Codebook::Mcg, offset: 0, bytes: 8, slices: [slice; 2] },
+            Projection { name: "b".into(), codebook: cuteafd_loader::Exl3Codebook::Mcg, offset: 4, bytes: 4, slices: [slice; 2] }];
         assert!(projection_slots(&overlap, &mut bank).is_err());
         Ok(())
     }

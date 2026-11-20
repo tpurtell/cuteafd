@@ -176,7 +176,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let mark_bytes = super::state::KdaLayout::for_ranks(&cfg, slots, 1, 1, physical_ranks)?.mark_bytes()
                 .checked_mul(physical_ranks).context("Kimi prefix mark extent overflow")?;
             let marks = worker_args.prefix.mark_rule(concurrency).slots(mark_bytes);
-            startup::preflight(&worker_args.manifest, &worker_args.native_lib)?;
+            startup::preflight(&checkpoint, &worker_args.manifest, &worker_args.native_lib)?;
             // SAFETY: every native owner drops on this worker before the library.
             let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&worker_args.native_lib)? });
             let programs = library.programs()?.with_manifest(&worker_args.manifest)?;

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from launcher_sandbox import copy_launcher_shared_inputs
+from launcher_sandbox import copy_launcher_shared_inputs, seed_exl3_index
 
 REPO = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location('release_scope', REPO / 'scripts/build/release-scope.py')
@@ -48,6 +48,8 @@ def fixture_repo(matrix, monkeypatch):
 
 @pytest.mark.parametrize('audio,enabled', [('auto', True), ('on', True), ('off', False)])
 def test_muse_release_audio_scope(fixture_repo, audio, enabled):
+    import os
+    seed_exl3_index(os.environ['HF_HOME'], 'fixture/muse-exl3')
     repo, path = fixture_repo
     (repo / 'muse.config').write_text(f'FAMILY=muse_spark\nMODEL_ID=fixture/muse-exl3\nSPARK_COUNT=4\nAUDIO={audio}\n')
     write_json(path, dict(entries=[dict(name='muse', family='muse_spark', config='muse.config')]))
@@ -516,6 +518,8 @@ def test_step5_release_derives_native_mixed_packages(tmp_path, monkeypatch, quan
 
 
 def test_kimi_release_derives_coordinator_programs(tmp_path, monkeypatch):
+    import os
+    seed_exl3_index(os.environ['HF_HOME'], 'fixture/Kimi-K3-EXL3-K2')
     real = SCOPE.scopes_module(REPO)
     monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
     (tmp_path / 'kimi.config').write_text(
@@ -542,6 +546,7 @@ def test_kimi_program_sources_agree_with_checkpoint_metadata(tmp_path, monkeypat
     monkeypatch.setenv('HF_HOME', str(tmp_path / 'hf'))
     # A misleading repository name must not select the K3.1 variant.
     model = 'fixture/Kimi-K3.1-EXL3-K2'
+    seed_exl3_index(tmp_path / 'hf', model, revision='revision')
     config = tmp_path / 'hf/hub/models--fixture--Kimi-K3.1-EXL3-K2/snapshots/revision/config.json'
     checkpoint = {'model_type': 'kimi_k3', **checkpoint}
     if 'text_config' in checkpoint:
@@ -575,6 +580,8 @@ def test_kimi_program_sources_agree_with_checkpoint_metadata(tmp_path, monkeypat
 
 
 def test_unrelated_release_keeps_kimi_disabled(tmp_path, monkeypatch):
+    import os
+    seed_exl3_index(os.environ['HF_HOME'], 'fixture/GLM-5.3-EXL3-K4')
     real = SCOPE.scopes_module(REPO)
     monkeypatch.setattr(SCOPE, 'scopes_module', lambda _: real)
     (tmp_path / 'glm.config').write_text(

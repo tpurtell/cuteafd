@@ -149,7 +149,12 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
            wire_input: bool = False, ws_input_stages: int | None = None,
            ws_dynamic_tiles: bool = False, decode_schedule: str | None = None,
            compile_only: bool = False, activation: str = "silu",
-           compact_weights: bool = False, row_addresses: bool = False) -> dict:
+           compact_weights: bool = False, row_addresses: bool = False,
+           codebook: str = "mcg") -> dict:
+    if codebook not in ("mcg", "mul1"):
+        raise ValueError("EXL3 codebook must be mcg or mul1")
+    if codebook == "mul1" and hasattr(_pinned_sparkinfer, "require_routed_mul1"):
+        _pinned_sparkinfer.require_routed_mul1()
     if row_addresses and (not warp_specialized or capacity != 8192
                           or output_dtype != 'bf16' or compact_weights or routing == 'direct'):
         raise ValueError('row addresses require noncompact warp-specialized packed capacity 8192 and BF16 output')
@@ -248,7 +253,7 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
         max_shared_mem=props.shared_memory_per_block_optin,
         force_tile_config=_projection_mixed_tile_config(tile, hidden_size=hidden,
             intermediate_size=intermediate, token_count=capacity, direct_topk_routes=direct),
-        tier0_bits=bits[0], tier1_bits=bits[1], trellis_codebook="mcg", swiglu_limit=swiglu_limit,
+        tier0_bits=bits[0], tier1_bits=bits[1], trellis_codebook=codebook, swiglu_limit=swiglu_limit,
         moe_block_size=block_m, rotation_input_dtype="bf16", full_rotation_output_dtype=output_dtype,
         route_ids_dtype=torch.int32)
     if activation != "silu":
@@ -336,6 +341,8 @@ def export(output: Path, intermediate: int, experts: int, capacity: int,
                         unique_execution_buffer_bytes=segment_bytes)
     if compact_weights:
         manifest.update(descriptor_rows=7, native_info_version=3)
+    if codebook != "mcg":
+        manifest["codebook"] = codebook
     if activation != "silu":
         manifest["activation"] = activation
     if experts > 512:
@@ -412,6 +419,8 @@ def main() -> None:
     parser.add_argument("--tile", help="Offline disjoint-layout tile override fc1_k,fc1_n,fc2_k,fc2_n "
                                        "(for example 64,256,64,256 or 128,128,128,128); default is the "
                                        "B12x per-capacity policy")
+    parser.add_argument("--codebook", choices=("mcg", "mul1"), default="mcg",
+                        help="EXL3 routed-expert codebook (default: mcg)")
     args = parser.parse_args()
     export(args.output, args.intermediate, args.experts, args.capacity, tuple(args.bits), args.routing, args.topk, args.output_dtype, args.blocks_per_sm,
            tile=None if args.tile is None else tuple(args.tile.split(",")), hidden=args.hidden,
@@ -421,7 +430,7 @@ def main() -> None:
            swiglu_limit=None if args.swiglu_limit.lower() == "none" else float(args.swiglu_limit),
            activation=args.activation,
            decode_schedule=args.decode_schedule, compact_weights=args.compact_weights,
-           row_addresses=args.row_addresses)
+           row_addresses=args.row_addresses, codebook=args.codebook)
 
 
 if __name__ == "__main__":

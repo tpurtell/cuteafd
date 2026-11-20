@@ -549,8 +549,7 @@ pub fn metadata_library(catalog: &crate::OfficialV41Catalog, manifest: Option<&s
     let manifest = manifest.unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     let share = manifest.parent().unwrap_or(std::path::Path::new("/opt/cuteafd/share"));
     let metadata = catalog.exl3().is_some_and(|exl3| {
-        let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
-        share.join(format!("exl3/exl3-qwen4-k{tiers}/rtx-tp1/m1/v41_exl3.json")).is_file()
+        share.join(format!("exl3/{}/rtx-tp1/m1/v41_exl3.json", exl3.package_name("qwen4"))).is_file()
     });
     (if metadata { share.to_owned() } else { crate::placement::inventory::image_lib(Some(manifest)) })
         .join("libcuteafd_native.so")
@@ -561,8 +560,7 @@ pub fn dual_packages(catalog: &crate::OfficialV41Catalog, native_lib: &std::path
     -> anyhow::Result<[std::path::PathBuf; 2]> {
     let root = native_lib.parent().unwrap_or(std::path::Path::new("."));
     if let Some(exl3) = catalog.exl3() {
-        let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
-        let root = root.join("exl3").join(format!("exl3-qwen4-k{tiers}"));
+        let root = root.join("exl3").join(exl3.package_name("qwen4"));
         Ok([0, 1].map(|rank| root.join(format!("rtx-tp2-rank{rank}"))))
     } else {
         let tensors = catalog.fp8().ok_or_else(|| anyhow::anyhow!("Qwen TP2 needs native expert headers"))?.for_coordinator();
@@ -585,12 +583,12 @@ pub fn dual_draft_demands(catalog: &crate::OfficialV41Catalog, native_lib: &std:
     let root = native_lib.parent().unwrap_or(std::path::Path::new("."));
     let (resident, scratch) = if let Some(exl3) = catalog.exl3() {
         let resident = exl3.residency(crate::V41Exl3Layer::Dspark(0), 1, 0)?.device_arena_layout()?.1 as u64;
-        let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
-        let root = root.join("exl3").join(format!("exl3-qwen4-k{tiers}/rtx-tp1"));
+        let root = root.join("exl3").join(exl3.package_name("qwen4")).join("rtx-tp1");
         anyhow::ensure!(rows > 0 && rows <= 4096, "Qwen MTP EXL3 capacity exceeds 4096 rows");
         let manifests = crate::placement::inventory::exl3_capacities(rows).into_iter().map(|capacity| {
             let path = root.join(format!("m{capacity}/v41_exl3.json"));
             let m: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).map_err(|error| anyhow::anyhow!("Qwen expert package {}: {error}", path.display()))?)?;
+            exl3.codebook().check_aot_manifest(&m)?;
             anyhow::ensure!(m["hidden"].as_u64() == Some(shape.hidden as u64)
                 && m["intermediate"].as_u64() == Some(shape.intermediate as u64)
                 && m["experts"].as_u64() == Some(shape.experts as u64)

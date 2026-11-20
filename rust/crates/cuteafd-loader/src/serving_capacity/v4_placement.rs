@@ -86,20 +86,24 @@ pub fn deepseek_v4_tp2_workspace(catalog: &crate::OfficialV41Catalog,
         return Ok(deepseek_v4_tp2_native_workspace(shape.hidden as u64, shape.intermediate as u64,
             shape.experts as u64, shape.topk as u64, max_rows)?);
     };
-    let tiers = exl3.decoder_tiers().iter().map(usize::to_string).collect::<String>();
     let family = if shape.hidden == 4096 { "dsv4f" } else { "dsv4p" };
     let parent = manifest.unwrap_or(std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"))
         .parent().ok_or_else(|| anyhow::anyhow!("program manifest has no parent"))?;
-    let stem = format!("exl3-{family}-k{tiers}");
-    let root = [parent.join("exl3").join(&stem), parent.join("../lib/exl3").join(&stem)]
-        .into_iter().find(|p| p.join("rtx-tp2").is_dir())
-        .ok_or_else(|| anyhow::anyhow!("missing {stem}/rtx-tp2 workspace manifests"))?;
+    let stem = exl3.package_name(family);
+    let exl3_roots = [parent.join("exl3"), parent.join("../lib/exl3")];
+    let root = exl3_roots.iter().map(|r| r.join(&stem))
+        .find(|p| p.join("rtx-tp2").is_dir())
+        .ok_or_else(|| anyhow::anyhow!(
+            "{}",
+            exl3.codebook().missing_package_detail(family, exl3.decoder_tiers(), "rtx-tp2", &exl3_roots)
+        ))?;
     let capacities = cuteafd_core::EXL3_CAPACITIES.map(u64::from);
     let compiled = capacities.into_iter().find(|&c| c >= max_rows.max(1))
         .ok_or_else(|| anyhow::anyhow!("TP2 expert capacity exceeds 4096 rows"))?;
     let manifests = capacities.into_iter().filter(|&c| c <= compiled).map(|c| {
         let path = root.join(format!("rtx-tp2/m{c}/v41_exl3.json"));
         let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        exl3.codebook().check_aot_manifest(&value)?;
         anyhow::ensure!(value["hidden"].as_u64() == Some(shape.hidden as u64)
             && value["intermediate"].as_u64() == Some(shape.intermediate as u64 / 2)
             && value["experts"].as_u64() == Some(shape.experts as u64), "TP2 EXL3 workspace geometry mismatch");

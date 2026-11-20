@@ -132,8 +132,7 @@ pub(super) fn layout(
     }
     let catalog = input.expert_catalog()?;
     let package = match catalog.exl3() {
-        Some(manifest) => format!("exl3-step5-k{}",
-            manifest.decoder_tiers().iter().map(usize::to_string).collect::<String>()),
+        Some(manifest) => manifest.package_name("step5"),
         None => catalog.fp8().context("Step-5 requires native FP8, NVFP4 or EXL3 expert headers")?
             .format().package_name("step5"),
     };

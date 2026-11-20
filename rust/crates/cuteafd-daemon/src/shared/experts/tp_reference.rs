@@ -22,6 +22,37 @@ fn f16(bits: u16) -> f64 {
     if sign == 0 { magnitude } else { -magnitude }
 }
 
+fn round_f16(value: f64) -> f64 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 48) & 0x8000) as u16;
+    let exp64 = ((bits >> 52) & 0x7ff) as i32 - 1023;
+    let mant64 = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
+    if (bits & !(1u64 << 63)) == 0 || exp64 < -26 {
+        return f16(sign);
+    }
+    if exp64 < -14 {
+        let shift = (-14 - exp64) as u32 + 42;
+        let q = if shift >= 64 { 0 } else { mant64 >> shift };
+        let half = 1u64 << (shift - 1);
+        let rem = if shift >= 64 { mant64 } else { mant64 & ((1u64 << shift) - 1) };
+        let round_up = rem > half || (rem == half && (q & 1) == 1);
+        return f16(sign | ((q as u16) + u16::from(round_up)));
+    }
+    let q = (mant64 >> 42) & 0x3ff;
+    let rem = mant64 & ((1u64 << 42) - 1);
+    let half = 1u64 << 41;
+    let mut frac = q as u16;
+    let mut biased = (exp64 + 15) as u16;
+    if rem > half || (rem == half && (frac & 1) == 1) {
+        frac += 1;
+        if frac == 1024 {
+            frac = 0;
+            biased += 1;
+        }
+    }
+    f16(sign | (biased << 10) | frac)
+}
+
 fn e4m3(bits: u8) -> Result<f64> {
     ensure!(bits & 127 != 127, "FP8 reference encountered NaN");
     let (exponent, fraction) = ((bits >> 3) & 15, bits & 7);
@@ -209,9 +240,9 @@ fn hadamard(values: &mut [f64]) {
     }
 }
 
-// Tail-biting MCG code and lane order, independently ported from the public
-// GPTQModel reference (Apache-2.0), as in python/tools/lib/exl3_reference.py.
-fn trellis_tile(bytes: &[u8], bits: usize) -> Result<[f64; 256]> {
+// Tail-biting MCG / MUL1 code and lane order, independently ported from the
+// public GPTQModel/ExLlamaV3 reference (Apache-2.0).
+fn trellis_tile(bytes: &[u8], bits: usize, codebook: cuteafd_loader::Exl3Codebook) -> Result<[f64; 256]> {
     ensure!(matches!(bits, 2..=6) && bytes.len() == 32 * bits, "invalid EXL3 tile");
     let words: Vec<_> = bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
     let mut symbols = [0u32; 256];
@@ -231,14 +262,24 @@ fn trellis_tile(bytes: &[u8], bits: usize) -> Result<[f64; 256]> {
     let mut decoded = [0.; 256];
     for (index, &symbol) in symbols.iter().enumerate() {
         state = ((state << bits) | symbol) & 0xffff;
-        let raw = 0x3b603b60 ^ (state.wrapping_mul(0xcbac1fed) & 0x8fff8fff);
         let lane = index / 8;
         let (row, column) = ((lane % 4) * 2, lane / 4);
         let offsets = [row * 16 + column, (row + 1) * 16 + column,
             (row + 8) * 16 + column, (row + 9) * 16 + column,
             row * 16 + column + 8, (row + 1) * 16 + column + 8,
             (row + 8) * 16 + column + 8, (row + 9) * 16 + column + 8];
-        decoded[offsets[index % 8]] = f16(raw as u16) + f16((raw >> 16) as u16);
+        decoded[offsets[index % 8]] = match codebook {
+            cuteafd_loader::Exl3Codebook::Mcg => {
+                let raw = 0x3b603b60 ^ (state.wrapping_mul(0xcbac1fed) & 0x8fff8fff);
+                f16(raw as u16) + f16((raw >> 16) as u16)
+            }
+            cuteafd_loader::Exl3Codebook::Mul1 => {
+                let prod = state.wrapping_mul(0x83dcd12d);
+                let byte_sum = (prod & 0xff) + ((prod >> 8) & 0xff) + ((prod >> 16) & 0xff) + (prod >> 24);
+                let h = f16((0x6400u32 + byte_sum) as u16);
+                round_f16(h.mul_add(f16(0x1eee), f16(0xc931)))
+            }
+        };
     }
     Ok(decoded)
 }
@@ -252,9 +293,10 @@ fn exl3_projection(catalog: &OfficialV41Catalog, name: &str, input: &[f64],
     let trellis = source(catalog, &format!("{name}.trellis"), DType::I16, &projection.trellis_shape())?;
     let suh = source(catalog, &format!("{name}.suh"), DType::F16, &[k])?;
     let svh = source(catalog, &format!("{name}.svh"), DType::F16, &[n])?;
-    let mcg = source(catalog, &format!("{name}.mcg"), DType::I32,
-        &catalog.tensor(&format!("{name}.mcg"))?.metadata.shape)?;
-    ensure!(mcg == 0xcbac1fedu32.to_le_bytes(), "unsupported EXL3 codebook");
+    let marker_name = format!("{name}.{}", projection.codebook.marker());
+    let marker = source(catalog, &marker_name, DType::I32,
+        &catalog.tensor(&marker_name)?.metadata.shape)?;
+    ensure!(marker == projection.codebook.multiplier().to_le_bytes(), "unsupported EXL3 codebook");
     let scales = |bytes: &[u8]| bytes.chunks_exact(2).map(|v| f16(u16::from_le_bytes([v[0], v[1]]))).collect::<Vec<_>>();
     let (suh, svh) = (scales(&suh), scales(&svh));
     ensure!(suh.iter().chain(&svh).all(|v| v.is_finite()), "nonfinite EXL3 rotations");
@@ -270,7 +312,7 @@ fn exl3_projection(catalog: &OfficialV41Catalog, name: &str, input: &[f64],
         for nb in 0..n / 16 {
             if !wanted[nb / 8] { continue; }
             let offset = (kb * (n / 16) + nb) * tile_bytes;
-            let tile = trellis_tile(&trellis[offset..offset + tile_bytes], projection.bits)?;
+            let tile = trellis_tile(&trellis[offset..offset + tile_bytes], projection.bits, projection.codebook)?;
             for row in 0..16 { for col in 0..16 { out[nb * 16 + col] += x[row] * tile[row * 16 + col]; } }
         }
     }
@@ -381,12 +423,17 @@ fn trellis_tiles_match_independent_numpy_source_vectors() -> Result<()> {
     ] {
         let bytes: Vec<_> = (0..16 * bits).flat_map(|j|
             ((j * 7919 + 12345) as u16).to_le_bytes()).collect();
-        let tile = trellis_tile(&bytes, bits)?;
+        let tile = trellis_tile(&bytes, bits, cuteafd_loader::Exl3Codebook::Mcg)?;
         let mut hash = Sha256::new();
         for value in tile { hash.update(value.to_le_bytes()); }
         assert_eq!(format!("{:x}", hash.finalize()), expected, "K{bits}");
+
+        let mul1 = trellis_tile(&bytes, bits, cuteafd_loader::Exl3Codebook::Mul1)?;
+        assert!(mul1.iter().all(|v| v.is_finite() && v.abs() <= 3.5));
+        assert_ne!(mul1, tile);
     }
-    assert!(trellis_tile(&[0; 32], 1).is_err());
+    assert!(trellis_tile(&[0; 32], 1, cuteafd_loader::Exl3Codebook::Mcg).is_err());
+    assert!(trellis_tile(&[0; 32], 1, cuteafd_loader::Exl3Codebook::Mul1).is_err());
     Ok(())
 }
 

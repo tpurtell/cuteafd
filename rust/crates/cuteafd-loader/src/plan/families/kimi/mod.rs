@@ -51,7 +51,6 @@ struct Tensor {
 
 pub(super) struct Model {
     cfg: KimiK3Config,
-    snapshot: std::path::PathBuf,
     spec: ModelSpec,
     tensors: BTreeMap<String, Tensor>,
     vision_shapes: BTreeMap<String, Vec<usize>>,
@@ -61,6 +60,7 @@ pub(super) struct Model {
     complete: bool,
     /// Routed formats observed (`exl3-k2`, ...).
     expert_formats: Vec<String>,
+    pub(super) expert_codebook: crate::formats::exl3_storage::Exl3Codebook,
     /// Coordinator text bytes by TP2 residency (embedding, head and MLA excluded).
     coordinator: Residency,
     /// One canonical latent/router frontend, alternating by routed ordinal.
@@ -165,7 +165,8 @@ impl Model {
         }
         let spec = spec(&cfg, checkpoint);
         let mla = vec![Residency::default(); cfg.layers];
-        let mut model = Self { vision_shapes, cfg, snapshot: checkpoint.snapshot.clone(), spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
+        let mut model = Self { vision_shapes, cfg, spec, tensors, bytes: BTreeMap::new(), complete: true, expert_formats: Vec::new(),
+            expert_codebook: crate::formats::exl3_storage::Exl3Codebook::Mcg,
             coordinator: Residency::default(), frontends: [0; 2], mla,
             core: crate::families::kimi_k3::core::CoreInventory::default() };
         model.core = crate::families::kimi_k3::core::CoreInventory::from_checkpoint(&model.cfg, checkpoint,
@@ -221,16 +222,40 @@ impl Model {
         }
         let mut formats = std::collections::BTreeSet::new();
         for tensor in &checkpoint.tensors {
-            if let Some(bits) = tensor.meta.name.strip_suffix(".trellis").filter(|n| n.contains(".block_sparse_moe.experts."))
+            if let Some(bits) = tensor.meta.name.strip_suffix(".trellis")
+                .filter(|_| is_routed_expert_tensor(&tensor.meta.name))
                 .and(tensor.meta.shape.get(2)).map(|packed| packed / 16) {
                 formats.insert(format!("exl3-k{bits}"));
             }
+        }
+        if let Some(codebook) = classify_routed_codebook(checkpoint)? {
+            model.expert_codebook = codebook;
         }
         model.expert_formats = formats.into_iter().collect();
         Ok(model)
     }
 
     pub(super) fn cfg(&self) -> &KimiK3Config { &self.cfg }
+}
+
+pub fn is_routed_expert_tensor(name: &str) -> bool {
+    let Some(rest) = text(name) else { return false };
+    let Some((_, rest)) = indexed(rest, "layers.") else { return false };
+    rest.strip_prefix("block_sparse_moe.experts.")
+        .and_then(|tail| tail.split_once('.'))
+        .is_some_and(|(expert, proj)| !proj.is_empty() && expert.parse::<usize>().is_ok())
+}
+
+pub fn classify_routed_codebook(checkpoint: &Checkpoint) -> Result<Option<crate::formats::exl3_storage::Exl3Codebook>> {
+    crate::formats::exl3_storage::classify_routed_exl3_codebook(
+        checkpoint, "Kimi K3", is_routed_expert_tensor,
+    )
+}
+
+pub fn routed_exl3_codebook(checkpoint: &Checkpoint) -> Result<crate::formats::exl3_storage::Exl3Codebook> {
+    use anyhow::Context;
+    classify_routed_codebook(checkpoint)?
+        .context("Kimi K3 checkpoint has no routed EXL3 expert projections")
 }
 
 fn spec(cfg: &KimiK3Config, checkpoint: &Checkpoint) -> ModelSpec {
@@ -388,7 +413,12 @@ impl FamilyModel for Model {
                 && operand.logical == [projection.stored_outputs, projection.shape[1]],
                 || format!("{stem}: expected header-native K{} {:?}", projection.bits, projection.shape));
         }
-        if role.component == Component::RoutedExpert && operand.exl3_bits() == Some(2) {
+        if role.component == Component::RoutedExpert && matches!(operand.exl3_routed(), Some((2, _))) {
+            let (_, codebook) = operand.exl3_routed().unwrap();
+            if codebook != self.expert_codebook {
+                return Err(format!("{stem}: Kimi routed EXL3 codebook {} differs from {}",
+                    codebook.marker(), self.expert_codebook.marker()));
+            }
             let expected = match stem.rsplit_once('.').map(|(_, name)| name) {
                 Some("w1" | "w3") => [self.cfg.moe_intermediate, self.cfg.latent],
                 Some("w2") => [self.cfg.latent, self.cfg.moe_intermediate],
@@ -412,12 +442,17 @@ impl FamilyModel for Model {
             format!("{stem}: expected plain {:?} {:?}, found {}", expected.dtype, expected.shape, super::describe(operand)))
     }
     fn experts(&self, operand: &QuantOperand) -> Option<ExpertContract> {
-        (operand.exl3_bits() == Some(2)).then(|| ExpertContract {
-            package: PACKAGE.into(),
-            block: 128,
-            spark_worlds: crate::plan::experts::spark_worlds(PACKAGE, self.cfg.moe_intermediate),
-            local: Ok("Kimi EXL3 RTX TP2 native expert package".into()),
-        })
+        operand.exl3_routed()
+            .filter(|&(bits, codebook)| bits == 2 && codebook == self.expert_codebook)
+            .map(|(_, codebook)| {
+                let package = format!("{PACKAGE}{}", codebook.package_suffix());
+                ExpertContract {
+                    spark_worlds: crate::plan::experts::spark_worlds(&package, self.cfg.moe_intermediate),
+                    package,
+                    block: 128,
+                    local: Ok("Kimi EXL3 RTX TP2 native expert package".into()),
+                }
+            })
     }
     fn placement(&self, input: &crate::plan::PlanInput, report: &mut crate::plan::PlanReport,
         options: &mut crate::plan::layout::LayoutOptions, requested: crate::plan::ExpertPlacement)

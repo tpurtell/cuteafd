@@ -49,6 +49,9 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
     manifest = json.loads((package / 'manifest.json').read_text())
     if manifest['schema'] != 'cuteafd.exl3-package.v1':
         raise ValueError('unsupported EXL3 package schema')
+    package_codebook = manifest.get('codebook', 'mcg')
+    if package_codebook not in ('mcg', 'mul1') or manifest.get('codebook') == 'mcg':
+        raise ValueError('unsupported EXL3 package codebook')
     if revision is not None and manifest['sparkinfer_revision'] != revision:
         raise ValueError('EXL3 package/source revision mismatch')
     if role is not None and manifest['role'] != ('spark' if role == 'expert' else role):
@@ -88,6 +91,11 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
         for key in ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits'):
             if meta[key] != variant[key]:
                 raise ValueError(f'EXL3 variant metadata mismatch: {directory}/{key}')
+        if (variant.get('codebook', 'mcg') != package_codebook
+                or meta.get('codebook', 'mcg') != package_codebook
+                or variant.get('codebook') == 'mcg'
+                or meta.get('codebook') == 'mcg'):
+            raise ValueError(f'EXL3 variant codebook mismatch: {directory}')
         compact = '-compact-' in directory.split('/')[0]
         contract = (7, 3) if compact else (3, 2)
         for record in (variant, meta):
@@ -230,7 +238,16 @@ def verify_root(root: Path, revision: str | None = None, runtime: Path | None = 
     missing = [family for family in families if not (family / 'manifest.json').is_file()]
     if missing:
         raise ValueError(f'EXL3 family is missing its manifest.json: {missing[0]}')
-    return [verify(family, revision, runtime, role) for family in families]
+    results = []
+    for family in families:
+        manifest = verify(family, revision, runtime, role)
+        expected_codebook = 'mul1' if family.name.endswith('-mul1') else 'mcg'
+        if manifest.get('codebook', 'mcg') != expected_codebook:
+            raise ValueError(
+                f'EXL3 package directory {family.name} disagrees with manifest codebook'
+            )
+        results.append(manifest)
+    return results
 
 
 def validate_destination(output: Path) -> None:
@@ -829,10 +846,13 @@ def decode_schedule_variants(geometry: str, role: str, profile: str,
             and capacity in spec['capacities']]
 
 
-def package_name(geometry: str, bits: list[int]) -> str:
-    """Package directory for one tier family; mirrors the daemon's resolver."""
+def package_name(geometry: str, bits: list[int], codebook: str = 'mcg') -> str:
+    """Package directory for one tier family and codebook; mirrors the daemon's resolver."""
+    if codebook not in ('mcg', 'mul1'):
+        raise ValueError(f'unsupported EXL3 codebook: {codebook}')
     tag = ''.join(map(str, bits))
-    return f'exl3-{geometry}-k{tag}'
+    suffix = '' if codebook == 'mcg' else f'-{codebook}'
+    return f'exl3-{geometry}-k{tag}{suffix}'
 
 
 def shard_profiles(geometry: str, role: str) -> list[tuple]:
@@ -1089,8 +1109,11 @@ def _compile_variants(payloads, jobs, context, reservations):
 SEGMENT_MAX_ROWS = 8192
 
 
-def segment_export_options(geometry: str, role: str, width: int, *, compact: bool = False) -> dict | None:
+def segment_export_options(geometry: str, role: str, width: int, *, compact: bool = False,
+                           codebook: str = 'mcg') -> dict | None:
     """One format-matched row-address program per shipping WS Spark layout."""
+    if codebook not in ('mcg', 'mul1'):
+        raise ValueError(f'unsupported EXL3 codebook: {codebook}')
     # Other families land with their planner charge and merged-wave oracle.
     if (geometry not in ('glm', 'glmf') or role != 'spark' or compact or GEOMETRIES[geometry][0] % 512
             or not any(warp_specialized(geometry, role, width, rows)
@@ -1099,6 +1122,8 @@ def segment_export_options(geometry: str, role: str, width: int, *, compact: boo
     options = dict(hidden=GEOMETRIES[geometry][0], warp_specialized=True,
                    row_addresses=True, route_block=64,
                    tile=(64, 256 if width % 256 == 0 else 128, 64, 256))
+    if codebook != 'mcg':
+        options['codebook'] = codebook
     # Spark requests carry K32 wire even when ordinary cores decode to BF16.
     if GEOMETRIES[geometry][0] % 512 == 0:
         options.update(wire_input=True, ws_input_stages=3)
@@ -1128,6 +1153,9 @@ def package_capacities(geometry: str, requested: str) -> list[int]:
 def build(args: argparse.Namespace) -> None:
     if len(args.bits) != 2:
         raise ValueError('EXL3 packages require two decoder tiers')
+    codebook = getattr(args, 'codebook', 'mcg')
+    if codebook not in ('mcg', 'mul1'):
+        raise ValueError(f'unsupported EXL3 codebook: {codebook}')
     validate_destination(args.output)
     geometry = getattr(args, 'geometry', 'dsv4p')
     hidden = GEOMETRIES[geometry][0]
@@ -1155,6 +1183,8 @@ def build(args: argparse.Namespace) -> None:
     tiles = tile_overrides(getattr(args, 'tile', []), capacities, args.role, geometry)
     # Import the source-pinned compiler only for builds, never package checks.
     import _pinned_sparkinfer
+    if codebook == 'mul1' and hasattr(_pinned_sparkinfer, 'require_routed_mul1'):
+        _pinned_sparkinfer.require_routed_mul1()
     import torch
 
     # The planner needs only a context, not a worker's sizing arena.
@@ -1181,6 +1211,8 @@ def build(args: argparse.Namespace) -> None:
                 compact_block = (compact_ws_route_block(geometry, args.role, width, capacity)
                                  if compact_ws else None)
                 options = {'compact_weights': True} if compact else {}
+                if codebook != 'mcg':
+                    options['codebook'] = codebook
                 if activation(geometry) != 'silu':
                     options['activation'] = activation(geometry)
                 if tile is not None:
@@ -1230,7 +1262,8 @@ def build(args: argparse.Namespace) -> None:
                 for schedule, run_options in exports:
                     pending.append((width, experts, capacity, topk, dtype, run_options,
                                     destinations, schedule, requested))
-            segment_options = segment_export_options(geometry, args.role, width, compact=compact)
+            segment_options = segment_export_options(
+                geometry, args.role, width, compact=compact, codebook=codebook)
             if segment_options is not None:
                 pending.append((width, experts, SEGMENT_MAX_ROWS, topk, 'bf16', segment_options,
                                 destinations, 'segments', None))
@@ -1267,7 +1300,7 @@ def build(args: argparse.Namespace) -> None:
                     shutil.copy2(source / name, target)
                 variant = {'directory': directory, **{key: meta[key] for key in
                     ('capacity', 'intermediate', 'experts', 'top_k', 'output_dtype', 'bits', 'blocks_per_sm')}}
-                for key in ('descriptor_rows', 'native_info_version'):
+                for key in ('descriptor_rows', 'native_info_version', 'codebook'):
                     if key in meta:
                         variant[key] = meta[key]
                 if 'tile' in meta:
@@ -1311,6 +1344,8 @@ def build(args: argparse.Namespace) -> None:
                     'runtime': {'library': 'libcute_dsl_runtime.so', 'sha256': digest(args.runtime),
                                 'provider': 'installed nvidia-cutlass-dsl CUDA runtime; release entrypoint sets its library path'}}
         manifest['geometry'] = geometry
+        if codebook != 'mcg':
+            manifest['codebook'] = codebook
         if requested_layouts:
             present = {v['directory'].split('/')[0] for v in variants}
             missing = sorted(set(requested_layouts) - present)
@@ -1354,6 +1389,8 @@ def main() -> None:
                         help='Build Spark-role layouts for the SM120 coordinator GPU (loopback worker tests)')
     create.add_argument('--capacities', default='1,16,80,256,1024,2048,2752,4096')
     create.add_argument('--bits', type=int, nargs='+', default=[3, 4])
+    create.add_argument('--codebook', choices=('mcg', 'mul1'), default='mcg',
+                        help='EXL3 routed-expert codebook (default: mcg)')
     create.add_argument('--build-dir', type=Path, required=True)
     create.add_argument('--output', type=Path, required=True)
     create.add_argument('--cxx', required=True)

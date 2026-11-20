@@ -159,7 +159,7 @@ pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize, lay
     }
     let groups = super::format::group_by_stem(&tensors);
     ensure!(!groups.is_empty(), "Spark admission: missing routed expert tensor headers");
-    let mut selected = None;
+    let mut selected: Option<(String, SparkRecipe)> = None;
     for (stem, members) in groups {
         let member = members.values().next().context("Spark admission: empty routed operand")?;
         let role = family.classify(model.spec(), &member.meta.name)
@@ -175,11 +175,13 @@ pub fn checkpoint_spark_recipe(checkpoint: &super::Checkpoint, world: usize, lay
             .with_context(|| format!("Spark admission tensor {stem}: no package for {}", operand.label()))?;
         let recipe = spark_recipe(&contract.package, intermediate, world)
             .with_context(|| format!("Spark admission tensor {stem}"))?;
-        ensure!(selected.as_ref().is_none_or(|previous: &SparkRecipe| previous.same_ownership(&recipe)),
-            "Spark admission tensor {stem}: routed formats require conflicting Spark recipes");
-        selected = Some(recipe);
+        ensure!(selected.as_ref().is_none_or(|(previous_pkg, previous)| {
+            previous.same_ownership(&recipe)
+                && (!previous_pkg.contains(":exl3-") || previous_pkg == &contract.package)
+        }), "Spark admission tensor {stem}: routed formats require conflicting Spark recipes");
+        selected = Some((contract.package, recipe));
     }
-    selected.context("Spark admission: missing routed expert storage recipe")
+    selected.map(|(_, recipe)| recipe).context("Spark admission: missing routed expert storage recipe")
 }
 
 use cuteafd_core::tp_units::package_width_keys;
@@ -191,10 +193,11 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     use crate::formats::fp8_experts::Slicing;
     if package.contains(" + ") {
         let mut packages = package.split(" + ");
-        let first = spark_recipe(packages.next().expect("nonempty package list"), intermediate, world)?;
+        let first_key = packages.next().expect("nonempty package list");
+        let first = spark_recipe(first_key, intermediate, world)?;
         for key in packages {
             let other = spark_recipe(key, intermediate, world)?;
-            if !first.same_ownership(&other) {
+            if !first.same_ownership(&other) || (first_key.contains(":exl3-") && key != first_key) {
                 return Err(SparkRecipeRefusal::IncompatiblePackages { package: package.into(), world });
             }
         }
@@ -203,7 +206,8 @@ pub fn spark_recipe(package: &str, intermediate: usize, world: usize) -> Result<
     let key = package.split_whitespace().next().unwrap_or(package);
     let (family, format) = key.split_once(':').ok_or_else(|| SparkRecipeRefusal::UnknownPackage(package.into()))?;
     let native = matches!(family, "v41" | "dsv4f" | "dsv4p");
-    let exl3 = format.strip_prefix("exl3-k").is_some_and(|bits| (1..=2).contains(&bits.len())
+    let exl3_tiers = format.strip_prefix("exl3-k").map(|rest| rest.strip_suffix("-mul1").unwrap_or(rest));
+    let exl3 = exl3_tiers.is_some_and(|bits| (1..=2).contains(&bits.len())
         && bits.bytes().all(|bit| (b'2'..=b'6').contains(&bit))
         && (bits.len() == 1 || bits.as_bytes()[0] != bits.as_bytes()[1]))
         && matches!(family, "dsv4p" | "glm" | "glmf" | "qwen4" | "kimik3" | "step5" | "muse" | "ml4" | "inkling2");

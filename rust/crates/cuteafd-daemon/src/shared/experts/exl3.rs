@@ -14,16 +14,20 @@ pub(crate) mod partial;
 mod partial_screen;
 pub(crate) mod worker;
 
-/// Family-qualified package name for one decoder-tier pair.
-pub(crate) fn package_name(family: &str, tiers: &[usize]) -> String {
-    let tag: String = tiers.iter().map(usize::to_string).collect();
-    format!("exl3-{family}-k{tag}")
+/// Family-qualified package name for one decoder-tier pair and codebook.
+pub(crate) fn package_name_for(
+    family: &str,
+    tiers: &[usize],
+    codebook: cuteafd_loader::Exl3Codebook,
+) -> String {
+    codebook.package_name(family, tiers)
 }
 
-/// Resolve the checkpoint family's exact decoder-tier package and layout.
-pub(crate) fn aot_layout_directory(
+/// Resolve the checkpoint family's exact decoder-tier + codebook package and layout.
+pub(crate) fn aot_layout_directory_for(
     native_lib: &std::path::Path,
     tiers: &[usize],
+    codebook: cuteafd_loader::Exl3Codebook,
     layout: &str,
 ) -> std::path::PathBuf {
     let root = native_lib
@@ -31,7 +35,55 @@ pub(crate) fn aot_layout_directory(
         .unwrap_or(std::path::Path::new("."))
         .join("exl3");
     let family = cuteafd_core::expert_geometry().family().unwrap_or("unknown");
-    root.join(package_name(family, tiers)).join(layout)
+    root.join(package_name_for(family, tiers, codebook)).join(layout)
+}
+
+/// Read an EXL3 export manifest, failing closed with an actionable error when a
+/// MUL1 routed checkpoint's `-mul1` package has not been exported (including
+/// when only the sibling MCG package is installed).
+pub(crate) fn read_export_manifest_bytes(
+    directory: &std::path::Path,
+    required_codebook: Option<cuteafd_loader::Exl3Codebook>,
+) -> Result<Vec<u8>> {
+    let path = directory.join("v41_exl3.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mul1_package = directory.ancestors().find_map(|ancestor| {
+                let name = ancestor.file_name()?.to_str()?;
+                name.strip_suffix("-mul1")
+                    .filter(|stem| stem.starts_with("exl3-"))
+                    .map(|stem| (ancestor, name, stem))
+            });
+            if let Some((pkg_dir, pkg_name, mcg_name)) = mul1_package {
+                let mcg_installed = pkg_dir
+                    .parent()
+                    .is_some_and(|root| root.join(mcg_name).exists());
+                if mcg_installed {
+                    anyhow::bail!(
+                        "EXL3 MUL1 routed-expert programs are not exported at {} \
+                         (only MCG package {mcg_name} is installed; refusing fallback to MCG — \
+                         export and install {pkg_name} with --codebook mul1)",
+                        path.display()
+                    );
+                }
+                anyhow::bail!(
+                    "EXL3 MUL1 routed-expert programs are not exported at {} \
+                     (export and install {pkg_name} with --codebook mul1)",
+                    path.display()
+                );
+            }
+            if required_codebook == Some(cuteafd_loader::Exl3Codebook::Mul1) {
+                anyhow::bail!(
+                    "EXL3 MUL1 routed-expert programs are not exported at {} \
+                     (export with --codebook mul1; refusing fallback to MCG)",
+                    path.display()
+                );
+            }
+            Err(error).with_context(|| format!("missing EXL3 export manifest {}", path.display()))
+        }
+        Err(error) => Err(error).with_context(|| format!("reading EXL3 export manifest {}", path.display())),
+    }
 }
 
 pub(crate) struct Exl3Weights<'a> {
@@ -310,9 +362,11 @@ impl<'a> Exl3Weights<'a> {
                     let mut offset = 0;
                     (expert * JOBS_PER_EXPERT..(expert + 1) * JOBS_PER_EXPERT).map(|job| {
                         let name = &weights[0][index].layout.loads[job].tensor;
-                        ensure!(*name == weights[1][index].layout.loads[job].tensor,
+                        ensure!(*name == weights[1][index].layout.loads[job].tensor
+                            && weights[0][index].layout.codebook == weights[1][index].layout.codebook,
                             "paired EXL3 projection mismatch");
-                        let projection = Projection::new(catalog, name.clone(), offset,
+                        let projection = Projection::new(catalog, name.clone(),
+                            weights[0][index].layout.codebook, offset,
                             [catalog.exl3_tensor_slice(name, 2, 0)?, catalog.exl3_tensor_slice(name, 2, 1)?])?;
                         offset += projection.bytes;
                         Ok(projection)
@@ -667,6 +721,16 @@ mod tests {
             assert_eq!(spark.aot_layout(), format!("tp2-compact-rank{rank}"));
         }
         Ok(())
+    }
+
+    #[test]
+    fn shared_exl3_exposes_only_explicit_codebook_package_resolvers() {
+        use cuteafd_loader::Exl3Codebook;
+        assert_eq!(package_name_for("glm", &[4, 5], Exl3Codebook::Mcg), "exl3-glm-k45");
+        assert_eq!(package_name_for("glm", &[4, 5], Exl3Codebook::Mul1), "exl3-glm-k45-mul1");
+        let source = include_str!("exl3.rs").split("\n#[cfg(test)]").next().unwrap();
+        assert!(!source.contains("fn package_name("));
+        assert!(!source.contains("fn aot_layout_directory("));
     }
 
     #[test]

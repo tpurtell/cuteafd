@@ -676,14 +676,14 @@ mod tests {
         ensure!(!source.is_empty(), "Kimi packing gate token panel empty");
         cuteafd_core::set_expert_geometry(cuteafd_core::ExpertGeometry::KIMI_K3)
             .map_err(|_| anyhow::anyhow!("native packing gate requires isolated process"))?;
-        super::super::startup::preflight(&args.manifest, &args.native_lib)?;
-        // SAFETY: explicit installed native library; every borrower drops before it.
-        let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
-        let programs = library.programs()?.with_manifest(&args.manifest)?;
         let view = args.attention.selected_view.clone().map(Ok)
             .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
         args.attention.validate_view(&view)?;
         let checkpoint = cuteafd_loader::plan::Checkpoint::coordinator_view(&view, false, false)?;
+        super::super::startup::preflight(&checkpoint, &args.manifest, &args.native_lib)?;
+        // SAFETY: explicit installed native library; every borrower drops before it.
+        let library = Arc::new(unsafe { cuteafd_ffi::NativeLibrary::load(&args.native_lib)? });
+        let programs = library.programs()?.with_manifest(&args.manifest)?;
         let cfg = cuteafd_loader::families::kimi_k3::config::KimiK3Config::from_hf(&checkpoint.config)?;
         let prefill = args.prefill()?;
         let peer = args.split_device.context("two-GPU packing gate requires --split-device")?;

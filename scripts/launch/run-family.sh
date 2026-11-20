@@ -1360,8 +1360,8 @@ hf_home="${HF_HOME:-$namespace_root/hf-home}"
 hub="$(readlink -f "$hf_home/hub")"
 root="$hub/models--${model//\//--}"
 if [[ -z "$revision" ]]; then
-  [[ -r "$root/refs/main" ]] || { echo "missing snapshot $model (no refs/main under $root)" >&2; exit 1; }
-  revision="$(<"$root/refs/main")"
+  revision="$(release_resolve_model_revision "$model" "" "$hf_home" 2>/dev/null)" ||
+    { echo "missing snapshot $model (no refs/main under $root)" >&2; exit 1; }
 fi
 snapshot="$(readlink -f "$root/snapshots/$revision")"
 [[ -d "$root/snapshots/$revision" ]] || { echo "missing snapshot $model@$revision" >&2; exit 1; }

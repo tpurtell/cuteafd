@@ -103,15 +103,59 @@ mod bridge_tests {
     }
 }
 
+/// Validate only the selected checkpoint codebook's sibling package under `exl3_root`.
+/// An unselected sibling (e.g. a stale `-mul1` package beside a valid `MCG` package)
+/// is ignored; an absent or invalid selected sibling fails closed.
+pub fn validate_selected_expert_inventory(
+    path: &std::path::Path,
+    exl3_root: &std::path::Path,
+    codebook: crate::Exl3Codebook,
+) -> anyhow::Result<()> {
+    let package = exl3_root.join(codebook.package_name("kimik3", &[2, 3]));
+    if !package.is_dir() {
+        anyhow::bail!(
+            "{}",
+            codebook.missing_package_detail("kimik3", &[2, 3], "manifest.json", &[exl3_root.to_path_buf()])
+        );
+    }
+    validate_expert_inventory_for_codebook(path, &package, codebook)
+}
+
 /// Validate sealed role artifacts at runtime, never during checkpoint planning.
 pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path) -> anyhow::Result<()> {
+    let expected_codebook = if root.file_name().and_then(|s| s.to_str()).is_some_and(|s| s.ends_with("-mul1")) {
+        crate::Exl3Codebook::Mul1
+    } else {
+        crate::Exl3Codebook::Mcg
+    };
+    validate_expert_inventory_for_codebook(path, root, expected_codebook)
+}
+
+/// Validate a specific sealed Kimi K3 EXL3 package directory against `expected_codebook`.
+pub fn validate_expert_inventory_for_codebook(
+    path: &std::path::Path,
+    root: &std::path::Path,
+    expected_codebook: crate::Exl3Codebook,
+) -> anyhow::Result<()> {
     use crate::plan::checkpoint::read_json;
     use anyhow::{ensure, Context};
+    let expected_name = expected_codebook.package_name("kimik3", &[2, 3]);
+    ensure!(
+        root.file_name().and_then(|s| s.to_str()) == Some(expected_name.as_str()),
+        "Kimi K3 EXL3 package directory {} does not match selected codebook package {expected_name}",
+        root.display()
+    );
     let programs = read_json(path)?;
     ensure!(programs["schema"] == 1 && programs["programs"].is_array(), "invalid PROGRAMS.json inventory");
     let package = read_json(&root.join("manifest.json"))?;
     ensure!(package["schema"] == "cuteafd.exl3-package.v1" && package["geometry"] == "kimik3",
         "Kimi K3 EXL3 package schema/geometry mismatch");
+    let package_codebook = match package.get("codebook") {
+        None => crate::Exl3Codebook::Mcg,
+        Some(serde_json::Value::String(s)) if s == "mul1" => crate::Exl3Codebook::Mul1,
+        Some(other) => anyhow::bail!("Kimi K3 EXL3 package invalid codebook {other}"),
+    };
+    ensure!(package_codebook == expected_codebook, "Kimi K3 EXL3 package directory/codebook mismatch");
     let revision = package["sparkinfer_revision"].as_str().filter(|s| s.len() == 40)
         .context("Kimi K3 package lacks source revision")?;
     let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
@@ -128,7 +172,11 @@ pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path)
             ensure!(!worlds.is_empty(), "Kimi K3 Spark package lacks rank layouts");
             let mut layouts = Vec::new();
             for world in worlds {
-                let recipe = crate::plan::experts::spark_recipe("kimik3:exl3-k23", 3072, world)?;
+                let recipe = crate::plan::experts::spark_recipe(
+                    &format!("kimik3:exl3-k23{}", expected_codebook.package_suffix()),
+                    3072,
+                    world,
+                )?;
                 for (rank, layout) in recipe.required_layouts.into_iter().enumerate() {
                     layouts.push((layout, recipe.widths[rank]));
                 }
@@ -166,6 +214,7 @@ pub fn validate_expert_inventory(path: &std::path::Path, root: &std::path::Path)
             ensure!(entries.len() == 1, "Kimi K3 package requires one {directory}");
             let meta = read_json(&root.join(&directory).join("v41_exl3.json"))?;
             for entry in [entries[0], &meta] {
+                expected_codebook.check_aot_manifest(entry)?;
                 ensure!(entry["intermediate"] == width && entry["experts"] == 896 && entry["top_k"] == 16
                     && entry["capacity"] == capacity && entry["bits"] == serde_json::json!([2, 3])
                     && entry["output_dtype"] == output, "Kimi K3 package geometry mismatch: {directory}");

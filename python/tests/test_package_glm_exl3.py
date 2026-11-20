@@ -15,6 +15,10 @@ class GlmExl3PackageTest(unittest.TestCase):
         self.assertIsNone(tool.swiglu_limit('glm'))
         self.assertEqual(tool.swiglu_limit('dsv4p'), 10.0)
         self.assertEqual(tool.package_name('glm', [4, 5]), 'exl3-glm-k45')
+        self.assertEqual(tool.package_name('glm', [4, 5], 'mcg'), 'exl3-glm-k45')
+        self.assertEqual(tool.package_name('glm', [4, 5], 'mul1'), 'exl3-glm-k45-mul1')
+        with self.assertRaises(ValueError):
+            tool.package_name('glm', [4, 5], '3inst')
 
     def test_muse_and_ml4_keep_distinct_unclamped_geometries(self):
         for family, geometry in (("muse", (4096, 4096, 256, 8)),
