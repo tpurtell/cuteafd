@@ -1,4 +1,5 @@
 import importlib.util
+import math
 import json
 from pathlib import Path
 
@@ -38,15 +39,25 @@ def test_fixed_rules_truncate_and_commit_min_of_length_and_run():
     assert full['tokens'] == 4 and full['tok_s'] == pytest.approx(4 / 1800e-6)
 
 
+def calibrated(*rows):
+    replay.attach_calibration(list(rows))
+    return rows
+
+
 def test_history_rule_keeps_scores_above_the_cut_plus_one_explore():
-    r = row([True] * 7, score=[0.9, 0.8, 0.4, 0.9, 0.9, 0.9, 0.9])
-    assert replay.rule_history()(r) == 3  # two kept + explore
-    token_only = row([True] * 3, history=[0.6, 0.2, 0.9], block=3)
+    r, token_only, head = calibrated(
+        dict(row([True] * 7, score=[0.9, 0.8, 0.4, 0.9, 0.9, 0.9, 0.9]), score_source='raw candidate p (cycle features)'),
+        dict(row([True] * 3, history=[0.6, 0.2, 0.9], block=3), score_source='history p (position acceptance)'),
+        dict(row([True] * 7, score=[0.5, 0.35, 0.2, 0.9, 0.9, 0.9, 0.9], request=2), score_source='head (dSpark/trained, calibrated)'))
+    assert replay.rule_history()(r) == 3  # raw 0.5 cut: two kept + explore
     assert replay.rule_history()(token_only) == 2  # history cut 0.3: one kept + explore
+    assert replay.rule_history()(head) == 3  # engine-calibrated head, 0.3 cut
+    # The calibrated sweep keys on `prob`; a cold Platt is the identity, so 0.85 keeps one.
+    assert replay.rule_history(cut=0.85, calibrated=True)(r) == 2
 
 
 def test_product_rule_uses_the_prefix_product():
-    r = row([True] * 7, score=[0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9])
+    (r,) = calibrated(dict(row([True] * 7, score=[0.9] * 7), score_source='head (dSpark/trained, calibrated)'))
     # 0.9^k > 0.5 for k <= 6 (0.531), fails at 7 (0.478): six kept, explore capped by proposed
     assert replay.rule_product(0.5)(r) == 7
     assert replay.rule_product(0.75)(r) == 3  # 0.81 > 0.75, 0.729 fails: 2 kept + explore
@@ -84,12 +95,22 @@ def test_measured_table_interpolates_rows_within_a_context_band():
     assert replay.predict(fit, 64, 8, 0.) == 230_000
 
 
+class FixedCost:
+    def __init__(self, base, per_row):
+        self.base, self.per_row = base, per_row
+
+    def predict(self, band, rows):
+        return self.base + self.per_row * rows
+
+
 def test_marginal_rule_stops_when_rows_cost_more_than_they_return():
-    cheap = dict(coef=[10_000., 1., 0., 0., 0.])
-    dear = dict(coef=[1_000., 10_000., 0., 0., 0.])
-    r = row([True] * 7, score=[0.99] * 7)
-    assert replay.rule_marginal([r], cheap) == [7]
-    assert replay.rule_marginal([r], dear) == [0]
+    (r,) = calibrated(dict(row([True] * 7, score=[0.99] * 7), score_source='head (dSpark/trained, calibrated)'))
+    assert replay.rule_marginal([r], FixedCost(10_000., 1.), '0') == [7]
+    assert replay.rule_marginal([r], FixedCost(1_000., 1_000_000.), '0') == [0]
+    # Scale-free: the ratio model's 1 + r*rows makes the same decisions as base + per_row*rows.
+    assert replay.rule_marginal([r], FixedCost(1., 1 / 10_000.), '0') == [7]
+    # No cost observed yet: verify the trace's own full block.
+    assert replay.rule_marginal([r], replay.OnlineCost(), '0') == [7]
 
 
 def test_acceptance_table_is_conditional_and_cumulative():
@@ -147,6 +168,8 @@ def test_settle_grants_the_row_budget_by_next_score_keeping_prefixes():
     a = row([True] * 7, score=[0.9] * 7, request=1)
     b = row([True] * 7, score=[0.99, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2], request=2)
     # budget 6 drafts (8 rows - 2 anchors): b's 0.99 first, then a's 0.9 run beats b's 0.2s
+    calibrated(dict(a, score_source='head (dSpark/trained, calibrated)'), dict(b, score_source='head (dSpark/trained, calibrated)'))
+    a['prob'], b['prob'] = a['score'], b['score']
     assert replay.settle([7, 7], [a, b], max_rows=8) == [5, 1]
     assert replay.settle([2, 3], [a, b], max_rows=64) == [2, 3]
 
@@ -171,3 +194,47 @@ def test_rows_below_a_long_band_take_the_short_curve_shape_scaled_at_its_anchor(
     assert replay.predict(fit, 1, 1, 128.) == pytest.approx(20_000)  # 10k * 40k/20k
     assert replay.predict(fit, 8, 1, 128.) == 40_000
     assert replay.predict(fit, 36, 1, 128.) == pytest.approx(100_000)
+
+
+def test_platt_mirror_moves_toward_observed_acceptance_and_is_causal():
+    platt = replay.Platt()
+    assert platt.apply(0.) == pytest.approx(0.5) and platt.apply(2.) == pytest.approx(1 / (1 + math.exp(-2)))
+    for _ in range(400):
+        platt.observe(replay.logit_of(0.9), False)  # an overconfident raw score
+    assert platt.apply(replay.logit_of(0.9)) < 0.2
+    rows = [dict(row([False], score=[0.9], rnd=k), score_source='raw candidate p (cycle features)') for k in range(300)]
+    replay.attach_calibration(rows)
+    assert rows[0]['prob'][0] == pytest.approx(0.9)  # first round: cold, identity, never sees its own outcome
+    assert rows[-1]['prob'][0] < 0.2 and rows[-1]['calibration'] == 'online platt (replay)'
+    head = dict(row([True], score=[0.42]), score_source='head (dSpark/trained, calibrated)')
+    replay.attach_calibration([head])
+    assert head['prob'] == [0.42] and head['calibration'] == 'engine'  # never calibrated twice
+
+
+def test_online_ratio_recovers_per_row_over_base_and_reports_convergence():
+    model = replay.OnlineRatio()
+    for k in range(40):
+        rows = 8 * (1 + k % 8)
+        model.observe('32K', rows, 50_000 + 2_000 * rows)
+    assert model.ratio('32K') == pytest.approx(0.04)
+    conv = model.convergence()['32K']
+    assert conv['final_ratio'] == pytest.approx(0.04) and conv['rounds_to_10pct'] <= 3
+    assert model.predict('32K', 10) == pytest.approx(1.4)
+
+
+def test_two_term_cost_separates_per_request_from_per_row_and_ratio_is_scale_free():
+    model = replay.OnlineTwoTerm()
+    for k in range(60):
+        n = 1 + k % 8
+        rows = n * (1 + (k // 8) % 8)  # rows vary at fixed requests
+        model.observe('32K', rows, 40_000 + 9_000 * n + 1_500 * rows, n)
+    a, b, c = model.coef('32K')
+    assert (a, b, c) == pytest.approx((40_000, 9_000, 1_500), rel=1e-3)
+    assert model.predict('32K', 10, 2) == pytest.approx(58_000 + 15_000)
+    ratio = replay.OnlineTwoTerm(ratio=True)
+    for k in range(60):
+        n = 1 + k % 8
+        ratio.observe('32K', n * (1 + (k // 8) % 8), 40_000 + 9_000 * n + 1_500 * n * (1 + (k // 8) % 8), n)
+    assert ratio.predict('32K', 10, 2) == pytest.approx(1 + 1_500 / 58_000 * 10)
+    (r,) = calibrated(dict(row([True] * 7, score=[0.99] * 7), score_source='head (dSpark/trained, calibrated)'))
+    assert replay.rule_marginal([r], model, '32K') == replay.rule_marginal([r], ratio, '32K')

@@ -290,10 +290,16 @@ def concurrency_band(n):
 
 
 def fit_cycle(rows):
-    """Linear model plus the measured table (see `fit_table`); `predict` prefers the table."""
+    """Linear model, the measured rows table (see `fit_table`) and the per-band
+    two-term fit a + b*requests + c*rows; `predict` prices from the table, or
+    from the two-term fit when `fit['pricing'] == 'two-term'`."""
     fit = fit_linear(rows)
     if fit is not None:
         fit['table'] = fit_table(rows)
+        model = OnlineTwoTerm()
+        for t, rws, n, band in round_samples(rows, with_requests=True):
+            model.observe(band, rws, t, n)
+        fit['two_term'] = {band: model.coef(band) for band in model.count if model.coef(band)}
     return fit
 
 
@@ -338,7 +344,7 @@ def lstsq(X, y, ridge=1e-6):
     return b
 
 
-def round_samples(rows, timed_only=True):
+def round_samples(rows, timed_only=True, with_requests=False):
     """One (round_us, rows, requests, context band) per batch round."""
     rounds = {}
     for r in rows:
@@ -390,6 +396,11 @@ def interpolate(curve, rows):
 def predict(fit, rows, requests, ctx_k):
     """Round microseconds at `rows`: interpolate the measured table of the
     nearest context band when present, else the linear model."""
+    two = fit.get('two_term') if isinstance(fit, dict) and fit.get('pricing') == 'two-term' else None
+    if two:
+        band = context_band(ctx_k * 1000)
+        a, b, c = two.get(band) or two.get('0')
+        return max(1., a + b * requests + max(c, 0.) * rows)
     table = fit.get('table') if isinstance(fit, dict) else None
     if table:
         band = context_band(ctx_k * 1000)
@@ -414,42 +425,121 @@ def rule_fixed(n):
     return lambda row: min(n, row['proposed'])
 
 
-def rule_history(candidate_cut=0.5, head_cut=0.3, history_cut=0.3):
-    """Dev `history` (draft_history.rs): keep while the per-token score clears its
-    cut, plus one explore. Raw DFlash2 candidate p uses CANDIDATE_KEEP_CUT 0.5, a
-    trained (calibrated) head TRAINED_HEAD_KEEP_CUT 0.3, and a token-only drafter
-    its history estimate against KEEP_CUT 0.3.
+class Platt:
+    """Python mirror of the engine's online calibrator (draft_history.rs `Platt`):
+    p = sigmoid(a*logit + b), Newton step on log-loss with a decayed information
+    matrix, theta from [1, 0], prior 2, decay 0.998, slope clamped to [0, 3]."""
+
+    DECAY, PRIOR = 0.998, 2.
+
+    def __init__(self):
+        self.theta = [1., 0.]
+        self.info = [[self.PRIOR, 0.], [0., self.PRIOR]]
+
+    def apply(self, x):
+        z = self.theta[0] * x + self.theta[1]
+        return 1 / (1 + math.exp(-max(min(z, 60.), -60.)))
+
+    def observe(self, x, accepted):
+        v = (x, 1.)
+        p = self.apply(x)
+        curvature = max(p * (1 - p), 0.02)
+        for i in range(2):
+            for j in range(2):
+                self.info[i][j] = self.DECAY * self.info[i][j] + curvature * v[i] * v[j]
+            self.info[i][i] = max(self.info[i][i], 1e-3)
+        (a, b), (c, d) = self.info
+        det = a * d - b * c
+        if not (math.isfinite(det) and det > 1e-12):
+            return
+        g = ((float(accepted) - p) * v[0], float(accepted) - p)
+        step = ((d * g[0] - b * g[1]) / det, (a * g[1] - c * g[0]) / det)
+        self.theta[0] = min(max(self.theta[0] + min(max(step[0], -1.), 1.), 0.), 3.)
+        self.theta[1] = min(max(self.theta[1] + min(max(step[1], -2.), 2.), -8.), 8.)
+
+
+def logit_of(p):
+    p = min(max(p, 1e-6), 1 - 1e-6)
+    return math.log(p / (1 - p))
+
+
+def attach_calibration(rows):
+    """One calibrated acceptance probability per drafted position, `row['prob']`,
+    computed once per family in round order (never calibrated twice):
+
+    - engine-calibrated head scores (`score_source` head): used as recorded;
+    - raw candidate p: an online per-position Platt over logit(p), the engine's
+      own calibrator, applied before it learns from the round (causal; every
+      round is held out from its own fit) and trained only on reached positions;
+    - no per-token score: the history estimate as recorded.
+
+    Also sets `row['raw']`, the uncalibrated per-token score (or history p)."""
+    per_family = collections.defaultdict(list)
+    for r in rows:
+        per_family[r['family']].append(r)
+    for family, fam_rows in per_family.items():
+        fam_rows.sort(key=lambda r: (r['card'], r['lane'] or 0, r['round'], r['request']))
+        platts = collections.defaultdict(Platt)
+        for r in fam_rows:
+            source = r.get('score_source') or ''
+            scored = any(v is not None for v in r['score'])
+            r['raw'] = [v if v is not None else 0. for v in (r['score'] if scored else r['history'])]
+            if not scored or source.startswith('head') or source.startswith('history'):
+                r['prob'] = list(r['raw'])
+                r['calibration'] = 'engine' if source.startswith('head') else 'history'
+                continue
+            r['prob'] = [platts[k].apply(logit_of(v)) for k, v in enumerate(r['raw'])]
+            r['calibration'] = 'online platt (replay)'
+            for k, (v, outcome) in enumerate(zip(r['raw'], r['outcome'])):
+                if outcome is None:
+                    break
+                platts[k].observe(logit_of(v), outcome is True)
+    return rows
+
+
+def keep_prefix(values, cut):
+    keep = 0
+    for v in values:
+        if v > cut:
+            keep += 1
+        else:
+            break
+    return keep
+
+
+def rule_history(cut=None, raw_cut=0.5, head_cut=0.3, history_cut=0.3, calibrated=False):
+    """`history`: keep while the per-token value clears its cut, plus one explore.
+
+    calibrated=False reproduces dev: raw DFlash2 candidate p against 0.5, the
+    engine-calibrated dSpark head against 0.3, history p against 0.3.
+    calibrated=True keys every scored family on its one calibrated probability
+    against `cut` (the sweep TJ asked for); token-only families keep history p.
 
     Replay caveat: the history estimate in a fixed-length trace saw every position
-    of every round, so for token-only drafters it is the estimate a fixed policy
-    would have, not the one `history`'s own shorter rounds would have produced.
+    of every round, so for token-only drafters it is what a fixed policy would
+    estimate, not what `history`'s own shorter rounds would have produced.
     """
     def length(row):
-        scores = row['score']
         source = row.get('score_source') or ''
-        if any(s is not None for s in scores):
-            c = head_cut if source.startswith('head') else candidate_cut
-            vals = scores
+        if source.startswith('history'):
+            c, vals = history_cut, row['raw']
+        elif calibrated:
+            c, vals = cut, row['prob']
+        elif source.startswith('head'):
+            c, vals = head_cut, row['prob']
         else:
-            c = history_cut
-            vals = row['history']
-        keep = 0
-        for v in vals:
-            if v is not None and v > c:
-                keep += 1
-            else:
-                break
-        return min(keep + 1, row['proposed'])
+            c, vals = raw_cut, row['raw']
+        return min(keep_prefix(vals, c) + 1, row['proposed'])
     return length
 
 
 def rule_product(threshold):
-    """Keep while the running product of per-token scores (or history) stays above threshold, plus one explore."""
+    """Keep while the running product of the calibrated probabilities stays above
+    `threshold` (the prefix's expected survival), plus one explore."""
     def length(row):
-        vals = row['score'] if any(s is not None for s in row['score']) else row['history']
         product, keep = 1., 0
-        for v in vals:
-            product *= (v if v is not None else 0.)
+        for v in row['prob']:
+            product *= v
             if product > threshold:
                 keep += 1
             else:
@@ -458,35 +548,20 @@ def rule_product(threshold):
     return length
 
 
-def platt(score, a=0.59, b=-0.84):
-    """#2460 part 2 pooled calibration of raw candidate probability."""
-    if score is None:
-        return 0.
-    s = min(max(score, 1e-6), 1 - 1e-6)
-    z = a * math.log(s / (1 - s)) + b
-    return 1 / (1 + math.exp(-z))
-
-
-def calibrated(row):
-    if any(s is not None for s in row['score']):
-        return [platt(s) for s in row['score']]
-    return [h if h is not None else 0. for h in row['history']]
-
-
 def settle(lengths, members, max_rows=64):
     """Dev `settle`: fit the round into `max_rows` (anchors included), granting
     positions across requests by highest next score, each keeping a prefix."""
     budget = max_rows - len(members)
     if sum(lengths) <= budget:
         return lengths
-    scores = [m['score'] if any(v is not None for v in m['score']) else m['history'] for m in members]
+    scores = [m['prob'] for m in members]
     granted = [0] * len(members)
     for _ in range(max(budget, 0)):
         best = None
         for i, m in enumerate(members):
             if granted[i] >= lengths[i]:
                 continue
-            v = scores[i][granted[i]] if granted[i] < len(scores[i]) and scores[i][granted[i]] is not None else 0.
+            v = scores[i][granted[i]] if granted[i] < len(scores[i]) else 0.
             key = (v, -granted[i], -m['request'])
             if best is None or key > best[0]:
                 best = (key, i)
@@ -496,59 +571,217 @@ def settle(lengths, members, max_rows=64):
     return granted
 
 
-def replay(rows, fit, rule, batch_rule=None, max_rows=64):
+class OnlineCost:
+    """Round time learned online from earlier rounds of the same trace: a
+    running median per (context band, verify rows) with linear interpolation in
+    rows; until a band has points, the 0-context band scaled by its first point,
+    and before any observation, the trace's first measured round."""
+
+    def __init__(self):
+        self.samples = collections.defaultdict(lambda: collections.defaultdict(list))
+
+    def observe(self, band, rows, us):
+        bucket = self.samples[band][rows]
+        bucket.append(us)
+        if len(bucket) > 64:
+            bucket.pop(0)
+
+    def curve(self, band):
+        return {r: statistics.median(v) for r, v in self.samples.get(band, {}).items() if v}
+
+    def predict(self, band, rows):
+        curve = self.curve(band)
+        if curve:
+            return max(1., interpolate(curve, rows))
+        base = self.curve('0')
+        if base:
+            return max(1., interpolate(base, rows))
+        return None
+
+
+class OnlineRatio:
+    """TJ's ratio-only cost: round time ~ base + rows*per_row, fitted online per
+    context band by least squares over earlier rounds only, exposing just
+    r = per_row/base. The marginal test is scale-free, so predict() returns time
+    in units of `base`: 1 + r*rows. Records r after every round for convergence."""
+
+    def __init__(self):
+        self.sums = collections.defaultdict(lambda: [0.] * 5)  # n, sx, sy, sxx, sxy
+        self.history = collections.defaultdict(list)
+
+    def observe(self, band, rows, us):
+        n, sx, sy, sxx, sxy = self.sums[band]
+        self.sums[band] = [n + 1, sx + rows, sy + us, sxx + rows * rows, sxy + rows * us]
+        self.history[band].append(self.ratio(band))
+
+    def ratio(self, band):
+        n, sx, sy, sxx, sxy = self.sums.get(band, [0.] * 5)
+        if n < 3 or n * sxx - sx * sx <= 0:
+            return None
+        slope = (n * sxy - sx * sy) / (n * sxx - sx * sx)
+        base = (sy - slope * sx) / n
+        return slope / base if base > 0 else None
+
+    def predict(self, band, rows):
+        r = self.ratio(band)
+        if r is None:
+            r = self.ratio('0')
+        return None if r is None else 1. + max(r, 0.) * rows
+
+    def convergence(self, tolerance=0.1):
+        """Rounds until the band's online r stays within `tolerance` of its final value."""
+        out = {}
+        for band, values in self.history.items():
+            final = values[-1] if values else None
+            if not final:
+                continue
+            last_bad = max((i for i, v in enumerate(values) if v is None or abs(v - final) > tolerance * abs(final)),
+                           default=-1)
+            out[band] = dict(final_ratio=final, rounds_to_10pct=last_bad + 1, rounds=len(values))
+        return out
+
+
+class OnlineTwoTerm:
+    """Round time t = a + b*requests + c*rows, fitted online per context band by
+    least squares over earlier rounds only. A marginal draft row joins a request
+    already in the batch, so its cost is c (per row at fixed requests and
+    context), not the rows-only curve's slope, which mixes in per-request cost
+    when rows grew with concurrency. `ratio=True` exposes only c / (a + b*n),
+    TJ's scale-free variant. Until a band identifies c (rank 3), the 0-context
+    band's fit is used; with neither, no prediction."""
+
+    def __init__(self, ratio=False):
+        self.ratio = ratio
+        self.xtx = collections.defaultdict(lambda: [[0.] * 3 for _ in range(3)])
+        self.xty = collections.defaultdict(lambda: [0.] * 3)
+        self.count = collections.Counter()
+        self.history = collections.defaultdict(list)
+
+    def observe(self, band, rows, us, requests=1):
+        x = (1., float(requests), float(rows))
+        for i in range(3):
+            self.xty[band][i] += x[i] * us
+            for j in range(3):
+                self.xtx[band][i][j] += x[i] * x[j]
+        self.count[band] += 1
+        coef = self.coef(band)
+        self.history[band].append(None if coef is None else coef[2] / max(coef[0] + coef[1] * requests, 1.))
+
+    def coef(self, band):
+        if self.count[band] < 8:
+            return None
+        A = [row[:] for row in self.xtx[band]]
+        b = self.xty[band][:]
+        for i in range(3):
+            A[i][i] += 1e-6 * (1 + A[i][i])
+        try:
+            sol = solve3(A, b)
+        except ZeroDivisionError:
+            return None
+        return sol if sol[0] + sol[1] > 0 else None
+
+    def predict(self, band, rows, requests=1):
+        coef = self.coef(band) or self.coef('0')
+        if coef is None:
+            return None
+        a, b, c = coef
+        c = max(c, 0.)
+        base = max(a + b * requests, 1.)
+        return 1. + (c / base) * rows if self.ratio else base + c * rows
+
+    def convergence(self, tolerance=0.1):
+        out = {}
+        for band, values in self.history.items():
+            final = next((v for v in reversed(values) if v is not None), None)
+            if not final:
+                continue
+            last_bad = max((i for i, v in enumerate(values) if v is None or abs(v - final) > tolerance * abs(final)),
+                           default=-1)
+            out[band] = dict(final_ratio=final, rounds_to_10pct=last_bad + 1, rounds=len(values))
+        return out
+
+
+def solve3(A, b):
+    """Gauss-Jordan for a 3x3 system (raises ZeroDivisionError when singular)."""
+    A = [row[:] + [v] for row, v in zip(A, b)]
+    for col in range(3):
+        pivot = max(range(col, 3), key=lambda r: abs(A[r][col]))
+        if abs(A[pivot][col]) < 1e-12:
+            raise ZeroDivisionError
+        A[col], A[pivot] = A[pivot], A[col]
+        for r in range(3):
+            if r != col:
+                f = A[r][col] / A[col][col]
+                A[r] = [x - f * y for x, y in zip(A[r], A[col])]
+    return [A[i][3] / A[i][i] for i in range(3)]
+
+
+def replay(rows, fit, rule, batch_rule=None, max_rows=64, cost_model=None):
     """Expected emitted tok/s of `rule` over the rows' batches, with time from `fit`.
 
     A batch round is the set of rows sharing (card, round, lane). Its replayed
     rows are sum(1 + L_i); committed tokens are sum(1 + min(L_i, accepted_i)).
-    `batch_rule`, when given, maps a round's rows to their lengths jointly.
+    `batch_rule`, when given, maps a round's rows to their lengths jointly and is
+    given an online cost model that only ever saw earlier rounds; the round is
+    still *priced* from `fit` like every other rule.
     """
     rounds = collections.defaultdict(list)
     for r in rows:
         rounds[(r['card'], r['round'], r['lane'])].append(r)
+    online = (cost_model or OnlineCost)()
     tokens = seconds = verify_rows = 0.
-    for members in rounds.values():
-        lengths = batch_rule(members, fit) if batch_rule else settle([rule(m) for m in members], members, max_rows)
+    for key in sorted(rounds, key=lambda k: (k[0], k[1], k[2] or 0)):
+        members = rounds[key]
+        ctx = [m['context'] for m in members if m['context'] is not None]
+        ck = statistics.fmean(ctx) / 1000 if ctx else 0.
+        band = context_band(ck * 1000)
+        lengths = batch_rule(members, online, band) if batch_rule else settle([rule(m) for m in members], members, max_rows)
         committed = sum(1 + min(L, accepted_run(m)) for L, m in zip(lengths, members))
         nrows = sum(1 + L for L in lengths)
-        ctx = [m['context'] for m in members if m['context'] is not None]
-        t = predict(fit, nrows, len(members), statistics.fmean(ctx) / 1000 if ctx else 0.)
+        t = predict(fit, nrows, len(members), ck)
+        measured = members[0]['round_us'] if members[0]['round_us'] is not None else members[0]['verify_us']
+        if measured is not None:
+            if isinstance(online, OnlineTwoTerm):
+                online.observe(band, members[0]['batch_rows'], measured, members[0]['batch_requests'])
+            else:
+                online.observe(band, members[0]['batch_rows'], measured)
         tokens += committed
         seconds += t / 1e6
         verify_rows += nrows
-    return dict(tok_s=tokens / seconds if seconds else 0., tokens=tokens, rounds=len(rounds),
-                rows_per_round=verify_rows / max(len(rounds), 1), tokens_per_round=tokens / max(len(rounds), 1))
+    out = dict(tok_s=tokens / seconds if seconds else 0., tokens=tokens, rounds=len(rounds),
+               rows_per_round=verify_rows / max(len(rounds), 1), tokens_per_round=tokens / max(len(rounds), 1))
+    if isinstance(online, (OnlineRatio, OnlineTwoTerm)):
+        out['convergence'] = online.convergence()
+    return out
 
 
-def rule_marginal(members, fit):
-    """Greedy over the whole batch: add the next row with the highest marginal expected
-    tokens per marginal microsecond while that ratio beats the batch's running tok/us.
-
-    Expected acceptance of position k is the calibrated product along the prefix.
-    """
-    probs = [calibrated(m) for m in members]
-    lengths = [0] * len(members)
-    cum = [1.] * len(members)
-    ctx = [m['context'] for m in members if m['context'] is not None]
-    ck = statistics.fmean(ctx) / 1000 if ctx else 0.
+def rule_marginal(members, cost, band, max_rows=64):
+    """Greedy over the whole batch: add the next row with the highest expected
+    acceptance (the calibrated product along its prefix) while expected tokens
+    per expected round time still rise, with round time from `cost`, an online
+    model of earlier rounds only. With no cost observed yet, verify full blocks
+    (the trace's own shape) for this round."""
     n = len(members)
-    rows = n
-    expected = float(n)
-    t = predict(fit, rows, n, ck)
-    while True:
+    price = (lambda rows: cost.predict(band, rows, n)) if isinstance(cost, OnlineTwoTerm) else (lambda rows: cost.predict(band, rows))
+    if price(n) is None:
+        return settle([m['proposed'] for m in members], members, max_rows)
+    lengths, cum = [0] * n, [1.] * n
+    rows, expected = n, float(n)
+    t = price(rows)
+    while rows < max_rows:
         best, gain = None, 0.
         for i, m in enumerate(members):
             if lengths[i] >= m['proposed']:
                 continue
-            g = cum[i] * probs[i][lengths[i]]
+            g = cum[i] * m['prob'][lengths[i]]
             if g > gain:
                 best, gain = i, g
         if best is None:
             break
-        t_next = predict(fit, rows + 1, n, ck)
+        t_next = price(rows + 1)
         if (expected + gain) / t_next <= expected / t:
             break
-        cum[best] *= probs[best][lengths[best]]
+        cum[best] *= members[best]['prob'][lengths[best]]
         lengths[best] += 1
         rows += 1
         expected += gain
@@ -598,26 +831,34 @@ def reliability(rows, field='score', bins=10):
                 for i, (n, a) in enumerate(cells)] for f, cells in table.items()}
 
 
+CUTS = (0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9)
 RULES = {
     **{f'fixed-{n}': rule_fixed(n) for n in range(0, 8)},
     'history': rule_history(),
+    **{f'history@{t}': rule_history(cut=t, calibrated=True) for t in CUTS},
     **{f'product>{t}': rule_product(t) for t in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)},
 }
+BATCH_RULES = {'marginal-rowsonly': OnlineCost, 'marginal-ratio-rowsonly': OnlineRatio,
+               'marginal': OnlineTwoTerm, 'marginal-ratio': lambda: OnlineTwoTerm(ratio=True)}
+RULE_PREFIXES = ('fixed-', 'history', 'product', 'marginal')
 
 
-def analyze(rows, weights=None, manifests=()):
+def analyze(rows, weights=None, manifests=(), pricing='table'):
     """Everything the report needs, from tidy rows (and, for calibration, the
     manifests' measured fixed-length tok/s per context x concurrency)."""
     measured = {}
     for m in manifests:
         for point in m.get('measured_fixed') or []:
             measured[(m['family'], point['context'], point['c'])] = point['tok_s']
+    attach_calibration(rows)
     fits = {}
     by_family = collections.defaultdict(list)
     for r in rows:
         by_family[r['family']].append(r)
     for family, fam_rows in by_family.items():
         fits[family] = fit_cycle(fam_rows)
+        if fits[family] is not None:
+            fits[family]['pricing'] = pricing
     cells = []
     acceptance_rows = acceptance_table(rows)
     for family, fam_rows in by_family.items():
@@ -634,13 +875,20 @@ def analyze(rows, weights=None, manifests=()):
                        truncated=sum(not full_block(g) for g in group) / len(group))
             for name, rule in RULES.items():
                 row[name] = replay(group, fit, rule)['tok_s']
-            row['marginal'] = replay(group, fit, None, rule_marginal)['tok_s']
+            for name, model in BATCH_RULES.items():
+                result = replay(group, fit, None, rule_marginal, cost_model=model)
+                row[name] = result['tok_s']
+                if 'convergence' in result:
+                    row['ratio_convergence'] = result['convergence'].get(band)
+            cut = max(CUTS, key=lambda t: row[f'history@{t}'])
+            row['best_cut'], row['best_cut_tok_s'] = cut, row[f'history@{cut}']
             # The replay prices verify rounds only; scale every rule by measured / replayed
             # fixed-length tok/s in this cell so fixed-7 reproduces the measurement.
             fixed_name = f"fixed-{max(g['block'] for g in group)}"
             got = measured.get((family, band, c))
             row['calibration'] = got / row[fixed_name] if got and row.get(fixed_name) else None
-            best = max((k for k in row if k.startswith(('fixed', 'history', 'product', 'marginal'))), key=lambda k: row[k])
+            best = max((k for k in row if k.startswith(RULE_PREFIXES) and k != 'fixed-0'
+                        and isinstance(row[k], float)), key=lambda k: row[k])
             row['best'] = best
             cells.append(row)
     sources = {}
@@ -650,7 +898,72 @@ def analyze(rows, weights=None, manifests=()):
     for row in acceptance_rows:
         row['score_source'] = sources.get(row['family'])
     return dict(fits=fits, cells=cells, sources=sources, acceptance=acceptance_rows,
-                reliability=reliability(rows), mix=traffic_mix(cells, weights))
+                reliability=reliability(rows, 'prob'), mix=traffic_mix(cells, weights),
+                cut_sweep=cut_sweep(cells, weights), ratio=ratio_summary(by_family, fits))
+
+
+def cut_sweep(cells, weights=None):
+    """Best calibrated history cut per family x context band (mean tok/s over that
+    band's concurrency cells), and per family in the traffic mix; plus one shared
+    cut chosen to maximize the sum over families of mix tok/s relative to each
+    family's own best."""
+    weights = weights or DEFAULT_MIX
+    out = {'by_band': {}, 'by_family': {}}
+    families = sorted({c['family'] for c in cells})
+    for family in families:
+        for band in weights:
+            group = [c for c in cells if c['family'] == family and c['context'] == band]
+            if not group:
+                continue
+            means = {t: statistics.fmean(c[f'history@{t}'] for c in group) for t in CUTS}
+            best = max(means, key=means.get)
+            out['by_band'][f'{family}/{band}'] = dict(best_cut=best, tok_s=means[best],
+                at_0_3=means[0.3], dev_history=statistics.fmean(c['history'] for c in group))
+    mix = traffic_mix(cells, weights)
+    for family in families:
+        means = {t: mix[family].get(f'history@{t}') for t in CUTS}
+        best = max((t for t in CUTS if means[t] is not None), key=lambda t: means[t])
+        out['by_family'][family] = dict(best_cut=best, tok_s=means[best], relative={t: means[t] / means[best] for t in CUTS})
+    shared = {t: statistics.fmean(out['by_family'][f]['relative'][t] for f in families) for t in CUTS}
+    out['shared_cut'] = max(shared, key=shared.get)
+    out['shared_relative'] = {f: out['by_family'][f]['relative'][out['shared_cut']] for f in families}
+    return out
+
+
+def ratio_summary(by_family, fits):
+    """Online r = per_row/base per family x band over each family's full trace order,
+    against the offline least-squares r of its measured table; and rounds to 10%."""
+    out = {}
+    for family, fam_rows in by_family.items():
+        rounds = {}
+        for r in sorted(fam_rows, key=lambda r: (r['card'], r['round'], r['lane'] or 0)):
+            if r.get('phase') == 'warm':
+                continue
+            t = r['round_us'] if r['round_us'] is not None else r['verify_us']
+            if t is not None:
+                rounds.setdefault((r['card'], r['round'], r['lane']), (context_band(r['context']), r['batch_rows'], t))
+        model = OnlineRatio()
+        for band, rows_, t in rounds.values():
+            model.observe(band, rows_, t)
+        conv = model.convergence()
+        out[family] = {band: dict(conv[band], offline_ratio=offline_ratio(fits.get(family), band))
+                       for band in conv}
+    return out
+
+
+def offline_ratio(fit, band):
+    curve = ((fit or {}).get('table') or {}).get(band)
+    if not curve or len(curve) < 2:
+        return None
+    xs = sorted(curve)
+    n = len(xs); sx = sum(xs); sy = sum(curve[x] for x in xs)
+    sxx = sum(x * x for x in xs); sxy = sum(x * curve[x] for x in xs)
+    den = n * sxx - sx * sx
+    if den <= 0:
+        return None
+    slope = (n * sxy - sx * sy) / den
+    base = (sy - slope * sx) / n
+    return slope / base if base > 0 else None
 
 
 DEFAULT_MIX = {'0': 0.25, '8K': 0.25, '32K': 0.3, '128K': 0.2}
@@ -662,7 +975,7 @@ def traffic_mix(cells, weights=None):
     assert sum(w for k, w in weights.items() if k in ('32K', '128K')) >= 0.5 - 1e-9, 'brief: >= half the weight at 32K+'
     out = {}
     for family in {c['family'] for c in cells}:
-        rules = [k for k in cells[0] if k.startswith(('fixed', 'history', 'product', 'marginal'))]
+        rules = [k for k in cells[0] if k.startswith(RULE_PREFIXES) and isinstance(cells[0][k], float)]
         row = {}
         for rule in rules:
             total = weight = 0.
@@ -766,6 +1079,8 @@ def main(argv=None):
     a.add_argument('dataset')
     a.add_argument('--out', required=True)
     a.add_argument('--plot', action='store_true', help='also write cycle-curves.png (needs matplotlib)')
+    a.add_argument('--pricing', choices=('table', 'two-term'), default='table',
+                   help='price replayed rounds from the measured rows table or the per-band a + b*requests + c*rows fit')
     args = parser.parse_args(argv)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -784,7 +1099,7 @@ def main(argv=None):
     else:
         rows = list(read_jsonl(Path(args.dataset) / 'tidy.jsonl'))
         manifests = [json.loads(p.read_text()) for p in sorted((Path(args.dataset) / 'manifests').glob('*.json'))]
-        result = analyze(rows, manifests=manifests)
+        result = analyze(rows, manifests=manifests, pricing=args.pricing)
         (out / 'analysis.json').write_text(json.dumps(result, indent=1, default=str))
         (out / 'report.md').write_text(render(result))
         if args.plot:
