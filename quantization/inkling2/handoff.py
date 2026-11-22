@@ -65,7 +65,7 @@ def successful(result, *, importing_files=None, eviction_files=None):
 
 
 def check_plan(plan, revision, files, *, offgrid=False, repo_id=TARGET_REPO,
-               skipped=(), evict_hosts=None, blob_paths=False, keep_ref=None):
+               skipped=(), evict_hosts=None, blob_paths=False, keep_ref=None, physical_paths=None):
     goal = plan.get('goal', {})
     # Native goals retain CLI disk selectors; execution steps use display names.
     disk_names = dict(zip(TARGET_ARGS[:2], TARGETS[:2]))
@@ -101,6 +101,10 @@ def check_plan(plan, revision, files, *, offgrid=False, repo_id=TARGET_REPO,
             else:
                 relative(name)
                 physical = model / 'blobs' / files[name]['hub_oid'] if blob_paths and name in files else snapshot / name
+                if physical_paths is not None and name in files:
+                    physical = physical_paths[name]
+                    if step['kind'] == 'evict' and physical.parent.parent == NAMESPACE / 'blobs':
+                        raise ValueError('placement must not evict a shared hub blob')
                 valid = (name in files and path == str(physical)
                     and copy.get('group') == repo_id and copy.get('size') == files[name]['bytes'])
             if not valid or bool(copy.get('skip')) != (name in skipped):

@@ -73,8 +73,15 @@ def published(tmp_path):
 
 
 class Native:
-    def __init__(self, files):
+    def __init__(self, files, *, shared_blobs=False):
         self.files = files
+        self.shared_blobs = shared_blobs
+        self.physical = {}
+        for name, row in files.items():
+            oid = row['hub_oid']
+            key = sha256(('shared ' + oid).encode()).hexdigest()
+            self.physical[name] = (nest.NAMESPACE / 'blobs' / key[:2] / key
+                                   if shared_blobs else BLOBS / oid)
         self.calls = []
         self.rules = {}
         self.plans = {}
@@ -97,7 +104,7 @@ class Native:
         assert args[0] == '--place'
         goal = dict(goal='place', selector='hf:' + publish.TARGET_REPO,
                     hub=str(nest.NAMESPACE), hosts=list(nest.TARGET_ARGS), factor=1/8, by_speed=False)
-        rows = {name: dict(path=str(BLOBS / row['hub_oid']), group=publish.TARGET_REPO, name=name, size=row['bytes'])
+        rows = {name: dict(path=str(self.physical[name]), group=publish.TARGET_REPO, name=name, size=row['bytes'])
                 for name, row in self.files.items()}
         steps = [dict(kind='replicate', host=host, copies=[rows[f'weight-{i:02d}.safetensors']])
                  for i, host in enumerate(nest.TARGETS)]
@@ -134,7 +141,7 @@ class Native:
             case ('plan', '--place', *_):
                 return self._plan(args[1:])
             case ('plan', 'skip', number, *paths):
-                assert set(paths) == {BLOBS / self.files[n]['hub_oid'] for n in PINS}
+                assert set(paths) == {self.physical[n] for n in PINS}
                 for step in self.plans[number]['steps']:
                     for row in step['copies']:
                         if Path(row['path']) in paths:
@@ -146,7 +153,7 @@ class Native:
                     plan['steps'][0]['copies'][0]['size'] += 1
                 return plan
             case ('plan', 'apply', number, '--wait'):
-                self.placements = handoff._project(self.plans[number], self.placements, self.files)
+                self.placements = handoff._project(self.plans[number], self.placements, self.files, self.physical)
                 count = sum(not row.get('skip') for step in self.plans[number]['steps'] for row in step['copies'])
                 job = self._job(count, what=f'apply plan {number}', eviction=number == 2)
                 if self.fail_submit:
@@ -168,15 +175,24 @@ class Native:
                 return dict(entries=[dict(name=name, kind='symlink', target='../../blobs/' + row['hub_oid'])
                                      for name, row in self.files.items()])
             case ('ls', path) if path == BLOBS:
+                if self.shared_blobs:
+                    return dict(entries=[dict(name=row['hub_oid'], kind='symlink',
+                                              target=os.path.relpath(self.physical[name], BLOBS))
+                                         for name, row in self.files.items()])
                 return dict(entries=[dict(name=row['hub_oid'], kind='regular', sealed=True, size=row['bytes'],
                                           hosts=sorted(self.placements[name])) for name, row in self.files.items()])
+            case ('ls', path) if self.shared_blobs:
+                name = next(n for n, physical in self.physical.items() if physical == path)
+                return dict(entries=[dict(name=path.name, kind='regular', sealed=True,
+                                          size=self.files[name]['bytes'], hosts=sorted(self.placements[name]))])
             case _:
                 pytest.fail('unexpected simulated SparkNest operation ' + repr(args))
 
 
-def test_hy4_no_copy_import_pin_spread_resume_and_cleanup(published, monkeypatch):
+@pytest.mark.parametrize("shared_blobs", [False, True])
+def test_hy4_no_copy_import_pin_spread_resume_and_cleanup(published, monkeypatch, shared_blobs):
     root, output, managed, record = published
-    call = Native(record['files'])
+    call = Native(record['files'], shared_blobs=shared_blobs)
     call.fail_wait = len(PINS) + 2  # pause after the native spread job has been submitted
     stage = root / 'handoff-stage'
     with pytest.raises(TimeoutError, match='interrupted'):
