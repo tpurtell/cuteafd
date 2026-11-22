@@ -215,7 +215,7 @@ def path_tokens(text):
                 yield piece
 
 
-def process_paths(root):
+def process_paths(root, *, ignore_own_cmdline=False):
     """Paths under root that any process uses, and how many of our own processes could only be
     partly read. Other users' processes expose only their cmdline; their cwd and open files under
     our home are not visible without root, but our cache is only written by us and our containers."""
@@ -232,11 +232,12 @@ def process_paths(root):
     for proc in Path('/proc').iterdir():
         if not proc.name.isdigit():
             continue
-        try:
-            for token in path_tokens((proc / 'cmdline').read_bytes().decode(errors='replace')):
-                keep(token)
-        except OSError:
-            continue  # exited
+        if not (ignore_own_cmdline and int(proc.name) == os.getpid()):
+            try:
+                for token in path_tokens((proc / 'cmdline').read_bytes().decode(errors='replace')):
+                    keep(token)
+            except OSError:
+                continue  # exited
         readable = True
         for link in ('cwd', 'root', 'exe'):
             try:

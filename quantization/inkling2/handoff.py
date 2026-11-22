@@ -376,7 +376,9 @@ def assert_unused(paths):
     sys.modules[loader.name] = gc
     loader.exec_module(gc)
     mounts = gc.docker_mounts()
-    busy, partial = gc.process_paths(Path('/'))
+    # The cleanup command names its output and staging leaves as operands.
+    # Still inspect this process's cwd, descriptors and mapped files.
+    busy, partial = gc.process_paths(Path('/'), ignore_own_cmdline=True)
     if mounts is None:
         raise RuntimeError('cannot inspect containers before retirement')
     if partial:
