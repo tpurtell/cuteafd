@@ -354,6 +354,11 @@ def handoff(root, stage_root, *, call=native, managed=MANAGED):
 
 def _known_unreadable_process(argv, comm):
     """Recognize only the known non-dumpable user infrastructure commands."""
+    if comm == 'ssh-agent' and argv and argv[-1:] == [b'']:
+        command = argv[:-1]
+        return command == [b'/usr/bin/ssh-agent', b'-D'] or (
+            len(command) == 5 and command[:4] == [b'ssh-agent', b'tmux', b'new', b'-s']
+            and re.fullmatch(rb'[A-Za-z0-9_-]+', command[4]) is not None)
     return bool(argv) and (argv[:2] == [b'/usr/lib/systemd/systemd', b'--user']
         or argv[0] == b'(sd-pam)'
         or (comm == 'sshd-session' and not any(argv[1:])

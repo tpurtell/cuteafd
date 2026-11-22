@@ -458,6 +458,10 @@ def test_cleanup_rejects_busy_or_unrelated_payloads(tmp_path):
     ([b'sshd-session: other@pts/5', b''], 'sshd-session', False),
     ([b'sshd-session: tj@pts/x', b''], 'sshd-session', False),
     ([b'python', b''], 'python', False),
+    ([b'/usr/bin/ssh-agent', b'-D', b''], 'ssh-agent', True),
+    ([b'ssh-agent', b'tmux', b'new', b'-s', b'work', b''], 'ssh-agent', True),
+    ([b'ssh-agent', b'tmux', b'new', b'-s', b'work', b'other-command', b''], 'ssh-agent', False),
+    ([b'/tmp/ssh-agent', b'-D', b''], 'ssh-agent', False),
 ])
 def test_unreadable_ssh_infrastructure_is_exact(argv, comm, expected):
     assert handoff._known_unreadable_process(argv, comm) is expected
