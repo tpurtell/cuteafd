@@ -1848,7 +1848,7 @@ HY4_LAYOUTS = {
 }
 HY4_GEOMETRY = re.compile(
     r"Key \{ layer: (\d+), rows: (\d+), section: "
-    r"(SwaLocal|SwaAttn|SwaExtendPre|SwaExtendPost|DsaPre|DsaIndexQ|DsaLocalPost|DsaAttnOut|FfnFrontend|FfnFinish) \}"
+    r"(SwaLocal|SwaAttn|SwaExtendPre|SwaExtendPost|DsaPre|DsaIndexQ|DsaLocalPost|DsaAttnOut|FfnFrontend|FfnExpert|FfnFinish) \}"
 )
 
 

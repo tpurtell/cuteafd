@@ -1148,6 +1148,7 @@ struct ActiveBatch {
     swa_pt_stride: usize,
     all_single_row: bool,
     graphed: bool,
+    decode_attention: bool,
     ffn_fused_layer: Option<usize>,
     post_attn_deferred: bool,
     decode_attention: bool,
@@ -2090,6 +2091,7 @@ impl<'a> Hy4Engine<'a> {
             swa_pt_stride,
             all_single_row,
             graphed,
+            decode_attention: priority == ReadPriority::Decode,
             ffn_fused_layer: None,
             post_attn_deferred: false,
             decode_attention: priority == ReadPriority::Decode,
@@ -2587,7 +2589,7 @@ impl<'a> Hy4Engine<'a> {
     }
 
     /// Run MoE router + latent down + FP8 K32 quant + shared expert on all ranks (used by both local & Spark FFN).
-    fn run_moe_router_and_shared(&mut self, layer: usize, batch: &mut ActiveBatch, local_experts: bool) -> Result<()> {
+    fn run_moe_router_and_shared(&mut self, layer: usize, batch: &mut ActiveBatch) -> Result<()> {
         let p = format!("model.layers.{layer}");
         let gpus = self.ranks.len();
         let rows = batch.rows;
@@ -2605,7 +2607,7 @@ impl<'a> Hy4Engine<'a> {
                             if deferred {
                                 r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                             }
-                            r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, rank == 0 || local_experts)
+                            r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, rank == 0)
                         })
                     },
                 )?;
@@ -2621,7 +2623,7 @@ impl<'a> Hy4Engine<'a> {
                 if deferred {
                     r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                 }
-                r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, rank == 0 || local_experts)
+                r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, rank == 0)
             })?;
         }
         if deferred {
@@ -2702,6 +2704,78 @@ impl<'a> Hy4Engine<'a> {
         Ok(())
     }
 
+    /// Route and quantize once for the two resident expert halves. Only the
+    /// rank-local work is captured; the peer read sits between graph sections.
+    fn run_tp2_local_moe(&mut self, layer: usize, batch: &mut ActiveBatch) -> Result<()> {
+        let p = format!("model.layers.{layer}");
+        let rows = batch.rows;
+        let wave_slot = batch.wave_slot;
+        let defer = batch.post_attn_deferred;
+        let use_a = batch.use_a;
+        let skip_routed = self.skip_routed_experts;
+        let routed_scale = self.cfg.routed_scaling_factor as f32;
+        let (lead, peer) = self.ranks.split_at_mut(1);
+        let (lead, peer) = (&mut lead[0], &mut peer[0]);
+        let frontend = GraphKey { layer, rows, section: GraphSection::FfnFrontend };
+        let run_frontend = |rank: &RankRuntime<'_>, canonical: bool| {
+            let work = || rank.device.run(|| {
+                if defer {
+                    rank.post_attn_ihc(&p, wave_slot, rows, use_a)?;
+                }
+                rank.moe_router_shared(&p, 2, wave_slot, rows, routed_scale, canonical && !skip_routed)?;
+                if canonical {
+                    rank.local_exl3(layer, 2, rows, skip_routed)?;
+                }
+                Ok(())
+            });
+            if batch.graphed { rank.graphs.run(frontend, &rank.stream, work) } else { work() }
+        };
+        run_frontend(lead, true)?;
+        if !skip_routed {
+            lead.peer_ready.record(&lead.stream)?;
+        }
+        run_frontend(peer, false)?;
+        if !skip_routed {
+            let mode = batch.decode_attention;
+            peer.device.run(|| {
+                let lib = peer.device.library;
+                let planes = [
+                    (peer.shared.wire_in.buffer, lead.shared.wire_in.buffer, rows * (LATENT_H + LATENT_H / 32)),
+                    (peer.shared.route_ids.buffer, lead.shared.route_ids.buffer, rows * TOPK * 4),
+                    (peer.shared.route_weights.buffer, lead.shared.route_weights.buffer, rows * TOPK * 4),
+                ];
+                ensure!(planes.iter().all(|(dst, src, bytes)| *bytes <= dst.bytes && *bytes <= src.bytes),
+                    "Hy4 TP2 route handoff exceeds its admitted storage");
+                // SAFETY: rank 0's event orders the producer, the peer stream
+                // orders its consumers, and the following joined expert
+                // reduction fences this read before rank 0 reuses the planes.
+                unsafe {
+                    lib.cuda_stream_wait_event(peer.stream.raw, lead.peer_ready.raw)?;
+                    if mode {
+                        let regions = planes.map(|(dst, src, bytes)| (dst.ptr, src.ptr.cast_const(), bytes as u64));
+                        lib.sm_copy_regions(&regions, peer.stream.raw)?;
+                    } else {
+                        for (dst, src, bytes) in planes {
+                            lib.copy_peer_async(dst, src, bytes, peer.stream.raw)?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        let run_peer = || peer.device.run(|| peer.local_exl3(layer, 2, rows, skip_routed));
+        if batch.graphed {
+            peer.graphs.run(GraphKey { layer, rows, section: GraphSection::FfnExpert }, &peer.stream, run_peer)?;
+        } else {
+            run_peer()?;
+        }
+        if defer {
+            batch.post_attn_deferred = false;
+            batch.use_a = !batch.use_a;
+        }
+        self.finish_ffn_combine_and_post(layer, batch, true)
+    }
+
     /// Run dense FFN (layer 0) or local onboarded LatentMoE (layers 1..=41) + post-FFN norm + iHC post.
     fn run_layer_local_ffn(&mut self, layer: usize, batch: &mut ActiveBatch) -> Result<()> {
         if batch.ffn_fused_layer == Some(layer) {
@@ -2748,6 +2822,10 @@ impl<'a> Hy4Engine<'a> {
             return self.finish_ffn_combine_and_post(layer, batch, true);
         }
 
+        if gpus == 2 {
+            return self.run_tp2_local_moe(layer, batch);
+        }
+
         if batch.graphed {
             for r in &self.ranks {
                 r.graphs.run(
@@ -2771,7 +2849,7 @@ impl<'a> Hy4Engine<'a> {
             return self.finish_ffn_combine_and_post(layer, batch, true);
         }
 
-        self.run_moe_router_and_shared(layer, batch, true)?;
+        self.run_moe_router_and_shared(layer, batch)?;
         for r in &self.ranks {
             r.device.run(|| r.local_exl3(layer, gpus, rows, skip_routed))?;
         }
@@ -3044,7 +3122,7 @@ impl<'a> Hy4Engine<'a> {
                         .get_mut(unit.slot)
                         .and_then(Option::as_mut)
                         .context("Hy4 send_experts without active unit")?;
-                    self.engine.run_moe_router_and_shared(layer, batch, false)?;
+                    self.engine.run_moe_router_and_shared(layer, batch)?;
                     let waves = self.waves.as_mut().context("Hy4 Spark route without active SparkLink")?;
                     let rows = batch.rows;
                     let identity = self.engine.next_identity;

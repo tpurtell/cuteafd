@@ -38,6 +38,8 @@ pub(crate) enum Section {
     DsaAttnOut,
     /// Post-attn iHC + Dense/MoE frontend (TP2 or Spark-routed; includes TP2 local EXL3 when onboarded).
     FfnFrontend,
+    /// Local rank-1 experts consuming the replicated route/input on TP2.
+    FfnExpert,
     /// Post-FFN combine + norm + iHC post (TP2 or Spark-routed).
     FfnFinish,
 }
@@ -278,6 +280,7 @@ mod tests {
                     Section::DsaLocalPost,
                     Section::DsaAttnOut,
                     Section::FfnFrontend,
+                    Section::FfnExpert,
                     Section::FfnFinish,
                 ] {
                     for rows in [1, 4, 16, 64] {
