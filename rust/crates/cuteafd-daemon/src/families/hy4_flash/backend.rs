@@ -118,6 +118,7 @@ pub(crate) struct Hy4Backend<'a> {
     library: &'a cuteafd_ffi::NativeLibrary,
     context: usize,
     concurrency: usize,
+    decode_rows: usize,
     unit_rows: usize,
     prefill_waves: usize,
     vocab: usize,
@@ -138,6 +139,7 @@ impl<'a> Hy4Backend<'a> {
         let library = engine.library();
         let family = engine.prefix()?;
         let concurrency = engine.max_sequences;
+        let decode_rows = engine.decode_rows;
         let prefill_waves = engine.prefill_waves;
         let vocab = engine.cfg.vocab_size;
         let pad_id = engine.cfg.engram_pad_id;
@@ -152,6 +154,7 @@ impl<'a> Hy4Backend<'a> {
             library,
             context,
             concurrency,
+            decode_rows,
             unit_rows,
             prefill_waves,
             vocab,
@@ -239,7 +242,7 @@ impl<'a> Hy4Backend<'a> {
             !sequences.is_empty() && sequences.len() <= self.concurrency && self.pending.borrow().is_none(),
             "Hy4 decode requires admitted requests and prior commit"
         );
-        let spans = decode_spans(sequences.iter().map(|(_, tokens)| tokens.len()), 64)?;
+        let spans = decode_spans(sequences.iter().map(|(_, tokens)| tokens.len()), self.decode_rows)?;
         let total_rows = spans.last().context("Hy4 decode has no rows")?.end;
         let mut slots = BTreeSet::new();
         let mut segments = Vec::with_capacity(sequences.len());
@@ -315,7 +318,7 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
             max_context: self.context,
             slots: self.concurrency,
             prefill_rows: self.unit_rows,
-            decode_rows: 64,
+            decode_rows: self.decode_rows,
         }
     }
 

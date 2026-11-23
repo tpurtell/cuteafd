@@ -164,11 +164,12 @@ impl Hy4EngramHost {
         cfg: &Hy4FlashConfig,
         max_rows: usize,
         prefill_waves: usize,
+        decode_rows: usize,
     ) -> Result<Self> {
         let shape = Hy4EngramShape::new(
             max_rows,
             prefill_waves.max(1),
-            hy4_placement::DECODE_ROWS as usize,
+            decode_rows,
             cfg.engram_layers.len(),
         )?;
         let _scope = cuteafd_ffi::memory_ledger::scope("hy4-engram");

@@ -5,7 +5,7 @@
 use super::cache::{Hy4CacheRank, Hy4Placement, Hy4Prefix};
 use super::graphs::{Hy4Graphs, Key as GraphKey, Section as GraphSection};
 use super::native::Hy4NativeScratch;
-use super::programs::{Hy4Programs, MLA_SPLIT_ROWS, MlaSplitPlan};
+use super::programs::{Hy4Programs, MlaSplitPlan};
 use super::weights::{Hy4EngramHost, Hy4EngramWave, Hy4RankWeights};
 use crate::shared::decode_graph::device::{self as graph_device, Cycle as GraphCycle};
 use crate::shared::distributed_head::Handoff;
@@ -26,7 +26,8 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, F32Add};
 use cuteafd_loader::families::hy4_flash::engram::advance_tail;
-use cuteafd_loader::families::hy4_flash::execution::PAGE_ROWS;
+use cuteafd_loader::families::hy4_flash::execution::{mla_split_scratch_bytes, PAGE_ROWS};
+use cuteafd_loader::placement::families::hy4_flash::DECODE_ROWS;
 use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
 use cuteafd_loader::formats::mapped_table::ReadPriority;
 use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
@@ -954,6 +955,7 @@ struct ActiveBatch {
 pub(crate) struct Hy4Engine<'a> {
     pub(crate) cfg: Hy4FlashConfig,
     pub(crate) max_rows: usize,
+    pub(crate) decode_rows: usize,
     pub(crate) prefill_waves: usize,
     pub(crate) max_pages: usize,
     pub(crate) max_sequences: usize,
@@ -984,6 +986,7 @@ impl<'a> Hy4Engine<'a> {
         cfg: &Hy4FlashConfig,
         tp: usize,
         max_rows: usize,
+        decode_rows: usize,
         max_seq_pages: usize,
         max_sequences: usize,
     ) -> u64 {
@@ -996,7 +999,7 @@ impl<'a> Hy4Engine<'a> {
             .max(max_seq_groups.max(1));
         let wire_row = LATENT_H + LATENT_H / 32;
         let tp2_f32 = if tp == 2 { 3 * max_rows * H * 4 } else { 0 };
-        let split_k_cap = max_rows.min(64) * 16 * max_heads * (512 * 2 + 4);
+        let split_k_cap = mla_split_scratch_bytes(decode_rows, tp);
         let engram_count = cfg.engram_layers.len();
         let sum = max_rows * (4 + 8 + 4 + 8 + 8)
             + 2 * max_rows * HC * H * 2
@@ -1043,6 +1046,7 @@ impl<'a> Hy4Engine<'a> {
             cfg,
             kv_format,
             max_rows,
+            max_rows.min(DECODE_ROWS as usize),
             1,
             max_pages,
             1,
@@ -1061,7 +1065,8 @@ impl<'a> Hy4Engine<'a> {
         checkpoint: &Checkpoint,
         cfg: Hy4FlashConfig,
         kv_format: Hy4KvCache,
-        max_rows: usize,
+        unit_rows: usize,
+        decode_rows: usize,
         prefill_waves: usize,
         max_pages: usize,
         max_sequences: usize,
@@ -1070,10 +1075,13 @@ impl<'a> Hy4Engine<'a> {
         skip_routed_experts: bool,
         mut onboarded_experts: Vec<Option<Exl3Tp2<'a>>>,
     ) -> Result<Self> {
+        ensure!((1..=DECODE_ROWS as usize).contains(&decode_rows),
+            "Hy4-flash split-K decode exports cover at most {DECODE_ROWS} rows; got {decode_rows}");
+        let max_rows = unit_rows.max(decode_rows);
         let gpus = devices.len();
         ensure!(matches!(gpus, 1 | 2), "Hy4Engine supports 1 or 2 GPUs, got {gpus}");
         ensure!(onboarded_experts.len() == gpus, "onboarded_experts rank count mismatch");
-        ensure!(max_sequences > 0 && max_pages > 0 && max_rows > 0, "invalid Hy4Engine extents");
+        ensure!(max_sequences > 0 && max_pages > 0 && unit_rows > 0, "invalid Hy4Engine extents");
         if gpus == 2 {
             let probed = crate::shared::peer_split::probed_device(
                 devices[0].library,
@@ -1089,9 +1097,9 @@ impl<'a> Hy4Engine<'a> {
         }
 
         let prefill_waves = prefill_waves.max(1);
-        let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, max_rows.min(64))?;
+        let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, decode_rows)?;
         // SAFETY: checkpoint shard files remain immutable for the duration of the engine.
-        let engram = unsafe { Hy4EngramHost::open(devices[0].library, checkpoint, &cfg, max_rows, prefill_waves)? };
+        let engram = unsafe { Hy4EngramHost::open(devices[0].library, checkpoint, &cfg, unit_rows, prefill_waves, decode_rows)? };
         let max_seq_pages = max_context.div_ceil(PAGE_ROWS).max(16).min(max_pages);
 
         let mut ranks = Vec::with_capacity(gpus);
@@ -1101,11 +1109,9 @@ impl<'a> Hy4Engine<'a> {
             let peer_ready = Event::new(device)?;
             let progs = device.run(|| Hy4Programs::load(programs, gpus, kv_format))?;
             let sms = device.run(|| device.library.sm_count())?;
-            let split_rows = max_rows.min(MLA_SPLIT_ROWS);
-            let mla_splits = MlaSplitPlan::new(&progs, max_context, split_rows, sms)?;
+            let mla_splits = MlaSplitPlan::new(&progs, max_context, decode_rows, sms)?;
             // Split-capable launches never exceed the admitted decode/verify rows.
-            let split_k_cap = split_rows * 16 * (64 / gpus) * (512 * 2 + 4);
-            let attn_scratch = split_k_cap.max(1024);
+            let attn_scratch = mla_split_scratch_bytes(decode_rows, gpus);
             let cache = Rc::new(Hy4CacheRank::new(
                 vec![stream.clone()],
                 &cfg,
@@ -1116,7 +1122,7 @@ impl<'a> Hy4Engine<'a> {
                 mark_slots,
             )?);
             let native_layout = weights.native.scratch_layout(max_rows)?;
-            let native_head_layout = weights.native.head_scratch_layout(max_rows.min(64))?;
+            let native_head_layout = weights.native.head_scratch_layout(max_rows.min(DECODE_ROWS as usize))?;
             let scratch = RankScratch::new(
                 device,
                 rank,
@@ -1183,6 +1189,7 @@ impl<'a> Hy4Engine<'a> {
         Ok(Self {
             cfg,
             max_rows,
+            decode_rows,
             prefill_waves,
             max_pages,
             max_sequences,
@@ -1549,6 +1556,8 @@ impl<'a> Hy4Engine<'a> {
     ) -> Result<ActiveBatch> {
         let rows = unit.rows.len();
         ensure!(rows > 0 && rows <= self.max_rows, "Hy4 unit rows {rows} outside 1..={}", self.max_rows);
+        ensure!(priority != ReadPriority::Decode || rows <= self.decode_rows,
+            "Hy4 decode/verify uses {rows} rows, exceeds admitted {}-row split-K owner", self.decode_rows);
         ensure!(!unit.segments.is_empty(), "Hy4 unit must carry explicit segments");
         ensure!(unit.segments.len() <= self.max_sequences, "Hy4 batch exceeds max_sequences {}", self.max_sequences);
 
@@ -1787,7 +1796,7 @@ impl<'a> Hy4Engine<'a> {
             graphed,
             ffn_fused_layer: None,
             post_attn_deferred: false,
-            decode_attention: priority == ReadPriority::Decode && rows <= MLA_SPLIT_ROWS,
+            decode_attention: priority == ReadPriority::Decode,
             dump_rows,
             use_a: true,
             members,
@@ -2067,7 +2076,7 @@ impl<'a> Hy4Engine<'a> {
                                         r.engram_compute(&p, slot, rows, use_a)?;
                                     }
                                     r.attn_pre(&p, layer, false, local_heads, rows, use_a, kv_cache_buf)?;
-                                    r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, true)?;
+                                    r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, decode_attention)?;
                                     r.attn_out(&p, layer, false, 1, local_heads, rows)?;
                                     r.post_attn_ihc(&p, rows, use_a)?;
                                     if is_dense {
@@ -2170,7 +2179,7 @@ impl<'a> Hy4Engine<'a> {
                                         r.engram_compute(&p, slot, rows, use_a)?;
                                     }
                                     r.attn_pre(&p, layer, false, local_heads, rows, use_a, kv_cache_buf)?;
-                                    r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, true)?;
+                                    r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, decode_attention)?;
                                     r.attn_out(&p, layer, false, gpus, local_heads, rows)
                                 })
                             },

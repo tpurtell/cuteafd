@@ -228,6 +228,18 @@ mod tests {
     }
 
     #[test]
+    fn hy4_refuses_decode_rows_not_covered_by_split_k_exports() {
+        let hy4 = &crate::plan::families::hy4_flash::HY4_FLASH;
+        for gpus in [1, 2] {
+            assert_eq!(resolve(hy4, req(Some(32), 16, 1, gpus, None)).unwrap(), 32);
+            assert_eq!(resolve(hy4, req(Some(64), 16, 1, gpus, None)).unwrap(), 64);
+            let err = resolve(hy4, req(Some(128), 32, 1, gpus, None)).unwrap_err();
+            assert!(matches!(err, PlanError::UnsupportedDecodeRows { value: 128, capacity: 64, .. }), "{err}");
+            assert!(err.to_string().contains("Hy4-flash split-K decode exports"), "{err}");
+        }
+    }
+
+    #[test]
     fn glmf_supports_128_on_one_gpu_and_refuses_128_on_two_gpus_naming_missing_program() {
         let glmf = &crate::plan::families::glm::GLM5_FLASH;
         assert_eq!(resolve(glmf, req(Some(128), 16, 1, 1, None)).unwrap(), 128);

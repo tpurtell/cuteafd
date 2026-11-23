@@ -380,9 +380,9 @@ impl Family for Hy4Flash {
     }
     fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
         crate::plan::decode_rows::DecodeRowSupport::fixed(
-            64,
+            crate::placement::families::hy4_flash::DECODE_ROWS,
             7,
-            "Hy4-flash coordinator decode programs cover 64 rows (pending #2579 and hy4f_*_m128 export)",
+            "Hy4-flash split-K decode exports cover at most 64 rows (hy4f / hy4f2 MLA)",
         )
     }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {

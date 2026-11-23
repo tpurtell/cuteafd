@@ -2700,7 +2700,7 @@ audio_encoder_hash=""
     release_die "deployment does not name a supported verify-row budget"
   if [[ ( -n "$decode_rows" && "$decode_rows" != auto ) || "$resolved_decode_rows" != 64 ]]; then
     case "$family" in
-      glm5_flash) family_args+=(--decode-rows "$resolved_decode_rows") ;;
+      glm5_flash|hy4_flash) family_args+=(--decode-rows "$resolved_decode_rows") ;;
     esac
   fi
   case "$(family_prefill_mode "$family")" in

@@ -341,6 +341,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             cfg.clone(),
             args.kv_cache,
             unit,
+            unit.min(cuteafd_loader::placement::families::hy4_flash::DECODE_ROWS as usize),
             1,
             max_pages,
             2,

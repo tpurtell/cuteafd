@@ -57,6 +57,8 @@ pub(crate) struct ServeArgs {
     pub model_id: Option<String>,
     #[arg(long)]
     pub prefill_rows: Option<usize>,
+    #[arg(long, default_value = "auto")]
+    pub decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3))]
     pub prefill_waves: Option<u8>,
     /// `exact` needs an attested coordinator route cap, which Hy4 does not report yet.
@@ -133,10 +135,16 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         "Hy4-flash supports 0..=6 distinct Spark peer endpoints"
     );
     let gpus = if args.split_device.is_some() { 2 } else { 1 };
+    let decode_rows = cuteafd_loader::plan::resolve_decode_rows("hy4_flash",
+        cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+            requested: args.decode_rows.as_option(), concurrency: args.max_sequences as u64,
+            decode_lanes: 1, rtx_gpus: gpus, draft_length: Some(0),
+        })? as usize;
     let resolved_attention = resolve_attention_placement(gpus, args.attention_placement.as_str())?;
     args.prefix.resolve_entries(args.max_sequences);
     let prefill = args.prefill()?;
     cuteafd_bench::context::ResolvedSettings::prefill(prefill)
+        .value("decode-rows", decode_rows)
         .value("attention-placement", resolved_attention)
         .publish();
 
@@ -191,6 +199,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let gpus = device_ids.len();
             let devices: Vec<Device<'_>> = device_ids.iter().map(|&id| Device { library: &library, id }).collect();
             let unit_rows = usize::try_from(prefill.unit_rows)?;
+            let capacity_rows = unit_rows.max(decode_rows);
             let max_context = match worker_args.max_context {
                 Some(0) | None => cfg.max_position,
                 Some(n) => n.min(cfg.max_position),
@@ -276,7 +285,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 };
                 let endpoint = SparkEndpoint {
                     ring_depth: None,
-                    capacity: u32::try_from(unit_rows)?,
+                    capacity: u32::try_from(capacity_rows)?,
                     ingress: SparkIngress::Fp8K32,
                     partial_reply_bytes: None,
                 };
@@ -307,7 +316,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 )?
                 .select(&worker_args.peers)?;
 
-                let shape = PrefillShape { rows: prefill.unit_rows, waves: prefill.waves };
+                let shape = PrefillShape { rows: capacity_rows as u64, waves: prefill.waves };
                 let links = hy4_place::spark_link(
                     0,
                     worker_args.peers.len(),
@@ -326,7 +335,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 })?;
                 link.enable_terminal_ownership(Arc::clone(&library))?;
                 let mut session = SparkSessionShape::new(
-                    u32::try_from(unit_rows)?,
+                    u32::try_from(capacity_rows)?,
                     u32::try_from(cfg.routed_expert_hidden)?,
                     u32::try_from(cfg.topk)?,
                     ExpertV2Dtype::Fp8E4m3Ue8m0K32,
@@ -353,7 +362,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                         &catalog,
                         &expert_pkg,
                         onboarded_layers.clone(),
-                        unit_rows,
+                        capacity_rows,
                         budget,
                         RtxSelectionPolicy::FirstCapacity,
                     )?;
@@ -365,7 +374,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                         cuteafd_core::ExpertGeometry::HY4_FLASH,
                         [expert_pkg.as_path(), expert_pkg.as_path()],
                         onboarded_layers.clone(),
-                        unit_rows,
+                        capacity_rows,
                         [budget, budget],
                         RtxSelectionPolicy::FirstCapacity,
                     )?;
@@ -381,7 +390,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 .map(|g| g.free_bytes.min(effective_cap))
                 .min()
                 .unwrap_or(0);
-            let swa_ring_pages = ((cfg.sliding_window + unit_rows).div_ceil(PAGE_ROWS) + 1)
+            let swa_ring_pages = ((cfg.sliding_window + capacity_rows).div_ceil(PAGE_ROWS) + 1)
                 .max(cuteafd_loader::families::hy4_flash::execution::SWA_RING_PAGES);
             let swa_seq_bytes = (cfg.swa_layers().len() * swa_ring_pages * PAGE_ROWS * worker_args.kv_format.record_bytes()) as u64;
             let cache_layout = cuteafd_loader::families::hy4_flash::execution::CacheLayout::new(
@@ -407,7 +416,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let rank_ws_bytes = Hy4Engine::estimated_rank_workspace_bytes(
                 &cfg,
                 gpus,
-                unit_rows,
+                capacity_rows,
+                decode_rows,
                 est_seq_pages,
                 worker_args.max_sequences,
             );
@@ -453,6 +463,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 cfg.clone(),
                 worker_args.kv_format,
                 unit_rows,
+                decode_rows,
                 usize::try_from(prefill.waves)?,
                 chosen_pages,
                 worker_args.max_sequences,
@@ -633,6 +644,19 @@ mod tests {
                 .publish();
             Ok(())
         })?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn serve_hy4f_refuses_wide_decode_before_opening_checkpoint() -> anyhow::Result<()> {
+        let base = ["cuteafd", "serve-hy4f", "--snapshot", "/not-opened", "--native-lib", "/not-opened.so",
+            "--decode-rows", "128", "--attention-placement", "heads"];
+        for extra in [&[][..], &["--split-device", "1"][..]] {
+            let crate::cli::Commands::ServeHy4f(args) = crate::cli::Cli::try_parse_from(base.iter().chain(extra))?.command
+                else { anyhow::bail!("not serve-hy4f") };
+            let error = super::run(args).await.unwrap_err();
+            assert!(error.to_string().contains("Hy4-flash split-K decode exports"), "{error}");
+        }
         Ok(())
     }
 

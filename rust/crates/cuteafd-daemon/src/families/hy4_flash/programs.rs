@@ -4,8 +4,6 @@ use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Program, Programs};
 use cuteafd_loader::families::hy4_flash::Hy4KvCache;
 
-pub(super) const MLA_SPLIT_ROWS: usize = 64;
-
 #[derive(Clone, Copy)]
 pub(super) struct MlaSplitPlan {
     pub dsa: i32,

@@ -69,13 +69,14 @@ def test_hy4_flash_launcher_composes_0spark_and_spark_argv(tmp_path: Path) -> No
     assert _flag(serve_max, "--prefill-packing") is None and _flag(serve_max, "--prefix-cache-mark-mib") is None
     marked = _family_launch_result(
         tmp_path / "marked", config, "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
-        keys_max + "PREFILL_PACKING=unrestricted\nPREFIX_CACHE_MARK_MIB=1024\n",
+        keys_max + "PREFILL_PACKING=unrestricted\nPREFIX_CACHE_MARK_MIB=1024\nDECODE_ROWS=32\n",
         physical_gpus=(0, 1), extra_args=("--wip", "hy4f"), encoder_plan={**PLANNED, "spark_ranks": 0},
-        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
+        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1, "decode_rows": 32},
     )
     marked_serve, marked_plan = _line(marked, "serve-hy4f --snapshot"), _line(marked, "cuteafd plan")
     assert _flag(marked_serve, "--prefill-packing") == "unrestricted"
     assert _flag(marked_serve, "--prefix-cache-mark-mib") == _flag(marked_plan, "--prefix-cache-mark-mib") == "1024"
+    assert _flag(marked_serve, "--decode-rows") == _flag(marked_plan, "--decode-rows") == "32"
     assert (_flag(serve_max, "--device"), _flag(serve_max, "--split-device")) == ("0", "1")
     assert _flag(serve_max, "--core-view") == "original"
     assert _flag(serve_max, "--kv-cache") == "fp8"

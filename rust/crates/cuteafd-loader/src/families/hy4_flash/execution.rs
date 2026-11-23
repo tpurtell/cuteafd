@@ -14,6 +14,12 @@ pub const PAGE_ROWS: usize = 64;
 /// (`512` window + up to `64` decode/verify rows + page wrap alignment).
 pub const SWA_RING_PAGES: usize = 10;
 pub const SWA_RING_ROWS: usize = SWA_RING_PAGES * PAGE_ROWS;
+/// Physical partial O (BF16) and LSE (F32) planes for the capped MLA decode exports.
+/// The export strides scratch by the compiled split capacity, not active splits.
+pub fn mla_split_scratch_bytes(decode_rows: usize, head_parts: usize) -> usize {
+    decode_rows * 16 * (64 / head_parts) * (512 * 2 + 4)
+}
+
 /// Compressed indexer group-cache record bytes: 128 E4M3 dims + 4B F32 scale.
 pub const INDEX_GROUP_RECORD_BYTES: usize = 132;
 
@@ -127,8 +133,6 @@ impl UnitLayout {
         buffers.insert("attn_uv".into(), rows * max_heads * cfg.v_head_dim * 2);
         let swa_step_pages = (rows + cfg.sliding_window + PAGE_ROWS).div_ceil(PAGE_ROWS);
         buffers.insert("swa_step_kv".into(), swa_step_pages * PAGE_ROWS * kv_format.record_bytes());
-        // Split-K partials for dense/sparse MLA (up to 16 splits × max_heads × 512 BF16 + LSE).
-        buffers.insert("mla_split_partials".into(), rows.min(64) * 16 * max_heads * (cfg.kv_lora_rank * 2 + 4));
 
         // Compressed indexer scratch (DSA layers): queries, token keys, candidate slots [rows, 2048] I32.
         buffers.insert("indexer_q".into(), rows * cfg.indexer_heads * cfg.indexer_head_dim * 2);
@@ -154,5 +158,16 @@ impl UnitLayout {
 
     pub fn total_bytes(&self) -> usize {
         self.buffers.values().sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mla_split_partials_scale_with_resolved_rows_and_head_parts() {
+        let full = super::mla_split_scratch_bytes(64, 1);
+        assert_eq!(full, 64 * 16 * 64 * 1028);
+        assert_eq!(super::mla_split_scratch_bytes(32, 1), full / 2);
+        assert_eq!(super::mla_split_scratch_bytes(32, 2), full / 4);
     }
 }
