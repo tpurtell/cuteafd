@@ -89,7 +89,7 @@ Each view shares the K4 routed experts, router, embeddings, vision tower, KDA re
 | View | Indexed weight payload | When to use it |
 | --- | ---: | --- |
 | `original` (default) | {sizes['original']:.2f} GiB | Preserve source BF16 core and MTP matrices |
-| `k8-compact` | {sizes['k8-compact']:.2f} GiB | Use the compact K8 core that supplied downstream calibration activations |
+| `k8-compact` | {sizes['k8-compact']:.2f} GiB | Use the K8 core that supplied downstream calibration activations |
 | `k6-compact` | {sizes['k6-compact']:.2f} GiB | Minimize the core footprint |
 
 ## How it was made
@@ -115,7 +115,7 @@ See `per-module-errors.csv` for projection error and routed recovery counts.
 
 ## Running it
 
-Select this checkpoint in cuteafd. Set `CORE_VIEW` to `original`, `k8-compact` or `k6-compact`. The default safetensors index selects the original view. MC-aware readers discover the compact indexes through `cuteafd-mc.json`.
+Select `{source.TARGET_REPO}` in cuteafd. Set `CORE_VIEW` to `original`, `k8-compact` or `k6-compact`. The default safetensors index selects the original view. MC-aware readers discover the compact indexes through `cuteafd-mc.json`.
 
 ## License
 

@@ -12,6 +12,7 @@ from glm5.core_k6.recipe import packed_bytes
 from glm5_flash.core_k6 import recipe as flash
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, read_header
 
+TARGET_REPO = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1"
 BASE_REPO = flash.BASE_REPO
 BASE_REVISION = "a5b45eb41df6402735dedc900be14a42e8d5e538"
 CONFIG_SHA256 = "33e63ec7fe607658be712bd6dd3c16c6549960d8e7f0483d34b939881b55f943"
