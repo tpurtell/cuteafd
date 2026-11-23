@@ -14,7 +14,8 @@ MIN_EXPERT_ROWS = 1024
 
 def covariance_accumulator(width, device):
     """FP32 128-row products, FP64 outer sum and finite FP32 snapshot."""
-    return fork.covariance_accumulator(width, device=device)
+    return fork.fork_module("utils.exl3_hessian").BoundedHessianAccumulator(
+        width, device=device, fail_stop=True)
 
 
 @torch.inference_mode()
