@@ -6,7 +6,7 @@ import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from glm5_flash.mul1_mc.experts import ExpertBank, memory_plan, raw_covariance, route_batch
+from glm5_flash.mul1_mc.experts import ExpertBank, memory_plan, route_batch
 
 
 def router_fixture():
@@ -66,9 +66,6 @@ def test_ordered_recovery_and_replay():
     assert receipts[16]["identity_rows"] == receipts[16]["effective_rows"] == 1024
     assert receipts[0]["natural_rows"] == count
     assert receipts == list(bank.receipts())
-    accumulator = SimpleNamespace(count=0, snapshot=lambda: torch.zeros(2, 2))
-    filled = raw_covariance(accumulator, receipts[16]["identity_rows"])
-    assert torch.equal(filled["H"], torch.eye(2) * 1024) and filled["count"] == 1024
 
     def outputs(expert, selected):
         for part in bank.chunks(selected, workspace):
@@ -89,3 +86,50 @@ def test_memory_plan_includes_rolling_frontier_and_headroom():
                        mem_available=117*gib, container_remaining=100*gib)
     assert plan["owners"]["input_bank"] == plan["owners"]["output_sum"] == 1_590_000 * 4096 * 4
     assert plan["available"] == 100*gib and not plan["admitted"]
+
+
+def test_fit_and_replay_observe_reconstructed_clamped_weighted_down(monkeypatch):
+    from glm5_flash.mul1_mc import experts
+    from glm5_flash.mul1_mc import numerics
+
+    width, intermediate, count = 4, 3, 6
+    inputs = torch.arange(count * width).reshape(count, width).bfloat16()
+    ids = torch.arange(8).repeat(count, 1)
+    near = torch.arange(8, 16).repeat(count, 1)
+    # Expert zero has natural, candidate and identity rows.
+    ids[-2:, 0], near[-2:, 0] = 8, 0
+    gamma = torch.arange(count * 8).reshape(count, 8).float() / 16
+    bank = ExpertBank([(inputs, ids, gamma, near, gamma / 2)], tokens=count, experts=16,
+                      width=width, device="cpu")
+    workspace = experts.ExpertWorkspace.allocate(width, intermediate, device="cpu", chunk_rows=3)
+    weights = dict(gate_proj=torch.ones(intermediate, width, dtype=torch.bfloat16),
+                   up_proj=torch.eye(intermediate, width, dtype=torch.bfloat16),
+                   down_proj=torch.eye(width, intermediate, dtype=torch.bfloat16))
+    matrices = []
+
+    def quantize(name, weight, covariance, device):
+        assert name.startswith("layer.experts.0.")
+        assert covariance["count"] == 1024
+        matrices.append(covariance["H"].clone())
+        return SimpleNamespace(packed={4: {"mock": weight - .25}}, metrics={4: {}}, reconstruction=weight - .25)
+
+    def reconstruct(packed, shape, device):
+        return packed["mock"]
+
+    monkeypatch.setattr(numerics, "encode_expert", quantize)
+    monkeypatch.setattr(numerics, "reconstruct", reconstruct)
+    packed, metrics = experts.fit_expert(bank, 0, weights, prefix="layer.experts.0", workspace=workspace, swiglu_limit=2)
+    rows, coefficients, natural, identity = bank.selection(0)
+    assert natural == 4 and identity == 1018
+    assert set(metrics) == set(weights)
+    assert torch.equal(matrices[0], matrices[1])
+    assert torch.equal(matrices[0], inputs.float().T @ inputs.float() + torch.eye(width) * identity)
+    gate = (inputs[rows] @ (weights["gate_proj"] - .25).T).clamp(max=2)
+    up = (inputs[rows] @ (weights["up_proj"] - .25).T).clamp(-2, 2)
+    activated = torch.nn.functional.silu(gate) * up
+    scaled = activated.float() * coefficients[:, None]
+    expected_down = scaled.T @ scaled + torch.eye(intermediate) * identity
+    torch.testing.assert_close(matrices[2], expected_down)
+    replay = torch.cat([v.clone() for v in experts.replay_expert(
+        bank, 0, packed, workspace=workspace, swiglu_limit=2)])
+    assert torch.equal(replay, activated[:natural] @ (weights["down_proj"] - .25).T)

@@ -176,7 +176,7 @@ class ExpertBank:
                        candidate_gamma_contract=CANDIDATE_GAMMA_CONTRACT, identity_contract=IDENTITY_CONTRACT)
 
     @torch.inference_mode()
-    def combine(self, expert_outputs):
+    def combine(self, expert_outputs, *, weighted_buffer=None):
         """Call expert_outputs(expert, natural_rows) for ordered unweighted chunks."""
         result = torch.zeros_like(self.inputs)
         for expert in range(self.experts):
@@ -189,19 +189,126 @@ class ExpertBank:
                         or output.shape[1] != result.shape[1] or output.device != result.device
                         or output.dtype not in (torch.bfloat16, torch.float32)):
                     raise ValueError("invalid routed expert output chunk")
-                weighted = output.float() * gamma[offset:end, None]
+                if weighted_buffer is None or len(weighted_buffer) < len(output):
+                    weighted_buffer = torch.empty(output.shape, device=result.device, dtype=torch.float32)
+                weighted = weighted_buffer[:len(output)]
+                if weighted.shape != output.shape or weighted.dtype != result.dtype or weighted.device != result.device:
+                    raise ValueError("incorrect weighted reduction workspace")
+                torch.mul(output, gamma[offset:end, None], out=weighted)
                 result.index_add_(0, rows[offset:end], weighted)
                 offset = end
             if offset != len(rows):
                 raise ValueError("incomplete routed expert output")
+        for part in result.split(2048):
+            if not bool(torch.isfinite(part).all()):
+                raise ValueError("nonfinite routed expert sum")
         return result
 
 
-def raw_covariance(accumulator, identity_rows):
-    """Apply the low-row fallback to raw XTX before any count normalization."""
-    if identity_rows < 0 or accumulator.count + identity_rows <= 0:
-        raise ValueError("invalid expert Hessian count")
-    matrix = accumulator.snapshot()
-    matrix.diagonal().add_(identity_rows)
-    return dict(H=matrix, count=accumulator.count + identity_rows,
-                finalized=False, identity_rows=identity_rows)
+@dataclass
+class ExpertWorkspace:
+    """The same native GEMM buffers serve fitting, replay and held-out batches."""
+    gather: torch.Tensor
+    inputs: torch.Tensor
+    fused: torch.Tensor
+    activated: torch.Tensor
+    scaled: torch.Tensor
+    outputs: torch.Tensor
+
+    @classmethod
+    def allocate(cls, width, intermediate, *, device, chunk_rows=2048):
+        if min(width, intermediate, chunk_rows) <= 0:
+            raise ValueError("invalid expert workspace geometry")
+        def bank(features, dtype):
+            return torch.empty((chunk_rows, features), dtype=dtype, device=device)
+        return cls(bank(width, torch.float32), bank(width, torch.bfloat16),
+                   bank(intermediate * 2, torch.bfloat16), bank(intermediate, torch.bfloat16),
+                   bank(intermediate, torch.float32), bank(width, torch.bfloat16))
+
+    def activate(self, gathered, gate_up, limit):
+        import torch.nn.functional as F
+        count = len(gathered)
+        inputs, fused = self.inputs[:count], self.fused[:count]
+        inputs.copy_(gathered)
+        torch.mm(inputs, gate_up.T, out=fused)
+        gate, up = fused.chunk(2, dim=-1)
+        # Native order: clamp before SiLU, then multiply in BF16.
+        F.silu(gate.clamp_(max=limit), inplace=True)
+        torch.mul(gate, up.clamp_(min=-limit, max=limit), out=self.activated[:count])
+        return self.activated[:count]
+
+
+_PARTS = ("gate_proj", "up_proj", "down_proj")
+
+
+def _reconstruct(packed, part, shape, device):
+    from .numerics import reconstruct
+    return reconstruct(packed[part], list(shape), device)
+
+
+def _gate_up(packed, workspace):
+    shape = workspace.activated.shape[-1], workspace.inputs.shape[-1]
+    return torch.cat([_reconstruct(packed, part, shape, workspace.inputs.device)
+                      for part in _PARTS[:2]], dim=0)
+
+
+@torch.inference_mode()
+def fit_expert(bank, expert, weights, *, prefix, workspace, swiglu_limit):
+    """Encode one K4 expert from its selected observations and return CPU packed weights.
+
+    Weights and return keys are gate_proj/up_proj/down_proj. The caller seals
+    packed buffers and evidence in groups. Recovery replay only needs packed.
+    """
+    from .numerics import covariance_accumulator, encode_expert, raw_hessian
+    intermediate, width = workspace.activated.size(1), workspace.inputs.size(1)
+    shapes = ((intermediate, width), (intermediate, width), (width, intermediate))
+    if set(weights) != set(_PARTS) or any(
+            weights[key].shape != shape or weights[key].dtype != torch.bfloat16
+            for key, shape in zip(_PARTS, shapes, strict=True)):
+        raise ValueError("GLM expert source weight contract mismatch")
+    rows, gamma, _, identity = bank.selection(expert)
+    device = bank.inputs.device
+    packed, metrics = {}, {}
+
+    def encode(part, covariance):
+        weight = weights[part].to(device)
+        encoded = encode_expert(f"{prefix}.{part}", weight, covariance, device)
+        packed[part] = encoded.packed[4]
+        metrics[part] = encoded.metrics[4]
+        return encoded.reconstruction
+
+    acc = covariance_accumulator(width, device=device)
+    for chunk in bank.chunks(rows, workspace.gather):
+        acc.add(chunk)
+    covariance = raw_hessian(acc, identity_rows=identity)
+    del acc
+    fused = torch.cat([encode(part, covariance) for part in _PARTS[:2]], dim=0)
+    del covariance
+    acc = covariance_accumulator(intermediate, device=device)
+    offset = 0
+    for chunk in bank.chunks(rows, workspace.gather):
+        count = len(chunk)
+        activation = workspace.activate(chunk, fused, swiglu_limit)
+        # The linear down output is route weighted. Apply the identical weight
+        # to its Hessian observations, including hypothetical candidate routes.
+        torch.mul(activation, gamma[offset:offset + count, None], out=workspace.scaled[:count])
+        acc.add(workspace.scaled[:count])
+        offset += count
+    encode("down_proj", raw_hessian(acc, identity_rows=identity))
+    return packed, metrics
+
+
+def replay_expert(bank, expert, packed, *, workspace, swiglu_limit):
+    """Reconstruct the serialized expert for the ordered natural-route sum."""
+    part = bank.native.part(expert)
+    rows = bank.native.rows[part]
+    if not len(rows):
+        return
+    fused = _gate_up(packed, workspace)
+    shape = (workspace.inputs.size(1), workspace.activated.size(1))
+    down = _reconstruct(packed, "down_proj", shape, bank.inputs.device)
+    for chunk in bank.chunks(rows, workspace.gather):
+        activation = workspace.activate(chunk, fused, swiglu_limit)
+        out = workspace.outputs[:len(chunk)]
+        torch.mm(activation, down.T, out=out)
+        yield out
