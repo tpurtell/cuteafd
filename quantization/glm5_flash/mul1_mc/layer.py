@@ -183,14 +183,14 @@ class LayerPass:
         block = self.source.load_block(index, self.device)
         return self.block(index, incoming, block)
 
-    def block(self, index, incoming, block, *, extra_fits=()):
+    def block(self, index, incoming, block):
         label = f"layer-{index:02d}"
         successor = label+"-next"
         if (self.writer.group_complete(label) and self.stages.load(successor)
                 and (self.metrics_dir / f"{label}.json").is_file()):
             return successor
         prefix = PREFIX+f"layers.{index}."
-        fit_stages = list(extra_fits)
+        fit_stages = []
         def fit(stage, leaves, inputs):
             modules = {prefix+name: self.math.module(block, name) for name in leaves}
             fit_stages.append(self.fit(label+"-"+stage, modules, inputs))
@@ -290,17 +290,12 @@ class LayerPass:
         adapter = mtp.load_mtp(self.source, self.device)
         norm = self.norm()
         embedding = self.source.tensor(PREFIX+"embed_tokens.weight", self.device)
-        def envelope(start):
-            for i, row in self.rows(incoming,"hidden",start=start):
-                aligned = mtp.aligned_inputs(row["hidden"], self.tokens[i].to(self.device), embedding, norm)
-                yield i, dict(x=adapter.envelope(aligned), position_ids=aligned["position_ids"])
-        stage = self.save("mtp-envelope", envelope)
-        fitted = self.fit("mtp-envelope-fit", {PREFIX+"layers.45.eh_proj": adapter.eh_proj},
-                          lambda: (r["x"] for _,r in self.rows(stage,"x")))
         def fused(start):
-            for i, row in self.rows(stage,start=start):
-                yield i, dict(hidden=adapter.eh_proj(row["x"]), position_ids=row["position_ids"])
+            for i, row in self.rows(incoming, "hidden", start=start):
+                aligned = mtp.aligned_inputs(row["hidden"], self.tokens[i].to(self.device), embedding, norm)
+                yield i, dict(hidden=adapter.eh_proj(adapter.envelope(aligned)),
+                              position_ids=aligned["position_ids"])
         start = self.save("mtp-fused", fused)
-        result = self.block(45, start, adapter.decoder, extra_fits=[fitted])
-        self.stages.retire(stage,start,fitted)
+        result = self.block(45, start, adapter.decoder)
+        self.stages.retire(start)
         return result
