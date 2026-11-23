@@ -970,6 +970,7 @@ pub(crate) struct Hy4Engine<'a> {
     pub(crate) skip_routed_experts: bool,
     pub(crate) dump_dir: Option<std::path::PathBuf>,
     pub(crate) mla_witness: Option<(usize, std::path::PathBuf)>,
+    pub(crate) mla_layer_trace: Option<(Vec<usize>, std::path::PathBuf)>,
     mla_oracle_splits: Option<MlaSplitPlan>,
     max_seq_pages: usize,
     graphs_enabled: Cell<bool>,
@@ -1209,6 +1210,7 @@ impl<'a> Hy4Engine<'a> {
             skip_routed_experts,
             dump_dir: None,
             mla_witness: None,
+            mla_layer_trace: None,
             mla_oracle_splits: None,
             max_seq_pages: max_seq_pages.max(16),
             graphs_enabled: Cell::new(false),
@@ -1455,6 +1457,29 @@ impl<'a> Hy4Engine<'a> {
         for r in &self.ranks {
             r.cache.inventory(inventory)?;
         }
+        Ok(())
+    }
+
+    fn mla_layer_trace_dir(&self, position: usize) -> Option<&std::path::Path> {
+        let (positions, dir) = self.mla_layer_trace.as_ref()?;
+        positions.contains(&position).then_some(dir.as_path())
+    }
+
+    fn dump_mla_layer_trace(&self, batch: &ActiveBatch, layer: usize, name: &str,
+        src: CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
+        if !batch.decode_attention || batch.rows != 1 {
+            return Ok(());
+        }
+        let position = batch.max_seq_end;
+        let Some(dir) = self.mla_layer_trace_dir(position) else { return Ok(()); };
+        let rank = &self.ranks[0];
+        ensure!(bytes <= src.bytes, "Hy4 layer trace {name} extent exceeds its scratch buffer");
+        let mut raw = vec![0u8; bytes];
+        rank.stream.drain()?;
+        rank.device.run(|| rank.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes, ..src }))?;
+        let dir = dir.join(format!("p{position}-l{layer:02}"));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(name), raw)?;
         Ok(())
     }
 
@@ -1767,7 +1792,9 @@ impl<'a> Hy4Engine<'a> {
         let graphed = priority == ReadPriority::Decode
             && self.graphs_active()
             && !self.skip_routed_experts
-            && self.dump_dir.is_none();
+            && self.dump_dir.is_none()
+            // Leave only witnessed rows eager so intermediate scratch is visible.
+            && self.mla_layer_trace_dir(max_seq_end).is_none();
         let all_single_row = members.len() == rows && rows <= 64;
         let pt_stride = max_seq_end.div_ceil(PAGE_ROWS).max(1);
         let swa_pt_stride = if graphed && all_single_row {
@@ -2340,10 +2367,14 @@ impl<'a> Hy4Engine<'a> {
         }
 
         // Eager path (prefill, ungraphed decode/scoring, dump_dir, or skip_routed_experts).
+        let r0 = &self.ranks[0];
+        let residual = if use_a { r0.scratch.r_a.buffer } else { r0.scratch.r_b.buffer };
+        self.dump_mla_layer_trace(batch, layer, "layer-in.bf16", residual, HC * H * 2)?;
         if let Some(slot) = engram_slot {
             for r in &self.ranks {
                 r.device.run(|| r.engram_compute(&p, slot, rows, use_a))?;
             }
+            self.dump_mla_layer_trace(batch, layer, "engram-out.bf16", residual, HC * H * 2)?;
             if batch.dump_rows > 0 && layer <= 3 {
                 let r_cur = if use_a { self.ranks[0].scratch.r_a.buffer } else { self.ranks[0].scratch.r_b.buffer };
                 self.dump_bf16(&format!("l{layer:02}_after_engram"), r_cur, batch.dump_rows * HC * H)?;
@@ -2356,6 +2387,9 @@ impl<'a> Hy4Engine<'a> {
                 r.cache.swa_layer_bank(self.swa_index_of[&layer])?
             };
             r.device.run(|| r.attn_pre(&p, layer, is_sparse, local_heads, rows, use_a, kv_cache_buf))?;
+            if r.device.id == r0.device.id {
+                self.dump_mla_layer_trace(batch, layer, "ihc-attn-pre.bf16", r.scratch.y.buffer, H * 2)?;
+            }
             if is_sparse {
                 let dsa_idx = self.dsa_index_of[&layer];
                 r.device.run(|| r.dsa_index_wk(&p, rows))?;
@@ -2367,6 +2401,7 @@ impl<'a> Hy4Engine<'a> {
             r.device.run(|| r.attn_out(&p, layer, is_sparse, gpus, local_heads, rows))?;
         }
         self.reduce_tp2_f32_to_bf16(rows, H, Some(&format!("{p}.self_attn.o_proj")))?;
+        self.dump_mla_layer_trace(batch, layer, "attn-proj.bf16", self.ranks[0].scratch.delta.buffer, H * 2)?;
         if batch.dump_rows > 0 && layer <= 3 {
             let s0 = &self.ranks[0].scratch;
             let dump_rows = batch.dump_rows;
@@ -2384,6 +2419,10 @@ impl<'a> Hy4Engine<'a> {
             r.device.run(|| r.post_attn_ihc(&p, rows, use_a))?;
         }
         batch.use_a = !batch.use_a;
+        let s = &self.ranks[0].scratch;
+        self.dump_mla_layer_trace(batch, layer, "ihc-attn-post.bf16",
+            if batch.use_a { s.r_a.buffer } else { s.r_b.buffer }, HC * H * 2)?;
+        self.dump_mla_layer_trace(batch, layer, "ihc-ffn-pre.bf16", s.y.buffer, H * 2)?;
         Ok(())
     }
 
@@ -2493,6 +2532,16 @@ impl<'a> Hy4Engine<'a> {
             }
         }
         batch.use_a = !batch.use_a;
+        let s = &self.ranks[0].scratch;
+        if !is_dense {
+            self.dump_mla_layer_trace(batch, layer, "route-ids.u32", s.route_ids.buffer, TOPK * 4)?;
+            self.dump_mla_layer_trace(batch, layer, "route-weights.f32", s.route_weights.buffer, TOPK * 4)?;
+            self.dump_mla_layer_trace(batch, layer, "routed-out.bf16", s.routed_out.buffer, H * 2)?;
+        }
+        self.dump_mla_layer_trace(batch, layer, "ffn-combined.bf16", s.delta.buffer, H * 2)?;
+        self.dump_mla_layer_trace(batch, layer, "ffn-norm.bf16", s.delta_norm.buffer, H * 2)?;
+        self.dump_mla_layer_trace(batch, layer, "layer-out.bf16",
+            if batch.use_a { s.r_a.buffer } else { s.r_b.buffer }, HC * H * 2)?;
 
         if batch.dump_rows > 0 {
             let dump_rows = batch.dump_rows;

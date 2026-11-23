@@ -66,6 +66,9 @@ pub(crate) struct GoldenArgs {
     /// Writes to --dump-dir without disabling graph capture.
     #[arg(long, requires_all = ["dump_dir", "decode_graphs"])]
     pub(crate) mla_witness_position: Option<usize>,
+    /// Capture layer boundaries on these scored decode positions (TP1 only).
+    #[arg(long, value_delimiter = ',', requires_all = ["dump_dir", "decode_graphs"], conflicts_with = "mla_witness_position")]
+    pub(crate) mla_layer_trace_positions: Vec<usize>,
     /// Save FP32 logits (`logits.bin`) to this directory.
     #[arg(long, hide = true)]
     pub(crate) save_logits: Option<PathBuf>,
@@ -376,6 +379,11 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         ensure!(args.decode && args.resume_at.is_empty() && !args.skip_routed_experts,
             "--mla-witness-position requires normal --decode with expert weights");
         engine.mla_witness = Some((position, args.dump_dir.clone().context("witness dump directory")?));
+    } else if !args.mla_layer_trace_positions.is_empty() {
+        ensure!(args.decode && args.resume_at.is_empty() && !args.skip_routed_experts && devices.len() == 1,
+            "--mla-layer-trace-positions requires TP1 --decode with expert weights");
+        engine.mla_layer_trace = Some((args.mla_layer_trace_positions.clone(),
+            args.dump_dir.clone().context("layer trace dump directory")?));
     } else {
         engine.dump_dir = args.dump_dir.clone();
     }
