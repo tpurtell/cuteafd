@@ -5,7 +5,7 @@
 use super::cache::{Hy4CacheRank, Hy4Placement, Hy4Prefix};
 use super::graphs::{Hy4Graphs, Key as GraphKey, Section as GraphSection};
 use super::native::Hy4NativeScratch;
-use super::programs::Hy4Programs;
+use super::programs::{Hy4Programs, MLA_SPLIT_ROWS, MlaSplitPlan};
 use super::weights::{Hy4EngramHost, Hy4EngramWave, Hy4RankWeights};
 use crate::shared::decode_graph::device::{self as graph_device, Cycle as GraphCycle};
 use crate::shared::distributed_head::Handoff;
@@ -382,6 +382,7 @@ struct RankRuntime<'a> {
     stream: Rc<Stream<'a>>,
     peer_ready: Event<'a>,
     programs: Hy4Programs<'a>,
+    mla_splits: MlaSplitPlan,
     weights: Hy4RankWeights<'a>,
     cache: Rc<Hy4CacheRank<'a>>,
     scratch: RankScratch<'a>,
@@ -568,7 +569,7 @@ impl<'a> RankRuntime<'a> {
         }
     }
 
-    fn dsa_attn(&self, kv_cache_buf: CuteafdDeviceBuffer, rows: usize) -> Result<()> {
+    fn dsa_attn(&self, kv_cache_buf: CuteafdDeviceBuffer, rows: usize, decode: bool) -> Result<()> {
         // SAFETY: cache and scratch live through stream drain.
         unsafe {
             self.programs.mla_dsa_decode.launch(
@@ -582,7 +583,8 @@ impl<'a> RankRuntime<'a> {
                     self.scratch.lse_out.buffer.ptr,
                     self.scratch.attn_scratch.buffer.ptr,
                 ],
-                &[Scalar::I32(rows as i32), Scalar::I32(rows as i32), Scalar::I64(CANDIDATE_TOPK as i64), Scalar::I32(1)],
+                &[Scalar::I32(rows as i32), Scalar::I32(rows as i32), Scalar::I64(CANDIDATE_TOPK as i64),
+                    Scalar::I32(if decode { self.mla_splits.dsa } else { 1 })],
                 self.stream.raw,
             )
         }
@@ -594,12 +596,12 @@ impl<'a> RankRuntime<'a> {
         rows: usize,
         members_len: usize,
         swa_pt_stride: usize,
-        all_single_row: bool,
+        decode: bool,
     ) -> Result<()> {
-        let swa_prog = if all_single_row {
-            &self.programs.mla_swa_decode
+        let (swa_prog, splits) = if decode {
+            (&self.programs.mla_swa_decode, self.mla_splits.swa)
         } else {
-            &self.programs.mla_swa_extend
+            (&self.programs.mla_swa_extend, 1)
         };
         // SAFETY: cache and scratch live through stream drain.
         unsafe {
@@ -618,7 +620,7 @@ impl<'a> RankRuntime<'a> {
                     Scalar::I32(rows as i32),
                     Scalar::I32(members_len as i32),
                     Scalar::I64(swa_pt_stride as i64),
-                    Scalar::I32(1),
+                    Scalar::I32(splits),
                 ],
                 self.stream.raw,
             )
@@ -941,6 +943,7 @@ struct ActiveBatch {
     graphed: bool,
     ffn_fused_layer: Option<usize>,
     post_attn_deferred: bool,
+    decode_attention: bool,
     dump_rows: usize,
     use_a: bool,
     members: Vec<ActiveMember>,
@@ -1096,16 +1099,13 @@ impl<'a> Hy4Engine<'a> {
             let device = devices[rank];
             let stream = Rc::new(Stream::new(device)?);
             let peer_ready = Event::new(device)?;
-            let progs = device.run(|| Hy4Programs::load(programs, gpus, kv_format, max_rows))?;
-            // DenseMlaForwardKernel only writes split-K partials when active_splits > 1,
-            // and Hy4Engine launches active_splits = 1 (never > 1 above 64 rows), matching UnitLayout.
-            let split_k_cap = max_rows.min(64) * 16 * (64 / gpus) * (512 * 2 + 4);
-            let attn_scratch = progs
-                .dsa_scratch_bytes
-                .min(split_k_cap)
-                .max(progs.swa_decode_scratch_bytes.min(split_k_cap))
-                .max(progs.swa_extend_scratch_bytes.min(split_k_cap))
-                .max(1024);
+            let progs = device.run(|| Hy4Programs::load(programs, gpus, kv_format))?;
+            let sms = device.run(|| device.library.sm_count())?;
+            let split_rows = max_rows.min(MLA_SPLIT_ROWS);
+            let mla_splits = MlaSplitPlan::new(&progs, max_context, split_rows, sms)?;
+            // Split-capable launches never exceed the admitted decode/verify rows.
+            let split_k_cap = split_rows * 16 * (64 / gpus) * (512 * 2 + 4);
+            let attn_scratch = split_k_cap.max(1024);
             let cache = Rc::new(Hy4CacheRank::new(
                 vec![stream.clone()],
                 &cfg,
@@ -1133,13 +1133,14 @@ impl<'a> Hy4Engine<'a> {
             )?;
             let bf16_add = device.run(|| device.library.bf16_add())?;
             let f32_add = device.run(|| device.library.f32_add())?;
-            let quantize_grid = Fp8QuantizeGrid::new(device.run(|| device.library.sm_count())?, None)?;
+            let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
             ranks.push(RankRuntime {
                 graphs: Hy4Graphs::new(),
                 device,
                 stream,
                 peer_ready,
                 programs: progs,
+                mla_splits,
                 weights,
                 cache,
                 scratch,
@@ -1567,7 +1568,6 @@ impl<'a> Hy4Engine<'a> {
         let mut engram_members: Vec<([u32; 2], &[u32])> = Vec::with_capacity(unit.segments.len());
 
         let mut max_seq_end = 0usize;
-        let mut all_single_row = true;
         let mut members = Vec::with_capacity(unit.segments.len());
         let mut row_cursor = 0usize;
 
@@ -1609,9 +1609,6 @@ impl<'a> Hy4Engine<'a> {
                 p.units.len()
             );
             ensure!(p.slot < self.max_sequences, "Hy4 sequence slot {} out of range", p.slot);
-            if n != 1 {
-                all_single_row = false;
-            }
             max_seq_end = max_seq_end.max(pos_end);
             swa_cu_bytes.extend_from_slice(&(row_cursor as i32).to_le_bytes());
             swa_seqlens_bytes.extend_from_slice(&(pos_end as i32).to_le_bytes());
@@ -1665,7 +1662,7 @@ impl<'a> Hy4Engine<'a> {
             && self.graphs_active()
             && !self.skip_routed_experts
             && self.dump_dir.is_none();
-        let all_single_row = all_single_row && rows <= 64;
+        let all_single_row = members.len() == rows && rows <= 64;
         let pt_stride = max_seq_end.div_ceil(PAGE_ROWS).max(1);
         let swa_pt_stride = if graphed && all_single_row {
             self.max_seq_pages
@@ -1790,6 +1787,7 @@ impl<'a> Hy4Engine<'a> {
             graphed,
             ffn_fused_layer: None,
             post_attn_deferred: false,
+            decode_attention: priority == ReadPriority::Decode && rows <= MLA_SPLIT_ROWS,
             dump_rows,
             use_a: true,
             members,
@@ -2043,6 +2041,7 @@ impl<'a> Hy4Engine<'a> {
         let swa_pt_stride = batch.swa_pt_stride;
         let members_len = batch.members.len();
         let all_single_row = batch.all_single_row;
+        let decode_attention = batch.decode_attention;
         let routed_scale = self.cfg.routed_scaling_factor as f32;
         let skip_routed = self.skip_routed_experts;
 
@@ -2094,7 +2093,7 @@ impl<'a> Hy4Engine<'a> {
                                 })
                             },
                         )?;
-                        r.device.run(|| r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, false))?;
+                        r.device.run(|| r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, decode_attention))?;
                         r.graphs.run(
                             GraphKey { layer, rows, section: GraphSection::SwaExtendPost },
                             &r.stream,
@@ -2134,7 +2133,7 @@ impl<'a> Hy4Engine<'a> {
                         &r.stream,
                         || {
                             r.device.run(|| {
-                                r.dsa_attn(kv_cache_buf, rows)?;
+                                r.dsa_attn(kv_cache_buf, rows, decode_attention)?;
                                 r.attn_out(&p, layer, true, 1, local_heads, rows)?;
                                 r.post_attn_ihc(&p, rows, use_a)?;
                                 if is_dense {
@@ -2189,7 +2188,7 @@ impl<'a> Hy4Engine<'a> {
                                 })
                             },
                         )?;
-                        r.device.run(|| r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, false))?;
+                        r.device.run(|| r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, decode_attention))?;
                         r.graphs.run(
                             GraphKey { layer, rows, section: GraphSection::SwaExtendPost },
                             &r.stream,
@@ -2217,7 +2216,7 @@ impl<'a> Hy4Engine<'a> {
                         &r.stream,
                         || {
                             r.device.run(|| {
-                                r.dsa_attn(kv_cache_buf, rows)?;
+                                r.dsa_attn(kv_cache_buf, rows, decode_attention)?;
                                 r.attn_out(&p, layer, true, gpus, local_heads, rows)
                             })
                         },
@@ -2251,9 +2250,9 @@ impl<'a> Hy4Engine<'a> {
                 let dsa_idx = self.dsa_index_of[&layer];
                 r.device.run(|| r.dsa_index_wk(&p, rows))?;
                 run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, false)?;
-                r.device.run(|| r.dsa_attn(kv_cache_buf, rows))?;
+                r.device.run(|| r.dsa_attn(kv_cache_buf, rows, decode_attention))?;
             } else {
-                r.device.run(|| r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, all_single_row))?;
+                r.device.run(|| r.swa_attn(kv_cache_buf, rows, members_len, swa_pt_stride, decode_attention))?;
             }
             r.device.run(|| r.attn_out(&p, layer, is_sparse, gpus, local_heads, rows))?;
         }

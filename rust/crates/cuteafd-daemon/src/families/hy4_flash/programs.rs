@@ -1,7 +1,51 @@
 //! Validated AOT program table for Hy4-flash TP1 (`hy4f_*`) and TP2 (`hy4f2_*`).
-use anyhow::{ensure, Result};
+use crate::shared::launch_grid::mla_wave_balanced_splits;
+use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::programs::{Program, Programs};
 use cuteafd_loader::families::hy4_flash::Hy4KvCache;
+
+pub(super) const MLA_SPLIT_ROWS: usize = 64;
+
+#[derive(Clone, Copy)]
+pub(super) struct MlaSplitPlan {
+    pub dsa: i32,
+    pub swa: i32,
+}
+
+impl MlaSplitPlan {
+    pub(super) fn new(programs: &Hy4Programs<'_>, context: usize, rows: usize, sms: usize) -> Result<Self> {
+        let choose = |program: &Program<'_>, is_swa: bool| -> Result<i32> {
+            let spec = program.spec();
+            let read = |name: &str| -> Result<usize> {
+                let value = spec.geometry[name].as_u64()
+                    .with_context(|| format!("{} lacks MLA geometry {name}", spec.name))?;
+                Ok(usize::try_from(value)?)
+            };
+            let max_splits = read("num_splits")?;
+            let heads = read("heads")?;
+            let limit = if is_swa { 512 } else { 2048 };
+            let expected_heads = if is_swa { 64 } else { 32 } / programs.tp;
+            ensure!(rows <= spec.capacity_rows as usize && heads == expected_heads
+                && (1..=16).contains(&max_splits) && read("max_context")? == limit,
+                "{} has incompatible MLA split geometry for {rows} rows", spec.name);
+            // Both decode exports use 64-record chunks and eight heads per CTA.
+            // SWA's 512-token window can straddle an extra chunk.
+            let chunks = if is_swa && context > limit {
+                limit.div_ceil(64) + 1
+            } else {
+                context.min(limit).div_ceil(64)
+            };
+            // Plan for a single query using startup-stable context capacity.
+            // Changing partitions with live width or a neighbor's history
+            // would break exact verify and invalidate row-only graph keys.
+            Ok(mla_wave_balanced_splits(chunks, heads / 8, sms, max_splits) as i32)
+        };
+        Ok(Self {
+            dsa: choose(&programs.mla_dsa_decode, false)?,
+            swa: choose(&programs.mla_swa_decode, true)?,
+        })
+    }
+}
 
 /// Resolved, ABI-validated Hy4-flash coordinator AOT programs for one GPU rank.
 pub(crate) struct Hy4Programs<'a> {
@@ -24,9 +68,6 @@ pub(crate) struct Hy4Programs<'a> {
     pub(crate) mla_dsa_decode: Program<'a>,
     pub(crate) mla_swa_decode: Program<'a>,
     pub(crate) mla_swa_extend: Program<'a>,
-    pub(crate) dsa_scratch_bytes: usize,
-    pub(crate) swa_decode_scratch_bytes: usize,
-    pub(crate) swa_extend_scratch_bytes: usize,
     // 16-head compressed indexer
     pub(crate) indexer_query_rope: Program<'a>,
     pub(crate) indexer_pool_group: Program<'a>,
@@ -67,7 +108,6 @@ impl<'a> Hy4Programs<'a> {
         programs: &'a Programs<'a>,
         tp: usize,
         kv_format: Hy4KvCache,
-        max_rows: usize,
     ) -> Result<Self> {
         ensure!(matches!(tp, 1 | 2), "Hy4-flash programs support TP1 or TP2, got {tp}");
         let prefix = if tp == 1 { "hy4f" } else { "hy4f2" };
@@ -79,17 +119,6 @@ impl<'a> Hy4Programs<'a> {
             let name = format!("{prefix}_{suffix}");
             programs.program(&name, ptrs)
         };
-        let scratch = |suffix: &str, _rows: usize| -> Result<usize> {
-            let name = format!("{prefix}_{suffix}");
-            let bytes = programs
-                .spec(&name)?
-                .scratch
-                .get("scratch")
-                .copied()
-                .unwrap_or(0);
-            Ok(usize::try_from(bytes)?.max(1024))
-        };
-
         let dsa_attn_name = format!("mla_dsa_decode_{kv}");
         let swa_dec_name = format!("mla_swa_decode_{kv}");
         let swa_ext_name = format!("mla_swa_extend_{kv}");
@@ -143,9 +172,6 @@ impl<'a> Hy4Programs<'a> {
             mla_dsa_decode: load(&dsa_attn_name, attn_ptrs)?,
             mla_swa_decode: load(&swa_dec_name, attn_ptrs)?,
             mla_swa_extend: load(&swa_ext_name, attn_ptrs)?,
-            dsa_scratch_bytes: scratch(&dsa_attn_name, max_rows)?,
-            swa_decode_scratch_bytes: scratch(&swa_dec_name, max_rows.min(64))?,
-            swa_extend_scratch_bytes: scratch(&swa_ext_name, max_rows)?,
             indexer_query_rope: load(
                 "indexer_query_rope",
                 &["q_raw", "w_raw", "positions", "inv_freq", "q_out", "w_out"],

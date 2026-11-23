@@ -1,4 +1,4 @@
-//! Device-sized launch policy for the grid-stride FP8 expert-input quantizer.
+//! Device-sized launch policies for coordinator kernels.
 use std::num::NonZeroUsize;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -7,6 +7,23 @@ pub(crate) enum SmCountError {
     Unavailable,
     #[error("--sms must be between 1 and the device's {actual} multiprocessors, got {requested}")]
     InvalidLimit { requested: usize, actual: usize },
+}
+
+/// Native AOT counterpart of SparkInfer dense MLA's `_wave_balanced_splits`.
+/// Minimize idle SMs in the final wave (up to three waves), preferring fewer
+/// splits on a tie.
+pub(crate) fn mla_wave_balanced_splits(chunks: usize, tiles: usize, sms: usize, max_splits: usize) -> usize {
+    let chunks = chunks.max(1);
+    let sms = sms.max(1);
+    let mut best = (usize::MAX, 1);
+    for per_cta in 1..=chunks {
+        let splits = chunks.div_ceil(per_cta);
+        let active = tiles.max(1) * splits;
+        if active.div_ceil(sms) <= 3 {
+            best = best.min(((sms - active % sms) % sms, splits));
+        }
+    }
+    best.1.min(max_splits.max(1))
 }
 
 /// Cached at engine creation, so captured and ordinary launches use the same
@@ -36,6 +53,15 @@ impl Fp8QuantizeGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mla_wave_balance_follows_live_sms_and_the_export_cap() {
+        assert_eq!(mla_wave_balanced_splits(1, 4, 188, 16), 1);
+        assert_eq!(mla_wave_balanced_splits(32, 4, 188, 16), 16);
+        assert_eq!(mla_wave_balanced_splits(32, 4, 32, 16), 8);
+        assert_eq!(mla_wave_balanced_splits(9, 8, 188, 8), 8);
+        assert_eq!(mla_wave_balanced_splits(32, 1024, 188, 16), 1);
+    }
 
     #[test]
     fn workload_rounds_up_tiles_and_blocks() {
