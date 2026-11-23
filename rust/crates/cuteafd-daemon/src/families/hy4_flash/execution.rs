@@ -571,6 +571,10 @@ impl<'a> RankRuntime<'a> {
     }
 
     fn dsa_attn(&self, kv_cache_buf: CuteafdDeviceBuffer, rows: usize, decode: bool) -> Result<()> {
+        self.dsa_attn_splits(kv_cache_buf, rows, if decode { self.mla_splits.dsa } else { 1 })
+    }
+
+    fn dsa_attn_splits(&self, kv_cache_buf: CuteafdDeviceBuffer, rows: usize, splits: i32) -> Result<()> {
         // SAFETY: cache and scratch live through stream drain.
         unsafe {
             self.programs.mla_dsa_decode.launch(
@@ -585,7 +589,7 @@ impl<'a> RankRuntime<'a> {
                     self.scratch.attn_scratch.buffer.ptr,
                 ],
                 &[Scalar::I32(rows as i32), Scalar::I32(rows as i32), Scalar::I64(CANDIDATE_TOPK as i64),
-                    Scalar::I32(if decode { self.mla_splits.dsa } else { 1 })],
+                    Scalar::I32(splits)],
                 self.stream.raw,
             )
         }
@@ -599,11 +603,13 @@ impl<'a> RankRuntime<'a> {
         swa_pt_stride: usize,
         decode: bool,
     ) -> Result<()> {
-        let (swa_prog, splits) = if decode {
-            (&self.programs.mla_swa_decode, self.mla_splits.swa)
-        } else {
-            (&self.programs.mla_swa_extend, 1)
-        };
+        self.swa_attn_splits(kv_cache_buf, rows, members_len, swa_pt_stride, decode,
+            if decode { self.mla_splits.swa } else { 1 })
+    }
+
+    fn swa_attn_splits(&self, kv_cache_buf: CuteafdDeviceBuffer, rows: usize,
+        members_len: usize, swa_pt_stride: usize, decode: bool, splits: i32) -> Result<()> {
+        let swa_prog = if decode { &self.programs.mla_swa_decode } else { &self.programs.mla_swa_extend };
         // SAFETY: cache and scratch live through stream drain.
         unsafe {
             swa_prog.launch(
@@ -963,6 +969,8 @@ pub(crate) struct Hy4Engine<'a> {
     pub(crate) engram: Hy4EngramHost,
     pub(crate) skip_routed_experts: bool,
     pub(crate) dump_dir: Option<std::path::PathBuf>,
+    pub(crate) mla_witness: Option<(usize, std::path::PathBuf)>,
+    mla_oracle_splits: Option<MlaSplitPlan>,
     max_seq_pages: usize,
     graphs_enabled: Cell<bool>,
     swa_pt_host: Vec<i32>,
@@ -1200,6 +1208,8 @@ impl<'a> Hy4Engine<'a> {
             engram,
             skip_routed_experts,
             dump_dir: None,
+            mla_witness: None,
+            mla_oracle_splits: None,
             max_seq_pages: max_seq_pages.max(16),
             graphs_enabled: Cell::new(false),
             swa_pt_host,
@@ -1247,6 +1257,7 @@ impl<'a> Hy4Engine<'a> {
     }
 
     pub(crate) fn golden_mla_splits(&mut self, dsa: bool, swa: bool) {
+        self.mla_oracle_splits = self.ranks.first().map(|r| r.mla_splits);
         for rank in &mut self.ranks {
             if !dsa { rank.mla_splits.dsa = 1; }
             if !swa { rank.mla_splits.swa = 1; }
@@ -1444,6 +1455,61 @@ impl<'a> Hy4Engine<'a> {
         for r in &self.ranks {
             r.cache.inventory(inventory)?;
         }
+        Ok(())
+    }
+
+    // Diagnostic only. Called after the graph's last consumer of O/LSE and
+    // before the next layer reuses the query, tables, or attention scratch.
+    fn dump_mla_witness(&self, layer: usize, batch: &ActiveBatch, cache: CuteafdDeviceBuffer) -> Result<()> {
+        let Some((position, dir)) = &self.mla_witness else { return Ok(()); };
+        let sparse = self.cfg.sparse_layer[layer];
+        if !batch.graphed || !batch.decode_attention || batch.rows != 1 || batch.max_seq_end != *position
+            || self.cfg.sparse_layer[..layer].contains(&sparse) {
+            return Ok(());
+        }
+        let rank = &self.ranks[0];
+        let heads = self.cfg.attention(layer).heads / self.ranks.len();
+        let planned = self.mla_oracle_splits.context("missing golden split plan")?;
+        let (active, full, table, lengths, cu, width) = if sparse {
+            (rank.mla_splits.dsa, planned.dsa, rank.scratch.idx_cand_slots.buffer,
+                rank.scratch.idx_cand_lens.buffer, rank.scratch.dsa_cu_seqlens.buffer, CANDIDATE_TOPK)
+        } else {
+            (rank.mla_splits.swa, planned.swa, rank.scratch.swa_page_table.buffer,
+                rank.scratch.swa_seqlens.buffer, rank.scratch.swa_cu_seqlens.buffer, batch.swa_pt_stride)
+        };
+        let name = format!("p{position}-l{layer:02}-{}", if sparse { "dsa" } else { "swa" });
+        let dir = dir.join(name);
+        std::fs::create_dir_all(&dir)?;
+        let dump = |name: &str, src: CuteafdDeviceBuffer, bytes: usize| -> Result<()> {
+            ensure!(bytes <= src.bytes, "MLA witness {name}: {bytes} exceeds {}", src.bytes);
+            let mut raw = vec![0u8; bytes];
+            rank.device.run(|| rank.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes, ..src }))?;
+            std::fs::write(dir.join(name), raw)?;
+            Ok(())
+        };
+        let output = |label: &str| -> Result<()> {
+            rank.stream.drain()?;
+            dump(&format!("{label}-o.bf16"), rank.scratch.attn_out.buffer, heads * 512 * 2)?;
+            dump(&format!("{label}-lse.f32"), rank.scratch.lse_out.buffer, heads * 4)
+        };
+        output("graph")?;
+        dump("query.bf16", rank.scratch.query.buffer, heads * 576 * 2)?;
+        dump("cache.raw", cache, cache.bytes)?;
+        let logical_table = if sparse { width } else { position.div_ceil(PAGE_ROWS) };
+        dump("table.i32", table, logical_table * 4)?;
+        dump("length.i32", lengths, 4)?;
+        dump("cu.i32", cu, 8)?;
+        std::fs::write(dir.join("geometry.json"), serde_json::to_vec(&serde_json::json!({
+            "position": position, "layer": layer, "heads": heads, "sparse": sparse,
+            "table_stride": width, "graph_splits": active, "planned_splits": full,
+            "kv_record_bytes": rank.cache.kv_format.record_bytes(),
+        }))?)?;
+        for (label, splits) in [("eager-same", active), ("eager-single", 1), ("eager-split", full)] {
+            rank.device.run(|| if sparse { rank.dsa_attn_splits(cache, 1, splits) }
+                else { rank.swa_attn_splits(cache, 1, 1, width, true, splits) })?;
+            output(label)?;
+        }
+        tracing::info!(layer, position, sparse, active, full, "Hy4 MLA graph/eager witness");
         Ok(())
     }
 
@@ -2167,6 +2233,7 @@ impl<'a> Hy4Engine<'a> {
                         },
                     )?;
                 }
+                self.dump_mla_witness(layer, batch, kv_cache_buf)?;
                 // Residual ping-pong flipped twice inside the fused layer; skip separate local_ffn.
                 batch.ffn_fused_layer = Some(layer);
                 return Ok(());

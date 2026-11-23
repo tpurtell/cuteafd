@@ -60,8 +60,12 @@ pub(crate) struct GoldenArgs {
     #[arg(long)]
     pub(crate) decode_graphs: bool,
     /// Diagnostic only: isolate one kind of split attention in an otherwise matched golden.
-    #[arg(long, hide = true, value_parser = ["both", "dsa", "swa", "off"], default_value = "both")]
+    #[arg(long, value_parser = ["both", "dsa", "swa", "off"], default_value = "both")]
     pub(crate) mla_split_probe: String,
+    /// Compare one score position's captured attention with eager single/split replay.
+    /// Writes to --dump-dir without disabling graph capture.
+    #[arg(long, requires_all = ["dump_dir", "decode_graphs"])]
+    pub(crate) mla_witness_position: Option<usize>,
     /// Save FP32 logits (`logits.bin`) to this directory.
     #[arg(long, hide = true)]
     pub(crate) save_logits: Option<PathBuf>,
@@ -368,7 +372,13 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     };
     engine.golden_mla_splits(matches!(args.mla_split_probe.as_str(), "both" | "dsa"),
         matches!(args.mla_split_probe.as_str(), "both" | "swa"));
-    engine.dump_dir = args.dump_dir.clone();
+    if let Some(position) = args.mla_witness_position {
+        ensure!(args.decode && args.resume_at.is_empty() && !args.skip_routed_experts,
+            "--mla-witness-position requires normal --decode with expert weights");
+        engine.mla_witness = Some((position, args.dump_dir.clone().context("witness dump directory")?));
+    } else {
+        engine.dump_dir = args.dump_dir.clone();
+    }
     if args.decode_graphs {
         let layout = cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(devices.len(), 0);
         engine.configure_graphs(layout)?;
