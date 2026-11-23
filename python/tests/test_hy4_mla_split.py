@@ -58,6 +58,9 @@ def test_hy4_mla_split_width_exact(heads, window, splits, kv_format):
         cu = [0, rows] if batch == 1 else list(range(rows + 1))
         out = torch.empty((rows, heads, 512), dtype=bf16, device=dev)
         lse = torch.empty((rows, heads), dtype=torch.float32, device=dev)
+        # 0xff is NaN in both split planes. Any stale partial read must
+        # survive neither a narrower launch nor empty tail splits.
+        scratch.fill_(0xff)
         prog.launch(
             q, cache, tables, torch.tensor(lengths, dtype=torch.int32, device=dev),
             torch.tensor(cu, dtype=torch.int32, device=dev), out, lse, scratch,

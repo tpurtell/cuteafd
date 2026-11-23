@@ -1458,13 +1458,32 @@ impl<'a> Hy4Engine<'a> {
         Ok(())
     }
 
+    fn mla_witness_matches(&self, layer: usize, batch: &ActiveBatch) -> bool {
+        self.mla_witness.as_ref().is_some_and(|(position, _)| {
+            batch.graphed && batch.decode_attention && batch.rows == 1
+                && batch.max_seq_end == *position
+                && !self.cfg.sparse_layer[..layer].contains(&self.cfg.sparse_layer[layer])
+        })
+    }
+
+    fn poison_mla_scratch(rank: &RankRuntime<'_>) -> Result<()> {
+        // 0xff is NaN in both BF16 and F32, so an unread/wrong-width
+        // partial cannot be hidden behind a previous valid workspace.
+        let dst = rank.scratch.attn_scratch.buffer;
+        let poison = vec![0xff; dst.bytes];
+        rank.device.run(|| {
+            // SAFETY: the persistent scratch and stream are rank-local; the
+            // ordered upload precedes the witness launch and retains staging.
+            unsafe { rank.device.library.copy_h2d_ordered(dst, &poison, rank.stream.raw) }
+        })
+    }
+
     // Diagnostic only. Called after the graph's last consumer of O/LSE and
     // before the next layer reuses the query, tables, or attention scratch.
     fn dump_mla_witness(&self, layer: usize, batch: &ActiveBatch, cache: CuteafdDeviceBuffer) -> Result<()> {
         let Some((position, dir)) = &self.mla_witness else { return Ok(()); };
         let sparse = self.cfg.sparse_layer[layer];
-        if !batch.graphed || !batch.decode_attention || batch.rows != 1 || batch.max_seq_end != *position
-            || self.cfg.sparse_layer[..layer].contains(&sparse) {
+        if !self.mla_witness_matches(layer, batch) {
             return Ok(());
         }
         let rank = &self.ranks[0];
@@ -1505,6 +1524,7 @@ impl<'a> Hy4Engine<'a> {
             "kv_record_bytes": rank.cache.kv_format.record_bytes(),
         }))?)?;
         for (label, splits) in [("eager-same", active), ("eager-single", 1), ("eager-split", full)] {
+            Self::poison_mla_scratch(rank)?;
             rank.device.run(|| if sparse { rank.dsa_attn_splits(cache, 1, splits) }
                 else { rank.swa_attn_splits(cache, 1, 1, width, true, splits) })?;
             output(label)?;
@@ -2137,6 +2157,9 @@ impl<'a> Hy4Engine<'a> {
         if batch.graphed {
             if gpus == 1 && local_ffn_route {
                 let r = &self.ranks[0];
+                if self.mla_witness_matches(layer, batch) {
+                    Self::poison_mla_scratch(r)?;
+                }
                 let kv_cache_buf = if is_sparse {
                     r.cache.dsa_kv_layer(self.dsa_index_of[&layer])?
                 } else {
