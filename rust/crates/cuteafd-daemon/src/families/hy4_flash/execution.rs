@@ -1246,6 +1246,15 @@ impl<'a> Hy4Engine<'a> {
         }
     }
 
+    pub(crate) fn golden_mla_splits(&mut self, dsa: bool, swa: bool) {
+        for rank in &mut self.ranks {
+            if !dsa { rank.mla_splits.dsa = 1; }
+            if !swa { rank.mla_splits.swa = 1; }
+            tracing::info!(device = rank.device.id, dsa = rank.mla_splits.dsa,
+                swa = rank.mla_splits.swa, "Hy4 golden MLA splits");
+        }
+    }
+
     pub(crate) fn configure_graphs(
         &mut self,
         layout: Option<cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout>,

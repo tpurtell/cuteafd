@@ -59,6 +59,9 @@ pub(crate) struct GoldenArgs {
     /// Enable bounded decode CUDA graphs during `--decode` or `--resume-at` verification.
     #[arg(long)]
     pub(crate) decode_graphs: bool,
+    /// Diagnostic only: isolate one kind of split attention in an otherwise matched golden.
+    #[arg(long, hide = true, value_parser = ["both", "dsa", "swa", "off"], default_value = "both")]
+    pub(crate) mla_split_probe: String,
     /// Save FP32 logits (`logits.bin`) to this directory.
     #[arg(long, hide = true)]
     pub(crate) save_logits: Option<PathBuf>,
@@ -363,6 +366,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             onboarded,
         )?
     };
+    engine.golden_mla_splits(matches!(args.mla_split_probe.as_str(), "both" | "dsa"),
+        matches!(args.mla_split_probe.as_str(), "both" | "swa"));
     engine.dump_dir = args.dump_dir.clone();
     if args.decode_graphs {
         let layout = cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(devices.len(), 0);
