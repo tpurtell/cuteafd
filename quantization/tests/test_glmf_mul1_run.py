@@ -112,3 +112,39 @@ def test_gb10_evidence_bound_to_kernel_files_and_native_bank():
         run.validate_gb10(receipt | dict(native_bf16_bank_equal=False), code)
     with pytest.raises(ValueError, match="exactness witness"):
         run.validate_gb10(receipt | dict(fork_revision="c"*40), code)
+
+
+def test_continuation_binds_saved_rows_and_new_measurements(tmp_path):
+    saved = [{"row": n} for n in range(82)]
+    fresh = [{"row": 82}]
+    (tmp_path / "pilot-continuation-events.jsonl").write_text('{"row":82}\n')
+    pilot = SimpleNamespace(restore_previous=lambda root:saved, PREVIOUS_CODE="abc", PREVIOUS_HASHES={"p":"def"})
+    report = dict(continuation=dict(previous_pilot_code_sha256="abc", hashes={"p":"def"},
+                                    reused_measurements=82, layers=[45,46]), modules=saved+fresh)
+    run.verify_continuation(tmp_path, report, pilot)
+    with pytest.raises(ValueError, match="stopped and resumed"):
+        run.verify_continuation(tmp_path, report | {"modules":saved}, pilot)
+
+
+def test_keep_native_requires_scoped_recovery_and_retains_other_bars():
+    winners = dict.fromkeys(("3", "22", "23", "44", "45"), 1)
+    recovery = {k:[{"expert":1}] for k in winners}
+    recovery["45"] = [{"expert":i} for i in range(288)]
+    modules = [dict(module=f"model.language_model.layers.{layer}.mlp.experts.1.{part}_proj", bits=4,
+                    codebook="mul1", side=1, heldout_rows=16, multiplier=run.source.MUL1_MULTIPLIER,
+                    native_nmse=0., heldout_nmse=.001) for layer in winners for part in ("gate", "up", "down")]
+    report = dict(schema="glm5-flash-mul1-pilot-v1", status="passed", layers=[0,3,22,23,44,45,46],
+                  mtp_eh_bits=[16,16], mtp_eh_policy=dict(module=run.MTP_FUSION, stored_dtype="BF16",
+                  views=["original","k8-compact","k6-compact"], prior_k8_nmse=0.0003184773128463848,
+                  prior_k8_bar=1e-4), memory_plan=dict(admitted=True), continuation={"layers":[45,46]},
+                  recovery_scope={k:"all-experts" if k=="45" else "selected-expert-only" for k in winners},
+                  selected_experts=winners, recovery=recovery, modules=modules)
+    run.quality_gate(report,set())
+    with pytest.raises(ValueError, match="native BF16"):
+        run.quality_gate(report, {(run.MTP_FUSION,8)})
+    report["modules"][0]["heldout_nmse"] = .0101
+    with pytest.raises(ValueError, match="projection qualification"):
+        run.quality_gate(report,set())
+    report["recovery"]["45"].pop()
+    with pytest.raises(ValueError, match="recorded scope"):
+        run.quality_gate(report,set())

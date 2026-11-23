@@ -96,6 +96,10 @@ def qualification(root, snapshot, code):
         raise ValueError("invalid reference-forward parity receipt")
     validate_gb10(read(root / "gb10-exactness.json"), code)
     quality_gate(report, pilot.expected_core_arms())
+    if report.get("continuation"):
+        verify_continuation(root, report, pilot)
+    if report["view_payload_bytes"] != source.payloads()["view_payload_bytes"]:
+        raise ValueError("pilot payload estimate differs from native BF16 MTP selection")
     captures = parity["captures_sha256"]
     if (report["source_revision"] != source.BASE_REVISION or report["fork_revision"] != code["fork"]
             or report["parity_sha256"] != sha256_file(root / "parity.json")
@@ -118,21 +122,48 @@ def validate_gb10(receipt, code):
         raise ValueError("GB10 exactness witness differs from the production input bank or quantizer")
 
 
+MTP_FUSION = "model.language_model.layers.45.eh_proj"
+
+
+def verify_continuation(root, report, pilot):
+    prior = pilot.restore_previous(root)
+    with (root / "pilot-continuation-events.jsonl").open() as stream:
+        fresh = [json.loads(line) for line in stream]
+    evidence = report["continuation"]
+    if (len(prior) != 82 or evidence["reused_measurements"] != len(prior)
+            or evidence["layers"] != [45, 46] or evidence["hashes"] != pilot.PREVIOUS_HASHES
+            or evidence["previous_pilot_code_sha256"] != pilot.PREVIOUS_CODE
+            or report["modules"] != prior + fresh):
+        raise ValueError("pilot continuation differs from the stopped and resumed measurements")
+
+
 def quality_gate(report, expected_core):
     if (report.get("schema") != "glm5-flash-mul1-pilot-v1" or report["status"] != "passed"
-            or report["layers"] != [0, 3, 22, 23, 44, 45, 46] or report["mtp_eh_bits"] != [8, 6]
+            or report["layers"] != [0, 3, 22, 23, 44, 45, 46] or report["mtp_eh_bits"] != [16, 16]
             or report["memory_plan"]["admitted"] is not True):
         raise ValueError("incomplete GLM Flash pilot qualification")
+    policy = report["mtp_eh_policy"]
+    if (policy["module"] != MTP_FUSION or policy["stored_dtype"] != "BF16"
+            or policy["views"] != ["original", "k8-compact", "k6-compact"]
+            or any(name == MTP_FUSION for name, _ in expected_core)):
+        raise ValueError("pilot must retain the native BF16 MTP fusion matrix")
+    if report.get("continuation") and (policy.get("prior_k8_nmse") != 0.0003184773128463848
+                                       or policy.get("prior_k8_bar") != 1e-4):
+        raise ValueError("stopped K8 MTP measurement differs")
     expected = set(expected_core)
     winners = report["selected_experts"]
     if set(winners) != {"3", "22", "23", "44", "45"}:
         raise ValueError("pilot MoE layer inventory differs")
     for layer, expert in winners.items():
-        if ({r["expert"] for r in report["recovery"][layer]} != set(range(288))
-                or len(report["recovery"][layer]) != 288):
-            raise ValueError("pilot expert recovery distribution is incomplete")
         if type(expert) is not int or not 0 <= expert < 288:
             raise ValueError("invalid pilot expert")
+        selected_only = bool(report.get("continuation")) and layer != "45"
+        scope = "selected-expert-only" if selected_only else "all-experts"
+        recipients = {expert} if selected_only else set(range(288))
+        records = report["recovery"][layer]
+        if (report["recovery_scope"][layer] != scope or len(records) != len(recipients)
+                or {r["expert"] for r in records} != recipients):
+            raise ValueError("pilot expert recovery inventory differs from its recorded scope")
         for part in ("gate_proj", "up_proj", "down_proj"):
             expected.add((f"model.language_model.layers.{layer}.mlp.experts.{expert}.{part}", 4))
     bars = {8: 1e-4, 6: 1e-3, 4: 1e-2}
@@ -166,6 +197,7 @@ def numerical_identity(root, snapshot):
                 components=manifest["components"], diagnostics=manifest["diagnostics"],
                 codebook="mul1", codebook_multiplier=source.MUL1_MULTIPLIER, seed=787, sigma=.025,
                 core_bits=[8, 6], expert_bits=4, upstream_activations="k8-compact",
+                mtp_eh_policy=report["mtp_eh_policy"],
                 expert_workspace_bytes=workspace, torch=torch.__version__, cuda=torch.version.cuda,
                 reference_revision=REFERENCE_REVISION, expert_recovery_ranks=[9,16], minimum_rows=1024,
                 proofs={n: sha256_file(root / n) for n in
@@ -287,7 +319,7 @@ def produce(root, output, snapshot, identity, *, attempt, interrupted_phase, sta
     finally:
         source_model.close()
     status("running", "export")
-    expected = {(m, bits) for m in source.core_modules(8) for bits in (8, 6)}
+    expected = {(m, bits) for bits in (8, 6) for m in source.core_modules(bits)}
     expected.update((m, 4) for m in source.expert_modules())
     csv_path = write_error_csv(root, expected)
     validation = writer.finalize(error_csv=csv_path, card_dir=root/"card")
