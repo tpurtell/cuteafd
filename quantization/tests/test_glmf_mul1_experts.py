@@ -133,3 +133,28 @@ def test_fit_and_replay_observe_reconstructed_clamped_weighted_down(monkeypatch)
     replay = torch.cat([v.clone() for v in experts.replay_expert(
         bank, 0, packed, workspace=workspace, swiglu_limit=2)])
     assert torch.equal(replay, activated[:natural] @ (weights["down_proj"] - .25).T)
+
+
+def test_native_bf16_bank_preserves_fp32_sum_and_refuses_narrowing():
+    kwargs = dict(tokens=3, width=2, experts=17, device="cpu", input_dtype=torch.bfloat16)
+    inputs = torch.ones(3, 2)
+    ids = torch.arange(8).expand(3, -1)
+    gamma = torch.full((3, 8), .1234567)
+    routes = (ids, gamma, ids+8, gamma/2)
+    with pytest.raises(ValueError, match="cannot narrow"):
+        ExpertBank([(inputs, *routes)], **kwargs)
+    bank = ExpertBank([(inputs.bfloat16(), *routes)], **kwargs)
+    rows = torch.arange(3)
+    fp32 = torch.empty(3,2)
+    with pytest.raises(ValueError, match="BF16 device gather"):
+        list(bank.chunks(rows, fp32))
+    narrowed = torch.empty_like(fp32, dtype=torch.bfloat16)
+    assert torch.equal(next(bank.chunks(rows, fp32, native_buffer=narrowed)), inputs)
+    result = bank.combine(lambda expert, rows: [inputs.bfloat16()] if len(rows) else [])
+    exact = torch.zeros_like(inputs)
+    for part in gamma.T:
+        exact += part[:,None]
+    assert torch.equal(result, exact) and result.dtype == torch.float32
+    plan = memory_plan(3,2,frontier_bytes=0,weight_bytes=0,hessian_bytes=0,workspace_bytes=0,
+                       input_dtype=torch.bfloat16)
+    assert plan["owners"]["output_sum"] == plan["owners"]["input_bank"]*2 == 24

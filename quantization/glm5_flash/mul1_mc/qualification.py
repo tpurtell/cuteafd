@@ -43,9 +43,10 @@ def fixture(n, generator, device):
         alternative = torch.cat((selected[:, :7], scores.gather(1, near[:, slot:slot+1])), dim=1)
         near_gamma[:, slot] = alternative[:, -1] / alternative.sum(1) * 2.5
     data = (hidden, ids, natural_gamma, near, near_gamma)
-    batches = (tuple(field[start:start+137] for field in data) for start in range(0, n, 137))
-    bank = ExpertBank(batches, tokens=n, width=WIDTH, experts=17, device=device)
-    return data, bank
+    def bank(dtype):
+        batches = (tuple(field[start:start+137] for field in data) for start in range(0, n, 137))
+        return ExpertBank(batches, tokens=n, width=WIDTH, experts=17, device=device, input_dtype=dtype)
+    return data, bank(torch.float32), bank(torch.bfloat16)
 
 
 def reference_selection(data, expert):
@@ -91,20 +92,25 @@ def reference_sum(data, fused, down):
 def qualify(device, scratch):
     generator = torch.Generator().manual_seed(787)
     # Calibration exceeds the 128-row product boundary and has identity rows.
-    data, bank = fixture(385, generator, device)
-    heldout, other_bank = fixture(37, generator, device)
+    data, bank, native_bank = fixture(385, generator, device)
+    heldout, other_bank, native_held = fixture(37, generator, device)
     workspace = ExpertWorkspace.allocate(WIDTH, WIDTH, device=device, chunk_rows=CHUNK)
     pointers = {name: tensor.data_ptr() for name, tensor in vars(workspace).items()}
-    for expert in range(17):
-        rows, gamma, natural, missing = bank.selection(expert)
-        ref_rows, ref_gamma, ref_natural, ref_missing = reference_selection(data, expert)
-        exact(rows, ref_rows, "ordered selected row IDs")
-        exact(gamma, ref_gamma, "ordered coefficients")
-        if (natural, missing) != (ref_natural, ref_missing):
-            raise ValueError("natural or synthetic row count differs")
-        if len(rows):
-            captured = torch.cat([chunk.clone() for chunk in bank.chunks(rows, workspace.gather)])
-            exact(captured, data[0][ref_rows].float(), "device gather")
+    if list(bank.receipts()) != list(native_bank.receipts()):
+        raise ValueError("BF16 native expert bank changed the ordered selection evidence")
+    if native_bank.inputs.dtype != torch.bfloat16 or bank.inputs.dtype != torch.float32:
+        raise ValueError("qualification requires native BF16 and widened FP32 banks")
+    for target in (bank, native_bank):
+        for expert in range(17):
+            rows, gamma, natural, missing = target.selection(expert)
+            ref_rows, ref_gamma, ref_natural, ref_missing = reference_selection(data, expert)
+            exact(rows, ref_rows, "ordered selected row IDs")
+            exact(gamma, ref_gamma, "ordered coefficients")
+            if (natural, missing) != (ref_natural, ref_missing):
+                raise ValueError("natural or synthetic row count differs")
+            if len(rows):
+                captured = torch.cat([chunk.clone() for chunk in target.chunks(rows, workspace.gather, native_buffer=workspace.inputs)])
+                exact(captured, data[0][ref_rows].float(), "device gather")
 
     rows, gamma, _, missing = reference_selection(data, 0)
     inputs = data[0][rows]
@@ -134,9 +140,12 @@ def qualify(device, scratch):
     with patch.object(numerics, "encode_expert", compare_covariance):
         packed, _ = fit_expert(bank, 0, matrices, prefix="fixture.experts.0",
                                workspace=workspace, swiglu_limit=LIMIT)
+        native_packed, _ = fit_expert(native_bank, 0, matrices, prefix="fixture.experts.0",
+                                      workspace=workspace, swiglu_limit=LIMIT)
     for part in PARTS:
         for suffix, expected in reference[part].items():
             exact(packed[part][suffix], expected, f"{part}.{suffix} K4 serialized bytes")
+            exact(native_packed[part][suffix], packed[part][suffix], f"native BF16 {part}.{suffix} K4 bytes")
 
     # Use the same sealed expert for each different natural selection, including
     # overlapping rows. Reopening this file is independent of live packed state.
@@ -148,7 +157,8 @@ def qualify(device, scratch):
     def combine(target, weights):
         return target.combine(lambda expert, _: replay_expert(
             target, expert, weights, workspace=workspace, swiglu_limit=LIMIT), weighted_buffer=weighted)
-    for label, target, fixture_data in (("calibration", bank, data), ("heldout", other_bank, heldout)):
+    for label, target, fixture_data in (("calibration", bank, data), ("heldout", other_bank, heldout),
+            ("native BF16 calibration", native_bank, data), ("native BF16 heldout", native_held, heldout)):
         expected = reference_sum(fixture_data, fused, down.reconstruction)
         exact(combine(target, packed), expected, label + " live ordered reduction")
         exact(combine(target, recovered), expected, label + " sealed recovery replay")
@@ -157,16 +167,18 @@ def qualify(device, scratch):
     h = heldout[0][rows[:natural]]
     base = activate(h, torch.cat([matrices[n] for n in PARTS[:2]])) @ matrices["down_proj"].T
     reference_out = activate(h, fused) @ down.reconstruction.T
-    actual_out = torch.cat([out.clone() for out in replay_expert(
-        other_bank, 0, recovered, workspace=workspace, swiglu_limit=LIMIT)])
     def error_sums(output):
         return torch.stack(((output.float() - base.float()).square().sum(dtype=torch.float64),
                             base.float().square().sum(dtype=torch.float64)))
-    exact(error_sums(actual_out), error_sums(reference_out), "heldout gate evidence")
+    for target in (native_held, other_bank):
+        actual_out = torch.cat([out.clone() for out in replay_expert(
+            target, 0, recovered, workspace=workspace, swiglu_limit=LIMIT)])
+        exact(error_sums(actual_out), error_sums(reference_out), "heldout gate evidence")
     if pointers != {name: tensor.data_ptr() for name, tensor in vars(workspace).items()}:
         raise ValueError("resident workspace replaced during encode or heldout replay")
     return dict(status="passed", fixture="deterministic-128-channel-glm-flash-v1", calibration_rows=385,
                 heldout_rows=37, shape=[WIDTH, WIDTH], compared_k4_encodes=3, raw_hessians_equal=True,
+                native_bf16_bank_equal=True, native_bf16_compared_k4_encodes=3,
                 packed_bytes_equal=True, heldout_sum_equal=True, sealed_replay_equal=True,
                 selection_equal=True, gate_evidence_equal=True, workspace_reused=True)
 

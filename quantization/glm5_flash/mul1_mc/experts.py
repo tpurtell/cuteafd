@@ -27,7 +27,7 @@ def route_batch(moe, hidden):
 
 
 def memory_plan(tokens, width, *, frontier_bytes, weight_bytes, hessian_bytes,
-                workspace_bytes, mem_available=None, container_remaining=None):
+                workspace_bytes, mem_available=None, container_remaining=None, input_dtype=torch.float32):
     """Admit against unified RAM headroom before allocating the routed layer.
 
     Frontier, weights, Hessians and workspace are peak additional resident bytes
@@ -40,11 +40,13 @@ def memory_plan(tokens, width, *, frontier_bytes, weight_bytes, hessian_bytes,
         mem_available = int(value.split()[1]) * 1024
     if min(tokens, width) <= 0 or min(frontier_bytes, weight_bytes, hessian_bytes, workspace_bytes) < 0:
         raise ValueError("invalid expert working set")
-    bank = tokens * width * 4
+    if input_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("expert input bank must use FP32 or native BF16")
+    bank = tokens * width * (2 if input_dtype == torch.bfloat16 else 4)
     # For two width-8 route sets, a conservative peak including input ids,
     # sort order, row ids, ranks, and both sorted and original coefficients.
     route_bytes = tokens * 16 * (4 + 8 + 8 + 8 + 4 + 4)
-    owners = dict(input_bank=bank, output_sum=bank, routes=route_bytes, frontier=frontier_bytes,
+    owners = dict(input_bank=bank, output_sum=tokens * width * 4, routes=route_bytes, frontier=frontier_bytes,
                   weights=weight_bytes, hessians=hessian_bytes, workspace=workspace_bytes)
     available = mem_available - (10 << 30)
     if container_remaining is not None:
@@ -89,16 +91,20 @@ class ExpertBank:
     """One device input bank. The same selections drive calibration and replay."""
 
     @torch.inference_mode()
-    def __init__(self, batches, *, tokens, width=4096, experts=288, device="cuda:0"):
+    def __init__(self, batches, *, tokens, width=4096, experts=288, device="cuda:0", input_dtype=torch.float32):
         if tokens <= 0 or width <= 0 or experts < 16:
             raise ValueError("invalid GLM expert bank dimensions")
-        self.inputs = torch.empty((tokens, width), dtype=torch.float32, device=device)
+        if input_dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError("expert input bank must use FP32 or native BF16")
+        self.inputs = torch.empty((tokens, width), dtype=input_dtype, device=device)
         ids = torch.empty((tokens, 8), dtype=torch.int32, device=device)
         near = torch.empty_like(ids)
         gamma = torch.empty_like(ids, dtype=torch.float32)
         near_gamma = torch.empty_like(gamma)
         offset = 0
         for hidden, native, scales, candidates, recovery_scales in batches:
+            if input_dtype == torch.bfloat16 and hidden.dtype != torch.bfloat16:
+                raise ValueError("native BF16 expert bank cannot narrow higher precision activations")
             n = len(hidden)
             if (not n or offset + n > tokens or hidden.shape != (n, width)
                     or hidden.dtype not in (torch.bfloat16, torch.float32)
@@ -142,16 +148,25 @@ class ExpertBank:
             gamma = torch.cat((gamma, self.recovery.gamma[r]))
         return rows, gamma, natural, max(0, MINIMUM_EXPERT_ROWS - len(rows))
 
-    def chunks(self, rows, gather_buffer):
+    def chunks(self, rows, gather_buffer, *, native_buffer=None):
         """Gather into the caller's reusable device workspace, in selection order."""
         if (gather_buffer.ndim != 2 or not len(gather_buffer)
-                or gather_buffer.shape[1] != self.inputs.shape[1]
-                or gather_buffer.dtype != self.inputs.dtype or gather_buffer.device != self.inputs.device):
+                or gather_buffer.shape[1] != self.inputs.shape[1] or gather_buffer.dtype != torch.float32
+                or gather_buffer.device != self.inputs.device):
             raise ValueError("invalid expert gather workspace")
+        gather = gather_buffer
+        if self.inputs.dtype == torch.bfloat16:
+            if (native_buffer is None or native_buffer.shape != gather_buffer.shape
+                    or native_buffer.dtype != torch.bfloat16 or native_buffer.device != self.inputs.device):
+                raise ValueError("native BF16 bank requires a reusable BF16 device gather workspace")
+            gather = native_buffer
         for indices in rows.split(len(gather_buffer)):
             if len(indices):
+                source = gather[:len(indices)]
+                torch.index_select(self.inputs, 0, indices, out=source)
                 chunk = gather_buffer[:len(indices)]
-                torch.index_select(self.inputs, 0, indices, out=chunk)
+                if gather is not gather_buffer:
+                    chunk.copy_(source)
                 yield chunk
 
     def receipts(self):
@@ -178,7 +193,7 @@ class ExpertBank:
     @torch.inference_mode()
     def combine(self, expert_outputs, *, weighted_buffer=None):
         """Call expert_outputs(expert, natural_rows) for ordered unweighted chunks."""
-        result = torch.zeros_like(self.inputs)
+        result = torch.zeros_like(self.inputs, dtype=torch.float32)
         for expert in range(self.experts):
             part = self.native.part(expert)
             rows, gamma = self.native.rows[part], self.native.gamma[part]
@@ -278,7 +293,7 @@ def fit_expert(bank, expert, weights, *, prefix, workspace, swiglu_limit):
         return encoded.reconstruction
 
     acc = covariance_accumulator(width, device=device)
-    for chunk in bank.chunks(rows, workspace.gather):
+    for chunk in bank.chunks(rows, workspace.gather, native_buffer=workspace.inputs):
         acc.add(chunk)
     covariance = raw_hessian(acc, identity_rows=identity)
     del acc
@@ -286,7 +301,7 @@ def fit_expert(bank, expert, weights, *, prefix, workspace, swiglu_limit):
     del covariance
     acc = covariance_accumulator(intermediate, device=device)
     offset = 0
-    for chunk in bank.chunks(rows, workspace.gather):
+    for chunk in bank.chunks(rows, workspace.gather, native_buffer=workspace.inputs):
         count = len(chunk)
         activation = workspace.activate(chunk, fused, swiglu_limit)
         # The linear down output is route weighted. Apply the identical weight
@@ -307,7 +322,7 @@ def replay_expert(bank, expert, packed, *, workspace, swiglu_limit):
     fused = _gate_up(packed, workspace)
     shape = (workspace.inputs.size(1), workspace.activated.size(1))
     down = _reconstruct(packed, "down_proj", shape, bank.inputs.device)
-    for chunk in bank.chunks(rows, workspace.gather):
+    for chunk in bank.chunks(rows, workspace.gather, native_buffer=workspace.inputs):
         activation = workspace.activate(chunk, fused, swiglu_limit)
         out = workspace.outputs[:len(chunk)]
         torch.mm(activation, down.T, out=out)
