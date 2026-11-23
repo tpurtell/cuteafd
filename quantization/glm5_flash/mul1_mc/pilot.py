@@ -20,12 +20,39 @@ LAYERS = (0, 3, 22, 23, 44, 45, 46)
 PREFIX = "model.language_model.layers."
 REPO = Path(__file__).resolve().parents[3]
 BUDGET_SECONDS = 1800
+EH_PROJ = PREFIX + "45.eh_proj"
+PREVIOUS_CODE = "1283bc376eee3fa287a79145991cd50f4782bd13f8f0a7603e53b8f9c435cae4"
+PREVIOUS_HASHES = {
+    "pilot-events.jsonl": "b55636f843563d1242e770e2175f54491c7048f280036165580b904f105b6b0b",
+    "pilot-stop.json": "0f896a2908047cfb01d78c9bbf6f8adf16741463d947d1e4862f13793b176f73",
+    "parity.json": "7d326b6f6e3a3f8bb83a862027fa1a7ed2dce0b216d37d36a14224b5dce7eb28",
+    "corpus/manifest.json": "d2d9924c343d660d758298c583caf57004b40d5990bac901523ca3154f4917d2",
+    "source-original-pilot.json": "1f614a590e9ee309a6d17ba05d64df0e7dd82797ce5e8f1008abd15707f241a4",
+}
+
+
+def restore_previous(root):
+    """Replay only measurements sealed before the reviewed MTP quality stop."""
+    for filename, expected in PREVIOUS_HASHES.items():
+        if digest(root / filename) != expected:
+            raise ValueError(f"stopped pilot receipt differs: {filename}")
+    stop = json.loads((root / "pilot-stop.json").read_text())
+    old_source = json.loads((root / "source-original-pilot.json").read_text())
+    source = json.loads((root / "source.json").read_text())
+    for key in ("files", "config_sha256", "manifest_sha256", "revision", "shards", "source_payload_bytes"):
+        if source[key] != old_source[key]:
+            raise ValueError(f"stopped pilot source differs: {key}")
+    rows = [json.loads(line) for line in (root / "pilot-events.jsonl").read_text().splitlines()]
+    if (stop["failed_module"] != EH_PROJ or stop["completed"] != len(rows) or len(rows) != 82
+            or len({(row["module"], row["bits"]) for row in rows}) != len(rows)):
+        raise ValueError("stopped pilot frontier differs")
+    return rows
 
 
 def expected_core_arms():
     prefixes = tuple(f"{PREFIX}{layer}." for layer in LAYERS)
     return {(name, bits) for name in reviewed_core_modules()
-            if name == "lm_head" or name.startswith(prefixes) for bits in (6, 8)}
+            if name != EH_PROJ and (name == "lm_head" or name.startswith(prefixes)) for bits in (6, 8)}
 
 
 def digest(path):
@@ -84,6 +111,9 @@ class Pilot:
         self.modules = []
         self.recovery, self.selected = {}, {}
         self.expert_workspace_bytes = 0
+        self.events = self.root / "pilot-events.jsonl"
+        self.recovery_scope = {}
+        self.continuation = None
 
     def record(self, metrics, shape, held_rows):
         metrics.update(native_nmse=0., native_bytes=math.prod(shape)*2,
@@ -91,7 +121,7 @@ class Pilot:
                            metrics["module"], shape, metrics["bits"]))
         self.modules.append(metrics)
         print(json.dumps({k:metrics[k] for k in ("module", "bits", "heldout_nmse", "heldout_rows")}), flush=True)
-        with (self.root/"pilot-events.jsonl").open("a") as events:
+        with self.events.open("a") as events:
             events.write(json.dumps(metrics, allow_nan=False)+"\n")
         if time.monotonic()-self.start >= BUDGET_SECONDS:
             raise TimeoutError("GLM Flash pilot exceeded 30 minute budget")
@@ -123,6 +153,7 @@ class Pilot:
         train, held = bank("train_"), bank("held_")
         receipts = list(train.receipts())
         self.recovery[str(layer)] = receipts
+        self.recovery_scope[str(layer)] = "all-experts"
         # Evaluate a routed expert with real held-out rows. Break ties by ID.
         expert = max(range(train.experts), key=lambda e: (
             min(held.native.bounds[e+1]-held.native.bounds[e], receipts[e]["natural_rows"]), -e))
@@ -172,7 +203,8 @@ class Pilot:
         prefix = f"{PREFIX}{layer}."
         if layer == 45:
             adapter = fork_module("utils.glm5_flash_mtp").load_mtp(self.source, self.device)
-            self.fit(prefix+"eh_proj", adapter.eh_proj.weight, values)
+            if adapter.eh_proj.weight.dtype != torch.bfloat16:
+                raise ValueError("native MTP fusion must retain source BF16")
             values = {k:adapter.eh_proj(v) for k,v in values.items()}
             block = adapter.decoder
         else:
@@ -202,11 +234,28 @@ class Pilot:
             self.expert(layer, block, mlp_inputs)
 
     @torch.inference_mode()
-    def run(self):
+    def run(self, *, resume_mtp=False):
         out = self.root/"pilot.json"
         if out.exists():
             raise ValueError("pilot receipt already exists")
-        for layer in LAYERS:
+        layers = LAYERS
+        if resume_mtp:
+            self.modules = restore_previous(self.root)
+            layers = (45, 46)
+            self.continuation = dict(previous_pilot_code_sha256=PREVIOUS_CODE,
+                                     hashes=PREVIOUS_HASHES, reused_measurements=len(self.modules),
+                                     layers=list(layers))
+            for row in self.modules:
+                if row["bits"] != 4 or not row["module"].endswith(".gate_proj"):
+                    continue
+                label = row["module"].removeprefix(PREFIX).split(".", 1)[0]
+                self.selected[label] = row["expert"]
+                self.recovery[label] = [row]
+                self.recovery_scope[label] = "selected-expert-only"
+            self.events = self.root / "pilot-continuation-events.jsonl"
+        if self.events.exists():
+            raise ValueError(f"refuse to append a second attempt to {self.events.name}")
+        for layer in layers:
             self.layer(layer)
             torch.cuda.empty_cache()
         actual = {(row["module"], row["bits"]) for row in self.modules if row["bits"] in (8,6)}
@@ -214,21 +263,24 @@ class Pilot:
             raise ValueError("pilot core inventory differs")
         tokens = sum(c["tokens"] for c in self.corpus["components"].values())
         width, inter = 4096, 2048
-        longest = self.corpus["splits"]["calibration"]["longest"]
-        # Full runs stream prompt residuals one at a time and source one expert
-        # at a time. Charge two four-stream BF16 prompt frontiers conservatively.
         ws = self.expert_workspace_bytes
-        plan = experts.memory_plan(tokens, width, frontier_bytes=longest*4*width*2*2,
+        plan = experts.memory_plan(tokens, width, frontier_bytes=tokens*4*width*2, input_dtype=torch.bfloat16,
             weight_bytes=3*width*inter*2, hessian_bytes=width**2*16, workspace_bytes=ws,
             container_remaining=100<<30)
         if not plan["admitted"]:
             raise MemoryError(f"full routed working set exceeds unified memory allowance: {plan}")
         fork_revision = json.loads((REPO/"third_party/gptqmodel.lock.json").read_text())["revision"]
+        eh_policy = dict(module=EH_PROJ, stored_dtype="BF16", views=["original","k8-compact","k6-compact"])
+        if resume_mtp:
+            stop = json.loads((self.root / "pilot-stop.json").read_text())
+            eh_policy.update(prior_k8_nmse=stop["heldout_nmse"], prior_k8_bar=stop["limit"])
         atomic_json(out, dict(schema="glm5-flash-mul1-pilot-v1", status="passed", layers=list(LAYERS),
             source_revision=self.snapshot.name, fork_revision=fork_revision, corpus_sha256=self.parity["corpus_sha256"],
             parity_sha256=digest(self.root/"parity.json"), pilot_code_sha256=digest(Path(__file__)),
             capture_sha256=self.parity["captures_sha256"], elapsed_seconds=time.monotonic()-self.start,
-            modules=self.modules, mtp_eh_bits=[8,6], recovery=self.recovery, selected_experts=self.selected,
+            modules=self.modules, mtp_eh_bits=[16,16], mtp_eh_policy=eh_policy,
+            continuation=self.continuation, recovery_scope=self.recovery_scope,
+            recovery=self.recovery, selected_experts=self.selected,
             memory_plan=plan, expert_workspace_bytes=ws, view_payload_bytes=self.source_report["view_payload_bytes"],
             predecessor="native BF16 target frontier; within-layer serialized K8 propagation"))
 
@@ -237,10 +289,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--snapshot", type=Path, required=True)
+    parser.add_argument("--resume-mtp", action="store_true")
     args = parser.parse_args()
     torch.set_num_threads(10)
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
-    Pilot(args.snapshot, args.root).run()
+    Pilot(args.snapshot, args.root).run(resume_mtp=args.resume_mtp)
 
 
 if __name__ == "__main__":
