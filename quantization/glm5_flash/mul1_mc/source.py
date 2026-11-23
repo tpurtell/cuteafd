@@ -23,12 +23,13 @@ MUL1_MULTIPLIER = 0x83DCD12D
 
 def core_modules(bits):
     """Provisional pilot selection for eh_proj is the same width as all other core."""
-    return {name: {**geometry, "bits": bits}
+    return {name: {**geometry, "bits": bits, "codebook": "mul1"}
             for name, geometry in flash.reviewed_core_modules(core_bits=bits).items()}
 
 
 def expert_modules():
-    return flash.reviewed_expert_modules()
+    return {name: {**geometry, "codebook": "mul1"}
+            for name, geometry in flash.reviewed_expert_modules().items()}
 
 
 def payloads():

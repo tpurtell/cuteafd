@@ -131,14 +131,14 @@ class DirectMCWriter:
             verify_receipt(self.output / shard['filename'], shard['receipt'])
         return True
 
-    def write_group(self, label, *, shared=None, original=None, k8=None, k6=None):
+    def write_group(self, label, *, shared=None, original=None, k8=None, k6=None, packed_hashes=None):
         if not isinstance(label, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,95}', label):
             raise ValueError('unsafe direct group label')
         entries = dict(zip(KINDS, (shared or {}, original or {}, k8 or {}, k6 or {})))
         references = {kind: {name: [str(Path(entry[0]).resolve()), *entry[1:]]
                             for name, entry in values.items()} for kind, values in entries.items()}
         previous = self.state['groups'].get(label)
-        if previous and previous['entries'] != references:
+        if previous and (previous['entries'] != references or previous.get('packed_hashes') != packed_hashes):
             raise ValueError('direct group recovery entries differ')
         if self.group_complete(label):
             return previous
@@ -186,6 +186,8 @@ class DirectMCWriter:
         if previous and (previous['inputs'] != inputs or previous['specs'] != specs):
             raise ValueError('direct group input changed before completion')
         group = dict(entries=references, inputs=inputs, specs=specs, sizes=sizes, shards=[], complete=False)
+        if packed_hashes is not None:
+            group['packed_hashes'] = packed_hashes
         self.state['groups'][label] = group
         atomic_json(self.state_path, self.state)
         for kind, values in references.items():
@@ -200,7 +202,9 @@ class DirectMCWriter:
                     receipt = package.write_shard(self.output, filename, {n: values[n] for n in names},
                         dict(producer=self.identity, group=label, kind=kind,
                              inputs={p: inputs[p] for p in sorted({values[n][0] for n in names})}),
-                        prove_original=prove, verify_checksum=False)
+                        prove_original=prove, verify_checksum=False,
+                        tensor_xxh3=({n: packed_hashes[kind][n] for n in names}
+                                     if packed_hashes is not None and not prove else None))
                     group['shards'].append(dict(filename=filename, kind=kind, names=names, receipt=receipt))
                     atomic_json(self.state_path, self.state)
         # Detect replacement/truncation of a producer input during the write.

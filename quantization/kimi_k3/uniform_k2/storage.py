@@ -156,13 +156,17 @@ def read_header(path, *, offset=0, length=None):
     return header, offset + size + 8
 
 
-def assemble_shard(entries, path, *, chunk_bytes=16 * 1024 * 1024):
+def assemble_shard(entries, path, *, chunk_bytes=16 * 1024 * 1024, tensor_xxh3=None):
     """Copy tensor byte spans once, hashing during writes with bounded RAM."""
     path = Path(path)
     if path.exists():
         raise FileExistsError(path)
     if not entries or not 1 <= chunk_bytes <= 64 * 1024 * 1024:
         raise ValueError("invalid shard entries/chunk bound")
+    if tensor_xxh3 is not None:
+        import xxhash
+        if tensor_xxh3.keys() != entries.keys():
+            raise ValueError("packed tensor digest inventory differs")
     sources, spans, header, offset = {}, [], {}, 0
     for name, entry in sorted(entries.items()):
         if len(entry) == 2:
@@ -181,7 +185,7 @@ def assemble_shard(entries, path, *, chunk_bytes=16 * 1024 * 1024):
         start, end = value["data_offsets"]
         header[name] = dict(dtype=value["dtype"], shape=value["shape"], data_offsets=[offset, offset + end - start])
         offset += end - start
-        spans.append((source_path, base + start, end - start))
+        spans.append((name, source_path, base + start, end - start))
     encoded = canonical(header).encode()
     encoded += b" " * (-len(encoded) % 8)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -191,7 +195,8 @@ def assemble_shard(entries, path, *, chunk_bytes=16 * 1024 * 1024):
         prefix = struct.pack("<Q", len(encoded)) + encoded
         output.write(prefix)
         digest.update(prefix)
-        for source_path, position, length in spans:
+        for name, source_path, position, length in spans:
+            tensor_hash = xxhash.xxh3_128() if tensor_xxh3 is not None else None
             with source_path.open("rb") as source:
                 source.seek(position)
                 while length:
@@ -201,6 +206,10 @@ def assemble_shard(entries, path, *, chunk_bytes=16 * 1024 * 1024):
                     output.write(block)
                     digest.update(block)
                     length -= len(block)
+                    if tensor_hash is not None:
+                        tensor_hash.update(block)
+            if tensor_hash is not None and tensor_hash.hexdigest() != tensor_xxh3[name]:
+                raise ValueError(f"packed tensor differs from producer receipt: {name}")
         output.flush()
         os.fsync(output.fileno())
     if temporary.stat().st_size != 8 + len(encoded) + offset:

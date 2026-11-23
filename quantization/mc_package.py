@@ -252,12 +252,14 @@ def _assemble_proved_shard(entries, path, *, chunk_bytes=16 << 20):
                 original_tensor_proofs=proofs)
 
 
-def write_shard(root, filename, entries, identity, *, prove_original=False, verify_checksum=True):
+def write_shard(root, filename, entries, identity, *, prove_original=False, verify_checksum=True,
+                tensor_xxh3=None):
     path = root / filename
     receipt_path = root / (filename + '.receipt.json')
     if receipt_path.exists():
         receipt = load_json(receipt_path)
-        if receipt['identity'] != identity or receipt['tensors'] != sorted(entries):
+        if (receipt['identity'] != identity or receipt['tensors'] != sorted(entries)
+                or receipt.get('tensor_xxh3') != tensor_xxh3):
             raise ValueError('package recovery identity differs')
         verify_receipt(path, receipt, checksum=verify_checksum)
         if prove_original and set(receipt.get('original_tensor_proofs', {})) != set(entries):
@@ -266,8 +268,11 @@ def write_shard(root, filename, entries, identity, *, prove_original=False, veri
         if path.is_symlink():
             raise ValueError('refuse package output symlink')
         path.unlink(missing_ok=True)
-        assembler = _assemble_proved_shard if prove_original else assemble_shard
-        receipt = dict(assembler(entries, path), identity=identity, tensors=sorted(entries))
+        assembled = (_assemble_proved_shard(entries, path) if prove_original else
+                     assemble_shard(entries, path, tensor_xxh3=tensor_xxh3))
+        receipt = dict(assembled, identity=identity, tensors=sorted(entries))
+        if tensor_xxh3 is not None:
+            receipt['tensor_xxh3'] = tensor_xxh3
         atomic_json(receipt_path, receipt)
     return receipt
 
@@ -750,30 +755,33 @@ def _check_direct_markers(output, inv, markers, checked):
                 checked.add((filename, name))
 
 
-def _hy4_markers(inv, quantize, config, core, view):
+DIRECT_MUL1_FAMILIES = {"hy4_flash", "hy4", "glm5_flash"}
+
+
+def _direct_mul1_markers(inv, quantize, config, core, view):
     """Require full metadata for every indexed shared expert and compact projection."""
     if any(value.get('codebook') != 'mul1' or value.get('codebook_multiplier') != MUL1
            for value in (quantize, config['quantization_config'])):
-        raise ValueError('Hy4 view differs from frozen MUL1 codebook')
+        raise ValueError('MC view differs from frozen MUL1 codebook')
     packed = {name.rsplit('.', 1)[0] for name in inv['mapping'] if name.endswith('.trellis')}
     if packed != quantize['tensor_storage'].keys():
-        raise ValueError('Hy4 tensor_storage does not cover every selected EXL3 module')
+        raise ValueError('MC tensor_storage does not cover every selected EXL3 module')
     markers = {}
     for module, entry in quantize['tensor_storage'].items():
         width = entry.get('bits_per_weight')
         if module not in core and width != 4:
-            raise ValueError('Hy4 routed expert requires K4')
+            raise ValueError('MUL1 routed expert requires K4')
         if (entry.get('quant_format') != 'exl3' or entry.get('side') != 1
                 or entry.get('mul1_multiplier') != MUL1 or 'mcg_multiplier' in entry):
-            raise ValueError('Hy4 EXL3 module codebook or side differs')
+            raise ValueError('MUL1 EXL3 module codebook or side differs')
         geometry = dict(entry, bits=width, codebook='mul1')
         specs = packed_specs(module, geometry)
         if set(specs) != set(entry['stored_tensors']) or any(inv['specs'].get(n) != spec for n, spec in specs.items()):
-            raise ValueError('Hy4 packed tensor geometry differs: ' + module)
+            raise ValueError('MUL1 packed tensor geometry differs: ' + module)
         markers[module + '.mul1'] = 'mul1'
     native = set(inv['mapping']) - {n for e in quantize['tensor_storage'].values() for n in e['stored_tensors']}
     if native != quantize.get('retained_native_tensors', {}).keys():
-        raise ValueError(f'Hy4 retained-native inventory differs in {view}')
+        raise ValueError(f'MC retained-native inventory differs in {view}')
     return markers
 
 
@@ -786,12 +794,12 @@ def validate(output, *, verification='full'):
     if state['identity']['schema'] != 'cuteafd-core-package-v1':
         raise ValueError('unsupported package receipt')
     family = state['identity']['family']
-    if verification == 'streaming-receipts' and (family not in ('inkling2', 'hy4_flash', 'hy4')
+    if verification == 'streaming-receipts' and (family not in DIRECT_MUL1_FAMILIES | {'inkling2'}
             or 'direct_expected_specs' not in state or state.get('copies') != {}):
         raise ValueError('streaming receipts require an independent direct package')
     if verification == 'streaming-receipts':
         source_names = set(state['core_tensors']['original'])
-        if family in ('hy4_flash', 'hy4'):
+        if family in DIRECT_MUL1_FAMILIES:
             source_names.update(n for n in state['direct_expected_specs']['original']
                                 if '.mlp.experts.' not in n)
         if set(state['source_tensor_locations']) != source_names:
@@ -809,10 +817,10 @@ def validate(output, *, verification='full'):
     if family != 'ml4':
         manifest = mc_manifest.validate(load_json(output / mc_manifest.MANIFEST), output)
         _validate_direct_engram(output, manifest, state)
-    if family in ('hy4_flash', 'hy4') and (state['identity'].get('codebook') != 'mul1'
+    if family in DIRECT_MUL1_FAMILIES and (state['identity'].get('codebook') != 'mul1'
             or state['identity'].get('codebook_multiplier') != MUL1
             or manifest.get('exl3_codebook') != dict(name='mul1', multiplier=MUL1)):
-        raise ValueError('Hy4 package, manifest and producer must agree on MUL1')
+        raise ValueError('MC package, manifest and producer must agree on MUL1')
     views = {}
     checked_markers = set()
     for view, core in state['core_tensors'].items():
@@ -824,8 +832,17 @@ def validate(output, *, verification='full'):
             if inv['specs'] != expected or inv['mapping'] != state['direct_expected_mappings'][view]:
                 raise ValueError('direct selected index differs from committed tensor inventory')
             selected = state['direct_core_selection']
-            markers = (_hy4_markers(inv, q, load_json(output / config), selected, view)
-                       if family in ('hy4_flash', 'hy4') else {})
+            config_document = load_json(output / config)
+            if family == 'glm5_flash':
+                declaration = config_document['quantization_config']
+                if (config_document['text_config'].get('quantization_config') != declaration
+                        or declaration.get('safetensors_index') != index
+                        or declaration.get('per_module_metadata') != quantize + ':tensor_storage'
+                        or any(q.get(k) != v for k, v in declaration.items())
+                        or q.get('meta', {}).get('upstream_activations') != 'k8-compact'):
+                    raise ValueError('GLM Flash per-view declarations differ')
+            markers = (_direct_mul1_markers(inv, q, config_document, selected, view)
+                       if family in DIRECT_MUL1_FAMILIES else {})
             for module, geometry in selected.items():
                 if view == 'original':
                     if module in q['tensor_storage']:
