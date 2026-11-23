@@ -25,6 +25,20 @@ def test_sparse_witness_crosses_pooled_cutoff():
             assert chat["reasoning_effort"] == "max"
             return [1] * len(messages[0]["content"].split())
 
-    witness = v2.long_witness(Tokenizer(), corpus.CHAT, corpus.DSA_CUTOFF)
+    witness = v2.long_witness(Tokenizer(), corpus.CHAT, corpus.WITNESS_MIN_TOKENS)
     assert witness["tokens"] // 4 > 2048
     assert witness["hessian_eligible"] is False
+
+
+def test_group_exclusion_begins_at_513_complete_pools():
+    cal = [dict(id="tail", tokens=2051), dict(id="extra_pool", tokens=2052)]
+    shared = dict(group="g1", prompt_sha256="same")
+    heldout = dict(group="g2", prompt_sha256="independent")
+    provenance = dict(splits={name: dict(records=rows) for name, rows in
+                              (("calibration", [shared]), ("screening", [shared]),
+                               ("heldout", [heldout]))})
+    report = corpus.corpus_diagnostics(dict(calibration=dict(records=cal)), provenance)
+    assert report["dsa"]["selected_groups"] == 512
+    assert report["dsa"]["sparse_calibration_rows"] == [cal[1]]
+    assert report["split_overlap"]["screening_and_calibration"] == dict(group=1, prompt_sha256=1)
+    assert report["split_overlap"]["calibration_and_heldout"] == dict(group=0, prompt_sha256=0)

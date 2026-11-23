@@ -17,7 +17,33 @@ SOURCE_FILES = {
 }
 CHAT = dict(v2.CHAT, reasoning_effort="max", date_string="2026-11-23")
 CONTRACT = dict(v2.CONTRACT, **CHAT)
-DSA_CUTOFF = 2048 * 4
+INDEX_TOPK = 2048
+INDEX_KPOOL = 4
+SELECT_GROUPS = INDEX_TOPK // INDEX_KPOOL
+# A partial tail is always selected in addition to the complete pooled keys.
+DSA_CUTOFF = SELECT_GROUPS * INDEX_KPOOL + INDEX_KPOOL - 1
+WITNESS_MIN_TOKENS = 8192
+
+
+def corpus_diagnostics(splits, provenance):
+    calibration = splits["calibration"]["records"]
+    sparse = [dict(id=row["id"], tokens=row["tokens"]) for row in calibration
+              if row["tokens"] > DSA_CUTOFF]
+    selection = provenance["splits"]
+    def values(split, key):
+        return {row[key] for row in selection[split]["records"]}
+
+    overlaps = {}
+    for a, b in (("screening", "calibration"), ("screening", "heldout"),
+                 ("calibration", "heldout")):
+        overlaps[f"{a}_and_{b}"] = {
+            key: len(values(a, key) & values(b, key))
+            for key in ("group", "prompt_sha256")
+        }
+    return dict(dsa=dict(selected_groups=SELECT_GROUPS, group_tokens=INDEX_KPOOL,
+                         max_tokens_before_first_group_exclusion=DSA_CUTOFF,
+                         sparse_calibration_count=len(sparse), sparse_calibration_rows=sparse),
+                split_overlap=overlaps)
 
 
 def prepare(source, corpus, output):
@@ -30,8 +56,9 @@ def prepare(source, corpus, output):
     lock = json.loads((repo / "third_party/transformers.lock.json").read_text())
     return v2.prepare(source, corpus, output, source_repo=SOURCE_REPO,
                       source_revision=SOURCE_REVISION, schema=SCHEMA, contract=CONTRACT,
-                      chat=CHAT, witness_cutoff=DSA_CUTOFF, assets=SOURCE_FILES,
-                      expected_assets=SOURCE_FILES, software={"transformers_revision": lock["revision"]})
+                      chat=CHAT, witness_cutoff=WITNESS_MIN_TOKENS, assets=SOURCE_FILES,
+                      expected_assets=SOURCE_FILES, diagnostics=corpus_diagnostics,
+                      software={"transformers_revision": lock["revision"]})
 
 
 def load_token_batches(root, split="calibration"):

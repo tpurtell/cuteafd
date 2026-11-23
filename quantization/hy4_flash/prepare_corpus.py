@@ -100,7 +100,8 @@ def append_standard(root, source, stage, ids, offsets, report, tokenizer_sha256)
 
 def prepare(source, corpus, output, *, source_repo="tencent/Hy4-flash",
             source_revision=SOURCE_REVISION, schema=SCHEMA, contract=CONTRACT, chat=CHAT,
-            witness_cutoff=2048, assets=ASSETS, expected_assets=None, software=None):
+            witness_cutoff=2048, assets=ASSETS, expected_assets=None, software=None,
+            diagnostics=None):
     import torch
     from transformers import PreTrainedTokenizerFast
 
@@ -143,6 +144,8 @@ def prepare(source, corpus, output, *, source_repo="tencent/Hy4-flash",
             sha256=panel.sha256_file(stage / "long-context-smoke.json"), hessian_eligible=False)
         if identity != {name: panel.sha256_file(source / name) for name in assets}:
             raise ValueError("source tokenizer changed during preparation")
+        if diagnostics is not None:
+            manifest["diagnostics"] = diagnostics(manifest["splits"], provenance)
         atomic_json(stage / "manifest.json", manifest)
         for split in panel.SPLITS:
             panel.load_token_records(stage, split, schema=schema, contract=contract, dataset=DATASET)
