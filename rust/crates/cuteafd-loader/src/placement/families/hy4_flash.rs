@@ -419,7 +419,7 @@ impl Hy4Inputs {
         out.extend(target.weight_components(maximum)?);
         if !target.core.is_empty() {
             out.push(crate::shared::dense_read::trellis_device_staging(gpu as u8, maximum));
-            if let Some(scratch) = target.trellis_scratch(rows as usize, self.decode_rows as usize).map_err(refusal)? {
+            if let Some(scratch) = target.trellis_scratch(rows as usize, DECODE_ROWS as usize).map_err(refusal)? {
                 out.extend(buffer(
                     format!("hy4_flash.target.{gpu}.trellis"),
                     location,
@@ -601,7 +601,8 @@ impl Hy4Inputs {
 
     fn head_owners(&self, maximum: u64) -> Result<Vec<Component>, Refusal> {
         let head = self.head_gpu();
-        let rows = u64::from(self.decode_rows);
+        // Also covers a full prefill scoring tile.
+        let rows = u64::from(DECODE_ROWS);
         let mut out = Vec::new();
         for (name, bytes) in [
             ("tokens", rows * 4),

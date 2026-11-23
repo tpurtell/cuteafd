@@ -207,7 +207,7 @@ impl<'a> Hy4Backend<'a> {
     ) -> Result<()> {
         let selected = cuteafd_loader::serving_capacity::hy4_graphs::selected_rows(
             layout,
-            64.min(self.unit_rows).min(self.context),
+            self.decode_rows.min(self.context),
         )?;
         if selected.is_empty() {
             return Ok(());

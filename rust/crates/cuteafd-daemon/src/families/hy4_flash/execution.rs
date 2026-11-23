@@ -1097,7 +1097,10 @@ impl<'a> Hy4Engine<'a> {
         }
 
         let prefill_waves = prefill_waves.max(1);
-        let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, decode_rows)?;
+        // Prefill scoring can project a full head tile, independently of the
+        // configured decode-row budget.
+        let head_rows = max_rows.min(DECODE_ROWS as usize);
+        let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, head_rows)?;
         // SAFETY: checkpoint shard files remain immutable for the duration of the engine.
         let engram = unsafe { Hy4EngramHost::open(devices[0].library, checkpoint, &cfg, unit_rows, prefill_waves, decode_rows)? };
         let max_seq_pages = max_context.div_ceil(PAGE_ROWS).max(16).min(max_pages);
@@ -1122,7 +1125,7 @@ impl<'a> Hy4Engine<'a> {
                 mark_slots,
             )?);
             let native_layout = weights.native.scratch_layout(max_rows)?;
-            let native_head_layout = weights.native.head_scratch_layout(max_rows.min(DECODE_ROWS as usize))?;
+            let native_head_layout = weights.native.head_scratch_layout(head_rows)?;
             let scratch = RankScratch::new(
                 device,
                 rank,
@@ -1248,7 +1251,7 @@ impl<'a> Hy4Engine<'a> {
         layout: Option<cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout>,
     ) -> Result<()> {
         for (rank, r) in self.ranks.iter_mut().enumerate() {
-            r.graphs.attach(r.device.library, r.device.id, rank, layout, self.max_rows.min(64))?;
+            r.graphs.attach(r.device.library, r.device.id, rank, layout, self.decode_rows)?;
         }
         self.graphs_enabled.set(true);
         Ok(())
@@ -1331,7 +1334,7 @@ impl<'a> Hy4Engine<'a> {
     /// Warm one decode row geometry at `pos` on disposable startup cache slots/pages.
     /// Pass 0 runs eager first-touch + `observe_graph_startup`; pass 1 captures + observes.
     pub(crate) fn warm_row_shape(&mut self, rows: usize, pos: usize) -> Result<()> {
-        ensure!(rows > 0 && rows <= 64.min(self.max_rows), "Hy4 warm rows {rows} out of range");
+        ensure!(rows > 0 && rows <= self.decode_rows, "Hy4 warm rows {rows} out of range");
         let n_seq = rows.min(self.max_sequences);
         let base_per = rows / n_seq;
         let rem = rows % n_seq;
@@ -1667,7 +1670,6 @@ impl<'a> Hy4Engine<'a> {
         swa_cu_bytes.extend_from_slice(&(rows as i32).to_le_bytes());
 
         let graphed = priority == ReadPriority::Decode
-            && rows <= 64
             && self.graphs_active()
             && !self.skip_routed_experts
             && self.dump_dir.is_none();
