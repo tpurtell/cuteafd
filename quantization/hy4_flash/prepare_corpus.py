@@ -28,15 +28,16 @@ CONTRACT = dict(renderer="native-chat-template",
                 batch_size=1, packing=False, order="dataset", **CHAT)
 
 
-def long_witness(tokenizer, chat=CHAT):
-    for length in (48, 72, 96, 128):
+def long_witness(tokenizer, chat=CHAT, cutoff=2048):
+    for units in (48, 72, 96, 128):
+        length = (units * cutoff + 2047) // 2048
         prompt = "\n".join(
             f"Observation {i}: The airship records the position and colour of every star. "
             "The archivist compares the last recorded coordinate with the first."
             for i in range(length)
         )
         ids = tokenizer.apply_chat_template([dict(role="user", content=prompt)], **chat)
-        if len(ids) > 2048:
+        if len(ids) > cutoff:
             return dict(input_ids=ids, tokens=len(ids), hessian_eligible=False,
                         input_ids_sha256=panel.ids_sha256(ids))
     raise ValueError("long context witness never crossed the sparse selector cutoff")
@@ -98,14 +99,17 @@ def append_standard(root, source, stage, ids, offsets, report, tokenizer_sha256)
 
 
 def prepare(source, corpus, output, *, source_repo="tencent/Hy4-flash",
-            source_revision=SOURCE_REVISION, schema=SCHEMA, contract=CONTRACT, chat=CHAT):
+            source_revision=SOURCE_REVISION, schema=SCHEMA, contract=CONTRACT, chat=CHAT,
+            witness_cutoff=2048, assets=ASSETS, expected_assets=None, software=None):
     import torch
     from transformers import PreTrainedTokenizerFast
 
     source, output = Path(source).absolute(), Path(output).absolute()
     if source.name != source_revision or output.exists():
         raise ValueError("require the pinned source and a fresh corpus directory")
-    identity = {name: panel.sha256_file(source / name) for name in ASSETS}
+    identity = {name: panel.sha256_file(source / name) for name in assets}
+    if expected_assets is not None and identity != expected_assets:
+        raise ValueError("pinned source tokenizer asset hashes differ")
     tokenizer = PreTrainedTokenizerFast.from_pretrained(source, local_files_only=True)
     if (not tokenizer.is_fast or not isinstance(tokenizer.chat_template, str)
             or hashlib.sha256(tokenizer.chat_template.encode()).hexdigest() != identity["chat_template.jinja"]):
@@ -116,7 +120,7 @@ def prepare(source, corpus, output, *, source_repo="tencent/Hy4-flash",
         dataset=DATASET, components={},
         historical_selection=provenance["selection"],
         source=dict(repo_id=source_repo, revision=source_revision, files=identity),
-        software=panel.software_identity(), tokenizer=dict(vocab_size=len(tokenizer)), splits={})
+        software={**panel.software_identity(), **(software or {})}, tokenizer=dict(vocab_size=len(tokenizer)), splits={})
     output.parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=output.name + ".partial-", dir=output.parent))
     try:
@@ -133,11 +137,11 @@ def prepare(source, corpus, output, *, source_repo="tencent/Hy4-flash",
                      offsets=torch.tensor(offsets, dtype=torch.int64)),
                 metadata=dict(schema=schema, split=split), hash_algorithm="sha256")
             manifest["splits"][split] = dict(report, file=path.name, sha256=receipt["sha256"])
-        witness = long_witness(tokenizer, chat)
+        witness = long_witness(tokenizer, chat, witness_cutoff)
         atomic_json(stage / "long-context-smoke.json", witness)
         manifest["long_context_smoke"] = dict(file="long-context-smoke.json", tokens=witness["tokens"],
             sha256=panel.sha256_file(stage / "long-context-smoke.json"), hessian_eligible=False)
-        if identity != {name: panel.sha256_file(source / name) for name in ASSETS}:
+        if identity != {name: panel.sha256_file(source / name) for name in assets}:
             raise ValueError("source tokenizer changed during preparation")
         atomic_json(stage / "manifest.json", manifest)
         for split in panel.SPLITS:
