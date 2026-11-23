@@ -10,12 +10,12 @@ from glm5_flash.mul1_mc import source
 
 
 @pytest.mark.parametrize("bits", [6, 8])
-def test_core_and_mtp_ride_selected_width(bits):
+def test_core_and_mtp_ride_selected_width_and_share_native_eh(bits):
     modules = source.core_modules(bits)
     prefix = "model.language_model.layers.45."
-    assert len(modules) == 324
+    assert len(modules) == 323
     assert modules[prefix + "self_attn.q_b_proj"]["bits"] == bits
-    assert modules[prefix + "eh_proj"]["bits"] == bits
+    assert prefix + "eh_proj" not in modules
     assert all(g["bits"] == bits for g in modules.values())
     assert prefix + "self_attn.kv_b_proj" not in modules
     assert prefix + "self_attn.indexer.wq_b" not in modules
@@ -23,9 +23,9 @@ def test_core_and_mtp_ride_selected_width(bits):
 
 def test_payloads_store_experts_only_once():
     assert source.payloads() == dict(shared_expert_bytes=156_283_454_592,
-        retained_native_bytes=3_390_684_024, expert_modules=37_152, core_modules_per_view=324,
-        view_payload_bytes={"k6-compact": 165_661_687_560, "k8-compact": 167_655_292_680,
-                            "original": 175_622_979_576}, package_payload_bytes=189_591_682_584)
+        retained_native_bytes=3_457_792_888, expert_modules=37_152, core_modules_per_view=323,
+        view_payload_bytes={"k6-compact": 165_703_606_020, "k8-compact": 167_688_822_532,
+                            "original": 175_622_979_576}, package_payload_bytes=189_532_913_168)
 
 
 def test_cache_inventory_binds_asset_content_and_expected_oid(tmp_path, monkeypatch):

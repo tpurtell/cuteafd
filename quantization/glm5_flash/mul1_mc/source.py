@@ -20,12 +20,13 @@ CONFIG_SHA256 = "33e63ec7fe607658be712bd6dd3c16c6549960d8e7f0483d34b939881b55f94
 # with blobs=true. OIDs are LFS SHA256 for weights, Git blob SHA1 for assets.
 SOURCE_MANIFEST_SHA256 = "762d842a4d3f3ce3266c034b5f7776f0fde8aeadf9512e5eba2203b9aa61d5f8"
 MUL1_MULTIPLIER = 0x83DCD12D
+NATIVE_EH = flash.PREFIX + "layers.45.eh_proj"
 
 
 def core_modules(bits):
-    """Provisional pilot selection for eh_proj is the same width as all other core."""
+    """Keep the MTP input projection source-native after the held-out pilot."""
     return {name: {**geometry, "bits": bits, "codebook": "mul1"}
-            for name, geometry in flash.reviewed_core_modules(core_bits=bits).items()}
+            for name, geometry in flash.reviewed_core_modules(core_bits=bits).items() if name != NATIVE_EH}
 
 
 def expert_modules():

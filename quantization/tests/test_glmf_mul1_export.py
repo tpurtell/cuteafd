@@ -19,9 +19,9 @@ def geometry(width):
 
 
 def fixture(tmp_path, monkeypatch):
-    core = "model.language_model.layers.45.eh_proj"
+    core = "model.language_model.layers.45.self_attn.q_b_proj"
     expert = "model.language_model.layers.45.mlp.experts.0.up_proj"
-    native = "model.language_model.layers.45.enorm.weight"
+    native = export.source.NATIVE_EH + ".weight"
     src = tmp_path / "source"
     src.mkdir()
     for asset in export.ASSETS:
@@ -29,7 +29,7 @@ def fixture(tmp_path, monkeypatch):
     config = dict(model_type="glm5_next", text_config=dict(model_type="glm5_next_text"))
     atomic_json(src / "config.json", config)
     bf16 = {n + ".weight": torch.zeros((128, 128), dtype=torch.bfloat16) for n in (core, expert)}
-    bf16[native] = torch.ones(128, dtype=torch.bfloat16)
+    bf16[native] = torch.ones((128,256), dtype=torch.bfloat16)
     save_file(bf16, src / "input.safetensors")
     total = sum(t.numel() * t.element_size() for t in bf16.values())
     atomic_json(src / "model.safetensors.index.json", dict(metadata=dict(total_size=total),
@@ -55,7 +55,7 @@ def fixture(tmp_path, monkeypatch):
         entries[kind] = {n: (path, n) for n in packed}
         hashes[kind] = {n: xxhash.xxh3_128_hexdigest(v.numpy().tobytes()) for n, v in packed.items()}
         packed_sizes[kind] = sum(v.numel() * v.element_size() for v in packed.values())
-    shared = packed_sizes["shared"] + 256
+    shared = packed_sizes["shared"] + 128 * 256 * 2
     monkeypatch.setattr(export.source, "payloads", lambda: dict(
         package_payload_bytes=shared + 32768 + packed_sizes["k8-compact"] + packed_sizes["k6-compact"],
         view_payload_bytes={k: shared + packed_sizes.get(k, 32768) for k in export.VIEWS}))
@@ -85,11 +85,18 @@ def test_producer_bytes_survive_group_resume_and_default_loader(tmp_path, monkey
     assert receipt["status"] == "validated-headers-and-byte-exactness"
     assert receipt["original_discovery"]["status"] == "passed"
     assert core + ".weight" in receipt["original_core_tensor_sha256"]
+    eh_weight = export.source.NATIVE_EH + ".weight"
+    assert eh_weight in receipt["original_core_tensor_sha256"]
+    eh_shards = set()
     for view in export.VIEWS:
         index, config_name, quant_name, bits = export.package.mc_manifest.FILES[view]
         config = export.package.load_json(writer.output / config_name)
         meta = export.package.load_json(writer.output / quant_name)
         storage = meta["tensor_storage"]
+        eh_shards.add(export.package.load_json(writer.output / index)["weight_map"][eh_weight])
+        assert meta["retained_native_tensors"][eh_weight] == {"dtype":"BF16","shape":[128,256]}
+        assert export.source.NATIVE_EH not in storage
+        assert "mtp_bits" not in meta
         assert meta["safetensors_index"] == index
         assert config["text_config"]["quantization_config"] == config["quantization_config"]
         assert meta["meta"]["upstream_activations"] == "k8-compact"
@@ -98,4 +105,4 @@ def test_producer_bytes_survive_group_resume_and_default_loader(tmp_path, monkey
             assert core not in storage
         else:
             assert storage[core]["bits_per_weight"] == bits
-            assert meta["mtp_bits"] == bits
+    assert len(eh_shards) == 1

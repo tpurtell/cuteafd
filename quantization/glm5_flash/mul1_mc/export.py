@@ -56,7 +56,9 @@ def view_metadata(document, native, core, experts, identity):
             core_bits=None if view == "original" else bits, module_include=patterns, codebook="mul1")
         config["quantization_config"]["safetensors_index"] = index
         if view != "original":
-            config["quantization_config"].update(mtp_bits=bits, head_bits=bits)
+            # MTP includes K4 routed experts alongside its compact matrices.
+            # The loader applies mtp_bits to every EXL3 module in that layer.
+            config["quantization_config"]["head_bits"] = bits
         config["text_config"]["quantization_config"] = dict(config["quantization_config"])
         metadata.update(config["quantization_config"])
         configs[view], quantizes[view] = config, metadata
@@ -84,7 +86,7 @@ tags:
 
 ## What multi-core means
 
-Each view shares the K4 routed experts, router, embeddings, vision tower, KDA recurrent tensors, DSA indexer, hyper-connections and absorbed MLA KV projection. The selected core includes the attention matrices, dense and shared MLPs, vocabulary head and MTP core.
+Each view shares the K4 routed experts, router, embeddings, vision tower, KDA recurrent tensors, DSA indexer, hyper-connections and absorbed MLA KV projection. The MTP input projection (`eh_proj`) stays in its original BF16 in every view. The selected core includes the attention matrices, dense and shared MLPs, vocabulary head and remaining MTP core.
 
 | View | Indexed weight payload | When to use it |
 | --- | ---: | --- |
@@ -99,7 +101,7 @@ The source is `{source.BASE_REPO}@{source.BASE_REVISION}`. The calibration panel
 | Recipe | Value |
 | --- | --- |
 | Codebook | EXL3 MUL1, multiplier `0x83DCD12D`, side 1, automatic output scales |
-| Widths | Shared K4 experts, K8 and K6 core including MTP |
+| Widths | Shared K4 experts, K8 and K6 compact core, shared BF16 MTP input projection |
 | Encoder | `tpurtell/GPTQModel@{identity['code']['fork']}` |
 | Search | Seed {identity['seed']}, sigma_reg {identity['sigma']} |
 | Hessians | FP32 products over at most 128 rows, FP64 outer sum, FP32 storage, checked FP64 Hadamard congruence |
