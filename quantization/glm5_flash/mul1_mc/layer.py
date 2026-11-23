@@ -9,7 +9,7 @@ import xxhash
 import sys
 from inkling2.numerical import fork_module
 from kimi_k3.uniform_k2.storage import atomic_json
-from . import experts, numerics, source as recipe
+from . import experts, numerics
 
 PREFIX = "model.language_model."
 PARTS = ("gate_proj", "up_proj", "down_proj")
@@ -27,12 +27,8 @@ class LayerPass:
         self.identity, self.device = identity, torch.device(device)
         self.tokens = [ids.reshape(1, -1) for ids in tokens]
         self.math = fork_module("utils.glm5_flash_core")
-        self.core = recipe.core_modules(8)
         self.metrics_dir = stages.root.parent / "metrics"
         self.metrics_dir.mkdir(exist_ok=True)
-
-    def source_refs(self, names):
-        return {key: (self.source.snapshot / self.source.weight_map[key], key) for key in names}
 
     def rows(self, stage, *keys, start=0):
         return self.stages.records(stage, device=self.device, keys=keys or None, start=start)
@@ -49,10 +45,6 @@ class LayerPass:
         return stage
 
     def initial(self):
-        if not self.writer.group_complete("globals"):
-            names = [key for key in self.source.weight_map
-                     if not key.startswith(PREFIX+"layers.") and key != "lm_head.weight"]
-            self.writer.write_group("globals", shared=self.source_refs(names))
         def batches(start):
             embedding = self.source.tensor(PREFIX+"embed_tokens.weight", self.device)
             for i in range(start, len(self.tokens)):
@@ -94,11 +86,7 @@ class LayerPass:
             module.weight.copy_(numerics.reconstruct(packed, module.weight.shape, self.device))
         return stage
 
-    def publish_layer(self, label, prefix, fit_stages, *, global_head=False):
-        names = {"lm_head.weight"} if global_head else {
-            key for key in self.source.weight_map if key.startswith(prefix)}
-        originals = {key for key in names if key.removesuffix(".weight") in self.core}
-        native = {key for key in names - originals if ".mlp.experts." not in key}
+    def publish_layer(self, label, fit_stages):
         packed = {4: {}, 6: {}, 8: {}}
         hashes = {4: {}, 6: {}, 8: {}}
         rows = []
@@ -114,25 +102,37 @@ class LayerPass:
                             key = f"k{bits}.{leaf}"
                             packed[bits][leaf] = self.stages.reference(stage, i, key)
                             hashes[bits][leaf] = meta["hashes"][key]
-        self.writer.write_group(label, shared=self.source_refs(native) | packed[4],
-            original=self.source_refs(originals), k8=packed[8], k6=packed[6],
+        self.writer.write_group(label, shared=packed[4], k8=packed[8], k6=packed[6],
             packed_hashes={"shared": hashes[4], "k6-compact": hashes[6], "k8-compact": hashes[8]})
         atomic_json(self.metrics_dir / f"{label}.json", rows)
 
     def routed(self, block, label, prefix, mlp_stage, count):
-        def routes():
-            for _, record in self.rows(mlp_stage, "normalized"):
-                hidden = record["normalized"].reshape(-1, self.source.config["hidden_size"])
-                yield hidden, *experts.route_batch(block.mlp, hidden)
         width = self.source.config["hidden_size"]
+        streams = () if block.layer_idx == 45 else (self.source.config["hc_mult"],)
+        residual_bytes = count * width * 2
+        if streams:
+            residual_bytes *= streams[0]
         intermediate = self.source.config["moe_intermediate_size"]
-        plan = experts.memory_plan(count, width, frontier_bytes=0,
+        # Return unused core-fit buffers to unified memory before admitting the routed phase.
+        torch.cuda.empty_cache()
+        plan = experts.memory_plan(count, width, frontier_bytes=residual_bytes, input_dtype=torch.bfloat16,
             weight_bytes=3*width*intermediate*2, hessian_bytes=width**2*16,
             workspace_bytes=self.identity["expert_workspace_bytes"], container_remaining=self.container_remaining())
         if not plan["admitted"]:
             raise MemoryError(f"unified RAM cannot admit {label}: {plan}")
         atomic_json(self.metrics_dir.parent / f"{label}-memory.json", plan)
-        bank = experts.ExpertBank(routes(), tokens=count, device=self.device)
+        residuals = torch.empty((count, *streams, width), dtype=torch.bfloat16, device=self.device)
+        def routes():
+            offset = 0
+            for _, record in self.rows(mlp_stage):
+                hidden = record["normalized"].reshape(-1, width)
+                residual = record["residual"].squeeze(0)
+                if residual.dtype != residuals.dtype or residual.shape != (len(hidden), *streams, width):
+                    raise ValueError("GLM residual storage would change shape or precision")
+                residuals[offset:offset+len(hidden)].copy_(residual)
+                offset += len(hidden)
+                yield hidden, *experts.route_batch(block.mlp, hidden)
+        bank = experts.ExpertBank(routes(), tokens=count, device=self.device, input_dtype=torch.bfloat16)
         evidence = list(bank.receipts())
         work = experts.ExpertWorkspace.allocate(width, intermediate, device=self.device)
         stages = []
@@ -155,9 +155,9 @@ class LayerPass:
                         hashes.update({key: value_hash(tensor) for key, tensor in packed.items()})
                         yield idx-base, packed
                 self.stages.write_batches(stage, fit_group(), dict(names=names, metrics=metrics, hashes=hashes))
-                encoder = sys.modules["gptqmodel.exllamav3.modules.quant.exl3_lib.quantize"]
+                encoder = sys.modules.get("gptqmodel.exllamav3.modules.quant.exl3_lib.quantize")
                 print(json.dumps(dict(event="expert_group_complete", layer=label, first=base,
-                    trellis_workspace_count=len(encoder._workspace_buffers),
+                    trellis_workspace_count=len(encoder._workspace_buffers) if encoder else 0,
                     cuda_allocated_bytes=torch.cuda.memory_allocated(self.device),
                     cuda_reserved_bytes=torch.cuda.memory_reserved(self.device))), flush=True)
             values = self.stages.read_batch(stage, expert-base)
@@ -166,7 +166,7 @@ class LayerPass:
             return experts.replay_expert(bank, expert, tensors, workspace=work,
                                          swiglu_limit=block.mlp.experts.swiglu_limit)
         combined = bank.combine(replay, weighted_buffer=work.gather)
-        return combined, stages
+        return combined, bank.inputs, residuals, stages
 
     @staticmethod
     def container_remaining():
@@ -227,13 +227,23 @@ class LayerPass:
         fit("down-fit", [mlp+"down_proj"],
             lambda: (self.math.shared_down_input(shared,x) for x in samples(m,"normalized")))
         lengths = [ids.numel() - int(index==45) for ids in self.tokens]
-        combined = None
+        combined = normalized_bank = residuals = None
         if index >= 3:
-            combined, expert_stages = self.routed(block, label, prefix, m, sum(lengths))
+            combined, normalized_bank, residuals, expert_stages = self.routed(block, label, prefix, m, sum(lengths))
             fit_stages.extend(expert_stages)
         def final_batches(start):
             offset = sum(lengths[:start])
-            for i, state in self.rows(m, start=start):
+            def states():
+                if combined is None:
+                    yield from self.rows(m, start=start)
+                else:
+                    cursor = offset
+                    for i in range(start, len(lengths)):
+                        part = slice(cursor, cursor+lengths[i])
+                        yield i, dict(normalized=normalized_bank[part].unsqueeze(0),
+                                      residual=residuals[part].unsqueeze(0))
+                        cursor += lengths[i]
+            for i, state in states():
                 x = state["normalized"]
                 output = shared(x)
                 if combined is not None:
@@ -246,7 +256,7 @@ class LayerPass:
                           if hasattr(block, "ffn_hc") else residual + output)
                 yield i, dict(hidden=hidden)
         self.save(successor, final_batches)
-        self.publish_layer(label, prefix, fit_stages)
+        self.publish_layer(label, fit_stages)
         self.stages.retire(a, o, m, *fit_stages)
         return successor
 
@@ -268,7 +278,7 @@ class LayerPass:
         norm = self.norm()
         fitted = self.fit("head-fit", {"lm_head":head},
                           lambda: (norm(r["hidden"].mean(2)) for _,r in self.rows(incoming, "hidden")))
-        self.publish_layer("head", "", [fitted], global_head=True)
+        self.publish_layer("head", [fitted])
         self.stages.retire(fitted)
 
     @torch.inference_mode()
