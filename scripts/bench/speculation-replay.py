@@ -184,10 +184,22 @@ def tidy_job(job_dir):
     return rows
 
 
+# Families whose dev drafter reported no per-token score (scored since #2573).
+DEV_UNSCORED = {'muse_spark', 'inkling2', 'qwen4', 'step5'}
+
+# Drafters with a trained confidence head (the engine calibrates it online).
+TRAINED_HEAD_FAMILIES = {'deepseek_v41', 'kimi_k3', 'minimax_m3', 'deepseek_v4', 'qwen3_5'}
+
+
 def score_source(family, positions, features):
-    """Which per-position signal a row's `score` holds."""
-    if any(p.get('head') is not None for p in positions):
+    """Which per-position signal a row's `score` holds. Since #2573 every scored
+    drafter records `head` (raw) and `calibrated`, so a trained head is told apart
+    from a candidate probability by family, not by which fields are present."""
+    has_head = any(p.get('head') is not None for p in positions)
+    if has_head and family in TRAINED_HEAD_FAMILIES:
         return 'head (dSpark/trained, calibrated)'
+    if has_head and any(p.get('calibrated') is not None for p in positions):
+        return 'candidate p (engine-calibrated)'
     if any(p.get('score') is not None for p in positions):
         return 'raw candidate p (DFlash2 selector)'
     if features:
@@ -484,9 +496,12 @@ def attach_calibration(rows):
             source = r.get('score_source') or ''
             scored = any(v is not None for v in r['score'])
             r['raw'] = [v if v is not None else 0. for v in (r['score'] if scored else r['history'])]
-            if not scored or source.startswith('head') or source.startswith('history'):
+            engine = source.startswith('head') or source.startswith('candidate p (engine')
+            if not scored or engine or source.startswith('history'):
+                # Engine-calibrated scores (dSpark heads; any scored drafter since #2573) are
+                # used as recorded: never calibrated a second time.
                 r['prob'] = list(r['raw'])
-                r['calibration'] = 'engine' if source.startswith('head') else 'history'
+                r['calibration'] = 'engine' if engine else 'history'
                 continue
             r['prob'] = [platts[k].apply(logit_of(v)) for k, v in enumerate(r['raw'])]
             r['calibration'] = 'online platt (replay)'
@@ -521,8 +536,10 @@ def rule_history(cut=None, raw_cut=0.5, head_cut=0.3, history_cut=0.3, calibrate
     """
     def length(row):
         source = row.get('score_source') or ''
-        if source.startswith('history'):
-            c, vals = history_cut, row['raw']
+        # Muse and Inkling had no per-token score on dev (#2573 added it): dev history
+        # kept them on their position-history rule.
+        if source.startswith('history') or (not calibrated and row['family'] in DEV_UNSCORED):
+            c, vals = history_cut, row['history']
         elif calibrated:
             c, vals = cut, row['prob']
         elif source.startswith('head'):
@@ -597,6 +614,98 @@ class OnlineCost:
         if base:
             return max(1., interpolate(base, rows))
         return None
+
+
+KEEP_CUT_DEV = 0.3
+
+
+class EngineRoundCost:
+    """Python mirror of the engine's `cuteafd_core::RoundCost` (DRAFT_POLICY=clamped):
+    per context band, a decayed mean round time per verify-row count (decay 0.9,
+    a point needs weight >= 2), an OLS line t = N + e*rows through those points,
+    warm after 32 rounds, x = (N / requests) / e."""
+
+    DECAY, POINT_WEIGHT, WARM = 0.9, 2., 32
+
+    def __init__(self):
+        self.points = collections.defaultdict(lambda: collections.defaultdict(lambda: [0., 0.]))
+        self.rounds = collections.Counter()
+
+    def observe(self, band, rows, us):
+        p = self.points[band][min(rows, 128)]
+        p[0] = self.DECAY * p[0] + us
+        p[1] = self.DECAY * p[1] + 1.
+        self.rounds[band] += 1
+
+    def line(self, band):
+        if self.rounds[band] < self.WARM:
+            return None
+        pts = [(r, s / w) for r, (s, w) in self.points[band].items() if w >= self.POINT_WEIGHT]
+        if len(pts) < 2:
+            return None
+        n = len(pts); mx = sum(p[0] for p in pts) / n; my = sum(p[1] for p in pts) / n
+        sxx = sum((p[0] - mx) ** 2 for p in pts)
+        if sxx <= 0:
+            return None
+        e = sum((p[0] - mx) * (p[1] - my) for p in pts) / sxx
+        intercept = my - e * mx
+        return (intercept, e) if e > 0 and intercept > 0 else None
+
+    def cut(self, band, requests, K=3.4, M=1., LO=0.3, HI=0.7, cold=0.3):
+        line = self.line(band)
+        if line is None:
+            return cold
+        x = line[0] / max(requests, 1) / line[1]
+        return min(HI, max(LO, K / (x + M)))
+
+
+def attach_clamped_cuts(rows, K=3.4, M=1., LO=0.3, HI=0.7):
+    """Each round's `clamped` cut as the engine computes it: one EngineRoundCost per
+    family (one serving process), fed every earlier round of that family's trace in
+    order, all panels and concurrencies, as live traffic would. Sets row['clamped_cut'].
+
+    Caveat: the cost learns from the fixed-length trace's own round times and row
+    counts; under `clamped` itself the live row mix would differ."""
+    per_family = collections.defaultdict(lambda: collections.defaultdict(list))
+    for r in rows:
+        per_family[r['family']][(r['card'], r['round'], r['lane'])].append(r)
+    for family, rounds in per_family.items():
+        cost = EngineRoundCost()
+        for key in sorted(rounds, key=lambda k: (k[0], k[1], k[2] or 0)):
+            members = rounds[key]
+            ctx = [m['context'] for m in members if m['context'] is not None]
+            band = context_band(statistics.fmean(ctx) if ctx else None)
+            cut = cost.cut(band, len(members), K, M, LO, HI)
+            for m in members:
+                m['clamped_cut'] = cut
+            measured = members[0]['round_us'] if members[0]['round_us'] is not None else members[0]['verify_us']
+            if measured is not None:
+                cost.observe(band, members[0]['batch_rows'], measured)
+    return rows
+
+
+def replay_clamped(rows, fit, max_rows=64):
+    """The engine's `clamped` policy replayed: each round keeps the calibrated product
+    against its own online cut (`attach_clamped_cuts`), plus one explore, settled."""
+    rounds = collections.defaultdict(list)
+    for r in rows:
+        rounds[(r['card'], r['round'], r['lane'])].append(r)
+    tokens = seconds = verify_rows = 0.
+    cuts = []
+    for key in sorted(rounds, key=lambda k: (k[0], k[1], k[2] or 0)):
+        members = rounds[key]
+        ctx = [m['context'] for m in members if m['context'] is not None]
+        ck = statistics.fmean(ctx) / 1000 if ctx else 0.
+        cut = members[0].get('clamped_cut', KEEP_CUT_DEV)
+        cuts.append(cut)
+        rule = rule_product(cut)
+        lengths = settle([rule(m) for m in members], members, max_rows)
+        tokens += sum(1 + min(L, accepted_run(m)) for L, m in zip(lengths, members))
+        nrows = sum(1 + L for L in lengths)
+        seconds += predict(fit, nrows, len(members), ck) / 1e6
+        verify_rows += nrows
+    return dict(tok_s=tokens / seconds if seconds else 0., rounds=len(rounds),
+                mean_cut=statistics.fmean(cuts) if cuts else None, rows_per_round=verify_rows / max(len(rounds), 1))
 
 
 class OnlineRatio:
@@ -832,15 +941,16 @@ def reliability(rows, field='score', bins=10):
 
 
 CUTS = (0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9)
+PRODUCT_CUTS = tuple(round(0.05 * i, 2) for i in range(2, 19))  # 0.1 .. 0.9
 RULES = {
     **{f'fixed-{n}': rule_fixed(n) for n in range(0, 8)},
     'history': rule_history(),
     **{f'history@{t}': rule_history(cut=t, calibrated=True) for t in CUTS},
-    **{f'product>{t}': rule_product(t) for t in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6)},
+    **{f'product>{t}': rule_product(t) for t in PRODUCT_CUTS},
 }
 BATCH_RULES = {'marginal-rowsonly': OnlineCost, 'marginal-ratio-rowsonly': OnlineRatio,
                'marginal': OnlineTwoTerm, 'marginal-ratio': lambda: OnlineTwoTerm(ratio=True)}
-RULE_PREFIXES = ('fixed-', 'history', 'product', 'marginal')
+RULE_PREFIXES = ('fixed-', 'history', 'product', 'marginal', 'clamped')
 
 
 def analyze(rows, weights=None, manifests=(), pricing='table'):
@@ -851,6 +961,7 @@ def analyze(rows, weights=None, manifests=(), pricing='table'):
         for point in m.get('measured_fixed') or []:
             measured[(m['family'], point['context'], point['c'])] = point['tok_s']
     attach_calibration(rows)
+    attach_clamped_cuts(rows)
     fits = {}
     by_family = collections.defaultdict(list)
     for r in rows:
@@ -875,6 +986,7 @@ def analyze(rows, weights=None, manifests=(), pricing='table'):
                        truncated=sum(not full_block(g) for g in group) / len(group))
             for name, rule in RULES.items():
                 row[name] = replay(group, fit, rule)['tok_s']
+            row['clamped'] = replay_clamped(group, fit)['tok_s']
             for name, model in BATCH_RULES.items():
                 result = replay(group, fit, None, rule_marginal, cost_model=model)
                 row[name] = result['tok_s']
