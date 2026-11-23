@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 from pathlib import Path
 import tempfile
-import subprocess
 from unittest.mock import patch
 
 import torch
@@ -182,10 +183,12 @@ def main():
     with tempfile.TemporaryDirectory(dir=args.output.parent) as temp:
         receipt = qualify(device, Path(temp))
     repo = Path(__file__).resolve().parents[3]
-    def revision(path):
-        return subprocess.check_output(["git", "-C", path, "rev-parse", "HEAD"], text=True).strip()
+    # WIP containers mount a worktree without the parent checkout's Git metadata.
+    files = {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
+             for p in (Path(__file__), Path(__file__).with_name("experts.py"), Path(numerics.__file__))}
+    lock = json.loads((repo / "third_party/gptqmodel.lock.json").read_text())
     atomic_json(args.output, dict(receipt, device=torch.cuda.get_device_name(device),
-                                  engine_revision=revision(repo), fork_revision=revision(repo / "third_party/gptqmodel")))
+                                  code_sha256=files, fork_revision=lock["revision"]))
 
 
 if __name__ == "__main__":
