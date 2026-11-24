@@ -35,7 +35,7 @@ impl GlmPrewarmFamily {
 ///   step 38/40 MiB, capture 4/4 MiB -> soft 446/450 / hard 454/458 MiB.
 /// - Mistral Large 4 2x RTX max (`original`, `context`, dSpark remote): W1 292/290 MiB,
 ///   step 34/36 MiB, capture 4/4 MiB -> soft 388/386 / hard 396/394 MiB.
-/// - Mistral Large 4 1x RTX (non-shipping; scaled from GLM 5.3 1x by 88/78 layers):
+/// - Mistral Large 4 1x RTX (scaled from GLM 5.3 1x by 88/78 layers; unmeasured / non-gated):
 ///   W1 196 MiB, step 28 MiB, capture 4 MiB -> soft 292 / hard 300 MiB.
 ///
 /// Soft and hard caps are derived by `graph_reserve::resolve_working_set`.
