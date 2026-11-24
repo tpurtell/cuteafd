@@ -272,6 +272,8 @@ def test_deployment_preserves_release_container_commands(
             for flag in ("--kda-output-shard", "--kda-prefill-expanded"):
                 if flag in before["command"]:
                     before["command"].remove(flag)
+        if old["host"] == "coordinator" and entry["family"] == "deepseek_v41":
+            before["command"][1:1] = ["--graph-no-prewarm", "--graph-donor-always", "--graph-donor-cold-lag", "8"]
         if old["host"] == "coordinator" and "--coordinator-weight-budget-gib" not in before["command"]:
             # Serve admits resident weights against the planner's budget; historical
             # captures predate passing it and fell back to the 80 GiB default.

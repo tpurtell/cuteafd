@@ -124,8 +124,12 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
         # The fingerprint now also covers the shared executor's prefill waves.
         fingerprinted = {key: value for key, value in before["env"].items() if key != "CUTEAFD_RELEASE_CONFIG_SHA256"}
         assert {key: after["env"][key] for key in fingerprinted} == fingerprinted, where
-        # The serve command is the same set of flags and values (clap ignores order;
-        # --usage now precedes nothing it depends on).
+        # V4.1 now sets the shared graph policy before the serve subcommand.
+        graph_policy = ["--graph-no-prewarm", "--graph-donor-always", "--graph-donor-cold-lag", "8"]
+        if role == "coordinator":
+            assert after["command"][1:1 + len(graph_policy)] == graph_policy, where
+            del after["command"][1:1 + len(graph_policy)]
+        # The remaining command compares the same flags and values (clap ignores order).
         assert after["command"][:3] == before["command"][:3], where
         planned_budget = {str(int(plan[plan.index("--gpu-memory-cap") + 1]) / 2**30)
                           for plan in current["plans"] if "--gpu-memory-cap" in plan}
