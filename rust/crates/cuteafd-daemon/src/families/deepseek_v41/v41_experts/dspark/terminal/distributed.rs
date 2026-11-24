@@ -111,7 +111,7 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
         let width = terminal.width();
         let key = (width, mode, requests);
         if !self.graphs.contains(&key) && !crate::shared::decode_graph::census::eager("dspark") {
-            let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(crate::families::deepseek_v41::graph_policy::ranks(), 1, requests, width);
+            let pinned = crate::families::deepseek_v41::graph_policy::pinned_draft(1, requests, width);
             let Some(mut ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
             let capture = device.run(|| unsafe {
                 ticket.capture_result(crate::shared::decode_graph::begin_capture(&device.library, terminal.stream.raw, &ticket))?;

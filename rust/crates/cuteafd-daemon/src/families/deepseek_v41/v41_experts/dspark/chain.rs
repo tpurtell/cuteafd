@@ -481,7 +481,7 @@ impl DsparkChain<'_, '_> {
     unsafe fn capture_geometry(&mut self, reads: &[WindowGeometry; 3], count: usize) -> Result<()> {
         let key = (count, self.width);
         if self.graphs.contains(&key) { return Ok(()); }
-        let pinned = cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(crate::families::deepseek_v41::graph_policy::ranks(), self.tokens.buffer.device_id as usize, count, self.width);
+        let pinned = crate::families::deepseek_v41::graph_policy::pinned_draft(self.tokens.buffer.device_id, count, self.width);
         let Some(mut ticket) = self.graphs.cache_ticket(&key, pinned, None) else { return Ok(()); };
         unsafe {
             ticket.capture_result(crate::shared::decode_graph::begin_capture(&self.stream.library, self.stream.raw, &ticket))?;

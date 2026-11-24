@@ -422,7 +422,8 @@ mod tests {
                 assert_eq!(graphs.len(), 1);
                 assert!(graphs[0].bytes > 0);
                 assert_eq!(graphs[0].bytes, owner.bytes);
-                let (base, _) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, rank);
+                let base = cuteafd_loader::placement::graph_reserve::v41_working_set(ranks, rank)
+                    .unwrap().base_bytes;
                 let sample = row(&id, Some(i128::from(base)), &owners, Some(base), json!({}), None);
                 assert_eq!(sample["graph_reserve_bytes"], owner.bytes);
                 assert_eq!(sample["graph_reserve_slack"], owner.bytes - base);

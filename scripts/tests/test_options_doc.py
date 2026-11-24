@@ -401,16 +401,16 @@ def test_optional_levers_are_default_off_and_documented():
                 assert lever["families"] == COLUMNS
                 assert default == "on"
                 assert "`GRAPH_PREWARM=off`" in DOC.read_text()
-                assert 'case "$(get GRAPH_PREWARM on)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
+                assert 'case "$(get GRAPH_PREWARM "$prewarm_default")"' in (ROOT / "scripts/launch/run-family.sh").read_text()
             elif key == "GRAPH_DONOR_ALWAYS":
                 assert default == "off"
-                assert lever["families"] == [family for family in COLUMNS if family != "Inkling"]
-                assert "`off`; Inkling `on`" in DOC.read_text()
+                assert lever["families"] == COLUMNS
+                assert "`off`; V4.1 and Inkling `on`" in DOC.read_text()
             elif key == "GRAPH_DONOR_COLD_LAG":
                 assert default == "0"
                 assert lever["families"] == COLUMNS
                 assert '`GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16`' in DOC.read_text()
-                assert "`0`; Inkling `8` with donor-always" in DOC.read_text()
+                assert "`0`; V4.1 and Inkling `8` with donor-always" in DOC.read_text()
                 assert 'graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG "$cold_lag_default")"' in (ROOT / "scripts/launch/run-family.sh").read_text()
             elif key == "DECODE_LANES":
                 # V4.1's default is two lanes; the lever is the one-lane opt-in.

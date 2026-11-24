@@ -1610,23 +1610,21 @@ mod admission_tests {
     /// family list and `GPU_GRAPH_RESERVE`, so a test cannot invent a third
     /// graph budget.
     fn graph_reserve_bytes(ranks: usize, rank: usize) -> Result<usize> {
-        let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, rank);
-        Ok(cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
+        Ok(cuteafd_loader::placement::graph_reserve::v41_working_set(ranks, rank)
             .map_err(anyhow::Error::msg)?.bytes as usize)
     }
 
     #[test]
     fn graph_reserves_and_uniform_layout_target_remain_distinct() -> Result<()> {
-        // Each physical rank owns its measured inventory and the shared
-        // extra; card size and logical KV target do not change that owner.
+        // Each physical rank owns its measured working set and safety margin;
+        // card size and logical KV target do not change that owner.
         for ranks in [1, 2] {
             for rank in 0..ranks {
-                let (base, tail) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, rank);
-                let expected = cuteafd_loader::placement::graph_reserve::resolve(None, rank, false, base, tail)?;
+                let soft = cuteafd_loader::serving_capacity::v41_graphs::v41_soft_cap(ranks, rank);
+                let expected = cuteafd_loader::placement::graph_reserve::resolve_working_set(None, rank, soft)?;
                 assert_eq!(graph_reserve_bytes(ranks, rank)?, expected.bytes as usize);
             }
         }
-        assert_ne!(graph_reserve_bytes(2, 0)?, graph_reserve_bytes(2, 1)?);
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),

@@ -12,11 +12,13 @@ pub fn qwen_default(shape: crate::serving_capacity::qwen_graphs::QwenGraphShapeK
     -> Option<(u64, u64)> {
     crate::serving_capacity::qwen_graphs::qwen_reserve(shape, rank)
 }
-/// Each layout rank charges only its trace-qualified identities and one tail.
-/// An unmeasured layout has no borrowed inventory; explicit policy still works.
-pub fn v41_default(ranks: usize, rank: usize) -> (u64, u64) {
-    crate::serving_capacity::v41_graphs::v41_prewarm(ranks, rank)
-        .map_or((0, 0), |list| (list.reserve_base_bytes, list.reserve_extra_bytes))
+/// The measured V4.1 soft cap is shared by offline admission and the live bank.
+pub fn v41_working_set(ranks: usize, rank: usize) -> Result<Resolved, Error> {
+    let soft_cap = crate::serving_capacity::v41_graphs::v41_soft_cap(ranks, rank);
+    let text = graph_env("CUTEAFD_GPU_GRAPH_RESERVE", "GPU_GRAPH_RESERVE")?;
+    let extra = graph_env("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA", "GPU_GRAPH_RESERVE_EXTRA")?;
+    let cap = graph_env("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP", "GPU_GRAPH_RESERVE_EXTRA_CAP")?;
+    resolve_working_set_with_extra(text.as_deref(), extra.as_deref(), cap.as_deref(), rank, soft_cap)
 }
 
 /// Kimi K3 selects its arena by checkpoint core format and coordinator rank count: TP2 captures a
@@ -167,9 +169,19 @@ pub fn resolve_with_extra(text: Option<&str>, extra_text: Option<&str>, cap_text
 /// `GPU_GRAPH_RESERVE` user totals override `reserve` while keeping the `max(reserve/6, 100 MB)`
 /// margin floor clamped so `soft = reserve - margin` stays positive.
 pub fn resolve_working_set(text: Option<&str>, rank: usize, soft_cap: u64) -> Result<Resolved, Error> {
+    resolve_working_set_with_extra(text, None, None, rank, soft_cap)
+}
+
+fn resolve_working_set_with_extra(text: Option<&str>, extra_text: Option<&str>, cap_text: Option<&str>,
+    rank: usize, soft_cap: u64) -> Result<Resolved, Error> {
     let key = "GPU_GRAPH_RESERVE";
     let selected = select(text, rank, false, key, false)?;
+    let extra = select(extra_text, rank, false, "GPU_GRAPH_RESERVE_EXTRA", true)?;
+    let cap = select(cap_text, rank, false, "GPU_GRAPH_RESERVE_EXTRA_CAP", true)?;
     if let Some(value) = selected {
+        for (key, value) in [("GPU_GRAPH_RESERVE_EXTRA", extra), ("GPU_GRAPH_RESERVE_EXTRA_CAP", cap)] {
+            if value.is_some() { return Err(Error::Conflict { key }) }
+        }
         let bytes = value.bytes(key, 0)?;
         let margin = if bytes <= GRAPH_CHUNK {
             bytes / 2
@@ -185,21 +197,29 @@ pub fn resolve_working_set(text: Option<&str>, rank: usize, soft_cap: u64) -> Re
         });
     }
     let soft = packed_chunk(soft_cap);
-    let margin = packed_chunk((soft / 5).max(WORKING_SET_MARGIN_MIN_BYTES));
+    let extra_bytes = extra.map_or_else(|| Ok(packed_chunk((soft / 5).max(WORKING_SET_MARGIN_MIN_BYTES))),
+        |value| value.bytes("GPU_GRAPH_RESERVE_EXTRA", soft))?;
+    let cap_bytes = cap.map(|value| value.bytes("GPU_GRAPH_RESERVE_EXTRA_CAP", soft)).transpose()?;
+    let margin = cap_bytes.map_or(extra_bytes, |cap| extra_bytes.min(cap));
     let bytes = soft.checked_add(margin).ok_or(Error::Overflow { key })?;
     Ok(Resolved {
         bytes, source: "working-set reserve", base_bytes: soft, base_source: FAMILY,
-        extra_bytes: margin, extra_source: FAMILY, cap_bytes: None, cap_source: FAMILY,
+        extra_bytes, extra_source: if extra.is_some() { USER } else { FAMILY },
+        cap_bytes, cap_source: if cap.is_some() { USER } else { FAMILY },
         effective_extra_bytes: margin, soft_margin_floor: margin,
     })
 }
 
-pub fn current_working_set(rank: usize, soft_cap: u64) -> Result<Resolved, Error> {
-    let text = match std::env::var("CUTEAFD_GPU_GRAPH_RESERVE") {
+fn graph_env(env_key: &str, key: &'static str) -> Result<Option<String>, Error> {
+    match std::env::var(env_key) {
         Ok(value) => Ok(Some(value)),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(_) => Err(Error::Environment { key: "GPU_GRAPH_RESERVE" }),
-    }?;
+        Err(_) => Err(Error::Environment { key }),
+    }
+}
+
+pub fn current_working_set(rank: usize, soft_cap: u64) -> Result<Resolved, Error> {
+    let text = graph_env("CUTEAFD_GPU_GRAPH_RESERVE", "GPU_GRAPH_RESERVE")?;
     resolve_working_set(text.as_deref(), rank, soft_cap)
 }
 
@@ -374,5 +394,18 @@ mod tests {
         assert_eq!(user.bytes, 256 << 20);
         assert_eq!(user.soft_margin_floor, 96 << 20);
         assert_eq!(user.base_bytes, 160 << 20);
+    }
+    #[test]
+    fn v41_working_set_preserves_explicit_reserve_selectors() {
+        let soft = 600 << 20;
+        let first = resolve_working_set_with_extra(Some("gpu1=1GiB"), Some("gpu0=25%"),
+            Some("gpu0=64MiB"), 0, soft).unwrap();
+        assert_eq!((first.bytes, first.soft_margin_floor), (664 << 20, 64 << 20));
+        assert_eq!(first.extra_bytes, 150 << 20);
+        let second = resolve_working_set_with_extra(Some("gpu1=1GiB"), Some("gpu0=25%"),
+            Some("gpu0=64MiB"), 1, soft).unwrap();
+        assert_eq!(second.bytes, 1 << 30);
+        assert_eq!(resolve_working_set_with_extra(Some("1GiB"), Some("25%"), None, 0, soft),
+            Err(Error::Conflict { key: "GPU_GRAPH_RESERVE_EXTRA" }));
     }
 }

@@ -5911,6 +5911,24 @@ def test_inkling_graph_donors_default_to_qualified_lag(tmp_path, overrides, dona
         assert serve[serve.index("--graph-donor-cold-lag") + 1] == lag
 
 
+@pytest.mark.parametrize("overrides,prewarm,donate,lag", [
+    ("", False, True, "8"),
+    ("GRAPH_PREWARM=on\nGRAPH_DONOR_ALWAYS=off\n", True, False, None),
+    ("GRAPH_DONOR_COLD_LAG=16\n", False, True, "16"),
+])
+def test_v41_graph_policy_defaults_to_lazy_with_lag_eight(tmp_path, overrides, prewarm, donate, lag):
+    result = _family_launch_result(tmp_path, {"model_type": "deepseek_v41"},
+        "deepseek-ai/DeepSeek-V4.1-Flash", "SPARK_COUNT=4\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\n" + overrides)
+    assert result.returncode == 0, result.stderr
+    serve = shlex.split(next(line for line in result.stderr.splitlines()
+        if "serve-native --snapshot" in line))
+    assert ("--graph-no-prewarm" in serve) == (not prewarm)
+    assert ("--graph-donor-always" in serve) == donate
+    assert ("--graph-donor-cold-lag" in serve) == (lag is not None)
+    if lag is not None:
+        assert serve[serve.index("--graph-donor-cold-lag") + 1] == lag
+
+
 @pytest.mark.parametrize("lag,donor,error", [
     ("16", "off", "requires GRAPH_DONOR_ALWAYS=on"),
     ("-1", "on", "must be a non-negative integer"),

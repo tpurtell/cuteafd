@@ -60,6 +60,18 @@ pub fn v41_prewarm(ranks: usize, rank: usize) -> Option<&'static V41RankPrewarm>
         .ranks.iter().find(|list| list.rank == rank)
 }
 
+/// Physical driver graph high-water, by coordinator rank. Rounded only by
+/// the shared graph reserve policy; no prewarm allocation tail is added here.
+pub fn v41_soft_cap(ranks: usize, rank: usize) -> u64 {
+    match (ranks, rank) {
+        // TP1: larger of the measured lag-16 charged and settled levels (#2460).
+        (1, 0) => 1_673_527_296,
+        // TP2: lag-8 max-card calibration (#2460), short C1/C4/C16 and 32K C1/C8.
+        (2, 0 | 1) => 680 << 20,
+        _ => 0,
+    }
+}
+
 pub fn v41_prewarm_rows(ranks: usize, rank: usize, decode_rows: usize) -> Vec<V41PrewarmEntry> {
     v41_prewarm(ranks, rank).into_iter().flat_map(|list| &list.entries)
         .copied().filter(|entry| entry.rows <= decode_rows).collect()

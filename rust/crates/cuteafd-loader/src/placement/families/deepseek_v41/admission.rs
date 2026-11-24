@@ -131,8 +131,7 @@ pub struct Opaque {
 /// overrides it per device and never splits across ranks. Nothing here is live
 /// at Ready, so it prices only the post-ready phases.
 pub fn graph_allowance(ranks: usize, rank: usize) -> Result<Opaque, Refusal> {
-    let (base, extra) = crate::placement::graph_reserve::v41_default(ranks, rank);
-    let resolved = crate::placement::graph_reserve::current(rank, false, base, extra)
+    let resolved = crate::placement::graph_reserve::v41_working_set(ranks, rank)
         .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
     Ok(Opaque {
         location: Location::coordinator(rank as u8),
@@ -1811,8 +1810,9 @@ mod explicit_budget_tests {
     #[test]
     fn graph_reserve_prices_only_the_named_arena() {
         let owner = super::graph_allowance(1, 0).unwrap();
-        let (base, tail) = crate::placement::graph_reserve::v41_default(1, 0);
-                assert_eq!(owner.bytes, crate::placement::graph_reserve::resolve(None, 0, false, base, tail).unwrap().bytes);
+        let policy = crate::placement::graph_reserve::v41_working_set(1, 0).unwrap();
+        assert_eq!(owner.bytes, policy.bytes);
+        assert_eq!(policy.source, "working-set reserve");
         assert_eq!(owner.source, "graph reserve: v41.graphs.0");
         // The old lazy envelope and runtime growth owner are gone, not renamed.
         assert!(!owner.source.contains("runtime"));

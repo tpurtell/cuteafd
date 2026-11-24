@@ -45,6 +45,8 @@ pub(crate) fn ranks() -> usize { RANKS.with(std::cell::Cell::get) }
 fn set_layout(ranks: usize) { RANKS.with(|layout| layout.set(ranks)); }
 
 pub(crate) fn pinned_shape(device: i32, rows: u32) -> bool {
+    // No measured rank-local shape met Reading A's half-of-band threshold.
+    if !crate::shared::decode_graph::prewarm_enabled() { return false; }
     let Ok(rank) = usize::try_from(device) else { return false };
     let Some(list) = cuteafd_loader::serving_capacity::v41_graphs::v41_prewarm(ranks(), rank) else { return false };
     list.entries.iter().chain(&list.prefill_entries)
@@ -113,15 +115,20 @@ fn site_name(name: &'static str) -> &'static str {
 /// Whether this layout keeps any spanning site in its startup prewarm.
 pub(crate) fn spanning_layout(ranks: usize) -> bool { ranks > 1 }
 
+pub(crate) fn pinned_draft(device: i32, requests: usize, width: usize) -> bool {
+    let Ok(rank) = usize::try_from(device) else { return false };
+    cuteafd_loader::serving_capacity::v41_graphs::v41_pinned_draft(ranks(), rank, requests, width)
+        && crate::shared::decode_graph::prewarm_enabled()
+}
+
 pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize,
     mut visit: impl FnMut(&mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>) -> Result<()> {
     use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
     tracing::warn!("V4.1 graph cache uses byte estimates: SM120 node rates are not calibrated");
     set_layout(ranks);
     visit(&mut |device, name, spans, bank| {
-        let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, device as usize);
-        let policy = cuteafd_loader::placement::graph_reserve::current(device as usize,
-            false, base, extra).map_err(anyhow::Error::msg)?;
+        let policy = cuteafd_loader::placement::graph_reserve::v41_working_set(ranks, device as usize)
+            .map_err(anyhow::Error::msg)?;
         bank.attach(library, device, policy.bytes, Site { name: site_name(name), cycle: Cycle::Other,
             preference: Preference::Adaptive, bootstrap: 2 << 20, basis: Basis::Bytes,
             spans_devices: spanning::spans(name, spans) })?;
@@ -148,6 +155,18 @@ mod tests {
             set_layout(2);
             assert_eq!(ranks(), 2);
         }).join().unwrap();
+    }
+
+    #[test]
+    fn lazy_policy_keeps_no_legacy_local_pins() {
+        set_layout(1);
+        assert!(pinned_shape(0, 1));
+        assert!(pinned_shape(0, 128));
+        assert!(pinned_draft(0, 1, 7));
+        let _off = crate::shared::decode_graph::testing::prewarm_off_on_this_thread();
+        assert!(!pinned_shape(0, 1));
+        assert!(!pinned_shape(0, 128));
+        assert!(!pinned_draft(0, 1, 7));
     }
 
     #[test]

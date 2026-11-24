@@ -366,8 +366,7 @@ mod tests {
     #[test]
     fn graph_reserve_stays_separate_from_native_code_and_blas() {
         let owner = admission::graph_allowance(1, 0).unwrap();
-        let (base, tail) = crate::placement::graph_reserve::v41_default(1, 0);
-        assert_eq!(owner.bytes, crate::placement::graph_reserve::current(0, false, base, tail).unwrap().bytes);
+        assert_eq!(owner.bytes, crate::placement::graph_reserve::v41_working_set(1, 0).unwrap().bytes);
         assert_eq!(owner.lifetime.first, crate::placement::planner::Phase::Ready);
         assert_eq!(owner.source, "graph reserve: v41.graphs.0");
     }

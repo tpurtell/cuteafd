@@ -695,8 +695,7 @@ mod tests {
                 assert_eq!(owner.location, Location::coordinator(gpu as u8));
                 assert_eq!(owner.lifetime, Lifetime { first: Phase::Ready, last: Phase::Growth });
                 assert_eq!(owner.source, format!("graph reserve: v41.graphs.{gpu}"));
-                let (base, tail) = crate::placement::graph_reserve::v41_default(ranks, gpu);
-                assert_eq!(owner.bytes, crate::placement::graph_reserve::resolve(None, gpu, false, base, tail).unwrap().bytes);
+                assert_eq!(owner.bytes, crate::placement::graph_reserve::v41_working_set(ranks, gpu).unwrap().bytes);
                 assert_eq!(owner.basis, Basis::Calibrated);
             }
         }
