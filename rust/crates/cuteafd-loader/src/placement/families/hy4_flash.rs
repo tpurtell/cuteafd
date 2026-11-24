@@ -20,7 +20,8 @@ use super::super::{
     ResidentWeights, TerminalHome, Tp2Range,
 };
 use crate::families::hy4_flash::execution::{
-    wave_metadata_layout, CacheLayout, SharedScratchLayout, WaveScratchLayout, PAGE_ROWS,
+    hy4_peer_slot_sizes, wave_metadata_layout, CacheLayout, SharedScratchLayout, WaveScratchLayout,
+    PAGE_ROWS,
 };
 use crate::families::hy4_flash::weight_layout::CoordinatorWeights;
 use crate::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
@@ -627,6 +628,32 @@ impl Hy4Inputs {
                 out.extend(buffer(
                     host.id(), Location::PINNED, host.bytes() as u64, Lifetime::TARGET,
                     Category::Staging, "hy4_flash/wave-metadata", maximum,
+                ));
+            }
+        }
+        if self.gpus == 2 {
+            let sizes = hy4_peer_slot_sizes(cfg, capacity_rows);
+            let peer = crate::serving_capacity::PeerStorageLayout::new(
+                sizes.len(),
+                sizes[1],
+                crate::serving_capacity::peer_wait_diagnostics(),
+            )
+            .map_err(refusal)?;
+            for (name, bytes) in [
+                ("peer.recv.0", sizes[0].max(256) as u64),
+                ("peer.recv.1", sizes[1].max(256) as u64),
+                ("peer.control", peer.control_bytes as u64),
+                ("peer.progress", peer.progress_bytes as u64),
+                ("peer.abort", 256),
+            ] {
+                out.extend(buffer(
+                    format!("hy4_flash.peer.{gpu}.{name}"),
+                    location,
+                    bytes,
+                    Lifetime::TARGET,
+                    Category::Transport,
+                    "Hy4-flash TP2 peer exchange",
+                    maximum,
                 ));
             }
         }

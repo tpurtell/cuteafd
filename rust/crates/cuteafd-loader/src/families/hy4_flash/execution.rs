@@ -16,6 +16,23 @@ pub const PAGE_ROWS: usize = 64;
 /// (`512` window + up to `64` decode/verify rows + page wrap alignment).
 pub const SWA_RING_PAGES: usize = 10;
 pub const SWA_RING_ROWS: usize = SWA_RING_PAGES * PAGE_ROWS;
+/// Fixed byte offset of peer routed-expert F32 partials inside `PeerExchange` FFN receive slot 1.
+/// Shared-expert (or dense FFN) F32 partials sit at offset 0; routed F32 partials sit at this
+/// 256-byte-aligned offset so both transfer in one `push_planes` exchange with invariant graph pointers.
+pub fn hy4_peer_ffn_routed_offset(cfg: &Hy4FlashConfig, max_rows: usize) -> usize {
+    (max_rows * cfg.hidden * 4).div_ceil(256) * 256
+}
+
+/// Receive-slot byte sizes for Hy4-flash TP2 `PeerExchange` (`[SLOT_ATTN, SLOT_FFN]`).
+/// - Slot 0 (`ATTN`): attention `o_proj` F32 partials (`[max_rows, hidden]`).
+/// - Slot 1 (`FFN`): dense FFN or combined `[shared_f32, routed_f32]` F32 partials.
+pub fn hy4_peer_slot_sizes(cfg: &Hy4FlashConfig, max_rows: usize) -> [usize; 2] {
+    let attn = (max_rows * cfg.hidden * 4).max(256);
+    let routed_off = hy4_peer_ffn_routed_offset(cfg, max_rows);
+    let ffn = (routed_off + max_rows * cfg.routed_expert_hidden * 4).max(256);
+    [attn, ffn]
+}
+
 /// Physical partial O (BF16) and LSE (F32) planes for the capped MLA decode exports.
 /// The export strides scratch by the compiled split capacity, not active splits.
 pub fn mla_split_scratch_bytes(decode_rows: usize, head_parts: usize) -> usize {
@@ -202,7 +219,7 @@ impl WaveScratchLayout {
         ];
         for i in 0..cfg.engram_layers.len() {
             views.push((format!("engram_raw.{i}"), (max_rows * engram_concat * 2).max(256)));
-            views.push((format!("engram_masked.{i}"), max_rows.max(256)));
+            views.push((format!("engram_masked.{i}"), (max_rows.div_ceil(16) * 16).max(256)));
         }
         let arena = WeightArenaLayout::new(Self::arena_id(gpu, slot), views)?;
         Ok(Self { arena })
@@ -261,7 +278,6 @@ impl SharedScratchLayout {
             ("post".into(), (max_rows * hc * 4).max(256)),
             ("delta".into(), (max_rows * h * 2).max(256)),
             ("delta_f32".into(), tp2_f32_bytes.max(256)),
-            ("delta_peer_f32".into(), tp2_f32_bytes.max(256)),
             ("delta_sum_f32".into(), tp2_f32_bytes.max(256)),
             ("delta_norm".into(), (max_rows * h * 2).max(256)),
             ("engram_normed".into(), (max_rows * engram_concat * 2).max(256)),

@@ -505,9 +505,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
                     )
                     .bytes,
                 );
-                let (gr_base, gr_tail) =
-                    crate::serving_capacity::hy4_graphs::reserve(graph_layout, gpu);
-                let gr = crate::placement::graph_reserve::current(gpu, false, gr_base, gr_tail)
+                let gr = crate::serving_capacity::hy4_graphs::reserve_policy(graph_layout, gpu)
                     .map_err(|error| {
                         refused(
                             format!("Hy4-flash graph reserve refused: {error}"),
@@ -528,9 +526,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
             for (gpu, &(total, logical, free)) in samples.iter().enumerate() {
                 budgets.push(hy4_flash::measured_budget(gpu as u8, total, logical, free));
                 code.push(loaded_code[gpu]);
-                let (gr_base, gr_tail) =
-                    crate::serving_capacity::hy4_graphs::reserve(graph_layout, gpu);
-                let gr = crate::placement::graph_reserve::current(gpu, false, gr_base, gr_tail)
+                let gr = crate::serving_capacity::hy4_graphs::reserve_policy(graph_layout, gpu)
                     .map_err(|error| {
                         refused(
                             format!("Hy4-flash graph reserve refused: {error}"),

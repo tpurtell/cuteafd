@@ -213,11 +213,7 @@ fn publish_provenance(
         args.peers.len(),
     );
     let graph_policies: Vec<_> = (0..runtime.gpus.len())
-        .map(|gpu| {
-            let (base, tail) =
-                cuteafd_loader::serving_capacity::hy4_graphs::reserve(graph_layout, gpu);
-            cuteafd_loader::placement::graph_reserve::current(gpu, false, base, tail)
-        })
+        .map(|gpu| cuteafd_loader::serving_capacity::hy4_graphs::reserve_policy(graph_layout, gpu))
         .collect::<std::result::Result<Vec<_>, _>>()?;
     cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
         "memory_reconciliation_provenance": {
@@ -298,6 +294,7 @@ fn reconcile_runtime_inventory(
             || id.starts_with("hy4_flash.wave.")
             || id.starts_with("hy4_flash.head.")
             || id.starts_with("hy4_flash.target.")
+            || id.starts_with("hy4_flash.peer.")
             || id.starts_with("expert-usage.gpu")
             || (id.starts_with("hy4_flash/dfly2/") && id != cuteafd_loader::families::hy4_flash::draft::ARENA_ID)
     };

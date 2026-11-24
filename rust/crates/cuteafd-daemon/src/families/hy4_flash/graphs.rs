@@ -43,6 +43,8 @@ pub(crate) enum Section {
     FfnFrontend,
     /// Post-FFN combine + norm + iHC post (TP2 or Spark-routed).
     FfnFinish,
+    /// Rank-0 final layer post-FFN combine + norm + iHC post + terminal `hc_head`.
+    Tail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -84,8 +86,7 @@ impl<'a> Hy4Graphs<'a> {
         layout: Option<Hy4GraphLayout>,
         max_rows: usize,
     ) -> Result<()> {
-        let (base, tail) = hy4_graphs::reserve(layout, rank);
-        let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+        let policy = hy4_graphs::reserve_policy(layout, rank)?;
         self.pins = hy4_graphs::selected_rows(layout, max_rows)?
             .into_iter()
             .filter_map(|(rows, pin)| pin.then_some(rows))
@@ -105,14 +106,6 @@ impl<'a> Hy4Graphs<'a> {
         )?;
         device::set_reserve_policy(device, policy)?;
         self.device = device;
-        if hy4_graphs::prewarm(layout).is_none() {
-            tracing::warn!(
-                ?layout,
-                rank,
-                reserve = policy.bytes,
-                "Hy4-flash untraced graph layout: no pins or measured base; using byte bootstrap estimate"
-            );
-        }
         Ok(())
     }
 

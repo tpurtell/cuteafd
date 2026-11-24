@@ -17,6 +17,7 @@ use crate::shared::memory::device::{Allocation, Device, Event, Stream};
 use crate::shared::memory::receipts::Inventory;
 use crate::shared::memory::{HostAllocation, Tag};
 use crate::shared::memory::weight_arena::DeviceArena;
+use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use crate::shared::prefill_pipeline::{run_prefill_units, FfnRoute, PrefillHooks, Unit, UnitSegment};
 use crate::shared::spark_intake::SparkLink;
 use crate::shared::spark_waves::{self, WaveTicket, Waves};
@@ -26,12 +27,13 @@ use crate::shared::token_table::{enqueue as enqueue_table_h2d, CopyPlane};
 use anyhow::{ensure, Context, Result};
 use cuteafd_core::memory_layout::{arena_class, ArenaTag};
 use cuteafd_ffi::expert_usage::{ExpertUsage, UsageDevice, UsagePhase, UsageStorage};
+use cuteafd_ffi::peer_exchange::PeerPlane;
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, CuteafdHostBuffer, F32Add};
 use cuteafd_loader::families::hy4_flash::engram::advance_tail;
 use cuteafd_loader::families::hy4_flash::execution::{
-    mla_split_scratch_bytes, wave_metadata_layout, SharedScratchLayout, WaveScratchLayout, PAGE_ROWS,
-    WAVE_METADATA,
+    hy4_peer_ffn_routed_offset, hy4_peer_slot_sizes, mla_split_scratch_bytes, wave_metadata_layout,
+    SharedScratchLayout, WaveScratchLayout, PAGE_ROWS, WAVE_METADATA,
 };
 use cuteafd_loader::placement::families::hy4_flash::DECODE_ROWS;
 use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
@@ -59,6 +61,8 @@ const IDX_HEADS: usize = 16;
 const IDX_DIM: usize = 128;
 const IDX_KEY_BYTES: usize = IDX_DIM * 2;
 const CANDIDATE_TOPK: usize = 2048;
+const PEER_SLOT_ATTN: usize = 0;
+const PEER_SLOT_FFN: usize = 1;
 
 /// Which rows of a batch compute terminal `hc_head` + `lm_head` FP32 logits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,42 +75,20 @@ pub(crate) enum HeadMode {
     Suffix(usize),
 }
 
-#[derive(Clone, Copy)]
-enum ReducePlanes {
-    Delta,
-    Routed,
-    Shared,
-}
-
-impl ReducePlanes {
-    fn buffers(
-        self,
-        rank: &RankRuntime<'_>,
-        wave_slot: usize,
-        rows: usize,
-        skip_routed: bool,
-    ) -> Result<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)> {
-        let shared = &rank.shared;
-        Ok(match self {
-            Self::Delta => (shared.delta_f32.buffer, shared.delta.buffer),
-            Self::Routed => {
-                let input = if skip_routed {
-                    shared.delta_f32.buffer
-                } else {
-                    let experts = rank.onboarded_experts.borrow();
-                    CuteafdDeviceBuffer {
-                        ptr: experts.as_ref().context("Hy4 TP2 routed expert output missing")?.output(),
-                        bytes: rows * LATENT_H * 4,
-                        device_id: rank.device.id,
-                        flags: 0,
-                    }
-                };
-                (input, shared.routed_latent.buffer)
-            }
-            Self::Shared => {
-                let w = &rank.waves[wave_slot];
-                (w.shared_f32.buffer, w.shared_out.buffer)
-            }
+fn routed_f32_input(
+    rank: &RankRuntime<'_>,
+    rows: usize,
+    skip_routed: bool,
+) -> Result<CuteafdDeviceBuffer> {
+    if skip_routed {
+        Ok(rank.shared.delta_f32.buffer)
+    } else {
+        let experts = rank.onboarded_experts.borrow();
+        Ok(CuteafdDeviceBuffer {
+            ptr: experts.as_ref().context("Hy4 TP2 routed expert output missing")?.output(),
+            bytes: rows * LATENT_H * 4,
+            device_id: rank.device.id,
+            flags: 0,
         })
     }
 }
@@ -307,7 +289,6 @@ struct SharedScratch<'a> {
     post: Allocation<'a>,
     delta: Allocation<'a>,
     delta_f32: Allocation<'a>,
-    delta_peer_f32: Allocation<'a>,
     delta_sum_f32: Allocation<'a>,
     delta_norm: Allocation<'a>,
     engram_normed: Allocation<'a>,
@@ -412,7 +393,6 @@ impl<'a> SharedScratch<'a> {
             post: view("post")?,
             delta: view("delta")?,
             delta_f32: view("delta_f32")?,
-            delta_peer_f32: view("delta_peer_f32")?,
             delta_sum_f32: view("delta_sum_f32")?,
             delta_norm: view("delta_norm")?,
             engram_normed: view("engram_normed")?,
@@ -466,7 +446,6 @@ impl<'a> SharedScratch<'a> {
             ("post", &self.post),
             ("delta", &self.delta),
             ("delta_f32", &self.delta_f32),
-            ("delta_peer_f32", &self.delta_peer_f32),
             ("delta_sum_f32", &self.delta_sum_f32),
             ("delta_norm", &self.delta_norm),
             ("engram_normed", &self.engram_normed),
@@ -639,7 +618,6 @@ struct RankRuntime<'a> {
     graphs: Hy4Graphs<'a>,
     device: Device<'a>,
     stream: Rc<Stream<'a>>,
-    peer_ready: Event<'a>,
     programs: Hy4Programs<'a>,
     mla_splits: MlaSplitPlan,
     weights: Hy4RankWeights<'a>,
@@ -1203,6 +1181,119 @@ impl<'a> RankRuntime<'a> {
             )
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reduce_f32_to_bf16_local(
+        &self,
+        rank: usize,
+        rows: usize,
+        width: usize,
+        egress_stem: Option<&str>,
+        local_f32: CuteafdDeviceBuffer,
+        peer_f32_ptr: *mut std::ffi::c_void,
+        out_bf16: CuteafdDeviceBuffer,
+    ) -> Result<()> {
+        let elems = rows * width;
+        let bytes = elems * 4;
+        ensure!(local_f32.bytes >= bytes && !peer_f32_ptr.is_null(), "Hy4 TP2 local reduce operand invalid");
+        let local = CuteafdDeviceBuffer { bytes, ..local_f32 };
+        let peer = CuteafdDeviceBuffer {
+            ptr: peer_f32_ptr,
+            bytes,
+            device_id: self.device.id,
+            flags: 0,
+        };
+        let (a, b) = if rank == 0 { (local, peer) } else { (peer, local) };
+        // SAFETY: PeerExchange::wait ordered peer_f32_ptr before this kernel; all operands are disjoint.
+        unsafe {
+            self.f32_add.launch(a, b, self.shared.delta_sum_f32.buffer, elems, self.stream.raw)?;
+        }
+        if let Some(linear) = egress_stem.and_then(|s| self.weights.native.get(s)) {
+            linear.egress(rows, self.shared.delta_sum_f32.buffer, out_bf16, self.stream.raw)
+        } else {
+            // SAFETY: f32_add precedes narrowing into the disjoint BF16 consumer buffer.
+            unsafe {
+                self.device.library.cuda_f32_to_bf16_async(
+                    self.shared.delta_sum_f32.buffer,
+                    out_bf16,
+                    elems,
+                    self.stream.raw,
+                )
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_deferred_ffn_local(
+        &self,
+        rank: usize,
+        gpus: usize,
+        prev: DeferredFfn,
+        wave_slot: usize,
+        rows: usize,
+        use_a: bool,
+        skip_routed: bool,
+        ffn_recv_ptr: *mut std::ffi::c_void,
+        routed_recv_offset: usize,
+    ) -> Result<()> {
+        let prev_p = format!("model.layers.{}", prev.layer);
+        if gpus == 2 {
+            if prev.is_dense {
+                self.reduce_f32_to_bf16_local(
+                    rank,
+                    rows,
+                    H,
+                    Some(&format!("{prev_p}.mlp.down_proj")),
+                    self.shared.delta_f32.buffer,
+                    ffn_recv_ptr,
+                    self.shared.delta.buffer,
+                )?;
+            } else {
+                if prev.reduce_routed_tp2 {
+                    let routed_in = routed_f32_input(self, rows, skip_routed)?;
+                    self.reduce_f32_to_bf16_local(
+                        rank,
+                        rows,
+                        LATENT_H,
+                        None,
+                        routed_in,
+                        ffn_recv_ptr.wrapping_byte_add(routed_recv_offset),
+                        self.shared.routed_latent.buffer,
+                    )?;
+                }
+                self.reduce_f32_to_bf16_local(
+                    rank,
+                    rows,
+                    H,
+                    Some(&format!("{prev_p}.mlp.shared_experts.down_proj")),
+                    self.waves[wave_slot].shared_f32.buffer,
+                    ffn_recv_ptr,
+                    self.waves[wave_slot].shared_out.buffer,
+                )?;
+            }
+        }
+        self.ffn_combine_post(&prev_p, prev.is_dense, wave_slot, rows, use_a)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_expert_usage_local(
+        &self,
+        usage: Option<&ExpertUsage<'a>>,
+        count_expert_usage: bool,
+        skip_routed: bool,
+        is_dense: bool,
+        layer: usize,
+        phase: UsagePhase,
+        rows: usize,
+    ) -> Result<()> {
+        if !count_expert_usage || skip_routed || is_dense {
+            return Ok(());
+        }
+        let usage = usage.context("Hy4 expert usage owner missing")?;
+        let tally = usage.routes(self.device.id, layer, phase)?;
+        // SAFETY: canonical router wrote route_ids on this stream; engine drains before dropping counters.
+        unsafe { tally.record(self.shared.route_ids.buffer.ptr, rows, None, u32::MAX, true, self.stream.raw) }
+    }
 }
 
 /// Active batch metadata staged once per unit in `begin_batch` and consumed across layers.
@@ -1216,6 +1307,13 @@ struct ActiveMember {
     next_engram_tail: [u32; 2],
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DeferredFfn {
+    layer: usize,
+    is_dense: bool,
+    reduce_routed_tp2: bool,
+}
+
 struct ActiveBatch {
     wave_slot: usize,
     rows: usize,
@@ -1226,6 +1324,10 @@ struct ActiveBatch {
     graphed: bool,
     ffn_fused_layer: Option<usize>,
     post_attn_deferred: bool,
+    reduce_attn_pending: bool,
+    prev_ffn_deferred: Option<DeferredFfn>,
+    final_layer: usize,
+    rank0_only_tail: bool,
     decode_attention: bool,
     usage_phase: UsagePhase,
     dump_rows: usize,
@@ -1251,6 +1353,8 @@ pub(crate) struct Hy4Engine<'a> {
     swa_pt_host: Vec<i32>,
     metadata_uploads: Vec<MetadataUpload<'a>>,
     ranks: Vec<RankRuntime<'a>>,
+    peer_exchange: Option<PeerExchange<'a>>,
+    ffn_routed_recv_offset: usize,
     head_handoff: Option<Handoff<'a>>,
     spark: Option<SparkLink<'a>>,
     onboarded_layers: BTreeSet<usize>,
@@ -1372,7 +1476,6 @@ impl<'a> Hy4Engine<'a> {
         for (rank, weights) in weights_all.into_iter().enumerate() {
             let device = devices[rank];
             let stream = Rc::new(Stream::new(device)?);
-            let peer_ready = Event::new(device)?;
             let progs = match preloaded_programs.as_mut() {
                 Some(pre) => pre.remove(0),
                 None => device.run(|| Hy4Programs::load(programs, gpus, kv_format))?,
@@ -1426,7 +1529,6 @@ impl<'a> Hy4Engine<'a> {
                 graphs: Hy4Graphs::new(),
                 device,
                 stream,
-                peer_ready,
                 programs: progs,
                 mla_splits,
                 weights,
@@ -1440,6 +1542,24 @@ impl<'a> Hy4Engine<'a> {
             });
         }
 
+        let ffn_routed_recv_offset = hy4_peer_ffn_routed_offset(&cfg, max_rows);
+        let peer_exchange = if gpus == 2 {
+            let sizes = hy4_peer_slot_sizes(&cfg, max_rows);
+            let decode_lane_bytes = (decode_rows * HC * H * 2).max(decode_rows * (H + LATENT_H) * 4);
+            let exchange = PeerExchange::new_abortable_sized(
+                devices[0].library,
+                [
+                    RankDevice { device: ranks[0].device.id, stream: ranks[0].stream.raw },
+                    RankDevice { device: ranks[1].device.id, stream: ranks[1].stream.raw },
+                ],
+                &sizes,
+                decode_lane_bytes,
+            )?;
+            exchange.trace_identity("hy4_flash.tp2");
+            Some(exchange)
+        } else {
+            None
+        };
         let head_handoff = if gpus == 2 {
             Some(Handoff::new(ranks[0].stream.clone(), ranks[1].stream.clone())?)
         } else {
@@ -1485,6 +1605,8 @@ impl<'a> Hy4Engine<'a> {
             swa_pt_host,
             metadata_uploads,
             ranks,
+            peer_exchange,
+            ffn_routed_recv_offset,
             head_handoff,
             spark: None,
             onboarded_layers,
@@ -1686,7 +1808,13 @@ impl<'a> Hy4Engine<'a> {
         if let Some(spark) = &mut self.spark {
             let _ = spark.terminal_quiesce();
         }
+        if let Some(exchange) = &self.peer_exchange {
+            let _ = exchange.publish_abort();
+        }
         let drained = self.drain();
+        if let Some(exchange) = &self.peer_exchange {
+            exchange.finish_terminal(drained.is_ok());
+        }
         if drained.is_err() {
             self.ranks[0].device.library.quarantine_module_after_failed_drain();
         }
@@ -1881,6 +2009,9 @@ impl<'a> Hy4Engine<'a> {
 
     pub(crate) fn require_live(&self) -> Result<()> {
         ensure!(!self.terminal, "Hy4-flash execution is terminal");
+        if let Some(exchange) = &self.peer_exchange {
+            exchange.require_live()?;
+        }
         Ok(())
     }
 
@@ -1938,6 +2069,11 @@ impl<'a> Hy4Engine<'a> {
         for upload in &self.metadata_uploads {
             retained_inv.pinned(upload.layout.id(), upload.backing.buffer)?;
         }
+        if let Some(exchange) = &self.peer_exchange {
+            for (rank, name, buf) in exchange.allocation_buffers() {
+                retained_inv.device(&format!("hy4_flash.peer.{rank}.{name}"), buf)?;
+            }
+        }
         for (rank, r) in self.ranks.iter().enumerate() {
             r.weights.inventory(weights_inv, retained_inv)?;
             r.cache.inventory(retained_inv)?;
@@ -1990,85 +2126,127 @@ impl<'a> Hy4Engine<'a> {
         Ok(())
     }
 
-    /// Reduce two FP32 partials into their final BF16 consumers without staging
-    /// through `delta`. The peer-read completion fence protects both sources.
-    fn reduce_tp2_f32_to_bf16(
-        &mut self,
+    fn peer_exchange(&self) -> Result<&PeerExchange<'a>> {
+        self.peer_exchange.as_ref().context("Hy4 TP2 PeerExchange missing")
+    }
+
+    fn peer_push_two_planes(
+        &self,
+        from: usize,
+        slot: usize,
+        p0: (*mut std::ffi::c_void, *const std::ffi::c_void, usize),
+        p1: (*mut std::ffi::c_void, *const std::ffi::c_void, usize),
+    ) -> Result<()> {
+        let exchange = self.peer_exchange()?;
+        let decode_cap = (self.decode_rows * HC * H * 2).max(self.decode_rows * (H + LATENT_H) * 4);
+        if p0.2 + p1.2 <= decode_cap {
+            let planes = [
+                PeerPlane {
+                    destination: p0.0,
+                    source: p0.1,
+                    rows: 1,
+                    row_bytes: p0.2 as u64,
+                    destination_pitch: p0.2 as u64,
+                    source_pitch: p0.2 as u64,
+                },
+                PeerPlane {
+                    destination: p1.0,
+                    source: p1.1,
+                    rows: 1,
+                    row_bytes: p1.2 as u64,
+                    destination_pitch: p1.2 as u64,
+                    source_pitch: p1.2 as u64,
+                },
+            ];
+            return exchange.push_planes(from, slot, &planes);
+        }
+        let r = &self.ranks[from];
+        let peer_dev = self.ranks[1 - from].device.id;
+        r.device.run(|| unsafe {
+            for (dst, src, bytes) in [p0, p1] {
+                if bytes == 0 {
+                    continue;
+                }
+                let dst_buf = CuteafdDeviceBuffer { ptr: dst, bytes, device_id: peer_dev, flags: 0 };
+                let src_buf = CuteafdDeviceBuffer { ptr: src.cast_mut(), bytes, device_id: r.device.id, flags: 0 };
+                r.device.library.copy_d2d_async(dst_buf, src_buf, bytes, r.stream.raw)?;
+            }
+            Ok(())
+        })?;
+        exchange.signal(from, slot)
+    }
+
+    /// Push both ranks' attention F32 partials on `PEER_SLOT_ATTN` outside capture, then wait both.
+    fn exchange_attn_tp2(&self, rows: usize) -> Result<()> {
+        if self.ranks.len() == 1 {
+            return Ok(());
+        }
+        let bytes = rows * H * 4;
+        let exchange = self.peer_exchange()?;
+        exchange.push(0, PEER_SLOT_ATTN, self.ranks[0].shared.delta_f32.buffer.ptr, bytes)?;
+        exchange.push(1, PEER_SLOT_ATTN, self.ranks[1].shared.delta_f32.buffer.ptr, bytes)?;
+        exchange.wait(0, PEER_SLOT_ATTN)?;
+        exchange.wait(1, PEER_SLOT_ATTN)
+    }
+
+    /// Push FFN partials on `PEER_SLOT_FFN` outside capture (combining local routed + shared into
+    /// one `push_planes` exchange on MoE layers), then wait.
+    fn exchange_ffn_tp2(
+        &self,
         wave_slot: usize,
         rows: usize,
-        width: usize,
-        egress_stem: Option<&str>,
-        planes: ReducePlanes,
+        is_dense: bool,
+        reduce_routed_tp2: bool,
+        rank0_only_consumer: bool,
     ) -> Result<()> {
         if self.ranks.len() == 1 {
             return Ok(());
         }
-        let elems = rows * width;
-        let bytes = elems * 4;
-        for r in &mut self.ranks {
-            r.peer_ready.record(&r.stream)?;
+        let exchange = self.peer_exchange()?;
+        let shared_bytes = rows * H * 4;
+        if is_dense {
+            if !rank0_only_consumer {
+                exchange.push(0, PEER_SLOT_FFN, self.ranks[0].shared.delta_f32.buffer.ptr, shared_bytes)?;
+            }
+            exchange.push(1, PEER_SLOT_FFN, self.ranks[1].shared.delta_f32.buffer.ptr, shared_bytes)?;
+        } else if reduce_routed_tp2 {
+            let routed_bytes = rows * LATENT_H * 4;
+            let skip = self.skip_routed_experts;
+            let routed0 = routed_f32_input(&self.ranks[0], rows, skip)?;
+            let routed1 = routed_f32_input(&self.ranks[1], rows, skip)?;
+            if !rank0_only_consumer {
+                let dst1 = exchange.recv(1, PEER_SLOT_FFN)?;
+                self.peer_push_two_planes(
+                    0,
+                    PEER_SLOT_FFN,
+                    (dst1, self.ranks[0].waves[wave_slot].shared_f32.buffer.ptr, shared_bytes),
+                    (dst1.wrapping_byte_add(self.ffn_routed_recv_offset), routed0.ptr, routed_bytes),
+                )?;
+            }
+            let dst0 = exchange.recv(0, PEER_SLOT_FFN)?;
+            self.peer_push_two_planes(
+                1,
+                PEER_SLOT_FFN,
+                (dst0, self.ranks[1].waves[wave_slot].shared_f32.buffer.ptr, shared_bytes),
+                (dst0.wrapping_byte_add(self.ffn_routed_recv_offset), routed1.ptr, routed_bytes),
+            )?;
+        } else {
+            // Spark MoE: rank 0 sends both shared_f32 and BF16 routed_latent in one exchange; rank 1 sends shared_f32.
+            if !rank0_only_consumer {
+                let dst1 = exchange.recv(1, PEER_SLOT_FFN)?;
+                let routed_bf16_bytes = rows * LATENT_H * 2;
+                self.peer_push_two_planes(
+                    0,
+                    PEER_SLOT_FFN,
+                    (dst1, self.ranks[0].waves[wave_slot].shared_f32.buffer.ptr, shared_bytes),
+                    (self.ranks[1].shared.routed_latent.buffer.ptr, self.ranks[0].shared.routed_latent.buffer.ptr, routed_bf16_bytes),
+                )?;
+            }
+            exchange.push(1, PEER_SLOT_FFN, self.ranks[1].waves[wave_slot].shared_f32.buffer.ptr, shared_bytes)?;
         }
-        let ev0 = self.ranks[0].peer_ready.raw;
-        let ev1 = self.ranks[1].peer_ready.raw;
-        let skip = self.skip_routed_experts;
-        let rank0 = planes.buffers(&self.ranks[0], wave_slot, rows, skip)?;
-        let rank1 = planes.buffers(&self.ranks[1], wave_slot, rows, skip)?;
-        ensure!(rank0.0.bytes >= bytes && rank1.0.bytes >= bytes, "Hy4 TP2 partial buffer too small");
-        let src0 = CuteafdDeviceBuffer { bytes, ..rank0.0 };
-        let src1 = CuteafdDeviceBuffer { bytes, ..rank1.0 };
-        self.ranks[0].device.run(|| unsafe {
-            self.ranks[0].device.library.cuda_stream_wait_event(self.ranks[0].stream.raw, ev1)?;
-            self.ranks[0].device.library.copy_peer_async(
-                CuteafdDeviceBuffer { bytes, ..self.ranks[0].shared.delta_peer_f32.buffer },
-                src1,
-                bytes,
-                self.ranks[0].stream.raw,
-            )
-        })?;
-        self.ranks[1].device.run(|| unsafe {
-            self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
-            self.ranks[1].device.library.copy_peer_async(
-                CuteafdDeviceBuffer { bytes, ..self.ranks[1].shared.delta_peer_f32.buffer },
-                src0,
-                bytes,
-                self.ranks[1].stream.raw,
-            )
-        })?;
-        for r in &mut self.ranks {
-            r.peer_ready.record(&r.stream)?;
-        }
-        let cp0 = self.ranks[0].peer_ready.raw;
-        let cp1 = self.ranks[1].peer_ready.raw;
-        let waits = [cp1, cp0];
-        for (idx, r) in self.ranks.iter().enumerate() {
-            let wait_ev = waits[idx];
-            let (input, output) = [rank0, rank1][idx];
-            r.device.run(|| {
-                // SAFETY: peer copy into delta_peer_f32 completed before wait_ev; all three buffers are disjoint.
-                unsafe {
-                    r.device.library.cuda_stream_wait_event(r.stream.raw, wait_ev)?;
-                    r.f32_add.launch(
-                        input,
-                        r.shared.delta_peer_f32.buffer,
-                        r.shared.delta_sum_f32.buffer,
-                        elems,
-                        r.stream.raw,
-                    )?;
-                }
-                if let Some(linear) = egress_stem.and_then(|s| r.weights.native.get(s)) {
-                    linear.egress(rows, r.shared.delta_sum_f32.buffer, output, r.stream.raw)
-                } else {
-                    // SAFETY: the sum precedes narrowing into the disjoint consumer buffer.
-                    unsafe {
-                        r.device.library.cuda_f32_to_bf16_async(
-                            r.shared.delta_sum_f32.buffer,
-                            output,
-                            elems,
-                            r.stream.raw,
-                        )
-                    }
-                }
-            })?;
+        exchange.wait(0, PEER_SLOT_FFN)?;
+        if !rank0_only_consumer {
+            exchange.wait(1, PEER_SLOT_FFN)?;
         }
         Ok(())
     }
@@ -2084,6 +2262,7 @@ impl<'a> Hy4Engine<'a> {
         sources: &[&[u32]],
         unit: &Unit,
         priority: ReadPriority,
+        head_mode: HeadMode,
     ) -> Result<ActiveBatch> {
         let wave_slot = unit.slot;
         ensure!(wave_slot < self.prefill_waves, "Hy4 unit wave slot {wave_slot} >= {}", self.prefill_waves);
@@ -2273,26 +2452,23 @@ impl<'a> Hy4Engine<'a> {
 
         // Embed tokens on rank 0 into waves[wave_slot].r_a [rows, 4, H] BF16, replicate GPU-to-GPU to rank 1 if TP2.
         {
-            let r0 = &mut self.ranks[0];
+            let r0 = &self.ranks[0];
             let emb = r0.weights.embedding.as_ref().context("rank 0 missing TokenEmbedding")?;
             r0.device.run(|| {
                 emb.embed(&flat_tokens, r0.shared.ids.buffer, HC, r0.waves[wave_slot].r_a.buffer, r0.stream.raw)
             })?;
-            r0.peer_ready.record(&r0.stream)?;
         }
         if self.ranks.len() == 2 {
             let bytes = rows * HC * H * 2;
-            let ev0 = self.ranks[0].peer_ready.raw;
-            let src0 = CuteafdDeviceBuffer { bytes, ..self.ranks[0].waves[wave_slot].r_a.buffer };
-            self.ranks[1].device.run(|| unsafe {
-                self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
-                self.ranks[1].device.library.copy_peer_async(
-                    CuteafdDeviceBuffer { bytes, ..self.ranks[1].waves[wave_slot].r_a.buffer },
-                    src0,
-                    bytes,
-                    self.ranks[1].stream.raw,
-                )
-            })?;
+            let exchange = self.peer_exchange()?;
+            exchange.push_to(
+                0,
+                DIRECT,
+                self.ranks[0].waves[wave_slot].r_a.buffer.ptr,
+                self.ranks[1].waves[wave_slot].r_a.buffer.ptr,
+                bytes,
+            )?;
+            exchange.wait(1, DIRECT)?;
         }
 
         let dump_rows = if self.dump_dir.is_some() && members.len() == 1
@@ -2308,6 +2484,11 @@ impl<'a> Hy4Engine<'a> {
             std::fs::write(dir.join("tokens.u32"), tok_bytes)?;
             self.dump_bf16("embed", self.ranks[0].waves[wave_slot].r_a.buffer, dump_rows * HC * H)?;
         }
+        let final_layer = unit.layers.end.saturating_sub(1);
+        let rank0_only_tail = self.ranks.len() == 2
+            && unit.layers.end == self.cfg.layers
+            && head_mode != HeadMode::None
+            && dump_rows == 0;
 
         Ok(ActiveBatch {
             wave_slot,
@@ -2319,6 +2500,10 @@ impl<'a> Hy4Engine<'a> {
             graphed,
             ffn_fused_layer: None,
             post_attn_deferred: false,
+            reduce_attn_pending: false,
+            prev_ffn_deferred: None,
+            final_layer,
+            rank0_only_tail,
             decode_attention: priority == ReadPriority::Decode,
             usage_phase: match priority {
                 ReadPriority::Decode | ReadPriority::DecodeFirst => UsagePhase::Decode,
@@ -2388,29 +2573,24 @@ impl<'a> Hy4Engine<'a> {
                     Ok(())
                 });
                 result?;
-                if gpus == 2 {
-                    r0.peer_ready.record(&r0.stream)?;
-                }
             }
             if gpus == 2 {
-                let ev0 = self.ranks[0].peer_ready.raw;
-                let src_raw = CuteafdDeviceBuffer { bytes: raw_bytes, ..self.ranks[0].waves[wave_slot].engram_raw[slot].buffer };
-                let src_mask = CuteafdDeviceBuffer { bytes: masked_bytes, ..self.ranks[0].waves[wave_slot].engram_masked[slot].buffer };
-                self.ranks[1].device.run(|| unsafe {
-                    self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
-                    self.ranks[1].device.library.copy_peer_async(
-                        CuteafdDeviceBuffer { bytes: raw_bytes, ..self.ranks[1].waves[wave_slot].engram_raw[slot].buffer },
-                        src_raw,
+                let aligned_masked = masked_bytes.div_ceil(16) * 16;
+                self.peer_push_two_planes(
+                    0,
+                    DIRECT,
+                    (
+                        self.ranks[1].waves[wave_slot].engram_raw[slot].buffer.ptr,
+                        self.ranks[0].waves[wave_slot].engram_raw[slot].buffer.ptr,
                         raw_bytes,
-                        self.ranks[1].stream.raw,
-                    )?;
-                    self.ranks[1].device.library.copy_peer_async(
-                        CuteafdDeviceBuffer { bytes: masked_bytes, ..self.ranks[1].waves[wave_slot].engram_masked[slot].buffer },
-                        src_mask,
-                        masked_bytes,
-                        self.ranks[1].stream.raw,
-                    )
-                })?;
+                    ),
+                    (
+                        self.ranks[1].waves[wave_slot].engram_masked[slot].buffer.ptr,
+                        self.ranks[0].waves[wave_slot].engram_masked[slot].buffer.ptr,
+                        aligned_masked,
+                    ),
+                )?;
+                self.peer_exchange()?.wait(1, DIRECT)?;
             }
         }
 
@@ -2607,10 +2787,29 @@ impl<'a> Hy4Engine<'a> {
         let decode_attention = batch.decode_attention;
         let routed_scale = self.cfg.routed_scaling_factor as f32;
         let skip_routed = self.skip_routed_experts;
+        let usage = self.expert_usage.as_ref();
+        let count_usage = self.count_expert_usage;
+        let usage_phase = batch.usage_phase;
+        let prev_ffn = batch.prev_ffn_deferred.take();
+        let prev_use_a = batch.use_a;
+        let use_a = if prev_ffn.is_some() {
+            batch.use_a = !batch.use_a;
+            batch.use_a
+        } else {
+            use_a
+        };
+        let ffn_recv_ptrs = if gpus == 2 {
+            let ex = self.peer_exchange()?;
+            [ex.recv(0, PEER_SLOT_FFN)?, ex.recv(1, PEER_SLOT_FFN)?]
+        } else {
+            [std::ptr::null_mut(); 2]
+        };
+        let routed_recv_offset = self.ffn_routed_recv_offset;
 
         // Graphed decode fast-path:
         //   Case 1 (TP1 + local FFN): fuse entire SWA layer (1 graph) or DSA pre + post (2 graphs).
-        //   Case 2 (TP2 or Spark-routed): rank-local attention sections, defer post-attn iHC to FfnFrontend.
+        //   Case 2 (TP2 or Spark-routed): fuse previous layer's deferred FFN finish into this layer's
+        //           rank-local attention section; PeerExchange push/wait stays outside capture.
         if batch.graphed {
             if gpus == 1 && local_ffn_route {
                 let r = &self.ranks[0];
@@ -2638,6 +2837,7 @@ impl<'a> Hy4Engine<'a> {
                                     } else {
                                         r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale, true)?;
                                         r.local_exl3(layer, 1, rows, skip_routed)?;
+                                        r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)?;
                                     }
                                     r.ffn_combine_post(&p, is_dense, wave_slot, rows, !use_a)
                                 })
@@ -2669,6 +2869,7 @@ impl<'a> Hy4Engine<'a> {
                                     } else {
                                         r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale, true)?;
                                         r.local_exl3(layer, 1, rows, skip_routed)?;
+                                        r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)?;
                                     }
                                     r.ffn_combine_post(&p, is_dense, wave_slot, rows, !use_a)
                                 })
@@ -2704,6 +2905,7 @@ impl<'a> Hy4Engine<'a> {
                                 } else {
                                     r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale, true)?;
                                     r.local_exl3(layer, 1, rows, skip_routed)?;
+                                    r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)?;
                                 }
                                 r.ffn_combine_post(&p, is_dense, wave_slot, rows, !use_a)
                             })
@@ -2716,19 +2918,21 @@ impl<'a> Hy4Engine<'a> {
             }
 
             // Case 2: TP2 or Spark-routed layer — rank-local attention sections, peer join outside capture.
-            for r in &self.ranks {
-                let kv_cache_buf = if is_sparse {
-                    r.cache.dsa_kv_layer(self.dsa_index_of[&layer])?
-                } else {
-                    r.cache.swa_layer_bank(self.swa_index_of[&layer])?
-                };
-                if !is_sparse {
-                    if all_single_row {
+            if !is_sparse {
+                if all_single_row {
+                    for (rank, r) in self.ranks.iter().enumerate() {
+                        let kv_cache_buf = r.cache.swa_layer_bank(self.swa_index_of[&layer])?;
+                        let ffn_recv = ffn_recv_ptrs[rank];
                         r.graphs.run(
                             GraphKey { layer, rows, section: GraphSection::SwaAttn },
                             &r.stream,
                             || {
                                 r.device.run(|| {
+                                    if let Some(prev) = prev_ffn {
+                                        r.finish_deferred_ffn_local(
+                                            rank, gpus, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
+                                        )?;
+                                    }
                                     if let Some(slot) = engram_slot {
                                         r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
                                     }
@@ -2738,12 +2942,21 @@ impl<'a> Hy4Engine<'a> {
                                 })
                             },
                         )?;
-                    } else {
+                    }
+                } else {
+                    for (rank, r) in self.ranks.iter().enumerate() {
+                        let kv_cache_buf = r.cache.swa_layer_bank(self.swa_index_of[&layer])?;
+                        let ffn_recv = ffn_recv_ptrs[rank];
                         r.graphs.run(
                             GraphKey { layer, rows, section: GraphSection::SwaExtendPre },
                             &r.stream,
                             || {
                                 r.device.run(|| {
+                                    if let Some(prev) = prev_ffn {
+                                        r.finish_deferred_ffn_local(
+                                            rank, gpus, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
+                                        )?;
+                                    }
                                     if let Some(slot) = engram_slot {
                                         r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
                                     }
@@ -2751,20 +2964,35 @@ impl<'a> Hy4Engine<'a> {
                                 })
                             },
                         )?;
+                    }
+                    for r in &self.ranks {
+                        let kv_cache_buf = r.cache.swa_layer_bank(self.swa_index_of[&layer])?;
                         r.device.run(|| r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention))?;
+                    }
+                    for r in &self.ranks {
                         r.graphs.run(
                             GraphKey { layer, rows, section: GraphSection::SwaExtendPost },
                             &r.stream,
                             || r.device.run(|| r.attn_out(&p, layer, false, gpus, local_heads, rows)),
                         )?;
                     }
-                } else {
-                    let dsa_idx = self.dsa_index_of[&layer];
+                }
+            } else {
+                let dsa_idx = self.dsa_index_of[&layer];
+                // Phase-by-phase across ranks so GPU 1 starts DsaPre before GPU 0 queues eager indexer D2D copies.
+                for (rank, r) in self.ranks.iter().enumerate() {
+                    let kv_cache_buf = r.cache.dsa_kv_layer(dsa_idx)?;
+                    let ffn_recv = ffn_recv_ptrs[rank];
                     r.graphs.run(
                         GraphKey { layer, rows, section: GraphSection::DsaPre },
                         &r.stream,
                         || {
                             r.device.run(|| {
+                                if let Some(prev) = prev_ffn {
+                                    r.finish_deferred_ffn_local(
+                                        rank, gpus, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
+                                    )?;
+                                }
                                 if let Some(slot) = engram_slot {
                                     r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
                                 }
@@ -2773,7 +3001,12 @@ impl<'a> Hy4Engine<'a> {
                             })
                         },
                     )?;
+                }
+                for r in &self.ranks {
                     run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, true)?;
+                }
+                for r in &self.ranks {
+                    let kv_cache_buf = r.cache.dsa_kv_layer(dsa_idx)?;
                     r.graphs.run(
                         GraphKey { layer, rows, section: GraphSection::DsaAttnOut },
                         &r.stream,
@@ -2786,13 +3019,24 @@ impl<'a> Hy4Engine<'a> {
                     )?;
                 }
             }
-            self.reduce_tp2_f32_to_bf16(wave_slot, rows, H, Some(&format!("{p}.self_attn.o_proj")), ReducePlanes::Delta)?;
-            // Defer post-attention norm + iHC post/pre into FfnFrontend so both fold into one graph.
+            self.exchange_attn_tp2(rows)?;
+            // Defer attention F32 reduce + post-attention norm + iHC post/pre into FfnFrontend.
             batch.post_attn_deferred = true;
+            batch.reduce_attn_pending = gpus == 2;
             return Ok(());
         }
 
         // Eager path (prefill, ungraphed decode/scoring, dump_dir, or skip_routed_experts).
+        if let Some(prev) = prev_ffn {
+            for (rank, r) in self.ranks.iter().enumerate() {
+                let ffn_recv = ffn_recv_ptrs[rank];
+                r.device.run(|| {
+                    r.finish_deferred_ffn_local(
+                        rank, gpus, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
+                    )
+                })?;
+            }
+        }
         if let Some(slot) = engram_slot {
             for r in &self.ranks {
                 r.device.run(|| r.engram_compute(&p, slot, wave_slot, rows, use_a))?;
@@ -2820,7 +3064,27 @@ impl<'a> Hy4Engine<'a> {
             }
             r.device.run(|| r.attn_out(&p, layer, is_sparse, gpus, local_heads, rows))?;
         }
-        self.reduce_tp2_f32_to_bf16(wave_slot, rows, H, Some(&format!("{p}.self_attn.o_proj")), ReducePlanes::Delta)?;
+        if gpus == 2 {
+            self.exchange_attn_tp2(rows)?;
+            let attn_recv = [
+                self.peer_exchange()?.recv(0, PEER_SLOT_ATTN)?,
+                self.peer_exchange()?.recv(1, PEER_SLOT_ATTN)?,
+            ];
+            let o_stem = format!("{p}.self_attn.o_proj");
+            for (rank, r) in self.ranks.iter().enumerate() {
+                r.device.run(|| {
+                    r.reduce_f32_to_bf16_local(
+                        rank,
+                        rows,
+                        H,
+                        Some(&o_stem),
+                        r.shared.delta_f32.buffer,
+                        attn_recv[rank],
+                        r.shared.delta.buffer,
+                    )
+                })?;
+            }
+        }
         if batch.dump_rows > 0 && layer <= 3 {
             let s0 = &self.ranks[0].shared;
             let w0 = &self.ranks[0].waves[wave_slot];
@@ -2845,23 +3109,45 @@ impl<'a> Hy4Engine<'a> {
     /// Run MoE router + latent down + FP8 K32 quant + shared expert on all ranks (used by both local & Spark FFN).
     fn run_moe_router_and_shared(&mut self, layer: usize, batch: &mut ActiveBatch, local_experts: bool) -> Result<()> {
         let p = format!("model.layers.{layer}");
+        let o_stem = format!("{p}.self_attn.o_proj");
         let gpus = self.ranks.len();
         let rows = batch.rows;
         let wave_slot = batch.wave_slot;
         let routed_scale = self.cfg.routed_scaling_factor as f32;
         let deferred = batch.post_attn_deferred;
+        let reduce_attn = batch.reduce_attn_pending;
         let use_a = batch.use_a;
+        let usage = self.expert_usage.as_ref();
+        let count_usage = self.count_expert_usage;
+        let skip_routed = self.skip_routed_experts;
+        let usage_phase = batch.usage_phase;
+        let attn_recv = if reduce_attn {
+            let ex = self.peer_exchange()?;
+            [ex.recv(0, PEER_SLOT_ATTN)?, ex.recv(1, PEER_SLOT_ATTN)?]
+        } else {
+            [std::ptr::null_mut(); 2]
+        };
         if batch.graphed {
             for (rank, r) in self.ranks.iter().enumerate() {
+                let recv_ptr = attn_recv[rank];
                 r.graphs.run(
                     GraphKey { layer, rows, section: GraphSection::FfnFrontend },
                     &r.stream,
                     || {
                         r.device.run(|| {
+                            if reduce_attn {
+                                r.reduce_f32_to_bf16_local(
+                                    rank, rows, H, Some(&o_stem), r.shared.delta_f32.buffer, recv_ptr, r.shared.delta.buffer,
+                                )?;
+                            }
                             if deferred {
                                 r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                             }
-                            r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, rank == 0 || local_experts)
+                            r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, rank == 0 || local_experts)?;
+                            if rank == 0 {
+                                r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)?;
+                            }
+                            Ok(())
                         })
                     },
                 )?;
@@ -2870,10 +3156,17 @@ impl<'a> Hy4Engine<'a> {
                 batch.post_attn_deferred = false;
                 batch.use_a = !batch.use_a;
             }
+            batch.reduce_attn_pending = false;
             return Ok(());
         }
         for (rank, r) in self.ranks.iter().enumerate() {
+            let recv_ptr = attn_recv[rank];
             r.device.run(|| {
+                if reduce_attn {
+                    r.reduce_f32_to_bf16_local(
+                        rank, rows, H, Some(&o_stem), r.shared.delta_f32.buffer, recv_ptr, r.shared.delta.buffer,
+                    )?;
+                }
                 if deferred {
                     r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                 }
@@ -2884,56 +3177,62 @@ impl<'a> Hy4Engine<'a> {
             batch.post_attn_deferred = false;
             batch.use_a = !batch.use_a;
         }
+        batch.reduce_attn_pending = false;
         Ok(())
     }
 
     /// Finish post-FFN combine (`latent_up` + shared add + norm + iHC post) for dense or MoE layer.
-    /// When `reduce_routed_tp2 == false` on TP2, rank 0's `routed_latent` (from Spark) is replicated to rank 1.
+    /// On TP2 graphed decode, exchanges FFN partials via `PeerExchange` and defers rank-local reduction
+    /// + combine + iHC post into the next layer's attention section (or terminal `Tail` graph).
     fn finish_ffn_combine_and_post(&mut self, layer: usize, batch: &mut ActiveBatch, reduce_routed_tp2: bool) -> Result<()> {
-        let p = format!("model.layers.{layer}");
         let gpus = self.ranks.len();
         let rows = batch.rows;
         let is_dense = self.cfg.dense_layer[layer];
         let wave_slot = batch.wave_slot;
+        let rank0_only = batch.rank0_only_tail && layer == batch.final_layer;
 
-        if is_dense {
-            self.reduce_tp2_f32_to_bf16(wave_slot, rows, H, Some(&format!("{p}.mlp.down_proj")), ReducePlanes::Delta)?;
-        } else if gpus == 2 {
-            if reduce_routed_tp2 {
-                self.reduce_tp2_f32_to_bf16(wave_slot, rows, LATENT_H, None, ReducePlanes::Routed)?;
-            } else {
-                // Spark reply landed on rank 0's routed_latent [rows, 1536] BF16: replicate to rank 1 via P2P.
-                let bytes = rows * LATENT_H * 2;
-                let (ev0, src0) = {
-                    let r0 = &mut self.ranks[0];
-                    r0.peer_ready.record(&r0.stream)?;
-                    (r0.peer_ready.raw, CuteafdDeviceBuffer { bytes, ..r0.shared.routed_latent.buffer })
-                };
-                self.ranks[1].device.run(|| unsafe {
-                    self.ranks[1].device.library.cuda_stream_wait_event(self.ranks[1].stream.raw, ev0)?;
-                    self.ranks[1].device.library.copy_peer_async(
-                        CuteafdDeviceBuffer { bytes, ..self.ranks[1].shared.routed_latent.buffer },
-                        src0,
-                        bytes,
-                        self.ranks[1].stream.raw,
-                    )
-                })?;
-            }
-            self.reduce_tp2_f32_to_bf16(
-                wave_slot, rows, H, Some(&format!("{p}.mlp.shared_experts.down_proj")), ReducePlanes::Shared,
-            )?;
+        if gpus == 2 {
+            self.exchange_ffn_tp2(wave_slot, rows, is_dense, reduce_routed_tp2, rank0_only)?;
+        }
+
+        let deferred_ffn = DeferredFfn { layer, is_dense, reduce_routed_tp2 };
+        if batch.graphed && gpus == 2 {
+            batch.prev_ffn_deferred = Some(deferred_ffn);
+            return Ok(());
         }
 
         let use_a = batch.use_a;
-        for r in &self.ranks {
+        let skip_routed = self.skip_routed_experts;
+        let ffn_recv = if gpus == 2 {
+            let ex = self.peer_exchange()?;
+            [ex.recv(0, PEER_SLOT_FFN)?, ex.recv(1, PEER_SLOT_FFN)?]
+        } else {
+            [std::ptr::null_mut(); 2]
+        };
+        let routed_off = self.ffn_routed_recv_offset;
+        for (rank, r) in self.ranks.iter().enumerate() {
+            if rank0_only && rank == 1 {
+                continue;
+            }
+            let recv_ptr = ffn_recv[rank];
             if batch.graphed {
                 r.graphs.run(
                     GraphKey { layer, rows, section: GraphSection::FfnFinish },
                     &r.stream,
-                    || r.device.run(|| r.ffn_combine_post(&p, is_dense, wave_slot, rows, use_a)),
+                    || {
+                        r.device.run(|| {
+                            r.finish_deferred_ffn_local(
+                                rank, gpus, deferred_ffn, wave_slot, rows, use_a, skip_routed, recv_ptr, routed_off,
+                            )
+                        })
+                    },
                 )?;
             } else {
-                r.device.run(|| r.ffn_combine_post(&p, is_dense, wave_slot, rows, use_a))?;
+                r.device.run(|| {
+                    r.finish_deferred_ffn_local(
+                        rank, gpus, deferred_ffn, wave_slot, rows, use_a, skip_routed, recv_ptr, routed_off,
+                    )
+                })?;
             }
         }
         batch.use_a = !batch.use_a;
@@ -2965,22 +3264,39 @@ impl<'a> Hy4Engine<'a> {
             return Ok(());
         }
         let p = format!("model.layers.{layer}");
+        let o_stem = format!("{p}.self_attn.o_proj");
         let gpus = self.ranks.len();
         let rows = batch.rows;
         let wave_slot = batch.wave_slot;
         let deferred = batch.post_attn_deferred;
+        let reduce_attn = batch.reduce_attn_pending;
         let use_a = batch.use_a;
         let routed_scale = self.cfg.routed_scaling_factor as f32;
         let skip_routed = self.skip_routed_experts;
+        let usage = self.expert_usage.as_ref();
+        let count_usage = self.count_expert_usage;
+        let usage_phase = batch.usage_phase;
+        let attn_recv = if reduce_attn {
+            let ex = self.peer_exchange()?;
+            [ex.recv(0, PEER_SLOT_ATTN)?, ex.recv(1, PEER_SLOT_ATTN)?]
+        } else {
+            [std::ptr::null_mut(); 2]
+        };
 
         if self.cfg.dense_layer[layer] {
-            for r in &self.ranks {
+            for (rank, r) in self.ranks.iter().enumerate() {
+                let recv_ptr = attn_recv[rank];
                 if batch.graphed {
                     r.graphs.run(
                         GraphKey { layer, rows, section: GraphSection::FfnFrontend },
                         &r.stream,
                         || {
                             r.device.run(|| {
+                                if reduce_attn {
+                                    r.reduce_f32_to_bf16_local(
+                                        rank, rows, H, Some(&o_stem), r.shared.delta_f32.buffer, recv_ptr, r.shared.delta.buffer,
+                                    )?;
+                                }
                                 if deferred {
                                     r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                                 }
@@ -2990,6 +3306,11 @@ impl<'a> Hy4Engine<'a> {
                     )?;
                 } else {
                     r.device.run(|| {
+                        if reduce_attn {
+                            r.reduce_f32_to_bf16_local(
+                                rank, rows, H, Some(&o_stem), r.shared.delta_f32.buffer, recv_ptr, r.shared.delta.buffer,
+                            )?;
+                        }
                         if deferred {
                             r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                         }
@@ -3001,21 +3322,32 @@ impl<'a> Hy4Engine<'a> {
                 batch.post_attn_deferred = false;
                 batch.use_a = !batch.use_a;
             }
+            batch.reduce_attn_pending = false;
             return self.finish_ffn_combine_and_post(layer, batch, true);
         }
 
         if batch.graphed {
-            for r in &self.ranks {
+            for (rank, r) in self.ranks.iter().enumerate() {
+                let recv_ptr = attn_recv[rank];
                 r.graphs.run(
                     GraphKey { layer, rows, section: GraphSection::FfnFrontend },
                     &r.stream,
                     || {
                         r.device.run(|| {
+                            if reduce_attn {
+                                r.reduce_f32_to_bf16_local(
+                                    rank, rows, H, Some(&o_stem), r.shared.delta_f32.buffer, recv_ptr, r.shared.delta.buffer,
+                                )?;
+                            }
                             if deferred {
                                 r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                             }
                             r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, true)?;
-                            r.local_exl3(layer, gpus, rows, skip_routed)
+                            r.local_exl3(layer, gpus, rows, skip_routed)?;
+                            if rank == 0 {
+                                r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)?;
+                            }
+                            Ok(())
                         })
                     },
                 )?;
@@ -3024,6 +3356,7 @@ impl<'a> Hy4Engine<'a> {
                 batch.post_attn_deferred = false;
                 batch.use_a = !batch.use_a;
             }
+            batch.reduce_attn_pending = false;
             return self.finish_ffn_combine_and_post(layer, batch, true);
         }
 
@@ -3131,13 +3464,87 @@ impl<'a> Hy4Engine<'a> {
     /// Run terminal `hc_head` + sharded FP32 `lm_head` -> zero-host-hop `DeviceLogits` tiles.
     fn finish_head(
         &self,
-        batch: &ActiveBatch,
+        batch: &mut ActiveBatch,
         mode: HeadMode,
         on_tile: &mut dyn FnMut(usize, DeviceLogits) -> Result<()>,
     ) -> Result<()> {
         let wave_slot = batch.wave_slot;
+        let gpus = self.ranks.len();
         let r0 = &self.ranks[0];
         let w0 = &r0.waves[wave_slot];
+
+        // On TP2 graphed decode with full-batch Suffix(0), fuse the final layer's deferred FFN finish
+        // with terminal `hc_head` into one rank-0 `Tail` graph.
+        if let Some(prev) = batch.prev_ffn_deferred.take() {
+            let prev_use_a = batch.use_a;
+            batch.use_a = !batch.use_a;
+            let ffn_recv0 = if gpus == 2 {
+                self.peer_exchange()?.recv(0, PEER_SLOT_FFN)?
+            } else {
+                std::ptr::null_mut()
+            };
+            let skip_routed = self.skip_routed_experts;
+            let routed_off = self.ffn_routed_recv_offset;
+            if batch.graphed && gpus == 2 && mode == HeadMode::Suffix(0) && batch.rows > 0 {
+                let rows = batch.rows;
+                let r_cur = if batch.use_a { w0.r_a.buffer } else { w0.r_b.buffer };
+                r0.graphs.run(
+                    GraphKey { layer: prev.layer, rows, section: GraphSection::Tail },
+                    &r0.stream,
+                    || {
+                        r0.device.run(|| {
+                            r0.finish_deferred_ffn_local(
+                                0, gpus, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv0, routed_off,
+                            )?;
+                            // SAFETY: arena weights and scratch live through stream drain.
+                            unsafe {
+                                r0.programs.hc_head.launch(
+                                    &[
+                                        r_cur.ptr,
+                                        r0.weights.buf("model.hc_head.hc_head_fn")?.ptr,
+                                        r0.weights.buf("model.hc_head.hc_head_scale")?.ptr,
+                                        r0.weights.buf("model.hc_head.hc_head_base")?.ptr,
+                                        r0.weights.buf("model.norm.weight")?.ptr,
+                                        r0.shared.delta_norm.buffer.ptr,
+                                        w0.y.buffer.ptr,
+                                    ],
+                                    &[Scalar::I32(rows as i32)],
+                                    r0.stream.raw,
+                                )
+                            }
+                        })
+                    },
+                )?;
+                self.capture_draft_hidden(batch, 0, false)?;
+                if batch.dump_rows > 0 {
+                    self.dump_bf16("hc_head_y", w0.y.buffer, batch.dump_rows * H)?;
+                }
+                for tile_off in (0..rows).step_by(64) {
+                    let count = (rows - tile_off).min(64);
+                    let logits = self.project_head_tile(wave_slot, tile_off, count)?;
+                    on_tile(tile_off, logits)?;
+                }
+                return Ok(());
+            }
+            let ffn_recv = if gpus == 2 {
+                let ex = self.peer_exchange()?;
+                [ex.recv(0, PEER_SLOT_FFN)?, ex.recv(1, PEER_SLOT_FFN)?]
+            } else {
+                [std::ptr::null_mut(); 2]
+            };
+            let rank0_only = batch.rank0_only_tail && prev.layer == batch.final_layer;
+            for (rank, r) in self.ranks.iter().enumerate() {
+                if rank0_only && rank == 1 {
+                    continue;
+                }
+                r.device.run(|| {
+                    r.finish_deferred_ffn_local(
+                        rank, gpus, prev, wave_slot, batch.rows, prev_use_a, skip_routed, ffn_recv[rank], routed_off,
+                    )
+                })?;
+            }
+        }
+
         let r_cur = if batch.use_a { w0.r_a.buffer } else { w0.r_b.buffer };
         match mode {
             HeadMode::None => Ok(()),
@@ -3283,6 +3690,11 @@ impl<'a> Hy4Engine<'a> {
                         slot < self.active.len() && self.active[slot].is_none(),
                         "Hy4 begin_unit slot {slot} invalid or already occupied"
                     );
+                    let mode = if unit.layers.end == self.engine.cfg.layers {
+                        (self.head_mode)(unit)
+                    } else {
+                        HeadMode::None
+                    };
                     let batch = self.engine.begin_batch(
                         self.placements,
                         self.initial_starts,
@@ -3291,6 +3703,7 @@ impl<'a> Hy4Engine<'a> {
                         self.sources,
                         unit,
                         self.priority,
+                        mode,
                     )?;
                     self.active[slot] = Some(batch);
                     Ok(())
@@ -3311,7 +3724,10 @@ impl<'a> Hy4Engine<'a> {
                         .and_then(Option::as_mut)
                         .context("Hy4 FFN without active unit")?;
                     self.engine.run_layer_local_ffn(layer, batch)?;
-                    self.engine.record_expert_usage(layer, batch)
+                    if !batch.graphed {
+                        self.engine.record_expert_usage(layer, batch)?;
+                    }
+                    Ok(())
                 }
                 fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Option<WaveTicket>> {
                     let batch = self
@@ -3320,6 +3736,12 @@ impl<'a> Hy4Engine<'a> {
                         .and_then(Option::as_mut)
                         .context("Hy4 send_experts without active unit")?;
                     self.engine.run_moe_router_and_shared(layer, batch, false)?;
+                    if self.engine.ranks.len() == 2 && self.engine.prefill_waves > 1 {
+                        // Protect rank 1's PEER_SLOT_ATTN read before another wave starts attention(layer).
+                        let exchange = self.engine.peer_exchange()?;
+                        exchange.signal(1, DIRECT)?;
+                        exchange.wait(0, DIRECT)?;
+                    }
                     let waves = self.waves.as_mut().context("Hy4 Spark route without active SparkLink")?;
                     let rows = batch.rows;
                     let identity = self.engine.next_identity;
@@ -3374,7 +3796,9 @@ impl<'a> Hy4Engine<'a> {
                             )
                         }
                     })?;
-                    self.engine.record_expert_usage(layer, batch)?;
+                    if !batch.graphed {
+                        self.engine.record_expert_usage(layer, batch)?;
+                    }
                     Ok(Some(ticket))
                 }
                 fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Option<WaveTicket>) -> Result<()> {
@@ -3406,8 +3830,8 @@ impl<'a> Hy4Engine<'a> {
                 fn end_unit(&mut self, unit: &Unit) -> Result<()> {
                     let batch = self
                         .active
-                        .get(unit.slot)
-                        .and_then(Option::as_ref)
+                        .get_mut(unit.slot)
+                        .and_then(Option::as_mut)
                         .context("Hy4 end_unit without active unit")?;
                     let mode = if unit.layers.end == self.engine.cfg.layers {
                         (self.head_mode)(unit)

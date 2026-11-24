@@ -8,8 +8,9 @@ pub(super) const SITES: &Table = &[(
     "hy4_flash.section",
     Scope::Local,
     "execution.rs: rank-local decode sections captured on each rank's exclusive stream; \
-     Engram H2D/P2P, DSA indexer pending D2D/pool/score/topk, TP2 reduce_tp2_f32_to_bf16, \
-     Spark waves send/land/reduce, DFly2 metadata and recall gathers, and TP2 head_handoff stay outside capture",
+     Engram H2D/PeerExchange, DSA indexer pending D2D/pool/score/topk, TP2 PeerExchange \
+     push/wait, Spark waves send/land/reduce, DFly2 metadata and recall gathers, and \
+     TP2 head_handoff stay outside capture",
 )];
 
 pub(super) fn spans(name: &str, declared: bool) -> bool {
