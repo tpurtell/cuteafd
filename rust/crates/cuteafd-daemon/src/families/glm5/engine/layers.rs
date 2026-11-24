@@ -150,15 +150,16 @@ impl<'a> GlmEngine<'a> {
             }
         }
         if bindings[0].decode_graphed() && head {
-            let key = GraphKey {
-                layer: self.weights.layers.len(),
-                sub: GlmOwnedPhase::Head as u8,
+            let key = owned_segment_key(
+                self.weights.layers.len(),
+                GlmOwnedPhase::Head,
                 rows,
-                table_width: tables[0].table_width,
-                table_stride: tables[0].table_stride,
-                previous: if last_join.is_some() { Previous::Delta } else { Previous::First },
-                head: true,
-            };
+                tables[0].table_width,
+                tables[0].table_stride,
+                false,
+                last_join.is_some(),
+                true,
+            );
             self.replay_on(0, key, || {
                 if let Some(last) = last_join {
                     bindings[0].ffn_join_local(0, last, self.weights.norm.buffer.ptr)?;
@@ -247,6 +248,30 @@ fn unit_exit(exchange: &impl attention::LayerProtocol, plan: &LayerExecutionPlan
     Ok(())
 }
 
+/// Pure key derivation for `ATTENTION_PLACEMENT=layers` decode/verify graph segments.
+///
+/// A deferred FFN join runs inside the segment, so `has_join` MUST distinguish
+/// `Previous::Delta` from `Previous::First` (otherwise a graph captured without
+/// the join — e.g. during a route check — could be replayed where one is needed).
+/// Only full-indexer `Attention` segments read page-table dimensions; every other
+/// segment normalizes `(table_width, table_stride)` to `(0, 0)` to share graphs
+/// across context lengths.
+pub(super) fn owned_segment_key(layer: usize, phase: GlmOwnedPhase, rows: usize,
+    table_width: usize, table_stride: usize, full_indexer: bool, has_join: bool,
+    head: bool) -> GraphKey {
+    let reads_page_table = phase == GlmOwnedPhase::Attention && full_indexer;
+    GraphKey {
+        layer,
+        sub: phase as u8,
+        rows,
+        table_width,
+        table_stride,
+        previous: if has_join { Previous::Delta } else { Previous::First },
+        head,
+    }
+    .normalized(reads_page_table)
+}
+
 impl Bindings<'_, '_, '_, '_, '_> {
     fn rows(&self) -> usize { self.tables[0].positions.len() }
     fn cap(&self) -> &'static str { if self.tables[0].decode { "m64" } else { "m4096" } }
@@ -265,9 +290,10 @@ impl Bindings<'_, '_, '_, '_, '_> {
         body: impl Fn() -> Result<()>) -> Result<()> {
         if self.decode_graphed() {
             let table = &self.tables[rank];
-            self.engine.replay_on(rank, GraphKey { layer, sub: phase as u8, rows: self.rows(),
-                table_width: table.table_width, table_stride: table.table_stride,
-                previous: if has_join { Previous::Delta } else { Previous::First }, head: false }, body)
+            let full_indexer = self.layer(rank, layer).full_indexer;
+            let key = owned_segment_key(layer, phase, self.rows(),
+                table.table_width, table.table_stride, full_indexer, has_join, false);
+            self.engine.replay_on(rank, key, body)
         } else { body() }
     }
     /// Rank-local FFN residual add + norm (capture-safe: caller already waited outside capture).
@@ -1130,6 +1156,43 @@ mod tests {
                 assert_eq!(order::check_submission_faults(&s.streams()), Ok(()),
                     "layers submission fault first={first} split_core={split_core}");
             }
+        }
+    }
+
+    #[test]
+    fn owned_segment_key_distinguishes_deferred_join_and_normalizes_page_tables() {
+        use super::{owned_segment_key, GlmOwnedPhase, Previous};
+        for (phase, head) in [
+            (GlmOwnedPhase::Attention, false),
+            (GlmOwnedPhase::FfnFront, false),
+            (GlmOwnedPhase::Head, true),
+        ] {
+            let with_join = owned_segment_key(4, phase, 1, 16, 16, true, true, head);
+            let without_join = owned_segment_key(4, phase, 1, 16, 16, true, false, head);
+            assert_eq!(with_join.previous, Previous::Delta, "{phase:?} with join must key Previous::Delta");
+            assert_eq!(without_join.previous, Previous::First, "{phase:?} without join must key Previous::First");
+            assert_ne!(with_join, without_join, "deferred FfnJoin graph must never alias no-join graph for {phase:?}");
+        }
+        // Only full-indexer Attention reads table_width/table_stride; all other segments share across contexts.
+        let full_short = owned_segment_key(4, GlmOwnedPhase::Attention, 5, 16, 16, true, true, false);
+        let full_long = owned_segment_key(4, GlmOwnedPhase::Attention, 5, 1024, 1024, true, true, false);
+        assert_ne!(full_short, full_long);
+        assert_eq!((full_long.table_width, full_long.table_stride), (1024, 1024));
+
+        let shared_short = owned_segment_key(5, GlmOwnedPhase::Attention, 5, 16, 16, false, true, false);
+        let shared_long = owned_segment_key(5, GlmOwnedPhase::Attention, 5, 1024, 1024, false, true, false);
+        assert_eq!(shared_short, shared_long);
+        assert_eq!((shared_short.table_width, shared_short.table_stride), (0, 0));
+
+        for (phase, head) in [
+            (GlmOwnedPhase::FfnFront, false),
+            (GlmOwnedPhase::Tp2Expert, false),
+            (GlmOwnedPhase::Head, true),
+        ] {
+            let short = owned_segment_key(4, phase, 5, 16, 16, true, false, head);
+            let long = owned_segment_key(4, phase, 5, 1024, 1024, true, false, head);
+            assert_eq!(short, long, "{phase:?} does not read page tables");
+            assert_eq!((short.table_width, short.table_stride), (0, 0));
         }
     }
 }

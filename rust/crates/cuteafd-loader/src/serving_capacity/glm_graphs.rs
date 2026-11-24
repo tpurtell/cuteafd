@@ -73,6 +73,23 @@ pub struct GlmGraphKey {
     pub head: bool,
 }
 
+impl GlmGraphKey {
+    /// Zero out page-table dimensions on segments that never read `table_width`
+    /// or `table_stride` (shared-indexer attention, combine/o_proj, FFN/MoE, head)
+    /// using the shared [`super::decode_graph_key::GraphGeometry`] helper so short
+    /// and long context steps share those rank-local graphs.
+    pub fn normalized(mut self, reads_page_table: bool) -> Self {
+        let geometry = super::decode_graph_key::GraphGeometry::paged(
+            self.table_width,
+            self.table_stride,
+            reads_page_table,
+        );
+        self.table_width = geometry.pool_width;
+        self.table_stride = geometry.page_stride;
+        self
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct GlmGraphLayer {
     pub dense: bool,
@@ -113,5 +130,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn graph_key_normalization_zeros_table_dims_only_when_unused() {
+        let base = GlmGraphKey {
+            layer: 4,
+            sub: 3,
+            rows: 5,
+            table_width: 512,
+            table_stride: 512,
+            previous: GlmGraphPrevious::First,
+            head: false,
+        };
+        let normalized = base.normalized(false);
+        assert_eq!((normalized.table_width, normalized.table_stride), (0, 0));
+        assert_eq!(base.normalized(true), base);
+        let long = GlmGraphKey { table_width: 1024, table_stride: 1024, ..base };
+        assert_eq!(base.normalized(false), long.normalized(false));
+        assert_ne!(base.normalized(true), long.normalized(true));
     }
 }

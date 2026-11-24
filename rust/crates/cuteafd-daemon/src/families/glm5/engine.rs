@@ -1569,8 +1569,8 @@ impl<'a> GlmEngine<'a> {
     }
 
     /// The page-table width a decode step whose longest row needs `pages`
-    /// pages runs with: a power of two from 16, capped at the
-    /// context's pages.
+    /// pages runs with: a power of two from the shared `MIN_PAGE_STRIDE` (64
+    /// pages = 4,096 tokens), capped at the pool and context's pages.
     fn table_width_bucket(&self, pages: usize) -> usize {
         glm_decode_table_width(pages, self.max_context, self.pages)
     }

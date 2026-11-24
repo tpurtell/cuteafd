@@ -32,39 +32,7 @@ pub fn bootstrap_bytes(gpus: usize, sparks: bool, rank: usize) -> u64 {
     bootstrap[rank.min(bootstrap.len() - 1)]
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct GraphGeometry {
-    pub pool_width: usize,
-    pub page_stride: usize,
-    pub pool_stride: usize,
-    pub long: bool,
-}
-
-impl GraphGeometry {
-    /// The table geometry a decode step's graphs are keyed by. The pool top-k (`index_topk`, which
-    /// runs only when a row is long) is the only launch that reads the pool table's width and
-    /// stride, so a short step keys neither: short steps that differ only there launch the same
-    /// programs with the same pointers and scalars, and share their graphs.
-    pub fn keyed(pool_width: usize, page_stride: usize, pool_stride: usize, long: bool) -> Self {
-        if long { Self { pool_width, page_stride, pool_stride, long } }
-        else { Self { pool_width: 0, page_stride, pool_stride: 0, long } }
-    }
-}
-
-/// The narrowest decode page-table stride, in MLA pages (4,096 tokens): sequences up to that size
-/// share one table shape, and so their decode graphs. The index expansion reads only a row's own
-/// pages, so a wider row changes nothing but its upload. A long step (a row past the 2,051-token
-/// dense context) already has at least 36 pages, so the floor never moves its stride.
-pub const MIN_PAGE_STRIDE: usize = 64;
-
-/// A decode step's (page-table, pool-table) strides for sequences of at most `pages` and
-/// `pool_pages` pages: powers of two (they bound the graphs a growing batch captures), the page
-/// stride from its floor, both at most the pool's pages and a table row's columns (a sequence
-/// holds at most `max_context` tokens' pages). Only a long step keys the pool stride.
-pub fn decode_strides(pages: usize, pool_pages: usize, pool: (usize, usize), table: (usize, usize)) -> (usize, usize) {
-    (pages.max(1).next_power_of_two().max(MIN_PAGE_STRIDE).min(pool.0).min(table.0),
-        pool_pages.max(1).next_power_of_two().min(pool.1).min(table.1))
-}
+pub use super::decode_graph_key::{GraphGeometry, MIN_PAGE_STRIDE, decode_page_stride, decode_strides};
 
 /// Every exchange slot owns its payload, completion word and native control storage.
 pub fn peer_exchange_bytes(lanes: u64, rows: u64, hidden: u64, partial_bytes: u64, output_shard: bool) -> u64 {

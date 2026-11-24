@@ -20,7 +20,7 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn local_key(layer: usize, sub: u8, rows: usize, tables: &StepTables,
-        previous: Previous, head: bool) -> GraphKey {
+        reads_page_table: bool, previous: Previous, head: bool) -> GraphKey {
         GraphKey {
             layer,
             sub,
@@ -30,6 +30,7 @@ impl<'a> GlmEngine<'a> {
             previous,
             head,
         }
+        .normalized(reads_page_table)
     }
 
     /// Stage Rank 1's Phase-0 (`sub = 0`) attention and outgoing push for layer `index`
@@ -52,7 +53,7 @@ impl<'a> GlmEngine<'a> {
             exchange.wait(1, slot(index - 1, true, 0))?;
         }
 
-        let key1 = Self::local_key(index, 0, t, tables1, previous, false);
+        let key1 = Self::local_key(index, 0, t, tables1, layer1.full_indexer, previous, false);
         self.replay_on(1, key1, || {
             if index == 0 {
                 self.norm_full(1, w1, layer1.ptr("input_norm")?, 0, rows,
@@ -177,7 +178,8 @@ impl<'a> GlmEngine<'a> {
                         self.moe_front(index, w, layer, t)
                     }
                 };
-                let key = Self::local_key(index, 0, t, tables, previous, head && layer.is_none());
+                let key = Self::local_key(index, 0, t, tables,
+                    layer.is_some_and(|l| l.full_indexer), previous, head && layer.is_none());
                 {
                     let _range = crate::shared::probe::verify_timing::range(Some(self.library), || match layer {
                         Some(layer) if layer.dense => format!("L{index} attention+dense"),
@@ -245,7 +247,7 @@ impl<'a> GlmEngine<'a> {
                     exchange.wait(0, slot(before, true, 0))?;
                 }
             }
-            let key0 = Self::local_key(index, 0, t, tables, prev_r0, false);
+            let key0 = Self::local_key(index, 0, t, tables, layer0.full_indexer, prev_r0, false);
             self.replay_on(0, key0, || {
                 if index == 0 {
                     self.norm_full(0, w, layer0.ptr("input_norm")?, 0, rows,
@@ -279,7 +281,7 @@ impl<'a> GlmEngine<'a> {
 
                     let (ps1, pi1) = self.context_local_wait_candidates(1, cslot)?;
                     let aq1 = self.context_local_wait_query(1, cslot)?;
-                    let key1 = Self::local_key(index, 1, t, &ranked[1], Previous::First, false);
+                    let key1 = Self::local_key(index, 1, t, &ranked[1], true, Previous::First, false);
                     self.replay_on(1, key1, || {
                         self.context_local_merge_and_partials(1, w1, index, rows, t, &ranked[1], ps1, pi1, aq1)
                     })?;
@@ -287,7 +289,7 @@ impl<'a> GlmEngine<'a> {
 
                     let (ps0, pi0) = self.context_local_wait_candidates(0, cslot)?;
                     let aq0 = self.context_local_wait_query(0, cslot)?;
-                    let key0 = Self::local_key(index, 1, t, tables, Previous::First, false);
+                    let key0 = Self::local_key(index, 1, t, tables, true, Previous::First, false);
                     self.replay_on(0, key0, || {
                         self.context_local_merge_and_partials(0, w, index, rows, t, tables, ps0, pi0, aq0)
                     })?;
@@ -312,7 +314,7 @@ impl<'a> GlmEngine<'a> {
                     || !layer0.native_projections.is_empty();
                 let recv1 = self.context_local_wait_partial(1, cslot)?;
                 if graph_combine {
-                    let key1 = Self::local_key(index, 2, t, &ranked[1], Previous::First, false);
+                    let key1 = Self::local_key(index, 2, t, &ranked[1], false, Previous::First, false);
                     self.replay_on(1, key1, || {
                         self.context_local_combine_out(1, w1, layer1, rows, t, recv1)
                     })?;
@@ -323,7 +325,7 @@ impl<'a> GlmEngine<'a> {
 
                 let recv0 = self.context_local_wait_partial(0, cslot)?;
                 if graph_combine {
-                    let key0 = Self::local_key(index, 2, t, tables, Previous::First, false);
+                    let key0 = Self::local_key(index, 2, t, tables, false, Previous::First, false);
                     self.replay_on(0, key0, || {
                         self.context_local_combine_out(0, w, layer0, rows, t, recv0)
                     })?;
@@ -338,7 +340,7 @@ impl<'a> GlmEngine<'a> {
             // 3. Post-attention + FFN + FFN pushes (Rank 1 first so GPU 1 stays ahead of GPU 0).
             if layer0.dense {
                 exchange.wait(1, att_slot)?;
-                let key1 = Self::local_key(index, 3, t, &ranked[1], Previous::First, false);
+                let key1 = Self::local_key(index, 3, t, &ranked[1], false, Previous::First, false);
                 self.replay_on(1, key1, || {
                     self.projection_norm(1, index, 0, w1, layer1, "o", layer1.ptr("post_norm")?,
                         rows, w1.delta.buffer.ptr, self.recv(1, att_slot)?)?;
@@ -347,7 +349,7 @@ impl<'a> GlmEngine<'a> {
                 self.publish_projection(1, index, 0, w1, layer1, "down", t)?;
 
                 exchange.wait(0, att_slot)?;
-                let key0 = Self::local_key(index, 3, t, tables, Previous::First, false);
+                let key0 = Self::local_key(index, 3, t, tables, false, Previous::First, false);
                 self.replay_on(0, key0, || {
                     self.projection_norm(0, index, 0, w, layer0, "o", layer0.ptr("post_norm")?,
                         rows, w.delta.buffer.ptr, self.recv(0, att_slot)?)?;
@@ -362,7 +364,7 @@ impl<'a> GlmEngine<'a> {
                     // One-way 1->0 split-core shared FFN: Rank 1 publishes its retained core
                     // partial immediately and enters TP2 experts without waiting on Rank 0.
                     exchange.wait(1, att_slot)?;
-                    let key1_pre = Self::local_key(index, 3, t, &ranked[1], Previous::First, false);
+                    let key1_pre = Self::local_key(index, 3, t, &ranked[1], false, Previous::First, false);
                     self.replay_on(1, key1_pre, || {
                         self.projection_norm(1, index, 0, w1, layer1, "o", layer1.ptr("post_norm")?,
                             rows, w1.delta.buffer.ptr, self.recv(1, att_slot)?)?;
@@ -370,7 +372,7 @@ impl<'a> GlmEngine<'a> {
                         self.core_zero_shared(1, w1, t)
                     })?;
                     self.publish_projection(1, index, 0, w1, layer1, "down", t)?;
-                    let key1_moe = Self::local_key(index, 4, t, &ranked[1], Previous::First, false);
+                    let key1_moe = Self::local_key(index, 4, t, &ranked[1], false, Previous::First, false);
                     self.replay_on(1, key1_moe, || {
                         self.moe_front_on(1, index, w1, layer1, t)?;
                         self.tp2_rank_local(pair, 1, index, 0, w1, t)
@@ -378,7 +380,7 @@ impl<'a> GlmEngine<'a> {
                     self.tp2_publish(pair, 1, index, 0, w1, t)?;
 
                     exchange.wait(0, att_slot)?;
-                    let key0_pre = Self::local_key(index, 3, t, tables, Previous::First, false);
+                    let key0_pre = Self::local_key(index, 3, t, tables, false, Previous::First, false);
                     self.replay_on(0, key0_pre, || {
                         self.projection_norm(0, index, 0, w, layer0, "o", layer0.ptr("post_norm")?,
                             rows, w.delta.buffer.ptr, self.recv(0, att_slot)?)?;
@@ -386,7 +388,7 @@ impl<'a> GlmEngine<'a> {
                         self.shared_on_local(0, index, w, layer0, rows, "m64")
                     })?;
                     exchange.wait(0, ffn_slot)?;
-                    let key0_moe = Self::local_key(index, 4, t, tables, Previous::First, false);
+                    let key0_moe = Self::local_key(index, 4, t, tables, false, Previous::First, false);
                     self.replay_on(0, key0_moe, || {
                         self.reduce_projection(0, index, 0, w, layer0, "down", t, w.shared.buffer)?;
                         self.tp2_rank_local(pair, 0, index, 0, w, t)
@@ -396,7 +398,7 @@ impl<'a> GlmEngine<'a> {
                     }
                 } else {
                     exchange.wait(1, att_slot)?;
-                    let key1 = Self::local_key(index, 3, t, &ranked[1], Previous::First, false);
+                    let key1 = Self::local_key(index, 3, t, &ranked[1], false, Previous::First, false);
                     self.replay_on(1, key1, || {
                         self.projection_norm(1, index, 0, w1, layer1, "o", layer1.ptr("post_norm")?,
                             rows, w1.delta.buffer.ptr, self.recv(1, att_slot)?)?;
@@ -407,7 +409,7 @@ impl<'a> GlmEngine<'a> {
                     self.tp2_publish(pair, 1, index, 0, w1, t)?;
 
                     exchange.wait(0, att_slot)?;
-                    let key0 = Self::local_key(index, 3, t, tables, Previous::First, false);
+                    let key0 = Self::local_key(index, 3, t, tables, false, Previous::First, false);
                     self.replay_on(0, key0, || {
                         self.projection_norm(0, index, 0, w, layer0, "o", layer0.ptr("post_norm")?,
                             rows, w.delta.buffer.ptr, self.recv(0, att_slot)?)?;
@@ -434,7 +436,7 @@ impl<'a> GlmEngine<'a> {
                 // Spark or skip MoE: Rank 1 finishes shared FFN & pushes immediately,
                 // while Rank 0 runs router + Spark exchange + reduction.
                 exchange.wait(1, att_slot)?;
-                let key1 = Self::local_key(index, 3, t, &ranked[1], Previous::First, false);
+                let key1 = Self::local_key(index, 3, t, &ranked[1], false, Previous::First, false);
                 self.replay_on(1, key1, || {
                     self.projection_norm(1, index, 0, w1, layer1, "o", layer1.ptr("post_norm")?,
                         rows, w1.delta.buffer.ptr, self.recv(1, att_slot)?)?;
@@ -452,7 +454,7 @@ impl<'a> GlmEngine<'a> {
                 }
 
                 exchange.wait(0, att_slot)?;
-                let key0 = Self::local_key(index, 3, t, tables, Previous::First, false);
+                let key0 = Self::local_key(index, 3, t, tables, false, Previous::First, false);
                 self.replay_on(0, key0, || {
                     self.projection_norm(0, index, 0, w, layer0, "o", layer0.ptr("post_norm")?,
                         rows, w.delta.buffer.ptr, self.recv(0, att_slot)?)?;
@@ -498,7 +500,7 @@ impl<'a> GlmEngine<'a> {
                 exchange.wait(0, slot(last, true, 0))?;
             }
         }
-        let tail_key = Self::local_key(layers.len(), 0, t, tables, prev_r0, head);
+        let tail_key = Self::local_key(layers.len(), 0, t, tables, false, prev_r0, head);
         let tail_segment = || -> Result<()> {
             if let Some(last) = layers.len().checked_sub(1) {
                 if self.tp2_layer(last) {
