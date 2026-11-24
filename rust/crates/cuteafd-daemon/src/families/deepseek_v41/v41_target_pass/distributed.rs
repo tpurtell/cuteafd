@@ -259,9 +259,6 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             },
             state: State::Idle,
             chain,
-            device_order: true,
-            device_default: true,
-            l2_solo: true,
             sampled: None,
         })
     }
@@ -443,8 +440,8 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
         encoder: Option<&BlockOutput<'_>>,
         greedy: bool,
     ) -> Result<()> {
-        // Verification passes run with device-ordered stages. Peer-projection
-        // modes (TP2 attention/query/output, all opt-in) keep host drains.
+        // Verification passes run with device-ordered stages, including TP2
+        // peer projections and dual attention.
         let library = self.resources.embedding.device.library;
         let verification = std::mem::replace(&mut self.resources.verification, false);
         self.set_attention_decode(verification);
@@ -453,11 +450,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                 crate::shared::decode_graph::device::Cycle::Decode
             } else { crate::shared::decode_graph::device::Cycle::Verify };
         super::super::graph_policy::cycle(cycle, |f| self.visit_graph_banks(f))?;
-        // `--l2-prefetch` only while the other lane is idle (consumed per pass).
-        let solo = std::mem::replace(&mut self.l2_solo, true);
-        for lane in &mut self.resources.lanes { lane.get_mut().set_l2_prefetch(solo); }
-        let chained = verification && !self.resources.lanes.iter().any(|lane| lane.uses_peer_projection());
-        let Some(handle) = self.begin_chain(chained)? else {
+        let Some(handle) = self.begin_chain(verification)? else {
             let result = unsafe { self.execute_unchained(requests, batch, transport, placement, selected,
                 suffix, encoder, greedy).await };
             // A failed Spark wire released its waits over garbage planes.
@@ -2059,5 +2052,33 @@ mod tests {
             "PASS cancelled distributed reserved pass revoked admission and restored both GPU owners"
         );
         Ok(())
+    }
+
+    #[test]
+    fn tp2_peer_projections_stay_in_the_device_ordered_chain() {
+        let distributed = include_str!("distributed.rs");
+        let distributed = &distributed[..distributed.find("#[cfg(test)]\nmod tests").unwrap()];
+        assert!(!distributed.contains("uses_peer_projection"));
+        assert!(distributed.contains("self.begin_chain(verification)?"));
+        let units = include_str!("distributed/encoder_units.rs");
+        assert!(!units.contains("uses_peer_projection"));
+        let query = include_str!("../v41_attention_query.rs");
+        let tp2_query = &query[query.find("execute_tokens_tp2_prepared_cooperative").unwrap()..];
+        let tp2_query = &tp2_query[..tp2_query.find("pub fn output(").unwrap()];
+        assert!(tp2_query.contains("chain::join("));
+        assert!(tp2_query.contains("chain::mark_fork("));
+        let projection = include_str!("../v41_projection_tp2.rs");
+        let exec = &projection[projection.find("pub async unsafe fn execute_after").unwrap()..];
+        let exec = &exec[..exec.find("impl Drop for Wave").unwrap()];
+        assert!(exec.contains("chain::join("));
+        assert!(exec.contains("owner.storage.stream.complete().await?"));
+        let dual = include_str!("../v41_sparse_attention/dual.rs");
+        let enqueue = &dual[dual.find("pub unsafe fn enqueue_cached<").unwrap()..];
+        let enqueue = &enqueue[..enqueue.find("pub unsafe fn enqueue<").unwrap()];
+        assert!(enqueue.contains("chain::join("));
+        let sparse = include_str!("../v41_sparse_attention.rs");
+        let split = &sparse[sparse.find("pub unsafe fn enqueue_split_query_prepared").unwrap()..];
+        let split = &split[..split.find("impl<const HEADS:usize> Drop for LocalSparseAttentionWave").unwrap()];
+        assert!(split.contains("chain::join("));
     }
 }

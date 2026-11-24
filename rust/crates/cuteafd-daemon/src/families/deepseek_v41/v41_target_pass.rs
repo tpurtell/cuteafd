@@ -135,13 +135,6 @@ pub(crate) struct Pass<'a, R> {
     state: State,
     sampled: Option<SampledTargetRows>,
     chain: Option<crate::shared::memory::chain::StageChain<'a>>,
-    device_order: bool,
-    /// Device order a pass returns to after a one-pass override: on for both
-    /// single-RTX and two-RTX passes when one lane is active (the independent
-    /// scheduler disables device order per pass while both lanes are busy).
-    device_default: bool,
-    /// The next pass may L2-prefetch during its exchanges ([`Self::set_l2_prefetch`]).
-    l2_solo: bool,
 }
 
 pub(crate) type TargetPass<'w, 'a> = Pass<'a, SingleResources<'w, 'a>>;
@@ -159,10 +152,10 @@ pub(crate) struct SingleResources<'w, 'a> {
 }
 
 impl<'a, R> Pass<'a, R> {
-    /// Select ordering once per pass, before borrowing its concrete resources.
+    /// Enter this pass's device-ordered stage chain when enabled.
     fn begin_chain(&mut self, enabled: bool) -> Result<Option<crate::shared::memory::chain::ChainHandle<'a>>> {
         if let Some(chain) = &self.chain {
-            chain.set_device_order(std::mem::replace(&mut self.device_order, self.device_default));
+            chain.set_device_order(true);
         }
         let Some(chain) = self.chain.as_ref().filter(|_| enabled) else { return Ok(None) };
         // Cancellation may have left work queued on this owner.
@@ -187,13 +180,6 @@ impl<'a, R> Pass<'a, R> {
         let chain = self.chain.as_ref().context("target pass chain absent")?;
         chain.drain_bounded(Duration::from_secs(60))
     }
-
-    /// Device order for the next pass only, within this pass's default.
-    pub(crate) fn set_device_order(&mut self, on: bool) { self.device_order = on && self.device_default; }
-    /// Whether the next pass may prefetch weights into L2 during its Spark
-    /// exchanges (`--l2-prefetch`): only while the other lane is idle. Consumed
-    /// by that pass, like the device order.
-    pub(crate) fn set_l2_prefetch(&mut self, on: bool) { self.l2_solo = on; }
 }
 impl<'w, 'a> TargetPass<'w, 'a> {
     pub(crate) fn capture_startup_prefill(&mut self, bank: &crate::families::deepseek_v41::v41_backbone_cache::BackboneCache<'a>, local: &[bool; 40]) -> Result<()> {
@@ -295,9 +281,6 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             state: State::Idle,
             sampled: None,
             chain,
-            device_order: true,
-            device_default: true,
-            l2_solo: true,
         })
     }
     /// `--l2-prefetch` with `budget` bytes per layer (see [`BackboneLane::enable_l2_prefetch`]).
@@ -495,8 +478,6 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         let step_sample = if verification && tracing::enabled!(target: "cuteafd::target_step", tracing::Level::DEBUG) {
             Some((batch.cache()?.positions().len(), std::time::Instant::now()))
         } else { None };
-        // `--l2-prefetch` only while the other lane is idle (consumed per pass).
-        self.resources.lane.set_l2_prefetch(std::mem::replace(&mut self.l2_solo, true));
         let Some(handle) = self.begin_chain(verification)? else {
             let result = unsafe { self.execute_phase_inner(requests, batch, transport, placement, selected,
                 suffix, encoder, terminal).await };
@@ -926,30 +907,63 @@ mod tests {
             state: State::Idle,
             sampled: None,
             chain: None,
-            device_order: false,
-            device_default: true,
-            l2_solo: true,
         };
         assert!(pass.begin_chain(false)?.is_none());
         assert!(pass.begin_chain(true)?.is_none());
         assert!(pass.drain_chain().is_err());
         pass.state.begin()?;
         assert!(pass.state.begin().is_err());
-        pass.set_device_order(true);
-        assert!(pass.device_order);
-        pass.set_device_order(false);
-        assert!(!pass.device_order);
-        // A pass whose default is false stays host-ordered whatever a scheduler asks.
-        pass.device_default = false;
-        pass.set_device_order(true);
-        assert!(!pass.device_order);
-        pass.set_l2_prefetch(false);
-        assert!(!pass.l2_solo);
-        // Single-RTX TargetPass defaults to device-ordered for one-lane passes.
-        let src = include_str!("v41_target_pass.rs");
-        let new_fn = &src[src.find("impl<'w, 'a> TargetPass<'w, 'a>").unwrap()..];
-        let new_fn = &new_fn[..new_fn.find("pub fn enable_l2_prefetch").unwrap()];
-        assert!(new_fn.contains("device_order: true") && new_fn.contains("device_default: true"));
+        Ok(())
+    }
+
+    #[test]
+    fn two_lane_chains_stay_device_ordered_and_isolated() -> anyhow::Result<()> {
+        use crate::shared::memory::chain::{self, StageChain};
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let mut passes = [
+            super::Pass { resources: (), state: State::Idle, sampled: None, chain: Some(StageChain::new(&library)?) },
+            super::Pass { resources: (), state: State::Idle, sampled: None, chain: Some(StageChain::new(&library)?) },
+        ];
+        // Even if a prior caller flipped a chain off, begin_chain restores device order.
+        passes[1].chain.as_ref().unwrap().set_device_order(false);
+        let h0 = passes[0].begin_chain(true)?.expect("lane 0 chain");
+        let h1 = passes[1].begin_chain(true)?.expect("lane 1 chain");
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        runtime.block_on(async {
+            let (a, b) = tokio::join!(
+                h0.scope(async {
+                    assert!(chain::active() && chain::deferred());
+                    tokio::task::yield_now().await;
+                    assert!(chain::active() && chain::deferred());
+                    anyhow::Ok(())
+                }),
+                h1.scope(async {
+                    assert!(chain::active() && chain::deferred());
+                    tokio::task::yield_now().await;
+                    assert!(chain::active() && chain::deferred());
+                    anyhow::Ok(())
+                }),
+            );
+            a?; b?;
+            anyhow::Ok(())
+        })?;
+        for pass in &passes { pass.drain_chain()?; }
+        let independent = include_str!("v41_native_serve/scheduler/independent.rs");
+        let independent = &independent[..independent.find("#[cfg(test)]").unwrap()];
+        assert!(!independent.contains("set_device_order"));
+        assert!(!independent.contains("set_l2_prefetch"));
+        let lane = include_str!("v41_backbone_lane.rs");
+        let lane = &lane[..lane.find("#[cfg(test)]").unwrap()];
+        assert!(!lane.contains("set_l2_prefetch"));
+        let router = include_str!("v41_backbone_router.rs");
+        let set_local = &router[router.find("pub fn set_local_mode(").unwrap()..];
+        let set_local = &set_local[..set_local.find("pub fn device_bytes(").unwrap()];
+        assert!(set_local.contains("if !crate::shared::memory::chain::active()"));
+        let index_query = include_str!("v41_index_query.rs");
+        let rebind = &index_query[index_query.find("pub fn rebind(").unwrap()..];
+        let rebind = &rebind[..rebind.find("pub(crate) fn startup_geometry(").unwrap()];
+        assert!(rebind.contains("if !crate::shared::memory::chain::active()"));
         Ok(())
     }
 

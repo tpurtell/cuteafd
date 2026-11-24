@@ -336,6 +336,9 @@ impl<'w,'a> Wave<'w,'a> {
     fn drain(&self) -> Result<()> {
         let first=self.ranks[0].storage.stream.drain();let second=self.ranks[1].storage.stream.drain();first.and(second)
     }
+    pub(crate) async fn wait_owner(&self) -> Result<()> {
+        self.ranks[self.owner].storage.stream.wait().await
+    }
     /// # Safety
     /// Input production is complete. Keep input live/unchanged until completion
     /// or cancellation drains both ranks. Consume the result before reusing wave.
@@ -363,14 +366,18 @@ impl<'w,'a> Wave<'w,'a> {
                 wave.ranks[input_rank].storage.stream.device.library.cuda_event_record(wave.storage.input_ready[input_rank].raw,producer)
             })?;
         }
+        let mut rank_cold = false;
         for rank in &mut wave.ranks {
             let weights=rank.weights.iter().find(|w|w.layer==layer).context("projection layer absent")?;
             let graph = if wave.window.is_windowed() { None }
                 else { rank.graphs.cached_launch(layer,weights,rows).map(|(raw,_)|raw) };
+            rank_cold |= graph.is_none();
             rank.storage.stream.device.run(||unsafe {
                 acquire(&rank.storage.guard, rank.storage.stream.raw)?;
                 if producer.is_some() {
                     rank.storage.stream.device.library.cuda_stream_wait_event(rank.storage.stream.raw,wave.storage.input_ready[input_rank].raw)?;
+                } else {
+                    crate::shared::memory::chain::join(rank.storage.stream.device.library, rank.storage.stream.raw)?;
                 }
                 rank.storage.copy.launch_rows(rank.storage.input.buffer,input,k*2,rows as usize,k*2,k*2,rank.storage.stream.raw)?;
                 crate::shared::decode_graph::census::dispatch(rank.storage.stream.device.library, rank.storage.stream.raw,
@@ -393,7 +400,15 @@ impl<'w,'a> Wave<'w,'a> {
         let output=CuteafdDeviceBuffer { bytes:rows as usize*n*2,..wave.storage.output.buffer };
         let result=owner.storage.stream.device.run(||consume(output,owner.storage.stream.raw))?;
         owner.storage.stream.complete().await?;
-        if !wave.window.is_windowed() && !crate::shared::memory::chain::deferred() {
+        let cold_capture = !wave.window.is_windowed()
+            && super::graph_policy::captures_shape(rows)
+            && !crate::shared::decode_graph::census::eager("layer_row")
+            && (rank_cold || gather_graph.is_none());
+        if cold_capture {
+            if crate::shared::memory::chain::deferred() {
+                owner.storage.stream.wait().await?;
+            }
+            peer.storage.stream.wait().await?;
             for rank in &mut wave.ranks { rank.capture_ready(layer,rows)?; }
             wave.capture_gather_ready(rows)?;
         }

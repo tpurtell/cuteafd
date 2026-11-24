@@ -285,20 +285,6 @@ impl<'a> UnitHooks<'_, '_, '_, 'a> {
         Ok(())
     }
 }
-/// Device order for a unit's hooks, as for the pass's verification chain:
-/// off when a lane's opt-in TP2 peer transfers are host-ordered.
-fn unit_chain<'a>(pass: &DistributedTargetPass<'_, 'a>)
-    -> Result<Option<crate::shared::memory::chain::ChainHandle<'a>>> {
-    if pass.resources.lanes.iter().any(|lane| lane.uses_peer_projection()) { return Ok(None); }
-    pass.unit_chain().map(Some)
-}
-
-/// Polls `future` in `chain`'s scope when there is one.
-async fn scoped<F: std::future::Future>(chain: Option<crate::shared::memory::chain::ChainHandle<'_>>, future: F)
-    -> F::Output {
-    match chain { Some(chain) => chain.scope(future).await, None => future.await }
-}
-
 impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
     type Ticket = UnitPendingLayer;
     fn route(&self, layer: usize) -> FfnRoute {
@@ -310,19 +296,15 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         // drain; drain before this unit rewrites the pass's pinned staging.
         if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
         crate::shared::spark_waves::healthy()?;
-        let chain = unit_chain(self.slots[unit.slot].pass)?;
-        scoped(chain, self.begin_unit_inner(unit)).await
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        chain.scope(self.begin_unit_inner(unit)).await
     }
     async fn attention(&mut self, layer: usize, unit: &Unit) -> Result<()> {
         // As on one RTX (#815 option (i)): device-ordered, no host wait. The
         // attention orders after the previous unit's publication of this layer;
         // its window and source publications are chained direct commits.
         crate::shared::spark_waves::healthy()?;
-        let Some(chain) = unit_chain(self.slots[unit.slot].pass)? else {
-            // Host-ordered TP2 peer transfers keep the established host order.
-            if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
-            return self.attention_inner(layer, unit).await;
-        };
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
         let event = self.previous_publication(unit, layer);
         chain.scope(async {
             super::super::encoder_units::order_after(self.slots[unit.slot].published.library, event)?;
@@ -331,25 +313,22 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
         }).await
     }
     async fn local_ffn(&mut self, layer: usize, unit: &Unit) -> Result<()> {
-        let chain = unit_chain(self.slots[unit.slot].pass)?;
-        scoped(chain, self.local_ffn_inner(layer, unit)).await
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        chain.scope(self.local_ffn_inner(layer, unit)).await
     }
     async fn send_experts(&mut self, layer: usize, unit: &Unit) -> Result<Self::Ticket> {
-        let chain = unit_chain(self.slots[unit.slot].pass)?;
-        scoped(chain, self.send_experts_inner(layer, unit)).await
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        chain.scope(self.send_experts_inner(layer, unit)).await
     }
     async fn land_experts(&mut self, layer: usize, unit: &Unit, ticket: Self::Ticket) -> Result<()> {
-        let chain = unit_chain(self.slots[unit.slot].pass)?;
-        scoped(chain, self.land_experts_inner(layer, unit, ticket)).await
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
+        chain.scope(self.land_experts_inner(layer, unit, ticket)).await
     }
     async fn end_unit(&mut self, unit: &Unit) -> Result<()> {
         // Device-ordered (#815 option (i)): the suffix capture and the
         // boundary source publication chain behind the unit's last layer.
         crate::shared::spark_waves::healthy()?;
-        let Some(chain) = unit_chain(self.slots[unit.slot].pass)? else {
-            if self.slots[unit.slot].pass.chain.is_some() { self.slots[unit.slot].pass.drain_chain()?; }
-            return self.end_unit_inner(unit).await;
-        };
+        let chain = self.slots[unit.slot].pass.unit_chain()?;
         let boundary = super::super::encoder_units::BOUNDARY;
         let event = self.previous_publication(unit, boundary);
         chain.scope(async {
@@ -361,13 +340,12 @@ impl<'a> AsyncPrefillHooks for UnitHooks<'_, '_, '_, 'a> {
     async fn commit_unit(&mut self, unit: &Unit) -> Result<()> {
         // As on one RTX: every window and source was published on the device
         // during the unit's layers, so its cache commit enqueues nothing and the
-        // commit is host bookkeeping. Without a device order (host-ordered peer
-        // transfers) the unit's work is drained first, as before.
+        // commit is host bookkeeping.
         crate::shared::spark_waves::healthy()?;
         let pass = &mut *self.slots[unit.slot].pass;
         // As on one RTX: a unit captured with routes drains before its ring
         // is read, and the ring is drained before the unit commits.
-        if pass.chain.is_some() && (pass.resources.capture_routes || unit_chain(pass)?.is_none()) {
+        if pass.chain.is_some() && pass.resources.capture_routes {
             pass.drain_chain()?;
         }
         pass.drain_route_rings()?;
