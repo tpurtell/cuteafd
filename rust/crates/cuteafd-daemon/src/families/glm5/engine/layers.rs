@@ -156,7 +156,7 @@ impl<'a> GlmEngine<'a> {
                 rows,
                 table_width: tables[0].table_width,
                 table_stride: tables[0].table_stride,
-                previous: Previous::First,
+                previous: if last_join.is_some() { Previous::Delta } else { Previous::First },
                 head: true,
             };
             self.replay_on(0, key, || {
@@ -250,18 +250,24 @@ fn unit_exit(exchange: &impl attention::LayerProtocol, plan: &LayerExecutionPlan
 impl Bindings<'_, '_, '_, '_, '_> {
     fn rows(&self) -> usize { self.tables[0].positions.len() }
     fn cap(&self) -> &'static str { if self.tables[0].decode { "m64" } else { "m4096" } }
-    fn decode_graphed(&self) -> bool { self.tables[0].decode && self.on_layer.is_none() }
+    fn decode_graphed(&self) -> bool {
+        self.tables[0].decode && self.on_layer.is_none()
+            && !self.engine.force_route_check.get()
+            && self.engine.tp2.as_ref().is_none_or(|pair| !pair.checking())
+    }
     fn layer(&self, rank: usize, layer: usize) -> &GlmLayer<'_> {
         if rank == 0 { &self.engine.weights.layers[layer] } else { &self.engine.peer.as_ref().unwrap().layers[layer] }
     }
     fn next_owner(&self, index: usize) -> Option<usize> {
         self.engine.weights.layers.get(index + 1).and_then(|l| l.attention_owner).map(usize::from)
     }
-    fn segment(&self, rank: usize, layer: usize, phase: GlmOwnedPhase, body: impl Fn() -> Result<()>) -> Result<()> {
+    fn segment(&self, rank: usize, layer: usize, phase: GlmOwnedPhase, has_join: bool,
+        body: impl Fn() -> Result<()>) -> Result<()> {
         if self.decode_graphed() {
             let table = &self.tables[rank];
             self.engine.replay_on(rank, GraphKey { layer, sub: phase as u8, rows: self.rows(),
-                table_width: table.table_width, table_stride: table.table_stride, previous: Previous::First, head: false }, body)
+                table_width: table.table_width, table_stride: table.table_stride,
+                previous: if has_join { Previous::Delta } else { Previous::First }, head: false }, body)
         } else { body() }
     }
     /// Rank-local FFN residual add + norm (capture-safe: caller already waited outside capture).
@@ -365,7 +371,7 @@ impl LayerKernels for Bindings<'_, '_, '_, '_, '_> {
                 e.exchange()?.wait(rank, slot(prev, true, self.lane))?;
             }
         }
-        self.segment(rank, index, GlmOwnedPhase::Attention, || {
+        self.segment(rank, index, GlmOwnedPhase::Attention, prev_join.is_some(), || {
             let rows = Scalar::I32(self.rows() as i32);
             if let Some(prev) = prev_join {
                 self.ffn_join_local(rank, prev, self.layer(rank, index).ptr("input_norm")?)?;
@@ -417,19 +423,19 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             if !layer.dense && e.tp2_layer(index) && e.tp2_routes_replicated() {
                 let pair = e.tp2.as_ref().context("TP2")?;
                 if split_core_down {
-                    self.segment(1, index, GlmOwnedPhase::FfnFront, || {
+                    self.segment(1, index, GlmOwnedPhase::FfnFront, false, || {
                         if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
                         e.shared_on_local(1, index, w1, layer1, rows, self.cap())?;
                         e.core_zero_shared(1, w1, rows_count)
                     })?;
                     e.publish_projection(1, index, self.lane, w1, layer1, "down", rows_count)?;
-                    self.segment(1, index, GlmOwnedPhase::Tp2Expert, || {
+                    self.segment(1, index, GlmOwnedPhase::Tp2Expert, false, || {
                         e.moe_front_on(1, index, w1, layer1, rows_count)?;
                         e.tp2_rank_local(pair, 1, index, self.lane, w1, rows_count)
                     })?;
                     e.tp2_publish(pair, 1, index, self.lane, w1, rows_count)?;
 
-                    self.segment(0, index, GlmOwnedPhase::FfnFront, || {
+                    self.segment(0, index, GlmOwnedPhase::FfnFront, join0.is_some(), || {
                         if let Some(prev) = join0 {
                             self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
                             self.tap_drafter_local(prev)?;
@@ -439,7 +445,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                         e.shared_on_local(0, index, w, layer, rows, self.cap())
                     })?;
                     e.exchange()?.wait(0, slot(index, true, self.lane))?;
-                    self.segment(0, index, GlmOwnedPhase::Tp2Expert, || {
+                    self.segment(0, index, GlmOwnedPhase::Tp2Expert, false, || {
                         e.reduce_projection(0, index, self.lane, w, layer, "down", rows_count, w.shared.buffer)?;
                         e.tp2_rank_local(pair, 0, index, self.lane, w, rows_count)
                     })?;
@@ -447,7 +453,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                         e.tp2_publish(pair, 0, index, self.lane, w, rows_count)?;
                     }
                 } else {
-                    self.segment(1, index, GlmOwnedPhase::FfnFront, || {
+                    self.segment(1, index, GlmOwnedPhase::FfnFront, false, || {
                         if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
                         e.shared_on_local(1, index, w1, layer1, rows, self.cap())?;
                         e.moe_front_on(1, index, w1, layer1, rows_count)?;
@@ -455,7 +461,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                     })?;
                     e.tp2_publish(pair, 1, index, self.lane, w1, rows_count)?;
 
-                    self.segment(0, index, GlmOwnedPhase::FfnFront, || {
+                    self.segment(0, index, GlmOwnedPhase::FfnFront, join0.is_some(), || {
                         if let Some(prev) = join0 {
                             self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
                             self.tap_drafter_local(prev)?;
@@ -490,12 +496,12 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                 return Ok(Ticket::Complete);
             }
             if layer.dense {
-                self.segment(1, index, GlmOwnedPhase::FfnFront, || {
+                self.segment(1, index, GlmOwnedPhase::FfnFront, false, || {
                     if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
                     e.ffn_on(1, w1, layer1, e.cfg.dense_intermediate, self.cap(), w1.delta.buffer.ptr, rows)
                 })?;
                 e.publish_projection(1, index, self.lane, w1, layer1, "down", rows_count)?;
-                self.segment(0, index, GlmOwnedPhase::FfnFront, || {
+                self.segment(0, index, GlmOwnedPhase::FfnFront, join0.is_some(), || {
                     if let Some(prev) = join0 {
                         self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
                         self.tap_drafter_local(prev)?;
@@ -509,7 +515,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                 return Ok(Ticket::Complete);
             }
             // Spark / Skip MoE in graphed decode mode:
-            self.segment(1, index, GlmOwnedPhase::FfnFront, || {
+            self.segment(1, index, GlmOwnedPhase::FfnFront, false, || {
                 if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
                 e.shared_on_local(1, index, w1, layer1, rows, self.cap())
             })?;
@@ -521,7 +527,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             if let Some(l2) = &e.peer()?.l2 {
                 e.on(1, || l2.issue(e.library, index, e.stream_of(1)))?;
             }
-            self.segment(0, index, GlmOwnedPhase::FfnFront, || {
+            self.segment(0, index, GlmOwnedPhase::FfnFront, join0.is_some(), || {
                 if let Some(prev) = join0 {
                     self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
                     self.tap_drafter_local(prev)?;

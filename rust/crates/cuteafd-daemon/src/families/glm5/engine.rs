@@ -1592,7 +1592,7 @@ impl<'a> GlmEngine<'a> {
                 name: "glm5.decode_local", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank],
                 basis: Basis::Bytes,
-                spans_devices: super::graph_sites::spans("glm5.decode_local", self.ranks() > 1),
+                spans_devices: super::graph_sites::spans("glm5.decode_local", false),
             })?;
             let policy = inventory.reserve_policy(rank)?;
             crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
@@ -1990,6 +1990,9 @@ impl<'a> GlmEngine<'a> {
     /// `GraphBank::cache_miss` / `replay_on`), and every failed capture cancels its ticket.
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.require_live()?;
+        if self.force_route_check.get() || self.tp2.as_ref().is_some_and(|pair| pair.checking()) {
+            return segment();
+        }
         let graphs = match (rank, &self.peer) {
             (1, Some(peer)) => &peer.graphs,
             _ => &self.graphs,
