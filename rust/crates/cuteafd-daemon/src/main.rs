@@ -467,9 +467,9 @@ async fn run() -> Result<()> {
     };
     // Spanning graph sites always prewarm, so `off` is safe on every layout (#2303).
     let no_prewarm = initial_graph_policy.0 || family_graph_policy.0;
-    // Flash's exact-row working set is qualified with the fixed lag-8 donor policy.
+    // Qualify pressure-only donor reuse at Flash's existing exact-row reserve.
     let (donor_always, donor_cold_lag) = if matches!(&command, Commands::ServeGlmf(_) | Commands::GlmfGolden(_)) {
-        (true, 8)
+        (false, 0)
     } else {
         (initial_graph_policy.1 || family_graph_policy.1, initial_graph_policy.2.max(family_graph_policy.2))
     };
