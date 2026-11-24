@@ -25,31 +25,40 @@ impl GlmPrewarmFamily {
     }
 }
 
-/// C1 exact-row working-set inputs for GLM 5.3 / Mistral Large 4.
+/// Measured short + 32K C1 exact-row working-set inputs for GLM 5.3 / Mistral Large 4.
 ///
-/// Provisional inputs before the hardware W1 census on GLM 5.3 MC K8 min/max
-/// and ML4 max; replaced with measured `(w1, step_growth, capture_growth)` before
-/// final cards. Soft and hard caps are derived by `graph_reserve::resolve_working_set`.
+/// Shipping-config C1 census (donor-off, no-prewarm, normalized non-indexer keys,
+/// `MIN_PAGE_STRIDE=64`, head `1c58d8fce0`, `GRAPH_TRACE` at 1536 MiB ceiling):
+/// - GLM 5.3 1x RTX min (`k8-compact`, `heads`, DFlash2 whole): W1 174 MiB,
+///   step 24 MiB, capture 4 MiB -> soft 270 / hard 278 MiB.
+/// - GLM 5.3 2x RTX max (`k8-compact`, `context`, DFlash2 remote): W1 350/354 MiB,
+///   step 38/40 MiB, capture 4/4 MiB -> soft 446/450 / hard 454/458 MiB.
+/// - Mistral Large 4 2x RTX max (`original`, `context`, dSpark remote): W1 292/290 MiB,
+///   step 34/36 MiB, capture 4/4 MiB -> soft 388/386 / hard 396/394 MiB.
+/// - Mistral Large 4 1x RTX (non-shipping; scaled from GLM 5.3 1x by 88/78 layers):
+///   W1 196 MiB, step 28 MiB, capture 4 MiB -> soft 292 / hard 300 MiB.
+///
+/// Soft and hard caps are derived by `graph_reserve::resolve_working_set`.
 pub fn glm_working_set(family: GlmPrewarmFamily, ranks: usize, rank: usize) -> WorkingSet {
     let idx = rank.min(1);
     let (w1_mib, step_growth, capture_growth_mib) = match (family, ranks) {
-        // Provisional before W1 census (GLM 5.3: 78 layers; ML4: 88 layers).
-        (GlmPrewarmFamily::Glm5, 0 | 1) => (160, 14 << 20, 4),
-        (GlmPrewarmFamily::Glm5, _) => [(256, 18 << 20, 4), (256, 18 << 20, 4)][idx],
-        (GlmPrewarmFamily::MistralLarge4, 0 | 1) => (256, 18 << 20, 4),
-        (GlmPrewarmFamily::MistralLarge4, _) => [(320, 20 << 20, 4), (320, 20 << 20, 4)][idx],
+        (GlmPrewarmFamily::Glm5, 0 | 1) => (174, 24 << 20, 4),
+        (GlmPrewarmFamily::Glm5, _) => [(350, 38 << 20, 4), (354, 40 << 20, 4)][idx],
+        (GlmPrewarmFamily::MistralLarge4, 0 | 1) => (196, 28 << 20, 4),
+        (GlmPrewarmFamily::MistralLarge4, _) => [(292, 34 << 20, 4), (290, 36 << 20, 4)][idx],
     };
     WorkingSet { w1: w1_mib << 20, step_growth, capture_growth: capture_growth_mib << 20 }
 }
 
-/// Initial per-executable byte estimate before the device controller observes live captures.
+/// Initial per-executable byte estimate before the device controller observes live captures
+/// (seeded from measured C1 census per-graph averages).
 pub fn glm_bootstrap_bytes(family: GlmPrewarmFamily, ranks: usize, rank: usize) -> u64 {
     let idx = rank.min(1);
     match (family, ranks) {
-        (GlmPrewarmFamily::Glm5, 0 | 1) => 176_000,
-        (GlmPrewarmFamily::Glm5, _) => [160_000, 156_000][idx],
-        (GlmPrewarmFamily::MistralLarge4, 0 | 1) => 188_000,
-        (GlmPrewarmFamily::MistralLarge4, _) => [172_000, 168_000][idx],
+        (GlmPrewarmFamily::Glm5, 0 | 1) => 193_000,
+        (GlmPrewarmFamily::Glm5, _) => [136_000, 138_000][idx],
+        (GlmPrewarmFamily::MistralLarge4, 0 | 1) => 196_000,
+        (GlmPrewarmFamily::MistralLarge4, _) => [127_000, 126_000][idx],
     }
 }
 
@@ -129,6 +138,25 @@ mod tests {
                     assert!(glm_bootstrap_bytes(family, ranks, rank) > 0);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn working_set_inputs_derive_expected_soft_and_hard_caps() {
+        use crate::placement::graph_reserve::resolve_working_set;
+        for (family, ranks, rank, soft_mib, hard_mib) in [
+            (GlmPrewarmFamily::Glm5, 1, 0, 270, 278),
+            (GlmPrewarmFamily::Glm5, 2, 0, 446, 454),
+            (GlmPrewarmFamily::Glm5, 2, 1, 450, 458),
+            (GlmPrewarmFamily::MistralLarge4, 1, 0, 292, 300),
+            (GlmPrewarmFamily::MistralLarge4, 2, 0, 388, 396),
+            (GlmPrewarmFamily::MistralLarge4, 2, 1, 386, 394),
+        ] {
+            let measured = glm_working_set(family, ranks, rank);
+            let policy = resolve_working_set(None, None, None, rank, measured).unwrap();
+            assert_eq!((policy.base_bytes, policy.bytes), (soft_mib << 20, hard_mib << 20),
+                "{family:?} ranks={ranks} rank={rank}");
+            assert_eq!(policy.growth_headroom, Some(8 << 20));
         }
     }
 
