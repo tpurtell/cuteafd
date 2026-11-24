@@ -39,6 +39,35 @@ pub fn mla_split_scratch_bytes(decode_rows: usize, head_parts: usize) -> usize {
     decode_rows * 16 * (64 / head_parts) * (512 * 2 + 4)
 }
 
+/// Scratch bytes required by `hy4f2_mla_dsa_partial_{bf16,fp8}_h{0,16}` (chunked at 64 rows,
+/// 16 heads, 16 splits; mirrors `hy4_dsa_partial_scratch_bytes` in `hy4_mla.py`).
+pub fn hy4_dsa_partial_scratch_bytes(rows: usize) -> usize {
+    let chunk = rows.clamp(1, 64);
+    let n = chunk * 16 * 16;
+    let part = (n * 512 * 2).div_ceil(1024) * 1024;
+    let lse = (n * 4).div_ceil(1024) * 1024;
+    part + lse
+}
+
+/// Shared `ContextExchange` buffer specification for Hy4-flash 2-GPU ContextSplit DSA layers
+/// (16 heads/GPU, 576-dim absorbed query, 512 scored group candidates, 2 alternating slots).
+pub fn hy4_context_buffers(cfg: &Hy4FlashConfig, decode_rows: usize) -> crate::placement::ContextBuffers {
+    let half_heads = (cfg.sparse_heads / 2) as u64;
+    let kv_a_dim = (cfg.kv_lora_rank + cfg.qk_rope_dim) as u64;
+    let group_topk = cfg.indexer_group_topk as u64;
+    crate::placement::ContextBuffers {
+        staging_unit_bytes: 0,
+        staging_unit_rows: 1,
+        query_row_bytes: half_heads * kv_a_dim * 2,
+        partial_row_bytes: half_heads * (cfg.kv_lora_rank as u64 * 2 + 4),
+        candidate_row_bytes: group_topk * 8,
+        compiled_extent: 0,
+        decode_rows: decode_rows as u64,
+        lanes: 1,
+        workspace_bytes: 0,
+    }
+}
+
 /// Compressed indexer group-cache record bytes: 128 E4M3 dims + 4B F32 scale.
 pub const INDEX_GROUP_RECORD_BYTES: usize = 132;
 /// Maximum rows projected through `lm_head` in one tile.
@@ -157,11 +186,20 @@ pub const WAVE_METADATA: [&str; 12] = [
 ];
 
 pub fn wave_metadata_layout(slot: usize, wave: &WeightArenaLayout) -> Result<WeightArenaLayout> {
+    wave_metadata_layout_for_rank(0, slot, wave)
+}
+
+pub fn wave_metadata_layout_for_rank(rank: usize, slot: usize, wave: &WeightArenaLayout) -> Result<WeightArenaLayout> {
     let views = WAVE_METADATA.iter().map(|&name| {
         let bytes = wave.view(name).with_context(|| format!("Hy4 metadata view {name} missing"))?.bytes();
         Ok((name.to_owned(), bytes))
     }).collect::<Result<Vec<_>>>()?;
-    WeightArenaLayout::new(format!("hy4_flash.wave.host_metadata.{slot}"), views)
+    let id = if rank == 0 {
+        format!("hy4_flash.wave.host_metadata.{slot}")
+    } else {
+        format!("hy4_flash.wave.host_metadata.{rank}.{slot}")
+    };
+    WeightArenaLayout::new(id, views)
 }
 
 /// One packed scratch arena per coordinator GPU per in-flight prefill wave slot.
@@ -250,8 +288,34 @@ impl SharedScratchLayout {
         max_sequences: usize,
         local_vocab: usize,
     ) -> Result<Self> {
+        Self::new_with_context(
+            cfg,
+            rank,
+            tp,
+            max_rows,
+            decode_rows,
+            max_seq_pages,
+            max_sequences,
+            local_vocab,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_context(
+        cfg: &Hy4FlashConfig,
+        rank: usize,
+        tp: usize,
+        max_rows: usize,
+        decode_rows: usize,
+        max_seq_pages: usize,
+        max_sequences: usize,
+        local_vocab: usize,
+        context_split: bool,
+    ) -> Result<Self> {
         ensure!(
-            matches!(tp, 1 | 2) && rank < tp && max_rows > 0 && decode_rows > 0 && max_sequences > 0,
+            matches!(tp, 1 | 2) && rank < tp && max_rows > 0 && decode_rows > 0 && max_sequences > 0
+                && (!context_split || tp == 2),
             "invalid Hy4-flash SharedScratchLayout shape"
         );
         let h = cfg.hidden;
@@ -293,7 +357,13 @@ impl SharedScratchLayout {
             ("attn_out".into(), (max_rows * max_heads * cfg.kv_lora_rank * 2).max(256)),
             ("lse_out".into(), (max_rows * max_heads * 4).max(256)),
             ("uv_out".into(), (max_rows * max_heads * cfg.v_head_dim * 2).max(256)),
-            ("attn_scratch".into(), mla_split_scratch_bytes(decode_rows, tp).max(ATTN_SCRATCH_BYTES).max(256)),
+            (
+                "attn_scratch".into(),
+                mla_split_scratch_bytes(decode_rows, tp)
+                    .max(if context_split { hy4_dsa_partial_scratch_bytes(decode_rows) } else { 0 })
+                    .max(ATTN_SCRATCH_BYTES)
+                    .max(256),
+            ),
             ("idx_q_raw".into(), (max_rows * idx_h * idx_d * 2).max(256)),
             ("idx_q_rot".into(), (max_rows * idx_h * idx_d * 2).max(256)),
             ("idx_w_raw".into(), (max_rows * idx_h * 2).max(256)),
@@ -320,6 +390,16 @@ impl SharedScratchLayout {
                 if tp == 2 { (HEAD_TILE_ROWS * local_vocab * 4).max(256) } else { 256 },
             ),
         ];
+        if context_split {
+            let half_dsa_heads = cfg.sparse_heads / 2;
+            views.push(("ctx_cand_scores".into(), (decode_rows * cfg.indexer_group_topk * 4).max(256)));
+            views.push(("ctx_cand_indices".into(), (decode_rows * cfg.indexer_group_topk * 4).max(256)));
+            views.push(("ctx_partial_own".into(), (decode_rows * half_dsa_heads * cfg.kv_lora_rank * 2).max(256)));
+            views.push(("ctx_lse_own".into(), (decode_rows * half_dsa_heads * 4).max(256)));
+            views.push(("ctx_partial_peer".into(), (decode_rows * half_dsa_heads * cfg.kv_lora_rank * 2).max(256)));
+            views.push(("ctx_lse_peer".into(), (decode_rows * half_dsa_heads * 4).max(256)));
+            views.push(("ctx_draft_slots".into(), (decode_rows * cfg.indexer_candidate_topk * 4).max(256)));
+        }
         if rank == 0 {
             views.push(("head_logits_f32".into(), (HEAD_TILE_ROWS * cfg.vocab_size * 4).max(256)));
         }
@@ -523,6 +603,53 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn context_split_scratch_and_exchange_layout_match_bounds() -> Result<()> {
+        let cfg = test_cfg();
+        let decode_rows = 64usize;
+        let partial_req = hy4_dsa_partial_scratch_bytes(decode_rows);
+        assert!(partial_req > 0);
+        assert_eq!(hy4_dsa_partial_scratch_bytes(4096), 16_842_752);
+
+        for rank in 0..2 {
+            let shared = SharedScratchLayout::new_with_context(
+                &cfg,
+                rank,
+                2,
+                2752,
+                decode_rows,
+                64,
+                16,
+                cfg.vocab_size / 2,
+                true,
+            )?;
+            for view_name in [
+                "ctx_cand_scores",
+                "ctx_cand_indices",
+                "ctx_partial_own",
+                "ctx_lse_own",
+                "ctx_partial_peer",
+                "ctx_lse_peer",
+                "ctx_draft_slots",
+            ] {
+                assert!(shared.arena.view(view_name).is_some(), "missing {view_name} view");
+            }
+            let attn_bytes = shared.arena.view("attn_scratch").unwrap().bytes();
+            assert!(
+                attn_bytes >= partial_req,
+                "ContextSplit attn_scratch {attn_bytes} < hy4_dsa_partial_scratch_bytes({decode_rows}) = {partial_req}"
+            );
+        }
+
+        let ex = hy4_context_buffers(&cfg, decode_rows);
+        let ex_bytes = crate::placement::ContextExchangeLayout::new(&ex)
+            .bytes()
+            .expect("ContextExchangeLayout bytes");
+        // Chunked at decode_rows=64: ~7.5 MiB per GPU (well under 16 MiB).
+        assert!(ex_bytes > 4 << 20 && ex_bytes < 16 << 20, "unexpected ex_bytes={ex_bytes}");
         Ok(())
     }
 }

@@ -7,6 +7,7 @@ use cuteafd_loader::families::hy4_flash::Hy4KvCache;
 #[derive(Clone, Copy)]
 pub(super) struct MlaSplitPlan {
     pub dsa: i32,
+    pub dsa_partial: i32,
     pub swa: i32,
 }
 
@@ -38,11 +39,51 @@ impl MlaSplitPlan {
             // would break exact verify and invalidate row-only graph keys.
             Ok(mla_wave_balanced_splits(chunks, heads / 8, sms, max_splits) as i32)
         };
+        let dsa_partial = if let Some(ctx) = &programs.context {
+            let spec = ctx.dsa_partial_h0.spec();
+            let max_splits = usize::try_from(
+                spec.geometry["num_splits"]
+                    .as_u64()
+                    .with_context(|| format!("{} lacks MLA geometry num_splits", spec.name))?,
+            )?;
+            let head_count = usize::try_from(
+                spec.geometry["head_count"]
+                    .as_u64()
+                    .with_context(|| format!("{} lacks MLA geometry head_count", spec.name))?,
+            )?;
+            let heads_per_tile = usize::try_from(
+                spec.geometry["heads_per_tile"]
+                    .as_u64()
+                    .unwrap_or(8),
+            )?;
+            ensure!(
+                rows <= spec.capacity_rows as usize && head_count == 16 && (2..=16).contains(&max_splits),
+                "{} has incompatible ContextSplit DSA partial geometry for {rows} rows",
+                spec.name
+            );
+            // Each parity shard owns half of the 2048 selected tokens (up to 1024 -> 16 chunks of 64).
+            // DenseMlaForwardKernel only writes base-2 partial_lse when active_splits >= 2.
+            let chunks = context.min(2048).div_ceil(2).max(1).div_ceil(64);
+            mla_wave_balanced_splits(chunks, head_count / heads_per_tile.max(1), sms, max_splits).max(2) as i32
+        } else {
+            2
+        };
         Ok(Self {
             dsa: choose(&programs.mla_dsa_decode, false)?,
+            dsa_partial,
             swa: choose(&programs.mla_swa_decode, true)?,
         })
     }
+}
+
+/// Optional 2-GPU ContextSplit DSA AOT programs (loaded when `ATTENTION_PLACEMENT=context`).
+pub(crate) struct Hy4ContextPrograms<'a> {
+    pub(crate) dsa_partial_h0: Program<'a>,
+    pub(crate) dsa_partial_h16: Program<'a>,
+    pub(crate) lse_combine2: Program<'a>,
+    pub(crate) mla_gate_uv_dsa: Program<'a>,
+    pub(crate) indexer_scored_topk: Program<'a>,
+    pub(crate) indexer_merge_expand_owned: Program<'a>,
 }
 
 /// Resolved, ABI-validated Hy4-flash coordinator AOT programs for one GPU rank.
@@ -99,6 +140,8 @@ pub(crate) struct Hy4Programs<'a> {
     pub(crate) proj_dense_down: Program<'a>,
     pub(crate) proj_shared_gate_up: Program<'a>,
     pub(crate) proj_shared_down: Program<'a>,
+    // 2-GPU ContextSplit DSA programs (loaded when context_split == true)
+    pub(crate) context: Option<Hy4ContextPrograms<'a>>,
 }
 
 impl<'a> Hy4Programs<'a> {
@@ -106,8 +149,10 @@ impl<'a> Hy4Programs<'a> {
         programs: &'a Programs<'a>,
         tp: usize,
         kv_format: Hy4KvCache,
+        context_split: bool,
     ) -> Result<Self> {
         ensure!(matches!(tp, 1 | 2), "Hy4-flash programs support TP1 or TP2, got {tp}");
+        ensure!(!context_split || tp == 2, "Hy4-flash ContextSplit programs require TP2");
         let prefix = if tp == 1 { "hy4f" } else { "hy4f2" };
         let kv = match kv_format {
             Hy4KvCache::Bf16 => "bf16",
@@ -215,6 +260,34 @@ impl<'a> Hy4Programs<'a> {
             proj_dense_down: load("dense_down", proj_ptrs)?,
             proj_shared_gate_up: load("shared_gate_up", proj_ptrs)?,
             proj_shared_down: load("shared_down", proj_ptrs)?,
+            context: if context_split {
+                let partial_ptrs = &[
+                    "query",
+                    "kv_cache",
+                    "page_table",
+                    "cache_seqlens",
+                    "cu_seqlens_q",
+                    "attn",
+                    "lse",
+                    "scratch",
+                ];
+                Some(Hy4ContextPrograms {
+                    dsa_partial_h0: load(&format!("mla_dsa_partial_{kv}_h0"), partial_ptrs)?,
+                    dsa_partial_h16: load(&format!("mla_dsa_partial_{kv}_h16"), partial_ptrs)?,
+                    lse_combine2: load("lse_combine2", &["o0", "l0", "o1", "l1", "sink", "out"])?,
+                    mla_gate_uv_dsa: load("mla_gate_uv_dsa", &["attn", "w_uv", "gate", "out"])?,
+                    indexer_scored_topk: load(
+                        "indexer_scored_topk",
+                        &["scores", "positions", "local_limits", "out_scores", "out_indices"],
+                    )?,
+                    indexer_merge_expand_owned: load(
+                        "indexer_merge_expand_owned",
+                        &["scores", "indices", "positions", "page_table", "local_slots", "local_lengths", "draft_slots"],
+                    )?,
+                })
+            } else {
+                None
+            },
         })
     }
 }

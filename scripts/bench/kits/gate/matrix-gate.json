@@ -560,8 +560,7 @@
         "ADDR": "0.0.0.0:8766",
         "EXPERT_PORT": "19866",
         "EXPERT_BACKEND": "local",
-        "SPARK_COUNT": "0",
-        "ATTENTION_PLACEMENT": "heads"
+        "SPARK_COUNT": "0"
       }
     },
     {

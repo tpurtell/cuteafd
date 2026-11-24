@@ -176,6 +176,18 @@ pub fn workspace(
     verify_rows: usize,
     attention_scratch: usize,
 ) -> Result<WeightArenaLayout> {
+    workspace_with_context(cfg, text, kv, slots, verify_rows, attention_scratch, false)
+}
+
+pub fn workspace_with_context(
+    cfg: &Hy4DflyConfig,
+    text: &Hy4FlashConfig,
+    kv: super::Hy4KvCache,
+    slots: usize,
+    verify_rows: usize,
+    attention_scratch: usize,
+    context_split: bool,
+) -> Result<WeightArenaLayout> {
     ensure!(
         (1..=MAX_BATCH).contains(&slots),
         "DFly2 draft batch exceeds installed capacity"
@@ -187,7 +199,7 @@ pub fn workspace(
     let k = cfg.target_index_topk;
     let record = kv.record_bytes();
     let recall = cfg.layers * k * 4;
-    let planes = [
+    let mut planes = vec![
         ("ids", r * 4),
         ("positions", r * 8),
         ("write_slots", r * 8),
@@ -226,9 +238,13 @@ pub fn workspace(
         ("verify_hidden", verify_rows * h * 2),
         ("verify_recall", verify_rows * recall),
     ];
+    if context_split {
+        planes.push(("tap_recall_peer", slots * recall));
+        planes.push(("verify_recall_peer", verify_rows * recall));
+    }
     WeightArenaLayout::new(
         "hy4_flash/dfly2/workspace",
-        planes.map(|(name, bytes)| (name.into(), bytes)),
+        planes.into_iter().map(|(name, bytes)| (name.into(), bytes)),
     )
 }
 
@@ -270,8 +286,22 @@ impl Admission {
         slots: usize,
         rows: usize,
     ) -> Result<Self> {
+        Self::new_with_context(checkpoint, text, cfg, core, kv, slots, rows, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_context(
+        checkpoint: &Checkpoint,
+        text: &Hy4FlashConfig,
+        cfg: &Hy4DflyConfig,
+        core: &BTreeMap<String, CoreProjection>,
+        kv: super::Hy4KvCache,
+        slots: usize,
+        rows: usize,
+        context_split: bool,
+    ) -> Result<Self> {
         let weights = DraftWeights::plan(checkpoint, text, cfg, core)?;
-        let workspace = workspace(cfg, text, kv, slots, rows, ATTENTION_SCRATCH * slots)?;
+        let workspace = workspace_with_context(cfg, text, kv, slots, rows, ATTENTION_SCRATCH * slots, context_split)?;
         let trellis_bytes = weights
             .trellis_scratch(cfg.block_rows() * slots)?
             .map(|s| s.packed_bytes())

@@ -338,7 +338,8 @@ impl<'a> Hy4CacheRank<'a> {
     }
 
     /// Read back every committed causal state byte for `placement` on this rank for exact-restore verification.
-    pub(crate) fn dump_state(&self, placement: &Hy4Placement) -> Result<Hy4RankStateSnapshot> {
+    /// Under ContextSplit (`parity_rank = Some(rank)`), reads back only logical pages owned by `rank`.
+    pub(crate) fn dump_state(&self, placement: &Hy4Placement, parity_rank: Option<usize>) -> Result<Hy4RankStateSnapshot> {
         self.drain()?;
         for reader in &self.readers {
             reader.drain()?;
@@ -347,8 +348,16 @@ impl<'a> Hy4CacheRank<'a> {
         let len = placement.len;
         let idx_group_bytes = self.layout.dsa_index_page_bytes / (PAGE_ROWS / 4);
 
-        let mut dsa_kv = vec![0u8; self.dsa_layers * len * rec];
-        let mut dsa_index = vec![0u8; self.dsa_layers * (len / 4) * idx_group_bytes];
+        let owned_rows = match parity_rank {
+            Some(rank) => crate::shared::peer_split::context::shard_rows(len, PAGE_ROWS, rank),
+            None => len,
+        };
+        let owned_groups = match parity_rank {
+            Some(rank) => crate::shared::peer_split::context::shard_rows(len / 4, PAGE_ROWS / 4, rank),
+            None => len / 4,
+        };
+        let mut dsa_kv = vec![0u8; self.dsa_layers * owned_rows * rec];
+        let mut dsa_index = vec![0u8; self.dsa_layers * owned_groups * idx_group_bytes];
         let pending_n = len % 4;
         let pending_tok_bytes = pending_n * 128 * 2;
         let mut pending_keys = vec![0u8; self.dsa_layers * pending_tok_bytes];
@@ -359,21 +368,34 @@ impl<'a> Hy4CacheRank<'a> {
         self.device.run(|| {
             for d in 0..self.dsa_layers {
                 let mut row_cursor = 0usize;
+                let mut out_row_cursor = 0usize;
+                let mut out_group_cursor = 0usize;
                 let mut page_idx = 0usize;
                 while row_cursor < len {
                     let take = (len - row_cursor).min(PAGE_ROWS);
-                    let phys = placement.units[page_idx] as usize;
-                    let kv_buf = slice_buf(self.dsa_kv_page(d, phys)?, 0, take * rec)?;
-                    let dst_off = (d * len + row_cursor) * rec;
-                    self.device.library.copy_d2h(&mut dsa_kv[dst_off..dst_off + take * rec], kv_buf)?;
                     let take_groups = take / 4;
-                    if take_groups > 0 {
-                        let idx_buf = slice_buf(self.dsa_index_page(d, phys)?, 0, take_groups * idx_group_bytes)?;
-                        let g_off = (d * (len / 4) + row_cursor / 4) * idx_group_bytes;
-                        self.device.library.copy_d2h(
-                            &mut dsa_index[g_off..g_off + take_groups * idx_group_bytes],
-                            idx_buf,
-                        )?;
+                    let include = parity_rank.is_none_or(|rank| crate::shared::peer_split::context::page_owner(page_idx) == rank);
+                    if include {
+                        let raw_id = placement.units[page_idx] as usize;
+                        let phys = if let Some(rank) = parity_rank {
+                            ensure!(raw_id & 1 == rank, "parity dump_state page {page_idx} id {raw_id} != rank {rank}");
+                            raw_id >> 1
+                        } else {
+                            raw_id
+                        };
+                        let kv_buf = slice_buf(self.dsa_kv_page(d, phys)?, 0, take * rec)?;
+                        let dst_off = (d * owned_rows + out_row_cursor) * rec;
+                        self.device.library.copy_d2h(&mut dsa_kv[dst_off..dst_off + take * rec], kv_buf)?;
+                        if take_groups > 0 {
+                            let idx_buf = slice_buf(self.dsa_index_page(d, phys)?, 0, take_groups * idx_group_bytes)?;
+                            let g_off = (d * owned_groups + out_group_cursor) * idx_group_bytes;
+                            self.device.library.copy_d2h(
+                                &mut dsa_index[g_off..g_off + take_groups * idx_group_bytes],
+                                idx_buf,
+                            )?;
+                        }
+                        out_row_cursor += take;
+                        out_group_cursor += take_groups;
                     }
                     row_cursor += take;
                     page_idx += 1;
@@ -520,16 +542,28 @@ impl crate::shared::qwen::scheduler::Placement for Hy4Placement {
 }
 
 /// Exact prefix-cache adapter across 1 or 2 Hy4-flash coordinator ranks.
+/// When `parity` is true (2-GPU ContextSplit), logical page `j` lives on GPU `j & 1`
+/// at local physical page `id >> 1` using `RefPagePool::parity(2 * local_pages, 64, 0)`.
 #[derive(Clone)]
 pub(crate) struct Hy4Prefix<'a> {
     ranks: Vec<Rc<Hy4CacheRank<'a>>>,
     pad_id: u32,
+    parity: bool,
 }
 
 impl<'a> Hy4Prefix<'a> {
-    pub(crate) fn new(ranks: Vec<Rc<Hy4CacheRank<'a>>>, pad_id: u32) -> Result<Self> {
+    pub(crate) fn new(ranks: Vec<Rc<Hy4CacheRank<'a>>>, pad_id: u32, parity: bool) -> Result<Self> {
         ensure!(!ranks.is_empty(), "Hy4Prefix requires at least one rank");
-        Ok(Self { ranks, pad_id })
+        ensure!(!parity || ranks.len() == 2, "Hy4Prefix parity pool requires two coordinator ranks");
+        if parity {
+            ensure!(
+                ranks[0].pages == ranks[1].pages,
+                "Hy4Prefix parity ranks must have equal local page capacities ({} != {})",
+                ranks[0].pages,
+                ranks[1].pages
+            );
+        }
+        Ok(Self { ranks, pad_id, parity })
     }
 
     pub(crate) fn snapshot_owners(&self) -> Vec<Rc<dyn SnapshotOwner + 'a>> {
@@ -542,11 +576,25 @@ impl<'a> Hy4Prefix<'a> {
     fn validate(&self, placement: &Hy4Placement, len: usize) -> Result<()> {
         let r0 = &self.ranks[0];
         ensure!(
-            placement.slot < r0.sequences
-                && len.div_ceil(PAGE_ROWS) <= placement.units.len()
-                && placement.units.iter().all(|&p| (p as usize) < r0.pages),
+            placement.slot < r0.sequences && len.div_ceil(PAGE_ROWS) <= placement.units.len(),
             "Hy4-flash prefix placement outside admitted state/pages"
         );
+        if self.parity {
+            for (j, &id) in placement.units.iter().enumerate() {
+                let owner = crate::shared::peer_split::context::page_owner(j);
+                let local = (id as usize) >> 1;
+                ensure!(
+                    (id as usize) & 1 == owner && local < self.ranks[owner].pages,
+                    "Hy4-flash parity page {j} id {id} outside owner {owner} pool {}",
+                    self.ranks[owner].pages
+                );
+            }
+        } else {
+            ensure!(
+                placement.units.iter().all(|&p| (p as usize) < r0.pages),
+                "Hy4-flash prefix placement outside admitted pages"
+            );
+        }
         ensure!(
             placement.units.iter().copied().collect::<BTreeSet<_>>().len() == placement.units.len(),
             "Hy4-flash prefix placement aliases physical pages"
@@ -566,16 +614,20 @@ impl cuteafd_engine::prefix::PrefixFamily for Hy4Prefix<'_> {
     }
 
     fn layout(&self) -> cuteafd_engine::prefix::FamilyLayout {
-        use cuteafd_engine::prefix::{FamilyLayout, MarkStore, ReuseRule};
+        use cuteafd_engine::prefix::{FamilyLayout, MarkStore, PageOwners, ReuseRule};
         FamilyLayout {
             page_rows: PAGE_ROWS,
-            pages: self.ranks[0].pages,
-            page_bytes: self.ranks.iter().map(|r| r.page_bytes_total()).sum(),
+            pages: if self.parity { self.ranks[0].pages * 2 } else { self.ranks[0].pages },
+            page_bytes: if self.parity {
+                self.ranks[0].page_bytes_total()
+            } else {
+                self.ranks.iter().map(|r| r.page_bytes_total()).sum()
+            },
             mark_bytes: self.ranks.iter().map(|r| r.mark_bytes_per_slot).sum(),
             draft_bytes: 0,
             rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena,
-            page_owners: Default::default(),
+            page_owners: if self.parity { PageOwners::Parity } else { PageOwners::Uniform },
         }
     }
 
@@ -647,6 +699,17 @@ impl cuteafd_engine::prefix::PrefixFamily for Hy4Prefix<'_> {
     }
 
     fn copy_rows(&self, copy: cuteafd_engine::prefix::TailCopy) -> Result<(), cuteafd_engine::prefix::BoxError> {
+        if self.parity {
+            let Some(owner) = copy.owner else {
+                return Err("Hy4-flash parity tail copy missing owner rank".into());
+            };
+            let rank = usize::from(owner);
+            if rank >= self.ranks.len() || (copy.from as usize & 1) != rank || (copy.to as usize & 1) != rank {
+                return Err(format!("Hy4-flash parity tail copy {copy:?} crosses GPUs").into());
+            }
+            self.ranks[rank].copy_page_rows((copy.from >> 1) as usize, (copy.to >> 1) as usize, copy.rows)?;
+            return Ok(());
+        }
         if copy.owner.is_some() {
             return Err("Hy4-flash whole-rank pages have no parity owner".into());
         }
@@ -663,8 +726,26 @@ impl cuteafd_engine::prefix::PrefixFamily for Hy4Prefix<'_> {
         Ok(())
     }
 
+    fn page_device(&self, page: u32) -> Option<u8> {
+        self.parity.then_some((page & 1) as u8)
+    }
+
     fn page_segments(&self, page: u32) -> Vec<cuteafd_hostcache::copy::DeviceRange> {
         let mut out = Vec::new();
+        if self.parity {
+            let owner = (page & 1) as usize;
+            let local = (page >> 1) as usize;
+            let rank = &self.ranks[owner];
+            for d in 0..rank.dsa_layers {
+                if let Ok(b) = rank.dsa_kv_page(d, local) {
+                    out.push(crate::shared::prefix::cuda_copy::range(b));
+                }
+                if let Ok(b) = rank.dsa_index_page(d, local) {
+                    out.push(crate::shared::prefix::cuda_copy::range(b));
+                }
+            }
+            return out;
+        }
         for rank in &self.ranks {
             for d in 0..rank.dsa_layers {
                 if let Ok(b) = rank.dsa_kv_page(d, page as usize) {
@@ -756,7 +837,7 @@ mod tests {
         };
         let rank = Rc::new(Hy4CacheRank::new(vec![reader], &cfg, Hy4KvCache::Fp8, 32, 2, 64, 3)?);
         assert_eq!(rank.mark_bytes_per_slot, rank.layout.mark_bytes_per_slot);
-        let family = Hy4Prefix::new(vec![rank.clone()], cfg.engram_pad_id)?;
+        let family = Hy4Prefix::new(vec![rank.clone()], cfg.engram_pad_id, false)?;
         let mut cache: PrefixCache<CudaCopyEngine<'_>> = PrefixCache::new(
             family.layout(),
             PrefixConfig { entries: 3, mark_slots: 3, keep_logits: true, min_tokens: 1 },
@@ -833,8 +914,8 @@ mod tests {
         let mut wrap_restored_p = wrap_restored.placement.clone();
         wrap_src.set_engram_tail_from_prefix(&wrap_tokens, cfg.engram_pad_id);
         wrap_restored_p.set_engram_tail_from_prefix(&wrap_tokens, cfg.engram_pad_id);
-        let snap_src = rank.dump_state(&wrap_src)?;
-        let snap_dst = rank.dump_state(&wrap_restored_p)?;
+        let snap_src = rank.dump_state(&wrap_src, None)?;
+        let snap_dst = rank.dump_state(&wrap_restored_p, None)?;
         assert!(snap_src.diff(&snap_dst).is_empty(), "diffs: {:?}", snap_src.diff(&snap_dst));
         let mut flipped = snap_dst.clone();
         flipped.swa_visible[0] ^= 1;
@@ -846,6 +927,148 @@ mod tests {
         flipped_e.engram_tail[0] ^= 1;
         assert!(snap_src.diff(&flipped_e).iter().any(|d| d.starts_with("engram_tail:")));
         cache.release(&family, &wrap_restored.placement.units)?;
+        Ok(())
+    }
+
+    #[test]
+    fn hy4_parity_prefix_cache_exact_restore_and_cow_tail() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.immediate_copies(&library)?;
+        let dev0 = Device { library: &library, id: 0 };
+        let dev1 = Device { library: &library, id: 1 };
+        let r0_stream = Rc::new(Stream::new(dev0)?);
+        let r1_stream = Rc::new(Stream::new(dev1)?);
+        let cfg = Hy4FlashConfig {
+            vocab_size: 120_832,
+            hidden: 3072,
+            layers: 2,
+            intermediate: 13_824,
+            max_position: 262_144,
+            rms_norm_eps: 1e-5,
+            hc_mult: 4,
+            hc_eps: 1e-6,
+            hc_magnitude: 2.0,
+            q_lora_rank: 1024,
+            kv_lora_rank: 512,
+            qk_nope_dim: 192,
+            qk_rope_dim: 64,
+            v_head_dim: 256,
+            sparse_heads: 32,
+            swa_heads: 64,
+            swa_qk_nope_dim: 192,
+            swa_qk_rope_dim: 64,
+            swa_v_head_dim: 256,
+            sliding_window: 512,
+            sparse_rope_theta: 10_000.0,
+            swa_rope_theta: 10_000.0,
+            sparse_layer: vec![true, false],
+            indexer_heads: 16,
+            indexer_head_dim: 128,
+            indexer_compress_ratio: 4,
+            indexer_group_topk: 512,
+            indexer_candidate_topk: 2048,
+            dense_layer: vec![true, false],
+            experts: 512,
+            topk: 16,
+            moe_intermediate: 1536,
+            routed_expert_hidden: 1536,
+            shared_experts: 1,
+            n_group: 1,
+            topk_group: 1,
+            norm_topk_prob: true,
+            routed_scaling_factor: 1.0,
+            swiglu_limit: 10.0,
+            engram_layers: Vec::new(),
+            engram_vocab_sizes: std::collections::BTreeMap::new(),
+            engram_max_ngram_size: 3,
+            engram_n_embed_per_ngram: 768,
+            engram_n_head_per_ngram: 8,
+            engram_pad_id: 120_002,
+            engram_seed: 0,
+            engram_fp8_embedding: true,
+            engram_lookup_table_size: 120_818,
+            image_token_id: 120_120,
+            video_token_id: 120_124,
+            eos: vec![120_025],
+        };
+        let rank0 = Rc::new(Hy4CacheRank::new(vec![r0_stream], &cfg, Hy4KvCache::Fp8, 16, 2, 64, 3)?);
+        let rank1 = Rc::new(Hy4CacheRank::new(vec![r1_stream], &cfg, Hy4KvCache::Fp8, 16, 2, 64, 3)?);
+        let family = Hy4Prefix::new(vec![rank0.clone(), rank1.clone()], cfg.engram_pad_id, true)?;
+        let layout = family.layout();
+        assert_eq!(layout.page_rows, PAGE_ROWS);
+        assert_eq!(layout.pages, 32);
+        assert_eq!(layout.page_owners, cuteafd_engine::prefix::PageOwners::Parity);
+        assert_eq!(family.page_device(0), Some(0));
+        assert_eq!(family.page_device(1), Some(1));
+        // Parity page segments target only the single owning rank (2 segments per DSA layer: kv + index).
+        assert_eq!(family.page_segments(0).len(), 2);
+        assert_eq!(family.page_segments(1).len(), 2);
+
+        let mut cache: PrefixCache<CudaCopyEngine<'_>> = PrefixCache::new(
+            layout,
+            PrefixConfig { entries: 3, mark_slots: 3, keep_logits: true, min_tokens: 1 },
+            None,
+        )?;
+
+        // Exercise both odd-parity tail (67 tokens -> logical page 1 on rank 1) and even-parity tail
+        // (131 tokens -> logical page 2 on rank 0) to verify COW TailCopy stays on the owning GPU.
+        for (base, len) in [(100u32, 67usize), (500u32, 131usize)] {
+            let tokens: Vec<u32> = (base..base + len as u32).collect();
+            let mut src = cache
+                .admit(&family, &tokens, len + 64, false, |units| {
+                    Hy4Placement::new(units, 0, cfg.engram_pad_id)
+                })?
+                .placement;
+            for (j, &id) in src.units.iter().enumerate() {
+                assert_eq!((id as usize) & 1, j & 1, "logical page {j} must match parity owner");
+                let owner = (id as usize) & 1;
+                let local = (id as usize) >> 1;
+                let rank = if owner == 0 { &rank0 } else { &rank1 };
+                let kv = rank.dsa_kv_page(0, local)?;
+                library.copy_h2d(kv, &vec![(id as u8).wrapping_add(0x31); kv.bytes])?;
+                let idx = rank.dsa_index_page(0, local)?;
+                library.copy_h2d(idx, &vec![(id as u8).wrapping_add(0x51); idx.bytes])?;
+            }
+            for (r_idx, rank) in [&rank0, &rank1].into_iter().enumerate() {
+                let swa = rank.swa_ring(0, 0)?;
+                library.copy_h2d(swa, &vec![0x11u8.wrapping_add(r_idx as u8); swa.bytes])?;
+                let pend = rank.pending_key_slot(0, 0)?;
+                library.copy_h2d(pend, &vec![0xA0u8.wrapping_add(r_idx as u8); pend.bytes])?;
+                rank.pending_counts.borrow_mut()[0].fill(len % 4);
+            }
+            src.len = len;
+            src.state_len = len;
+            src.set_engram_tail_from_prefix(&tokens, cfg.engram_pad_id);
+            assert!(cache.capture(&family, SnapshotKind::Prompt, &tokens, &src, After::from_logits(&[1.0, 0.0], true))?);
+
+            // Restore with an extra token forcing a COW TailCopy on the partial tail page (owner = (len/64)&1).
+            let mut ext = tokens.clone();
+            ext.push(9999);
+            let restored = cache.admit(&family, &ext, len + 64, false, |units| {
+                Hy4Placement::new(units, 1, cfg.engram_pad_id)
+            })?;
+            assert_eq!(restored.resume, len);
+            let mut restored_p = restored.placement.clone();
+            restored_p.set_engram_tail_from_prefix(&tokens, cfg.engram_pad_id);
+            assert_ne!(
+                restored_p.units[len / PAGE_ROWS],
+                src.units[len / PAGE_ROWS],
+                "partial tail page must COW-copy while source stays pinned"
+            );
+            assert_eq!(
+                (restored_p.units[len / PAGE_ROWS] as usize) & 1,
+                (len / PAGE_ROWS) & 1,
+                "COW tail page must keep parity owner"
+            );
+            for (r_idx, rank) in [&rank0, &rank1].into_iter().enumerate() {
+                let snap_src = rank.dump_state(&src, Some(r_idx))?;
+                let snap_dst = rank.dump_state(&restored_p, Some(r_idx))?;
+                assert!(snap_src.diff(&snap_dst).is_empty(), "rank {r_idx} len {len} diffs: {:?}", snap_src.diff(&snap_dst));
+            }
+            cache.release(&family, &src.units)?;
+            cache.release(&family, &restored.placement.units)?;
+        }
         Ok(())
     }
 }

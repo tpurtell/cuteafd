@@ -44,6 +44,9 @@ pub(crate) struct GoldenArgs {
     /// Optional second CUDA device for 2x RTX TP2 coordinator execution.
     #[arg(long)]
     pub(crate) split_device: Option<i32>,
+    /// Attention placement on 2 GPUs (`auto` -> `context`, or explicit `heads` / `context`).
+    #[arg(long, default_value = "auto", value_parser = ["auto", "heads", "context"])]
+    pub(crate) attention_placement: String,
     /// Validate checkpoint headers, MC views, Engram FP8 shards, and target arenas without CUDA.
     #[arg(long)]
     pub(crate) check_headers: bool,
@@ -364,6 +367,14 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             "hy4f-golden --prefill-waves {prefill_waves} requires 64-row-aligned --prefill-units (got {unit})"
         );
     }
+    let attention = match (devices.len(), args.attention_placement.as_str()) {
+        (1, "auto" | "heads") => cuteafd_loader::placement::AttentionPlacement::Heads,
+        (2, "auto" | "context") => cuteafd_loader::placement::AttentionPlacement::Context,
+        (2, "heads") => cuteafd_loader::placement::AttentionPlacement::Heads,
+        (gpus, other) => anyhow::bail!("hy4f-golden does not support --attention-placement {other} on {gpus} GPU(s)"),
+    };
+    let context_split = attention == cuteafd_loader::placement::AttentionPlacement::Context;
+    let local_pages = if context_split { max_pages.div_ceil(2).max(16) } else { max_pages };
     let mut engine = if !args.resume_at.is_empty() || args.verify_waves {
         let marks = if !args.resume_at.is_empty() {
             if args.resume_host { 2 } else { 4 }
@@ -377,13 +388,14 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             &checkpoint,
             cfg.clone(),
             args.kv_cache,
+            attention,
             unit,
             decode_rows,
             prefill_waves,
-            max_pages,
+            local_pages,
             2,
-            max_pages * 64,
-            max_pages * 64,
+            local_pages * if context_split { 128 } else { 64 },
+            local_pages * if context_split { 128 } else { 64 },
             marks,
             args.skip_routed_experts,
             onboarded,
@@ -395,10 +407,11 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             &checkpoint,
             cfg.clone(),
             args.kv_cache,
+            attention,
             unit,
             decode_rows,
             prefill_waves,
-            max_pages,
+            local_pages,
             args.skip_routed_experts,
             onboarded,
         )?
@@ -408,8 +421,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         use cuteafd_loader::families::hy4_flash::{draft, Hy4DflyConfig};
         let model = hy4_plan::Model::open(&checkpoint)?;
         let config = Hy4DflyConfig::from_hf(&checkpoint.config, &cfg)?.context("no bundled DFly2")?;
-        let layout = draft::Admission::new(&checkpoint, &cfg, &config, &model.core, args.kv_cache,
-            2, decode_rows)?;
+        let layout = draft::Admission::new_with_context(&checkpoint, &cfg, &config, &model.core, args.kv_cache,
+            2, decode_rows, context_split)?;
         let drafter = devices[0].run(|| super::draft::Drafter::new(devices[0], &programs, &checkpoint,
             &cfg, config, layout, args.kv_cache, 2, decode_rows))?;
         engine.attach_drafter(drafter)?;

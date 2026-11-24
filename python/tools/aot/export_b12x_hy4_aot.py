@@ -50,7 +50,7 @@ def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096
         dsa_fp8 = mla.Hy4MlaGeometry(heads=dsa_heads, window_size=None, kv_cache="fp8")
         swa_bf16 = mla.Hy4MlaGeometry(heads=swa_heads, window_size=512, kv_cache="bf16")
         swa_fp8 = mla.Hy4MlaGeometry(heads=swa_heads, window_size=512, kv_cache="fp8")
-        return {
+        entries = {
             "mla_rank_norm_pack_bf16": lambda: mla.compile_hy4_mla_rank_norm_pack_aot(dsa_bf16),
             "mla_rank_norm_pack_fp8": lambda: mla.compile_hy4_mla_rank_norm_pack_aot(dsa_fp8),
             "mla_q_absorb_dsa": lambda: mla.compile_hy4_mla_q_absorb_aot(dsa_bf16),
@@ -76,16 +76,44 @@ def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096
                 swa_fp8, max_rows=max_rows, max_context=max_context, mode="extend", page_size=64
             ),
         }
+        if tp == 2:
+            from b12x.integration.cuteafd import context_split as cs
+
+            dsa32_bf16 = mla.Hy4MlaGeometry(heads=32, window_size=None, kv_cache="bf16")
+            dsa32_fp8 = mla.Hy4MlaGeometry(heads=32, window_size=None, kv_cache="fp8")
+            entries.update({
+                "mla_dsa_partial_bf16_h0": lambda: mla.compile_hy4_mla_dsa_partial_aot(
+                    dsa32_bf16, max_rows=max_rows, head_begin=0, head_count=16, num_splits=16, row_chunk_size=64
+                ),
+                "mla_dsa_partial_bf16_h16": lambda: mla.compile_hy4_mla_dsa_partial_aot(
+                    dsa32_bf16, max_rows=max_rows, head_begin=16, head_count=16, num_splits=16, row_chunk_size=64
+                ),
+                "mla_dsa_partial_fp8_h0": lambda: mla.compile_hy4_mla_dsa_partial_aot(
+                    dsa32_fp8, max_rows=max_rows, head_begin=0, head_count=16, num_splits=16, row_chunk_size=64
+                ),
+                "mla_dsa_partial_fp8_h16": lambda: mla.compile_hy4_mla_dsa_partial_aot(
+                    dsa32_fp8, max_rows=max_rows, head_begin=16, head_count=16, num_splits=16, row_chunk_size=64
+                ),
+                "lse_combine2": lambda: cs.compile_lse_combine2_aot(heads=16, has_sink=True),
+                "mla_gate_uv_dsa": lambda: mla.compile_hy4_mla_gate_uv_aot(dsa_bf16),
+            })
+        return entries
 
     if group == "indexer":
         from b12x.integration.cuteafd import hy4_indexer as idx
 
-        return {
+        entries = {
             "indexer_query_rope": lambda: idx.compile_hy4_indexer_query_rope_aot(idx.HY4_FLASH_INDEXER),
             "indexer_pool_group": lambda: idx.compile_hy4_indexer_pool_group_aot(idx.HY4_FLASH_INDEXER),
             "indexer_score_groups": lambda: idx.compile_hy4_indexer_score_groups_aot(idx.HY4_FLASH_INDEXER),
             "indexer_topk_expand": lambda: idx.compile_hy4_indexer_topk_expand_aot(idx.HY4_FLASH_INDEXER),
         }
+        if tp == 2:
+            entries.update({
+                "indexer_scored_topk": lambda: idx.compile_hy4_indexer_scored_topk_aot(idx.HY4_FLASH_INDEXER),
+                "indexer_merge_expand_owned": lambda: idx.compile_hy4_indexer_merge_expand_owned_aot(idx.HY4_FLASH_INDEXER),
+            })
+        return entries
 
     import torch
     from b12x.integration.cuteafd import pointwise as p

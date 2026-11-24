@@ -35,6 +35,8 @@ pub(crate) enum Section {
     DsaPre,
     /// DSA >2048 indexer query projections + RoPE (3 kernels).
     DsaIndexQ,
+    /// 2-GPU ContextSplit DSA dual partials (h0 + h16 over local pages).
+    DsaPartial,
     /// TP1 local DSA post-indexer: `mla_dsa_decode` + sink/UV + o_proj + post-attn + MoE+EXL3+post-FFN.
     DsaLocalPost,
     /// DSA attention output only (TP2 before peer reduce, or Spark-routed): `mla_dsa_decode` + sink/UV + o_proj.
@@ -290,6 +292,7 @@ mod tests {
                     Section::SwaExtendPost,
                     Section::DsaPre,
                     Section::DsaIndexQ,
+                    Section::DsaPartial,
                     Section::DsaLocalPost,
                     Section::DsaAttnOut,
                     Section::FfnFrontend,

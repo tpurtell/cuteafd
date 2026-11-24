@@ -351,14 +351,13 @@ view (`original` default; `k8-compact` and `k6-compact` use stored trellis cores
 `fp8-compact` converts the original BF16 core tensors at load with block-128
 FP8). `KV_CACHE=fp8|bf16` defaults to `fp8` for absorbed MLA KV and keeps the
 FP8 indexer key cache default. `ATTENTION_PLACEMENT=auto` selects whole layers
-on one RTX GPU and `context` (ContextSplit, no DSA KV replication) on two RTX
-GPUs; `serve-hy4f` currently refuses two-GPU `auto`/`context` loudly until
-ContextSplit LSE and cross-GPU scored-indexer exports land (#2579), while
-explicit `ATTENTION_PLACEMENT=heads` opts into replicated-KV head-split (`layers`
-refuses). `EMBEDDING=gpu` is required
+on one RTX GPU and `context` (ContextSplit, parity-owned DSA KV/index pages with
+no DSA KV replication and head-split SWA-512) on two RTX GPUs; explicit
+`ATTENTION_PLACEMENT=heads` opts into replicated-KV head-split (`layers`
+refuses in `serve-hy4f`). `EMBEDDING=gpu` is required
 (`host` refuses). `VISION` and `AUDIO` accept `auto` or `off` (both resolve to
 `off`). `SPECULATOR=dfly2` opts into the checkpoint's bundled five-stage
-DFly2 on one RTX or explicit two-RTX `heads`. It reuses committed target MLA KV
+DFly2 on one RTX or two RTX (`context` or explicit `heads`). It reuses committed target MLA KV
 and compressed-indexer recall; a fully restored prefix takes one target-only
 round before proposing. Proposals batch across requests; rank-local draft and
 verify sections graph exact live rows. Recall gathering, metadata uploads and

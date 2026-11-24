@@ -572,6 +572,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
             "Check dense tensor header extents.",
         ))?;
 
+    let context_split = modes.iter().any(|m| *m == LayerMode::ContextSplit);
     let draft = request.dfly2.then(|| {
         use super::{draft, Hy4DflyConfig};
         let checkpoint = request.checkpoint;
@@ -579,8 +580,8 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         let source = checkpoint.view.as_ref().map(|view| {
             crate::plan::Checkpoint::open_view_for_role(view, "Hy4 DFly2", |name| name.starts_with(draft::PREFIX))
         }).transpose()?;
-        draft::Admission::new(source.as_ref().unwrap_or(checkpoint), cfg, &config, request.model_core,
-            request.kv_format, request.sequences as usize, request.decode_rows as usize)
+        draft::Admission::new_with_context(source.as_ref().unwrap_or(checkpoint), cfg, &config, request.model_core,
+            request.kv_format, request.sequences as usize, request.decode_rows as usize, context_split)
     }).transpose().map_err(|error| refused(
         format!("Hy4 DFly2 admission refused: {error:#}"),
         "Use a supported bundled Hy4 drafter or SPECULATOR=off.",

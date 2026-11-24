@@ -151,18 +151,16 @@ fn resolve_expert_package(
     Ok(base.join("exl3").join(exl3.package_name("hy4f")).join(format!("rtx-tp{gpus}")))
 }
 
-fn resolve_attention_placement(gpus: usize, setting: &str) -> Result<&'static str> {
+fn resolve_attention_placement(gpus: usize, setting: &str) -> Result<(&'static str, AttentionPlacement)> {
     match (gpus, setting) {
-        (1, "auto" | "heads") => Ok("whole"),
+        (1, "auto" | "heads") => Ok(("whole", AttentionPlacement::Heads)),
         (1, other) => anyhow::bail!(
             "Hy4-flash single-GPU serving does not support ATTENTION_PLACEMENT={other}; use auto or heads"
         ),
-        (2, "heads") => Ok("heads"),
-        (2, "auto" | "context") => anyhow::bail!(
-            "Hy4-flash 2-GPU default ContextSplit serving is not implemented yet: missing SparkInfer partial-attention LSE + lse_combine2 (hy4_mla.py), cross-GPU scored_index_topk (hy4_indexer.py), and 32-head ContextSplit execution in Hy4Engine (#2579). Use explicit ATTENTION_PLACEMENT=heads to opt into replicated-KV head-split, or serve on 1 GPU."
-        ),
+        (2, "auto" | "context") => Ok(("context", AttentionPlacement::Context)),
+        (2, "heads") => Ok(("heads", AttentionPlacement::Heads)),
         (2, other) => anyhow::bail!(
-            "Hy4-flash 2-GPU serving does not support ATTENTION_PLACEMENT={other}; ContextSplit is the default (pending #2579) and heads is explicit opt-in"
+            "Hy4-flash 2-GPU serving does not support ATTENTION_PLACEMENT={other}; use auto/context (ContextSplit default) or explicit heads"
         ),
         _ => anyhow::bail!("Hy4-flash supports 1 or 2 coordinator GPUs, got {gpus}"),
     }
@@ -295,6 +293,7 @@ fn reconcile_runtime_inventory(
             || id.starts_with("hy4_flash.head.")
             || id.starts_with("hy4_flash.target.")
             || id.starts_with("hy4_flash.peer.")
+            || id.starts_with("hy4_flash.context_exchange.")
             || id.starts_with("expert-usage.gpu")
             || (id.starts_with("hy4_flash/dfly2/") && id != cuteafd_loader::families::hy4_flash::draft::ARENA_ID)
     };
@@ -390,7 +389,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     );
     let gpus = if args.split_device.is_some() { 2 } else { 1 };
     let decode_rows = args.resolved_decode_rows(gpus)?;
-    let resolved_attention = resolve_attention_placement(gpus, args.attention_placement.as_str())?;
+    let (resolved_attention, attention_placement) =
+        resolve_attention_placement(gpus, args.attention_placement.as_str())?;
     args.prefix.resolve_entries(args.max_sequences);
     let prefill = args.prefill()?;
     cuteafd_bench::context::ResolvedSettings::prefill(prefill)
@@ -482,9 +482,10 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
 
             // Load coordinator AOT programs inside the pre-weight sample window so their
             // module bytes are measured once and never double-charged.
+            let context_split = attention_placement == AttentionPlacement::Context;
             let mut preloaded_programs: Vec<Hy4Programs<'_>> = Vec::with_capacity(gpus);
             let pre = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| {
-                preloaded_programs.push(Hy4Programs::load(&programs, gpus, worker_args.kv_format)?);
+                preloaded_programs.push(Hy4Programs::load(&programs, gpus, worker_args.kv_format, context_split)?);
                 Ok(())
             })?;
 
@@ -525,7 +526,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 kv_format: worker_args.kv_format,
                 manifest_path: Some(&worker_args.manifest),
                 coordinator: Coordinator::Measured { samples, loaded_code },
-                attention: AttentionPlacement::Heads,
+                attention: attention_placement,
                 spark_ranks: worker_args.peers.len(),
                 spark_bytes,
                 prefill: shape,
@@ -703,6 +704,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 &checkpoint,
                 cfg.clone(),
                 worker_args.kv_format,
+                attention_placement,
                 unit_rows,
                 decode_rows,
                 prefill_waves,
@@ -978,15 +980,14 @@ mod tests {
     }
 
     #[test]
-    fn attention_placement_refuses_2gpu_context_loudly_and_allows_explicit_heads() -> anyhow::Result<()> {
-        assert_eq!(super::resolve_attention_placement(1, "auto")?, "whole");
-        assert_eq!(super::resolve_attention_placement(1, "heads")?, "whole");
+    fn attention_placement_defaults_to_context_on_2gpu_and_allows_explicit_heads() -> anyhow::Result<()> {
+        use cuteafd_loader::placement::AttentionPlacement;
+        assert_eq!(super::resolve_attention_placement(1, "auto")?, ("whole", AttentionPlacement::Heads));
+        assert_eq!(super::resolve_attention_placement(1, "heads")?, ("whole", AttentionPlacement::Heads));
         assert!(super::resolve_attention_placement(1, "context").is_err());
-        assert_eq!(super::resolve_attention_placement(2, "heads")?, "heads");
-        let err_auto = super::resolve_attention_placement(2, "auto").unwrap_err().to_string();
-        let err_ctx = super::resolve_attention_placement(2, "context").unwrap_err().to_string();
-        assert!(err_auto.contains("ContextSplit") && err_auto.contains("ATTENTION_PLACEMENT=heads"), "{err_auto}");
-        assert!(err_ctx.contains("ContextSplit") && err_ctx.contains("ATTENTION_PLACEMENT=heads"), "{err_ctx}");
+        assert_eq!(super::resolve_attention_placement(2, "auto")?, ("context", AttentionPlacement::Context));
+        assert_eq!(super::resolve_attention_placement(2, "context")?, ("context", AttentionPlacement::Context));
+        assert_eq!(super::resolve_attention_placement(2, "heads")?, ("heads", AttentionPlacement::Heads));
         assert!(super::resolve_attention_placement(2, "layers").is_err());
         Ok(())
     }
@@ -1158,7 +1159,7 @@ mod tests {
             None,
             replies,
         );
-        let admitted = inputs.admit(req)?;
+        let admitted = inputs.admit(req.clone())?;
         let contract = inputs.prepare(&admitted.solved.request)?;
         let pages = admitted.solved.pool_tokens.div_ceil(admitted.solved.pool_page_rows);
 
@@ -1221,6 +1222,84 @@ mod tests {
             address: addr,
         });
         assert!(super::reconcile_runtime_inventory(&admitted.solved, &inputs, &weights_receipts, &extra).is_err());
+
+        // 2-GPU ContextSplit reconciliation: context_exchange.{0,1} and rank-1 wave metadata are admitted & verified.
+        let modes_ctx = hy4_place::layer_modes(&inputs.cfg, 2, AttentionPlacement::Context);
+        let mut facts_ctx = PoolFacts::new(context, None, 128);
+        facts_ctx.memory = vec![
+            PoolMemory { available_bytes: 96u64 << 30, bytes_per_unit: 12 * 64 * 1024 },
+            PoolMemory { available_bytes: 96u64 << 30, bytes_per_unit: 12 * 64 * 1024 },
+        ];
+        let pool_ctx = cuteafd_loader::placement::prepare_pool(facts_ctx)?;
+        let targets_ctx = (0..2)
+            .map(|gpu| {
+                Ok(CoordinatorWeights {
+                    rank: gpu,
+                    layers: (0..42).collect(),
+                    arena: WeightArenaLayout::new(
+                        format!("hy4_flash/target/gpu{gpu}"),
+                        vec![("lm_head.weight".to_string(), (120_832 / 2) * 3072 * 2)],
+                    )?,
+                    core: BTreeMap::new(),
+                    fp8: BTreeMap::new(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let inputs_ctx = Hy4Inputs {
+            gpus: 2,
+            pool: pool_ctx,
+            targets: targets_ctx,
+            placement: AttentionPlacement::Context,
+            modes: modes_ctx,
+            budgets: vec![
+                hy4_place::planned_budget(0, 96u64 << 30, 96u64 << 30, 1u64 << 30),
+                hy4_place::planned_budget(1, 96u64 << 30, 96u64 << 30, 1u64 << 30),
+                inputs.budgets[1].clone(),
+                inputs.budgets[2].clone(),
+            ],
+            code: vec![256u64 << 20, 256u64 << 20],
+            graph_reserve: vec![0, 0],
+            ..inputs
+        };
+        let admitted_ctx = inputs_ctx.admit(req)?;
+        let contract_ctx = inputs_ctx.prepare(&admitted_ctx.solved.request)?;
+        let pages_ctx = admitted_ctx.solved.pool_tokens.div_ceil(admitted_ctx.solved.pool_page_rows);
+        let mut w_ctx = Vec::new();
+        let mut r_ctx = Vec::new();
+        for alloc in admitted_ctx.solved.facts.allocations.iter().filter(|a| a.view.is_none()) {
+            if alloc.id.starts_with("hy4_flash/target/gpu") {
+                w_ctx.push(Receipt { allocation: alloc.clone(), address: addr });
+                addr += 0x1000;
+            } else if alloc.id.starts_with("hy4_flash.cache.")
+                || alloc.id.starts_with("hy4_flash.scratch.")
+                || alloc.id.starts_with("hy4_flash.wave.")
+                || alloc.id.starts_with("hy4_flash.head.")
+                || alloc.id.starts_with("hy4_flash.target.")
+                || alloc.id.starts_with("hy4_flash.peer.")
+                || alloc.id.starts_with("hy4_flash.context_exchange.")
+            {
+                let curve = contract_ctx
+                    .components
+                    .iter()
+                    .find_map(|c| match &c.kind {
+                        ComponentKind::Allocation { template, .. } if template.id == alloc.id => Some(&c.bytes),
+                        _ => None,
+                    })
+                    .expect("contract curve");
+                let piece = curve.0.iter().find(|p| (p.first..=p.last).contains(&pages_ctx)).unwrap();
+                let payload = piece.bytes_at_first + piece.bytes_per_page * (pages_ctx - piece.first);
+                let mut rec = alloc.clone();
+                rec.bytes = payload;
+                if rec.id.starts_with("hy4_flash.cache.") || rec.id.starts_with("hy4_flash.head.") {
+                    rec.id = format!("retained.{}", rec.id);
+                }
+                r_ctx.push(Receipt { allocation: rec, address: addr });
+                addr += 0x1000;
+            }
+        }
+        assert!(r_ctx.iter().any(|r| r.allocation.id == "hy4_flash.context_exchange.0"));
+        assert!(r_ctx.iter().any(|r| r.allocation.id == "hy4_flash.context_exchange.1"));
+        super::reconcile_runtime_inventory(&admitted_ctx.solved, &inputs_ctx, &w_ctx, &r_ctx)?;
         Ok(())
     }
 }

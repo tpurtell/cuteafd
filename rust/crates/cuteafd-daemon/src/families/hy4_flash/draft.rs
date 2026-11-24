@@ -40,6 +40,7 @@ pub(super) struct Drafter<'a> {
     frontiers: Vec<Cell<Option<usize>>>,
     verify_rows: usize,
     batch_capacity: usize,
+    has_peer_recall: bool,
 }
 
 impl<'a> Drafter<'a> {
@@ -243,6 +244,7 @@ impl<'a> Drafter<'a> {
             .iter()
             .map(|(name, v)| Ok((name.clone(), run.view(name, v.bytes())?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let has_peer_recall = views.contains_key("tap_recall_peer");
         Ok(Self {
             cfg,
             format,
@@ -256,6 +258,7 @@ impl<'a> Drafter<'a> {
             frontiers: (0..slots).map(|_| Cell::new(None)).collect(),
             verify_rows,
             batch_capacity: slots,
+            has_peer_recall,
         })
     }
 
@@ -423,6 +426,21 @@ impl<'a> Drafter<'a> {
             TOPK * 4,
         )
     }
+    fn recall_peer(&self, verify: bool, row: usize, stage: usize) -> Result<Buffer> {
+        ensure!(self.has_peer_recall, "DFly2 peer recall buffer not admitted");
+        slice_buf(
+            self.b(if verify {
+                "verify_recall_peer"
+            } else {
+                "tap_recall_peer"
+            }),
+            (row * self.cfg.layers + stage) * TOPK * 4,
+            TOPK * 4,
+        )
+    }
+    pub fn captures_layer(&self, target_layer: usize) -> bool {
+        self.cfg.target_index_layers.contains(&target_layer)
+    }
     fn hidden(&self, verify: bool, row: usize) -> Result<Buffer> {
         slice_buf(
             self.b(if verify {
@@ -452,6 +470,24 @@ impl<'a> Drafter<'a> {
         }
         Ok(())
     }
+    pub fn capture_recall_peer(
+        &self,
+        verify: bool,
+        row: usize,
+        target_layer: usize,
+        src_on_peer: Buffer,
+        stream: &Stream<'a>,
+    ) -> Result<()> {
+        if let Some(stage) = self
+            .cfg
+            .target_index_layers
+            .iter()
+            .position(|&l| l == target_layer)
+        {
+            self.copy(self.recall_peer(verify, row, stage)?, src_on_peer, stream)?;
+        }
+        Ok(())
+    }
     pub fn capture_hidden(
         &self,
         verify: bool,
@@ -473,6 +509,13 @@ impl<'a> Drafter<'a> {
                 self.recall(true, row, stage)?,
                 stream,
             )?;
+            if self.has_peer_recall {
+                self.copy(
+                    self.recall_peer(false, slot, stage)?,
+                    self.recall_peer(true, row, stage)?,
+                    stream,
+                )?;
+            }
         }
         self.publish(slot, pos);
         Ok(())
@@ -487,6 +530,7 @@ impl<'a> Drafter<'a> {
         graphs: Option<&Hy4Graphs<'a>>,
         rope: Buffer,
         cache: impl Fn(usize) -> Result<Buffer>,
+        cache_peer: Option<&dyn Fn(usize) -> Result<Buffer>>,
         mut head: impl FnMut(Buffer, usize) -> Result<DeviceLogits>,
     ) -> Result<Vec<Vec<u32>>> {
         if members.is_empty() {
@@ -569,6 +613,7 @@ impl<'a> Drafter<'a> {
                 let p = format!("{PREFIX}{stage}");
                 let a = format!("{p}.self_attn");
                 let layer_cache = cache(target)?;
+                let layer_cache_peer = cache_peer.map(|f| f(target)).transpose()?;
                 for (i, member) in members.iter().enumerate() {
                     let staging = slice_buf(kv, i * pt_width * record, pt_width * record)?;
                     self.launch(
@@ -585,6 +630,22 @@ impl<'a> Drafter<'a> {
                         ],
                         stream,
                     )?;
+                    if let Some(peer_pool) = layer_cache_peer {
+                        self.launch(
+                            "gather",
+                            &[
+                                peer_pool,
+                                self.recall_peer(false, member.slot, stage)?,
+                                staging,
+                            ],
+                            &[
+                                Scalar::I32(meta.recall[i] as i32),
+                                Scalar::I32(1),
+                                Scalar::I32(0),
+                            ],
+                            stream,
+                        )?;
+                    }
                 }
                 run(Section::DraftLayer, stage, &mut || {
                     self.norm(

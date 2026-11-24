@@ -20,8 +20,8 @@ use super::super::{
     ResidentWeights, TerminalHome, Tp2Range,
 };
 use crate::families::hy4_flash::execution::{
-    hy4_peer_slot_sizes, wave_metadata_layout, CacheLayout, SharedScratchLayout, WaveScratchLayout,
-    PAGE_ROWS,
+    hy4_context_buffers, hy4_peer_slot_sizes, wave_metadata_layout_for_rank, CacheLayout,
+    SharedScratchLayout, WaveScratchLayout, PAGE_ROWS,
 };
 use crate::families::hy4_flash::weight_layout::CoordinatorWeights;
 use crate::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
@@ -578,12 +578,13 @@ impl Hy4Inputs {
         ));
 
         // Packed hook-local scratch arena (one per rank) + packed per-wave scratch arenas (one per rank per wave).
+        let context_split = self.modes.iter().any(|m| *m == LayerMode::ContextSplit);
         let max_seq_pages = usize::try_from(self.context.maximum)
             .map_err(|_| Refusal::Overflow("Hy4 context pages"))?
             .div_ceil(PAGE_ROWS)
             .max(16);
         let local_vocab = cfg.vocab_size / self.gpus;
-        let shared = SharedScratchLayout::new(
+        let shared = SharedScratchLayout::new_with_context(
             cfg,
             gpu,
             self.gpus,
@@ -592,6 +593,7 @@ impl Hy4Inputs {
             max_seq_pages,
             self.sequences as usize,
             local_vocab,
+            context_split,
         )
         .map_err(refusal)?;
         out.extend(buffer(
@@ -623,8 +625,8 @@ impl Hy4Inputs {
                 "Hy4-flash packed wave scratch arena",
                 maximum,
             ));
-            if gpu == 0 {
-                let host = wave_metadata_layout(slot, &wave.arena).map_err(refusal)?;
+            if gpu == 0 || context_split {
+                let host = wave_metadata_layout_for_rank(gpu, slot, &wave.arena).map_err(refusal)?;
                 out.extend(buffer(
                     host.id(), Location::PINNED, host.bytes() as u64, Lifetime::TARGET,
                     Category::Staging, "hy4_flash/wave-metadata", maximum,
@@ -653,6 +655,23 @@ impl Hy4Inputs {
                     Lifetime::TARGET,
                     Category::Transport,
                     "Hy4-flash TP2 peer exchange",
+                    maximum,
+                ));
+            }
+            if context_split {
+                let ctx_bytes = crate::placement::ContextExchangeLayout::new(&hy4_context_buffers(
+                    cfg,
+                    self.decode_rows as usize,
+                ))
+                .bytes()
+                .ok_or(Refusal::Overflow("Hy4 ContextSplit exchange"))?;
+                out.extend(buffer(
+                    format!("hy4_flash.context_exchange.{gpu}"),
+                    location,
+                    ctx_bytes,
+                    Lifetime::TARGET,
+                    Category::Transport,
+                    "Hy4-flash ContextSplit exchange",
                     maximum,
                 ));
             }
