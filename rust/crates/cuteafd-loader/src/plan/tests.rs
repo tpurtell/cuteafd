@@ -5255,7 +5255,7 @@ fn v41_graph_reserve_is_one_card_size_independent_arena() {
         assert!(report.executable(), "{}", render(&report));
         let memory = report.memory_layout.unwrap();
         let graph = memory.devices[0].items.iter().find(|item| item.group.starts_with("graph reserve")).unwrap();
-        assert_eq!(graph.bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0).unwrap().bytes);
+        assert_eq!(graph.bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, report.decode_lanes).unwrap().bytes);
     }
 }
 
@@ -5266,20 +5266,24 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     let mut options = sparks(4);
     options.layout = Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], context_tokens: 512, pool_tokens: Some(0),
         prefix_slots: Some(0), native_mtp_layers: 0, workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
-    let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let auto_report = plan(dir.path(), &options).unwrap();
+    let auto_lanes = auto_report.decode_lanes;
+    let automatic = auto_report.memory_layout.unwrap();
     assert_eq!(automatic.devices[0].capacity_bytes, crate::placement::inventory::PRO_TOTAL_BYTES);
     // The graph arena is one configured owner; automatic admission does not
     // grow it.
-    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0).unwrap().bytes);
+    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, auto_lanes).unwrap().bytes);
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
     let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
     let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&crate::read_json_file::<Value>(&dir.path().join("config.json")).unwrap(), 1).unwrap();
     let rank = cache.ranks[0];
     assert_eq!(state, (rank.active_state_per_sequence_bytes - 4 * 4096 * 4) * 16);
     options.layout.as_mut().unwrap().pool_tokens = Some(512);
-    let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let explicit_report = plan(dir.path(), &options).unwrap();
+    let explicit_lanes = explicit_report.decode_lanes;
+    let explicit = explicit_report.memory_layout.unwrap();
     assert_eq!(explicit.devices[0].capacity_bytes, crate::placement::inventory::PRO_TOTAL_BYTES);
-    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0).unwrap().bytes);
+    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, explicit_lanes).unwrap().bytes);
 }
 
 #[test]
@@ -5532,10 +5536,10 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     // original E4M3-relative and graph-relative headroom, not a real-card claim.
     let source = 129280 * 5120 * 2;
     let head_delta = Fp8Head::configured().resident(source).0 - Fp8Head::All.resident(source).0;
-    let graph_delta = crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0).unwrap().bytes - 1_048_576_000;
+    let graph_reserve = crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 2).unwrap().bytes;
     let layout = layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
-        drafter_bytes: (4 << 30) - head_delta - graph_delta, prefill_rows: 0, ..Default::default() };
+        drafter_bytes: (4 << 30) - head_delta + 1_048_576_000 - graph_reserve, prefill_rows: 0, ..Default::default() };
     let roomy = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], ..layout.clone() }), ..sparks(4) };
     let roomy = input.plan_spark_count(&roomy, 6, Some(4)).unwrap();
     assert!(roomy.executable(), "{}", render(&roomy));
@@ -5568,7 +5572,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     assert!(modules >= 34 << 20);
     let blas = bytes("cuBLAS handles:") + bytes("BLAS device initialization");
     assert_eq!(blas, 66 << 20);
-    assert_eq!(bytes("graph reserve"), crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0).unwrap().bytes);
+    assert_eq!(bytes("graph reserve"), crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, compact.decode_lanes).unwrap().bytes);
     assert_eq!(bytes("native LoadedCode estimate"), 0);
     let retired = (2u64 << 30) + arch.cublas_bytes - modules - blas;
     eprintln!("V4.1 synthetic 31 GiB: selected modules {modules}, named BLAS {blas}, retired mixed allowance delta {retired} B; one graph reserve");
