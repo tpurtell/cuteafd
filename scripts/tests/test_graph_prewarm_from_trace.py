@@ -691,25 +691,6 @@ def test_glm_two_rank_cli_keeps_built_widths(tmp_path):
     assert output.read_text() == json.dumps(expected, indent=2) + "\n"
 
 
-def test_glm_two_rank_trace_reproduces_checked_in_bytes():
-    import gzip
-
-    fixture = Path(__file__).parent / "fixtures/glm-prewarm-two-rank-trace.json.gz"
-    traces = json.loads(gzip.decompress(fixture.read_bytes()))
-    assert {trace["cache"]["device"] for trace in traces} == {0, 1}
-    generated = MODULE.generate(traces, "glm5", layout=2)
-    installed = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity/glm_prewarm_2.json"
-    assert json.dumps(generated, indent=2) + "\n" == installed.read_text()
-    assert generated["layout"] == 2
-    assert generated["reserve_extra_bytes"] == MODULE.CHUNK
-    replayed = {MODULE.geometry("glm5", graph["shape"])
-                for trace in traces for graph in trace["graphs"]
-                if MODULE.glm_request_replays(graph) > 0}
-    assert all((entry["rows"], entry["table_width"] // 2) in replayed
-               for entry in generated["entries"])
-    assert fixture.stat().st_size < 1_000_000
-
-
 def test_odd_half_table_width_is_refused():
     data = context_trace()
     data["graphs"][0]["shape"] = data["graphs"][0]["shape"].replace(
@@ -723,7 +704,7 @@ def test_generator_prefix_matches_shared_engine_graph_site(family):
     import re
     engine = SCRIPT.parents[2] / "rust/crates/cuteafd-daemon/src/families/glm5/engine.rs"
     sites = re.findall(r'name:\s*"([^"]+)"', engine.read_text())
-    assert "glm5.segment" in sites
+    assert "glm5.decode_local" in sites
     assert all(site.startswith(MODULE.SITE_PREFIX[family]) for site in sites)
 
 
@@ -746,20 +727,6 @@ def test_every_consumer_uses_fixed_allocation_tail_not_largest_graph(family):
     result = MODULE.generate([data], family, **({"layout": 1} if family == "mistral_large4" else {}))
     assert result["reserve_base_bytes"] == 8 << 20
     assert result["reserve_extra_bytes"] == 2 << 20
-
-
-@pytest.mark.parametrize("filename", ["glm_prewarm_1.json", "ml4_prewarm_1.json", "ml4_prewarm_2.json"])
-def test_regeneration_reproduces_checked_in_base_and_tail(filename):
-    import json
-    root = SCRIPT.parents[2] / "rust/crates/cuteafd-loader/src/serving_capacity"
-    checked_in = json.loads((root / filename).read_text())
-    data = trace(charged=checked_in["reserve_base_bytes"])
-    # The measured arena, not a largest capture or the old reservation, is the base.
-    data["sites"]["glm5.segment"]["largest_bytes"] = 80 << 20
-    result = MODULE.generate([data], checked_in["family"],
-                             **({"layout": checked_in["layout"]} if checked_in.get("layout") else {}))
-    for key in ("reserve_base_bytes", "reserve_extra_bytes"):
-        assert result[key] == checked_in[key]
 
 
 def qwen_identity(segment, rows=64, spec=False, long=False, width=64, page_stride=64, pool_stride=128):

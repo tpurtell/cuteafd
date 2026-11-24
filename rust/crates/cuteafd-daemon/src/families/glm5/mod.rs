@@ -547,7 +547,6 @@ mod draft_cli_tests {
     #[test]
     fn planner_charge_equals_admission_charge_for_the_same_geometry() {
         use cuteafd_loader::plan::exlr8::PrefillActivations;
-        cuteafd_loader::placement::families::glm5::admission::allow_synthetic_graphs();
         const GROUP: &str = "GLM target hooks";
         let dir = tempfile::tempdir().unwrap();
         cuteafd_loader::plan::testing::exlr8::glm_admission_snapshot(dir.path());
@@ -1870,29 +1869,25 @@ impl Opened {
                 engine.attach_peer_l2(budget)?;
             }
         }
+        if let Some(dump) = crate::shared::selection_dump::shared("glm5")? {
+            engine.attach_selection_dump(dump)?;
+        }
         engine.prime_tp2()?;
         self.startup_probe(&devices, "glm/transport-before-graphs", None, false)?;
         let graph_reserves = admitted.graphs.reserves().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let graph_bootstraps: Vec<_> = admitted.graphs.ranks().iter()
-            .map(|row| row.bytes.div_ceil(row.executables.max(1))).collect();
-        engine.configure_graph_cache(&admitted.graphs, &graph_reserves, &graph_bootstraps)?;
+        let graph_bootstraps = admitted.graphs.bootstraps().to_vec();
+        if engine.selection_dump.is_none() && engine.weights.layers.len() == self.cfg.layers
+            && graph_reserves.iter().any(|&bytes| bytes > 0)
+            && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0") {
+            engine.configure_graph_cache(&admitted.graphs, &graph_reserves, &graph_bootstraps)?;
+        }
         for rank in 0..admitted.graphs.ranks().len() {
             let reserve = admitted.graphs.reserve_policy(rank)?;
             tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
                 base = reserve.base_bytes, base_source = reserve.base_source,
                 extra = reserve.extra_bytes, extra_source = reserve.extra_source,
-                cap = ?reserve.cap_bytes, cap_source = reserve.cap_source,
+                growth_headroom = ?reserve.growth_headroom,
                 charged = reserve.bytes, "GLM GPU_GRAPH_RESERVE startup policy");
-        }
-        if let Some(dump) = crate::shared::selection_dump::shared("glm5")? {
-            engine.attach_selection_dump(dump)?;
-        }
-        // Current startup shapes are a best-effort prewarm list. Admission keeps
-        // the entire graph reserve charged; measured warmup never shrinks it.
-        if engine.selection_dump.is_none() && engine.weights.layers.len() == self.cfg.layers
-            && graph_reserves.iter().any(|&bytes| bytes > 0)
-            && (transport.is_some() || args.skip_routed_experts || engine.has_local()) {
-            engine.warm_decode_graphs(transport.as_mut().map(|t| (t, &runtime)), &admitted.graphs, &graph_bootstraps)?;
         }
         engine.check_tp2_routes(transport.as_mut().map(|t| (t, &runtime)))?;
         self.startup_probe(&devices, "glm/graphs-before-serving", None, false)?;
@@ -1901,7 +1896,7 @@ impl Opened {
             tracing::info!(rank, reserve = reserve.bytes, source = reserve.source,
                 base = reserve.base_bytes, base_source = reserve.base_source,
                 extra = reserve.extra_bytes, extra_source = reserve.extra_source,
-                cap = ?reserve.cap_bytes, cap_source = reserve.cap_source,
+                growth_headroom = ?reserve.growth_headroom,
                 charged = reserve.bytes, "GLM GPU_GRAPH_RESERVE Ready summary");
         }
         engine.usage_active.set(true);

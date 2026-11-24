@@ -1,11 +1,12 @@
-//! Graph capture-site classification (#2303). An unclassified site is
+//! Graph capture-site classification (#2303, #2609). An unclassified site is
 //! spanning: it stays prewarmed under `GRAPH_PREWARM=off` and sealed after
-//! readiness (#1878). Evidence line numbers refer to dev 672a7e25f1.
+//! readiness (#1878).
 use crate::shared::decode_graph::sites::{Scope, Table};
 
 // (site, scope, capture and host-issue-order evidence).
 pub(super) const SITES: &Table = &[
-    ("glm5.segment", Scope::Declared, "engine.rs:2272,2286 exchange.wait(1, ..) inside the peer segment captured by replay_on(1) at :2306; rank 0 waits at :2183 inside replay_on(0); one rank has no peer"),
+    ("glm5.decode_local", Scope::Local,
+        "engine/local_graph.rs:95 decode_layers_local and engine/layers.rs:255 keep every PeerExchange, ContextExchange, and HopLink push/wait outside replay_on with zero unmatched waits during capture"),
 ];
 
 pub(super) fn spans(name: &str, declared: bool) -> bool {
@@ -23,7 +24,6 @@ mod tests {
     #[test]
     fn graph_prewarm_off_warms_spanning_and_defers_local() {
         let off = |name, declared| crate::shared::decode_graph::sites::testing::assert_off_transitions(super::SITES, name, declared);
-        assert_eq!(off("glm5.segment", false), false, "glm5 one-GPU layout");
-        assert_eq!(off("glm5.segment", true), true, "glm5 two-GPU layout");
+        assert_eq!(off("glm5.decode_local", false), false, "glm5 exact-row local site (no peer dependency inside capture)");
     }
 }

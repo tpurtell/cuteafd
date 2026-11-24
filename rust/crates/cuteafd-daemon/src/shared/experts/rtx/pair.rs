@@ -352,6 +352,37 @@ impl<'a> Whole<'a> {
     pub(crate) fn allocation_receipts(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>,
         name: &str) -> Result<()> { self.backend.try_borrow()?.allocation_receipts(inventory, name) }
 
+    /// Resolves lazy backend capacities outside CUDA graph capture (#2544 / #2609).
+    /// # Safety
+    /// Input, routes, shared and output are live initialized buffers of `rows` rows on `stream`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn prime_whole(&self, input: ExpertInput, routes: Routes, rows: usize,
+        shared: CuteafdDeviceBuffer, output: CuteafdDeviceBuffer, stream: *mut c_void,
+        library: &NativeLibrary) -> Result<()> {
+        ensure!(rows > 0 && rows <= self.max_rows, "whole routed prime outside admitted extent");
+        let mut backend = self.backend.try_borrow_mut()?;
+        // SAFETY: startup operands are initialized and exclusively owned on this serialized stream.
+        unsafe {
+            backend.prime(input, routes, stream)?;
+            for capacity in [1, 16, 80, 256, 1024, 4096] {
+                if capacity <= rows || capacity == 4096 {
+                    backend.enqueue(self.layers[0], capacity.min(rows), input, routes, stream, &mut || {})?;
+                }
+            }
+            let count = rows.checked_mul(self.hidden).context("whole routed prime output extent")?;
+            match &self.add {
+                WholeCombine::Bf16(add) => add.launch(CuteafdDeviceBuffer {
+                    ptr: backend.output(), bytes: count * 2, device_id: self.device, flags: 0 },
+                    shared, output, count, stream)?,
+                WholeCombine::F32(add) => add.partial(backend.output().cast(), shared.ptr.cast(),
+                    output.ptr, count, ExchangeDtype::Bf16, stream)?,
+                WholeCombine::Compact(add) => add.finish(backend.output().cast(), shared.ptr.cast(),
+                    output.ptr.cast(), u32::try_from(rows)?, true, stream)?,
+            }
+            library.cuda_stream_synchronize(stream)
+        }
+    }
+
     /// # Safety
     /// Input, routes, shared and output are live on this device's serialized stream.
     /// Shared/output are disjoint from backend storage and retained through completion.
@@ -667,6 +698,10 @@ impl<'a> Pair<'a> {
 
     pub(crate) fn checking(&self) -> bool {
         self.checking.get()
+    }
+
+    pub(crate) fn routes_replicated(&self) -> bool {
+        self.source.get() == RouteSource::Replicated && !self.checking.get()
     }
 
     /// Completes a single-pass call's lanes, then its span.

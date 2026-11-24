@@ -2,10 +2,9 @@
 use crate::serving_capacity::glm_graphs::GlmPrewarmFamily;
 use cuteafd_core::memory_policy::{Size, SizeError};
 
-/// Trace-derived prewarm arena and its allocation tail. Together these are the base.
-pub fn glm_default(family: GlmPrewarmFamily, ranks: usize) -> (u64, u64) {
-    let list = crate::serving_capacity::glm_graphs::glm_prewarm(family, ranks);
-    (list.reserve_base_bytes, list.reserve_extra_bytes)
+/// Measured C1 working-set inputs for GLM 5.3 / ML4 exact-row rank-local decode graphs.
+pub fn glm_default(family: GlmPrewarmFamily, ranks: usize, rank: usize) -> WorkingSet {
+    crate::serving_capacity::glm_graphs::glm_working_set(family, ranks, rank)
 }
 /// Per-device V4.1 measured C1 working set under shipping settings (rank-local
 /// prewarm intact), scaled by the number of decode lanes sharing the device.
@@ -302,16 +301,24 @@ mod tests {
             assert_eq!(policy.cap_bytes, Some(base));
             assert_eq!(policy.source, "family default with extra");
         }
-        let (base, tail) = glm_default(GlmPrewarmFamily::Glm5, 1);
-        assert_eq!(resolve(None, 0, false, base, tail).unwrap().bytes, 675_282_944);
+        let measured = glm_default(GlmPrewarmFamily::Glm5, 1, 0);
+        let policy = resolve_working_set(None, None, None, 0, measured).unwrap();
+        let headroom = policy.growth_headroom.unwrap();
+        assert!(headroom >= GRAPH_CHUNK && headroom % GRAPH_CHUNK == 0);
+        assert!(policy.base_bytes > measured.w1 && policy.base_bytes % GRAPH_CHUNK == 0);
+        assert_eq!(policy.bytes, policy.base_bytes + headroom);
     }
     #[test]
-    fn ml4_layout_bases_get_shared_headroom() {
-        for (ranks, expected_base) in [(1, 715_128_832), (2, 914_358_272)] {
-            let (base, tail) = glm_default(GlmPrewarmFamily::MistralLarge4, ranks);
-            let policy = resolve(None, 0, false, base, tail).unwrap();
-            assert_eq!(policy.base_bytes, expected_base);
-            assert_eq!(policy.bytes, expected_base + 500_000_000);
+    fn ml4_layout_bases_get_working_set_margin() {
+        for ranks in [1, 2] {
+            for rank in 0..ranks {
+                let measured = glm_default(GlmPrewarmFamily::MistralLarge4, ranks, rank);
+                let policy = resolve_working_set(None, None, None, rank, measured).unwrap();
+                let headroom = policy.growth_headroom.unwrap();
+                assert!(headroom >= GRAPH_CHUNK && headroom % GRAPH_CHUNK == 0);
+                assert!(policy.base_bytes > measured.w1 && policy.base_bytes % GRAPH_CHUNK == 0);
+                assert_eq!(policy.bytes, policy.base_bytes + headroom);
+            }
         }
     }
     #[test]

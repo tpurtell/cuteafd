@@ -2,7 +2,7 @@
 use super::*;
 use crate::shared::experts::rtx::pair::SubmissionScope;
 use crate::shared::peer_split::{attention::{self, AttentionStateOwners, LaneOrder, LayerKernels, PipelineKernels}, hop::HopLink};
-use cuteafd_loader::serving_capacity::glm_graphs::{GlmOwnedPhase, GlmOwnedSegment, glm_owned_segments};
+use cuteafd_loader::serving_capacity::glm_graphs::GlmOwnedPhase;
 use cuteafd_loader::placement::{FfnMode, Hop, HopPoint, LayerExecutionPlan, LayerMode, Placement};
 
 pub(super) struct Execution<'a> {
@@ -10,7 +10,6 @@ pub(super) struct Execution<'a> {
     hops: HopLink<'a>,
     // Keep dispatched receivers owned across submission errors until engine drainage.
     waves: RefCell<Vec<Option<PendingWave>>>,
-    pub(super) segments: Vec<GlmOwnedSegment>,
 }
 
 enum Transport<'t, 'l> {
@@ -29,6 +28,13 @@ struct Bindings<'e, 'a, 't, 'l, 'c> {
     owners: Vec<Vec<u8>>,
     on_layer: Option<&'c mut dyn FnMut(usize, &[u8]) -> Result<()>>,
     tap: (usize, usize, usize),
+    /// Deferred rank-local adopt copy+post_norm fused into `FfnFront` during graphed decode
+    /// (avoids <=2-node `GRAPH_TOO_SMALL` and eager adopt copy).
+    pending_adopt: [Option<(usize, *mut c_void)>; 2],
+    /// Deferred rank-local FFN join fused into next `Attention`, `FfnFront`, or terminal `Head`.
+    pending_join: [Option<usize>; 2],
+    /// Set if the current TP2 layer ran the eager Broadcast/route-check fallback (both ranks pushed).
+    eager_tp2_layer: bool,
 }
 
 enum PendingWave {
@@ -105,11 +111,7 @@ impl<'a> GlmEngine<'a> {
             device: exchange.device(rank), stream: exchange.stream(rank) }), plan.hops(), spec, DECODE_ROWS * self.cfg.hidden * 2)?;
         hops.attach_abort([exchange.abort_word(0)?.context("rank 0 abort")?, exchange.abort_word(1)?.context("rank 1 abort")?])?;
         hops.validate_binding(&plan, exchange)?;
-        let owners: Vec<_> = self.weights.layers.iter().map(|layer| layer.attention_owner.unwrap()).collect();
-        let tp2: Vec<_> = placement.layers.iter().map(|layer|
-            layer.experts == cuteafd_loader::placement::ExpertHome::RtxTp2).collect();
-        let segments = glm_owned_segments(&owners, &tp2).map_err(anyhow::Error::msg)?;
-        self.layer_execution = Some(Execution { plan, hops, segments,
+        self.layer_execution = Some(Execution { plan, hops,
             waves: RefCell::new((0..self.prefill_lanes).map(|_| None).collect()) });
         Ok(())
     }
@@ -136,10 +138,44 @@ impl<'a> GlmEngine<'a> {
         let owners = self.loaded_attention_owners();
         let mut bindings = [Bindings { unit: None, engine: self, work: [w, w1], tables, lane: 0,
             transport: Transport::Serial(experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime))),
-            owners, on_layer, tap: (rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS), rows.min(crate::shared::speculation::dflash::TAP_ROWS), 0) }];
+            owners, on_layer, tap: (rows.saturating_sub(crate::shared::speculation::dflash::TAP_ROWS), rows.min(crate::shared::speculation::dflash::TAP_ROWS), 0),
+            pending_adopt: [None; 2], pending_join: [None; 2], eager_tp2_layer: false }];
         self.run_layer_pipeline(scope, LaneOrder::Independent, &mut bindings)?;
+        let full_layers = self.weights.layers.len() == self.cfg.layers;
+        let head = full_layers && tables[0].decode && rows == wanted;
+        let last_join = bindings[0].pending_join[0].take();
+        if let Some(last) = last_join {
+            if !self.shared_zero_elided(last, &self.weights.layers[last]) {
+                self.exchange()?.wait(0, slot(last, true, 0))?;
+            }
+        }
+        if bindings[0].decode_graphed() && head {
+            let key = GraphKey {
+                layer: self.weights.layers.len(),
+                sub: GlmOwnedPhase::Head as u8,
+                rows,
+                table_width: tables[0].table_width,
+                table_stride: tables[0].table_stride,
+                previous: Previous::First,
+                head: true,
+            };
+            self.replay_on(0, key, || {
+                if let Some(last) = last_join {
+                    bindings[0].ffn_join_local(0, last, self.weights.norm.buffer.ptr)?;
+                    bindings[0].tap_drafter_local(last)?;
+                }
+                self.launch_head(w, rows, rows)?;
+                self.select_greedy(w, rows)
+            })?;
+            if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
+            return Ok(Some(self.device_logits(w, wanted, true)));
+        }
+        if let Some(last) = last_join {
+            bindings[0].ffn_join_local(0, last, self.weights.norm.buffer.ptr)?;
+            bindings[0].tap_drafter_local(last)?;
+        }
         if let Some(pair) = &self.tp2 { pair.finish_checks()?; }
-        if self.weights.layers.len() < self.cfg.layers { return Ok(None); }
+        if !full_layers { return Ok(None); }
         if wanted == 0 { return Ok(None); }
         self.launch_head(w, rows, wanted)?;
         if tables[0].decode && rows == wanted { self.select_greedy(w, rows)?; }
@@ -162,7 +198,8 @@ impl<'a> GlmEngine<'a> {
         let from = unit.rows.start.max(window).min(unit.rows.end);
         Bindings { unit: Some(unit), engine: self, work, tables, lane: unit.slot, transport,
             owners: self.loaded_attention_owners(), on_layer: None,
-            tap: (from - unit.rows.start, unit.rows.end - from, from.saturating_sub(window)) }
+            tap: (from - unit.rows.start, unit.rows.end - from, from.saturating_sub(window)),
+            pending_adopt: [None; 2], pending_join: [None; 2], eager_tp2_layer: false }
     }
 
     pub(super) fn owned_unit_attention(&self, work: [&Workspace<'a>; 2], tables: &[StepTables; 2],
@@ -213,45 +250,37 @@ fn unit_exit(exchange: &impl attention::LayerProtocol, plan: &LayerExecutionPlan
 impl Bindings<'_, '_, '_, '_, '_> {
     fn rows(&self) -> usize { self.tables[0].positions.len() }
     fn cap(&self) -> &'static str { if self.tables[0].decode { "m64" } else { "m4096" } }
+    fn decode_graphed(&self) -> bool { self.tables[0].decode && self.on_layer.is_none() }
     fn layer(&self, rank: usize, layer: usize) -> &GlmLayer<'_> {
         if rank == 0 { &self.engine.weights.layers[layer] } else { &self.engine.peer.as_ref().unwrap().layers[layer] }
     }
+    fn next_owner(&self, index: usize) -> Option<usize> {
+        self.engine.weights.layers.get(index + 1).and_then(|l| l.attention_owner).map(usize::from)
+    }
     fn segment(&self, rank: usize, layer: usize, phase: GlmOwnedPhase, body: impl Fn() -> Result<()>) -> Result<()> {
-        if self.tables[0].decode && self.on_layer.is_none() {
-            if self.engine.graphs_warming.get() {
-                ensure!(self.engine.layer_execution.as_ref().context("GLM layer execution")?.segments
-                    .contains(&GlmOwnedSegment { rank, layer, phase }), "capture outside GLM GraphSet");
-            }
+        if self.decode_graphed() {
             let table = &self.tables[rank];
-            self.engine.replay_on(rank, GraphKey { layer: phase.key(layer), rows: self.rows(),
+            self.engine.replay_on(rank, GraphKey { layer, sub: phase as u8, rows: self.rows(),
                 table_width: table.table_width, table_stride: table.table_stride, previous: Previous::First, head: false }, body)
         } else { body() }
     }
-    fn join(&self, index: usize) -> Result<()> {
+    /// Rank-local FFN residual add + norm (capture-safe: caller already waited outside capture).
+    fn ffn_join_local(&self, rank: usize, index: usize, weight: *mut c_void) -> Result<()> {
         let e = self.engine;
-        for rank in 0..2 {
-            let w = self.work[rank];
-            self.segment(rank, index, GlmOwnedPhase::FfnJoin, || {
-                if rank == 1 || !e.shared_zero_elided(index, self.layer(rank, index)) {
-                    e.exchange()?.wait(rank, slot(index, true, self.lane))?;
-                }
-                let weight = if let Some(next) = e.weights.layers.get(index + 1) { next.ptr("input_norm")? }
-                    else { e.weights.norm.buffer.ptr };
-                // The terminal norm has only rank-0 weights; the residual itself
-                // is replicated by the same rank-ordered BF16 addition on both GPUs.
-                let weight = if rank == 1 { if let Some(next) = e.peer()?.layers.get(index + 1) { next.ptr("input_norm")? }
-                    else { self.layer(rank, index).ptr("input_norm")? } } else { weight };
-                if e.tp2_layer(index) { e.tp2_norm(rank, w, weight, index, self.lane, Scalar::I32(self.rows() as i32)) }
-                else {
-                    let local = if rank == 0 || self.layer(rank, index).dense { w.delta.buffer.ptr } else { w.shared.buffer.ptr };
-                    let peer = e.recv(rank, slot(index, true, self.lane))?;
-                    let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
-                    e.ffn_norm(rank, index, self.lane, w, self.layer(rank, index), weight,
-                        Scalar::I32(self.rows() as i32), first, second)
-                }
-            })?;
+        let w = self.work[rank];
+        if e.tp2_layer(index) {
+            e.tp2_norm(rank, w, weight, index, self.lane, Scalar::I32(self.rows() as i32))
+        } else {
+            let local = if rank == 0 || self.layer(rank, index).dense { w.delta.buffer.ptr } else { w.shared.buffer.ptr };
+            let peer = e.recv(rank, slot(index, true, self.lane))?;
+            let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
+            e.ffn_norm(rank, index, self.lane, w, self.layer(rank, index), weight,
+                Scalar::I32(self.rows() as i32), first, second)
         }
-        if let Some(drafter) = &e.drafter {
+    }
+    /// Rank-0 local drafter tap (capture-safe).
+    fn tap_drafter_local(&self, index: usize) -> Result<()> {
+        if let Some(drafter) = &self.engine.drafter {
             if self.tables[0].segments.is_empty() {
                 let (first, rows, offset) = self.tap;
                 if rows > 0 { drafter.tap_at(index, self.work[0].h.buffer.ptr, first, rows, offset)?; }
@@ -262,6 +291,36 @@ impl Bindings<'_, '_, '_, '_, '_> {
             }
         }
         Ok(())
+    }
+    /// Rank-local adopt copy + post_norm (capture-safe: HopLink::land already waited outside capture).
+    fn adopt_local(&self, rank: usize, layer: usize, residual: *mut c_void) -> Result<()> {
+        let e = self.engine;
+        let w = self.work[rank];
+        let bytes = self.rows() * e.cfg.hidden * 2;
+        e.on(rank, || unsafe {
+            // SAFETY: HopLink landed these admitted rows before this stream-ordered copy.
+            e.library.copy_d2d_async(w.h.buffer, cuteafd_ffi::CuteafdDeviceBuffer { ptr: residual, bytes,
+                device_id: e.exchange()?.device(rank), flags: 0 }, bytes, e.stream_of(rank))
+        })?;
+        e.norm_full(rank, w, self.layer(rank, layer).ptr("post_norm")?,
+            0, Scalar::I32(self.rows() as i32), w.delta.buffer.ptr, w.delta.buffer.ptr)
+    }
+    /// Eager/prefill join on both ranks.
+    fn join(&self, index: usize) -> Result<()> {
+        let e = self.engine;
+        for rank in 0..2 {
+            if rank == 1 || !e.shared_zero_elided(index, self.layer(rank, index)) {
+                e.exchange()?.wait(rank, slot(index, true, self.lane))?;
+            }
+            let weight = if let Some(next) = e.weights.layers.get(index + 1) { next.ptr("input_norm")? }
+                else { e.weights.norm.buffer.ptr };
+            let weight = if rank == 1 {
+                if let Some(next) = e.peer()?.layers.get(index + 1) { next.ptr("input_norm")? }
+                else { self.layer(rank, index).ptr("input_norm")? }
+            } else { weight };
+            self.ffn_join_local(rank, index, weight)?;
+        }
+        self.tap_drafter_local(index)
     }
 }
 
@@ -275,6 +334,14 @@ impl LayerKernels for Bindings<'_, '_, '_, '_, '_> {
         if hop.at == HopPoint::Entry { return Ok(()); }
         let layer = match hop.at { HopPoint::AfterAttention(layer) => Some(layer), HopPoint::BeforeLayer(0) => None,
             _ => anyhow::bail!("unexpected whole-attention hop") };
+        if self.decode_graphed() {
+            if let Some(layer) = layer {
+                // Defer copy_d2d + post_norm into the immediately following rank-local FfnFront capture.
+                ensure!(self.pending_adopt[rank].replace((layer, residual)).is_none(),
+                    "overwrite of unconsumed GLM layers adopt");
+                return Ok(());
+            }
+        }
         let bytes = self.rows() * e.cfg.hidden * 2;
         e.on(rank, || unsafe {
             // SAFETY: HopLink landed these admitted rows before this stream-ordered copy.
@@ -282,8 +349,8 @@ impl LayerKernels for Bindings<'_, '_, '_, '_, '_> {
                 device_id: e.exchange()?.device(rank), flags: 0 }, bytes, e.stream_of(rank))
         })?;
         if let Some(layer) = layer {
-            self.segment(rank, layer, GlmOwnedPhase::RemoteNorm, || e.norm_full(rank, w, self.layer(rank, layer).ptr("post_norm")?,
-                0, Scalar::I32(self.rows() as i32), w.delta.buffer.ptr, w.delta.buffer.ptr))?;
+            e.norm_full(rank, w, self.layer(rank, layer).ptr("post_norm")?,
+                0, Scalar::I32(self.rows() as i32), w.delta.buffer.ptr, w.delta.buffer.ptr)?;
         }
         Ok(())
     }
@@ -292,10 +359,21 @@ impl LayerKernels for Bindings<'_, '_, '_, '_, '_> {
     fn owned(&mut self, index: usize, rank: usize) -> Result<()> {
         let e = self.engine;
         let w = self.work[rank];
+        let prev_join = if self.decode_graphed() { self.pending_join[rank].take() } else { None };
+        if let Some(prev) = prev_join {
+            if rank == 1 || !e.shared_zero_elided(prev, self.layer(rank, prev)) {
+                e.exchange()?.wait(rank, slot(prev, true, self.lane))?;
+            }
+        }
         self.segment(rank, index, GlmOwnedPhase::Attention, || {
             let rows = Scalar::I32(self.rows() as i32);
-            if index == 0 { e.norm_full(rank, w, self.layer(rank, index).ptr("input_norm")?, 0, rows,
-                w.delta.buffer.ptr, w.delta.buffer.ptr)?; }
+            if let Some(prev) = prev_join {
+                self.ffn_join_local(rank, prev, self.layer(rank, index).ptr("input_norm")?)?;
+                if rank == 0 { self.tap_drafter_local(prev)?; }
+            } else if index == 0 {
+                e.norm_full(rank, w, self.layer(rank, index).ptr("input_norm")?, 0, rows,
+                    w.delta.buffer.ptr, w.delta.buffer.ptr)?;
+            }
             e.attention_unit(rank, w, index, self.layer(rank, index), rows, self.cap(), self.tables, self.lane)?;
             e.norm_full(rank, w, self.layer(rank, index).ptr("post_norm")?, 1, rows,
                 w.delta.buffer.ptr, w.delta.buffer.ptr)
@@ -319,41 +397,176 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         let e = self.engine;
         let [w, w1] = self.work;
         let layer = &e.weights.layers[index];
-        let rows = Scalar::I32(self.rows() as i32);
-        if !layer.dense && e.tp2_layer(index) {
-            e.moe_front(index, w, layer, self.rows())?;
-            e.shared_on(0, index, w, layer, rows, self.cap())?;
-            e.moe_front_on(1, index, w1, self.layer(1, index), self.rows())?;
-            e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap())?;
-            let pair = e.tp2.as_ref().context("TP2")?;
-            e.tp2_rank(pair, 0, index, self.lane, w, self.rows())?;
-            e.tp2_rank(pair, 1, index, self.lane, w1, self.rows())?;
-            return Ok(Ticket::Complete);
-        }
-        self.segment(1, index, GlmOwnedPhase::FfnFront, || {
-            peer_ffn_front(layer.dense,
-                || e.ffn_on(1, w1, self.layer(1, index), e.cfg.dense_intermediate,
-                    self.cap(), w1.delta.buffer.ptr, rows),
-                || e.shared_on(1, index, w1, self.layer(1, index), rows, self.cap()))
-        })?;
-        if self.tables[0].decode && !layer.dense {
+        let layer1 = &e.peer()?.layers[index];
+        let rows_count = self.rows();
+        let rows = Scalar::I32(rows_count as i32);
+        self.eager_tp2_layer = false;
+
+        if self.decode_graphed() {
+            let adopt1 = self.pending_adopt[1].take();
+            let adopt0 = self.pending_adopt[0].take();
+            let join0 = self.pending_join[0].take();
+            ensure!(self.pending_join[1].is_none(), "unconsumed rank-1 FfnJoin before begin_ffn");
+            let next_needs_r1 = self.next_owner(index) == Some(1);
+            if let Some(prev) = join0 {
+                if !e.shared_zero_elided(prev, self.layer(0, prev)) {
+                    e.exchange()?.wait(0, slot(prev, true, self.lane))?;
+                }
+            }
+            let split_core_down = GlmEngine::core_split(layer, "down");
+            if !layer.dense && e.tp2_layer(index) && e.tp2_routes_replicated() {
+                let pair = e.tp2.as_ref().context("TP2")?;
+                if split_core_down {
+                    self.segment(1, index, GlmOwnedPhase::FfnFront, || {
+                        if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
+                        e.shared_on_local(1, index, w1, layer1, rows, self.cap())?;
+                        e.core_zero_shared(1, w1, rows_count)
+                    })?;
+                    e.publish_projection(1, index, self.lane, w1, layer1, "down", rows_count)?;
+                    self.segment(1, index, GlmOwnedPhase::Tp2Expert, || {
+                        e.moe_front_on(1, index, w1, layer1, rows_count)?;
+                        e.tp2_rank_local(pair, 1, index, self.lane, w1, rows_count)
+                    })?;
+                    e.tp2_publish(pair, 1, index, self.lane, w1, rows_count)?;
+
+                    self.segment(0, index, GlmOwnedPhase::FfnFront, || {
+                        if let Some(prev) = join0 {
+                            self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
+                            self.tap_drafter_local(prev)?;
+                        }
+                        if let Some((l, res)) = adopt0 { self.adopt_local(0, l, res)?; }
+                        e.moe_front(index, w, layer, rows_count)?;
+                        e.shared_on_local(0, index, w, layer, rows, self.cap())
+                    })?;
+                    e.exchange()?.wait(0, slot(index, true, self.lane))?;
+                    self.segment(0, index, GlmOwnedPhase::Tp2Expert, || {
+                        e.reduce_projection(0, index, self.lane, w, layer, "down", rows_count, w.shared.buffer)?;
+                        e.tp2_rank_local(pair, 0, index, self.lane, w, rows_count)
+                    })?;
+                    if next_needs_r1 {
+                        e.tp2_publish(pair, 0, index, self.lane, w, rows_count)?;
+                    }
+                } else {
+                    self.segment(1, index, GlmOwnedPhase::FfnFront, || {
+                        if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
+                        e.shared_on_local(1, index, w1, layer1, rows, self.cap())?;
+                        e.moe_front_on(1, index, w1, layer1, rows_count)?;
+                        e.tp2_rank_local(pair, 1, index, self.lane, w1, rows_count)
+                    })?;
+                    e.tp2_publish(pair, 1, index, self.lane, w1, rows_count)?;
+
+                    self.segment(0, index, GlmOwnedPhase::FfnFront, || {
+                        if let Some(prev) = join0 {
+                            self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
+                            self.tap_drafter_local(prev)?;
+                        }
+                        if let Some((l, res)) = adopt0 { self.adopt_local(0, l, res)?; }
+                        e.moe_front(index, w, layer, rows_count)?;
+                        e.shared_on_local(0, index, w, layer, rows, self.cap())?;
+                        e.tp2_rank_local(pair, 0, index, self.lane, w, rows_count)
+                    })?;
+                    if next_needs_r1 {
+                        e.tp2_publish(pair, 0, index, self.lane, w, rows_count)?;
+                    }
+                }
+                return Ok(Ticket::Complete);
+            }
+            if !layer.dense && e.tp2_layer(index) {
+                // Broadcast / route-check TP2 fallback (eager).
+                if let Some(prev) = join0 {
+                    self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
+                    self.tap_drafter_local(prev)?;
+                }
+                if let Some((l, res)) = adopt0 { self.adopt_local(0, l, res)?; }
+                if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
+                self.eager_tp2_layer = true;
+                e.moe_front(index, w, layer, rows_count)?;
+                e.shared_on(0, index, w, layer, rows, self.cap())?;
+                e.moe_front_on(1, index, w1, layer1, rows_count)?;
+                e.shared_on(1, index, w1, layer1, rows, self.cap())?;
+                let pair = e.tp2.as_ref().context("TP2")?;
+                e.tp2_rank(pair, 0, index, self.lane, w, rows_count)?;
+                e.tp2_rank(pair, 1, index, self.lane, w1, rows_count)?;
+                return Ok(Ticket::Complete);
+            }
+            if layer.dense {
+                self.segment(1, index, GlmOwnedPhase::FfnFront, || {
+                    if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
+                    e.ffn_on(1, w1, layer1, e.cfg.dense_intermediate, self.cap(), w1.delta.buffer.ptr, rows)
+                })?;
+                e.publish_projection(1, index, self.lane, w1, layer1, "down", rows_count)?;
+                self.segment(0, index, GlmOwnedPhase::FfnFront, || {
+                    if let Some(prev) = join0 {
+                        self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
+                        self.tap_drafter_local(prev)?;
+                    }
+                    if let Some((l, res)) = adopt0 { self.adopt_local(0, l, res)?; }
+                    e.ffn(w, layer, e.cfg.dense_intermediate, self.cap(), w.delta.buffer.ptr, rows)
+                })?;
+                if next_needs_r1 {
+                    e.publish_projection(0, index, self.lane, w, layer, "down", rows_count)?;
+                }
+                return Ok(Ticket::Complete);
+            }
+            // Spark / Skip MoE in graphed decode mode:
+            self.segment(1, index, GlmOwnedPhase::FfnFront, || {
+                if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
+                e.shared_on_local(1, index, w1, layer1, rows, self.cap())
+            })?;
+            if split_core_down {
+                e.publish_projection(1, index, self.lane, w1, layer1, "down", rows_count)?;
+            } else {
+                e.exchange()?.push(1, slot(index, true, self.lane), w1.shared.buffer.ptr, rows_count * e.cfg.hidden * 2)?;
+            }
             if let Some(l2) = &e.peer()?.l2 {
                 e.on(1, || l2.issue(e.library, index, e.stream_of(1)))?;
             }
+            self.segment(0, index, GlmOwnedPhase::FfnFront, || {
+                if let Some(prev) = join0 {
+                    self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
+                    self.tap_drafter_local(prev)?;
+                }
+                if let Some((l, res)) = adopt0 { self.adopt_local(0, l, res)?; }
+                e.moe_front(index, w, layer, rows_count)
+            })?;
+            let real = self.tables[0].exchange_rows;
+            if e.skip.is_some() { return Ok(Ticket::Skip(e.moe_skip_one_way(w, index, layer, real, self.cap())?)); }
+            let execution = e.layer_execution.as_ref().context("layer execution")?;
+            ensure!(execution.waves.borrow()[self.lane].is_none(), "previous Spark wave is still live");
+            let cap = self.cap();
+            let (pending, ticket) = match &mut self.transport {
+                Transport::Serial(Some((link, _))) => (PendingWave::Landed(e.moe_exchange_one_way(w, index, layer, real, cap, true,
+                    link.exchange()?)?), Ticket::Spark),
+                _ => anyhow::bail!("GLM MoE layer {index} needs Spark peers"),
+            };
+            execution.waves.borrow_mut()[self.lane] = Some(pending);
+            return Ok(ticket);
         }
-        if layer.dense {
-            self.segment(0, index, GlmOwnedPhase::FfnFront, || e.ffn(w, layer, e.cfg.dense_intermediate, self.cap(), w.delta.buffer.ptr, rows))?;
+
+        // Prefill / eager diagnostic path (unchanged multi-lane wave behavior):
+        if !layer.dense && e.tp2_layer(index) {
+            e.moe_front(index, w, layer, rows_count)?;
+            e.shared_on(0, index, w, layer, rows, self.cap())?;
+            e.moe_front_on(1, index, w1, layer1, rows_count)?;
+            e.shared_on(1, index, w1, layer1, rows, self.cap())?;
+            let pair = e.tp2.as_ref().context("TP2")?;
+            e.tp2_rank(pair, 0, index, self.lane, w, rows_count)?;
+            e.tp2_rank(pair, 1, index, self.lane, w1, rows_count)?;
             return Ok(Ticket::Complete);
         }
-        self.segment(0, index, GlmOwnedPhase::FfnFront, || e.moe_front(index, w, layer, self.rows()))?;
+        peer_ffn_front(layer.dense,
+            || e.ffn_on(1, w1, layer1, e.cfg.dense_intermediate, self.cap(), w1.delta.buffer.ptr, rows),
+            || e.shared_on(1, index, w1, layer1, rows, self.cap()))?;
+        if layer.dense {
+            e.ffn(w, layer, e.cfg.dense_intermediate, self.cap(), w.delta.buffer.ptr, rows)?;
+            return Ok(Ticket::Complete);
+        }
+        e.moe_front(index, w, layer, rows_count)?;
         let real = self.tables[0].exchange_rows;
         if e.skip.is_some() { return Ok(Ticket::Skip(e.moe_skip(w, index, layer, real, self.cap())?)); }
         let decode = self.tables[0].decode;
         let execution = e.layer_execution.as_ref().context("layer execution")?;
         ensure!(execution.waves.borrow()[self.lane].is_none(), "previous Spark wave is still live");
-        // Routes and wire rows go to the link's exchange; the shared expert
-        // and the prefetch queue behind them; the planes' wait is queued in
-        // `finish_ffn`. The host never waits for the GPU or the Sparks.
         let cap = self.cap();
         let (pending, ticket) = match &mut self.transport {
             Transport::Serial(Some((link, _))) => (PendingWave::Landed(e.moe_exchange(w, index, layer, real, cap, decode,
@@ -392,6 +605,19 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
         };
         if let Some((planes, ranks)) = planes { e.reduce(planes, w, ranks, real)?; }
         if !self.layer(0, index).dense { e.tap_width(w, index, real)?; }
+        if self.decode_graphed() && !self.eager_tp2_layer {
+            let next_needs_r1 = self.next_owner(index) == Some(1);
+            if !self.layer(0, index).dense && !e.tp2_layer(index) && next_needs_r1 {
+                let bytes = self.rows() * e.cfg.hidden * 2;
+                e.exchange()?.push(0, slot(index, true, self.lane), w.delta.buffer.ptr, bytes)?;
+            }
+            self.pending_join[0] = Some(index);
+            if next_needs_r1 {
+                self.pending_join[1] = Some(index);
+            }
+            crate::shared::console::layer_mark(index);
+            return Ok(());
+        }
         if !e.tp2_layer(index) {
             let bytes = self.rows() * e.cfg.hidden * 2;
             for rank in 0..2 {
@@ -763,6 +989,141 @@ mod tests {
             assert!(fault.run(2, LaneOrder::OrderedChunks).is_err());
             assert_eq!(fault.calls.get(), fail + 1);
             order::check_terminal(&fault.schedule.borrow().streams(), true).unwrap();
+        }
+    }
+
+    #[test]
+    fn layers_decode_captures_contain_no_exchanges_and_are_deadlock_free() {
+        let source = include_str!("layers.rs");
+        let body = source.split_once("#[cfg(test)]").unwrap().0;
+        let mut count = 0usize;
+        for part in body.split("self.segment(").skip(1) {
+            count += 1;
+            let after_arrow = part.split_once("|| {").unwrap().1;
+            let closure = after_arrow.split_once("})?;")
+                .or_else(|| after_arrow.split_once("\n        })"))
+                .unwrap().0;
+            for forbidden in [
+                "exchange()?.push", "exchange()?.wait", "publish_projection", "tp2_publish",
+                "tp2_rank(", "meet_shared_core", "shared_on(", "moe_exchange", "moe_skip",
+            ] {
+                assert!(!closure.contains(forbidden),
+                    "layers.rs segment closure #{count} unexpectedly contains {forbidden}");
+            }
+        }
+        assert!(count >= 8, "expected rank-local segment captures in layers.rs, found {count}");
+
+        // Model two consecutive graphed decode steps across Dense, TP2, and Spark layers,
+        // with alternating attention owners and sync(0)+sync(1) at every capture point.
+        #[derive(Clone, Copy)]
+        enum Kind { Dense, Tp2, Spark }
+        let kinds = [Kind::Dense, Kind::Tp2, Kind::Tp2, Kind::Spark, Kind::Spark, Kind::Tp2];
+        for first in [0usize, 1] {
+            for split_core in [false, true] {
+                let mut s = HostSchedule::default();
+                let capture = |s: &mut HostSchedule, label: &str| {
+                    s.sync(0, format!("capture {label} sync gpu0"));
+                    s.sync(1, format!("capture {label} sync gpu1"));
+                };
+                let owners: Vec<usize> = (0..kinds.len()).map(|l| first ^ ((l / 2) % 2)).collect();
+                for step in 0..2 {
+                    if owners[0] == 1 {
+                        s.push(0, "main", DIRECT, format!("step{step} entry 0->1"));
+                        s.wait(1, "main", DIRECT, format!("step{step} entry wait 1"));
+                    }
+                    let mut pending_join = [None::<usize>; 2];
+                    let mut hop_ord = [0usize; 2];
+                    for (layer, &kind) in kinds.iter().enumerate() {
+                        let owner = owners[layer];
+                        let peer = 1 - owner;
+                        let next_needs_r1 = owners.get(layer + 1).copied() == Some(1);
+                        let ffn = slot(layer, true, 0);
+
+                        // owned(layer, owner): wait deferred join if any, then capture Attention.
+                        if let Some(prev) = pending_join[owner].take() {
+                            let prev_elided = matches!(kinds[prev], Kind::Spark) && split_core;
+                            if owner == 1 || !prev_elided {
+                                s.wait(owner, "main", slot(prev, true, 0), format!("step{step} L{layer} attn wait prev"));
+                            }
+                        }
+                        capture(&mut s, &format!("step{step} L{layer} attn r{owner}"));
+
+                        // AfterAttention hop: owner -> peer.
+                        let hslot = hop_ord[peer] % 2;
+                        hop_ord[peer] += 1;
+                        s.push(owner, "hop", hslot, format!("step{step} L{layer} hop push"));
+                        s.wait(peer, "hop", hslot, format!("step{step} L{layer} hop land"));
+
+                        // begin_ffn: wait deferred join0 if owner == 1.
+                        let join0 = pending_join[0].take();
+                        assert!(pending_join[1].is_none());
+                        if let Some(prev) = join0 {
+                            let prev_elided = matches!(kinds[prev], Kind::Spark) && split_core;
+                            if !prev_elided {
+                                s.wait(0, "main", slot(prev, true, 0), format!("step{step} L{layer} r0 ffn wait prev"));
+                            }
+                        }
+                        match kind {
+                            Kind::Dense => {
+                                capture(&mut s, &format!("step{step} L{layer} r1 dense"));
+                                s.push(1, "main", ffn, format!("step{step} L{layer} r1 push dense"));
+                                capture(&mut s, &format!("step{step} L{layer} r0 dense"));
+                                if next_needs_r1 {
+                                    s.push(0, "main", ffn, format!("step{step} L{layer} r0 push dense"));
+                                }
+                            }
+                            Kind::Tp2 => {
+                                if split_core {
+                                    capture(&mut s, &format!("step{step} L{layer} r1 tp2 pre"));
+                                    s.push(1, "core", ffn, format!("step{step} L{layer} r1 push core"));
+                                    capture(&mut s, &format!("step{step} L{layer} r1 tp2 moe"));
+                                    s.push(1, "main", ffn, format!("step{step} L{layer} r1 push tp2"));
+                                    capture(&mut s, &format!("step{step} L{layer} r0 tp2 pre"));
+                                    s.wait(0, "core", ffn, format!("step{step} L{layer} r0 wait core"));
+                                    capture(&mut s, &format!("step{step} L{layer} r0 tp2 moe"));
+                                    if next_needs_r1 {
+                                        s.push(0, "main", ffn, format!("step{step} L{layer} r0 push tp2"));
+                                    }
+                                } else {
+                                    capture(&mut s, &format!("step{step} L{layer} r1 tp2"));
+                                    s.push(1, "main", ffn, format!("step{step} L{layer} r1 push tp2"));
+                                    capture(&mut s, &format!("step{step} L{layer} r0 tp2"));
+                                    if next_needs_r1 {
+                                        s.push(0, "main", ffn, format!("step{step} L{layer} r0 push tp2"));
+                                    }
+                                }
+                            }
+                            Kind::Spark => {
+                                capture(&mut s, &format!("step{step} L{layer} r1 spark shared"));
+                                if split_core {
+                                    s.push(1, "core", ffn, format!("step{step} L{layer} r1 push core"));
+                                } else {
+                                    s.push(1, "main", ffn, format!("step{step} L{layer} r1 push shared"));
+                                }
+                                capture(&mut s, &format!("step{step} L{layer} r0 spark front"));
+                                if split_core {
+                                    s.wait(0, "core", ffn, format!("step{step} L{layer} r0 wait core"));
+                                }
+                                if next_needs_r1 {
+                                    s.push(0, "main", ffn, format!("step{step} L{layer} r0 push spark"));
+                                }
+                            }
+                        }
+                        pending_join[0] = Some(layer);
+                        if next_needs_r1 { pending_join[1] = Some(layer); }
+                    }
+                    // Terminal Head on GPU 0.
+                    let last = pending_join[0].take().unwrap();
+                    let last_elided = matches!(kinds[last], Kind::Spark) && split_core;
+                    if !last_elided {
+                        s.wait(0, "main", slot(last, true, 0), format!("step{step} head wait last"));
+                    }
+                    capture(&mut s, &format!("step{step} head"));
+                }
+                assert_eq!(check_host(&s), Ok(()), "layers deadlock first={first} split_core={split_core}");
+                assert_eq!(order::check_submission_faults(&s.streams()), Ok(()),
+                    "layers submission fault first={first} split_core={split_core}");
+            }
         }
     }
 }
