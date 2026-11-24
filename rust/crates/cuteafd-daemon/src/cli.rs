@@ -1203,7 +1203,9 @@ mod tests {
     fn graph_donor_cold_lag_is_a_typed_cli_option() {
         use clap::Parser;
         let base = ["cuteafd", "bench-rdma-ring"];
-        assert_eq!(super::Cli::try_parse_from(base).unwrap().graph_donor_cold_lag, 0);
+        let defaults = super::Cli::try_parse_from(base).unwrap();
+        assert!(!defaults.graph_donor_always);
+        assert_eq!(defaults.graph_donor_cold_lag, 0);
         for lag in ["0", "16", "18446744073709551615"] {
             let cli = super::Cli::try_parse_from(base.into_iter().chain([
                 "--graph-donor-always", "--graph-donor-cold-lag", lag])).unwrap();
