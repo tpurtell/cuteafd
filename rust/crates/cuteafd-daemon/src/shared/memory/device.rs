@@ -462,12 +462,30 @@ pub(crate) const DECODE_PEER_COPY_BYTES: usize = 80 * 10240;
 
 /// Whether a device-ordered peer copy of `bytes` runs as an SM copy on the
 /// issuing stream (ordered by its event waits) instead of on a copy engine.
-/// Decode-width transfers do: a copy-engine copy queued behind an unmet event
-/// wait parks that engine and head-of-line blocks every other copy on it
-/// (Engram uploads, peer landings). Prefill-width transfers keep the copy
-/// engines (prof12: SM copies cost ~1.2 s of GPU0 per 64K prefill on two RTX).
+/// Decode-width transfers behind memory-wait streams do: a copy-engine copy
+/// queued behind an unmet memory wait parks that engine and head-of-line
+/// blocks every other copy on it (Engram uploads, peer landings). Prefill-width
+/// transfers keep the copy engines (prof12: SM copies cost ~1.2 s of GPU0 per
+/// 64K prefill on two RTX).
 pub(crate) fn sm_peer_copy_for(deferred: bool, bytes: usize, decode_lane_bytes: usize) -> bool {
     deferred && bytes <= decode_lane_bytes
+}
+
+/// Variant of [`sm_peer_copy_for`] for streams ordered solely by CUDA events
+/// (`cudaStreamWaitEvent`, never a device memory wait). Measured on V4.1 max
+/// two-lane C16 (`v41-step23-max2-c16-nsys`, `m1` vs `m2`): routing event-only
+/// decode peer copies through the copy engine cuts peer transfer time 2.7x
+/// (`318.9 -> 116.7 ms`), eliminates correlated 350-650 us `copy_regions` SM
+/// stalls (`359.3 -> 58.2 us` avg, `429.0 -> 11.6 us` p50), improves `HTOD`/
+/// `DTOD` copy latency (`1.0 -> 0.6 us` / `3.0 -> 1.4 us`, zero lane parking),
+/// and lifts C16 throughput `+10.3%` (`746.4 -> 823.3 tok/s`).
+pub(crate) fn sm_peer_copy_for_stream(
+    deferred: bool,
+    event_only: bool,
+    bytes: usize,
+    decode_lane_bytes: usize,
+) -> bool {
+    !event_only && sm_peer_copy_for(deferred, bytes, decode_lane_bytes)
 }
 
 /// Same-device handoff behind an upstream device wait. Decode-sized payloads
@@ -513,6 +531,16 @@ mod peer_copy_choice_tests {
         for row_bytes in [8192, 10240, 12288] {
             assert!(sm_peer_copy_for(true, 80 * row_bytes, 80 * row_bytes));
             assert!(!sm_peer_copy_for(true, 81 * row_bytes, 80 * row_bytes));
+        }
+        // Event-only streams (PeerTransfer, TP2 FFN) always use the copy engine.
+        for deferred in [false, true] {
+            for bytes in [0, 10240, DECODE_PEER_COPY_BYTES, DECODE_PEER_COPY_BYTES + 1] {
+                assert!(!super::sm_peer_copy_for_stream(deferred, true, bytes, DECODE_PEER_COPY_BYTES));
+                assert_eq!(
+                    super::sm_peer_copy_for_stream(deferred, false, bytes, DECODE_PEER_COPY_BYTES),
+                    sm_peer_copy_for(deferred, bytes, DECODE_PEER_COPY_BYTES),
+                );
+            }
         }
     }
 }
@@ -583,7 +611,9 @@ impl<'a> PeerTransfer<'a> {
         let mut drain = self.destination.cancellation_guard("cancelled peer transfer");
         self.ready.device.run(|| unsafe { library.cuda_event_record(self.ready.raw, producer.raw) })?;
         let deferred = super::chain::deferred();
-        let sm = self.sm.as_ref().filter(|_| sm_peer_copy_for(deferred, bytes, DECODE_PEER_COPY_BYTES));
+        // `self.destination` waits on CUDA events only, never a memory wait, so
+        // copy-engine peer transfers do not park other lanes' DMA.
+        let sm = self.sm.as_ref().filter(|_| sm_peer_copy_for_stream(deferred, true, bytes, DECODE_PEER_COPY_BYTES));
         self.destination.device.run(|| unsafe {
             library.cuda_stream_wait_event(self.destination.raw, self.ready.raw)?;
             // The destination's previous readers precede this write: the
