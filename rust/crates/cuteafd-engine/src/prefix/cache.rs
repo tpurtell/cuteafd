@@ -21,8 +21,9 @@
 //! A host-enabled mark family keeps a retained entry's positional mark only on the host
 //! (`Entry::host_mark`) once its copy landed. That host snapshot is pinned while the device entry
 //! lives, so host pressure evicts host-only snapshots and never orphans live device pages; the
-//! pinned bytes stay inside the host quota. If pinned snapshots fill the quota, new host stores
-//! are skipped and those entries keep their device staging mark until the staging ring needs it.
+//! pinned bytes stay inside the host quota. If pinned snapshots fill the quota, older idle
+//! host-backed device entries release their pins so the host tier can make room. If none can
+//! be retired, the new entry keeps its device staging mark until the staging ring needs it.
 //! A mark-less entry (staging reaped an uncached mark, or, as an invariant violation counted in
 //! `PrefixStats::dead_marks`, its host mark is gone) is handled by the rule: under an approximate
 //! partial rule (V4.1, MiMo `--prefix-partial on`) its exact pages stay and it restores by bounded
@@ -46,7 +47,7 @@ use super::marks::MarkArena;
 use super::pages::{Need, PoolExhausted, RefPagePool};
 use cuteafd_core::prefix::{Retention, SnapshotKind};
 use cuteafd_hostcache::cache::{
-    DevicePage, DeviceSnapshot, EvictDecision, HostCache, RestoreOutcome, RestoreTarget, StoreOutcome,
+    DevicePage, DeviceSnapshot, EvictDecision, HostCache, RestoreOutcome, RestoreTarget, SkipReason, StoreOutcome,
 };
 use cuteafd_hostcache::copy::{CopyEngine, DeviceRange, Stream};
 use cuteafd_hostcache::snapshot::{DevicePageId, EvictionOrder, SnapshotMeta};
@@ -144,6 +145,7 @@ pub struct Admitted<P> {
 
 /// What travels with a host snapshot besides its device bytes: plain host data (no device
 /// handles), so an entry is self-describing given the family's layout.
+#[derive(Clone)]
 pub struct HostPayload<M = ()> {
     pub record_format: &'static str,
     pub session: Option<String>,
@@ -1731,16 +1733,50 @@ impl<E: CopyEngine, M: Clone + Default> PrefixCache<E, M> {
         };
         let payload = HostPayload { record_format: family.record_format(), session: entry.session.clone(), after: entry.after.clone(), media: entry.media.clone(),
             family: entry.meta.clone(), approximate_from: entry.approximate_from, draft: entry.draft.clone() };
-        let host = self.host.as_mut().expect("checked");
-        let ticket = match host.store(&snapshot, payload) {
-            StoreOutcome::Issued(ticket) | StoreOutcome::Deferred(ticket) => Some(ticket),
-            StoreOutcome::Skipped(_) => {
-                self.stats.host_store_skips += 1;
-                None
+        let ticket = loop {
+            let host = self.host.as_mut().expect("checked");
+            match host.store(&snapshot, payload.clone()) {
+                StoreOutcome::Issued(ticket) | StoreOutcome::Deferred(ticket) => break Some(ticket),
+                StoreOutcome::Skipped(SkipReason::Exhausted) if self.layout.mark_bytes > 0
+                    && host.fits_empty(&snapshot) => {
+                    let Some(victim) = self.host_pressure_victim(id) else {
+                        self.stats.host_store_skips += 1;
+                        break None;
+                    };
+                    self.evict(family, victim)?;
+                }
+                StoreOutcome::Skipped(_) => {
+                    self.stats.host_store_skips += 1;
+                    break None;
+                }
             }
         };
         self.entries.get_mut(&id).expect("checked").ticket = ticket;
         Ok(())
+    }
+
+    /// Host pressure must not strand a mark or displace a shared base with its
+    /// own follow-up. Retire an idle host-backed entry, not its host allocation
+    /// directly: the host cache then reclaims unpinned slabs in its normal order.
+    fn host_pressure_victim(&self, incoming: EntryId) -> Option<EntryId> {
+        let host = self.host.as_ref()?;
+        let tokens = &self.entries.get(&incoming)?.tokens;
+        // A page reference not owned by a retained or queued entry belongs to
+        // a live placement (or quarantine); conservatively leave it alone.
+        let mut held = BTreeMap::<u32, u32>::new();
+        for entry in self.entries.values().chain(self.pending.iter().map(|p| &p.entry)) {
+            for &page in &entry.pages { *held.entry(page).or_default() += 1; }
+        }
+        self.entries.iter().filter(|(&id, entry)| id != incoming
+            && entry.ticket.is_none() && entry.mark.is_none()
+            && entry.host_mark.is_some_and(|key| host.singly_pinned(key))
+            && !tokens.starts_with(&entry.tokens)
+            && entry.pages.iter().all(|page| self.pool.refs(*page) == held[page]))
+            .min_by_key(|(&id, entry)| {
+                let ancestor = self.entries.values().any(|other| other.len() > entry.len()
+                    && other.tokens.starts_with(&entry.tokens));
+                (ancestor, entry.last_use, entry.kind == SnapshotKind::Turn, id)
+            }).map(|(&id, _)| id)
     }
 
     /// On a device miss: rebuild the best host snapshot on the device so the device path finds
