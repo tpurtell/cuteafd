@@ -1,4 +1,4 @@
-"""Resumable package publication; invoke only after TJ approves this exact tree.
+"""Resumable HTTP LFS package publication; invoke only after TJ approves this exact tree.
 
 No auto-publish hook exists. CPU assembly never imports or calls this module.
 """
@@ -10,7 +10,8 @@ import json
 from pathlib import Path
 
 from hub_requirements import require_qualified_hub
-from kimi_k3.uniform_k2.storage import atomic_json, sha256_file
+import hub_lfs
+from kimi_k3.uniform_k2.storage import atomic_json, sha256_file, verify_receipt
 
 
 DESTINATIONS = {
@@ -25,7 +26,11 @@ DESTINATIONS = {
 
 
 def publication_inventory(output):
-    """Pure local approval packet; does not contact HF or preupload bytes."""
+    """Pure local approval packet; does not contact HF or preupload bytes.
+
+    New shards reuse the writer's streaming SHA256 receipt (stat-checked), so
+    approval and upload never reread their weights; metadata is hashed.
+    """
     from mc_package import load_json, PARENTS
     output = Path(output)
     state = load_json(output / 'package-state.json')
@@ -35,10 +40,16 @@ def publication_inventory(output):
     family = state['identity']['family']
     new = sorted(state['new_files'] + ['package-validation.json', 'package-provenance.json'])
     expected_hashes = validation['new_file_sha256']
+    receipts = state.get('new_shards', {})
     files = {}
     for name in new:
         path = output / name
-        digest = sha256_file(path)
+        receipt = receipts.get(name, {})
+        if receipt.get('hash_algorithm', 'sha256') == 'sha256' and 'sha256' in receipt:
+            verify_receipt(path, receipt)  # stat only: the writer hashed its byte stream.
+            digest = receipt['sha256']
+        else:
+            digest = sha256_file(path)
         if name in expected_hashes and digest != expected_hashes[name]:
             raise ValueError('validated new file changed: ' + name)
         files[name] = dict(bytes=path.stat().st_size, sha256=digest)
@@ -76,9 +87,8 @@ def publication_inventory(output):
 def verified_remote_tree(api, repo, commit, expected, attributes):
     """Keep content exact, allowing only Hub-added literal LFS attributes."""
     from huggingface_hub import hf_hub_download
-    from upload_model import _remote
 
-    actual = _remote(api, repo, commit)
+    actual = hub_lfs.remote_tree(api, repo, commit)
     if actual == expected:
         return actual, None
     name = '.gitattributes'
@@ -104,14 +114,18 @@ def verified_remote_tree(api, repo, commit, expected, attributes):
     return actual, delta
 
 
-def publish(output, state_root, approved_packet, *, api=None):
-    """Publish exactly the separately reviewed packet. Never call before approval."""
-    from huggingface_hub import CommitOperationAdd, CommitOperationCopy, HfApi
+def publish(output, state_root, approved_packet, *, api=None, options=None):
+    """Publish exactly the separately reviewed packet. Never call before approval.
+
+    Verified HTTP LFS batch commits on a guarded parent; the first batch also
+    carries the server-side parent copies. Resume reads the remote tree and
+    never sends a committed file again.
+    """
+    from huggingface_hub import CommitOperationCopy, HfApi
     from huggingface_hub.errors import RepositoryNotFoundError
-    from upload_model import _remote, _restored_operation
-    from write_export import _fingerprint
 
     require_qualified_hub()
+    options = options or hub_lfs.UploadOptions()
     output, state_root = Path(output).resolve(), Path(state_root).resolve()
     if output == state_root or output in state_root.parents or state_root in output.parents:
         raise ValueError('upload state must be disjoint from package')
@@ -127,7 +141,7 @@ def publish(output, state_root, approved_packet, *, api=None):
             raise ValueError('resumable upload plan differs')
         atomic_json(plan, packet)
         repo = packet['repo_id']
-        parent_remote = _remote(api, packet['parent_repo'], packet['parent_revision'])
+        parent_remote = hub_lfs.remote_tree(api, packet['parent_repo'], packet['parent_revision'])
         if not set(packet['copies'].values()) <= parent_remote.keys():
             raise ValueError('copy source file absent from pinned parent')
         for target, source in packet['copies'].items():
@@ -143,73 +157,63 @@ def publish(output, state_root, approved_packet, *, api=None):
             except RepositoryNotFoundError:
                 api.create_repo(repo, repo_type='model', private=False)
                 info = api.repo_info(repo, repo_type='model')
-            if info.private or set(_remote(api, repo, info.sha)) - {'.gitattributes'}:
+            if info.private or set(hub_lfs.remote_tree(api, repo, info.sha)) - {'.gitattributes'}:
                 raise ValueError('destination must be new, empty and public')
             guard = dict(commit=info.sha)
             atomic_json(guard_path, guard)
-        info = api.repo_info(repo, repo_type='model')
-        if info.private:
-            raise ValueError('destination became private')
-        if info.sha != guard['commit'] and not (state_root / 'upload-complete.json').exists():
-            # A lost commit reply is recoverable only after every preupload receipt exists.
-            records = state_root / 'preuploaded'
-            if any(not (records / (hashlib.sha256(n.encode()).hexdigest() + '.json')).exists()
-                   for n in packet['new_files']):
-                raise ValueError('destination moved before preparation completed')
-        operations, expected = [], {}
-        for target, source in sorted(packet['copies'].items()):
-            operations.append(CommitOperationCopy(src_path_in_repo=source, path_in_repo=target,
-                src_revision=packet['parent_revision'], src_repo_id=packet['parent_repo'], src_repo_type='model'))
-            expected[target] = parent_remote[source]
-        uploads = state_root / 'preuploaded'
-        uploads.mkdir(exist_ok=True)
-        for name, planned in sorted(packet['new_files'].items()):
+        copies = {target: parent_remote[source] for target, source in packet['copies'].items()}
+        files = {}
+        for name, planned in packet['new_files'].items():
             path = output / name
-            local = _fingerprint(path)
-            if local['bytes'] != planned['bytes'] or sha256_file(path) != planned['sha256']:
+            files[name] = dict(path=str(path), bytes=planned['bytes'], sha256=planned['sha256'],
+                               git_blob=None if name.endswith('.safetensors') else hub_lfs.git_blob(path),
+                               local=hub_lfs.fingerprint(path))
+            if files[name]['local']['bytes'] != planned['bytes']:
                 raise ValueError('upload source changed after approval: ' + name)
-            record_path = uploads / (hashlib.sha256(name.encode()).hexdigest() + '.json')
-            if record_path.exists():
-                record = json.loads(record_path.read_text())
-                if record['local'] != local:
-                    raise ValueError('preuploaded file changed: ' + name)
-                operation = _restored_operation(name, str(path), record)
-            else:
-                operation = CommitOperationAdd(name, str(path))
-                api.preupload_lfs_files(repo, [operation], repo_type='model', revision='main',
-                                       num_threads=1, free_memory=False, gitignore_content='')
-                mode = operation._upload_mode
-                if operation._should_ignore or mode not in ('lfs', 'regular'):
-                    raise ValueError('unexpected upload classification')
-                if mode == 'lfs':
-                    if not operation._is_uploaded or not operation.upload_info.is_hashed:
-                        raise ValueError('preupload was not acknowledged')
-                    blob = operation.upload_info.sha256.hex()
-                    if blob != planned['sha256']:
-                        raise ValueError('uploaded LFS checksum differs')
+        attributes = (output / '.gitattributes').read_bytes()
+
+        def expected_tree(tree, names):
+            """Exact rows for committed ``names`` plus every server-side copy."""
+            expected = dict(copies)
+            for name in names:
+                if name not in tree:
+                    raise ValueError('published inventory differs from approved tree')
+                if name == '.gitattributes' and not hub_lfs.matches(tree[name], files[name]):
+                    # Hub-appended LFS rules are checked by verified_remote_tree.
+                    expected[name] = dict(bytes=files[name]['bytes'], blob=files[name]['git_blob'])
                 else:
-                    if planned['bytes'] > 64 << 20:
-                        raise ValueError('unexpected large regular upload')
-                    raw = path.read_bytes()
-                    blob = hashlib.sha1(f'blob {len(raw)}\0'.encode() + raw).hexdigest()
-                record = dict(mode=mode, bytes=planned['bytes'], blob=blob, local=local)
-                atomic_json(record_path, record)
-            if record['bytes'] != planned['bytes'] or (record['mode'] == 'lfs' and record['blob'] != planned['sha256']):
-                raise ValueError('preupload receipt differs from approved bytes: ' + name)
-            if _fingerprint(path) != local or sha256_file(path) != planned['sha256']:
-                raise ValueError('upload source changed during preupload: ' + name)
-            operations.append(operation)
-            expected[name] = dict(bytes=record['bytes'], blob=record['blob'])
+                    expected[name] = hub_lfs.resolved(tree[name], files[name], name)
+            return expected
+
         info = api.repo_info(repo, repo_type='model')
         if info.private:
             raise ValueError('destination became private')
-        attributes = (output / '.gitattributes').read_bytes()
+        done = set()
         if info.sha != guard['commit']:
-            verified_remote_tree(api, repo, info.sha, expected, attributes)
-            commit = info.sha
-        else:
-            commit = api.create_commit(repo, operations, repo_type='model', revision='main',
-                parent_commit=guard['commit'], commit_message='Publish calibrated EXL3 checkpoint with original native core').oid
+            # Earlier batches (or a lost commit reply) landed. The first batch carries
+            # every copy and our attributes, so any other moved head is refused.
+            tree = hub_lfs.remote_tree(api, repo, info.sha)
+            done = hub_lfs.committed_names(tree, files, fixed=copies, ignore={'.gitattributes'})
+            if not set(copies) <= set(tree) or not done or '.gitattributes' not in tree:
+                raise ValueError('destination moved before the first verified batch')
+            done.add('.gitattributes')
+            verified_remote_tree(api, repo, info.sha, expected_tree(tree, done), attributes)
+        pending = [name for name in hub_lfs.upload_order(files) if name not in done]
+        leading = [] if done else [CommitOperationCopy(src_path_in_repo=source, path_in_repo=target,
+            src_revision=packet['parent_revision'], src_repo_id=packet['parent_repo'], src_repo_type='model')
+            for target, source in sorted(packet['copies'].items())]
+
+        def verify(commit, batch, operations):
+            done.update(batch)
+            verified_remote_tree(api, repo, commit, expected_tree(hub_lfs.remote_tree(api, repo, commit), done),
+                                 attributes)
+
+        commit = info.sha
+        if pending or leading:
+            commit = hub_lfs.commit_batches(api, repo, files, pending, revision=info.sha, leading=leading,
+                commit_message='Publish calibrated EXL3 checkpoint with original native core', options=options,
+                check_sources=lambda batch: hub_lfs.check_fingerprints(files, batch), verify=verify)
+        expected = expected_tree(hub_lfs.remote_tree(api, repo, commit), files)
         published, normalization = verified_remote_tree(api, repo, commit, expected, attributes)
         anonymous = HfApi(token=False)
         if anonymous.model_info(repo, revision=commit).sha != commit:
@@ -219,3 +223,26 @@ def publish(output, state_root, approved_packet, *, api=None):
                        server_normalized_attributes=normalization)
         atomic_json(state_root / 'upload-complete.json', receipt)
         return receipt
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--state', type=Path, help='upload state root (required to publish)')
+    parser.add_argument('--approved-packet', type=Path, help='separately approved inventory JSON')
+    parser.add_argument('--inventory-only', action='store_true')
+    hub_lfs.add_arguments(parser)
+    args = parser.parse_args()
+    if args.inventory_only:
+        print(json.dumps(publication_inventory(args.output)), flush=True)
+        return
+    if args.state is None or args.approved_packet is None:
+        parser.error('publication requires --state and --approved-packet')
+    receipt = publish(args.output, args.state, json.loads(args.approved_packet.read_text()),
+                      options=hub_lfs.options_from(args))
+    print(json.dumps({key: receipt[key] for key in ('status', 'repo_id', 'commit')}), flush=True)
+
+
+if __name__ == '__main__':
+    main()

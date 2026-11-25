@@ -1,7 +1,8 @@
 """Publish a numbered-shard revision using server-side copies, never weight uploads.
 
 Default is local preparation/validation only. --publish authorizes a single
-parent-guarded Hub commit and cache ref advance. Old exports/receipts survive.
+parent-guarded Hub commit (server-side copies, deletes and the HTTP LFS index
+upload through hub_lfs) and cache ref advance. Old exports/receipts survive.
 """
 import argparse
 import copy
@@ -11,7 +12,8 @@ import os
 from pathlib import Path
 import re
 
-from huggingface_hub import CommitOperationAdd, CommitOperationCopy, CommitOperationDelete, HfApi
+from huggingface_hub import CommitOperationCopy, CommitOperationDelete, HfApi
+import hub_lfs
 from hub_requirements import require_qualified_hub
 
 from export_assets import asset_target
@@ -32,7 +34,7 @@ def numbered_mapping(files):
             for i, name in enumerate(sorted(shards, key=order), 1)}
 
 
-def run(manifest, source_state, state, output, parent, *, publish=False):
+def run(manifest, source_state, state, output, parent, *, publish=False, options=None):
     repo = manifest['publication']['repo_id']
     if repo != 'wrldsuksgo2mars/DeepSeek-V4.1-EXL3-K3.25-v1':
         raise ValueError('unexpected publication repository')
@@ -100,9 +102,18 @@ def run(manifest, source_state, state, output, parent, *, publish=False):
         operations = [CommitOperationCopy(src_path_in_repo=src, path_in_repo=dst, src_revision=parent)
                       for src, dst in mapping.items()]
         operations += [CommitOperationDelete(path_in_repo=src) for src in mapping if src not in mapping.values()]
-        operations.append(CommitOperationAdd(index_name, payload))
-        commit = api.create_commit(repo, operations, repo_type='model', revision='main',
-            parent_commit=parent, commit_message='Normalize all 52 shard filenames; preserve isolated PLE boundaries').oid
+        # Copies, deletes and the new index must land in one atomic commit.
+        index = dict(path=str(output / index_name), bytes=len(payload), sha256=expected[index_name]['blob'],
+                     local=hub_lfs.fingerprint(output / index_name))
+
+        def verify(commit, batch, operations):
+            if _remote(api, repo, commit) != expected:
+                raise ValueError('renamed remote inventory differs')
+
+        commit = hub_lfs.commit_batches(api, repo, {index_name: index}, [index_name], revision=parent,
+            leading=operations, commit_message='Normalize all 52 shard filenames; preserve isolated PLE boundaries',
+            options=options or hub_lfs.UploadOptions(),
+            check_sources=lambda batch: hub_lfs.check_fingerprints({index_name: index}, batch), verify=verify)
     else:
         commit = info.sha  # Recover a lost response only after exact inventory comparison.
     if _remote(api, repo, commit) != expected:
@@ -131,6 +142,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--parent', required=True)
     parser.add_argument('--publish', action='store_true')
+    hub_lfs.add_arguments(parser, batches=False)  # The rename is one atomic commit.
     args = parser.parse_args()
     run(json.loads(args.manifest.read_text()), args.source_state, args.state, args.output,
-        args.parent, publish=args.publish)
+        args.parent, publish=args.publish, options=hub_lfs.options_from(args))
