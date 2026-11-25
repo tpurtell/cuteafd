@@ -57,8 +57,8 @@
         "reason": "Pending v7 Release smoke (K8 compact)"
       },
       "2rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact)"
+        "status": "current",
+        "report": "benchmarks/glm5/2026-11-25-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-k8-compact-max"
       }
     },
     {
@@ -221,7 +221,7 @@
       "family": "glm5",
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
       "views": {
-        "k8-compact": null,
+        "k8-compact": "benchmarks/glm5/2026-11-25-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-k8-compact-max",
         "original": "benchmarks/glm5/2026-11-19-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-original-max",
         "k6-compact": null,
         "fp8-compact": null
