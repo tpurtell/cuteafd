@@ -106,6 +106,7 @@ pub(crate) struct MuseBackend<'r, 'a> {
     profile: RefCell<[f64; 2]>,
     graphs: Vec<super::graphs::Graphs<'a>>,
     graph_enabled: std::cell::Cell<bool>,
+    graph_cycles: RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
     graph_warming: std::cell::Cell<bool>,
     media_binding: super::media::Binding,
     /// Prefill units: rows and waves in flight; the sequence slots, context, pool pages.
@@ -183,7 +184,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             (Some(0), reason)
         } else { (None, String::new()) };
         Ok(Self { cfg, ranks, streams, table, experts: RefCell::new(experts), peer, library: ranks[0].device.library,
-            profile: RefCell::new([0.0; 2]), graphs: Vec::new(), graph_enabled: std::cell::Cell::new(false), graph_warming: std::cell::Cell::new(false), media_binding, unit_rows, packed_row_cap, packed_fallback_reason, waves, slots, decode_rows, context, host_prefix_bytes, pages, ring_rows,
+            profile: RefCell::new([0.0; 2]), graphs: Vec::new(), graph_cycles: RefCell::new(None), graph_enabled: std::cell::Cell::new(false), graph_warming: std::cell::Cell::new(false), media_binding, unit_rows, packed_row_cap, packed_fallback_reason, waves, slots, decode_rows, context, host_prefix_bytes, pages, ring_rows,
             local: RefCell::new(local), draft })
     }
 
@@ -194,6 +195,10 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             }
             self.graphs = self.ranks.iter().enumerate().map(|(rank, resources)|
                 super::graphs::Graphs::new(resources.device, rank, self.ranks.len(), onboard_layers)).collect::<Result<_>>()?;
+        }
+        if enabled {
+            let streams = self.ranks.iter().zip(&self.streams).map(|(r, &s)| (r.device.id,s)).collect::<Vec<_>>();
+            *self.graph_cycles.borrow_mut() = Some(crate::shared::decode_graph::device::EventCycles::new(self.library, &streams)?);
         }
         self.graph_enabled.set(enabled);
         if !enabled { return Ok(()); }
@@ -237,19 +242,30 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         warmed
     }
 
-    fn graph_completed(&self) -> Result<()> {
-        if !self.graphs.iter().any(|bank| bank.needs_boundary()) {
-            for bank in &self.graphs { bank.tick(); }
-            return Ok(());
+    fn begin_graph_cycle(&self) -> Result<()> {
+        if !self.graph_enabled.get() { return Ok(()) }
+        if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() {
+            // SAFETY: rank graph operands are persistent engine storage.
+            unsafe { cycles.begin_persistent(|visit| { for bank in &self.graphs { bank.visit(visit)?; } Ok(()) })?; }
         }
-        let wait = std::time::Instant::now();
-        self.diagnostic_sync()?;
-        crate::shared::decode_graph::device::record_boundary_drain(self.ranks.iter().map(|r| r.device.id), wait.elapsed());
-        // SAFETY: all participating ranks are joined; graphs retain no private allocations.
-        unsafe { crate::shared::decode_graph::device::observe_completed(self.library, |visit| {
-            for bank in &self.graphs { bank.visit(visit)?; }
-            Ok(())
-        }) }
+        Ok(())
+    }
+
+    fn graph_completed(&self) -> Result<()> {
+        if !self.graph_enabled.get() { return Ok(()) }
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        for bank in &self.graphs { bank.tick(); }
+        // SAFETY: all rank graph work for this step has been submitted.
+        unsafe { cycles.complete()?; }
+        if self.graph_warming.get() {
+            // Startup captures must be measured before the next geometry.
+            let wait = std::time::Instant::now();
+            self.diagnostic_sync()?;
+            cycles.record_drain(wait.elapsed());
+            cycles.poll()?;
+        }
+        Ok(())
     }
 
     pub(super) fn diagnostic_graph_width(&self) -> Option<usize> {
@@ -317,6 +333,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
                 crate::shared::decode_graph::device::Cycle::Verify
             } else { crate::shared::decode_graph::device::Cycle::Decode };
             for bank in &self.graphs { bank.cycle(cycle); }
+            self.begin_graph_cycle()?;
             let logits = forward::step(self.cfg, self.ranks, &self.streams, self.table, &tokens, &media, &meta, false, wave,
                 &mut **experts, peers, &mut self.local.borrow_mut(), self.draft.as_ref(),
                 0..rows,
