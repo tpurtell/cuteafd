@@ -122,3 +122,103 @@ impl Drop for EventWaiters {
         if let Err(error) = self.join() { tracing::error!(%error, "joining copy event waiters"); }
     }
 }
+
+enum BlockingRequest {
+    Wait {
+        device: i32,
+        event: *mut c_void,
+        done: Box<dyn FnOnce(Result<()>) + Send>,
+    },
+    Flush(mpsc::SyncSender<()>),
+}
+// SAFETY: submit's caller retains the recorded event until the callback fires
+// or flush/drop joins the worker; CUDA allows synchronizing events across host threads.
+unsafe impl Send for BlockingRequest {}
+
+/// Single sleeping OS waiter thread for blocking `cudaEventSynchronize` calls
+/// off an async executor thread (zero busy-poll on the runtime thread).
+pub struct BlockingEventWaiter {
+    queue: Option<mpsc::Sender<BlockingRequest>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl BlockingEventWaiter {
+    pub fn new(library: &NativeLibrary, name: impl Into<String>) -> Result<Self> {
+        let synchronize = library.cuteafd_cuda_event_synchronize()?;
+        let set_device = library.cuteafd_cuda_set_device()?;
+        let last_error = library.cuteafd_last_error()?;
+        let module = Arc::clone(&library.lib);
+        let (queue, pending) = mpsc::channel::<BlockingRequest>();
+        let worker = std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let _module = module;
+                while let Ok(request) = pending.recv() {
+                    match request {
+                        BlockingRequest::Flush(ack) => {
+                            let _ = ack.send(());
+                        }
+                        BlockingRequest::Wait { device, event, done } => {
+                            // SAFETY: module is retained, error buffer is local, and
+                            // submit's caller retains `event` until completion/flush.
+                            let status = unsafe {
+                                let status = set_device(device);
+                                if status == 0 { synchronize(event) } else { status }
+                            };
+                            let result = if status == 0 {
+                                Ok(())
+                            } else {
+                                let mut text = [0 as c_char; 512];
+                                // SAFETY: valid writable local buffer and retained function pointer.
+                                let message = if unsafe { last_error(text.as_mut_ptr(), text.len()) } == 0 {
+                                    text[text.len() - 1] = 0;
+                                    // SAFETY: final byte is explicitly NUL-terminated above.
+                                    unsafe { CStr::from_ptr(text.as_ptr()) }.to_string_lossy().into_owned()
+                                } else {
+                                    "last error unavailable".into()
+                                };
+                                Err(anyhow::anyhow!("blocking event wait returned status {status}: {message}"))
+                            };
+                            done(result);
+                        }
+                    }
+                }
+            })?;
+        Ok(Self { queue: Some(queue), worker: Some(worker) })
+    }
+
+    /// Submit a blocking `cudaEventSynchronize` for `event` on `device`.
+    /// # Safety
+    /// `event` was created on `device` (ideally with `cuda_event_create_blocking`)
+    /// and remains live and un-rerecorded until `done` fires or [`Self::flush`] returns.
+    pub unsafe fn submit(
+        &self,
+        device: i32,
+        event: *mut c_void,
+        done: Box<dyn FnOnce(Result<()>) + Send>,
+    ) -> Result<()> {
+        self.queue.as_ref().context("blocking event waiter closed")?
+            .send(BlockingRequest::Wait { device, event, done })
+            .map_err(|_| anyhow::anyhow!("blocking event waiter thread exited"))
+    }
+
+    /// Wait until every previously submitted event wait has returned.
+    pub fn flush(&self) -> Result<()> {
+        let Some(queue) = self.queue.as_ref() else { return Ok(()) };
+        let (ack_tx, ack_rx) = mpsc::sync_channel(0);
+        queue.send(BlockingRequest::Flush(ack_tx))
+            .map_err(|_| anyhow::anyhow!("blocking event waiter thread exited"))?;
+        ack_rx.recv().map_err(|_| anyhow::anyhow!("blocking event waiter flush interrupted"))
+    }
+}
+
+impl Drop for BlockingEventWaiter {
+    fn drop(&mut self) {
+        self.queue.take();
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                tracing::error!("blocking event waiter thread panicked");
+            }
+        }
+    }
+}
