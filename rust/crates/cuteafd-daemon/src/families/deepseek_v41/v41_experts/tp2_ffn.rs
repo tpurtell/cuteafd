@@ -416,7 +416,22 @@ impl<'a> Execution<'a> {
                 upload.device.library.cuda_stream_wait_event(upload.raw, after)
             })?;
         }
-        let unresolved_dependency = deferred || upload_after.is_some();
+        let head_pending = if deferred {
+            crate::shared::memory::chain::head_unresolved(upload.device.library)?
+        } else {
+            false
+        };
+        let after_pending = match upload_after {
+            Some(after) => unsafe {
+                crate::shared::memory::chain::event_unresolved(
+                    upload.device.library,
+                    local as i32,
+                    after,
+                )?
+            },
+            None => false,
+        };
+        let unresolved_dependency = head_pending || after_pending;
         let peer = self.window.apply(self.peers[remote].values.buffer, 10240);
         let sm = self.sm[remote].as_ref();
         upload.device.run(|| unsafe {
@@ -464,11 +479,16 @@ impl<'a> Execution<'a> {
         let mut output = self.window.apply(self.output[destination].buffer, 10240);
         output.bytes = rows as usize * 10240;
         let sm = self.sm[destination].as_ref();
+        let unresolved_dependency = if deferred {
+            crate::shared::memory::chain::head_unresolved(stream.device.library)?
+        } else {
+            false
+        };
         let queued = stream.device.run(|| unsafe {
             if deferred {
                 crate::shared::memory::chain::join(stream.device.library, stream.raw)?;
             }
-            peer_copy(stream, sm, deferred, output, source, output.bytes)
+            peer_copy(stream, sm, unresolved_dependency, output, source, output.bytes)
         });
         let drained = stream.complete().await;
         queued.and(drained)?;
@@ -533,11 +553,16 @@ impl<'a> Execution<'a> {
         let peer = self.peers[remote].buffers().into_iter().zip(widths)
             .map(|(buffer, width)| self.window.apply(buffer, width)).collect::<Vec<_>>();
         let peer: [CuteafdDeviceBuffer; 4] = peer.try_into().ok().unwrap();
+        let unresolved_dependency = if deferred {
+            crate::shared::memory::chain::head_unresolved(upload.device.library)?
+        } else {
+            false
+        };
         let sm = self.sm[remote].as_ref();
         upload.device.run(|| {
             for ((source, destination), width) in inputs.into_iter().zip(peer).zip(widths) {
                 unsafe {
-                    peer_copy(upload, sm, deferred, destination, source, rows as usize * width)?;
+                    peer_copy(upload, sm, unresolved_dependency, destination, source, rows as usize * width)?;
                 }
             }
             Ok(())
@@ -1145,12 +1170,15 @@ mod shared_storage_tests {
         assert!(sm_peer_copy_for_dependency(true, decode_bytes, DECODE_PEER_COPY_BYTES));
         assert!(sm_peer_copy_for_dependency(true, DECODE_PEER_COPY_BYTES, DECODE_PEER_COPY_BYTES));
         assert!(!sm_peer_copy_for_dependency(true, prefill_bytes, DECODE_PEER_COPY_BYTES));
-        // Confirm execute_shared_on_after keeps both the staged_event wait and
-        // unresolved-dependency routing to peer_copy.
+        // Confirm execute_shared_on_after keeps the staged_event wait and bases
+        // unresolved_dependency on actual non-blocking cudaEventQuery wait state
+        // (head_unresolved / event_unresolved), not on `deferred` alone.
         let src = include_str!("tp2_ffn.rs");
         let shared = &src[src.find("pub async unsafe fn execute_shared_on_after(").unwrap()..];
         let shared = &shared[..shared.find("pub async unsafe fn return_result(").unwrap()];
         assert!(shared.contains("cuda_stream_wait_event(upload.raw, after)"));
-        assert!(shared.contains("let unresolved_dependency = deferred || upload_after.is_some();"));
+        assert!(shared.contains("head_unresolved("));
+        assert!(shared.contains("event_unresolved("));
+        assert!(shared.contains("let unresolved_dependency = head_pending || after_pending;"));
     }
 }
