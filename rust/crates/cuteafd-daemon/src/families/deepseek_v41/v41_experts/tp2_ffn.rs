@@ -241,19 +241,24 @@ impl Drop for Execution<'_> {
     }
 }
 /// Copies `bytes` from `source` (the other GPU) into `destination` on
-/// `stream`: an SM copy ordered by events under a device-ordered pass (no
-/// copy-engine queue held behind an event), else a copy-engine peer copy.
+/// `stream`: an SM copy on the lane's own stream when waiting on an unresolved
+/// upstream device dependency (so a blocked packet never parks CUDA's shared
+/// P2P copy engine), else a copy-engine peer copy.
 unsafe fn peer_copy(
     stream: &Stream<'_>,
     sm: Option<&cuteafd_ffi::V41PeerCopy<'_>>,
+    unresolved_dependency: bool,
     destination: CuteafdDeviceBuffer,
     source: CuteafdDeviceBuffer,
     bytes: usize,
 ) -> Result<()> {
-    // The issuing stream is this wave's own, ordered by `cudaStreamWaitEvent`
-    // only (never a memory wait), so copy-engine peer transfers do not park
-    // other lanes' DMA (`device::sm_peer_copy_for_stream`).
-    match sm.filter(|_| crate::shared::memory::device::sm_peer_copy_for_stream(crate::shared::memory::chain::deferred(), true, bytes, crate::shared::memory::device::DECODE_PEER_COPY_BYTES)) {
+    match sm.filter(|_| {
+        crate::shared::memory::device::sm_peer_copy_for_dependency(
+            unresolved_dependency,
+            bytes,
+            crate::shared::memory::device::DECODE_PEER_COPY_BYTES,
+        )
+    }) {
         Some(sm) => unsafe { sm.launch(destination, source, bytes, stream.raw) },
         None => unsafe {
             stream
@@ -391,14 +396,15 @@ impl<'a> Execution<'a> {
         );
         // Peer DMA is never queued behind an unresolved dependency: settle any
         // chained producer of `values` on the host first.
-        if !crate::shared::memory::chain::deferred() {
+        let deferred = crate::shared::memory::chain::deferred();
+        if !deferred {
             crate::shared::memory::chain::settle(self.streams[0].device.library)?;
         }
         let local = values.device_id as usize;
         let remote = 1 - local;
         let upload = &self.streams[remote];
         let mut guard = upload.cancellation_guard("TP2 shared input upload");
-        if crate::shared::memory::chain::deferred() {
+        if deferred {
             // Both GPUs' streams follow the input's producers (the chain head).
             self.streams[0].join_chain()?;
             self.streams[1].join_chain()?;
@@ -410,11 +416,12 @@ impl<'a> Execution<'a> {
                 upload.device.library.cuda_stream_wait_event(upload.raw, after)
             })?;
         }
+        let unresolved_dependency = deferred || upload_after.is_some();
         let peer = self.window.apply(self.peers[remote].values.buffer, 10240);
         let sm = self.sm[remote].as_ref();
-        upload
-            .device
-            .run(|| unsafe { peer_copy(upload, sm, peer, values, rows as usize * 10240) })?;
+        upload.device.run(|| unsafe {
+            peer_copy(upload, sm, unresolved_dependency, peer, values, rows as usize * 10240)
+        })?;
         let mut inputs = [values; 2];
         inputs[remote] = peer;
         let output = unsafe {
@@ -449,7 +456,8 @@ impl<'a> Execution<'a> {
                 && source.bytes >= rows as usize * 10240,
             "invalid TP2 result transfer"
         );
-        if !crate::shared::memory::chain::deferred() {
+        let deferred = crate::shared::memory::chain::deferred();
+        if !deferred {
             crate::shared::memory::chain::settle(self.streams[0].device.library)?;
         }
         let stream = &self.streams[destination];
@@ -457,10 +465,10 @@ impl<'a> Execution<'a> {
         output.bytes = rows as usize * 10240;
         let sm = self.sm[destination].as_ref();
         let queued = stream.device.run(|| unsafe {
-            if crate::shared::memory::chain::deferred() {
+            if deferred {
                 crate::shared::memory::chain::join(stream.device.library, stream.raw)?;
             }
-            peer_copy(stream, sm, output, source, output.bytes)
+            peer_copy(stream, sm, deferred, output, source, output.bytes)
         });
         let drained = stream.complete().await;
         queued.and(drained)?;
@@ -512,10 +520,11 @@ impl<'a> Execution<'a> {
         // Do not submit DMA behind an unresolved stream dependency: a blocked
         // copy packet can hold up independent lanes on the shared copy engine.
         // Chained producers of these inputs are settled on the host as well.
-        if !crate::shared::memory::chain::deferred() {
+        let deferred = crate::shared::memory::chain::deferred();
+        if !deferred {
             crate::shared::memory::chain::settle(upload.device.library)?;
         }
-        if crate::shared::memory::chain::deferred() {
+        if deferred {
             self.streams[0].join_chain()?;
             self.streams[1].join_chain()?;
         } else {
@@ -528,7 +537,7 @@ impl<'a> Execution<'a> {
         upload.device.run(|| {
             for ((source, destination), width) in inputs.into_iter().zip(peer).zip(widths) {
                 unsafe {
-                    peer_copy(upload, sm, destination, source, rows as usize * width)?;
+                    peer_copy(upload, sm, deferred, destination, source, rows as usize * width)?;
                 }
             }
             Ok(())
@@ -1121,5 +1130,27 @@ mod shared_storage_tests {
     #[test]
     fn peer_input_storage_bytes_equal_planned_allocations() {
         assert_eq!(PeerInputs::allocation_sizes(8192).into_iter().sum::<usize>(),8192*15568);
+    }
+
+    #[test]
+    fn peer_copy_uses_sm_only_for_unresolved_decode_dependencies() {
+        use crate::shared::memory::device::{sm_peer_copy_for_dependency, DECODE_PEER_COPY_BYTES};
+        let decode_bytes = 55 * 10240;
+        let prefill_bytes = 256 * 10240;
+        // Resolved host-settled copy (deferred=false, upload_after=None): CE.
+        assert!(!sm_peer_copy_for_dependency(false, decode_bytes, DECODE_PEER_COPY_BYTES));
+        assert!(!sm_peer_copy_for_dependency(false, prefill_bytes, DECODE_PEER_COPY_BYTES));
+        // Unresolved chain head or Spark-staging event (deferred || upload_after.is_some()):
+        // decode-width uses SM on the lane's own stream; prefill stays on CE.
+        assert!(sm_peer_copy_for_dependency(true, decode_bytes, DECODE_PEER_COPY_BYTES));
+        assert!(sm_peer_copy_for_dependency(true, DECODE_PEER_COPY_BYTES, DECODE_PEER_COPY_BYTES));
+        assert!(!sm_peer_copy_for_dependency(true, prefill_bytes, DECODE_PEER_COPY_BYTES));
+        // Confirm execute_shared_on_after keeps both the staged_event wait and
+        // unresolved-dependency routing to peer_copy.
+        let src = include_str!("tp2_ffn.rs");
+        let shared = &src[src.find("pub async unsafe fn execute_shared_on_after(").unwrap()..];
+        let shared = &shared[..shared.find("pub async unsafe fn return_result(").unwrap()];
+        assert!(shared.contains("cuda_stream_wait_event(upload.raw, after)"));
+        assert!(shared.contains("let unresolved_dependency = deferred || upload_after.is_some();"));
     }
 }

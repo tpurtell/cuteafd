@@ -385,10 +385,11 @@ impl<'a> OwnerReduce<'a> {
             dtype != PartialDtype::Bf16 || matches!(layout, PartialLayout::Routes { .. }),
             "BF16 owner reduction requires route planes"
         );
-        let bytes = rows as usize
-            * self.geometry.hidden as usize
+        let row_bytes = self.geometry.hidden as usize
             * columns
             * if dtype == PartialDtype::F32 { 4 } else { 2 };
+        let bytes = rows as usize * row_bytes;
+        let decode_lane_bytes = crate::shared::memory::device::DECODE_PEER_COPY_ROWS * row_bytes;
         ensure!(
             local.device.id == self.output.device.id
                 && local.buffer.bytes >= bytes
@@ -412,11 +413,12 @@ impl<'a> OwnerReduce<'a> {
         // and drains copy/reduction on any partial enqueue or cancellation.
         unsafe {
             self.transfer
-                .copy_then(
+                .copy_then_with_limit(
                     remote,
                     &mut self.staging,
                     remote_producer,
                     bytes,
+                    decode_lane_bytes,
                     |peer, stream| {
                         output
                             .device

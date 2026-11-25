@@ -454,11 +454,15 @@ impl Drop for Event<'_> {
     }
 }
 
-/// The widest decode-width peer transfer: a decode lane's 80 rows
-/// (`DECODE_LANE_ROWS`, the compiled cover of the 64-row verify width) of a
-/// 10240-byte BF16 hidden row. Every decode/verify transfer is at most this;
-/// every prefill unit (>= 256 rows, `V41_LIVE_MIN_ROWS`) is wider.
-pub(crate) const DECODE_PEER_COPY_BYTES: usize = 80 * 10240;
+/// The widest decode-width peer transfer row count: a decode lane's 80 rows
+/// (`DECODE_LANE_ROWS`, the compiled cover of the 64-row verify width). Every
+/// decode/verify transfer is at most this many rows; every prefill unit
+/// (>= 256 rows, `V41_LIVE_MIN_ROWS`) is wider.
+pub(crate) const DECODE_PEER_COPY_ROWS: usize = 80;
+
+/// The widest decode-width single-stream BF16 hidden peer transfer (`80` rows
+/// of a 10240-byte BF16 hidden row).
+pub(crate) const DECODE_PEER_COPY_BYTES: usize = DECODE_PEER_COPY_ROWS * 10240;
 
 /// Whether a device-ordered peer copy of `bytes` runs as an SM copy on the
 /// issuing stream (ordered by its event waits) instead of on a copy engine.
@@ -471,21 +475,23 @@ pub(crate) fn sm_peer_copy_for(deferred: bool, bytes: usize, decode_lane_bytes: 
     deferred && bytes <= decode_lane_bytes
 }
 
-/// Variant of [`sm_peer_copy_for`] for streams ordered solely by CUDA events
-/// (`cudaStreamWaitEvent`, never a device memory wait). Measured on V4.1 max
-/// two-lane C16 (`v41-step23-max2-c16-nsys`, `m1` vs `m2`): routing event-only
-/// decode peer copies through the copy engine cuts peer transfer time 2.7x
-/// (`318.9 -> 116.7 ms`), eliminates correlated 350-650 us `copy_regions` SM
-/// stalls (`359.3 -> 58.2 us` avg, `429.0 -> 11.6 us` p50), improves `HTOD`/
-/// `DTOD` copy latency (`1.0 -> 0.6 us` / `3.0 -> 1.4 us`, zero lane parking),
-/// and lifts C16 throughput `+10.3%` (`746.4 -> 823.3 tok/s`).
-pub(crate) fn sm_peer_copy_for_stream(
-    deferred: bool,
-    event_only: bool,
+/// Variant of [`sm_peer_copy_for`] keyed on whether the issuing stream waits on
+/// an unresolved upstream device dependency (such as a `StageChain` head,
+/// Spark-staging event, or unsettled producer event).
+///
+/// Any decode-width peer copy with an unresolved upstream dependency must run
+/// through the SM peer-copy kernel on the lane's own stream rather than enter
+/// CUDA's shared per-device P2P copy-engine channel (`cudaMemcpyPeerAsync`),
+/// because a blocked CE packet head-of-line blocks independent lanes and
+/// `dSpark` on the same GPU pair. Already-resolved copies (`unresolved_dependency
+/// == false`, e.g. host-settled passes and non-chained callers) and
+/// prefill-width transfers (`bytes > decode_lane_bytes`) keep the copy engine.
+pub(crate) fn sm_peer_copy_for_dependency(
+    unresolved_dependency: bool,
     bytes: usize,
     decode_lane_bytes: usize,
 ) -> bool {
-    !event_only && sm_peer_copy_for(deferred, bytes, decode_lane_bytes)
+    sm_peer_copy_for(unresolved_dependency, bytes, decode_lane_bytes)
 }
 
 /// Same-device handoff behind an upstream device wait. Decode-sized payloads
@@ -532,15 +538,24 @@ mod peer_copy_choice_tests {
             assert!(sm_peer_copy_for(true, 80 * row_bytes, 80 * row_bytes));
             assert!(!sm_peer_copy_for(true, 81 * row_bytes, 80 * row_bytes));
         }
-        // Event-only streams (PeerTransfer, TP2 FFN) always use the copy engine.
-        for deferred in [false, true] {
-            for bytes in [0, 10240, DECODE_PEER_COPY_BYTES, DECODE_PEER_COPY_BYTES + 1] {
-                assert!(!super::sm_peer_copy_for_stream(deferred, true, bytes, DECODE_PEER_COPY_BYTES));
-                assert_eq!(
-                    super::sm_peer_copy_for_stream(deferred, false, bytes, DECODE_PEER_COPY_BYTES),
-                    sm_peer_copy_for(deferred, bytes, DECODE_PEER_COPY_BYTES),
-                );
-            }
+        // Already-resolved copies keep the copy engine (#2747); decode-width
+        // copies waiting on an unresolved upstream dependency use SM on the
+        // lane's own stream so they never HOL-block the shared P2P CE channel.
+        for bytes in [0, 10240, DECODE_PEER_COPY_BYTES, DECODE_PEER_COPY_BYTES + 1] {
+            assert!(!super::sm_peer_copy_for_dependency(false, bytes, DECODE_PEER_COPY_BYTES));
+            assert_eq!(
+                super::sm_peer_copy_for_dependency(true, bytes, DECODE_PEER_COPY_BYTES),
+                bytes <= DECODE_PEER_COPY_BYTES,
+            );
+        }
+        // Wider decode rows (F32 OwnerReduce partials and 4-stream mHC hops)
+        // scale their decode ceiling by row width while prefill stays on CE.
+        for row_bytes in [20480usize, 40960] {
+            let decode_cap = super::DECODE_PEER_COPY_ROWS * row_bytes;
+            assert!(super::sm_peer_copy_for_dependency(true, 52 * row_bytes, decode_cap));
+            assert!(super::sm_peer_copy_for_dependency(true, decode_cap, decode_cap));
+            assert!(!super::sm_peer_copy_for_dependency(true, 256 * row_bytes, decode_cap));
+            assert!(!super::sm_peer_copy_for_dependency(false, 52 * row_bytes, decode_cap));
         }
     }
 }
@@ -585,7 +600,16 @@ impl<'a> PeerTransfer<'a> {
     pub async unsafe fn copy_then(&mut self, source: &Allocation<'a>, destination: &mut Allocation<'a>,
         producer: &Stream<'a>, bytes: usize,
         then: impl FnMut(CuteafdDeviceBuffer, *mut c_void) -> Result<()>) -> Result<()> {
-        unsafe { self.copy_then_ordered(source, destination, producer, bytes, None, then).await }
+        unsafe { self.copy_then_ordered_with_limit(source, destination, producer, bytes, DECODE_PEER_COPY_BYTES, None, then).await }
+    }
+    /// As [`Self::copy_then`] with an explicit decode-lane byte ceiling for
+    /// wider-than-BF16 decode rows (such as F32 TP2 expert partials).
+    /// # Safety
+    /// Same buffer and stream contract as `copy_then`.
+    pub async unsafe fn copy_then_with_limit(&mut self, source: &Allocation<'a>, destination: &mut Allocation<'a>,
+        producer: &Stream<'a>, bytes: usize, decode_lane_bytes: usize,
+        then: impl FnMut(CuteafdDeviceBuffer, *mut c_void) -> Result<()>) -> Result<()> {
+        unsafe { self.copy_then_ordered_with_limit(source, destination, producer, bytes, decode_lane_bytes, None, then).await }
     }
     /// As [`Self::copy_then`]; under device ordering, `guard` (when given)
     /// replaces the join to the whole chain head. The destination stream then
@@ -598,6 +622,11 @@ impl<'a> PeerTransfer<'a> {
     /// streams releases the guard after its read.
     pub async unsafe fn copy_then_ordered(&mut self, source: &Allocation<'a>, destination: &mut Allocation<'a>,
         producer: &Stream<'a>, bytes: usize, guard: Option<&super::row_window::ScratchGuard<'a>>,
+        then: impl FnMut(CuteafdDeviceBuffer, *mut c_void) -> Result<()>) -> Result<()> {
+        unsafe { self.copy_then_ordered_with_limit(source, destination, producer, bytes, DECODE_PEER_COPY_BYTES, guard, then).await }
+    }
+    async unsafe fn copy_then_ordered_with_limit(&mut self, source: &Allocation<'a>, destination: &mut Allocation<'a>,
+        producer: &Stream<'a>, bytes: usize, decode_lane_bytes: usize, guard: Option<&super::row_window::ScratchGuard<'a>>,
         mut then: impl FnMut(CuteafdDeviceBuffer, *mut c_void) -> Result<()>) -> Result<()> {
         let library = self.destination.device.library;
         ensure!(source.device.id == self.ready.device.id
@@ -611,9 +640,12 @@ impl<'a> PeerTransfer<'a> {
         let mut drain = self.destination.cancellation_guard("cancelled peer transfer");
         self.ready.device.run(|| unsafe { library.cuda_event_record(self.ready.raw, producer.raw) })?;
         let deferred = super::chain::deferred();
-        // `self.destination` waits on CUDA events only, never a memory wait, so
-        // copy-engine peer transfers do not park other lanes' DMA.
-        let sm = self.sm.as_ref().filter(|_| sm_peer_copy_for_stream(deferred, true, bytes, DECODE_PEER_COPY_BYTES));
+        // Under device ordering, `producer` has not been awaited on the host
+        // and `self.destination` joins `self.ready` plus the guard/chain head:
+        // route decode-width copies through SM `peer_copy` so an unmet upstream
+        // dependency never parks the shared P2P copy engine. Already-resolved
+        // passes (`!deferred`) and prefill widths keep the copy engine.
+        let sm = self.sm.as_ref().filter(|_| sm_peer_copy_for_dependency(deferred, bytes, decode_lane_bytes));
         self.destination.device.run(|| unsafe {
             library.cuda_stream_wait_event(self.destination.raw, self.ready.raw)?;
             // The destination's previous readers precede this write: the
@@ -630,9 +662,6 @@ impl<'a> PeerTransfer<'a> {
             }
             match sm {
                 Some(sm) => sm.launch(destination.buffer, source.buffer, bytes, self.destination.raw)?,
-                // Device-ordered passes copy on the copy engines too (#815,
-                // prof13): this stream waits on events only, never a memory
-                // wait, so it holds no other lane's DMA behind it.
                 None => library.copy_peer_async(destination.buffer, source.buffer, bytes, self.destination.raw)?,
             }
             then(destination.buffer, self.destination.raw)

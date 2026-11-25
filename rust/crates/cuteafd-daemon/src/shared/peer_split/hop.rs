@@ -89,10 +89,12 @@ impl<'a> DirectInputHop<'a> {
             // on the device and becomes the new head: no host wait. Decode-width
             // transfers copy on the SMs, prefill-width on the copy engines
             // (`device::sm_peer_copy_for`); this stream waits on events only.
+            let decode_lane_bytes = crate::shared::memory::device::DECODE_PEER_COPY_ROWS
+                .saturating_mul(self.contract.row_bytes as usize);
             return device.run(|| unsafe {
                 crate::shared::memory::chain::join(device.library, self.destination.raw)?;
                 for (source, destination) in sources.into_iter().zip(destinations) {
-                    match self.sm.as_ref().filter(|_| crate::shared::memory::device::sm_peer_copy_for(true, source.bytes, crate::shared::memory::device::DECODE_PEER_COPY_BYTES)) {
+                    match self.sm.as_ref().filter(|_| crate::shared::memory::device::sm_peer_copy_for_dependency(true, source.bytes, decode_lane_bytes)) {
                         Some(sm) => sm.launch(destination, source, source.bytes, self.destination.raw)?,
                         None => device.library.copy_peer_async(destination, source, source.bytes,
                             self.destination.raw)?,
