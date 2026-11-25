@@ -14,7 +14,7 @@ set(CUTEAFD_VISION_ATTENTION_OUTPUTS)
 # command (legacy keeps its byte-identical two-object command below). Without it,
 # ARGS exports the supplied PROGRAMS as one group in an isolated directory.
 function(cuteafd_vision_owner_entry name)
-  cmake_parse_arguments(E "WINDOWED" "HEAD_DIM;POINTWISE_GROUP;DIRECTORY;BORROW_POINTWISE_GROUP" "PROGRAMS;ARGS;POINTWISE_PROGRAMS;POINTWISE_ARGS;BORROW_POINTWISE_PROGRAMS" ${ARGN})
+  cmake_parse_arguments(E "WINDOWED" "HEAD_DIM;POINTWISE_GROUP;DIRECTORY" "PROGRAMS;ARGS;POINTWISE_PROGRAMS;POINTWISE_ARGS;BORROW_POINTWISE_GROUP;BORROW_POINTWISE_PROGRAMS" ${ARGN})
   if(NOT E_HEAD_DIM OR NOT E_PROGRAMS OR E_UNPARSED_ARGUMENTS)
     message(FATAL_ERROR "Incomplete vision owner entry ${name}")
   endif()
@@ -66,13 +66,20 @@ function(cuteafd_vision_owner_entry name)
     endforeach()
     foreach(stem IN LISTS E_POINTWISE_PROGRAMS)
       if(stem IN_LIST E_BORROW_POINTWISE_PROGRAMS)
-        get_property(borrowed_programs GLOBAL PROPERTY "CUTEAFD_VISION_GROUP_PROGRAMS_${E_BORROW_POINTWISE_GROUP}")
-        if(NOT stem IN_LIST borrowed_programs)
+        set(found_borrow_group "")
+        foreach(borrow_group IN LISTS E_BORROW_POINTWISE_GROUP)
+          get_property(borrowed_programs GLOBAL PROPERTY "CUTEAFD_VISION_GROUP_PROGRAMS_${borrow_group}")
+          if(stem IN_LIST borrowed_programs)
+            set(found_borrow_group "${borrow_group}")
+            break()
+          endif()
+        endforeach()
+        if(NOT found_borrow_group)
           message(FATAL_ERROR "Vision group ${E_BORROW_POINTWISE_GROUP} does not export ${stem}")
         endif()
         get_property(borrowed_directory GLOBAL PROPERTY "CUTEAFD_VISION_PROGRAM_DIR_${stem}")
         if(NOT borrowed_directory)
-          set(borrowed_directory "${CUTEAFD_VISION_ATTENTION_DIR}/pointwise_${E_BORROW_POINTWISE_GROUP}")
+          set(borrowed_directory "${CUTEAFD_VISION_ATTENTION_DIR}/pointwise_${found_borrow_group}")
         endif()
         string(JSON size LENGTH "${programs}")
         string(JSON programs SET "${programs}" ${size}
@@ -198,11 +205,13 @@ endforeach()
 # Registration alone does not qualify runtime dispatch, which stays oracle-gated.
 set(tower_inventory "${CMAKE_CURRENT_LIST_DIR}/../../../python/tools/aot/vision_tower_programs.py")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${tower_inventory}")
-foreach(kind kimi minimax hy4f)
+foreach(kind kimi minimax hy4f hy4)
   if(kind STREQUAL "kimi")
     set(dim 128)
   elseif(kind STREQUAL "hy4f")
     set(dim 72)
+  elseif(kind STREQUAL "hy4")
+    set(dim 96)
   else()
     set(dim 80)
   endif()
@@ -216,10 +225,20 @@ foreach(kind kimi minimax hy4f)
     message(FATAL_ERROR "Generic tower inventory must start with geometry-keyed dynamic attention")
   endif()
   list(REMOVE_AT tower_programs 0)
+  set(borrow_groups muse)
   set(borrowed_programs)
   if(kind STREQUAL "kimi")
     # These use the same media/pointwise builders and keys as Muse.
     set(borrowed_programs vision_projection_h4096_o4096 vision_gelu_h4096)
+  elseif(kind STREQUAL "hy4")
+    # Reuse identical compiled objects from earlier groups to keep symbols unique.
+    set(borrow_groups muse tower_minimax tower_hy4f)
+    set(borrowed_programs
+      vision_patches_raster_p16_t1
+      vision_residual_h1536
+      vision_gelu_h6144
+      vision_biased_projection_h1536_o1536
+      vision_biased_projection_h6144_o6144)
   endif()
   set(attention_args --group tower --tower ${kind})
   foreach(stem IN LISTS tower_programs)
@@ -228,7 +247,7 @@ foreach(kind kimi minimax hy4f)
   cuteafd_vision_owner_entry(tower_${kind} HEAD_DIM ${dim}
     PROGRAMS ${first_program} ARGS ${attention_args}
     POINTWISE_GROUP tower_${kind} POINTWISE_PROGRAMS ${tower_programs}
-    BORROW_POINTWISE_GROUP muse BORROW_POINTWISE_PROGRAMS ${borrowed_programs}
+    BORROW_POINTWISE_GROUP ${borrow_groups} BORROW_POINTWISE_PROGRAMS ${borrowed_programs}
     POINTWISE_ARGS --group tower --tower ${kind} --omit-program ${first_program})
 endforeach()
 get_property(owner_outputs GLOBAL PROPERTY CUTEAFD_VISION_OWNER_OUTPUTS)

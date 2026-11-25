@@ -827,6 +827,35 @@
         "coverage_unit_columns": 128,
         "legacy_unit_columns": 128
       }
+    },
+    "hy4:exl3": {
+      "intermediate": 2048,
+      "minimum": 3,
+      "maximum": 8,
+      "basis": "lower_bound",
+      "worlds": [
+        3,
+        4,
+        5,
+        6,
+        7,
+        8
+      ],
+      "checkpoints": [
+        {
+          "model": "wrldsuksgo2mars/Hy4-EXL3-K4-MC",
+          "revision": "67346c4bdee2d8694606b4b4db9a96442e8667b7",
+          "routed_expert_bytes": 373020662784
+        }
+      ],
+      "provenance_note": "Published safetensors headers at 67346c4bdee2d8694606b4b4db9a96442e8667b7: 77 routed layers (1..77) x 256 experts x three 6144x2048 K4 MUL1 projections (59,136 .mul1 tensors, zero .mcg; 373,020,662,784 bytes).",
+      "native_layout": {
+        "unit_columns": 128,
+        "storage_alignment": 1,
+        "exact_worlds": [],
+        "coverage_unit_columns": 128,
+        "legacy_unit_columns": 128
+      }
     }
   },
   "provenance_notes": {

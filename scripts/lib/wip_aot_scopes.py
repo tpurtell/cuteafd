@@ -31,7 +31,7 @@ DEFAULT_MODEL_ID = 'deepseek-ai/DeepSeek-V4.1-Flash-1017'
 V41_RELEASES = ('deepseek-ai/DeepSeek-V4.1-Flash', 'deepseek-ai/DeepSeek-V4.1-Flash-1017')
 PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_v2='MIMO', qwen4='QWEN4',
                         qwen3_5='QWEN_DENSE', step5='STEP5', kimi_k3='KIMIK3', muse_spark='MUSE', mistral_large4='ML4', minimax_m3='MINIMAX',
-                        inkling2='INKLING2', inkling2_mini='INKLING2_MINI', hy4_flash='HY4F')
+                        inkling2='INKLING2', inkling2_mini='INKLING2_MINI', hy4_flash='HY4F', hy4='HY4')
 # Families whose bundled vision tower runs the shared BF16 attention exports
 # (native/shared/cuda/vision_runtime.cu shared-runtime towers, including PE and
 # independent still towers). MiMo's ABI-1 tower and V4.1's own tower need none.
@@ -598,6 +598,14 @@ def family_scopes(cards, config_reader):
             scopes.add('hy4f:exl3-k45-mul1')
             if count:
                 counts.add(f"hy4f={count}")
+        if family == 'hy4':
+            env['CUTEAFD_WIP_HY4_AOT'] = 'ON'
+            suffix = exl3_codebook_suffix(family, values)
+            if suffix != '-mul1':
+                raise ValueError('hy4 routed EXL3 checkpoints ship MUL1 only')
+            scopes.add('hy4:exl3-k45-mul1')
+            if count:
+                counts.add(f"hy4={count}")
         # EXLR8 checkpoints retain family coordinator programs without expert packages.
         exlr8 = bool(values.get('EXLR8_MANIFEST'))
         if exlr8:
