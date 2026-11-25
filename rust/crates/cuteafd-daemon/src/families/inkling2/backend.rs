@@ -1,5 +1,5 @@
 //! Inkling adapter for the shared request scheduler; no family scheduling loop.
-use super::{cache::{InklingPrefix, Placement}, engine::Execution};
+use super::{cache::{InklingPrefix, Placement}, engine::Execution, prefill::HeadRows};
 use crate::shared::{prefix::{CudaCopyEngine, PrefixArgs}, probe,
     prefill_packing::{Limits, MemberOutcome}, prefill_pipeline::{sequence_units, Unit, UnitSegment},
     qwen::scheduler::{self, Backend}, token_io::{DeviceLogits, TokenSelector}};
@@ -19,6 +19,27 @@ fn check_writable(placement: &Placement, rows: usize, context: usize, pool: &Ref
             "Inkling append requires private nonaliased COW pages");
     }
     Ok(())
+}
+
+/// One request's append units. A unit gets a head segment only when it holds
+/// a row `heads` asks for: the last unit for serving, and those reaching the
+/// scored suffix (1-based `first`) for streamed scoring.
+fn append_units(start: usize, rows: usize, unit_rows: usize, waves: usize, layers: usize,
+    heads: Option<HeadRows>) -> Result<Vec<Unit>> {
+    let end = start+rows;
+    let mut units = sequence_units(rows, unit_rows, waves, layers)?;
+    for unit in &mut units {
+        unit.rows = unit.rows.start+start..unit.rows.end+start;
+        let head = match heads {
+            None => false,
+            Some(HeadRows::All) => true,
+            Some(HeadRows::MemberLast) => unit.rows.end == end,
+            Some(HeadRows::FromPosition(first)) => unit.rows.end >= first,
+        };
+        unit.segments = vec![UnitSegment { sequence: 0, rows: 0..unit.rows.len(), tokens: unit.rows.clone(),
+            prompt_end: unit.rows.end == end, snapshot: false, head }];
+    }
+    Ok(units)
 }
 
 fn decode_spans(widths: impl IntoIterator<Item = usize>, capacity: usize) -> Result<Vec<std::ops::Range<usize>>> {
@@ -112,19 +133,16 @@ impl<'a> InklingBackend<'a> {
         check_writable(placement, tokens.len(), self.context, pool)
 
     }
-    fn append(&self, placement: &mut Placement, tokens: &[u32], heads: bool, pool: &RefPagePool,
+    /// `heads` names the rows whose logits the callback reads; units holding
+    /// none of them only normalize (and tap, with a drafter).
+    fn append(&self, placement: &mut Placement, tokens: &[u32], heads: Option<HeadRows>, pool: &RefPagePool,
         callback: &mut dyn FnMut(usize, usize, DeviceLogits) -> Result<()>) -> Result<()> {
         self.check(placement, tokens, pool)?;
         let start = placement.len;
-        let layers = self.execution.borrow().cfg.layers;
-        let mut units = sequence_units(tokens.len(), self.unit_rows, self.waves, layers)?;
-        for unit in &mut units {
-            unit.rows = unit.rows.start+start..unit.rows.end+start;
-            unit.segments = vec![UnitSegment { sequence: 0, rows: 0..unit.rows.len(), tokens: unit.rows.clone(),
-                prompt_end: unit.rows.end == start+tokens.len(), snapshot: false, head: heads }];
-        }
+        let units = append_units(start, tokens.len(), self.unit_rows, self.waves,
+            self.execution.borrow().cfg.layers, heads)?;
         let mut next = [placement.clone()];
-        self.execution.borrow_mut().prefill(&mut next, &[tokens], &units, 1, callback)?;
+        self.execution.borrow_mut().prefill(&mut next, &[tokens], &units, 1, heads.unwrap_or(HeadRows::All), callback)?;
         *placement = next.into_iter().next().unwrap();
         Ok(())
     }
@@ -269,7 +287,7 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     fn prefill_device(&self, placement: &mut Placement, tokens: &[u32], rows: usize, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         ensure!(rows <= 1, "Inkling prefill head retains one row; scoring streams tiles");
         let mut last = None;
-        self.append(placement, tokens, rows > 0, pool, &mut |_, _, logits| {
+        self.append(placement, tokens, (rows > 0).then_some(HeadRows::MemberLast), pool, &mut |_, _, logits| {
             let offset = (logits.rows-1)*logits.stride*4;
             last = Some(DeviceLogits { ptr: logits.ptr.wrapping_byte_add(offset), rows: 1, ..logits }); Ok(())
         })?;
@@ -281,7 +299,7 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
         ensure!(rows <= tokens.len(), "Inkling score suffix exceeds submitted rows");
         let first = placement.len+tokens.len()-rows+1;
         let scoring = probe::ScoringRows { consumer: probe, position };
-        self.append(placement, tokens, rows > 0, pool, &mut |_, at, logits| {
+        self.append(placement, tokens, (rows > 0).then_some(HeadRows::FromPosition(first)), pool, &mut |_, at, logits| {
             let end = at.checked_add(logits.rows).context("Inkling score tile overflow")?;
             if end > first {
                 let skip = first.saturating_sub(at);
@@ -316,7 +334,7 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
                 rows: segment.first..segment.end_row(), tokens: segment.start..segment.start+segment.rows,
                 prompt_end: true, snapshot: false, head: true }).collect() };
         let mut last = (0..sequences.len()).map(|_| None).collect::<Vec<_>>();
-        self.execution.borrow_mut().prefill(&mut placements, &sources, &[unit], 1, &mut |member, position, logits| {
+        self.execution.borrow_mut().prefill(&mut placements, &sources, &[unit], 1, HeadRows::MemberLast, &mut |member, position, logits| {
             if position+logits.rows == chunks[member].0+chunks[member].1+1 {
                 let offset = (logits.rows-1)*logits.stride*4;
                 let logits = DeviceLogits { ptr: logits.ptr.wrapping_byte_add(offset), rows: 1, ..logits };
@@ -431,6 +449,48 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Vocabulary projections a call issues: one per projected 64-row span.
+    fn projections(units: &[Unit], heads: HeadRows) -> Result<usize> {
+        units.iter().map(|unit| Ok(super::super::prefill::projected_spans(unit.rows.len(), &unit.segments, heads)?
+            .into_iter().filter(|(_, project)| *project).count())).sum()
+    }
+
+    #[test]
+    fn serving_prefill_projects_one_head_span_per_member_not_every_64_rows() -> Result<()> {
+        for (start, rows, unit_rows, waves) in [(0, 8192, 4096, 2), (0, 8192, 2048, 4), (37, 8191, 4096, 2),
+            (0, 100, 4096, 2), (5000, 3000, 4096, 3), (0, 65, 256, 1)] {
+            let serving = append_units(start, rows, unit_rows, waves, 1, Some(HeadRows::MemberLast))?;
+            assert_eq!(projections(&serving, HeadRows::MemberLast)?, 1, "{rows} rows from {start}");
+            assert_eq!(serving.iter().filter(|unit| unit.segments[0].head).count(), 1);
+            let last = serving.last().unwrap();
+            assert!(last.segments[0].head && last.rows.end == start+rows);
+            // The old shape: every unit a head segment, every row projected.
+            let every = append_units(start, rows, unit_rows, waves, 1, Some(HeadRows::All))?;
+            assert_eq!(projections(&every, HeadRows::All)?,
+                every.iter().map(|unit| unit.rows.len().div_ceil(64)).sum::<usize>());
+            let none = append_units(start, rows, unit_rows, waves, 1, None)?;
+            assert_eq!(projections(&none, HeadRows::MemberLast)?, 0);
+        }
+        // Packed prefill: three members in one unit, one projection each, even
+        // when two members' last rows share a span.
+        let segment = |sequence, rows: std::ops::Range<usize>, start| UnitSegment { sequence,
+            tokens: start..start+rows.len(), rows, prompt_end: true, snapshot: false, head: true };
+        let unit = Unit { index: 0, sequence: 0, rows: 0..3000, layers: 0..1, slot: 0, barrier: false,
+            segments: vec![segment(0, 0..1000, 0), segment(1, 1000..1010, 64), segment(2, 1010..3000, 7)] };
+        let spans = super::super::prefill::projected_spans(3000, &unit.segments, HeadRows::MemberLast)?;
+        let projected = spans.iter().filter(|(_, project)| *project).map(|(span, _)| span.clone()).collect::<Vec<_>>();
+        assert_eq!(projected, [960..1024, 2944..3000]);
+        assert_eq!(projections(std::slice::from_ref(&unit), HeadRows::MemberLast)?, 2);
+        assert_eq!(spans.len(), 3000usize.div_ceil(64));
+        // Streamed scoring projects the spans reaching the scored suffix only.
+        let scoring = append_units(0, 8192, 4096, 2, 1, Some(HeadRows::FromPosition(8192-99)))?;
+        assert_eq!(scoring.iter().filter(|unit| unit.segments[0].head).count(), 1);
+        assert_eq!(projections(&scoring, HeadRows::FromPosition(8192-99))?, 2);
+        let scoring = append_units(0, 8192, 4096, 2, 1, Some(HeadRows::FromPosition(4000)))?;
+        assert_eq!(projections(&scoring, HeadRows::FromPosition(4000))?, 8192/64-3999/64);
+        Ok(())
+    }
 
     #[test]
     fn teacher_forced_windows_commit_receipts_and_draft_taps_before_next_decode() -> Result<()> {

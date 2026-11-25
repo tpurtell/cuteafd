@@ -1,6 +1,6 @@
 //! Single-rank and head-parallel arithmetic on the shared request scheduler.
 use super::{cache::Placement, experts::Dispatcher, head::Head, layers::Kernels,
-    owners::RequestOwners, prefill::{Stateful, TokenIo}, weights::TargetWeights};
+    owners::RequestOwners, prefill::{HeadRows, Stateful, TokenIo}, weights::TargetWeights};
 use crate::shared::{prefill_pipeline::Unit, spark_intake::SparkLink, token_io::DeviceLogits};
 use anyhow::{ensure, Result};
 use cuteafd_loader::families::inkling2::Inkling2Config;
@@ -84,7 +84,7 @@ impl<'a> Execution<'a> {
     /// Tokens are submitted suffixes; placement frontiers define their origins
     /// while unit members retain absolute request-local causal spans. Every scratch head is consumed before another overwrites it.
     pub fn prefill(&mut self, placements: &mut [Placement], tokens: &[&[u32]], units: &[Unit],
-        version: u64, on_logits: &mut dyn FnMut(usize, usize, DeviceLogits) -> Result<()>) -> Result<()> {
+        version: u64, head_rows: HeadRows, on_logits: &mut dyn FnMut(usize, usize, DeviceLogits) -> Result<()>) -> Result<()> {
         ensure!(!self.terminal && placements.len() == tokens.len(), "Inkling execution terminal or request count differs");
         let slots = placements.iter().map(|placement| placement.slot).collect::<Vec<_>>();
         let starts = placements.iter().map(|placement| placement.len).collect::<Vec<_>>();
@@ -93,7 +93,7 @@ impl<'a> Execution<'a> {
             let waves = self.link.exchange()?;
             let (peer_head, peer_units) = self.peer.as_mut().map(|peer| peer.units(false)).unzip();
             let mut io = TokenIo { kernels: &self.kernels, head: &self.head, peer_head, cache: &self.requests.cache,
-                target: &self.target, cfg: &self.cfg, tokens, media: &media, starts: &starts, slots: &slots, retained_rows: false, draft:self.draft.as_deref(),publish_draft:true,trace:None,on_logits };
+                target: &self.target, cfg: &self.cfg, tokens, media: &media, starts: &starts, slots: &slots, retained_rows: false, head_rows, draft:self.draft.as_deref(),publish_draft:true,trace:None,on_logits };
             Stateful { graphs: None, peer: peer_units, kernels: &self.kernels, owners: &self.requests.prefill, cache: &self.requests.cache,
                 target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements, uploads: &mut self.requests.prefill_uploads,
                 waves, onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
@@ -131,7 +131,7 @@ impl<'a> Execution<'a> {
             let waves = self.link.exchange()?;
             let (peer_head, peer_units) = self.peer.as_mut().map(|peer| peer.units(true)).unzip();
             let mut io = TokenIo { kernels: &self.kernels, head: &self.head, peer_head, cache: &self.requests.cache,
-                target: &self.target, cfg: &self.cfg, tokens, media: &media, starts: &starts, slots: &slots, retained_rows: true, draft:self.draft.as_deref(),publish_draft:false,trace:self.width_trace.as_ref(),
+                target: &self.target, cfg: &self.cfg, tokens, media: &media, starts: &starts, slots: &slots, retained_rows: true, head_rows: HeadRows::All, draft:self.draft.as_deref(),publish_draft:false,trace:self.width_trace.as_ref(),
                 on_logits: &mut |_, _, _| Ok(()) };
             Stateful { graphs: self.graphs.as_mut(), peer: peer_units, kernels: &self.kernels, owners: std::slice::from_ref(&self.requests.decode),
                 cache: &self.requests.cache, target: &self.target, cfg: &self.cfg, ingress: &self.ingress, placements,
