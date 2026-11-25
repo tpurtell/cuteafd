@@ -2090,12 +2090,12 @@ def test_dense_qwen_engine_graph_lifetime_reconciliation_contract():
     dual = (root / "rust/crates/cuteafd-daemon/src/families/qwen3_5/dual.rs").read_text()
     assert dual.index("pub stream: Stream") < dual.index("pub graphs: graphs::Graphs")
     assert 'self.owner_stream(rank)' in graph and 'peer.graphs' in graph
-    assert 'for (device, graphs) in &banks' in graph
+    assert "cycles.begin_persistent(" in graph
     assert 'self.enter_layer(index, step.rows)?' in graph
     assert 'capture("first_request")' in scheduler
     assert "nodes < 2" in graph
     assert 'spans_devices: super::super::graph_sites::spans("qwen3_5.segment", false)' in graph
-    assert graph.count("device::observe_completed(") == 1
+    assert "cycles.complete()" in graph
     assert "cache_ticket" in graph and "cache_commit" in graph
     assert "GraphOwner" in graph and "struct Executable" not in graph
     assert "golden_decode_graphs" in graph

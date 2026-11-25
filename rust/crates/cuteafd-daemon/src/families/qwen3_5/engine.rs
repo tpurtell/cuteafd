@@ -37,6 +37,7 @@ pub(crate) struct DenseEngine<'a> {
     stream: Stream<'a>,
     peer: Option<dual::Peer<'a>>,
     graphs: graphs::Graphs<'a>,
+    graph_cycles: std::cell::RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
     pub(crate) cfg: Qwen35Config,
     pub(crate) kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
     programs: &'a Programs<'a>,
@@ -338,7 +339,11 @@ impl<'a> DenseEngine<'a> {
             "dense native planner KV differs from actual runtime allocations");
         tracing::info!("dense native planner equals actual weight, KV, state, replay, workspace and prefix allocations");
         cfg.max_context = usize::try_from(admitted_plan.served_context())?;
-        Ok(Self { stream, peer, graphs, cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
+        let graph_cycles = if graphs.enabled {
+            let streams = std::iter::once((stream.device.id, stream.raw)).chain(peer.iter().map(|p| (p.stream.device.id,p.stream.raw))).collect::<Vec<_>>();
+            Some(crate::shared::decode_graph::device::EventCycles::new(device.library, &streams)?)
+        } else { None };
+        Ok(Self { stream, peer, graphs, graph_cycles: std::cell::RefCell::new(graph_cycles), cfg, kv_format, programs, admitted, embedding, weights, homes, bank, kv, planes,
             _planes: std::mem::take(&mut allocated), ids, logits, head, head_rows: buffers.head_rows, _head_workspace: head_workspace,
             pool_tokens, admitted_host_config: host_config, position: 0, slots: vec![rows::Slot { position: 0, pages: Vec::new() }; slots],
             prefix_arena, prefix_marks, healthy: true, tap_layers: None, verification })
