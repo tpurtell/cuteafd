@@ -345,6 +345,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     };
     execution.graphs = attach(0, &execution.requests.decode.stream)?;
     if let Some(peer) = &mut execution.peer { peer.graphs = attach(1, &peer.requests.decode.stream)?; }
+    execution.enable_graph_cycles()?;
     // Runtime backends now retain the same code sampled before weights.
     drop(module_pins); drop(exl3_modules);
     phase.log("inkling2 request owners and transport bootstrap");

@@ -106,6 +106,8 @@ impl<'a> DecodeGraphs<'a> {
     pub(super) fn cycle(&mut self, cycle: Cycle) {
         self.bank.cache_cycle(cycle);
     }
+    pub(super) fn first_touch_pending(&self) -> bool { self.first_touch_pending }
+    #[cfg(test)]
     pub(super) fn needs_boundary(&self) -> bool {
         self.first_touch_pending || self.bank.cache_needs_boundary()
     }

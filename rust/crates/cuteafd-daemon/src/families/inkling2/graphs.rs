@@ -57,9 +57,7 @@ impl<'a> DecodeGraphs<'a> {
     }
 
     pub(super) fn cycle(&mut self, cycle: Cycle) { self.bank.cache_cycle(cycle); }
-    pub(super) fn needs_boundary(&self) -> bool {
-        self.first_touch_pending || self.bank.cache_needs_boundary()
-    }
+    pub(super) fn first_touch_pending(&self) -> bool { self.first_touch_pending }
     pub(super) fn observed(&mut self) { self.first_touch_pending = false; }
     pub(super) fn tick(&mut self) { self.bank.cache_tick(); }
 
