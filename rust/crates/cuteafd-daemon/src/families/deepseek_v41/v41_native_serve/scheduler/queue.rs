@@ -57,7 +57,7 @@ pub(in crate::families::deepseek_v41::v41_native_serve) trait Host<T, C> {
     /// A fresh cursor: the left prompt's state (its suffix arena) drops now.
     fn rest(&self) -> C;
     /// Where this host's queue waits are counted (the serve loop's counters).
-    fn phases(&self) -> &super::phase_stats::PhaseStats { &super::phase_stats::GLOBAL }
+    fn phases(&self) -> &crate::shared::phase_stats::PhaseStats { &crate::shared::phase_stats::GLOBAL }
 }
 
 /// A packed pass that failed (every member stores the error) may have left a
@@ -172,7 +172,7 @@ mod tests {
     /// links is the bug #2475's review found, so it panics.
     struct FakeHost { whole: bool, rows: usize, waves: usize, log: Rc<RefCell<Vec<(usize, Range<usize>)>>>,
         leases: BTreeSet<usize>, admitted: Vec<(usize, usize)>, failed: Vec<(usize, String)>, sleep: Duration,
-        resets: usize, dirty: bool, fault: Option<usize>, phases: super::super::phase_stats::PhaseStats }
+        resets: usize, dirty: bool, fault: Option<usize>, phases: crate::shared::phase_stats::PhaseStats }
     impl Host<Prompt, Cursor> for FakeHost {
         type Output = usize;
         fn run(&mut self, request: &mut Prompt, cursor: &mut Cursor) -> Result<Option<usize>> {
@@ -206,13 +206,13 @@ mod tests {
             super::super::round_failure::mark_recovered(&mut request.packed)
         }
         fn rest(&self) -> Cursor { Cursor::default() }
-        fn phases(&self) -> &super::super::phase_stats::PhaseStats { &self.phases }
+        fn phases(&self) -> &crate::shared::phase_stats::PhaseStats { &self.phases }
     }
 
     fn host(share: f64, rows: usize, waves: usize) -> FakeHost {
         FakeHost { whole: share == 0.0, rows, waves, log: Rc::default(), leases: BTreeSet::new(), admitted: Vec::new(),
             failed: Vec::new(), sleep: Duration::ZERO, resets: 0, dirty: false, fault: None,
-            phases: super::super::phase_stats::PhaseStats::new() }
+            phases: crate::shared::phase_stats::PhaseStats::new() }
     }
     fn queue(host: &mut FakeHost, share: f64, prompts: &[usize], closed: &Rc<RefCell<BTreeSet<usize>>>)
         -> PrefillQueue<Queued<Prompt, Cursor>> {

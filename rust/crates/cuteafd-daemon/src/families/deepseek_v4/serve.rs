@@ -629,6 +629,9 @@ fn prefill_group(engine: &super::engine::Engine<'_>, loaded: &super::Loaded,
     selector: &mut TokenSelector<'_>, transports: &mut [crate::shared::spark_intake::SparkLink<'_>],
     group: &mut [Prefill<'_>]) -> Vec<Result<Chunk>> {
     let timer = Instant::now();
+    for p in group.iter() {
+        crate::shared::phase_stats::GLOBAL.record_first_chunk_wait(p.chunks, p.started, timer);
+    }
     let ends = group.iter().map(|p| p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len())).collect::<Vec<_>>();
     let counts = group.iter().zip(&ends).map(|(p, end)| end - p.placement.len).collect::<Vec<_>>();
     let result = (|| {
@@ -740,7 +743,7 @@ fn schedule(
                         cache.tick();
                         publish(engine, stats, requests, generated_total, 0, 0, &cache, &reserve, 0);
                         console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
-                        match receive.blocking_recv() {
+                        match crate::shared::phase_stats::GLOBAL.time_idle_wait(|| receive.blocking_recv()) {
                             Some(job) => job,
                             None => return Ok(()),
                         }
@@ -892,6 +895,7 @@ fn schedule(
                             anyhow::bail!("client went away");
                         }
                         let timer = Instant::now();
+                        crate::shared::phase_stats::GLOBAL.record_first_chunk_wait(p.chunks, p.started, timer);
                         let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                         let last = end == p.tokens.len();
                         let chunk = &p.tokens[p.placement.len..end];
@@ -1035,10 +1039,15 @@ fn schedule(
             }
             continue;
         }
+        let members = active.len() as u64;
+        let prefill_waiting = !prefills.is_empty();
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, eos, transports,
             runtime, &mut lane, &mut active, &mut shared, selector, &family, &mut cache, &mut states, cycle)))?
-            else { continue };
+            else {
+            crate::shared::phase_stats::GLOBAL.record_decode_call(cycle.elapsed().as_nanos() as u64, prefill_waiting, members);
+            continue;
+        };
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
@@ -1067,7 +1076,9 @@ fn schedule(
         publish(engine, stats, requests, generated_total, active.len(), prefills.len(), &cache, &reserve, stalled.len());
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len() + stalled.len(), prefills.len(),
             receive.len() + kv_waiter.len()));
-        prefills.stepped(cycle.elapsed().as_secs_f64());
+        let elapsed = cycle.elapsed();
+        crate::shared::phase_stats::GLOBAL.record_decode_call(elapsed.as_nanos() as u64, prefill_waiting, members);
+        prefills.stepped(elapsed.as_secs_f64());
     }
     })
 }
