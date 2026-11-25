@@ -118,7 +118,7 @@ int main() {
   check(cuteafd_cuda_graph_begin_capture(pending) == CUTEAFD_STATUS_OK);
   check(cuLaunchKernel(function, 1, 1, 1, 1, 1, 1, 0,
       reinterpret_cast<CUstream>(pending), args, nullptr) == CUDA_SUCCESS);
-  check(cuteafd_cuda_graph_end_capture(pending, &graph) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_graph_end_capture_for_test(pending, &graph) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_graph_launch(graph, pending) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_stream_synchronize(pending) == CUTEAFD_STATUS_OK);
   unsigned actual = 0;
