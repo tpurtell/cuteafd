@@ -129,7 +129,7 @@ ROW_FILE = re.compile(r'row-[0-9]+\.safetensors\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 # Key result lines across the families' goldens.
-KEY_LINE = re.compile(r'(?i)(admission|prefill logits|decode logits|logits digest|top-1|agreement|mean nll|mean kl|'
+KEY_LINE = re.compile(r'(?i)(admission|context-only|nll sanity|prefill logits|decode logits|logits digest|top-1|agreement|mean nll|mean kl|'
                       r'resume at|resume check|vs one straight|byte-identical|rows:|verify|layer +[0-9]+: cosine|'
                       r'test result|^test |^running [0-9]+ test|'
                       r'\berror\b|panicked|failed|refus|out of memory|golden-run:)')
@@ -1740,7 +1740,10 @@ def write_summary(state, records, comparisons):
             lines += ['', f"workers (ready after {r.get('workers_ready_s', '-')} s):", '', '```',
                       *(worker_lines(run_dir / 'workers') or ['(no worker logs)']), '```']
     if comparisons:
-        lines += ['', '## Logits comparisons', '', '| a | b | repeat | file | byte-identical | rows | max abs diff | mean KL | max KL | top-1 | worst row |',
+        lines += ['', '## Logits comparisons', '',
+                  'KL and top-1 here are arm-vs-arm numerics drift between two runs of the same fixture, '
+                  'not a quality score against a reference: context-only fixture: no quality verdict '
+                  '(use the published fidelity set).', '', '| a | b | repeat | file | byte-identical | rows | max abs diff | arm-drift mean KL | arm-drift max KL | arm-drift top-1 | worst row |',
                   '|---|---|---|---|---|---|---|---|---|---|---|']
         for c in comparisons:
             if c.get('error'):

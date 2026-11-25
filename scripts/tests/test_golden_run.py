@@ -395,6 +395,8 @@ def test_compare_logits_byte_identical_arms(env, monkeypatch):
     assert golden.main(argv) == 0
     summary = (env['home'] / '.cache/cuteafd/builds/gr/golden/summary.md').read_text()
     assert '| a | b | 1 | logits/logits.bin | True | 4 | 0.0000e+00 |' in summary
+    assert 'context-only fixture: no quality verdict (use the published fidelity set)' in summary
+    assert 'arm-drift mean KL' in summary and '| mean KL |' not in summary
 
 
 def test_require_identical_fails_on_differing_logits(env, monkeypatch):
@@ -428,6 +430,8 @@ def test_compare_tool_on_synthetic_logits(tmp_path):
     assert diff['top1_agreement'] < 1 and diff['top1_agreement'] >= 128 / 130
     assert diff['max_kl'] > diff['mean_kl'] > 0
     assert diff['nll_rows'] == 130 and diff['nll_a'] > 0
+    assert same['last_row_argmax_match'] is True and diff['last_row_argmax_match'] is True
+    assert 'last-row argmax match: True' in compare.describe(diff)
     with pytest.raises(ValueError):
         compare.compare(pa, pb, 7)
     cli = subprocess.run([sys.executable, str(COMPARE), str(pa), str(pa), '50'], capture_output=True, text=True)
