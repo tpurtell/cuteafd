@@ -108,6 +108,7 @@ impl<'a, P> Graphs<'a, P> {
         bootstrap_keys(self.rank, self.capacity, &sites)
     }
     pub(crate) fn cycle(&mut self, cycle: Cycle) { self.bank.cache_cycle(cycle); }
+    pub(crate) fn first_touch_pending(&self) -> bool { self.first_touch_pending }
     pub(crate) fn needs_boundary(&self) -> bool {
         self.first_touch_pending || self.bank.cache_needs_boundary()
     }

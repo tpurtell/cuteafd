@@ -115,6 +115,7 @@ pub(crate) struct MiniMaxBackend<'e, 'a> {
     owners: &'e Owners<'a>,
     cfg: &'e MiniMaxM3Config,
     execution: RefCell<ServingPrefill<'a>>,
+    graph_cycles: RefCell<crate::shared::decode_graph::device::EventCycles<'a>>,
     schedule: Requests,
     context: usize,
     host: Option<cuteafd_hostcache::config::Config>,
@@ -157,7 +158,9 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         }
         let schedule = Requests::new(state.capacity, served_context, cfg.layers, rank.prefill.len())?;
         drop(state);
-        Ok(Self { media_enabled: false, snapshot: Default::default(), owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
+        let streams = storage.ranks.iter().map(|rank| { let decode = rank.decode.borrow(); (decode.stream.device.id, decode.stream.raw) }).collect::<Vec<_>>();
+        let graph_cycles = crate::shared::decode_graph::device::EventCycles::new(rank.decode.borrow().stream.device.library, &streams)?;
+        Ok(Self { graph_cycles: RefCell::new(graph_cycles), media_enabled: false, snapshot: Default::default(), owners, cfg, execution: RefCell::new(execution), schedule, context: served_context,
             host, profile: RefCell::new([0.0; 2]), identities: RefCell::new(BTreeMap::new()),
             next_identity: Cell::new(1), pending: RefCell::new(None), terminal: Cell::new(false),
             selector_receipts: RefCell::new(None), packing })
@@ -274,28 +277,29 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
                 tokens: &request.tokens[row..row + 1], placement }
         }).collect::<Vec<_>>();
         let mut graphs = self.owners.graphs.borrow_mut();
+        // SAFETY: graphs retain their persistent storage through retirement.
+        unsafe { self.graph_cycles.borrow_mut().begin_persistent(|visit| {
+            for graph in graphs.iter_mut() { graph.visit(visit)?; } Ok(())
+        })?; }
         let result = self.execution.borrow_mut().decode(&self.owners.storage, self.cfg, &self.schedule,
             &requests, &mut graphs, captured);
         let logits = self.queued(result)?;
         let paired = self.owners.storage.ranks.len() > 1;
         if paired { self.completed_health()?; } // The paired executor drained its rank tails.
         for graph in graphs.iter_mut() { graph.tick(); }
-        let observe = graphs.iter().any(|graph| graph.needs_boundary());
+        let first_touch = graphs.iter().any(|graph| graph.first_touch_pending());
         let draft = self.owners.storage.draft_prefix.as_ref();
-        if !paired && (observe || draft.is_none()) {
-            // No drafter: canonical state publishes before selection. Graph
-            // maintenance likewise needs a completed sample.
+        // SAFETY: all graph-owner rank launches have been submitted.
+        unsafe { self.graph_cycles.borrow_mut().complete()?; }
+        if !paired && (first_touch || draft.is_none()) {
+            // No drafter requires publication before selection; first touch requires
+            // a settled module/workspace baseline before future capture.
             let wait = std::time::Instant::now();
             self.completed(Ok(()))?;
-            if observe && draft.is_some() { crate::shared::decode_graph::device::record_boundary_drain(self.owners.storage.ranks.iter().map(|r| r.decode.borrow().stream.device.id), wait.elapsed()); }
+            if first_touch && draft.is_some() { self.graph_cycles.borrow().record_drain(wait.elapsed()); }
         }
-        if observe {
-            // SAFETY: paired execution or the publication/maintenance fence
-            // just drained the target queues. Pins borrow persistent storage.
-            unsafe { crate::shared::decode_graph::device::observe_completed(self.library(), |visit| {
-                for graph in graphs.iter_mut() { graph.visit(visit)?; }
-                Ok(())
-            })?; }
+        if first_touch {
+            self.graph_cycles.borrow_mut().poll()?;
             for graph in graphs.iter_mut() { graph.observed(); }
         }
         drop(graphs);
