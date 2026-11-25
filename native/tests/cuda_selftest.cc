@@ -3263,6 +3263,133 @@ void test_cuda_graph_source_transfer_rewrites_1d_memset_pointers() {
   free_buffer(&ref_mid); free_buffer(&ref_out);
 }
 
+void test_cuda_graph_source_transfer_rewrites_owned_event_record_nodes() {
+  constexpr size_t count = 5120, bytes = count * sizeof(uint16_t);
+  auto old_in = device_buffer(bytes), old_mid = device_buffer(bytes), old_out = device_buffer(bytes);
+  auto new_in = device_buffer(bytes), new_mid = device_buffer(bytes), new_out = device_buffer(bytes);
+  std::vector<uint16_t> donor_vals(count, 0x3f80), target_vals(count);
+  for (size_t i = 0; i < count; ++i) target_vals[i] = static_cast<uint16_t>(0x3c00 + (i & 0x3ff));
+  copy_h2d(old_in, donor_vals);
+  copy_h2d(new_in, target_vals);
+  cudaStream_t stream = nullptr, other_stream = nullptr;
+  require_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "event transfer stream");
+  require_cuda(cudaStreamCreateWithFlags(&other_stream, cudaStreamNonBlocking), "event transfer other stream");
+  void *ev_a = nullptr, *ev_b = nullptr, *ev_other = nullptr;
+  require_status(cuteafd_cuda_event_create_ordering(&ev_a), "event transfer create ev_a");
+  require_status(cuteafd_cuda_event_create_ordering(&ev_b), "event transfer create ev_b");
+  require_status(cuteafd_cuda_event_create_ordering(&ev_other), "event transfer create ev_other");
+  cudaEvent_t foreign_ev = nullptr;
+  require_cuda(cudaEventCreateWithFlags(&foreign_ev, cudaEventDisableTiming), "event transfer create foreign");
+
+  auto record_owned = [&](cuteafd_device_buffer_t in, cuteafd_device_buffer_t mid,
+                          cuteafd_device_buffer_t out, void* ev) {
+    const uint16_t* in_planes[8] = {static_cast<const uint16_t*>(in.ptr)};
+    const uint16_t* mid_planes[8] = {static_cast<const uint16_t*>(mid.ptr)};
+    require_cuda(static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(
+        in_planes, nullptr, static_cast<uint16_t*>(mid.ptr), 1, 1, stream)), "event transfer kernel 1");
+    require_status(cuteafd_cuda_event_record_external(ev, stream), "event transfer record owned");
+    require_cuda(static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(
+        mid_planes, nullptr, static_cast<uint16_t*>(out.ptr), 1, 1, stream)), "event transfer kernel 2");
+  };
+  // Eager warmup on the same stream must preserve single-stream ownership.
+  record_owned(old_in, old_mid, old_out, ev_a);
+  record_owned(new_in, new_mid, new_out, ev_b);
+  require_cuda(cudaStreamSynchronize(stream), "event transfer warmup");
+
+  size_t nodes = 0, width = 0, words = 0;
+  int spans = 0;
+  const uint64_t* signature = nullptr;
+  void *first = nullptr, *second = nullptr, *other_ev_src = nullptr;
+  void *foreign_src = nullptr, *cross_stream_src = nullptr, *tainted_src = nullptr;
+  void *donor = nullptr, *receiver = nullptr;
+
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "event transfer first begin");
+  record_owned(old_in, old_mid, old_out, ev_a);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &first, &nodes, &width, &spans, &signature, &words),
+                 "event transfer first source");
+  assert(nodes == 3 && spans == 0 && words != 0);
+  const std::vector<uint64_t> sig_a(signature, signature + words);
+  require_status(cuteafd_cuda_graph_source_instantiate(first, stream, &donor), "event transfer instantiate");
+  require_cuda(cudaStreamSynchronize(stream), "event transfer upload complete");
+
+  // Same owned event on the same stream with swapped buffers: signature matches and donor updates.
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "event transfer second begin");
+  record_owned(new_in, new_mid, new_out, ev_a);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &second, &nodes, &width, &spans, &signature, &words),
+                 "event transfer second source");
+  assert(nodes == 3 && spans == 0 && sig_a == std::vector<uint64_t>(signature, signature + words));
+  int status = -1, result = -1;
+  require_status(cuteafd_cuda_graph_source_update(second, donor, &status, &result), "event transfer update");
+  assert(status == cudaSuccess && result == cudaGraphExecUpdateSuccess);
+  require_status(cuteafd_cuda_graph_source_transfer(second, donor, &receiver), "event transfer owner");
+  require_status(cuteafd_cuda_graph_upload(receiver, stream), "event transfer upload");
+  require_status(cuteafd_cuda_graph_source_destroy(first), "event transfer first destroy");
+  require_status(cuteafd_cuda_graph_source_destroy(second), "event transfer second destroy");
+  require_status(cuteafd_cuda_graph_exec_destroy(donor), "event transfer donor destroy");
+  free_buffer(&old_in); free_buffer(&old_mid); free_buffer(&old_out);
+  require_cuda(cudaMemset(new_mid.ptr, 0, bytes), "event transfer reset new_mid");
+  require_cuda(cudaMemset(new_out.ptr, 0, bytes), "event transfer reset new_out");
+  require_status(cuteafd_cuda_graph_launch(receiver, stream), "event transfer launch");
+  require_status(cuteafd_cuda_event_synchronize(ev_a), "event transfer sync ev_a");
+  require_cuda(cudaStreamSynchronize(stream), "event transfer completion");
+  assert(copy_d2h<uint16_t>(new_out, count) == target_vals);
+  require_status(cuteafd_cuda_graph_exec_destroy(receiver), "event transfer receiver destroy");
+
+  // A distinct owned event on the same stream is transferable but MUST produce a different signature
+  // so a donor can never retarget an event-record node onto another event.
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "event transfer ev_b begin");
+  record_owned(new_in, new_mid, new_out, ev_b);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &other_ev_src, &nodes, &width, &spans, &signature, &words),
+                 "event transfer ev_b source");
+  assert(nodes == 3 && spans == 0 && words != 0);
+  assert(sig_a != std::vector<uint64_t>(signature, signature + words));
+  require_status(cuteafd_cuda_graph_source_destroy(other_ev_src), "event transfer ev_b destroy");
+
+  // Foreign event (not created via cuteafd_cuda_event_create*) must stay non-transferable.
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "event transfer foreign begin");
+  {
+    const uint16_t* in_planes[8] = {static_cast<const uint16_t*>(new_in.ptr)};
+    const uint16_t* mid_planes[8] = {static_cast<const uint16_t*>(new_mid.ptr)};
+    require_cuda(static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(
+        in_planes, nullptr, static_cast<uint16_t*>(new_mid.ptr), 1, 1, stream)), "event transfer foreign k1");
+    require_cuda(cudaEventRecordWithFlags(foreign_ev, stream, cudaEventRecordExternal), "event transfer foreign rec");
+    require_cuda(static_cast<cudaError_t>(cuteafd_reduce_compact_bf16_eight_planes_async(
+        mid_planes, nullptr, static_cast<uint16_t*>(new_out.ptr), 1, 1, stream)), "event transfer foreign k2");
+  }
+  require_status(cuteafd_cuda_graph_capture_source(stream, &foreign_src, &nodes, &width, &spans, &signature, &words),
+                 "event transfer foreign source");
+  assert(nodes == 3 && words == 0);
+  require_status(cuteafd_cuda_graph_source_destroy(foreign_src), "event transfer foreign destroy");
+
+  // Event previously recorded on another stream must stay non-transferable.
+  require_status(cuteafd_cuda_event_record_external(ev_other, other_stream), "event transfer record ev_other");
+  require_cuda(cudaStreamSynchronize(other_stream), "event transfer sync other_stream");
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "event transfer cross-stream begin");
+  record_owned(new_in, new_mid, new_out, ev_other);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &cross_stream_src, &nodes, &width, &spans, &signature, &words),
+                 "event transfer cross-stream source");
+  assert(nodes == 3 && words == 0);
+  require_status(cuteafd_cuda_graph_source_destroy(cross_stream_src), "event transfer cross-stream destroy");
+
+  // Once an owned event is also recorded on a second stream, it becomes multi-stream and non-transferable.
+  require_status(cuteafd_cuda_event_record_external(ev_a, other_stream), "event transfer taint ev_a");
+  require_cuda(cudaStreamSynchronize(other_stream), "event transfer sync tainted other_stream");
+  require_status(cuteafd_cuda_graph_begin_capture(stream), "event transfer tainted begin");
+  record_owned(new_in, new_mid, new_out, ev_a);
+  require_status(cuteafd_cuda_graph_capture_source(stream, &tainted_src, &nodes, &width, &spans, &signature, &words),
+                 "event transfer tainted source");
+  assert(nodes == 3 && words == 0);
+  require_status(cuteafd_cuda_graph_source_destroy(tainted_src), "event transfer tainted destroy");
+
+  require_cuda(cudaEventDestroy(foreign_ev), "event transfer destroy foreign");
+  require_status(cuteafd_cuda_event_destroy(ev_other), "event transfer destroy ev_other");
+  require_status(cuteafd_cuda_event_destroy(ev_b), "event transfer destroy ev_b");
+  require_status(cuteafd_cuda_event_destroy(ev_a), "event transfer destroy ev_a");
+  require_cuda(cudaStreamDestroy(other_stream), "event transfer destroy other_stream");
+  require_cuda(cudaStreamDestroy(stream), "event transfer destroy stream");
+  free_buffer(&new_in); free_buffer(&new_mid); free_buffer(&new_out);
+}
+
 void test_cuda_graph_programmatic_edges_and_diagnostic_recovery() {
   constexpr size_t bytes = 5120 * sizeof(uint16_t);
   auto input = device_buffer(bytes);
@@ -3746,7 +3873,8 @@ int main(int argc, char** argv) {
     test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
     test_cuda_graph_source_transfer_rewrites_d2d_memcpy_pointers();
     test_cuda_graph_source_transfer_rewrites_1d_memset_pointers();
-    std::cout << "test result: ok. 3 passed; 0 failed\n";
+    test_cuda_graph_source_transfer_rewrites_owned_event_record_nodes();
+    std::cout << "test result: ok. 4 passed; 0 failed\n";
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--graph-update-probe-only") == 0) {
@@ -3760,7 +3888,8 @@ int main(int argc, char** argv) {
     test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
     test_cuda_graph_source_transfer_rewrites_d2d_memcpy_pointers();
     test_cuda_graph_source_transfer_rewrites_1d_memset_pointers();
-    std::cout << "test result: ok. 6 passed; 0 failed\n";
+    test_cuda_graph_source_transfer_rewrites_owned_event_record_nodes();
+    std::cout << "test result: ok. 7 passed; 0 failed\n";
     return 0;
   }
   test_peer_copy_optional_query_failure_is_recoverable();
@@ -3816,6 +3945,7 @@ int main(int argc, char** argv) {
   test_cuda_graph_source_transfer_rewrites_all_kernel_pointers();
   test_cuda_graph_source_transfer_rewrites_d2d_memcpy_pointers();
   test_cuda_graph_source_transfer_rewrites_1d_memset_pointers();
+  test_cuda_graph_source_transfer_rewrites_owned_event_record_nodes();
   test_cuda_graph_replay_matches_uncaptured();
   test_cuda_graph_bf16_replay_matches_uncaptured();
   test_nvfp4_pack_unpack_or_skip_with_reason();

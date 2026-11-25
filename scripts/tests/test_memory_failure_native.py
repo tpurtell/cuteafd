@@ -306,6 +306,8 @@ def test_transferable_signature_handles_d2d_memcpy_nodes(tmp_path):
     if not compiler:
         pytest.skip("C++ compiler unavailable")
     native = (ROOT / "native/shared/src/cuteafd_native.cc").read_text()
+    event_owner_block = native.split("struct OwnedEvent {", 1)[1].split("extern \"C\" cuteafd_status_t cuteafd_cuda_event_create", 1)[0]
+    event_owner_block = "struct OwnedEvent {" + event_owner_block.rsplit("}\n#endif", 1)[0]
     signature_fn = native.split("std::vector<uint64_t> transferable_signature(", 1)[1]
     signature_fn = "std::vector<uint64_t> transferable_signature(" + signature_fn.split("\n}\n}\n#endif", 1)[0] + "\n}\n"
     diagnostics = (ROOT / "native/shared/include/cuteafd_graph_diagnostics.h").read_text()
@@ -318,15 +320,17 @@ def test_transferable_signature_handles_d2d_memcpy_nodes(tmp_path):
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 using cudaError_t = int;
 using CUresult = int;
 using cudaGraph_t = struct FakeGraph*;
 using cudaGraphNode_t = struct FakeNode*;
+using cudaEvent_t = struct FakeEvent*;
 using CUgraphNode = cudaGraphNode_t;
 constexpr int cudaSuccess = 0, CUDA_SUCCESS = 0, cudaErrorInvalidValue = 1;
-enum cudaGraphNodeType { cudaGraphNodeTypeKernel = 0, cudaGraphNodeTypeMemcpy = 1, cudaGraphNodeTypeMemset = 2, cudaGraphNodeTypeHost = 3 };
+enum cudaGraphNodeType { cudaGraphNodeTypeKernel = 0, cudaGraphNodeTypeMemcpy = 1, cudaGraphNodeTypeMemset = 2, cudaGraphNodeTypeHost = 3, cudaGraphNodeTypeEventRecord = 7 };
 enum cudaMemcpyKind { cudaMemcpyHostToHost = 0, cudaMemcpyHostToDevice = 1, cudaMemcpyDeviceToHost = 2, cudaMemcpyDeviceToDevice = 3, cudaMemcpyDefault = 4 };
 enum cudaMemoryType { cudaMemoryTypeUnregistered = 0, cudaMemoryTypeHost = 1, cudaMemoryTypeDevice = 2 };
 struct cudaPos { size_t x = 0, y = 0, z = 0; };
@@ -353,11 +357,13 @@ struct cudaMemsetParams {
 struct CUDA_KERNEL_NODE_PARAMS { void* func = nullptr; };
 struct cudaPointerAttributes { cudaMemoryType type = cudaMemoryTypeUnregistered; int device = -1; };
 struct cudaGraphEdgeData { uint8_t from_port = 0, to_port = 0, type = 0; };
+struct FakeEvent { int tag = 0; };
 struct FakeNode {
   cudaGraphNodeType kind = cudaGraphNodeTypeKernel;
   void* func = nullptr;
   cudaMemcpy3DParms memcpy{};
   cudaMemsetParams memset{};
+  cudaEvent_t event = nullptr;
 };
 struct FakeGraph {
   std::vector<FakeNode*> nodes;
@@ -378,6 +384,7 @@ int cudaGraphNodeGetType(cudaGraphNode_t n, cudaGraphNodeType* kind) { *kind = n
 CUresult cuGraphKernelNodeGetParams(CUgraphNode n, CUDA_KERNEL_NODE_PARAMS* p) { p->func = n->func; return CUDA_SUCCESS; }
 int cudaGraphMemcpyNodeGetParams(cudaGraphNode_t n, cudaMemcpy3DParms* p) { *p = n->memcpy; return cudaSuccess; }
 int cudaGraphMemsetNodeGetParams(cudaGraphNode_t n, cudaMemsetParams* p) { *p = n->memset; return cudaSuccess; }
+int cudaGraphEventRecordNodeGetEvent(cudaGraphNode_t n, cudaEvent_t* e) { *e = n->event; return cudaSuccess; }
 int cudaPointerGetAttributes(cudaPointerAttributes* attr, const void* ptr) {
   auto it = ptr_attrs.find(ptr);
   if (it == ptr_attrs.end()) return cudaErrorInvalidValue;
@@ -393,7 +400,7 @@ int cudaGraphGetEdges(cudaGraph_t g, cudaGraphNode_t* from, cudaGraphNode_t* to,
 namespace cuteafd {
 ''' + "inline cudaError_t diagnostic_cuda" + clear_error + r'''
 }
-''' + signature_fn + r'''
+''' + event_owner_block + signature_fn + r'''
 int main() {
   std::vector<uint8_t> old_src(4096, 0x11), old_dst(4096, 0), new_src(4096, 0x5a), new_dst(4096, 0);
   std::vector<uint8_t> host_buf(4096, 0x22), peer_buf(4096, 0x33);
@@ -533,6 +540,40 @@ int main() {
   assert(run_sig(make_memset(new_dst.data(), 1024, 8)).empty());
   assert(run_sig(make_memset(host_buf.data(), 1024, 4)).empty());
   assert(run_sig(make_memset(peer_buf.data(), 1024, 4)).empty());
+
+  // Lane-stream-owned EventRecord nodes key on (kind, event pointer) only when non-null,
+  // same-device, and exclusively bound to the captured lane stream.
+  FakeEvent ev_a{1}, ev_b{2}, ev_other_stream{3}, ev_multi{4}, ev_other_dev{5}, ev_foreign{6};
+  void* stream_a = reinterpret_cast<void*>(0xaaaa);
+  void* stream_b = reinterpret_cast<void*>(0xbbbb);
+  current_device = 0;
+  register_owned_event(&ev_a); note_event_stream_record(&ev_a, stream_a);
+  register_owned_event(&ev_b); note_event_stream_record(&ev_b, stream_a);
+  register_owned_event(&ev_other_stream); note_event_stream_record(&ev_other_stream, stream_b);
+  register_owned_event(&ev_multi); note_event_stream_record(&ev_multi, stream_a); note_event_stream_record(&ev_multi, stream_b);
+  current_device = 1;
+  register_owned_event(&ev_other_dev); note_event_stream_record(&ev_other_dev, stream_a);
+  current_device = 0;
+  auto run_ev = [&](cudaEvent_t ev, void* cap_stream) {
+    FakeNode k1{cudaGraphNodeTypeKernel, reinterpret_cast<void*>(0x101), {}, {}, nullptr};
+    FakeNode k2{cudaGraphNodeTypeKernel, reinterpret_cast<void*>(0x202), {}, {}, nullptr};
+    FakeNode er{cudaGraphNodeTypeEventRecord, nullptr, {}, {}, ev};
+    FakeGraph g{{&k1, &k2, &er}, {{&k1, &k2}, {&k2, &er}}};
+    return transferable_signature(&g, 3, cap_stream);
+  };
+  const auto sig_ev_a = run_ev(&ev_a, stream_a);
+  assert(!sig_ev_a.empty());
+  assert(sig_ev_a[5] == cudaGraphNodeTypeEventRecord && sig_ev_a[6] == reinterpret_cast<uintptr_t>(&ev_a));
+  const auto sig_ev_b = run_ev(&ev_b, stream_a);
+  assert(!sig_ev_b.empty() && sig_ev_b != sig_ev_a);
+  assert(run_ev(nullptr, stream_a).empty());
+  assert(run_ev(&ev_a, nullptr).empty());
+  assert(run_ev(&ev_foreign, stream_a).empty());
+  assert(run_ev(&ev_other_stream, stream_a).empty());
+  assert(run_ev(&ev_multi, stream_a).empty());
+  assert(run_ev(&ev_other_dev, stream_a).empty());
+  unregister_owned_event(&ev_a);
+  assert(run_ev(&ev_a, stream_a).empty());
 }
 ''')
     executable = tmp_path / "transferable_signature_d2d"

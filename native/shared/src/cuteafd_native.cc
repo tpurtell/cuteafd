@@ -1552,6 +1552,53 @@ extern "C" cuteafd_status_t cuteafd_cuda_stream_wait_event(void* cuda_stream, vo
 #endif
 }
 
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+namespace {
+struct OwnedEvent {
+  int device = -1;
+  void* stream = nullptr;
+  bool multi_stream = false;
+};
+std::mutex event_owners_mutex;
+std::unordered_map<cudaEvent_t, OwnedEvent> event_owners;
+
+void register_owned_event(cudaEvent_t event) {
+  if (!event) return;
+  int device = -1;
+  if (cuteafd::diagnostic_cuda(cudaGetDevice(&device)) != cudaSuccess || device < 0) return;
+  std::lock_guard<std::mutex> guard(event_owners_mutex);
+  event_owners[event] = OwnedEvent{device, nullptr, false};
+}
+
+void unregister_owned_event(cudaEvent_t event) {
+  if (!event) return;
+  std::lock_guard<std::mutex> guard(event_owners_mutex);
+  event_owners.erase(event);
+}
+
+void note_event_stream_record(cudaEvent_t event, void* stream) {
+  if (!event || !stream) return;
+  std::lock_guard<std::mutex> guard(event_owners_mutex);
+  auto it = event_owners.find(event);
+  if (it == event_owners.end()) return;
+  if (it->second.stream == nullptr) {
+    it->second.stream = stream;
+  } else if (it->second.stream != stream) {
+    it->second.multi_stream = true;
+  }
+}
+
+bool is_owned_stream_event(cudaEvent_t event, void* capture_stream, int current_device) {
+  if (!event || !capture_stream || current_device < 0) return false;
+  std::lock_guard<std::mutex> guard(event_owners_mutex);
+  auto it = event_owners.find(event);
+  if (it == event_owners.end()) return false;
+  return it->second.device == current_device && !it->second.multi_stream &&
+         it->second.stream == capture_stream;
+}
+}
+#endif
+
 extern "C" cuteafd_status_t cuteafd_cuda_event_create(void** out_cuda_event) {
   if (out_cuda_event == nullptr) {
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA event output pointer is null");
@@ -1563,6 +1610,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_create(void** out_cuda_event) {
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "cudaEventCreateWithFlags failed", err);
   }
+  register_owned_event(event);
   *out_cuda_event = reinterpret_cast<void*>(event);
   return ok();
 #else
@@ -1585,6 +1633,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_create_blocking(void** out_cuda_e
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "cudaEventCreateWithFlags(blocking) failed", err);
   }
+  register_owned_event(event);
   *out_cuda_event = reinterpret_cast<void*>(event);
   return ok();
 #else
@@ -1603,6 +1652,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_create_ordering(void** out_cuda_e
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "cudaEventCreateWithFlags failed", err);
   }
+  register_owned_event(event);
   *out_cuda_event = reinterpret_cast<void*>(event);
   return ok();
 #else
@@ -1615,7 +1665,9 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_destroy(void* cuda_event) {
     return ok();
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  cudaError_t err = cudaEventDestroy(reinterpret_cast<cudaEvent_t>(cuda_event));
+  auto event = reinterpret_cast<cudaEvent_t>(cuda_event);
+  unregister_owned_event(event);
+  cudaError_t err = cudaEventDestroy(event);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaEventDestroy failed", err);
   }
@@ -1630,11 +1682,12 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_record(void* cuda_event, void* cu
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA event is null");
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
-  cudaError_t err = cudaEventRecord(reinterpret_cast<cudaEvent_t>(cuda_event),
-                                    reinterpret_cast<cudaStream_t>(cuda_stream));
+  auto event = reinterpret_cast<cudaEvent_t>(cuda_event);
+  cudaError_t err = cudaEventRecord(event, reinterpret_cast<cudaStream_t>(cuda_stream));
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaEventRecord failed", err);
   }
+  note_event_stream_record(event, cuda_stream);
   return ok();
 #else
   if (cuda_stream != nullptr) {
@@ -1649,6 +1702,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_record_external(void* cuda_event,
     return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "CUDA event is null");
   }
 #if CUTEAFD_NATIVE_ENABLE_CUDA
+  auto event = reinterpret_cast<cudaEvent_t>(cuda_event);
   const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   cudaStreamCaptureStatus capture_status;
   cudaError_t err = cudaStreamIsCapturing(stream, &capture_status);
@@ -1659,10 +1713,11 @@ extern "C" cuteafd_status_t cuteafd_cuda_event_record_external(void* cuda_event,
   // before capturing the same markers, and may reuse them for uncaptured shapes.
   const unsigned flags = capture_status == cudaStreamCaptureStatusNone
       ? cudaEventRecordDefault : cudaEventRecordExternal;
-  err = cudaEventRecordWithFlags(reinterpret_cast<cudaEvent_t>(cuda_event), stream, flags);
+  err = cudaEventRecordWithFlags(event, stream, flags);
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaEventRecordWithFlags failed", err);
   }
+  note_event_stream_record(event, cuda_stream);
   return ok();
 #else
   (void)cuda_stream;
@@ -2014,23 +2069,27 @@ struct GraphSource {
   ~GraphSource() { if (graph) cuteafd::diagnostic_cuda(cudaGraphDestroy(graph)); }
 };
 // Exact census signature: ordered node kinds/identities and sorted, annotated
-// edges. Kernel nodes, 1D same-device D2D memcpy nodes, and 1D same-device
-// memset nodes can transfer: cudaGraphExecUpdate rewrites every kernel
-// parameter, D2D memcpy pointer/size, and 1D memset pointer/size/value with
-// no host, peer, allocation or multidimensional state retained.
-std::vector<uint64_t> transferable_signature(cudaGraph_t graph, size_t count) {
+// edges. Kernel nodes, 1D same-device D2D memcpy nodes, 1D same-device memset
+// nodes, and lane-stream-owned event-record nodes can transfer:
+// cudaGraphExecUpdate rewrites every kernel parameter, D2D memcpy pointer/size,
+// and 1D memset pointer/size/value with no host, peer, allocation, cross-lane
+// event, or multidimensional state retained.
+std::vector<uint64_t> transferable_signature(cudaGraph_t graph, size_t count,
+                                             void* capture_stream = nullptr) {
   std::vector<cudaGraphNode_t> nodes(count);
   if (cuteafd::diagnostic_cuda(cudaGraphGetNodes(graph, nodes.data(), &count)) != cudaSuccess) return {};
   int current_device = -1;
   bool have_device = false;
+  const auto ensure_current_device = [&]() {
+    if (have_device) return true;
+    if (cuteafd::diagnostic_cuda(cudaGetDevice(&current_device)) != cudaSuccess || current_device < 0) return false;
+    have_device = true;
+    return true;
+  };
   // Shared 1D same-device checks for transferable memory-op nodes
   // (cudaGraphNodeTypeMemcpy and cudaGraphNodeTypeMemset).
   const auto is_current_device_ptr = [&](const void* ptr) {
-    if (!ptr) return false;
-    if (!have_device) {
-      if (cuteafd::diagnostic_cuda(cudaGetDevice(&current_device)) != cudaSuccess || current_device < 0) return false;
-      have_device = true;
-    }
+    if (!ptr || !ensure_current_device()) return false;
     cudaPointerAttributes attr{};
     if (cuteafd::diagnostic_cuda(cudaPointerGetAttributes(&attr, ptr)) != cudaSuccess) return false;
     return attr.type == cudaMemoryTypeDevice && attr.device == current_device;
@@ -2089,6 +2148,16 @@ std::vector<uint64_t> transferable_signature(cudaGraph_t graph, size_t count) {
       signature.push_back(static_cast<uint64_t>(kind));
       signature.push_back(static_cast<uint64_t>(params.elementSize));
       signature.push_back(static_cast<uint64_t>(current_device));
+    } else if (kind == cudaGraphNodeTypeEventRecord) {
+      cudaEvent_t event = nullptr;
+      if (cuteafd::diagnostic_cuda(cudaGraphEventRecordNodeGetEvent(nodes[n], &event)) != cudaSuccess ||
+          !event || !ensure_current_device() ||
+          !is_owned_stream_event(event, capture_stream, current_device)) return {};
+      // Key on (kind, event pointer) only for non-null events exclusively owned
+      // by the captured lane stream, so a donor update never retargets another
+      // lane's completion event.
+      signature.push_back(static_cast<uint64_t>(kind));
+      signature.push_back(reinterpret_cast<uintptr_t>(event));
     } else {
       return {};
     }
@@ -2136,7 +2205,7 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_capture_source(void* stream, void
   if (*nodes <= 2) return CUTEAFD_STATUS_GRAPH_TOO_SMALL;
   const auto inspection = cuteafd::inspect_graph_topology(captured->graph, nodes, width, spans);
   if (inspection != cudaSuccess) *width = 0;
-  captured->signature = transferable_signature(captured->graph, *nodes);
+  captured->signature = transferable_signature(captured->graph, *nodes, stream);
   *signature = captured->signature.data(); *words = captured->signature.size();
   *source = captured.release();
   if (inspection != cudaSuccess) {

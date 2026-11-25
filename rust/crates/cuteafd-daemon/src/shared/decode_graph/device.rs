@@ -3405,6 +3405,30 @@ mod tests {
     }
 
     #[test]
+    fn event_record_signature_is_indexed_per_event_and_empty_never_matches() {
+        let (mut cache, donor_a) = aged_update_fixture(40, false);
+        cache.remove_donor_candidate(donor_a);
+        let sig_a = vec![0, 0x1000, 7, 0xaaaa, 0, 0x2000];
+        let sig_b = vec![0, 0x1000, 7, 0xbbbb, 0, 0x2000];
+        let sig_c = vec![0, 0x1000, 7, 0xcccc, 0, 0x2000];
+        cache.register_native(donor_a, 202, sig_a.clone());
+        let mut second = cache.records[&donor_a].clone();
+        cache.next_id += 1;
+        let donor_b = cache.next_id;
+        second.identity = key(2);
+        second.list = None; second.previous = None; second.next = None;
+        second.accounted = Inventory::default();
+        cache.identities.insert(second.identity.clone(), donor_b);
+        cache.records.insert(donor_b, second);
+        cache.push(donor_b, List::Recent);
+        cache.register_native(donor_b, 303, sig_b.clone());
+        assert_eq!(cache.cold_donor(&sig_a), Some(donor_a));
+        assert_eq!(cache.cold_donor(&sig_b), Some(donor_b));
+        assert!(cache.cold_donor(&sig_c).is_none());
+        assert!(cache.cold_donor(&[]).is_none());
+    }
+
+    #[test]
     fn donor_index_selects_coldest_and_revalidates_hits_and_victims() {
         let (mut cache, older) = aged_update_fixture(40, false);
         let mut second = cache.records[&older].clone();
