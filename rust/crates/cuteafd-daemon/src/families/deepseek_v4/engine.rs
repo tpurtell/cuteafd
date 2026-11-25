@@ -138,6 +138,7 @@ pub(crate) struct Engine<'a> {
     /// Decode segments on this rank, owned by the device-wide bounded cache.
     graphs: RefCell<crate::shared::decode_graph::GraphBank<GraphKey, GraphExec<'a>>>,
     /// The checked-in prewarm set's pinned geometries for this layout.
+    graph_cycles: RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
     graph_pinned: RefCell<Vec<(usize, usize)>>,
     /// Whether this serve attaches Sparks, which selects the prewarm list.
     graph_sparks: Cell<bool>,
@@ -647,6 +648,7 @@ impl<'a> Engine<'a> {
             decode_workspace: RefCell::new(None),
             profile: RefCell::new(Profile::default()),
             graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()),
+            graph_cycles: RefCell::new(None),
             graph_pinned: RefCell::new(Vec::new()),
             graph_sparks: Cell::new(false),
             local: RefCell::new(None),
@@ -1065,6 +1067,7 @@ impl<'a> Engine<'a> {
         crate::shared::experts::rtx::pair::submit(
             || self.require_live(), || self.shutdown_submission(&mut transports.borrow_mut()),
             || {
+                self.begin_graph_cycle()?;
                 let logits = self.step_inner(lanes, &mut transports.borrow_mut(), runtime, logit_rows, on_layer, download)?;
                 self.graph_completed()?;
                 Ok(logits)
@@ -1999,6 +2002,26 @@ impl<'a> Engine<'a> {
         if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(cycle); }
     }
 
+    pub(super) fn enable_graph_cycles(&self, reserves: &[u64]) -> Result<()> {
+        if reserves.iter().any(|&bytes| bytes > 0) {
+            self.drain_state()?; // Startup capture-only uploads must finish before runtime event ownership.
+            let streams = std::iter::once((self.device, self.stream)).chain(self.peer.iter().map(|p| (p.device, p.stream))).collect::<Vec<_>>();
+            *self.graph_cycles.borrow_mut() = Some(crate::shared::decode_graph::device::EventCycles::new(self.library, &streams)?);
+        }
+        Ok(())
+    }
+
+    fn begin_graph_cycle(&self) -> Result<()> {
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        // SAFETY: rank graphs borrow persistent engine storage.
+        unsafe { cycles.begin_persistent(|visit| {
+            visit(self.device, "deepseek_v4.segment", self.graph_spans(), &mut *self.graphs.borrow_mut())?;
+            if let Some(peer) = &self.peer { visit(peer.device, "deepseek_v4.segment", self.graph_spans(), &mut *peer.graphs.borrow_mut())?; }
+            Ok(())
+        }) }
+    }
+
     /// Every rank's launches for the completed step are queued: observe each
     /// physical device once, tick its site and retire victims without draining
     /// a lane. V4 every graph owner pins `()` and captures only persistent
@@ -2006,6 +2029,13 @@ impl<'a> Engine<'a> {
     /// destroying a victim executable never releases storage an in-flight
     /// launch reads.
     fn graph_completed(&self) -> Result<()> {
+        if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() {
+            self.graphs.borrow_mut().cache_tick();
+            if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_tick(); }
+            // SAFETY: all rank graph launches have been submitted.
+            return unsafe { cycles.complete() };
+        }
+        // Startup only: capture-only passes still need their settled memory sample.
         let needs = self.graphs.borrow().cache_needs_boundary()
             || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().cache_needs_boundary());
         if !needs {
