@@ -627,7 +627,7 @@ def test_kimi_min_recipe_launches_one_physical_owner_with_pinned_prefill_shape(t
                 "MAX_CONTEXT_TOKENS", "CONCURRENCY", "GPU_MEMORY_CAP"}.intersection(values)
     draft = values["SPECULATOR_MODEL_ID"]
     _snapshot(tmp_path / "hf", draft, {}, revision="e77935fb4804e17eb55085bffd045eae1d779769")
-    config = "".join(f"{key}={value}\n" for key, value in values.items()
+    config = "".join(f"{key}={value.replace('REPLACE-ME-spark-', 'spark-')}\n" for key, value in values.items()
                      if key not in ("MODEL_ID", "MODEL_REVISION"))
     result = _family_launch_result(tmp_path, KIMI, KIMI_K6_ID, config,
                                    extra_args=("--wip", "k3"), physical_gpus=(0,),
