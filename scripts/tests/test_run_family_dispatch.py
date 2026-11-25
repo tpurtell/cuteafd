@@ -1506,7 +1506,7 @@ def capture_glm_flash_real_planner_launch(snapshot: Path, example: Path, binary:
     assert deployment["prefill_unit_rows"] == (4096 if local else 2752), deployment
     assert deployment["prefill_waves"] == (1 if local else 3), deployment
     assert deployment["report"]["phase_ledger"], deployment
-    if example.name == "glm53f-exl3-k4-core-k6-max.config":
+    if example.name == "glm53-flash-exl3-k4-mc-k6-max.config":
         assert deployment["report"]["encoder"]["kind"]["kind"] != "off", deployment
         strict_dir = temporary / "vision-on"
         strict_dir.mkdir()

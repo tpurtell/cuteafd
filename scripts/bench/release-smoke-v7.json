@@ -1275,21 +1275,21 @@
     },
     {
       "name": "glm53f-exl3-k6-5090",
-      "config": "examples/configs/glm53-flash-exl3-k6-min.config",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-k6-min.config",
       "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-4spark-glm53f-exl3-k6-5090",
       "release": "v5.0.0",
       "release_note": "replaced by K4 MC original"
     },
     {
       "name": "glm53f-exl3-k6-min",
-      "config": "examples/configs/glm53-flash-exl3-k6-min.config",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-k6-min.config",
       "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-1rtx-2spark-glm53f-exl3-k6-min",
       "release": "v5.0.0",
       "release_note": "replaced by K4 MC original"
     },
     {
       "name": "glm53f-exl3-k6-max",
-      "config": "examples/configs/glm53-flash-exl3-k6-max.config",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-k6-max.config",
       "report": "benchmarks/glm5_flash/2026-11-10-smoke-glm-5-3-flash-exl3-k4-core-k6-2rtx-glm53f-exl3-k6-max",
       "release": "v5.0.0",
       "release_note": "replaced by K4 MC original"

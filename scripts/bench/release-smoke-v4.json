@@ -296,7 +296,7 @@
     {
       "name": "glm53f-exl3-k6-min",
       "family": "glm5_flash",
-      "config": "examples/configs/glm53-flash-exl3-k6-min.config",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-k6-min.config",
       "gpus": [
         1
       ],
@@ -321,7 +321,7 @@
     {
       "name": "glm53f-exl3-k6-max",
       "family": "glm5_flash",
-      "config": "examples/configs/glm53-flash-exl3-k6-max.config",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-k6-max.config",
       "gpus": [
         0,
         1

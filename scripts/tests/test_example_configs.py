@@ -36,10 +36,10 @@ QUALIFICATION = {"inkling2-mxfp8-min.config", "inkling2-mxfp8-max.config",
                  "hy4-flash-exl3-k4-mc-1rtx-4spark.config",
                  "kimi-k31-exl3-k2-mc-min.config", "kimi-k31-exl3-k2-mc-max.config", "minimax-m31-flash-nvfp4-min.config", "minimax-m31-flash-nvfp4-max.config", "kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
                  "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
-                 "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION | NEW_PUBLICATIONS
+                 "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config",
+                 "glm53-flash-exl3-k4-mc-k6-min.config", "glm53-flash-exl3-k4-mc-k6-max.config"} | ML4_QUALIFICATION | NEW_PUBLICATIONS
 V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
-           "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config",
-           "glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config"}
+           "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config"}
 FP8_EXAMPLES = {"glm53-flash-exl3-k4-mc-fp8-max.config"}
 PRIVATE = ("raptor", "ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "10.55.", "/home/", "/mnt/",
            "sparknest")
@@ -73,6 +73,7 @@ CHECKPOINTS = {
     "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8": GLMF,
     "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6": {**GLMF, "quantization_config": {
         "quant_method": "exl3", "bits": 4.0, "core_bits": 6.0, "head_bits": 6.0, "mtp_bits": 4.0}},
+    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC": {**GLMF, "quantization_config": {"quant_method": "exl3"}},
     "nvidia/GLM-5.3-Flash-NVFP4": GLMF,
     "XiaomiMiMo/MiMo-V2.6-Flash-MOPD": {**MIMO, "hidden_size": 4096},
     "XiaomiMiMo/MiMo-V2.6-Pro-MOPD": {**MIMO, "hidden_size": 6144},
@@ -261,7 +262,7 @@ def test_one_starting_config_per_release_card() -> None:
     names = {p.name for p in starting_configs()}
     expected = {f"{model}-{profile}.config" for model in (
         "deepseek-v41-mxfp4", "v41-flash-strided", "deepseek-v4-flash-mxfp4", "deepseek-v4-pro-exl3",
-        "glm53-exl3", "glm53-exl3-k6core", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-exl3-k6", "glm53-flash-nvfp4",
+        "glm53-exl3", "glm53-exl3-k6core", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-nvfp4",
         "glm53-flash-exlr8-k4", "mimo-v26-flash-mxfp4", "mimo-v26-pro-mxfp4") for profile in ("min", "max")}
     # Qwen fits one RTX: the 2x RTX column is n/a, so only min exists.
     expected |= {"qwen38-exl3-min.config", "qwen38-nvfp4-min.config"}
@@ -1066,7 +1067,8 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         if name.endswith('-min.config'):
             expected['MAX_CONTEXT_TOKENS'] = 'auto'
     else:
-        expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6-"))
+        # GLM Flash: the K6 view example shares every layout key with the original view.
+        expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k4-mc-k6-"))
     publication = next((model, revision, doc) for stem, model, revision, doc in [
         ("mistral-", "Mistral-Large-4-EXL3-K4", "9c354cee78cd6feddb057549b8edde6e3b319822", "mistral_large4"),
         ("glm53-flash-exl3-k325-mc-", "GLM-5.3-Flash-EXL3-K3.25-MC",
@@ -1183,15 +1185,6 @@ def test_v4_candidate_config_contract(name: str, tmp_path: Path) -> None:
     values = keys(path)
     text = path.read_text()
     assert f"./run.sh --config examples/configs/{name}" in text and "--dry-run" in text
-    if name.startswith("glm53f-exl3-k4-core-k6"):
-        assert values["MODEL_ID"] == "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6"
-        assert values["SPECULATOR"] == "dflash2"
-        assert values["SPECULATOR_MODEL_ID"] == "incoai/GLM-5.3-Flash-DFlash2"
-        assert values["SPARK_COUNT"] == ("2" if "-min" in name else "0")
-        assert values["RTX_GPUS"] == ("1" if "-min" in name else "2")
-        assert values["POOL_TOKENS"] == "auto"
-        assert not any(needle in text.lower() for needle in PRIVATE)
-        return
     assert re.fullmatch("[0-9a-f]{40}", values["MODEL_REVISION"])
     assert not any(needle in text.lower() for needle in PRIVATE)
     assert "EXLR8_DENSE_FROM" not in values
