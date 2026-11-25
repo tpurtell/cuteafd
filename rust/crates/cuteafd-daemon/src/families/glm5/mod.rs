@@ -2336,9 +2336,8 @@ fn nll_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>, m
     let rows = metrics.rows;
     let scored = metrics.scored as f64;
     if reference.is_some() {
-        println!("prefill logits: {rows} tokens in {seconds:.2} s | top-1 agreement {:.2}% | mean NLL engine {:.4} golden \
-            {:.4} | mean KL(golden||engine) {:.5}", 100.0 * metrics.agree as f64 / rows as f64,
-            metrics.nll / scored, metrics.reference_nll / scored, metrics.kl / rows as f64);
+        println!("prefill: {rows} tokens in {seconds:.2} s");
+        println!("{}", metrics.context_only_line("prefill"));
     } else {
         println!("prefill logits: {rows} tokens in {seconds:.2} s | mean NLL engine {:.4} | logits digest {:016x}",
             metrics.nll / scored, digest.finish());
@@ -2750,25 +2749,16 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmEngine<'_>
     if !decode_logits.is_empty() {
         let vocab = cfg.vocab_size;
         let golden = crate::shared::golden_scores::read_reference_logits(&args.golden.join("logits.bin"), vocab)?;
-        let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
-        let (mut agree, mut next_ok, mut golden_next) = (0usize, 0usize, 0usize);
-        let rows = decode_logits.len() / vocab;
-        for r in 0..rows {
-            let (ours, theirs) = (&decode_logits[r * vocab..][..vocab], &golden[(prefill + r) * vocab..][..vocab]);
-            agree += usize::from(argmax(ours) == argmax(theirs));
-            if let Some(&next) = tokens.get(prefill + r + 1) {
-                next_ok += usize::from(argmax(ours) == next as usize);
-                golden_next += usize::from(argmax(theirs) == next as usize);
-            }
+        let mut decode_metrics = crate::shared::golden_scores::RowMetrics::default();
+        for (r, ours) in decode_logits.chunks_exact(vocab).enumerate() {
+            decode_metrics.push(ours, Some(&golden[(prefill + r) * vocab..][..vocab]),
+                tokens.get(prefill + r + 1).copied())?;
         }
-        println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% golden {:.1}%",
-            100.0 * agree as f64 / rows as f64, 100.0 * next_ok as f64 / (rows - 1).max(1) as f64,
-            100.0 * golden_next as f64 / (rows - 1).max(1) as f64);
+        println!("{}", decode_metrics.context_only_line("decode"));
         use std::hash::{Hash, Hasher};
         let mut digest = std::collections::hash_map::DefaultHasher::new();
         decode_logits.iter().for_each(|v| v.to_bits().hash(&mut digest));
-        println!("decode logits: mean KL(golden||engine) {:.5} | logits digest {:016x}",
-            mean_kl(&decode_logits, &golden[prefill * vocab..][..decode_logits.len()], vocab), digest.finish());
+        println!("decode logits: logits digest {:016x}", digest.finish());
         // A/B between builds or attention placements: every decode row's logits (F32).
         if let Some(dir) = &args.save_logits {
             std::fs::create_dir_all(dir)?;

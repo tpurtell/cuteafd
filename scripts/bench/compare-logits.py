@@ -92,6 +92,7 @@ def compare(a_path: Path, b_path: Path, vocab: int, tokens: Path | None = None, 
             nll_b -= float(lb[keep][np.arange(len(nxt)), nxt].sum())
             scored += len(nxt)
     compared = rows - nonfinite
+    result['last_row_argmax_match'] = bool(np.argmax(a[rows - 1]) == np.argmax(b[rows - 1]))
     result.update(nonfinite_rows=nonfinite, max_abs_diff=max_diff, mean_kl=kl_sum / max(compared, 1),
                   max_kl=kl_max, top1_agreement=agree / max(compared, 1))
     if ids is not None:
@@ -233,6 +234,8 @@ def describe(result: dict) -> str:
         lines.append(f"rows {result['rows']}: max |diff| {result['max_abs_diff']:.4e} | mean KL(a||b) {result['mean_kl']:.6f} "
                      f"max {result['max_kl']:.6f} | top-1 agreement {100 * result['top1_agreement']:.2f}%"
                      + (f" | {result['nonfinite_rows']} nonfinite rows skipped" if result['nonfinite_rows'] else ''))
+    if 'last_row_argmax_match' in result:
+        lines.append(f"last-row argmax match: {result['last_row_argmax_match']}")
     if 'nll_a' in result:
         lines.append(f"mean NLL a {result['nll_a']:.4f} b {result['nll_b']:.4f} over {result['nll_rows']} rows")
     return '\n'.join(lines)
