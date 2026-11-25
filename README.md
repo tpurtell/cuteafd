@@ -148,7 +148,7 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 </tr>
 <tr>
 <td width="20%" valign="top"><b>wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC</b><br><sub>2× RTX</sub></td>
-<td width="20%" valign="top">pending</td>
+<td width="20%" valign="top"><a href="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-2rtx-hy4-flash-exl3-max/card.svg"><img src="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-2rtx-hy4-flash-exl3-max/card.svg" alt="wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC (k8-compact) on 2× RTX"></a></td>
 <td width="20%" valign="top">pending</td>
 <td width="20%" valign="top">pending</td>
 <td width="20%" valign="top">pending</td>
@@ -174,17 +174,17 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/kimi_k3.md"><b>Kimi K3</b></a><br><sub>wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC</sub><br><sub>exl3-k2</sub></td>
-<td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact)</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/kimi_k3/2026-11-25-smoke-kimi-k3-1-pro-exl3-k2-mc-1rtx-6spark-kimi-k31-mc-k8-compact-min/card.svg"><img src="benchmarks/kimi_k3/2026-11-25-smoke-kimi-k3-1-pro-exl3-k2-mc-1rtx-6spark-kimi-k31-mc-k8-compact-min/card.svg" alt="wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC on 1× RTX PRO 6000 @ gpu-powerd 435 W (250–600) + 6× DGX Spark"></a><br><sub>1× RTX + 6× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/kimi_k3/2026-11-19-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-k8-compact-max/card.svg"><img src="benchmarks/kimi_k3/2026-11-19-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-k8-compact-max/card.svg" alt="wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC on 2× RTX PRO 6000 @ gpu-powerd 430/415 W (320–450) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5.md"><b>GLM 5.3</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
-<td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact)</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5/2026-11-25-smoke-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-k8-compact-min/card.svg"><img src="benchmarks/glm5/2026-11-25-smoke-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-k8-compact-min/card.svg" alt="wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 430 W (250–600) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5/2026-11-25-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-k8-compact-max/card.svg"><img src="benchmarks/glm5/2026-11-25-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-k8-compact-max/card.svg" alt="wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (250–525) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
-<td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact)</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-1rtx-2spark-glmf-mc-k8-compact-min/card.svg"><img src="benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-1rtx-2spark-glmf-mc-k8-compact-min/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 435 W (425–600) + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k8-compact-max/card.svg"><img src="benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k8-compact-max/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC on 2× RTX PRO 6000 @ gpu-powerd 445/380 W (325–450)"></a><br><sub>2× RTX</sub></td>
 </tr>
 <tr>
@@ -194,7 +194,7 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC</sub><br><sub>exl3-k3+exl3-k4</sub></td>
-<td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact)</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k3-25-mc-1rtx-2spark-glm53f-k325-mc-min/card.svg"><img src="benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k3-25-mc-1rtx-2spark-glm53f-k325-mc-min/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC on 1× RTX PRO 6000 @ gpu-powerd 445 W (425–600) + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k3-25-mc-2rtx-glmf-k325-mc-k8-compact-max/card.svg"><img src="benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k3-25-mc-2rtx-glmf-k325-mc-k8-compact-max/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC on 2× RTX PRO 6000 @ gpu-powerd 440/390 W (335–450)"></a><br><sub>2× RTX</sub></td>
 </tr>
 <tr>
@@ -219,7 +219,7 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/muse_spark.md"><b>Muse Spark</b></a><br><sub>wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
-<td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact)</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/muse_spark/2026-11-25-smoke-muse-spark-open-exl3-k4-mc-1rtx-4spark-muse-spark-exl3-k4-mc-min/card.svg"><img src="benchmarks/muse_spark/2026-11-25-smoke-muse-spark-open-exl3-k4-mc-1rtx-4spark-muse-spark-exl3-k4-mc-min/card.svg" alt="wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 430 W (250–595) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/muse_spark/2026-11-19-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-mc-k8-compact-max/card.svg"><img src="benchmarks/muse_spark/2026-11-19-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-mc-k8-compact-max/card.svg" alt="wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
@@ -234,7 +234,7 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 </tr>
 <tr>
 <td width="19%" valign="top"><a href="docs/models/inkling2.md"><b>Inkling 2 Small</b></a><br><sub>wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
-<td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact)</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/inkling2/2026-11-25-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min/card.svg"><img src="benchmarks/inkling2/2026-11-25-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min/card.svg" alt="wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 430 W (425–600) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-2rtx-6spark-inkling2-mc-k8-compact-max/card.svg"><img src="benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-2rtx-6spark-inkling2-mc-k8-compact-max/card.svg" alt="wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
@@ -243,9 +243,9 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 <td width="27%" valign="top">n/a<br><sub>TP1 only (1x RTX, 0 Sparks)</sub></td>
 </tr>
 <tr>
-<td width="19%" valign="top"><a href="docs/models/hy4_flash.md"><b>Hy4-flash</b></a><br><sub>wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC</sub><br><sub></sub></td>
-<td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact, 0 Sparks)</sub></td>
-<td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact, 0 Sparks)</sub></td>
+<td width="19%" valign="top"><a href="docs/models/hy4_flash.md"><b>Hy4-flash</b></a><br><sub>wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-1rtx-hy4-flash-exl3-min/card.svg"><img src="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-1rtx-hy4-flash-exl3-min/card.svg" alt="wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 490 W (425–600)"></a><br><sub>1× RTX</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-2rtx-hy4-flash-exl3-max/card.svg"><img src="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-2rtx-hy4-flash-exl3-max/card.svg" alt="wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (250–520)"></a><br><sub>2× RTX</sub></td>
 </tr>
 </table>
 
@@ -253,8 +253,8 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 
 <table>
 <tr><th>Model · quant</th><th>Layout</th><th>Card</th></tr>
-<tr><td>wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC</td><td>1× RTX + 1× Spark</td><td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact)</sub></td></tr>
-<tr><td>wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC</td><td>1× RTX + 4× Sparks</td><td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact)</sub></td></tr>
+<tr><td>wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC</td><td>1× RTX + 1× Spark</td><td width="27%" valign="top"><a href="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-1rtx-1spark-hy4-flash-1rtx-1spark/card.svg"><img src="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-1rtx-1spark-hy4-flash-1rtx-1spark/card.svg" alt="wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 460 W (425–600) + 1× DGX Spark"></a><br><sub>1× RTX + 1× Spark</sub></td></tr>
+<tr><td>wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC</td><td>1× RTX + 4× Sparks</td><td width="27%" valign="top"><a href="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-1rtx-4spark-hy4-flash-1rtx-4spark/card.svg"><img src="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-1rtx-4spark-hy4-flash-1rtx-4spark/card.svg" alt="wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 465 W (425–600) + 4× DGX Spark"></a><br><sub>1× RTX + 4× Spark</sub></td></tr>
 </table>
 
 Each card is one launch of the basic profile: tok/s for C1 decode and concurrent decode with thinking off (each stream its own prompt; earlier cards sent one code prompt to every stream, which shares experts and drafts and reads higher), cold exactly-8,192-token prefill, logit fidelity against the family golden reference, prefix-cache restore exactness and lossless speculation. Older releases, other profiles and every report: [benchmarks](benchmarks/README.md).
