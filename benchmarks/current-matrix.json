@@ -185,8 +185,8 @@
       "family": "inkling2_mini",
       "checkpoint": "thinkingmachines/Inkling-2-Mini",
       "1rtx": {
-        "status": "pending",
-        "reason": "Pending Inkling 2 Mini 1x RTX qualification card (#2701)"
+        "status": "current",
+        "report": "benchmarks/inkling2_mini/2026-11-25-smoke-inkling-2-mini-1rtx-inkling2-mini-1x-rtx"
       },
       "2rtx": {
         "status": "na",

@@ -233,8 +233,8 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 <td width="27%" valign="top"><a href="benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-2rtx-6spark-inkling2-mc-k8-compact-max/card.svg"><img src="benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-2rtx-6spark-inkling2-mc-k8-compact-max/card.svg" alt="wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) + 6× DGX Spark"></a><br><sub>2× RTX + 6× Spark</sub></td>
 </tr>
 <tr>
-<td width="19%" valign="top"><a href="docs/models/inkling2_mini.md"><b>Inkling 2 Mini</b></a><br><sub>thinkingmachines/Inkling-2-Mini</sub><br><sub></sub></td>
-<td width="27%" valign="top">pending<br><sub>Pending Inkling 2 Mini 1x RTX qualification card (#2701)</sub></td>
+<td width="19%" valign="top"><a href="docs/models/inkling2_mini.md"><b>Inkling 2 Mini</b></a><br><sub>thinkingmachines/Inkling-2-Mini</sub><br><sub>fp8-tensor/ue8m0+nvfp4-g16-amax</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/inkling2_mini/2026-11-25-smoke-inkling-2-mini-1rtx-inkling2-mini-1x-rtx/card.svg"><img src="benchmarks/inkling2_mini/2026-11-25-smoke-inkling-2-mini-1rtx-inkling2-mini-1x-rtx/card.svg" alt="thinkingmachines/Inkling-2-Mini on 1× RTX PRO 6000 @ gpu-powerd 435 W (425–600)"></a><br><sub>1× RTX</sub></td>
 <td width="27%" valign="top">n/a<br><sub>TP1 only (1x RTX, 0 Sparks)</sub></td>
 </tr>
 <tr>
