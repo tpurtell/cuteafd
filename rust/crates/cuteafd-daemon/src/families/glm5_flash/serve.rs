@@ -926,7 +926,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
                         publish(stats, requests, generated_total, active.len(), prefills.len(), ring_misses, &cache,
                             media, preparer, &lane.stats, &memory_boundaries, &reserve, stalled.len());
                         let job = if !busy && media.is_empty() {
-                            let next = turn.receive(&runtime, receive)?;
+                            let next = crate::shared::phase_stats::GLOBAL.time_idle_wait(|| turn.receive(&runtime, receive))?;
                             match next { Some(job) => job, None => return Ok(()) }
                         } else {
                             match receive.try_recv() {
@@ -1272,10 +1272,15 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             continue;
         }
         offer()?;
+        let members = active.len() as u64;
+        let prefill_waiting = !prefills.is_empty();
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             verify_rows, &mut lane, &mut active, &mut shared, &mut selector, &family, &mut cache, &mut free_kda,
-            &mut free_slots, &mut trace)))? else { continue };
+            &mut free_slots, &mut trace)))? else {
+            crate::shared::phase_stats::GLOBAL.record_decode_call(cycle.elapsed().as_nanos() as u64, prefill_waiting, members);
+            continue;
+        };
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
@@ -1313,7 +1318,9 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
             &lane.stats, &memory_boundaries, &reserve, stalled.len());
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len() + stalled.len(), prefills.len(),
             receive.len() + kv_waiter.len() + media.len()));
-        prefills.stepped(cycle.elapsed().as_secs_f64());
+        let elapsed = cycle.elapsed();
+        crate::shared::phase_stats::GLOBAL.record_decode_call(elapsed.as_nanos() as u64, prefill_waiting, members);
+        prefills.stepped(elapsed.as_secs_f64());
     }
     })
 }
@@ -1697,6 +1704,7 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     }
     offer()?;
     let timer = Instant::now();
+    crate::shared::phase_stats::GLOBAL.record_first_chunk_wait(p.chunks, p.started, timer);
     let end = chunk_end(p);
     let draft_end = draft_context_end(p, p.placement.len);
     let chunk = &p.tokens[p.done..end];
@@ -1818,6 +1826,9 @@ fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     }
     let engine = cx.engine;
     let timer = Instant::now();
+    for p in group.iter() {
+        crate::shared::phase_stats::GLOBAL.record_first_chunk_wait(p.chunks, p.started, timer);
+    }
     let ends: Vec<usize> = group.iter().map(chunk_end).collect();
     let rows: usize = group.iter().zip(&ends).map(|(p, &end)| end - p.done).sum();
     let memory_before = first_prefill_sample(cx.first_prefill_seen, false, prefill_memory_sample);

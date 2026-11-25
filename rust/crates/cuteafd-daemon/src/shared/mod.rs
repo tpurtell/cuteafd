@@ -28,6 +28,7 @@ pub(crate) mod memory_report;
 pub(crate) mod packed_head;
 pub(crate) mod peer_probe;
 pub(crate) mod peer_split;
+pub(crate) mod phase_stats;
 pub(crate) mod stack_dump;
 pub(crate) mod placement;
 pub(crate) mod prefill_depth;

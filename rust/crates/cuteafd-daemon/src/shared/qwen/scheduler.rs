@@ -780,6 +780,9 @@ fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
     group: &mut [Prefill<'_, B::Placement, B::Draft>], neural: bool) -> Vec<Result<Chunk>> {
     use crate::shared::prefill_packing::{member_outcomes, row_shares};
     let timer = Instant::now();
+    for p in group.iter() {
+        crate::shared::phase_stats::GLOBAL.record_first_chunk_wait(p.chunks, p.started, timer);
+    }
     let ends = group.iter().map(|p| p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len())).collect::<Vec<_>>();
     let counts = group.iter().zip(&ends).map(|(p, end)| end - p.done).collect::<Vec<_>>();
     let caching = cache.enabled();
@@ -918,7 +921,10 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, media, preparer, &lane.stats,
                             &reserve, stalled.len());
                         let job = if !busy && media.is_empty() {
-                            match turn.receive(&runtime, receive)? { Some(job) => job, None => return Ok(()) }
+                            match crate::shared::phase_stats::GLOBAL.time_idle_wait(|| turn.receive(&runtime, receive))? {
+                                Some(job) => job,
+                                None => return Ok(()),
+                            }
                         } else {
                             match receive.try_recv() {
                                 Ok(job) => job,
@@ -1151,6 +1157,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                 }
                 offer()?;
                 let timer = Instant::now();
+                crate::shared::phase_stats::GLOBAL.record_first_chunk_wait(p.chunks, p.started, timer);
                 let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                 let chunk = &p.tokens[p.done..end];
                 // Its demand gathers own the running chunk from here on.
@@ -1342,10 +1349,15 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             continue;
         }
         offer()?;
+        let members = active.len() as u64;
+        let prefill_waiting = !prefills.is_empty();
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, &geometry, drafts,
             &mut lane, &mut active, &mut shared, &mut selector, &mut cache, &family, &mut free_slots, &mut trace,
-            cycle)))? else { continue };
+            cycle)))? else {
+            crate::shared::phase_stats::GLOBAL.record_decode_call(cycle.elapsed().as_nanos() as u64, prefill_waiting, members);
+            continue;
+        };
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
@@ -1381,7 +1393,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             &reserve, stalled.len());
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len() + stalled.len(), prefills.len(),
             receive.len() + kv_waiter.len()));
-        prefills.stepped(cycle.elapsed().as_secs_f64());
+        let elapsed = cycle.elapsed();
+        crate::shared::phase_stats::GLOBAL.record_decode_call(elapsed.as_nanos() as u64, prefill_waiting, members);
+        prefills.stepped(elapsed.as_secs_f64());
     }
     })
 }

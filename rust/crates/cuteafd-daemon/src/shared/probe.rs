@@ -129,12 +129,19 @@ pub(crate) fn graph_capture_stats(stats: &mut serde_json::Value) {
     let tables = cuteafd_loader::mapped_table_stats_with_intervals();
     if !tables.is_empty() { stats["mapped_tables"] = serde_json::json!(tables); }
     stats["graph_cache"] = serde_json::json!(crate::shared::decode_graph::device::snapshots());
+    stats["graph_instantiate_ns"] = crate::shared::decode_graph::stats::GLOBAL.graph_instantiate_ns().into();
     stats["memory_reconciliation"] = crate::shared::memory_report::reconcile::snapshot();
     let sites = cuteafd_ffi::graph_capture_sites();
     record_graph_captures(stats, cuteafd_ffi::graph_captures(), sites, &mut previous);
     stats["graph_missing_variants"] = serde_json::json!(crate::shared::decode_graph::missing_variants()
         .into_iter().map(|miss| serde_json::json!({
             "family": miss.family, "shape": miss.shape, "runs": miss.runs })).collect::<Vec<_>>());
+    let decoding = stats.get("active").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    stats["phases"] = crate::shared::phase_stats::GLOBAL.snapshot(
+        &crate::shared::prefill_share::round_stats::GLOBAL,
+        decoding,
+    );
+    stats["exchange"] = crate::shared::spark_waves::exchange_stats::GLOBAL.snapshot();
 }
 
 fn record_graph_captures(stats: &mut serde_json::Value, total: u64, sites: Vec<(String, u64)>,
@@ -265,11 +272,42 @@ mod graph_capture_tests {
 
     #[test]
     fn live_counter_fields_are_present_without_cuda() {
-        let mut stats = serde_json::json!({});
+        let mut stats = serde_json::json!({"active": 3});
         graph_capture_stats(&mut stats);
         assert!(stats["graph_captures"].is_u64());
         assert!(stats["graph_capture_sites"].is_array());
         assert!(stats["graph_capture_site_deltas"].is_array());
+        assert!(stats["graph_instantiate_ns"].is_u64());
+        let phases = &stats["phases"];
+        assert!(phases["phase_ns_total"]["prefill_round"].is_u64());
+        assert!(phases["phase_ns_total"]["decode_call"].is_u64());
+        assert!(phases["phase_ns_total"]["decode_call_with_prefill_waiting"].is_u64());
+        assert!(phases["phase_ns_total"]["idle_wait"].is_u64());
+        assert!(phases["phase_ns_total"].get("graph_instantiate").is_none());
+        assert!(phases["rounds_total"]["prefill"].is_u64());
+        assert!(phases["rounds_total"]["decode_calls"].is_u64());
+        assert!(phases["decode_call_members_total"].is_u64());
+        assert!(phases["prefill_prompt_rounds_total"].is_u64());
+        assert!(phases["prefill_queue_wait_ns_total"].is_u64());
+        assert_eq!(phases["active_decode"], 3);
+        let exchange = &stats["exchange"];
+        for key in ["staging", "post", "wait"] {
+            assert!(exchange["wave_ns_total"][key].is_u64());
+        }
+        assert!(exchange["waves_total"].is_u64());
+        assert!(exchange["wave_rows_total"].is_u64());
+        assert!(exchange["reply_plane_bytes_total"].is_u64());
+        for key in ["busy_ns_total", "idle_ns_total", "units_total"] {
+            assert_eq!(exchange["expert_prefill_units"][key].as_array().unwrap().len(),
+                cuteafd_core::MAX_SPARK_WORLD);
+        }
+        // Going idle drops active_decode back to 0 (never latched).
+        let mut idle = serde_json::json!({"active": 0});
+        graph_capture_stats(&mut idle);
+        assert_eq!(idle["phases"]["active_decode"], 0);
+        let mut empty = serde_json::json!({});
+        graph_capture_stats(&mut empty);
+        assert_eq!(empty["phases"]["active_decode"], 0);
     }
 }
 
