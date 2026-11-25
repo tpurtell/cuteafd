@@ -195,6 +195,45 @@ def test_partial_native_upload_resumes_exact_allowlist(tmp_path):
     assert api.uploads == 2
 
 
+def test_http_lfs_commits_verified_batches_and_skips_committed_files(tmp_path, monkeypatch):
+    from huggingface_hub import constants
+    monkeypatch.setattr(constants, 'HF_HUB_DISABLE_XET', True)
+    files = {}
+    for name in ['.gitattributes', *[f'shard-{i:02d}.safetensors' for i in range(34)]]:
+        path = tmp_path / name
+        path.write_bytes(name.encode())
+        files[name] = dict(path=str(path), bytes=path.stat().st_size,
+                           device=path.stat().st_dev, file_identity=file_identity(path),
+                           **publish.metadata_identity(path))
+
+    class BatchHub(Hub):
+        def create_commit(self, repo, operations, **kwargs):
+            assert kwargs['parent_commit'] == self.revision
+            assert kwargs['num_threads'] == 8
+            names = [op.path_in_repo for op in operations]
+            assert len(names) <= 16 and not set(names).intersection(self.remote)
+            for op in operations:
+                assert op.upload_info.sha256.hex() == files[op.path_in_repo]['sha256']
+                assert not op._is_uploaded
+            if self.fail and self.uploads == 1:
+                raise OSError('interrupted')
+            self.remote.update({name: files[name] for name in names})
+            self.uploads += 1
+            self.revision = f'{self.uploads:040x}'
+            return SimpleNamespace(oid=self.revision)
+
+    api = BatchHub(files)
+    api.fail = True
+    with pytest.raises(OSError, match='interrupted'):
+        publish._upload_http_lfs(api, api.model_info(publish.TARGET_REPO), files,
+                                 tmp_path, None, target=publish.INKLING)
+    assert len(api.remote) == 16
+    api.fail = False
+    publish._upload_http_lfs(api, api.model_info(publish.TARGET_REPO), files,
+                             tmp_path, None, target=publish.INKLING)
+    assert api.uploads == 3 and set(api.remote) == set(files)
+
+
 @pytest.mark.parametrize('change', ['sha256', 'bytes', 'extra', 'nonlfs'])
 def test_remote_metadata_mismatch_fails(tmp_path, change):
     output = completed_export(tmp_path)
