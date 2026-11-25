@@ -192,7 +192,21 @@ impl<'a> Wave<'a> {
     /// # Safety
     /// Same input/chain lifetime contract as execute_shared.
     pub(crate) async unsafe fn execute_shared_on(&mut self, layer: usize, rows: u32, values: CuteafdDeviceBuffer, destination: usize) -> Result<CuteafdDeviceBuffer> {
-        unsafe { self.execution(rows).await?.execute_shared_on(layer, rows, values, destination).await }
+        unsafe { self.execute_shared_on_after(layer, rows, values, destination, None).await }
+    }
+    /// # Safety
+    /// Same input/chain lifetime contract as `execute_shared`; if `upload_after`
+    /// is `Some`, it must be a live CUDA event recorded before this call that
+    /// outlives the peer upload stream's wait.
+    pub(crate) async unsafe fn execute_shared_on_after(
+        &mut self,
+        layer: usize,
+        rows: u32,
+        values: CuteafdDeviceBuffer,
+        destination: usize,
+        upload_after: Option<*mut std::ffi::c_void>,
+    ) -> Result<CuteafdDeviceBuffer> {
+        unsafe { self.execution(rows).await?.execute_shared_on_after(layer, rows, values, destination, upload_after).await }
     }
     /// # Safety
     /// Source stays immutable and retained until the enclosing chain drains.
@@ -348,6 +362,23 @@ impl<'a> Execution<'a> {
         values: CuteafdDeviceBuffer,
         destination: usize,
     ) -> Result<CuteafdDeviceBuffer> {
+        unsafe { self.execute_shared_on_after(layer, rows, values, destination, None).await }
+    }
+    /// Same as `execute_shared_on`, optionally ordering the peer input upload
+    /// strictly after `upload_after` via `cudaStreamWaitEvent` (no host sync)
+    /// so GPU-1 SM staging (`copy_regions`) and GPU-1->0 peer DMA do not
+    /// collide on PCIe egress.
+    /// # Safety
+    /// Input storage remains complete, immutable and live through completion or
+    /// drain; any `upload_after` event stays live until the upload stream drains.
+    pub async unsafe fn execute_shared_on_after(
+        &mut self,
+        layer: usize,
+        rows: u32,
+        values: CuteafdDeviceBuffer,
+        destination: usize,
+        upload_after: Option<*mut std::ffi::c_void>,
+    ) -> Result<CuteafdDeviceBuffer> {
         ensure!(
             self.contains_shared(layer)
                 && destination < 2
@@ -373,6 +404,11 @@ impl<'a> Execution<'a> {
             self.streams[1].join_chain()?;
         } else {
             upload.wait().await?;
+        }
+        if let Some(after) = upload_after {
+            upload.device.run(|| unsafe {
+                upload.device.library.cuda_stream_wait_event(upload.raw, after)
+            })?;
         }
         let peer = self.window.apply(self.peers[remote].values.buffer, 10240);
         let sm = self.sm[remote].as_ref();

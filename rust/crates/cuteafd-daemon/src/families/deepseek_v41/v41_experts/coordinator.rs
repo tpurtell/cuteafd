@@ -59,6 +59,12 @@ pub(crate) struct NativeTp4Wave<'a> {
     ready_rows: Option<u32>,
     local: Option<super::local::LocalExpertWave<'a>>,
     tp2: Option<Box<super::tp2_ffn::Wave<'a>>>,
+    /// Ordering event recorded on `stream` immediately after Spark-wave
+    /// staging (`copy_regions` + `Staged` write), so TP2 shared-FFN peer
+    /// uploads wait on it instead of colliding with `copy_regions` on GPU 1's
+    /// PCIe egress. Declared after `tp2` so it drops after both `stream` and
+    /// `tp2`'s streams have drained.
+    staged_event: crate::shared::memory::device::Event<'a>,
 }
 
 impl<'a> NativeTp4Wave<'a> {
@@ -194,14 +200,19 @@ impl<'a> NativeTp4Wave<'a> {
     /// shared prefill link).
     pub fn unlinked(library: &'a NativeLibrary, capacity: u32) -> Result<Self> {
         ensure!(capacity > 0 && capacity <= 4096, "invalid native TP wave capacity");
+        let output = DeviceAllocation::new(library, capacity as usize * 5120 * 2, Tag::workspace("v41/expert-wave"))?;
+        let staged_event = crate::shared::memory::device::Event::new(
+            crate::shared::memory::device::Device { library, id: output.buffer.device_id },
+        )?;
         Ok(Self {
             link: None,
             stream: LoadStream { library, raw: library.cuda_stream_create()? },
-            output: DeviceAllocation::new(library, capacity as usize * 5120 * 2, Tag::workspace("v41/expert-wave"))?,
+            output,
             library,
             ready_rows: None,
             local: None,
             tp2: None,
+            staged_event,
         })
     }
 
@@ -244,10 +255,20 @@ impl<'a> NativeTp4Wave<'a> {
         rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow]) -> Result<NativePendingFfn<'w, 'a>> {
         self.ready_rows = None;
         let link = self.link.as_mut().context("prefill-only slot has no Spark link of its own")?;
-        let ticket = unsafe { send_on(self.library, &self.stream, link, routed, router_stream, placement, rows)? };
-        Ok(NativePendingFfn { ticket: ticket.0, binding: ticket.1, layer: routed.layer, rows: routed.rows,
+        let (ticket, binding, staged_on_wave_stream) = unsafe {
+            send_on(self.library, &self.stream, link, routed, router_stream, placement, rows)?
+        };
+        let staged_event = if staged_on_wave_stream {
+            self.staged_event.device.run(|| unsafe {
+                self.staged_event.device.library.cuda_event_record(self.staged_event.raw, self.stream.raw)
+            })?;
+            Some(self.staged_event.raw)
+        } else {
+            None
+        };
+        Ok(NativePendingFfn { ticket, binding, layer: routed.layer, rows: routed.rows,
             library: self.library, stream: &self.stream, link: &mut link.link, output: self.output.buffer,
-            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut() })
+            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut(), staged_event })
     }
     /// A prefill unit's wave on the shared prefill `link` (its return slots
     /// hold the in-flight units): the returned ticket owns nothing borrowed, so
@@ -261,7 +282,7 @@ impl<'a> NativeTp4Wave<'a> {
         router_stream: *mut std::ffi::c_void, placement: u64,
         rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow]) -> Result<NativeUnitFfn> {
         self.ready_rows = None;
-        let (ticket, binding) = unsafe { send_on(self.library, &self.stream, link, routed, router_stream, placement, rows)? };
+        let (ticket, binding, _) = unsafe { send_on(self.library, &self.stream, link, routed, router_stream, placement, rows)? };
         Ok(NativeUnitFfn { ticket, binding, layer: routed.layer, rows: routed.rows,
             owner: self.output.buffer.ptr as usize })
     }
@@ -281,7 +302,7 @@ impl<'a> NativeTp4Wave<'a> {
         values.bytes = unit.rows as usize * 10240;
         let pending = NativePendingFfn { ticket: unit.ticket, binding: unit.binding, layer: unit.layer, rows: unit.rows,
             library: self.library, stream: &self.stream, link: &mut link.link, output: self.output.buffer,
-            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut() };
+            ready_rows: &mut self.ready_rows, tp2: self.tp2.as_deref_mut(), staged_event: None };
         let destination = Some(destination).filter(|&device| device != self.output.buffer.device_id);
         if destination.is_some() {
             let device = crate::shared::memory::device::Device { library: self.library, id: self.output.buffer.device_id };
@@ -325,7 +346,7 @@ unsafe fn send_on<'a>(library: &'a NativeLibrary, stream: &LoadStream<'a>, link:
     routed: &crate::families::deepseek_v41::v41_backbone_router::RouterOutput<'_>,
     router_stream: *mut std::ffi::c_void, placement: u64,
     rows: &[crate::families::deepseek_v41::v41_backbone_router::ExpertRow])
-    -> Result<(crate::shared::spark_waves::WaveTicket, crate::families::deepseek_v41::v41_attention_binding::QueryBinding)> {
+    -> Result<(crate::shared::spark_waves::WaveTicket, crate::families::deepseek_v41::v41_attention_binding::QueryBinding, bool)> {
     let capacity = link.link.capacity();
     ensure!(routed.rows > 0 && routed.rows <= capacity, "native dispatched FFN rows exceed capacity");
     let (binding, build) = routed.request_builder(placement, rows)?;
@@ -335,7 +356,8 @@ unsafe fn send_on<'a>(library: &'a NativeLibrary, stream: &LoadStream<'a>, link:
     // per-layer host waits, which a host-ordered pass relies on when it
     // rebinds them (`LoadStream::require_complete`). A router on the other
     // GPU (TP2 shared, device-ordered passes) stages from its own stream.
-    let stage = if sources[0].device_id == link.link.device() { stream.raw } else { router_stream };
+    let staged_on_wave_stream = sources[0].device_id == link.link.device();
+    let stage = if staged_on_wave_stream { stream.raw } else { router_stream };
     let exchange = link.link.exchange()?;
     // SAFETY: the sources are the router's live device outputs, complete in
     // chain order: `stage` joins the chain head, which the router's stage
@@ -346,7 +368,7 @@ unsafe fn send_on<'a>(library: &'a NativeLibrary, stream: &LoadStream<'a>, link:
             crate::shared::spark_waves::combined_reply_eligible(rows.iter().map(|row|
                 (row.request_id, row.kind == cuteafd_transport::ExpertV2SourceKind::Prefill))), build)?
     };
-    Ok((ticket, binding))
+    Ok((ticket, binding, staged_on_wave_stream))
 }
 impl Drop for NativeTp4Wave<'_> {
     fn drop(&mut self) {
@@ -393,6 +415,7 @@ pub(crate) struct NativePendingFfn<'w, 'a> {
     output: CuteafdDeviceBuffer,
     ready_rows: &'w mut Option<u32>,
     tp2: Option<&'w mut super::tp2_ffn::Wave<'a>>,
+    staged_event: Option<*mut std::ffi::c_void>,
 }
 impl<'w> NativePendingFfn<'w, '_> {
     /// # Safety
@@ -416,7 +439,7 @@ impl<'w> NativePendingFfn<'w, '_> {
             && self.rows as usize == input.tokens.len() && matches!(input.values.device_id, 0 | 1),
             "TP2 shared input/request/device differs");
         let values = unsafe { self.tp2.as_mut().context("TP2 shared workspace missing")?
-            .execute_shared_on(input.layer, self.rows, input.values, self.output.device_id as usize).await? };
+            .execute_shared_on_after(input.layer, self.rows, input.values, self.output.device_id as usize, self.staged_event).await? };
         let destination = input.values.device_id;
         if destination != self.output.device_id {
             let device = crate::shared::memory::device::Device { library: self.library, id: self.output.device_id };
@@ -494,6 +517,22 @@ mod upload_tests {
             assert!(reserved >= capacity as usize * (2 * V41_PARTIAL_ROW_BYTES as usize + 2 * 10240));
         }
         Ok(())
+    }
+
+    #[test]
+    fn tp2_shared_upload_orders_after_spark_staging_event() {
+        let coord = include_str!("coordinator.rs");
+        let dispatch = &coord[coord.find("pub(crate) unsafe fn dispatch_ffn").unwrap()..];
+        let dispatch = &dispatch[..dispatch.find("pub(crate) unsafe fn dispatch_unit").unwrap()];
+        assert!(dispatch.contains("cuda_event_record(self.staged_event.raw, self.stream.raw)"));
+        let finish = &coord[coord.find("pub async unsafe fn finish_tp2").unwrap()..];
+        let finish = &finish[..finish.find("async unsafe fn finish_values").unwrap()];
+        assert!(finish.contains("execute_shared_on_after("));
+        assert!(finish.contains("self.staged_event"));
+        let tp2 = include_str!("tp2_ffn.rs");
+        let exec = &tp2[tp2.find("pub async unsafe fn execute_shared_on_after").unwrap()..];
+        let exec = &exec[..exec.find("pub async unsafe fn return_result").unwrap()];
+        assert!(exec.contains("cuda_stream_wait_event(upload.raw, after)"));
     }
 
 }
