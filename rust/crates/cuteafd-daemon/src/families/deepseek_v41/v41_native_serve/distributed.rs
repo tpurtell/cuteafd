@@ -50,7 +50,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // The resolved decode lanes (one or two) at decode width, and `slots`
     // prefill slots on one shared storage set per GPU (PLAN "Prefill
     // contract"). The prefill slots' TP2 FFN is one execution arena per GPU at the unit cap.
-    let lanes = args.decode_lanes;
+    let lanes = args.resolved_decode_lanes();
     let prefill_shape = super::AdmittedPrefill::resolve(&args)?;
     ensure!(prefill_shape.unit_cap == capacity as usize, "V4.1 prefill unit cap {} differs from the live rows {capacity}",
         prefill_shape.unit_cap);

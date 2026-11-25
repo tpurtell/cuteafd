@@ -1180,10 +1180,11 @@ if family == "mimo_v2":
     waves = 3
 unit = int(value("--prefill-rows", "0")) or {1: 4096, 2: 4096, 3: 2752, 4: 2048}[waves]
 span = int(value("--prefill-span-rows", "0")) or (16384 if family == "mimo_v2" else unit * waves)
-decode_lanes = int(value("--decode-lanes", "2" if family == "deepseek_v41" else "1"))
-if (family == "deepseek_v41" and decode_lanes != 2) or (family != "deepseek_v41" and decode_lanes != 1):
+default_lanes = ("2" if gpus >= 2 else "1") if family == "deepseek_v41" else "1"
+decode_lanes = int(value("--decode-lanes", default_lanes))
+if (family == "deepseek_v41" and decode_lanes not in (1, 2)) or (family != "deepseek_v41" and decode_lanes != 1):
     sys.exit("unsupported --decode-lanes for " + family)
-if family == "mimo_v2" and int(value("--concurrency", "16")) == 1:
+if family in ("deepseek_v41", "mimo_v2") and int(value("--concurrency", "16")) == 1:
     decode_lanes = 1
 raw_decode_rows = value("--decode-rows", "auto")
 decode_rows = 64 if raw_decode_rows in (None, "", "auto") else int(raw_decode_rows)
