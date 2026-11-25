@@ -312,6 +312,8 @@ historical recipe; new release launches use the v7 matrix.
 
 ## GLM 5.3 Flash
 
+- 2026-11-25 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1 · 2× RTX PRO 6000 @ gpu-powerd 420/425 W (250–525) · build e5186bced4a1 · [report](glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-2rtx-glmf-mc-mul1-original-max/report.svg)
+- 2026-11-25 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1 · 1× RTX PRO 6000 @ gpu-powerd 435 W (425–600) + 2× DGX Spark · build e5186bced4a1 · [report](glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-1rtx-2spark-glmf-mc-mul1-original-min/report.svg)
 - 2026-11-19 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 435/400 W (335–450) · build v6.0.0-rc1 · [report](glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k6-compact-max-recard/report.svg)
 - 2026-11-19 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 445/380 W (325–450) · build v6.0.0-rc1 · [report](glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k8-compact-max/report.svg)
 - 2026-11-19 · Release smoke · wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 440/375 W (150–450) · build v6.0.0-rc1 · [report](glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k6-compact-max/report.svg)

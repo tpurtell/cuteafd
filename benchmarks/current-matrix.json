@@ -77,12 +77,12 @@
       "family": "glm5_flash",
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1",
       "1rtx": {
-        "status": "pending",
-        "reason": "Pending Release smoke"
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-1rtx-2spark-glmf-mc-mul1-original-min"
       },
       "2rtx": {
-        "status": "pending",
-        "reason": "Pending Release smoke"
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-2rtx-glmf-mc-mul1-original-max"
       }
     },
     {
