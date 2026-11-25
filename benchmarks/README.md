@@ -434,6 +434,10 @@ historical recipe; new release launches use the v7 matrix.
 - 2026-11-16 · Release smoke · wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC · 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 4× DGX Spark · build 45482847e1a8 · [report](inkling2/2026-11-16-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min-cand-r1/report.svg)
 - 2026-11-16 · Release smoke · thinkingmachines/Inkling-2-Small-MXFP8 · 1× RTX PRO 6000 @ gpu-powerd 425 W (425–450) + 6× DGX Spark · build d4ac343cb8ab · [report](inkling2/2026-11-16-smoke-mxfp8-1rtx-6spark/report.svg)
 
+## Inkling 2 Mini
+
+- 2026-11-25 · Release smoke · thinkingmachines/Inkling-2-Mini · 1× RTX PRO 6000 @ gpu-powerd 435 W (425–600) · build 062e7af0f70c · [report](inkling2_mini/2026-11-25-smoke-inkling-2-mini-1rtx-inkling2-mini-1x-rtx/report.svg)
+
 ## Kimi K3
 
 - 2026-11-19 · Release smoke · wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC · 2× RTX PRO 6000 @ gpu-powerd 430/415 W (320–450) + 6× DGX Spark · build v6.0.0-rc1 · [report](kimi_k3/2026-11-19-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-k8-compact-max/report.svg)
