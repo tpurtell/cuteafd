@@ -155,7 +155,7 @@ fn snapshot_loading_reads_template_eos_and_special_tokens() {
 
 #[test]
 fn served_snapshot_template_matches_the_fixture_when_present() {
-    let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required")).join("hub/models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1/snapshots/47af23347db743b4666d952e2eb48f2b01c3fede");
+    let snapshot = std::path::PathBuf::from(std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required")).join("hub/models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-MC/snapshots/2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e");
     assert!(snapshot.exists(), "required installed snapshot missing: {}", snapshot.display());
     assert_eq!(std::fs::read_to_string(snapshot.join("chat_template.jinja")).unwrap(), EXL3_K4);
     assert_eq!(GlmEncoding::from_snapshot(&snapshot).unwrap().tokens(), &GlmTokenIds::glm5());

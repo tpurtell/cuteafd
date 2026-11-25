@@ -3616,13 +3616,17 @@ mod checkpoint_header_tests {
     #[test]
     fn installed_glm_k6_index_resolves_a_dflash_target_head() {
         let home = std::env::var_os("CUTEAFD_DEPLOYMENT_TEST_HF_HOME").map(std::path::PathBuf::from).expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required");
-        let snapshot = home.join("hub/models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6/snapshots")
-            .join("5a4e83a09a11f3145332ed632d28a9894ea88225");
-        assert!(snapshot.join("model.safetensors.index.json").is_file(), "required installed K6 index missing");
-        let index = cuteafd_loader::plan::checkpoint::read_json(&snapshot.join("model.safetensors.index.json")).unwrap();
+        // The standalone Core-K6 checkpoint is retired; its core is the MC checkpoint's k6-compact view.
+        use cuteafd_loader::plan::checkpoint::{CheckpointView, CoreView};
+        let snapshot = home.join("hub/models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-MC/snapshots")
+            .join("2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e");
+        let view = CheckpointView::select(&snapshot, CoreView::K6Compact)
+            .expect("required installed MC k6-compact view missing");
+        assert!(view.index_path().is_file(), "required installed K6 index missing");
+        let index = cuteafd_loader::plan::checkpoint::read_json(&view.index_path()).unwrap();
         assert!(index["weight_map"].get("lm_head.weight").is_none());
         assert!(index["weight_map"].get("lm_head.trellis").is_some());
-        check_snapshot_target_head(&snapshot, "lm_head", 6144, 154880, false).unwrap();
+        check_view_target_head(&view, "lm_head", 6144, 154880, false).unwrap();
     }
 
     fn fixture(dtype: DType) -> Checkpoint {
