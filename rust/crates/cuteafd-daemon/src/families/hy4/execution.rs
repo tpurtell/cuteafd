@@ -927,7 +927,6 @@ impl<'a> RankRuntime<'a> {
             .cast();
         let scalars = [
             Scalar::I32(c_rows as i32),
-            Scalar::I32(c_rows as i32),
             Scalar::I64(CANDIDATE_TOPK as i64),
             Scalar::I32(splits),
         ];
@@ -4137,7 +4136,7 @@ impl<'a> Hy4Engine<'a> {
                 };
                 self.run_units(
                     &mut placements,
-                    &[tokens],
+                    &[&tokens[off..off + 1]],
                     &[unit],
                     priority,
                     |_| head_mode,
