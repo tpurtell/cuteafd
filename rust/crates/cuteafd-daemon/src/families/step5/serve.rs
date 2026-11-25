@@ -792,7 +792,8 @@ mod tests {
         let boundary = execution.split_once("    fn graph_completed(").unwrap().1
             .split_once("    pub(super) fn validate_caches(").unwrap().0;
         assert!(boundary.find("bank.tick()").unwrap() < boundary.find("stage.stream.drain()").unwrap());
-        assert!(boundary.find("stage.stream.drain()").unwrap() < boundary.find("observe_completed(").unwrap());
+        assert!(boundary.find("cycles.complete()").unwrap() < boundary.find("stage.stream.drain()").unwrap());
+        assert!(boundary.find("stage.stream.drain()").unwrap() < boundary.find("cycles.poll()").unwrap());
         let enqueue = execution.split_once("    pub fn enqueue<'s").unwrap().1
             .split_once("/// Each unit owns").unwrap().0;
         assert!(enqueue.contains("self.graph_completed()?"));

@@ -56,9 +56,8 @@ impl<'a> Graphs<'a> {
     pub(super) fn retained_rows(&self, rows: usize) -> usize {
         self.bank.borrow().count(|key| key.rows == rows)
     }
-    pub(super) fn needs_boundary(&self) -> bool {
-        self.first_touch_pending.get() || self.bank.borrow().cache_needs_boundary()
-    }
+    pub(super) fn first_touch_pending(&self) -> bool { self.first_touch_pending.get() }
+    pub(super) fn is_warming(&self) -> bool { self.warming.get() }
     pub(super) fn observed(&self) { self.first_touch_pending.set(false); }
     pub(super) fn tick(&self) { self.bank.borrow_mut().cache_tick(); }
     pub(super) fn visit(&self, visit: &mut device::GraphVisitor<'_>) -> Result<()> {
