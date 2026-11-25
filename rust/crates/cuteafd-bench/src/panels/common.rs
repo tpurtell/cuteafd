@@ -228,7 +228,10 @@ pub fn graph_sample(stats: &Value) -> Option<Value> {
             spans.insert(site.to_string(), json!(known || span));
         }
         json!({"device": device["device"], "cycles": device["cycles"], "update_sites": device["update_sites"],
-            "site_spans": spans, "lane_cycles_completed": device["epochs"]["completed"]})
+            "site_spans": spans, "lane_cycles_completed": device["epochs"]["completed"],
+            "boundary": {"boundary_drains": device["epochs"]["boundary_drains"],
+                "boundary_wait_us": device["epochs"]["boundary_wait_us"]},
+            "event_pending_cycles": device["epochs"]["event_pending_cycles"], "charged": device["charged"]})
     }).collect();
     Some(json!({"captures": captures, "sites": stats["graph_capture_sites"], "devices": devices,
         "missing_variants": stats["graph_missing_variants"]}))
@@ -345,7 +348,15 @@ pub fn graph_interval(before: Option<&Value>, after: Option<&Value>) -> Option<V
             Some(Some(lanes)) => json!(lanes),
             None => Value::Null,
         };
+        let Some(mut boundary) = counter_delta(&start["boundary"], &device["boundary"]) else {
+            return unavailable("a boundary counter went backwards");
+        };
+        for key in ["boundary_drains", "boundary_wait_us"] {
+            if device["boundary"][key].is_u64() { boundary.entry(key.to_string()).or_insert(json!(0)); }
+        }
         devices.push(json!({"device": device["device"], "new_device": old.is_none(), "totals": totals,
+            "boundary": boundary, "event_pending_cycles": device["event_pending_cycles"],
+            "charged_before": start["charged"], "charged_after": device["charged"],
             "by_cycle": by_cycle, "sites": sites, "lane_cycles_completed": lanes}));
     }
     let mut eager = Vec::new();
@@ -413,7 +424,10 @@ pub fn graph_band(band: String, graph: &Value, thermal: Option<&Value>) -> Value
     json!({"band": band, "available": graph["available"], "captures": graph["captures"],
         "device_captures": device("captures"), "misses": device("misses"),
         "eager_runs": device("eager_runs"), "updates": device("updates"), "zero_captures": graph["zero_captures"],
-        "reason": graph["reason"], "sites": sites, "thermal": thermal.and_then(thermal_summary)})
+        "reason": graph["reason"], "sites": sites, "thermal": thermal.and_then(thermal_summary),
+        "boundary_devices": devices.map(|devices| devices.iter().map(|d| json!({
+            "device": d["device"], "boundary": d["boundary"], "event_pending_cycles": d["event_pending_cycles"],
+            "charged_before": d["charged_before"], "charged_after": d["charged_after"]})).collect::<Vec<_>>())})
 }
 
 /// Differences of asynchronous total snapshots, not exact phase-isolated counts.
@@ -706,7 +720,8 @@ mod tests {
         let before = super::phase_counters_from(&graph_stats(6, 1, 3, 40)).graph;
         let sample = before.as_ref().unwrap();
         assert_eq!(sample["captures"], 6);
-        assert!(sample["devices"][0].get("charged").is_none(), "samples stay compact");
+        assert_eq!(sample["devices"][0]["charged"], 335544320);
+        assert!(sample["devices"][1]["charged"].is_null(), "missing legacy charge remains unknown");
         // Steady state: hits and lane cycles move, nothing captures.
         let steady = super::phase_counters_from(&graph_stats(6, 1, 3, 72)).graph;
         let band = super::graph_interval(before.as_ref(), steady.as_ref()).unwrap();
@@ -751,6 +766,24 @@ mod tests {
         let steady = super::graph_interval(before.as_ref(), steady.as_ref()).unwrap();
         assert_eq!(steady["devices"][0]["sites"]["glm5.decode"]["totals"], json!({"hits": 32}));
         assert_eq!(super::graph_band("levels C1".into(), &steady, None)["sites"], json!([]));
+    }
+
+    #[test]
+    fn graph_boundaries_report_wait_deltas_and_pending_gauge() {
+        let mut before = graph_stats(6, 1, 3, 40);
+        before["graph_cache"][0]["epochs"]["boundary_drains"] = json!(2);
+        before["graph_cache"][0]["epochs"]["boundary_wait_us"] = json!(10);
+        before["graph_cache"][0]["charged"] = json!(40);
+        let mut after = before.clone();
+        after["graph_cache"][0]["epochs"]["boundary_drains"] = json!(4);
+        after["graph_cache"][0]["epochs"]["boundary_wait_us"] = json!(60);
+        after["graph_cache"][0]["epochs"]["event_pending_cycles"] = json!(3);
+        after["graph_cache"][0]["charged"] = json!(42);
+        let interval = super::graph_interval(super::graph_sample(&before).as_ref(), super::graph_sample(&after).as_ref()).unwrap();
+        let band = super::graph_band("C1".into(), &interval, None);
+        assert_eq!(band["boundary_devices"][0], json!({"device": 0,
+            "boundary": {"boundary_drains": 2, "boundary_wait_us": 50},
+            "event_pending_cycles": 3, "charged_before": 40, "charged_after": 42}));
     }
 
     #[test]
