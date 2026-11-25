@@ -23,6 +23,7 @@ pub(crate) const FAMILIES: &[(&str, &str, Option<&str>)] = &[
     ("inkling2", "serve-inkling2", Some("inkling2-golden")),
     ("inkling2_mini", "serve-inkling2-mini", Some("inkling2-mini-golden")),
     ("hy4_flash", "serve-hy4f", Some("hy4f-golden")),
+    ("hy4", "serve-hy4", Some("hy4-golden")),
 ];
 
 #[derive(Debug, clap::Args)]
@@ -176,10 +177,13 @@ mod tests {
         assert_eq!(argv_golden("deepseek_v41")[1], "v41-golden");
         assert_eq!(argv_golden("step5")[1], "step5-golden");
         assert_eq!(argv_golden("qwen3_5")[1], "qwen35-golden");
+        assert_eq!(argv_golden("hy4")[1], "hy4-golden");
         assert_eq!(super::argv(Kind::Serve, args(Some("qwen3_5"), &["--snapshot", "/m"]))
             .unwrap().unwrap(), ["cuteafd", "serve-qwen35", "--snapshot", "/m"]);
         assert_eq!(super::argv(Kind::Serve, args(Some("step5"), &["--snapshot", "/m"]))
             .unwrap().unwrap(), ["cuteafd", "serve-step5", "--snapshot", "/m"]);
+        assert_eq!(super::argv(Kind::Serve, args(Some("hy4"), &["--snapshot", "/m"]))
+            .unwrap().unwrap(), ["cuteafd", "serve-hy4", "--snapshot", "/m"]);
         assert!(super::argv(Kind::Serve, args(Some("nope"), &[])).is_err());
     }
 

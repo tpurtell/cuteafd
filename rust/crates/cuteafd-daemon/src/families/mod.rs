@@ -14,4 +14,6 @@ pub(crate) mod muse_spark;
 pub(crate) mod minimax_m3;
 pub(crate) mod inkling2;
 pub(crate) mod inkling2_mini;
+pub(crate) mod hy4;
+pub(crate) mod hy4_common;
 pub(crate) mod hy4_flash;

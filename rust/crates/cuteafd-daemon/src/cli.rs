@@ -275,6 +275,12 @@ pub(crate) enum Commands {
     /// Serve Hy4-flash through the shared scheduler on 1x or 2x RTX (and Spark experts).
     #[command(hide = true)]
     ServeHy4f(crate::families::hy4_flash::serve::ServeArgs),
+    /// Qualify Hy4 coordinator text forward, IndexCache sharing, pages-only prefix restore, and TP2.
+    #[command(hide = true)]
+    Hy4Golden(crate::families::hy4::golden::GoldenArgs),
+    /// Serve Hy4 through the shared scheduler on 1x or 2x RTX and Spark experts.
+    #[command(hide = true)]
+    ServeHy4(crate::families::hy4::serve::ServeArgs),
     /// Serve Inkling through the shared scheduler on one RTX and Spark experts.
     #[command(hide = true)]
     ServeInkling2(crate::families::inkling2::serve::ServeArgs),

@@ -303,7 +303,7 @@ fn synthetic_hy4_snapshot(exl3: bool, compact_core_bits: Option<usize>) -> tempf
 #[test]
 fn hy4_family_descriptor_invariants() {
     assert_eq!(HY4.id(), "hy4");
-    assert_eq!(HY4.runtime(), RuntimeStatus::Planned);
+    assert_eq!(HY4.runtime(), RuntimeStatus::Serving);
     assert!(HY4.expert_catalog());
     assert!(HY4.optional(Component::Vision));
     assert!(HY4.optional(Component::Speculator));
@@ -410,7 +410,7 @@ fn hy4_bf16_source_contract_and_arena_sizes_match_expectations() {
     let input = PlanInput::open(dir.path()).unwrap();
     let report = input.plan(&PlanOptions::default()).unwrap();
     assert_eq!(report.family.as_deref(), Some("hy4"));
-    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+    assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
     assert!(report.unclassified.is_empty(), "unclassified: {:?}", report.unclassified);
     for comp in &report.components {
         if comp.component == Component::RoutedExpert {
@@ -478,7 +478,7 @@ fn hy4_live_bf16_checkpoint_validates_all_2710_tensors() {
     assert_eq!(crate::plan::family::detect(input.checkpoint()).expect("detected family").id(), "hy4");
     let report = input.plan(&PlanOptions::default()).expect("plan live tencent/Hy4");
     assert_eq!(report.family.as_deref(), Some("hy4"));
-    assert_eq!(report.runtime, Some(RuntimeStatus::Planned));
+    assert_eq!(report.runtime, Some(RuntimeStatus::Serving));
     assert!(report.unclassified.is_empty(), "unclassified: {:?}", report.unclassified);
     for comp in &report.components {
         if comp.component == Component::RoutedExpert {
@@ -500,5 +500,52 @@ fn hy4_live_bf16_checkpoint_validates_all_2710_tensors() {
                 comp.rejections
             );
         }
+    }
+}
+
+pub(crate) fn concurrency_matrix_snapshot() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = synthetic_hy4_snapshot(true, Some(8));
+    let manifest = dir.path().join("share/PROGRAMS.json");
+    std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    std::fs::write(&manifest, r#"{"programs":[]}"#).unwrap();
+    for (tp, intermediate) in [(1usize, 2048usize), (2, 1024)] {
+        let root = dir.path().join(format!("lib/exl3/exl3-hy4-k45-mul1/rtx-tp{tp}"));
+        for capacity in crate::placement::inventory::exl3_capacities(4096) {
+            let path = root.join(format!("m{capacity}"));
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("v41_exl3.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "capacity": capacity, "hidden": 6144, "experts": 256, "intermediate": intermediate, "top_k": 8,
+                    "bits": [4, 5], "codebook": "mul1", "activation": "silu_post_clamp", "swiglu_limit": 10.0,
+                    "input_format": "e4m3_k32", "trellis_lut": {"bytes": 4096}, "buffers": {
+                        "scratch": {"allocation": "scratch", "dtype": "f32", "bytes": capacity * 64, "zero_on_create": false}}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+    }
+    (dir, manifest)
+}
+
+#[test]
+fn hy4_compact_core_trellis_side_is_output_on_tp1_and_input_on_tp2() {
+    use crate::formats::dense_trellis::TrellisSide;
+    let dir = synthetic_hy4_snapshot(true, Some(8));
+    let ckpt = crate::plan::checkpoint::Checkpoint::inventory(dir.path()).unwrap();
+    let model = Model::open(&ckpt).unwrap();
+    let modes_1x = crate::placement::families::hy4::layer_modes(&model.cfg, 1, AttentionPlacement::Context);
+    let modes_2x = crate::placement::families::hy4::layer_modes(&model.cfg, 2, AttentionPlacement::Context);
+    let tp1 = target_arenas(&ckpt, &model.cfg, &model.core, &modes_1x, 1).unwrap();
+    let tp2 = target_arenas(&ckpt, &model.cfg, &model.core, &modes_2x, 2).unwrap();
+    for stem in [
+        "model.layers.0.self_attn.o_proj",
+        "model.layers.0.mlp.down_proj",
+        "model.layers.1.mlp.shared_experts.down_proj",
+    ] {
+        assert_eq!(tp1[0].core[stem].side, TrellisSide::Output, "TP1 {stem}");
+        assert_eq!(tp2[0].core[stem].side, TrellisSide::Input, "TP2 rank 0 {stem}");
+        assert_eq!(tp2[1].core[stem].side, TrellisSide::Input, "TP2 rank 1 {stem}");
     }
 }
