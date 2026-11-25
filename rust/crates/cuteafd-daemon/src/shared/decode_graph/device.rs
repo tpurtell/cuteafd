@@ -1537,10 +1537,22 @@ impl DeviceCache {
 
     fn resident_bytes(&self) -> u64 { self.inventory.resident }
 
+    fn reported_live_bytes(&self) -> u64 {
+        match (self.soft.measured_bytes, self.soft.measured_nodes) {
+            (Some(_), Some(measured_nodes)) if measured_nodes > 0 => {
+                let live_nodes = self.native_pools().live_nodes;
+                ((u128::from(self.charged) * u128::from(live_nodes)) / u128::from(measured_nodes))
+                    .min(u128::from(self.charged)) as u64
+            }
+            _ => self.live_bytes,
+        }
+    }
+
     fn estimate(&self, site: Site, node_estimate: Option<u64>) -> (u64, u64) {
         let class = self.classes.get(site.name);
         let estimate = node_estimate.filter(|n| *n > 0).unwrap_or_else(|| class
-            .filter(|c| c.samples > 0).map_or(site.bootstrap, |c| c.total.div_ceil(c.samples)));
+            .filter(|c| c.samples > 0 && c.total > 0)
+            .map_or(site.bootstrap, |c| c.total.div_ceil(c.samples)));
         (estimate, class.map_or(estimate, |c| c.largest.max(estimate)))
     }
 
@@ -2086,8 +2098,13 @@ impl DeviceCache {
             }
             let new_nodes = metadata.nodes.filter(|nodes| *nodes > 0)
                 .or_else(|| old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0))
-                .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
-                    .filter_map(|r| r.stats.native_nodes).max());
+                .or_else(|| {
+                    let (sum, count) = self.records.values()
+                        .filter(|r| r.identity.site == site.name)
+                        .filter_map(|r| r.stats.native_nodes.filter(|n| *n > 0))
+                        .fold((0u64, 0u64), |(s, c), n| (s.saturating_add(n), c + 1));
+                    (count > 0).then(|| sum.div_ceil(count))
+                });
             // Historical physical shares are slab-sized, not the cost of a
             // replacement graph. Known native nodes that fit the frozen soft
             // capacity after retirement reuse the arena; pending/uncredited
@@ -2440,7 +2457,8 @@ impl DeviceCache {
             self.live_bytes = self.live_bytes.saturating_sub(record.bytes).saturating_add(share);
             record.bytes = share;
             let class = self.classes.entry(record.identity.site).or_default();
-            if share > 0 { class.total = class.total.saturating_add(share); class.samples += 1; class.largest = class.largest.max(share); }
+            class.samples += 1;
+            if share > 0 { class.total = class.total.saturating_add(share); class.largest = class.largest.max(share); }
             self.counters.entry(record.cycle).or_default().captures += 1;
             self.update_sites.entry(record.identity.site).or_default().entry(record.cycle).or_default().captures += 1;
             if let Some(list) = list { self.push(id, list); }
@@ -2584,7 +2602,7 @@ impl DeviceCache {
     pub fn report_due(&mut self, elapsed: Duration) -> bool {
         if elapsed < Duration::from_secs(30) || self.interval_evictions == 0 { return false }
         tracing::info!(device = self.device, evictions = self.interval_evictions,
-            reserve = self.reserve, charged = self.charged, live_bytes = self.live_bytes, resident_bytes = self.resident_bytes(), cycles = ?self.counters, "graph cache interval");
+            reserve = self.reserve, charged = self.charged, live_bytes = self.reported_live_bytes(), resident_bytes = self.resident_bytes(), cycles = ?self.counters, "graph cache interval");
         self.interval_evictions = 0;
         self.last_report = Instant::now();
         true
@@ -2606,7 +2624,7 @@ impl DeviceCache {
         let per_cycle = self.per_cycle(&update_sites);
         let records = self.records.values().map(RawRecord::copy).collect();
         TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor,
-            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft, level: self.level,
+            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.reported_live_bytes(), resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft, level: self.level,
             pinned: self.inventory.pinned, spanning_bytes: self.inventory.spanning_bytes, spanning_nodes: self.inventory.spanning_nodes, spanning_execs: self.inventory.spanning_execs,
             pending_capture: self.pending_bytes, cycles, pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
@@ -2659,7 +2677,7 @@ impl DeviceCache {
         let (cycles, update_sites) = self.launch_counts();
         let per_cycle = self.per_cycle(&update_sites);
         let now = self.started.elapsed().as_millis() as u64;
-        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft,
+        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.reported_live_bytes(), resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft,
             level: self.level,
             pinned: self.inventory.pinned, spanning_bytes: self.inventory.spanning_bytes, spanning_nodes: self.inventory.spanning_nodes, spanning_execs: self.inventory.spanning_execs,
             pending_capture: self.pending_bytes, cycles, pools: self.pools.clone(), basis: self.basis,
@@ -5012,6 +5030,78 @@ mod tests {
         assert!(cache.counters[&Cycle::Decode].hot_guard_skips >= 36,
             "select_victim must walk past and skip hot graphs (saw {})",
             cache.counters[&Cycle::Decode].hot_guard_skips);
+    }
+
+    #[test]
+    fn calibrated_live_bytes_tracks_node_share_not_slab_carrier_tags() {
+        let mut cache = test_cache(-99121, 100 << 20);
+        // 15 zero-growth captures + 1 slab-crossing 2 MiB capture, all 10 nodes each.
+        let mut ids = Vec::new();
+        for n in 0..16 {
+            let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, false) else { panic!() };
+            cache.captured_topology(id, 10, 1, false);
+            cache.measured_capture(if n == 0 { 2 << 20 } else { 0 });
+            ids.push(id);
+        }
+        cache.serial_boundary();
+        cache.serial_boundary();
+        cache.soft.limit = 2 << 20;
+        cache.soft.measured_bytes = Some(2 << 20);
+        cache.soft.measured_nodes = Some(160);
+        assert_eq!(cache.snapshot().live_bytes, 2 << 20);
+        // Evict the slab-crossing carrier (id 0) and replace with a 0-byte reuse capture.
+        let victim = ids[0];
+        cache.records.get_mut(&victim).unwrap().pending_destroy = true;
+        cache.pending_destroy += 1;
+        cache.pending_lanes[0] += 1;
+        cache.clocks[0].pending.fetch_add(1, Ordering::Release);
+        cache.destroyed(&[victim], ReleaseMeasurement { released: 0 });
+        assert_eq!(cache.snapshot().live_bytes, (2 << 20) * 150 / 160);
+        let Miss::Capture(repl) = cache.miss(key(99), site(Preference::Capture), None, false) else { panic!() };
+        cache.captured_topology(repl, 10, 1, false);
+        cache.measured_capture(0);
+        assert_eq!(cache.snapshot().live_bytes, 2 << 20, "reuse replacement keeps live_bytes proportional to live_nodes");
+        assert_eq!(cache.charged, 2 << 20);
+    }
+
+    #[test]
+    fn class_samples_counts_all_settled_captures_and_prevents_estimate_inflation() {
+        let mut cache = test_cache(-99122, 100 << 20);
+        // Initial zero-growth capture increments samples but still falls back to bootstrap (> 0).
+        let Miss::Capture(_) = cache.miss(key(0), site(Preference::Capture), None, false) else { panic!() };
+        cache.measured_capture(0);
+        assert_eq!(cache.classes["test"].samples, 1);
+        assert_eq!(cache.estimate(site(Preference::Capture), None).0, 10);
+        // 14 more zero-growth captures + 1 two-MiB slab capture -> 16 samples total, 128 KiB mean.
+        for n in 1..16 {
+            let Miss::Capture(_) = cache.miss(key(n), site(Preference::Capture), None, false) else { panic!() };
+            cache.measured_capture(if n == 15 { 2 << 20 } else { 0 });
+        }
+        assert_eq!(cache.classes["test"].samples, 16);
+        let (est, headroom) = cache.estimate(site(Preference::Capture), None);
+        assert_eq!(est, (2 << 20) / 16, "estimate amortizes slab bytes across all settled captures");
+        assert_eq!(headroom, 2 << 20, "headroom retains worst single slab jump");
+    }
+
+    #[test]
+    fn unseen_key_uses_site_mean_nodes_instead_of_max() {
+        let mut cache = test_cache(-99123, 10_000);
+        for n in 0..9 {
+            let id = capture(&mut cache, n, false);
+            cache.captured_topology(id, 6, 1, false);
+        }
+        let outlier = capture(&mut cache, 9, false);
+        cache.captured_topology(outlier, 27, 1, false);
+        // Total live_nodes = 9*6 + 27 = 81; site mean = ceil(81/10) = 9, max = 27.
+        // Set soft cap to 91 (10 free nodes): fits site mean (9) without evicting, would fail max (27).
+        cache.soft.measured_bytes = Some(100);
+        cache.soft.measured_nodes = Some(91);
+        cache.soft.limit = 100;
+        cache.charged = 100;
+        cache.begin_lane(0);
+        assert!(matches!(cache.miss(key(100), site(Preference::Capture), None, false), Miss::Capture(_)),
+            "unseen key must admit against site mean (9 <= 10), not max (27)");
+        assert_eq!(cache.pending_destroy, 0);
     }
 }
 
