@@ -1,4 +1,4 @@
-"""Publish the sealed Hy4-flash K4 MC package through native Hub upload."""
+"""Publish the sealed Hy4-flash K4 MC package through verified HTTP LFS batches."""
 from __future__ import annotations
 
 import argparse
@@ -8,6 +8,7 @@ import re
 import sys
 
 from core_export import MUL1
+import hub_lfs
 from inkling2 import publish as hub
 
 from . import recipe
@@ -89,6 +90,7 @@ def run_cli(target, revision):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--root', type=Path, required=True)
+    hub_lfs.add_arguments(parser)
     args = parser.parse_args()
     # No implicit login or token persistence; the completed receipt is public.
     root, output = args.root.resolve(), args.output.absolute()
@@ -100,7 +102,8 @@ def run_cli(target, revision):
         token = sys.stdin.readline(1024).strip()
         if not re.fullmatch(r'hf_[A-Za-z0-9]+', token):
             parser.error('the write token on stdin is missing or malformed')
-    result = hub.publish(output, root, api=HfApi(token=token or False), target=target)
+    result = hub.publish(output, root, api=HfApi(token=token or False), target=target,
+                         options=hub_lfs.options_from(args))
     print(json.dumps({key: result[key] for key in ('status', 'repo_id', 'revision', 'url')}), flush=True)
 
 
