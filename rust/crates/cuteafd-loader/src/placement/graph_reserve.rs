@@ -7,11 +7,41 @@ pub fn glm_default(family: GlmPrewarmFamily, ranks: usize) -> (u64, u64) {
     let list = crate::serving_capacity::glm_graphs::glm_prewarm(family, ranks);
     (list.reserve_base_bytes, list.reserve_extra_bytes)
 }
-/// Each layout rank charges only its trace-qualified identities and one tail.
-/// An unmeasured layout has no borrowed inventory; explicit policy still works.
-pub fn v41_default(ranks: usize, rank: usize) -> (u64, u64) {
-    crate::serving_capacity::v41_graphs::v41_prewarm(ranks, rank)
-        .map_or((0, 0), |list| (list.reserve_base_bytes, list.reserve_extra_bytes))
+/// Per-device V4.1 measured C1 working set under shipping settings (rank-local
+/// prewarm intact), scaled by the number of decode lanes sharing the device.
+/// Passed directly to `resolve_working_set` / `current_working_set` with no
+/// family-local margin or hard-extra arithmetic.
+///
+/// Measured from `v41-strided-lanes-ab` reconciliation logs + C1 bands and the
+/// five Nov 18 V4.1 graph traces (`v41-width7-layout1`, `v41-width7-layout2`,
+/// `v41-history-final`; `largest_bytes = 4 MiB` across all five traces):
+/// - 1x RTX GPU 0: `W1_lane = 984 MiB` (944 MiB prewarm/lane + 38 MiB C1
+///   `backbone.shared` + 2 MiB 32K index), `shared = 80 MiB` (14 MiB ready
+///   shared + 66 MiB `first_request` prefill), `step_growth = 27 MiB/lane`.
+/// - 2x RTX GPU 0: `W1_lane = 592 MiB` (590 MiB prewarm/lane + 2 MiB 32K index),
+///   `shared = 12 MiB`, `step_growth = 11 MiB/lane`.
+/// - 2x RTX GPU 1: `W1_lane = 594 MiB` (592 MiB prewarm/lane + 2 MiB 32K index),
+///   `shared = 14 MiB` (incl. 6 MiB spanning `dspark_chain`), `step_growth = 11 MiB/lane`.
+/// An unknown layout returns `None` so it never borrows another layout's inventory.
+pub fn v41_working_set(ranks: usize, rank: usize, lanes: u8) -> Option<WorkingSet> {
+    const MIB: u64 = 1 << 20;
+    let lanes = u64::from(lanes.max(1));
+    let (w1, step_growth) = match (ranks, rank) {
+        (1, 0) => ((lanes * 984 + 80) * MIB, lanes * 27 * MIB),
+        (2, 0) => ((lanes * 592 + 12) * MIB, lanes * 11 * MIB),
+        (2, 1) => ((lanes * 594 + 14) * MIB, lanes * 11 * MIB),
+        _ => return None,
+    };
+    Some(WorkingSet { w1, step_growth, capture_growth: 4 * MIB })
+}
+
+/// Resolve V4.1's reserve through the shared `current_working_set` rule for
+/// measured layouts, or `current(rank, false, 0, 0)` for unknown layouts.
+pub fn v41_current(ranks: usize, rank: usize, lanes: u8) -> Result<Resolved, Error> {
+    match v41_working_set(ranks, rank, lanes) {
+        Some(measured) => current_working_set(rank, measured),
+        None => current(rank, false, 0, 0),
+    }
 }
 
 /// Kimi K3 selects its arena by checkpoint core format and coordinator rank count: TP2 captures a
@@ -395,5 +425,26 @@ mod tests {
             assert_eq!(resolve_working_set(Some("256MiB"), extra, cap, 0, measured), Err(Error::WorkingSetExtra { key }));
         }
         assert!(resolve_working_set(None, Some("gpu1=1MB"), None, 0, measured).is_ok());
+    }
+
+    #[test]
+    fn v41_working_set_uses_shared_resolver_across_layouts_and_lanes() {
+        const MIB: u64 = 1 << 20;
+        for (ranks, rank, lanes, w1_mib, soft_mib, hard_mib) in [
+            (1, 0, 1, 1_064, 1_278, 1_286),
+            (1, 0, 2, 2_048, 2_458, 2_466),
+            (2, 0, 1, 604, 726, 734),
+            (2, 0, 2, 1_196, 1_436, 1_444),
+            (2, 1, 1, 608, 730, 738),
+            (2, 1, 2, 1_202, 1_444, 1_452),
+        ] {
+            let measured = v41_working_set(ranks, rank, lanes).unwrap();
+            assert_eq!(measured.w1, w1_mib * MIB, "ranks={ranks} rank={rank} lanes={lanes}");
+            let policy = resolve_working_set(None, None, None, rank, measured).unwrap();
+            assert_eq!(policy.base_bytes, soft_mib * MIB);
+            assert_eq!(policy.growth_headroom, Some(8 * MIB));
+            assert_eq!(policy.bytes, hard_mib * MIB);
+        }
+        assert!(v41_working_set(3, 0, 1).is_none());
     }
 }

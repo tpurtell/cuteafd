@@ -198,6 +198,14 @@ impl<'a> ScratchGuard<'a> {
         // and cross-device event waits are permitted.
         unsafe { self.library.cuda_stream_wait_event(writer, self.events[index].1) }
     }
+    /// Non-blocking check for whether the last recorded release event has not
+    /// yet signaled on the GPU (zero host sync).
+    pub(crate) fn unresolved(&self) -> Result<bool> {
+        let Some(index) = self.recorded.get() else { return Ok(false) };
+        let (device, event) = self.events[index];
+        // SAFETY: owned by `self` on `device`.
+        unsafe { super::chain::event_unresolved(self.library, device, event) }
+    }
     /// Records the joined chain head: the scratch is free once it completes.
     /// Call after the hook's last reader finished on the chain.
     pub(crate) fn release(&self) -> Result<()> {

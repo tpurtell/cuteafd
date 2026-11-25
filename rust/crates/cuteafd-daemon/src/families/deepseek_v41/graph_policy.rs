@@ -113,15 +113,14 @@ fn site_name(name: &'static str) -> &'static str {
 /// Whether this layout keeps any spanning site in its startup prewarm.
 pub(crate) fn spanning_layout(ranks: usize) -> bool { ranks > 1 }
 
-pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize,
+pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize, lanes: u8,
     mut visit: impl FnMut(&mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>) -> Result<()> {
     use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
     tracing::warn!("V4.1 graph cache uses byte estimates: SM120 node rates are not calibrated");
     set_layout(ranks);
     visit(&mut |device, name, spans, bank| {
-        let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, device as usize);
-        let policy = cuteafd_loader::placement::graph_reserve::current(device as usize,
-            false, base, extra).map_err(anyhow::Error::msg)?;
+        let policy = cuteafd_loader::placement::graph_reserve::v41_current(ranks, device as usize, lanes)
+            .map_err(anyhow::Error::msg)?;
         bank.attach(library, device, policy.bytes, Site { name: site_name(name), cycle: Cycle::Other,
             preference: Preference::Adaptive, bootstrap: 2 << 20, basis: Basis::Bytes,
             spans_devices: spanning::spans(name, spans) })?;

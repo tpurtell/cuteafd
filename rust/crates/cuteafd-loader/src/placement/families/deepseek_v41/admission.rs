@@ -127,12 +127,13 @@ pub struct Opaque {
 
 /// The bounded graph arena, one owner per coordinator GPU. Admission charges
 /// the whole configured reserve once before KV sizing; the daemon's device
-/// cache reports its measured high-water against it. `GPU_GRAPH_RESERVE`
-/// overrides it per device and never splits across ranks. Nothing here is live
-/// at Ready, so it prices only the post-ready phases.
-pub fn graph_allowance(ranks: usize, rank: usize) -> Result<Opaque, Refusal> {
-    let (base, extra) = crate::placement::graph_reserve::v41_default(ranks, rank);
-    let resolved = crate::placement::graph_reserve::current(rank, false, base, extra)
+/// cache reports its measured high-water against it. Scaled by `lanes` through
+/// the shared `resolve_working_set` / `current_working_set` rule (`W1` per lane
+/// x `lanes` + shared, plus shared step and single-capture headroom).
+/// `GPU_GRAPH_RESERVE` overrides it per device and never splits across ranks.
+/// Nothing here is live at Ready, so it prices only the post-ready phases.
+pub fn graph_allowance(ranks: usize, rank: usize, lanes: u8) -> Result<Opaque, Refusal> {
+    let resolved = crate::placement::graph_reserve::v41_current(ranks, rank, lanes)
         .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
     Ok(Opaque {
         location: Location::coordinator(rank as u8),
@@ -1810,12 +1811,15 @@ impl Recipe for V41Recipe<'_> {
 mod explicit_budget_tests {
     #[test]
     fn graph_reserve_prices_only_the_named_arena() {
-        let owner = super::graph_allowance(1, 0).unwrap();
-        let (base, tail) = crate::placement::graph_reserve::v41_default(1, 0);
-                assert_eq!(owner.bytes, crate::placement::graph_reserve::resolve(None, 0, false, base, tail).unwrap().bytes);
-        assert_eq!(owner.source, "graph reserve: v41.graphs.0");
-        // The old lazy envelope and runtime growth owner are gone, not renamed.
-        assert!(!owner.source.contains("runtime"));
+        for lanes in [1u8, 2] {
+            let owner = super::graph_allowance(1, 0, lanes).unwrap();
+            let measured = crate::placement::graph_reserve::v41_working_set(1, 0, lanes).unwrap();
+            assert_eq!(owner.bytes, crate::placement::graph_reserve::resolve_working_set(None, None, None, 0, measured).unwrap().bytes);
+            assert_eq!(owner.source, "graph reserve: v41.graphs.0");
+            // The old lazy envelope and runtime growth owner are gone, not renamed.
+            assert!(!owner.source.contains("runtime"));
+        }
+        assert!(super::graph_allowance(1, 0, 2).unwrap().bytes > super::graph_allowance(1, 0, 1).unwrap().bytes);
     }
 }
 

@@ -194,6 +194,9 @@ impl<'a> DualAttentionWave<'a> {
         let mut guard=PendingDualAttention { wave:Some(self),cold:[false;2],rows,layer };
         let wave=guard.wave.as_deref_mut().unwrap();
         let owner=wave.halves[0].device;
+        if crate::shared::memory::chain::active() {
+            owner.future(wave.halves[0].wait_host()).await?;
+        }
         owner.run(||unsafe {
             tail.restore_warmup()?;
             let checkpoint = tail.checkpoint();
@@ -243,7 +246,10 @@ impl<'a> DualAttentionWave<'a> {
         let wave=pending.wave.as_deref_mut().unwrap();
         let stream=wave.halves[1].chain_stream();
         let peer=wave.halves[1].device;
-        peer.run(|| unsafe { wave.storage.guard.acquire(stream) })?;
+        peer.run(|| unsafe {
+            wave.storage.guard.acquire(stream)?;
+            crate::shared::memory::chain::join(peer.library, stream)
+        })?;
         let mirrored=unsafe { wave.storage.inputs.enqueue(bank,cache,stream)? };
         let selected=selection.map(|s|unsafe { wave.storage.inputs.selection(s,stream) }).transpose()?;
         peer.run(||unsafe { wave.storage.copies[1].launch(wave.storage.peer_sink.buffer,slice(sink,128,128),128,stream) })?;

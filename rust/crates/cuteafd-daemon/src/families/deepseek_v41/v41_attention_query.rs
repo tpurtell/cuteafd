@@ -648,12 +648,15 @@ impl AttentionQueryWave<'_, '_> {
         let mut guard=Drain { stream:&storage.stream,complete:false };
         let graph=if self.window.is_windowed() { None } else { self.tp2_prefix_graphs.cached_launch(self.weights.layer,self.weights,rows) };
         unsafe {
+            crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
             // The projection's own stream writes `b(3)` after this stream's
             // rank stage, so this acquire orders it too.
             self.acquire_scratch()?;
             self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(),self.position_staging.buffer,
                 tokens.len()*8,self.storage.stream.raw)?;
             prepare(self.storage.stream.raw,self.input())?;
+            // The normalized input is complete here; cache producers fork from it.
+            crate::shared::memory::chain::mark_fork(self.storage.stream.library, self.storage.stream.raw)?;
             crate::shared::decode_graph::census::dispatch(self.storage.stream.library, self.storage.stream.raw, c"layer_row",
                 rows as usize, graph.map(|(raw, _)| raw), || self.enqueue_rank(rows))?;
             projection.execute_after(self.weights.layer,rows,self.b(2),Some(self.storage.stream.raw),|projected,stream| {
@@ -665,6 +668,7 @@ impl AttentionQueryWave<'_, '_> {
         }
         if !self.window.is_windowed() && graph.is_none() && super::graph_policy::captures_shape(rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
+            if crate::shared::memory::chain::deferred() { self.storage.stream.wait().await?; }
             unsafe { self.capture_ready_kind(rows, true)?; }
         }
         guard.complete=true;drop(guard);

@@ -633,7 +633,7 @@ pub(super) fn resolve_with_owners(
     // or replaces the configured reserve.
     let mut allowances = Vec::new();
     for gpu in 0..memory.len() {
-        allowances.push(admission::graph_allowance(memory.len(), gpu)?);
+        allowances.push(admission::graph_allowance(memory.len(), gpu, args.decode_lanes)?);
     }
     let mut retained = owners.iter().map(Owner::from_demand).collect::<Vec<_>>();
     for (gpu, &bytes) in deferred.iter().enumerate().filter(|(_, &bytes)| bytes > 0) {
@@ -1480,7 +1480,7 @@ mod admission_tests {
             }
             assert_eq!(admitted.placement.pool_tokens, args.pool_tokens.unwrap());
             assert_eq!(admitted.reservation_bytes, vec![total; ranks]);
-            let graph_reserves = (0..ranks).map(|rank| graph_reserve_bytes(ranks, rank)).collect::<Result<Vec<_>>>()?;
+            let graph_reserves = (0..ranks).map(|rank| graph_reserve_bytes(ranks, rank, args.decode_lanes)).collect::<Result<Vec<_>>>()?;
             let exact = admitted
                 .cache_bytes
                 .iter()
@@ -1614,26 +1614,28 @@ mod admission_tests {
     }
 
     /// The same configured reserve admission charged, resolved through the
-    /// family list and `GPU_GRAPH_RESERVE`, so a test cannot invent a third
-    /// graph budget.
-    fn graph_reserve_bytes(ranks: usize, rank: usize) -> Result<usize> {
-        let (base, extra) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, rank);
-        Ok(cuteafd_loader::placement::graph_reserve::current(rank, false, base, extra)
+    /// shared `current_working_set` rule and `GPU_GRAPH_RESERVE`, so a test
+    /// cannot invent a third graph budget.
+    fn graph_reserve_bytes(ranks: usize, rank: usize, lanes: u8) -> Result<usize> {
+        Ok(cuteafd_loader::placement::graph_reserve::v41_current(ranks, rank, lanes)
             .map_err(anyhow::Error::msg)?.bytes as usize)
     }
 
     #[test]
     fn graph_reserves_and_uniform_layout_target_remain_distinct() -> Result<()> {
-        // Each physical rank owns its measured inventory and the shared
-        // extra; card size and logical KV target do not change that owner.
+        // Each physical rank owns its lane-scaled working-set reserve; card
+        // size and logical KV target do not change that owner.
         for ranks in [1, 2] {
             for rank in 0..ranks {
-                let (base, tail) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, rank);
-                let expected = cuteafd_loader::placement::graph_reserve::resolve(None, rank, false, base, tail)?;
-                assert_eq!(graph_reserve_bytes(ranks, rank)?, expected.bytes as usize);
+                for lanes in [1u8, 2] {
+                    let measured = cuteafd_loader::placement::graph_reserve::v41_working_set(ranks, rank, lanes).unwrap();
+                    let expected = cuteafd_loader::placement::graph_reserve::resolve_working_set(None, None, None, rank, measured)?;
+                    assert_eq!(graph_reserve_bytes(ranks, rank, lanes)?, expected.bytes as usize);
+                }
+                assert!(graph_reserve_bytes(ranks, rank, 2)? > graph_reserve_bytes(ranks, rank, 1)?);
             }
         }
-        assert_ne!(graph_reserve_bytes(2, 0)?, graph_reserve_bytes(2, 1)?);
+        assert_ne!(graph_reserve_bytes(2, 0, 2)?, graph_reserve_bytes(2, 1, 2)?);
         let dir = tempfile::tempdir()?;
         std::fs::write(
             dir.path().join("config.json"),

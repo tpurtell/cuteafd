@@ -127,8 +127,6 @@ struct LaneL2<'a> {
     stream: crate::shared::memory::device::Stream<'a>,
     /// The pass is a decode or verify step ([`BackboneLane::set_attention_decode`]).
     decode: bool,
-    /// The other request lane is idle ([`BackboneLane::set_l2_prefetch`]).
-    solo: bool,
 }
 impl LaneL2<'_> {
     /// Queues the prefetch planned for layer `layer`'s exchange window.
@@ -324,6 +322,9 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
                     Ok((lane.block.graph_normalized_storage(rows),stream,projected))
                 }).await? };
             if cached.is_none() && !windowed && !crate::shared::decode_graph::census::eager("layer_row") {
+                // Inside a device-ordered chain, `finish_tp2_then` left the warmup
+                // queued on `stream`; drain cooperatively before capturing.
+                if crate::shared::memory::chain::deferred() { output.wait_owner().await?; }
                 // Warm output is complete. Recording the next invocation restores
                 // host phase without executing the FFN prefix a second time.
                 unsafe {graphs.capture_ready(&mut lane.block,weights,binding,rows,projected,stream)?;}
@@ -338,7 +339,7 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
             library: lane.weights.library, phase: &mut lane.phase,
             route_capture: if lane.capture_routes { Some(&mut lane.route_capture) } else { None },
             ffn_split: if lane.capture_timing { Some(&mut lane.ffn_split) } else { None },
-            l2: lane.l2.as_ref().filter(|l2| l2.decode && l2.solo),
+            l2: lane.l2.as_ref().filter(|l2| l2.decode),
  })
     }
 }
@@ -1014,14 +1015,8 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             "V4.1 L2 prefetch: next layer's lane weights per Spark exchange");
         let plan = device.run(|| crate::shared::l2_prefetch::L2Prefetch::new(device.library, budget, &order))?;
         let stream = crate::shared::memory::device::Stream::new(device)?;
-        self.l2 = Some(LaneL2 { plan, stream, decode: false, solo: true });
+        self.l2 = Some(LaneL2 { plan, stream, decode: false });
         Ok(())
-    }
-    /// Whether this lane's next pass may prefetch ([`Self::enable_l2_prefetch`]):
-    /// only while the other request lane is idle, whose work would otherwise
-    /// fill the exchange and evict the prefetched lines.
-    pub fn set_l2_prefetch(&mut self, on: bool) {
-        if let Some(l2) = &mut self.l2 { l2.solo = on; }
     }
     fn enter(&mut self, expected: Phase) -> Result<()> {
         let prior = std::mem::replace(&mut self.phase, Phase::Invalid);
@@ -1205,7 +1200,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             library: self.weights.library, phase: &mut self.phase,
             route_capture: if self.capture_routes { Some(&mut self.route_capture) } else { None },
             ffn_split: if self.capture_timing { Some(&mut self.ffn_split) } else { None },
-            l2: self.l2.as_ref().filter(|l2| l2.decode && l2.solo),
+            l2: self.l2.as_ref().filter(|l2| l2.decode),
         })
     }
     /// Lands a prefill unit's wave and reduces it with the shared values the
@@ -1276,7 +1271,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
             phase: &mut self.phase,
             route_capture: if self.capture_routes { Some(&mut self.route_capture) } else { None },
             ffn_split: if self.capture_timing { Some(&mut self.ffn_split) } else { None },
-            l2: self.l2.as_ref().filter(|l2| l2.decode && l2.solo),
+            l2: self.l2.as_ref().filter(|l2| l2.decode),
         })
     }
     /// # Safety
@@ -1463,11 +1458,6 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     pub fn discard_route_ring(&mut self) -> Result<()> { self.router.discard_ring() }
     /// Host FFN stage split of the last captured pass on this lane.
     pub fn captured_ffn_split(&self) -> FfnSplit { self.ffn_split }
-    /// Opt-in TP2 attention or projection owners, whose peer transfers are
-    /// host-ordered and therefore not stage-chained.
-    pub fn uses_peer_projection(&self) -> bool {
-        self.dual_sparse.is_some() || self.tp2_query.is_some() || self.tp2_output.is_some()
-    }
     /// Device time per layer of the captured pass, once its work completed.
     pub fn layer_clock(&self) -> &LayerClock<'a> { &self.layer_clock }
     /// Mark the arrival of the current layer's input from the other GPU.

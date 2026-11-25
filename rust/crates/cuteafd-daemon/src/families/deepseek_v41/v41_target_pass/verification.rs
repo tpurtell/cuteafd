@@ -13,13 +13,6 @@ pub(crate) trait VerificationTarget<'a>: TargetCache<'a> {
     fn set_route_capture(&mut self, enabled: bool) -> Result<()>;
     /// Route ids and/or pass timing (layer clock, FFN stage split).
     fn set_capture(&mut self, capture: crate::families::deepseek_v41::v41_backbone_lane::Capture) -> Result<()>;
-    /// Keep decode-row graph shapes once captured, for speculative rounds
-    /// whose row count varies (route capture also enables it).
-    /// Whether the next pass may run device-ordered (`CUTEAFD_V41_DEVICE`).
-    fn set_device_order(&mut self, on: bool);
-    /// Whether the next pass may prefetch into L2 during its Spark exchanges
-    /// (`--l2-prefetch`; only while the other lane is idle).
-    fn set_l2_prefetch(&mut self, on: bool);
     fn captured_routes(&self) -> &[Vec<[u32; 6]>];
     /// FFN completion instant of each layer of the last captured pass.
     fn captured_layer_us(&self) -> Vec<Option<f64>>;
@@ -79,8 +72,6 @@ impl<'a> VerificationTarget<'a> for TargetPass<'_, 'a> {
         self.visit_graph_banks(visit)
     }
     type Transport = NativeTp4Wave<'a>;
-    fn set_device_order(&mut self, on: bool) { TargetPass::set_device_order(self, on) }
-    fn set_l2_prefetch(&mut self, on: bool) { TargetPass::set_l2_prefetch(self, on) }
     const SUPPORTS_SAMPLED_TERMINAL: bool = true;
     fn set_route_capture(&mut self, enabled: bool) -> Result<()> {
         TargetPass::set_route_capture(self, enabled); Ok(())
@@ -133,8 +124,6 @@ impl<'a> VerificationTarget<'a> for DistributedTargetPass<'_, 'a> {
         self.visit_graph_banks(visit)
     }
     type Transport = DeviceOwner<'a, NativeTp4Wave<'a>>;
-    fn set_device_order(&mut self, on: bool) { DistributedTargetPass::set_device_order(self, on) }
-    fn set_l2_prefetch(&mut self, on: bool) { DistributedTargetPass::set_l2_prefetch(self, on) }
     const SUPPORTS_SAMPLED_TERMINAL: bool = true;
     async unsafe fn execute_shared_sampled(&mut self, requests: &RefCell<&mut Requests<'a>>,
         batch: &mut RequestBatch, transport: &mut Self::Transport, placement: u64,

@@ -314,6 +314,40 @@ pub(crate) fn deferred() -> bool {
     CURRENT.with(|c| c.borrow().as_ref().is_some_and(|c| c.device))
 }
 
+/// Non-blocking `cudaEventQuery` check: returns `true` when `event` on
+/// `device` has not yet signaled on the GPU (zero host sync).
+/// # Safety
+/// `event` is a live CUDA event owned by `device`.
+pub(crate) unsafe fn event_unresolved(
+    library: &NativeLibrary,
+    device: i32,
+    event: *mut c_void,
+) -> Result<bool> {
+    let previous = library.cuda_get_device()?;
+    if previous != device {
+        library.cuda_set_device(device)?;
+    }
+    // SAFETY: caller guarantees `event` is live on `device`.
+    let ready = unsafe { library.cuda_event_query(event) };
+    if previous != device {
+        library.cuda_set_device(previous)?;
+    }
+    Ok(!ready?)
+}
+
+/// Non-blocking check for whether the current device-ordered chain has a
+/// recorded head event that has not yet signaled on the GPU (zero host sync).
+pub(crate) fn head_unresolved(library: &NativeLibrary) -> Result<bool> {
+    let Some(current) = current() else { return Ok(false) };
+    if !current.device {
+        return Ok(false);
+    }
+    let Some(head) = current.head.get() else { return Ok(false) };
+    let (device, event) = current.events[head];
+    // SAFETY: `StageChain` retains all chain events for the scope's lifetime.
+    unsafe { event_unresolved(library, device, event) }
+}
+
 pub(crate) struct ChainScope<'a, F> {
     library: &'a NativeLibrary,
     current: Current,

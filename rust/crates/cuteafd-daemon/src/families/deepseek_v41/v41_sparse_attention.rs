@@ -460,6 +460,10 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
     pub async fn wait_chain(&self) -> Result<()> {
         unsafe { crate::shared::memory::chain::finish_cooperative(&self.storage.stream).await }
     }
+    /// Cooperatively drain this wave's stream on the host (cold graph capture).
+    pub async fn wait_host(&self) -> Result<()> {
+        self.storage.stream.wait().await
+    }
     pub fn drain_chain(&mut self) -> Result<()> {
         let drained = self.synchronize(); self.cold = None; drained
     }
@@ -940,6 +944,7 @@ impl LocalSparseAttentionWave<'_,32> {
         let input = slice(query.rotated, offset, query.rotated.bytes-offset);
         let result = (|| unsafe {
             self.acquire_scratch()?;
+            crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
             copy.launch_rows(self.storage.query.buffer, input, 32*1024, query.rows,
                 32*1024, 64*1024, self.storage.stream.raw)?;
             self.execute_staged_inner(query.layer, sink, requests, selection, defer_warmup, tail)
