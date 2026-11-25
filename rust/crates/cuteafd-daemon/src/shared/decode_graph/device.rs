@@ -177,6 +177,9 @@ pub(crate) struct EpochStats {
     pub lagged_chunks: usize,
     pub uncredited_nodes: u64,
     pub reuse_growth_bytes: u64,
+    pub event_pending_cycles: u64,
+    pub boundary_drains: u64,
+    pub boundary_wait_us: u64,
 }
 
 #[derive(Default)]
@@ -648,13 +651,15 @@ fn observe_device_sampled(device: i32,
     sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64, u64, u64)>) -> anyhow::Result<()> {
     let Some(cache) = existing_cache(device) else { return Ok(()) };
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-    if cache.needs_boundary() {
+    if cache.needs_boundary() && (!cache.event_completion || cache.lanes[0].completed >= cache.capture_frontier) {
         let (free, total, tracked, rounding, unclaimed) = match sample() {
             Ok(sample) => sample,
             Err(error) => {
                 tracing::warn!(%error, device, "boundary graph measurement failed; capture disabled, serving eagerly");
                 cache.measurement_failed = true;
                 cache.floor_resample_pending = false;
+                // Live event-backed owners cannot be invalidated by a failed sample.
+                if cache.event_completion { return Ok(()) }
                 let pending: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_capture).map(|(&id, _)| id).collect();
                 for id in pending { cache.cancel_capture(id); }
                 cache.unmeasured = false;
@@ -722,6 +727,177 @@ pub(crate) unsafe fn observe_completed(library: &cuteafd_ffi::NativeLibrary,
         Ok(())
     })?;
     Ok(())
+}
+
+/// Fixed-capacity event slots. If all slots are occupied, re-record the newest
+/// marker: the later FIFO marker covers the previous one. Keep older markers
+/// available for incremental progress, without allocating or waiting.
+const COMPLETION_SLOTS: usize = 8;
+
+#[derive(Default)]
+struct CompletionSlots {
+    pending: [Option<u64>; COMPLETION_SLOTS],
+}
+impl CompletionSlots {
+    fn slot(&self) -> usize {
+        self.pending.iter().position(Option::is_none).unwrap_or_else(||
+            self.pending.iter().enumerate().max_by_key(|(_, cycle)| *cycle).unwrap().0)
+    }
+    fn record(&mut self, slot: usize, cycle: u64, record: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        // A partial multi-rank record error cannot leave a valid old marker.
+        self.pending[slot] = None;
+        record()?;
+        self.pending[slot] = Some(cycle);
+        Ok(())
+    }
+    fn query(&mut self, mut query: impl FnMut(usize) -> anyhow::Result<bool>) -> anyhow::Result<Option<u64>> {
+        let mut newest = None;
+        for (slot, cycle) in self.pending.iter().enumerate() {
+            if let Some(cycle) = cycle {
+                if query(slot)? { newest = Some(newest.map_or(*cycle, |old: u64| old.max(*cycle))); }
+            }
+        }
+        // A later marker on the same FIFO streams proves earlier work even
+        // if an older marker wasn't ready when we queried it.
+        if let Some(done) = newest {
+            for cycle in &mut self.pending {
+                if cycle.is_some_and(|cycle| cycle <= done) { *cycle = None; }
+            }
+        }
+        Ok(newest)
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn completion_waits_for_all_owners_and_handles_out_of_order_queries() -> anyhow::Result<()> {
+        let mut slots = CompletionSlots::default();
+        slots.record(0, 1, || Ok(()))?;
+        slots.record(1, 2, || Ok(()))?;
+        let mut ready = [[true, false], [false, true]];
+        assert_eq!(slots.query(|slot| Ok(ready[slot].iter().all(|x| *x)))?, None);
+        ready[1][0] = true;
+        assert_eq!(slots.query(|slot| Ok(ready[slot].iter().all(|x| *x)))?, Some(2));
+        assert!(slots.pending.iter().all(Option::is_none));
+        Ok(())
+    }
+
+    #[test]
+    fn completion_pool_is_bounded_and_errors_never_prove_completion() -> anyhow::Result<()> {
+        let mut slots = CompletionSlots::default();
+        for cycle in 1..=100 {
+            let slot = slots.slot();
+            slots.record(slot, cycle, || Ok(()))?;
+        }
+        assert_eq!(slots.pending.iter().flatten().count(), COMPLETION_SLOTS);
+        assert!(slots.pending.contains(&Some(100)));
+        let slot = slots.slot();
+        assert!(slots.record(slot, 101, || anyhow::bail!("record failed")).is_err());
+        assert!(!slots.pending.contains(&Some(100)));
+        let before = slots.pending;
+        assert!(slots.query(|slot| if slot == 1 { anyhow::bail!("query failed") } else { Ok(true) }).is_err());
+        assert_eq!(slots.pending, before);
+        assert_eq!(slots.query(|_| Ok(true))?, Some((COMPLETION_SLOTS - 1) as u64));
+        Ok(())
+    }
+}
+
+/// One serial cycle shared by all owner streams (including peer ranks).
+/// Allocate all timing-disabled events before the first step. An error never
+/// publishes completion; teardown owns the existing family drain contract.
+pub(crate) struct EventCycles<'a> {
+    owners: Vec<(crate::shared::memory::device::Device<'a>, *mut std::ffi::c_void,
+        [crate::shared::memory::device::Event<'a>; COMPLETION_SLOTS], SharedCache)>,
+    slots: CompletionSlots,
+    index: u64,
+}
+impl<'a> EventCycles<'a> {
+    pub fn new(library: &'a cuteafd_ffi::NativeLibrary,
+        streams: &[(i32, *mut std::ffi::c_void)]) -> anyhow::Result<Self> {
+        use crate::shared::memory::device::{Device, Event};
+        let mut owners = Vec::with_capacity(streams.len());
+        for &(id, stream) in streams {
+            let cache = existing_cache(id).ok_or_else(|| anyhow::anyhow!("no graph cache on device {id}"))?;
+            let device = Device { library, id };
+            let events: [Event<'a>; COMPLETION_SLOTS] = (0..COMPLETION_SLOTS)
+                .map(|_| Event::new(device)).collect::<anyhow::Result<Vec<_>>>()?
+                .try_into().ok().expect("fixed event pool size");
+            owners.push((device, stream, events, cache));
+        }
+        for (_, _, _, cache) in &owners {
+            cache.lock().unwrap_or_else(|p| p.into_inner()).event_completion = true;
+        }
+        Ok(Self { owners, slots: CompletionSlots::default(), index: 0 })
+    }
+
+    pub fn record_drain(&self, elapsed: Duration) {
+        for (_, _, _, cache) in &self.owners {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.epochs.boundary_drains += 1;
+            cache.epochs.boundary_wait_us += elapsed.as_micros().min(u64::MAX as u128) as u64;
+        }
+    }
+
+    pub fn poll(&mut self) -> anyhow::Result<()> {
+        let owners = &self.owners;
+        let completed = self.slots.query(|slot| {
+            let mut ready = true;
+            for (device, _, events, _) in owners {
+                // SAFETY: the pool owns this live event on this device.
+                ready &= device.run(|| unsafe { device.library.cuda_event_query(events[slot].raw) })?;
+            }
+            Ok(ready)
+        })?;
+        for (device, _, _, cache) in owners {
+            {
+                let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(done) = completed {
+                    cache.clocks[0].completed.fetch_max(done, Ordering::Release);
+                    cache.refresh_cycles();
+                }
+                cache.epochs.event_pending_cycles = self.index.saturating_sub(cache.lanes[0].completed);
+            }
+            if cache.lock().unwrap_or_else(|p| p.into_inner()).needs_boundary() {
+                observe_device(device.library, device.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn begin(&mut self) {
+        self.index += 1;
+        for (_, _, _, cache) in &self.owners {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.clocks[0].index.store(self.index, Ordering::Release);
+            cache.clocks[0].active.store(true, Ordering::Release);
+            cache.refresh_cycles();
+        }
+    }
+
+    /// # Safety
+    /// Every owner stream is live and all this cycle's launches have been queued.
+    pub unsafe fn complete(&mut self) -> anyhow::Result<()> {
+        {
+            let slot = self.slots.slot();
+            let owners = &self.owners;
+            self.slots.record(slot, self.index, || {
+                for (device, stream, events, _) in owners {
+                    // SAFETY: caller guarantees live streams; no stream waits on this query-only event.
+                    device.run(|| unsafe { device.library.cuda_event_record(events[slot].raw, *stream) })?;
+                }
+                Ok(())
+            })?;
+        }
+        for (_, _, _, cache) in &self.owners {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.clocks[0].active.store(false, Ordering::Release);
+            cache.epochs.event_pending_cycles = self.index.saturating_sub(cache.lanes[0].completed);
+        }
+        Ok(())
+    }
 }
 
 /// Start/finish one independently scheduled cycle, visiting only its own banks.
@@ -856,6 +1032,8 @@ pub(crate) struct DeviceCache {
     measurement_failed: bool,
     failed_measurement_credit: u64,
     pending_bytes: u64,
+    event_completion: bool,
+    capture_frontier: u64,
     next_id: u64,
     next_bank: u64,
     identity_generation: u64,
@@ -934,7 +1112,7 @@ pub(crate) fn seal_cross_device_capture_on_this_thread(sealed: bool) {
 
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
-        Self { device, reserve, reserve_policy: None, charged: 0, live_bytes: 0, inventory: Inventory::default(), ranked_hits: Vec::new(), ranked_churn: Vec::new(), ranked_at: Instant::now() - Duration::from_secs(30), level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
+        Self { device, reserve, reserve_policy: None, charged: 0, live_bytes: 0, inventory: Inventory::default(), ranked_hits: Vec::new(), ranked_churn: Vec::new(), ranked_at: Instant::now() - Duration::from_secs(30), level: None, pending_bytes: 0, event_completion: false, capture_frontier: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
             soft: SoftState::new(reserve), margin_clamp_warned: false, measurement_failed: false, failed_measurement_credit: 0, physical_floor: 0, physical_sample: None, physical_floor_warned: false,
             floor_resample_pending: false, floor_resample_used: false,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
@@ -1109,7 +1287,7 @@ impl DeviceCache {
     // begin/complete and these boundaries serially; not a multi-thread barrier.
     pub(super) fn serial_boundary(&mut self) {
         self.refresh_cycles();
-        if self.lanes.iter().any(|lane| lane.active) { return }
+        if self.event_completion || self.lanes.iter().any(|lane| lane.active) { return }
         for clock in self.clocks.iter() {
             let next = clock.index.fetch_add(1, Ordering::AcqRel) + 1;
             clock.completed.store(next, Ordering::Release);
@@ -1136,6 +1314,10 @@ impl DeviceCache {
         self.records.get(&id).is_some_and(|record| {
             let lane = self.bank_lane(record.identity.bank);
             let epoch = &self.lanes[lane];
+            if self.event_completion {
+                return record.pending_destroy && record.used().is_some_and(|used| used <= epoch.completed)
+                    && self.selected_epochs.get(&id).is_none_or(|until| epoch.completed >= until[lane]);
+            }
             let closed = if epoch.active { epoch.completed >= epoch.index.saturating_sub(1) }
                 else { epoch.completed >= epoch.index };
             record.pending_destroy && closed && self.selected_epochs.get(&id).is_none_or(|until|
@@ -1513,7 +1695,9 @@ impl DeviceCache {
             !matches!(record.list, Some(List::Recent | List::Frequent)) ||
             !self.native_graphs.contains_key(&id) { return None }
         let lane = self.bank_lane(record.identity.bank);
-        let age = self.lanes[lane].index.saturating_sub(record.used()?);
+        let used = record.used()?;
+        if self.event_completion && used > self.lanes[lane].completed { return None }
+        let age = self.lanes[lane].index.saturating_sub(used);
         // Pressure keeps the safety floor K; optional extra lag only protects
         // reusable shapes while donor-always is operating below the soft cap.
         let lag = if self.donor_always && self.charged < self.soft.limit && self.charged < self.reserve {
@@ -1849,7 +2033,10 @@ impl DeviceCache {
         // waits for that GPU forever). The miss runs eagerly and stays a remembered
         // key, so a GRAPH_TRACE run still lists it for the layout's prewarm set.
         let sealed = site.spans_devices && cross_device_capture_sealed();
-        let allowed = site.preference != Preference::Eager && estimate > 0 && !sealed;
+        // A physical sample covers the entire outstanding capture batch. Do
+        // not mix a newer capture cycle into that batch before its proof.
+        let allowed = site.preference != Preference::Eager && estimate > 0 && !sealed
+            && (!self.event_completion || !self.unmeasured || self.capture_frontier == self.lanes[lane].index);
         let mut projected_hard_stop = false;
         if allowed && !vampire {
             // No CUDA query or ticket for a planned physical-headroom miss.
@@ -1895,7 +2082,7 @@ impl DeviceCache {
                 self.soft.fits(self.native_pools().live_nodes.saturating_add(self.epochs.uncredited_nodes)
                     .saturating_sub(reclaimable).saturating_add(incoming))
             });
-            let hard_room = self.soft.measured_bytes.is_none() || native_reuse
+            let hard_room = (!self.event_completion && self.soft.measured_bytes.is_none()) || native_reuse
                 || self.charged.saturating_add(projected) <= self.reserve;
             projected_hard_stop = !hard_room;
             let selected_before = self.pending_destroy;
@@ -1927,6 +2114,7 @@ impl DeviceCache {
             if projected == 0 || native_reuse { self.reuse_captures.insert(id); }
             self.pending_growth = self.pending_growth.max(projected);
             self.unmeasured = true;
+            if self.event_completion { self.capture_frontier = self.lanes[lane].index; }
             self.pools.live_nodes = next_nodes;
             self.pools.live_execs = next_execs;
             let stats = &mut record.stats;
@@ -2081,6 +2269,7 @@ impl DeviceCache {
     }
 
     pub fn completed_capture(&mut self, id: u64) -> bool {
+        if self.event_completion { return true }
         let Some(query) = &self.memory_query else { return true };
         let sample = query.sample(self.device);
         match sample {
@@ -2639,6 +2828,52 @@ mod tests {
         cache.charged = if hard { 1000 } else { 10 };
         (cache, donor)
     }
+    #[test]
+    fn event_completion_gates_donors_and_retirement_independent_of_age() {
+        let (mut cache, donor) = aged_update_fixture(5, false);
+        cache.event_completion = true;
+        let used = cache.records[&donor].used().unwrap();
+        cache.clocks[0].completed.store(used - 1, Ordering::Release);
+        cache.refresh_cycles();
+        assert!(cache.donor_age(donor).is_none());
+        cache.serial_boundary();
+        assert_eq!(cache.lanes[0].completed, used - 1);
+        cache.clocks[0].completed.store(used, Ordering::Release);
+        cache.refresh_cycles();
+        assert!(cache.donor_age(donor).is_some());
+        assert_eq!(cache.mark_victim(false), Some(donor));
+        assert!(!cache.persistent_victim_ready(donor));
+        cache.clocks[0].completed.store(cache.lanes[0].index, Ordering::Release);
+        cache.refresh_cycles();
+        assert!(cache.persistent_victim_ready(donor));
+    }
+
+    #[test]
+    fn event_capture_measurement_is_deferred_until_cycle_proof() -> anyhow::Result<()> {
+        let device = -28105;
+        let controller = device_cache_sampled(device, 1000, Basis::Bytes, || Ok((1000, 1000, 0, 0, 0)))?;
+        {
+            let mut cache = controller.lock().unwrap();
+            cache.event_completion = true;
+            cache.clocks[0].index.store(1, Ordering::Release);
+            let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!("capture expected") };
+            assert!(cache.completed_capture(id));
+            assert!(cache.records[&id].pending_capture);
+            assert_eq!(cache.charged, 0);
+        }
+        observe_device_sampled(device, || panic!("premature measurement"))?;
+        {
+            let mut cache = controller.lock().unwrap();
+            cache.clocks[0].completed.store(1, Ordering::Release);
+            cache.refresh_cycles();
+        }
+        observe_device_sampled(device, || Ok((990, 1000, 0, 0, 0)))?;
+        let cache = controller.lock().unwrap();
+        assert_eq!(cache.charged, 10);
+        assert_eq!(cache.pending_bytes, 0);
+        Ok(())
+    }
+
     #[test]
     fn spanning_residents_are_unevictable_before_and_after_ready() {
         let (mut cache, spanning) = aged_update_fixture(5, false);

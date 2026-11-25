@@ -34,15 +34,31 @@ int main() {
   check(cuteafd_cuda_stream_query(pending, nullptr) == CUTEAFD_STATUS_INVALID_ARGUMENT);
   int32_t ready = -1;
   check(cuteafd_cuda_stream_query(pending, &ready) == CUTEAFD_STATUS_OK && ready == 1);
+  void* completion[2] = {};
+  for (auto& event : completion) check(cuteafd_cuda_event_create_ordering(&event) == CUTEAFD_STATUS_OK);
   Gate gate;
   check(cudaLaunchHostFunc(static_cast<cudaStream_t>(pending), hold, &gate) == cudaSuccess);
   // The gate cannot complete until after these queries. A blocking implementation
   // hits the CTest deadline instead of silently passing as a completion query.
   check(cuteafd_cuda_stream_query(pending, &ready) == CUTEAFD_STATUS_OK && ready == 0);
   check(cuteafd_cuda_stream_query(peer, &ready) == CUTEAFD_STATUS_OK && ready == 1);
+  check(cuteafd_cuda_event_record(completion[0], pending) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_event_record(completion[1], peer) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_event_query(completion[0], &ready) == CUTEAFD_STATUS_OK && ready == 0);
+  check(cuteafd_cuda_stream_synchronize(peer) == CUTEAFD_STATUS_OK);
+  check(cuteafd_cuda_event_query(completion[1], &ready) == CUTEAFD_STATUS_OK && ready == 1);
   gate.release.store(true, std::memory_order_release);
   check(cuteafd_cuda_stream_synchronize(pending) == CUTEAFD_STATUS_OK);
   check(cuteafd_cuda_stream_query(pending, &ready) == CUTEAFD_STATUS_OK && ready == 1);
+  check(cuteafd_cuda_event_query(completion[0], &ready) == CUTEAFD_STATUS_OK && ready == 1);
+  for (auto event : completion) {
+    check(cuteafd_cuda_event_record(event, pending) == CUTEAFD_STATUS_OK);
+  }
+  check(cuteafd_cuda_stream_synchronize(pending) == CUTEAFD_STATUS_OK);
+  for (auto event : completion) {
+    check(cuteafd_cuda_event_query(event, &ready) == CUTEAFD_STATUS_OK && ready == 1);
+    check(cuteafd_cuda_event_destroy(event) == CUTEAFD_STATUS_OK);
+  }
   void* start = nullptr;
   void* end = nullptr;
   void* graph = nullptr;

@@ -616,6 +616,7 @@ pub(crate) struct GlmEngine<'a> {
     pub(super) expert_usage: Option<cuteafd_ffi::expert_usage::ExpertUsage<'a>>,
     usage_lookup: Option<HostAllocation<'a>>,
     pub(super) usage_active: Cell<bool>,
+    graph_cycles: RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
     graphs_warmed: Cell<bool>,
     graphs_warming: Cell<bool>,
     graph_basis: Cell<Option<crate::shared::decode_graph::device::Basis>>,
@@ -791,7 +792,7 @@ impl<'a> GlmEngine<'a> {
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), width_taps: RefCell::new(None),
-            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, fp8_prefill: Default::default(), selection_dump: None })
+            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graph_cycles: RefCell::new(None), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, fp8_prefill: Default::default(), selection_dump: None })
     }
 
     pub(super) fn initialize_usage(&mut self, geometry: Option<cuteafd_core::expert_usage::Geometry>,
@@ -1696,6 +1697,15 @@ impl<'a> GlmEngine<'a> {
                 self.pad_rows(&mut tables, bucket);
                 let experts = experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime));
                 self.step(&tables, &vec![0; bucket], bucket, experts, None)?;
+                if warming {
+                    // Startup must measure each admitted shape before the next:
+                    // a spanning prewarm miss cannot be captured during serving.
+                    // This is not on the serving step path.
+                    let started = std::time::Instant::now();
+                    self.synchronize()?;
+                    if let Some(cycles) = self.graph_cycles.borrow().as_ref() { cycles.record_drain(started.elapsed()); }
+                    self.graph_boundary()?;
+                }
             }
             Ok(())
         };
@@ -1706,6 +1716,9 @@ impl<'a> GlmEngine<'a> {
         captured?;
         // Prewarm is best effort within the reserve, not a sealed inventory.
         let after = self.graph_memory_samples()?;
+        // The startup inventory sample already drained both ranks. Settle
+        // the final prewarm capture through its event, not submission.
+        self.graph_boundary()?;
         self.graphs_warmed.set(true);
         let captures = (0..self.ranks()).map(|rank| {
             let graphs = if rank == 0 { self.graphs.borrow() } else { self.peer()?.graphs.borrow() };
@@ -1739,6 +1752,13 @@ impl<'a> GlmEngine<'a> {
             })?;
             let policy = inventory.reserve_policy(rank)?;
             crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
+        }
+        let streams: Vec<_> = (0..self.ranks()).map(|rank| {
+            let device = self.peer.as_ref().filter(|_| rank == 1).map_or(self.device, |peer| peer.device);
+            (device, self.stream_of(rank))
+        }).collect();
+        if reserves.iter().any(|&bytes| bytes > 0) {
+            *self.graph_cycles.borrow_mut() = Some(crate::shared::decode_graph::device::EventCycles::new(self.library, &streams)?);
         }
         Ok(())
     }
@@ -1790,12 +1810,17 @@ impl<'a> GlmEngine<'a> {
     pub(crate) fn production_replay_ready(&self) -> bool { self.graphs_warmed.get() }
 
     fn graph_boundary(&self) -> Result<()> {
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        cycles.poll()?;
         for rank in 0..self.ranks() {
             let graphs = if rank == 0 { &self.graphs } else { &self.peer.as_ref().unwrap().graphs };
-            graphs.borrow_mut().cache_tick();
-            crate::shared::decode_graph::device::observe_device(&self.library, self.peer.as_ref().filter(|_| rank == 1).map_or(self.device, |peer| peer.device))?;
-            self.on(rank, || graphs.borrow_mut().cache_drain(|| Ok(()), ||
-                Ok(crate::shared::decode_graph::device::ReleaseMeasurement { released: 0 })))?;
+            self.on(rank, || {
+                // SAFETY: executables capture persistent engine storage; the
+                // shared cache retires owners only after the event proof.
+                unsafe { graphs.borrow_mut().cache_evict_persistent(); }
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -1833,13 +1858,15 @@ impl<'a> GlmEngine<'a> {
                 Ok(())
             },
             |scope| {
+                self.graph_boundary()?;
+                if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() { cycles.begin(); }
                 let result = self.step_inner(scope, tables, tokens, logit_rows, experts, on_layer)?;
-                if self.graphs.borrow().cache_needs_boundary()
-                    || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().cache_needs_boundary()) {
-                    self.graph_boundary()?;
-                }
                 self.graphs.borrow_mut().cache_tick();
                 if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_tick(); }
+                if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() {
+                    // SAFETY: both ranks have queued all graph launches for this step.
+                    unsafe { cycles.complete()?; }
+                }
                 Ok(result)
             })
     }
