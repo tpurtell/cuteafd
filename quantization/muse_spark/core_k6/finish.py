@@ -233,7 +233,7 @@ def _unlink_weight(row):
     fsync_directory(path.parent)
 
 
-def finish(root,export):
+def finish(root,export,options=None):
     """Run the authorized CPU continuation; retry safely after partial cleanup."""
     root,export,identity,audit=_admission(root,export)
     lock_path=root/'finish.lock'
@@ -247,7 +247,7 @@ def finish(root,export):
         if not ingest_complete.exists():
             if terminal_path.exists() or retirement_path.exists():
                 raise ValueError('retirement state exists without matching managed completion')
-            publish.publish(export,root,TARGET_REPO)
+            publish.publish(export,root,TARGET_REPO,options=options)
             _run_ingest(root,export)
         marker,snapshot=_publication(root,export,identity)
         iplan,icomplete=_ingest_bindings(root,export,identity,marker)

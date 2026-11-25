@@ -361,6 +361,8 @@ def main():
         parser.add_argument('--'+arg,type=Path,required=True)
     for flag in ('resume','preflight','publish-only'):
         parser.add_argument('--'+flag,action='store_true')
+    import hub_lfs
+    hub_lfs.add_arguments(parser)
     args = parser.parse_args()
     source = MistralSource(args.source_snapshot)
     args.tokens,args.root,args.export = (p.expanduser().resolve() for p in (args.tokens,args.root,args.export))
@@ -384,7 +386,7 @@ def main():
             completed = json.loads((args.root/'quantization-complete.json').read_text())
             if completed['identity'] != plan['identity']:
                 raise ValueError('publication requires matching completed numerical producer')
-            publish(args.export,args.root,plan['publication_repo'])
+            publish(args.export,args.root,plan['publication_repo'],options=hub_lfs.options_from(args))
         return
     torch.set_num_threads(8)
     torch.backends.cuda.matmul.allow_tf32 = False

@@ -8,7 +8,8 @@ import os
 from pathlib import Path
 import re
 
-from kimi_k3.uniform_k2.publish import install_upload_compat
+import hub_lfs
+from hub_requirements import require_qualified_hub
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, file_identity, fsync_directory, verify_receipt
 from .export import SHARD_COUNT
 from .recipe import MODULE_COUNT, TARGET_PAYLOAD_BYTES, TARGET_REPO, TARGET_TENSOR_COUNT
@@ -259,7 +260,7 @@ def _hardlink_snapshot(snapshot, files):
     fsync_directory(refs)
 
 
-def publish(export, root, repo_id):
+def publish(export, root, repo_id, *, options=None):
     """Upload and verify an approved complete run; this function never quantizes."""
     export, root = Path(export).expanduser(), Path(root).expanduser()
     if export.is_symlink() or root.is_symlink():
@@ -287,11 +288,12 @@ def publish(export, root, repo_id):
         return complete["revision"]
 
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
-    install_upload_compat()
+    require_qualified_hub()  # HTTP LFS before any remote mutation.
     api = HfApi()
     api.create_repo(repo_id, repo_type="model", exist_ok=True, private=False)
-    api.upload_large_folder(repo_id=repo_id, repo_type="model", folder_path=str(export),
-        ignore_patterns=IGNORE_PATTERNS, num_workers=4, print_report=True, print_report_every=1800)
+    # Verified, resumable HTTP LFS batches reuse the shard receipts' SHA256.
+    hub_lfs.upload_files(api, repo_id, hub_lfs.core_rows(files), options=options,
+                         commit_message="Publish calibrated EXL3 checkpoint")
     info = api.model_info(repo_id, files_metadata=True)
     revision = _field(info, "sha")
     snapshot = _cache_snapshot(repo_id, revision)

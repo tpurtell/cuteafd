@@ -13,11 +13,12 @@ from .finish import finish
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root',type=Path,required=True);parser.add_argument('--export',type=Path,required=True)
+    import hub_lfs;hub_lfs.add_arguments(parser)
     args=parser.parse_args()
     # The finisher owns the audit gate and publication/ingest/retirement
     # recovery barriers. Repeating the CPU continuation after local weights
     # retire must not replay a publisher that requires those deleted files.
-    result=finish(args.root,args.export)
+    result=finish(args.root,args.export,hub_lfs.options_from(args))
     print(json.dumps(dict(event='publication_job_complete',result=result['revision'],
         managed_ingest_complete=True,local_retirement_complete=True,
         retired_weight_shards=result['retired_weight_shards'])),flush=True)

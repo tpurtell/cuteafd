@@ -81,8 +81,29 @@ def finished(tmp_path, monkeypatch):
 def fake_hub(monkeypatch):
     import huggingface_hub
     state=dict(instances=[],uploads=[],creates=[],downloads=[],offline=[],damage=None,
-               modern=False,private=False,metadata_lfs=False,mutate_after_info=False)
-    def upload(self,**kwargs):state["uploads"].append(kwargs)
+               private=False,metadata_lfs=False,mutate_after_info=False,head="0"*40,trees={})
+    def repo_info(self,repo_id,**kwargs):
+        return SimpleNamespace(sha=state["head"],private=state["private"])
+    def list_repo_tree(self,repo_id,revision=None,**kwargs):
+        from huggingface_hub.hf_api import RepoFile
+        return [RepoFile(path=n,size=r["bytes"],oid=r["blob"],
+                         lfs=dict(oid=r["blob"],size=r["bytes"],pointerSize=130) if len(r["blob"])==64 else None)
+                for n,r in state["trees"].get(revision,{}).items()]
+    def commit(self,repo_id,operations,**kwargs):
+        # Verified HTTP LFS batch: receipt SHA256s, guarded parent, no resend.
+        assert kwargs["parent_commit"]==state["head"] and kwargs["num_threads"]==16
+        tree=dict(state["trees"].get(state["head"],{}))
+        folder=None
+        for op in operations:
+            assert op.upload_info.is_hashed and op.path_in_repo not in tree
+            path=Path(op.path_or_fileobj);folder=path.parents[len(Path(op.path_in_repo).parts)-1]
+            data=path.read_bytes();assert hashlib.sha256(data).digest()==op.upload_info.sha256
+            lfs=path.suffix==".safetensors" or (state["metadata_lfs"] and op.path_in_repo=="quantize_config.json")
+            tree[op.path_in_repo]=dict(bytes=len(data),blob=hashlib.sha256(data).hexdigest() if lfs else git_blob(data))
+        state["uploads"].append(dict(folder_path=str(folder),ignore_patterns=publication.IGNORE_PATTERNS,
+                                     names=[op.path_in_repo for op in operations]))
+        state["head"]=REVISION;state["trees"][REVISION]=tree
+        return SimpleNamespace(oid=REVISION)
     def create(self,*args,**kwargs):state["creates"].append((args,kwargs))
     def model_info(self,repo_id,files_metadata=False,revision=None):
         assert repo_id == publication.TARGET_REPO
@@ -120,24 +141,20 @@ def fake_hub(monkeypatch):
         state["offline"].append((repo_id,kwargs))
         assert kwargs["local_files_only"]
         return str(Path(kwargs["cache_dir"])/("models--"+repo_id.replace("/","--"))/"snapshots"/kwargs["revision"])
-    def install(*,modern=False):
-        state["modern"]=modern
-        attrs=dict(__init__=init,create_repo=create,model_info=model_info)
-        attrs["upload_folder" if modern else "upload_large_folder"]=upload
+    def install():
+        attrs=dict(__init__=init,create_repo=create,model_info=model_info,repo_info=repo_info,
+                   list_repo_tree=list_repo_tree,create_commit=commit)
         api=type("FakeApi",(),attrs)
         monkeypatch.setattr(huggingface_hub,"HfApi",api)
         monkeypatch.setattr(huggingface_hub,"hf_hub_download",download)
         monkeypatch.setattr(huggingface_hub,"snapshot_download",offline)
-        monkeypatch.setattr("huggingface_hub.utils._runtime.is_xet_available",lambda:True)
         return state
     state["install"]=install
     install()
     return state
 
 
-@pytest.mark.parametrize("modern",[False,True])
-def test_publish_audits_hardlinks_offline_cache_and_idempotent_completion(finished,fake_hub,modern):
-    fake_hub["install"](modern=modern)
+def test_publish_audits_hardlinks_offline_cache_and_idempotent_completion(finished,fake_hub):
     fake_hub["metadata_lfs"]=True
     revision=publication.publish(finished.export,finished.root,publication.TARGET_REPO)
     assert revision==REVISION
@@ -150,7 +167,8 @@ def test_publish_audits_hardlinks_offline_cache_and_idempotent_completion(finish
     assert not (snapshot/".cache").exists()
     for path in snapshot.rglob("*"):
         if path.is_file():assert os.path.samefile(path,finished.export/path.relative_to(snapshot))
-    assert fake_hub["uploads"][0]["ignore_patterns"]==publication.IGNORE_PATTERNS
+    files=set(publication._collect_local(finished.export,finished.identity))-{".gitattributes"}
+    assert sorted(n for u in fake_hub["uploads"] for n in u["names"])==sorted(files)  # The Hub adds attributes.
     assert fake_hub["offline"][0][1]["cache_dir"]==finished.cache
     assert fake_hub["downloads"][0][2]["revision"]==REVISION
     assert fake_hub["creates"][0][1]["private"] is False
