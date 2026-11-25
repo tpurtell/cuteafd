@@ -823,7 +823,8 @@ mod completion_tests {
 /// publishes completion; teardown owns the existing family drain contract.
 pub(crate) struct EventCycles<'a> {
     owners: Vec<(crate::shared::memory::device::Device<'a>, *mut std::ffi::c_void,
-        [crate::shared::memory::device::Event<'a>; COMPLETION_SLOTS], SharedCache)>,
+        [crate::shared::memory::device::Event<'a>; COMPLETION_SLOTS])>,
+    devices: Vec<(crate::shared::memory::device::Device<'a>, SharedCache)>,
     slots: CompletionSlots,
     index: u64,
 }
@@ -831,23 +832,30 @@ impl<'a> EventCycles<'a> {
     pub fn new(library: &'a cuteafd_ffi::NativeLibrary,
         streams: &[(i32, *mut std::ffi::c_void)]) -> anyhow::Result<Self> {
         use crate::shared::memory::device::{Device, Event};
-        let mut owners = Vec::with_capacity(streams.len());
+        let mut owners: Vec<(Device<'a>, *mut std::ffi::c_void, [Event<'a>; COMPLETION_SLOTS])> = Vec::with_capacity(streams.len());
+        let mut devices: Vec<(Device<'a>, SharedCache)> = Vec::new();
         for &(id, stream) in streams {
-            let cache = existing_cache(id).ok_or_else(|| anyhow::anyhow!("no graph cache on device {id}"))?;
+            if owners.iter().any(|(device, raw, _)| device.id == id && *raw == stream) { continue; }
             let device = Device { library, id };
+            if !devices.iter().any(|(device, _)| device.id == id) {
+                let cache = existing_cache(id).ok_or_else(|| anyhow::anyhow!("no graph cache on device {id}"))?;
+                devices.push((device, cache));
+            }
             let events: [Event<'a>; COMPLETION_SLOTS] = (0..COMPLETION_SLOTS)
                 .map(|_| Event::new(device)).collect::<anyhow::Result<Vec<_>>>()?
                 .try_into().ok().expect("fixed event pool size");
-            owners.push((device, stream, events, cache));
+            owners.push((device, stream, events));
         }
-        for (_, _, _, cache) in &owners {
+        for (_, cache) in &devices {
             cache.lock().unwrap_or_else(|p| p.into_inner()).event_completion = true;
         }
-        Ok(Self { owners, slots: CompletionSlots::default(), index: 0 })
+        let index = devices.iter().map(|(_, cache)| cache.lock().unwrap_or_else(|p| p.into_inner())
+            .clocks[0].index.load(Ordering::Acquire)).max().unwrap_or(0);
+        Ok(Self { owners, devices, slots: CompletionSlots::default(), index })
     }
 
     pub fn record_drain(&self, elapsed: Duration) {
-        for (_, _, _, cache) in &self.owners {
+        for (_, cache) in &self.devices {
             let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
             cache.epochs.boundary_drains += 1;
             cache.epochs.boundary_wait_us += elapsed.as_micros().min(u64::MAX as u128) as u64;
@@ -858,13 +866,13 @@ impl<'a> EventCycles<'a> {
         let owners = &self.owners;
         let completed = self.slots.query(|slot| {
             let mut ready = true;
-            for (device, _, events, _) in owners {
+            for (device, _, events) in owners {
                 // SAFETY: the pool owns this live event on this device.
                 ready &= device.run(|| unsafe { device.library.cuda_event_query(events[slot].raw) })?;
             }
             Ok(ready)
         })?;
-        for (device, _, _, cache) in owners {
+        for (device, cache) in &self.devices {
             {
                 let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(done) = completed {
@@ -880,9 +888,30 @@ impl<'a> EventCycles<'a> {
         Ok(())
     }
 
+    /// Poll prior submissions and retire only proved-idle persistent owners.
+    /// # Safety
+    /// Visitor banks capture only persistent engine storage.
+    pub unsafe fn begin_persistent(&mut self,
+        mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        self.poll()?;
+        visit(&mut |_, _, _, bank| {
+            // SAFETY: forwarded persistent-storage contract.
+            unsafe { bank.evict_persistent(); }
+            Ok(())
+        })?;
+        self.begin();
+        Ok(())
+    }
+
+    pub fn abandon(&mut self) {
+        for (_, cache) in &self.devices {
+            cache.lock().unwrap_or_else(|p| p.into_inner()).clocks[0].active.store(false, Ordering::Release);
+        }
+    }
+
     pub fn begin(&mut self) {
         self.index += 1;
-        for (_, _, _, cache) in &self.owners {
+        for (_, cache) in &self.devices {
             let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
             cache.clocks[0].index.store(self.index, Ordering::Release);
             cache.clocks[0].active.store(true, Ordering::Release);
@@ -897,14 +926,14 @@ impl<'a> EventCycles<'a> {
             let slot = self.slots.slot();
             let owners = &self.owners;
             self.slots.record(slot, self.index, || {
-                for (device, stream, events, _) in owners {
+                for (device, stream, events) in owners {
                     // SAFETY: caller guarantees live streams; no stream waits on this query-only event.
                     device.run(|| unsafe { device.library.cuda_event_record(events[slot].raw, *stream) })?;
                 }
                 Ok(())
             })?;
         }
-        for (_, _, _, cache) in &self.owners {
+        for (_, cache) in &self.devices {
             let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
             cache.clocks[0].active.store(false, Ordering::Release);
             cache.epochs.event_pending_cycles = self.index.saturating_sub(cache.lanes[0].completed);
