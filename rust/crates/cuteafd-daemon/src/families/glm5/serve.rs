@@ -1680,7 +1680,7 @@ mod chat_encoding_tests {
             .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required")).join("hub");
         for (snapshot, mistral) in [
             ("models--mistralai--Mistral-Large-4-1T-A52B/snapshots/f12dabdc0c1e99e7f7924461a6f308859b05af4d", true),
-            ("models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1/snapshots/47af23347db743b4666d952e2eb48f2b01c3fede", false),
+            ("models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-MC/snapshots/2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e", false),
         ] {
             let path = hub.join(snapshot);
             assert!(path.exists(), "required checkpoint missing: {}", path.display());
