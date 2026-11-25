@@ -131,9 +131,7 @@ impl<'a> Hy4Graphs<'a> {
         self.bank.borrow().count(|key| key.rows == rows)
     }
 
-    pub(crate) fn needs_boundary(&self) -> bool {
-        self.first_touch_pending.get() || self.bank.borrow().cache_needs_boundary()
-    }
+    pub(crate) fn first_touch_pending(&self) -> bool { self.first_touch_pending.get() }
 
     pub(crate) fn observed(&self) {
         self.first_touch_pending.set(false);
