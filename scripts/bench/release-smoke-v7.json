@@ -385,6 +385,57 @@
       }
     },
     {
+      "name": "glmf-mc-mul1-original-min",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-mul1-min.config",
+      "gpus": [
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1"
+      ],
+      "set": {
+        "RTX_GPUS": "1",
+        "COORDINATOR_GPUS": "1",
+        "SPARK_COUNT": "2",
+        "ADDR": "0.0.0.0:8847",
+        "EXPERT_PORT": "32400",
+        "SPECULATOR": "dflash2",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v7-rc",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1",
+        "MODEL_REVISION": "1bca67feffab2747e0e489e571185bc06336ee26",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "EXPERT_BACKEND": "spark",
+        "CORE_VIEW": "original"
+      }
+    },
+    {
+      "name": "glmf-mc-mul1-original-max",
+      "family": "glm5_flash",
+      "config": "examples/configs/glm53-flash-exl3-k4-mc-mul1-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "0",
+        "ADDR": "0.0.0.0:8848",
+        "EXPERT_PORT": "32600",
+        "EXPERT_BACKEND": "local",
+        "SPECULATOR": "dflash2",
+        "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1",
+        "MODEL_REVISION": "1bca67feffab2747e0e489e571185bc06336ee26",
+        "CORE_VIEW": "original"
+      }
+    },
+    {
       "name": "glm53f-k325-mc-min",
       "family": "glm5_flash",
       "config": "examples/configs/glm53-flash-exl3-k325-mc-min.config",

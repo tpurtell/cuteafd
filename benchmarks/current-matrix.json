@@ -75,6 +75,18 @@
     },
     {
       "family": "glm5_flash",
+      "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1",
+      "1rtx": {
+        "status": "pending",
+        "reason": "Pending Release smoke"
+      },
+      "2rtx": {
+        "status": "pending",
+        "reason": "Pending Release smoke"
+      }
+    },
+    {
+      "family": "glm5_flash",
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC",
       "1rtx": {
         "status": "pending",
