@@ -243,6 +243,7 @@ historical recipe; new release launches use the v7 matrix.
 
 ## GLM 5.3
 
+- 2026-11-25 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (250–525) + 6× DGX Spark · build a5aa26864ba5 · [report](glm5/2026-11-25-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-k8-compact-max/report.svg)
 - 2026-11-19 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) + 6× DGX Spark · build v6.0.0-rc1 · [report](glm5/2026-11-19-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-k8-compact-max/report.svg)
 - 2026-11-19 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) + 6× DGX Spark · build v6.0.0-rc1 · [report](glm5/2026-11-19-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-k6-compact-max/report.svg)
 - 2026-11-19 · Release smoke · wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC · 2× RTX PRO 6000 @ gpu-powerd 425/425 W (400–450) + 6× DGX Spark · build v6.0.0-rc1 · [report](glm5/2026-11-19-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-fp8-compact-max/report.svg)
