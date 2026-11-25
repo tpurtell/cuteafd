@@ -61,7 +61,7 @@ def case(tmp_path,monkeypatch):
         files={r['relative']:dict(sha256=r['sha256'],size=r['size'],host=r['host'],namespace=r['namespace'],weight=r['weight'],owners=[r['host']]) for r in plan['files']},
         ref=dict(sha256=plan['ref']['sha256']))
     calls=[];bad_hash=[None];ingest_error=[False];ref_error=[False]
-    def published(export_value,root_value,repo):calls.append(('publish',));return revision
+    def published(export_value,root_value,repo,*,options=None):calls.append(('publish',));return revision
     def run_ingest(root_value,export_value):
         calls.append(('ingest',))
         if ingest_error[0]:raise RuntimeError('interrupted ingest')

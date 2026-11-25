@@ -140,7 +140,7 @@ def validate_manifest(manifest):
             raise ValueError("publication requires the requested repository and absolute HF cache root")
 
 
-def run(manifest, *, resume=False):
+def run(manifest, *, resume=False, upload_options=None):
     validate_manifest(manifest)
     if "recovery" in manifest and not resume:
         raise ValueError("compatible recovery requires explicit --resume")
@@ -240,7 +240,7 @@ def run(manifest, *, resume=False):
                 if "publication" in manifest:
                     publication = manifest["publication"]
                     receipt = upload_artifact(manifest["output"], manifest["export_state"],
-                        publication["repo_id"], resume=resume, progress=progress)
+                        publication["repo_id"], resume=resume, progress=progress, options=upload_options)
                     run_owner = root.stat()
                     cached = materialize_cache(manifest["output"], publication["cache_root"], receipt,
                                                owner=(run_owner.st_uid, run_owner.st_gid))
@@ -264,5 +264,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--resume", action="store_true")
+    import hub_lfs
+    hub_lfs.add_arguments(parser)
     args = parser.parse_args()
-    run(json.loads(args.manifest.read_text()), resume=args.resume)
+    run(json.loads(args.manifest.read_text()), resume=args.resume, upload_options=hub_lfs.options_from(args))

@@ -3,10 +3,12 @@
 ## Quantization CPU tests and Hub qualification (2026-11-16)
 
 All quant publishers use `quantization/hub_requirements.py` to require the same
-`huggingface-hub==1.33.0` with Xet enabled. This is the newest Hub 1.x accepted
+`huggingface-hub==1.33.0` over HTTP LFS (`HF_HUB_DISABLE_XET=1`; Xet is not used
+for publication), and upload through the shared verified, resumable batch
+publisher `quantization/hub_lfs.py`. This is the newest Hub 1.x accepted
 by the pinned Transformers and tokenizers; Hub 2.2.0 fails Transformers' import
-version check. Real-SDK offline tests cover lazy hashes, Xet selection,
-`preupload_lfs_files`, receipt-restored adds and cross-repo server-side LFS copies.
+version check. Real-SDK offline tests cover receipt SHA256s without rehashing,
+parallel LFS file uploads, receipt-restored adds and cross-repo server-side LFS copies.
 No test uploads weights. The default CPU gate runs `scripts/tests`, not
 `quantization/tests`; its exact requirements also pin Hub 1.33.0.
 

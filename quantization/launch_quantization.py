@@ -56,7 +56,7 @@ def command(manifest_path, manifest, image, hf_home, attempt, *, resume=False):
             "--network=host", "--shm-size=16g", "--memory=170g", "--memory-swap=170g",
             "--log-driver=local", "--log-opt=max-size=20m", "--log-opt=max-file=5",
             "--env", "PYTHONDONTWRITEBYTECODE=1", "--env", "HF_HOME=" + str(hf_home),
-            "--env", "HF_TOKEN_PATH=" + str(token), "--env", "HF_XET_HIGH_PERFORMANCE=1",
+            "--env", "HF_TOKEN_PATH=" + str(token), "--env", "HF_HUB_DISABLE_XET=1",
             "--mount", f"type=bind,src={root},dst={root}",
             "--mount", f"type=bind,src={hf_home},dst={hf_home}",
             "--mount", f"type=bind,src={snapshot.parent.parent},dst={snapshot.parent.parent},readonly",

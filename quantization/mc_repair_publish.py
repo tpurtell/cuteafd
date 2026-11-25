@@ -1,7 +1,8 @@
 """Publish only validated original-MTP repair deltas, reusing writer SHA receipts.
 
 No inherited checkpoint payloads are opened, uploaded or hashed. Publication is
-one parent-guarded commit; verification reads pinned Hub tree metadata only.
+parent-guarded HTTP LFS batch commits (metadata last); verification reads pinned
+Hub tree metadata only, and resume never resends a committed delta file.
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import json
 from pathlib import Path
 import re
 
+import hub_lfs
 from hub_requirements import require_qualified_hub
 from kimi_k3.uniform_k2.storage import atomic_json, file_identity
 
@@ -142,6 +144,25 @@ def verify_tree(actual, parent, changes, normalized_attributes=None):
                 raise ValueError('published repair file identity differs: ' + name)
 
 
+def committed_changes(actual, parent, changes):
+    """Delta files an interrupted publication committed; anything else refuses."""
+    done = set()
+    for name, row in actual.items():
+        if name == '.gitattributes':
+            continue  # Checked against literal appended rules by normalized_attributes.
+        if name in changes:
+            expected = changes[name]
+            digest = expected['sha256'] if row['storage'] == 'lfs' else expected['git_blob']
+            if row['bytes'] == expected['bytes'] and row['oid'] == digest:
+                done.add(name)
+                continue
+        if parent.get(name) != row:
+            raise ValueError('repair publication tree differs from parent and delta: ' + name)
+    if set(parent) - set(actual):
+        raise ValueError('repair publication tree inventory differs')
+    return done
+
+
 def normalized_attributes(actual, parent, changes, revision, root, fetch):
     """Permit only literal Hub-appended LFS rules for changed repair files."""
     name = '.gitattributes'
@@ -166,18 +187,20 @@ def normalized_attributes(actual, parent, changes, revision, root, fetch):
     if not added or len(added) != len(set(added)) or not set(added) <= allowed:
         raise ValueError('unexpected inherited attributes rules')
     target = root / 'published.gitattributes'
-    if target.is_symlink() or (target.exists() and metadata(target) != new):
+    # Batches only append literal rules, so a recorded copy may only grow.
+    if target.is_symlink() or (target.exists() and not new.startswith(metadata(target))):
         raise ValueError('normalized attributes recovery file differs')
-    if not target.exists():
+    if not target.exists() or metadata(target) != new:
         target.write_bytes(new)
     return after
 
 
-def publish(delta, root, *, api=None, anonymous_api=None, fetch_metadata=None):
-    """Commit a delta once and recover interruption using exact remote metadata."""
-    from huggingface_hub import HfApi, CommitOperationAdd, hf_hub_download
+def publish(delta, root, *, api=None, anonymous_api=None, fetch_metadata=None, options=None):
+    """Commit a delta in verified batches and resume from exact remote metadata."""
+    from huggingface_hub import HfApi, hf_hub_download
 
     require_qualified_hub()
+    options = options or hub_lfs.UploadOptions()
     root, delta = Path(root).absolute(), Path(delta).absolute()
     if root == delta or root in delta.parents or delta in root.parents:
         raise ValueError('repair delta and publication receipts must be disjoint')
@@ -201,9 +224,17 @@ def publish(delta, root, *, api=None, anonymous_api=None, fetch_metadata=None):
         if not plan_path.exists():
             atomic_json(plan_path, plan)
         repo, parent = plan['repo_id'], plan['parent_revision']
-        fetch = fetch_metadata or (lambda revision, name: Path(hf_hub_download(repo, name,
+        download = fetch_metadata or (lambda revision, name: Path(hf_hub_download(repo, name,
             revision=parent if revision == 'parent' else revision, token=getattr(api, 'token', False),
             local_dir=root / 'hub-metadata' / revision)).read_bytes())
+        fetched = {}
+
+        def fetch(revision, name):
+            # Pinned revisions are immutable: per-batch verification fetches each once.
+            if (revision, name) not in fetched:
+                fetched[revision, name] = download(revision, name)
+            return fetched[revision, name]
+
         parent_files = hub_tree(api, repo, parent)
         if set(plan['files']) & set(parent_files) != METADATA:
             raise ValueError('new repair payload collides with pinned parent')
@@ -213,24 +244,32 @@ def publish(delta, root, *, api=None, anonymous_api=None, fetch_metadata=None):
             raise ValueError('repair destination became private')
         revision = field(head, 'sha')
         attempt = root / 'publication-attempt.json'
+        changes = plan['files']
+        done = set()
         if revision != parent:
             if not attempt.exists() or load(attempt) != dict(identity=plan['identity'], parent_revision=parent):
                 raise ValueError('Hub head moved before guarded repair commit')
             shown = hub_tree(api, repo, revision)
-            normalized = normalized_attributes(shown, parent_files, plan['files'], revision, root, fetch)
-            verify_tree(shown, parent_files, plan['files'], normalized)
+            done = committed_changes(shown, parent_files, changes)
+            committed = {name: changes[name] for name in done}
+            verify_tree(shown, parent_files, committed,
+                        normalized_attributes(shown, parent_files, committed, revision, root, fetch))
         else:
-            operations = [CommitOperationAdd(name, row['path']) for name, row in sorted(plan['files'].items())]
-            for op in operations:
-                row = plan['files'][op.path_in_repo]
-                if op.upload_info.size != row['bytes']:
-                    raise ValueError('native upload operation source size differs')
-                op.upload_info.sha256 = bytes.fromhex(row['sha256'])
-            check_sources(plan['files'])
             atomic_json(attempt, dict(identity=plan['identity'], parent_revision=parent))
-            committed = api.create_commit(repo_id=repo, repo_type='model', operations=operations,
-                parent_commit=parent, commit_message='Restore original MTP core in default MC view')
-            revision = field(committed, 'oid')
+        pending = [name for name in hub_lfs.upload_order(changes) if name not in done]
+
+        def verify(commit, batch, operations):
+            done.update(batch)
+            shown = hub_tree(api, repo, commit)
+            committed = {name: changes[name] for name in done}
+            verify_tree(shown, parent_files, committed,
+                        normalized_attributes(shown, parent_files, committed, commit, root, fetch))
+
+        if pending:
+            revision = hub_lfs.commit_batches(api, repo, changes, pending, revision=revision,
+                commit_message='Restore original MTP core in default MC view', options=options,
+                check_sources=lambda batch: check_sources({name: changes[name] for name in batch}),
+                verify=verify)
         check_sources(plan['files'])
         actual = hub_tree(api, repo, revision)
         normalized = normalized_attributes(actual, parent_files, plan['files'], revision, root, fetch)
@@ -251,8 +290,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--delta', type=Path, required=True)
     parser.add_argument('--root', type=Path, required=True)
+    hub_lfs.add_arguments(parser)
     args = parser.parse_args()
-    print(json.dumps(publish(args.delta, args.root)), flush=True)
+    print(json.dumps(publish(args.delta, args.root, options=hub_lfs.options_from(args))), flush=True)
 
 
 if __name__ == '__main__':

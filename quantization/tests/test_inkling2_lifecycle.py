@@ -31,6 +31,7 @@ def completed_export(tmp_path, *, attributes=True):
 
 
 class Hub:
+    """Fake Hub for verified HTTP LFS batch commits; tracks every sent file."""
     token = False
 
     def __init__(self, files):
@@ -38,8 +39,13 @@ class Hub:
         self.remote = {}
         self.revision = '0' * 40
         self.uploads = 0
+        self.sent = []
+        self.batches = []
+        self.workers = []
         self.fail = False
+        self.lose_reply = False
         self.normalized = None
+        self.mutate = None
 
     def model_info(self, repo, *, revision=None, files_metadata=False):
         assert repo == publish.TARGET_REPO
@@ -49,30 +55,35 @@ class Hub:
                 lfs=SimpleNamespace(sha256=v['sha256']) if n.endswith('.safetensors') else None)
                 for n, v in self.remote.items()])
 
-    def _prepare_upload_folder_additions(self, folder_path, path_in_repo='', **kwargs):
-        from huggingface_hub import CommitOperationAdd
-        return [CommitOperationAdd(name, Path(folder_path) / name)
-                for name in kwargs['allow_patterns']]
-
-    def upload_folder(self, **kwargs):
-        self.uploads += 1
-        assert set(kwargs['allow_patterns']) == set(self.files)
-        for operation in self._prepare_upload_folder_additions(
-                kwargs['folder_path'], allow_patterns=kwargs['allow_patterns']):
-            assert operation.upload_info.is_hashed
-            assert operation.upload_info.sha256.hex() == self.files[operation.path_in_repo]['sha256']
-            assert operation._is_uploaded is False
-        assert 'delete_patterns' not in kwargs
-        assert 'parent_repo' not in kwargs
-        self.revision = REVISION
-        if self.fail:
-            self.remote = {n: v for n, v in self.files.items() if n.endswith('.safetensors')}
+    def create_commit(self, repo, operations, **kwargs):
+        assert repo == publish.TARGET_REPO and kwargs['revision'] == 'main'
+        assert kwargs['parent_commit'] == self.revision
+        names = [op.path_in_repo for op in operations]
+        assert not set(names) & set(self.remote), 'committed file sent again'
+        for op in operations:
+            # Receipt SHA256 supplied; the SDK owns uploaded/committed state.
+            assert op.upload_info.is_hashed
+            assert op.upload_info.sha256.hex() == self.files[op.path_in_repo]['sha256']
+            assert op._is_uploaded is False and op._is_committed is False
+        self.batches.append(names)
+        self.workers.append(kwargs['num_threads'])
+        if self.mutate is not None and len(self.batches) == self.mutate[0]:
+            with Path(self.files[self.mutate[1]]['path']).open('ab') as stream:
+                stream.write(b'changed during transfer')
+        if self.fail and self.uploads == 1:
             raise OSError('upload interrupted')
-        self.remote = deepcopy(self.files)
-        if self.normalized is not None:
+        self.sent.extend(names)
+        self.uploads += 1
+        self.remote.update({name: deepcopy(self.files[name]) for name in names})
+        if self.normalized is not None and '.gitattributes' in self.remote:
             raw = self.normalized
             self.remote['.gitattributes'].update(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest(),
                 git_blob=hashlib.sha1(f'blob {len(raw)}\0'.encode() + raw).hexdigest())
+        self.revision = REVISION if self.uploads == 1 else f'{self.uploads:040x}'
+        if self.lose_reply:
+            self.lose_reply = False
+            raise OSError('lost commit reply')
+        return SimpleNamespace(oid=self.revision)
 
 
 def test_publication_uses_streaming_receipts_and_metadata_only(tmp_path, monkeypatch):
@@ -112,9 +123,9 @@ def test_publish_supplies_missing_protocol_metadata_without_rewriting_sealed_pac
         return real_open(path, *args, **kwargs)
 
     class PreparedHub(Hub):
-        def upload_folder(self, **kwargs):
+        def create_commit(self, repo, operations, **kwargs):
             self.files = publish.publication_inventory(output)['files']
-            return super().upload_folder(**kwargs)
+            return super().create_commit(repo, operations, **kwargs)
 
     monkeypatch.setattr(Path, 'open', no_weight_reads)
     api, root = PreparedHub({}), tmp_path / 'publication'
@@ -142,57 +153,138 @@ def test_unsealed_publication_attributes_are_never_overwritten(tmp_path, kind):
     assert path.is_symlink() if kind == 'symlink' else path.read_bytes() == b'foreign rules\n'
 
 
-def test_native_folder_pipeline_gets_known_sha_and_restores_client_builder(tmp_path, monkeypatch):
-    from huggingface_hub import HfApi
-    import huggingface_hub._upload_pipeline as pipeline
-    import huggingface_hub.lfs as lfs
-    output = completed_export(tmp_path)
-    files = publish.publication_inventory(output)['files']
-    api = HfApi(token=False)
-    monkeypatch.setattr(api, '_validate_yaml', lambda *a, **kw: None)
-    monkeypatch.setattr(api, '_prepare_folder_deletions', lambda **kw: [])
-
-    def no_extra_hash(*args, **kwargs):
-        pytest.fail('SDK attempted an extra payload SHA pass')
-
-    monkeypatch.setattr(lfs, 'sha_fileobj', no_extra_hash)
-
-    def native(client, **kwargs):
-        assert client is api and not kwargs['delete_operations']
-        operations = kwargs['add_operations']
-        assert {op.path_in_repo for op in operations} == set(files)
-        for op in operations:
-            assert op.upload_info.is_hashed
-            assert op.upload_info.sha256.hex() == files[op.path_in_repo]['sha256']
-            assert op._is_uploaded is False
-        return 'native-pipeline'
-
-    monkeypatch.setattr(pipeline, 'pipelined_upload', native)
-    arguments = dict(repo_id=publish.TARGET_REPO, repo_type='model', folder_path=str(output),
-                     allow_patterns=sorted(files))
-    assert publish._upload_with_writer_hashes(api, arguments, files) == 'native-pipeline'
-    assert '_prepare_upload_folder_additions' not in vars(api)
-
-    def interrupted(client, **kwargs):
-        raise OSError('native transfer interrupted')
-
-    monkeypatch.setattr(pipeline, 'pipelined_upload', interrupted)
-    with pytest.raises(OSError, match='interrupted'):
-        publish._upload_with_writer_hashes(api, arguments, files)
-    assert '_prepare_upload_folder_additions' not in vars(api)
-
-
-def test_partial_native_upload_resumes_exact_allowlist(tmp_path):
+def test_partial_upload_resumes_without_resending_committed_files(tmp_path):
     output = completed_export(tmp_path)
     packet = publish.publication_inventory(output)
     api = Hub(packet['files'])
     api.fail = True
-    root = tmp_path / 'publication'
+    root, options = tmp_path / 'publication', publish.hub_lfs.UploadOptions(workers=3, batch_files=2)
     with pytest.raises(OSError, match='interrupted'):
-        publish.publish(output, root, api=api, anonymous_api=api)
+        publish.publish(output, root, api=api, anonymous_api=api, options=options)
+    committed = set(api.remote)
+    assert len(committed) == 2
     api.fail = False
-    assert publish.publish(output, root, api=api, anonymous_api=api)['revision'] == REVISION
-    assert api.uploads == 2
+    assert publish.publish(output, root, api=api, anonymous_api=api, options=options)['status'] == 'passed'
+    assert len(api.sent) == len(set(api.sent)) == len(packet['files'])
+    assert not committed & {name for batch in api.batches[2:] for name in batch}
+    assert set(api.workers) == {3} and all(len(batch) <= 2 for batch in api.batches)
+
+
+def http_files(tmp_path, count=34):
+    files = {}
+    names = ['.gitattributes', 'config.json', *[f'shard-{i:02d}.safetensors' for i in range(count)]]
+    for i, name in enumerate(names):
+        path = tmp_path / name
+        path.write_bytes(name.encode() * (i + 1))
+        files[name] = dict(path=str(path), bytes=path.stat().st_size,
+                           device=path.stat().st_dev, file_identity=file_identity(path),
+                           **publish.metadata_identity(path))
+    return files
+
+
+def run_http_lfs(api, files, tmp_path, options=None):
+    return publish._upload_http_lfs(api, api.model_info(publish.TARGET_REPO), files, tmp_path, None,
+                                    target=publish.INKLING, options=options or publish.hub_lfs.UploadOptions())
+
+
+def test_http_lfs_defaults_to_16_workers_and_48_file_batches(tmp_path):
+    files = http_files(tmp_path, count=100)
+    api = Hub(files)
+    run_http_lfs(api, files, tmp_path)
+    assert [len(batch) for batch in api.batches] == [48, 48, 6]
+    assert set(api.workers) == {publish.hub_lfs.DEFAULT_WORKERS} == {16}
+    # Attributes first, then shards largest first, small metadata last.
+    assert api.batches[0][0] == '.gitattributes' and api.batches[-1][-1] == 'config.json'
+    sizes = [files[n]['bytes'] for batch in api.batches for n in batch if n.endswith('.safetensors')]
+    assert sizes == sorted(sizes, reverse=True)
+    assert set(api.remote) == set(files)
+
+
+def test_http_lfs_commits_verified_batches_and_skips_committed_files(tmp_path):
+    files = http_files(tmp_path)
+    api = Hub(files)
+    api.fail = True
+    options = publish.hub_lfs.UploadOptions(workers=8, batch_files=16)
+    with pytest.raises(OSError, match='interrupted'):
+        run_http_lfs(api, files, tmp_path, options)
+    assert len(api.remote) == 16
+    committed = set(api.remote)
+    api.fail = False
+    run_http_lfs(api, files, tmp_path, options)
+    assert api.uploads == 3 and set(api.remote) == set(files)
+    assert set(api.workers) == {8}
+    assert len(api.sent) == len(set(api.sent)) == len(files)
+    assert not committed & {name for batch in api.batches[2:] for name in batch}
+
+
+def test_http_lfs_lost_commit_reply_resumes_from_hub_tree(tmp_path):
+    files = http_files(tmp_path, count=4)
+    api = Hub(files)
+    api.lose_reply = True
+    options = publish.hub_lfs.UploadOptions(batch_files=3)
+    with pytest.raises(OSError, match='lost commit reply'):
+        run_http_lfs(api, files, tmp_path, options)
+    run_http_lfs(api, files, tmp_path, options)
+    assert len(api.sent) == len(set(api.sent)) == len(files)
+
+
+@pytest.mark.parametrize('change', ['bytes', 'sha256'])
+def test_http_lfs_refuses_receipt_mismatch_before_transfer(tmp_path, change):
+    files = http_files(tmp_path, count=4)
+    shard = 'shard-02.safetensors'
+    if change == 'bytes':
+        files[shard]['bytes'] += 1
+    else:
+        files[shard]['sha256'] = 'not-a-sha256'
+    api = Hub(files)
+    with pytest.raises(ValueError, match='sealed receipt|receipt SHA256'):
+        run_http_lfs(api, files, tmp_path, publish.hub_lfs.UploadOptions(batch_files=64))
+    assert api.batches == [] and api.remote == {}
+
+
+def test_http_lfs_refuses_source_changed_mid_batch(tmp_path):
+    files = http_files(tmp_path, count=6)
+    api = Hub(files)
+    options = publish.hub_lfs.UploadOptions(batch_files=3)
+    changed = publish.hub_lfs.upload_order(files)[4]
+    api.mutate = (2, changed)  # Changes while batch 2 is transferring.
+    with pytest.raises(ValueError, match='source changed'):
+        run_http_lfs(api, files, tmp_path, options)
+    assert len(api.batches) == 2  # Its verify never ran and no later batch started.
+
+
+def test_publish_resume_refuses_source_changed_mid_batch(tmp_path):
+    output = completed_export(tmp_path)
+    packet = publish.publication_inventory(output)
+    api = Hub(packet['files'])
+    options = publish.hub_lfs.UploadOptions(batch_files=2)
+    changed = next(n for n in publish.hub_lfs.upload_order(packet['files'])[2:4] if n != '.gitattributes')
+    api.mutate = (2, changed)
+    root = tmp_path / 'publication'
+    with pytest.raises(ValueError, match='source changed'):
+        publish.publish(output, root, api=api, anonymous_api=api, options=options)
+    with pytest.raises(ValueError, match='committed file changed|source changed'):
+        publish.publish(output, root, api=api, anonymous_api=api, options=options)
+    assert len(api.batches) == 2 and not (root / 'publication-complete.json').exists()
+
+
+def test_http_lfs_refuses_remote_not_matching_receipts(tmp_path):
+    files = http_files(tmp_path, count=4)
+    api = Hub(files)
+    run_http_lfs(api, files, tmp_path, publish.hub_lfs.UploadOptions(batch_files=2))
+    api.remote['shard-00.safetensors']['sha256'] = 'f' * 64
+    with pytest.raises(ValueError, match='Hub file identity differs'):
+        publish.verify_hub(api, api.revision, files)
+
+
+def test_publication_requires_http_lfs_before_any_remote_call(tmp_path, monkeypatch):
+    from huggingface_hub import constants
+    output = completed_export(tmp_path)
+    api = Hub(publish.publication_inventory(output)['files'])
+    monkeypatch.setattr(constants, 'HF_HUB_DISABLE_XET', False)
+    with pytest.raises(ValueError, match='HF_HUB_DISABLE_XET=1'):
+        publish.publish(output, tmp_path / 'publication', api=api, anonymous_api=api)
+    assert api.batches == [] and not (tmp_path / 'publication' / 'publication-destination.json').exists()
 
 
 @pytest.mark.parametrize('change', ['sha256', 'bytes', 'extra', 'nonlfs'])

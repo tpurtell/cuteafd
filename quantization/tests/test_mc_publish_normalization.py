@@ -17,7 +17,7 @@ def git_entry(raw):
 @pytest.fixture
 def normalized(tmp_path, monkeypatch):
     import huggingface_hub
-    import upload_model
+    import hub_lfs
     original = b'*.safetensors filter=lfs diff=lfs merge=lfs -text\n'
     expected = {'.gitattributes': git_entry(original),
                 'index.json': dict(bytes=123, blob='a' * 64),
@@ -27,7 +27,7 @@ def normalized(tmp_path, monkeypatch):
     raw = original + b'index.json filter=lfs diff=lfs merge=lfs -text\n'
     path.write_bytes(raw)
     actual['.gitattributes'] = git_entry(raw)
-    monkeypatch.setattr(upload_model, '_remote', lambda *args: actual)
+    monkeypatch.setattr(hub_lfs, 'remote_tree', lambda *args: actual)
     monkeypatch.setattr(huggingface_hub, 'hf_hub_download', lambda *args, **kwargs: path)
     return SimpleNamespace(token=False), expected, actual, original, path
 
@@ -78,11 +78,14 @@ def test_publish_and_lost_reply_accept_only_normalized_attributes(tmp_path, monk
     path.write_bytes(raw)
     monkeypatch.setattr(huggingface_hub, 'hf_hub_download', lambda *args, **kwargs: path)
     create = api.create_commit
+    lost = [lost_reply]
 
     def normalized_commit(*args, **kwargs):
         result = create(*args, **kwargs)
         api.files['.gitattributes'] = git_entry(raw)
-        if lost_reply:
+        api.trees[api.head] = dict(api.files)
+        if lost[0]:
+            lost[0] = False
             raise RuntimeError('lost normalized commit reply')
         return result
 

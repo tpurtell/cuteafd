@@ -61,16 +61,17 @@ class Hub:
             lfs=SimpleNamespace(sha256=r['oid']) if r['storage']=='lfs' else None)
             for n,r in self.trees[revision].items()]
 
-    def create_commit(self, **kwargs):
-        assert kwargs['parent_commit'] == self.parent and kwargs['repo_id'] == self.packet['repo_id']
+    def create_commit(self, repo, operations, **kwargs):
+        assert kwargs['parent_commit'] == self.head and repo == self.packet['repo_id']
         assert kwargs['repo_type'] == 'model'
-        operations = kwargs['operations']
         # Exercise the SDK's actual SHA scheduling against the prepared operations.
         from huggingface_hub._commit_api import _compute_missing_sha256s
         _compute_missing_sha256s(operations, num_threads=1)
-        assert {op.path_in_repo for op in operations} == set(self.packet['files'])
+        names = [op.path_in_repo for op in operations]
         assert not any(op.path_in_repo == 'existing.safetensors' for op in operations)
-        tree = deepcopy(self.trees[self.parent])
+        tree = deepcopy(self.trees[self.head])
+        assert not set(names) & {n for n, r in tree.items() if n in self.packet['files']
+                                 and r != self.trees[self.parent].get(n)}, 'committed file sent again'
         for op in operations:
             row = self.packet['files'][op.path_in_repo]
             assert op.upload_info.is_hashed and op.upload_info.sha256.hex() == row['sha256']
@@ -78,15 +79,17 @@ class Hub:
             assert op.upload_info.size == row['bytes']
             lfs = op.path_in_repo.endswith('.safetensors') or op.path_in_repo == 'quantize_config.json'
             tree[op.path_in_repo] = dict(bytes=row['bytes'], oid=row['sha256'] if lfs else row['git_blob'], storage='lfs' if lfs else 'git')
-        self.calls.append(kwargs)
+        self.calls.append(dict(kwargs, operations=operations))
         if self.normalized:
             tree['.gitattributes'] = dict(bytes=len(self.normalized),
                 oid=hashlib.sha1(f'blob {len(self.normalized)}\0'.encode()+self.normalized).hexdigest(), storage='git')
-        self.trees[REVISION] = tree
-        self.head = REVISION
+        revision = REVISION if len(self.calls) == 1 else f'{len(self.calls):040x}'
+        self.trees[revision] = tree
+        self.head = revision
         if self.fail_after_commit:
+            self.fail_after_commit = False
             raise OSError('commit response lost')
-        return SimpleNamespace(oid=REVISION)
+        return SimpleNamespace(oid=revision)
 
 
 def deny_payload_reads(monkeypatch):
@@ -197,4 +200,68 @@ def test_wrong_sdk_and_private_repository_fail_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(hub_requirements.importlib.metadata, 'version', lambda name: '1.0.0')
     with pytest.raises(ValueError, match='1.33.0'):
         repair.publish(delta, tmp_path/'wrong-sdk', api=hub, anonymous_api=hub)
+    assert hub.calls == []
+
+
+def test_batched_delta_resumes_without_resending_committed_files(tmp_path, monkeypatch):
+    delta, packet = fixture(tmp_path)
+    hub, root = Hub(packet), tmp_path / 'receipts'
+    deny_payload_reads(monkeypatch)
+    options = repair.hub_lfs.UploadOptions(workers=4, batch_files=2)
+    create, interrupt = hub.create_commit, [True]
+
+    def interrupted(repo, operations, **kwargs):
+        if len(hub.calls) == 1 and interrupt[0]:
+            interrupt[0] = False
+            raise OSError('transfer interrupted')
+        return create(repo, operations, **kwargs)
+
+    hub.create_commit = interrupted
+    with pytest.raises(OSError, match='interrupted'):
+        repair.publish(delta, root, api=hub, anonymous_api=hub, options=options)
+    first = [op.path_in_repo for op in hub.calls[0]['operations']]
+    # New shards go before metadata, so the default view's index lands last.
+    assert len(first) == 2 and first[0] == 'original-mtp-0001.safetensors'
+    result = repair.publish(delta, root, api=hub, anonymous_api=hub, options=options)
+    assert result['status'] == 'passed'
+    sent = [op.path_in_repo for call in hub.calls for op in call['operations']]
+    assert len(sent) == len(set(sent)) == len(packet['files'])
+    assert {call['num_threads'] for call in hub.calls} == {4}
+    assert all(len(call['operations']) <= 2 for call in hub.calls)
+
+
+def test_batched_delta_refuses_source_changed_mid_batch(tmp_path):
+    delta, packet = fixture(tmp_path)
+    hub, root = Hub(packet), tmp_path / 'receipts'
+    create = hub.create_commit
+
+    def mutate(repo, operations, **kwargs):
+        result = create(repo, operations, **kwargs)
+        with (delta / operations[0].path_in_repo).open('ab') as stream:
+            stream.write(b'changed during transfer')
+        return result
+
+    hub.create_commit = mutate
+    with pytest.raises(ValueError, match='changed'):
+        repair.publish(delta, root, api=hub, anonymous_api=hub,
+                       options=repair.hub_lfs.UploadOptions(batch_files=2))
+    assert len(hub.calls) == 1 and not (root / 'publication-complete.json').exists()
+    with pytest.raises(ValueError, match='changed'):
+        repair.publish(delta, root, api=hub, anonymous_api=hub)  # Resume refuses too.
+    assert len(hub.calls) == 1
+
+
+def test_receipt_size_mismatch_refused_before_transfer(tmp_path, monkeypatch):
+    delta, packet = fixture(tmp_path)
+    hub, root = Hub(packet), tmp_path / 'receipts'
+    real = repair.delta_packet
+
+    def mismatched(path):
+        plan = real(path)
+        plan['files']['original-mtp-0001.safetensors']['bytes'] += 1
+        return plan
+
+    monkeypatch.setattr(repair, 'delta_packet', mismatched)
+    with pytest.raises(ValueError, match='sealed receipt'):
+        repair.publish(delta, root, api=hub, anonymous_api=hub)
     assert hub.calls == []

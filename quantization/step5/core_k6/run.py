@@ -316,6 +316,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     for name in ('source-snapshot','tokens','root','export'):p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--resume',action='store_true');p.add_argument('--preflight',action='store_true');p.add_argument('--publish-only',action='store_true')
+    import hub_lfs;hub_lfs.add_arguments(p)
     p.add_argument('--core-only',action='store_true')
     p.add_argument('--core-bits',type=int,choices=(6,8),default=6)
     p.add_argument('--layer-limit',type=int)
@@ -338,7 +339,7 @@ def main():
     if not prior.exists() and (args.resume or args.publish_only):raise ValueError('resume requires committed plan')
     if args.publish_only:
         from .publish import publish
-        with exclusive_run(args.root):publish(args.export,args.root,TARGET_REPO)
+        with exclusive_run(args.root):publish(args.export,args.root,TARGET_REPO,options=hub_lfs.options_from(args))
         return
     torch.set_num_threads(8);torch.backends.cuda.matmul.allow_tf32=False;torch.backends.cudnn.allow_tf32=False
     torch.cuda.set_per_process_memory_fraction(86*GIB/torch.cuda.get_device_properties(0).total_memory)
