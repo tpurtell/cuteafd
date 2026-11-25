@@ -309,7 +309,7 @@ fn wide_batch_oracle(
         for unit in &mut units {
             unit.segments = vec![UnitSegment { sequence: 0, rows: 0..unit.rows.len(), tokens: unit.rows.clone(), prompt_end: false, snapshot: false, head: false }];
         }
-        execution.prefill(std::slice::from_mut(&mut p), &[&slice[..args.prefill]], &units, 1, &mut |_, _, _| Ok(()))?;
+        execution.prefill(std::slice::from_mut(&mut p), &[&slice[..args.prefill]], &units, 1, super::prefill::HeadRows::All, &mut |_, _, _| Ok(()))?;
         for requests in execution.request_ranks() { requests.cache.capture(s, s)?; requests.cache.drain()?; }
         saved.push(p);
     }
@@ -477,7 +477,7 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
     prefix.bind_slot(&mut placement,Some(args.prefill+maximum))?;
     let mut units=crate::shared::prefill_pipeline::sequence_units(args.prefill,args.prefill_rows,args.prefill_waves as usize,cfg.layers)?;
     for unit in &mut units{unit.segments=vec![UnitSegment{sequence:0,rows:0..unit.rows.len(),tokens:unit.rows.clone(),prompt_end:false,snapshot:false,head:false}];}
-    execution.prefill(std::slice::from_mut(&mut placement),&[&tokens[..args.prefill]],&units,1,&mut|_,_,_|Ok(()))?;
+    execution.prefill(std::slice::from_mut(&mut placement),&[&tokens[..args.prefill]],&units,1,super::prefill::HeadRows::All,&mut|_,_,_|Ok(()))?;
     for requests in execution.request_ranks(){requests.cache.capture(0,0)?;requests.cache.drain()?;}
     let saved=placement.clone();
     if args.graph_parity {

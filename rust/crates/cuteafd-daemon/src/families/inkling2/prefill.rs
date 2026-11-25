@@ -14,6 +14,41 @@ pub(crate) trait UnitIo<'a> {
     fn tap(&mut self,_layer:usize,_unit:&Unit,_owner:&super::owners::UnitOwner<'a>)->Result<()> {Ok(())}
     fn stage(&mut self,_layer:usize,_stage:&str,_unit:&Unit,_owner:&super::owners::UnitOwner<'a>)->Result<()> {Ok(())}
 }
+/// Which rows of `head` segments anybody reads. Spans are the head's 64-row
+/// tiles; a span is projected through the vocabulary only when it holds such a
+/// row, so its GEMM (and the bytes of every returned row) matches projecting
+/// every span. Drafter final-norm taps still normalize every span.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeadRows {
+    /// Every row of every head segment (decode, verify).
+    All,
+    /// Each head segment's last row (serving prefill, packed prefill).
+    MemberLast,
+    /// Rows at 1-based request position `>= first` (streamed prefill scoring).
+    FromPosition(usize),
+}
+
+/// Per 64-row head span: whether its vocabulary projection is read.
+pub(crate) fn projected_spans(rows: usize, members: &[crate::shared::prefill_pipeline::UnitSegment],
+    head_rows: HeadRows) -> Result<Vec<(std::ops::Range<usize>, bool)>> {
+    let needed = members.iter().filter(|member| member.head && !member.rows.is_empty()).filter_map(|member| {
+        let rows = match head_rows {
+            HeadRows::All => member.rows.clone(),
+            HeadRows::MemberLast => member.rows.end-1..member.rows.end,
+            HeadRows::FromPosition(first) => {
+                // Row r holds 1-based position member.tokens.start + (r - member.rows.start) + 1.
+                let skip = first.saturating_sub(member.tokens.start+1);
+                member.rows.start.saturating_add(skip).min(member.rows.end)..member.rows.end
+            }
+        };
+        (!rows.is_empty()).then_some(rows)
+    }).collect::<Vec<_>>();
+    Ok(crate::shared::probe::head_spans(rows, 64)?.map(|span| {
+        let project = needed.iter().any(|rows| rows.start < span.end && span.start < rows.end);
+        (span, project)
+    }).collect())
+}
+
 /// Token/head edge for ordinary prefill and bounded streamed scoring. The
 /// callback consumes scratch logits before another head tile overwrites them.
 pub(crate) struct TokenIo<'s, 'a> {
@@ -28,6 +63,7 @@ pub(crate) struct TokenIo<'s, 'a> {
     pub starts: &'s [usize],
     pub slots: &'s [usize],
     pub retained_rows: bool,
+    pub head_rows: HeadRows,
     pub draft:Option<&'s super::draft::Binding<'a>>,
     pub publish_draft:bool,
     pub trace:Option<&'s std::cell::RefCell<super::width_invariance::Trace>>,
@@ -60,13 +96,14 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
     }
     fn end(&mut self, unit: &Unit, owner: &super::owners::UnitOwner<'a>) -> Result<()> {
         let members = members(unit);
-        let head=members.iter().any(|member|member.head);
-        if !head && self.draft.is_none() {return Ok(());}
+        let spans = projected_spans(unit.rows.len(), &members, self.head_rows)?;
+        if !spans.iter().any(|(_, project)| *project) && self.draft.is_none() {return Ok(());}
         let sequence = *self.slots.get(members[0].sequence).context("Inkling head sequence slot absent")?;
-        for span in crate::shared::probe::head_spans(unit.rows.len(), 64)? {
+        for (span, project) in spans {
+            if !project && self.draft.is_none() { continue; }
             let state = owner.segment(self.cache, sequence, self.cfg.layers-1, span.clone())?;
             let output_row = if self.retained_rows { span.start } else { 0 };
-            let logits = if head {Some(self.head.project_at(self.kernels,&state,self.target,self.peer_head,self.cfg,span.len(),
+            let logits = if project {Some(self.head.project_at(self.kernels,&state,self.target,self.peer_head,self.cfg,span.len(),
                 self.cfg.residual_blocks()+1,output_row)?)} else {
                 self.head.normalize(self.kernels,&state,self.target,span.len(),self.cfg.residual_blocks()+1)?;None
             };
