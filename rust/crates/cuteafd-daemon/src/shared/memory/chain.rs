@@ -532,6 +532,20 @@ pub(crate) unsafe fn depend(library: &NativeLibrary, event: *mut c_void) -> Resu
     Ok(())
 }
 
+/// Host-ordered TP2: keep peer DMA out of the shared copy queue until the
+/// producer is ready, without blocking the executor that issues the other lane.
+/// Staging fences are otherwise used only in device-ordered passes.
+pub(crate) async fn settle_before_peer_dma(library: &NativeLibrary) -> Result<()> {
+    let Some(chain) = current() else { return Ok(()) };
+    if chain.device { return Ok(()) }
+    let Some(head) = chain.head.get() else { return Ok(()) };
+    // SAFETY: the scoped chain owns the head. CUDA permits querying an event
+    // on another device. A completed producer needs no fence or host handoff.
+    if unsafe { library.cuda_event_query(chain.events[head].1)? } { return Ok(()) }
+    fence_mark(library, 0)?;
+    fence_wait(library, 0).await
+}
+
 /// Host wait for all chained work before a host-synchronous operation (legacy
 /// stream copies do not order with the non-blocking stage streams).
 pub(crate) fn settle(library: &NativeLibrary) -> Result<()> {

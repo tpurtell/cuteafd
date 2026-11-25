@@ -360,9 +360,7 @@ impl<'a> Execution<'a> {
         );
         // Peer DMA is never queued behind an unresolved dependency: settle any
         // chained producer of `values` on the host first.
-        if !crate::shared::memory::chain::deferred() {
-            crate::shared::memory::chain::settle(self.streams[0].device.library)?;
-        }
+        crate::shared::memory::chain::settle_before_peer_dma(self.streams[0].device.library).await?;
         let local = values.device_id as usize;
         let remote = 1 - local;
         let upload = &self.streams[remote];
