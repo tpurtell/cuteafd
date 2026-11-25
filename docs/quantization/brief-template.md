@@ -144,8 +144,9 @@ These rules come from past runs: Inkling 2, Kimi K3/K3.1, GLM 5.3/Flash, ML4, Mu
   - **Memory:** 94 GiB RAM with no swap, so cap containers at about 80G. Page cache from mmapped scratch counts against the cap.
   - **GPU access:** request GPUs via CDI, not `--gpus`, because `daemon-reload` kills `--gpus` containers. Keep timeouts in the supervisor's process group.
 - **Hub upload throughput:**
-  - Xet's adaptive concurrency oscillated between 1 and 64 streams. `HF_XET_FIXED_UPLOAD_CONCURRENCY=32` gave about 299 Mbps, and xet 1.8 (direct to S3) about 500 Mbps.
-  - The code pins Hub SDK 1.33.0 (`quantization/hub_requirements.py`), but Inkling actually published with hub 2.2.0 and xet 1.8. **Confirm the SDK the run uses supports xet 1.8 before uploading.**
+  - **Publish over HTTP LFS (`HF_HUB_DISABLE_XET=1`), through the shared resumable publisher (`quantization/hub_lfs.py`).** Xet is not used for publication: `hub_requirements.py` keeps the hub 1.33.0 pin and refuses to publish unless Xet is disabled, and the publish units set `HF_HUB_DISABLE_XET=1`.
+  - **Tuning:** start at 16 workers (`--upload-workers`, files uploading at once) and batches of 32–64 files (`--upload-batch-files`, default 48), and tune toward a sustained 900–950 Mbps on the gigabit link. Use the CLI flags, not env vars. Hub 1.33.0 parallelizes across files, but each file's multipart parts go up serially. A batch therefore ends when its largest file does, and a few very large shards (Hy4-flash's 29.5 GiB Engram tables, say) leave the tail on that many streams. The publisher starts the largest shards first.
+  - **Measured:** Xet from Asia topped out at about 300 Mbps (`HF_XET_FIXED_UPLOAD_CONCURRENCY=32` gave 299 Mbps). Parallel LFS at 8 workers gave about 800 Mbps (Hy4 K4 MC, maxq, 2026-11-25).
 - **Don't repeat known dead ends:** for example, page-cache hint trials (released 65 GiB, no speedup).
 - **Progress reporting:** an update every 30 min via a durable timer, with remaining time and an Asia/Taipei ETA. Exclude the interrupted layer from averages, and allow separately for head/MTP, upload and placement.
 
@@ -186,8 +187,8 @@ These rules come from past runs: Inkling 2, Kimi K3/K3.1, GLM 5.3/Flash, ML4, Mu
 - **Before publishing:** release the GPU. Run publication as a separate, CPU-only unit (`af7528e1b7`).
 - **Sealing:** predeclare `.gitattributes` in the sealed package as a regular file, because the Hub appends LFS rules. **Why:** Inkling's publication omitted it, and its staging used a symlink.
 - **The lifecycle:**
-  1. **Upload** as `wrldsuksgo2mars/<Model>-EXL3-K<bits>-MC` (standard upload).
-  2. **Verify** by size plus the LFS/Xet sha256 the Hub already reports. **No extra hash passes,** no hashing over 10G, and no re-downloading your own quant; reuse the writer's hashes. (Older briefs said otherwise, and this supersedes them.)
+  1. **Upload** as `wrldsuksgo2mars/<Model>-EXL3-K<bits>-MC` over HTTP LFS (`HF_HUB_DISABLE_XET=1`) through the shared resumable publisher (`quantization/hub_lfs.py`; §8 has the tuning). Each batch is one parent-guarded commit, verified against the Hub before the next one starts. An interrupted transfer resumes automatically from the verified remote tree and never sends a committed file again. A sealed-receipt size or SHA256 mismatch, or a source that changes mid-batch, refuses the publication.
+  2. **Verify** by size plus the LFS sha256 the Hub already reports. **Reuse the export's SHA256s:** the writer's streaming receipts supply the LFS object ids, so nothing rereads weights for hashing. No extra hash passes, no hashing over 10G, and no re-downloading your own quant. (Older briefs said otherwise, and this supersedes them.)
   3. **Stage** a hard-link HF cache with the Hub OIDs as blob names, then run `nest hf import --offline --no-copy`. Update `refs/main`. Pinned revisions get `refs/keep/<name>`, written with `printf %s`, with no trailing newline.
   4. **Place it, before deleting anything.** Use SparkNest only: `nest plan --place hf:<repo> --host raptor:d2 --host raptor:d3 --host ostrich --host dodo --host emu --host kiwi --host rhea --host moa --factor 1/8`, then `nest plan show` (check for removals), then one `nest plan apply --wait`.
      - Random-read tables get a pin rule to raptor first.
