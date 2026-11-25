@@ -1029,12 +1029,20 @@ mod tests {
         let source = include_str!("layers.rs");
         let body = source.split_once("#[cfg(test)]").unwrap().0;
         let mut count = 0usize;
+        let mut captures_core_zero = false;
+        let mut captures_adopt = false;
         for part in body.split("self.segment(").skip(1) {
             count += 1;
             let after_arrow = part.split_once("|| {").unwrap().1;
             let closure = after_arrow.split_once("})?;")
                 .or_else(|| after_arrow.split_once("\n        })"))
                 .unwrap().0;
+            if closure.contains("core_zero_shared") {
+                captures_core_zero = true;
+            }
+            if closure.contains("adopt_local") {
+                captures_adopt = true;
+            }
             for forbidden in [
                 "exchange()?.push", "exchange()?.wait", "publish_projection", "tp2_publish",
                 "tp2_rank(", "meet_shared_core", "shared_on(", "moe_exchange", "moe_skip",
@@ -1044,6 +1052,17 @@ mod tests {
             }
         }
         assert!(count >= 8, "expected rank-local segment captures in layers.rs, found {count}");
+        assert!(captures_core_zero,
+            "split-core rank-1 core_zero_shared must stay inside FfnFront capture");
+        assert!(captures_adopt,
+            "layers adopt_local must stay inside FfnFront capture");
+        let native = include_str!("../../../../../../../native/shared/src/cuteafd_native.cc");
+        let sig = native.split_once("transferable_signature(").unwrap().1
+            .split_once("cuteafd_cuda_graph_capture_source(").unwrap().0;
+        assert!(sig.contains("kind == cudaGraphNodeTypeMemset") && sig.contains("cudaGraphMemsetNodeGetParams"),
+            "1D same-device memset nodes captured by core_zero_shared must be donor-transferable");
+        assert!(sig.contains("kind == cudaGraphNodeTypeMemcpy") && sig.contains("cudaGraphMemcpyNodeGetParams"),
+            "1D same-device D2D memcpy nodes captured by adopt_local must be donor-transferable");
 
         // Model two consecutive graphed decode steps across Dense, TP2, and Spark layers,
         // with alternating attention owners and sync(0)+sync(1) at every capture point.

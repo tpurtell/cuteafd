@@ -541,10 +541,14 @@ mod tests {
         let source = include_str!("local_graph.rs");
         let body = source.split_once("#[cfg(test)]").unwrap().0;
         let mut count = 0usize;
+        let mut captures_core_zero = false;
         for part in body.split("self.replay_on(").skip(1) {
             let Some((_, after_arrow)) = part.split_once("|| {") else { continue };
             count += 1;
             let closure = after_arrow.split_once("})?;").unwrap().0;
+            if closure.contains("core_zero_shared") {
+                captures_core_zero = true;
+            }
             for forbidden in [
                 "exchange.push", "exchange.wait", "exchange.push_to", "publish_projection",
                 "tp2_publish", "tp2_pair", "push_query", "wait_query", "push_candidates",
@@ -556,6 +560,13 @@ mod tests {
             }
         }
         assert!(count >= 10, "expected rank-local inline replay_on sites in local_graph.rs, found {count}");
+        assert!(captures_core_zero,
+            "split-core rank-1 core_zero_shared must stay inside capture (no per-layer eager memset launch)");
+        let native = include_str!("../../../../../../../native/shared/src/cuteafd_native.cc");
+        let sig = native.split_once("transferable_signature(").unwrap().1
+            .split_once("cuteafd_cuda_graph_capture_source(").unwrap().0;
+        assert!(sig.contains("kind == cudaGraphNodeTypeMemset") && sig.contains("cudaGraphMemsetNodeGetParams"),
+            "1D same-device memset nodes captured by core_zero_shared must be donor-transferable");
     }
 
     #[test]
