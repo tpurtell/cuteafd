@@ -270,13 +270,53 @@ def _upload_with_writer_hashes(api, arguments, files, *, target=INKLING):
             setattr(api, name, prior)
 
 
+def _upload_http_lfs(api, head, files, root, fetch_metadata, *, target):
+    """Commit bounded, parallel HTTP LFS batches with verified resume."""
+    from huggingface_hub import CommitOperationAdd
+
+    require_qualified_hub(allow_http_lfs=True)
+    repo = target.repo_id
+    revision = _field(head, 'sha')
+    present = {_field(row, 'rfilename') for row in _field(head, 'siblings')}
+    if present == {'.gitattributes'}:
+        # The new repository's default attributes are replaced by the sealed rules.
+        present.clear()
+    pending = sorted(set(files) - present)
+    for offset in range(0, len(pending), 16):
+        names = pending[offset:offset + 16]
+        batch = {name: files[name] for name in names}
+        _check_sources(batch)
+        operations = []
+        for name, row in batch.items():
+            operation = CommitOperationAdd(name, row['path'])
+            info = operation.upload_info
+            digest = bytes.fromhex(row['sha256'])
+            if info.size != row['bytes'] or (info.is_hashed and info.sha256 != digest):
+                raise ValueError('HTTP LFS operation differs from sealed receipt')
+            info.sha256 = digest
+            operations.append(operation)
+        print(f'HTTP LFS batch: {len(names)} files, {sum(row["bytes"] for row in batch.values())} bytes', flush=True)
+        commit = api.create_commit(repo, operations, repo_type='model', revision='main',
+                                   parent_commit=revision, num_threads=8,
+                                   commit_message=target.commit_message).oid
+        _check_sources(batch)
+        expected = _attribute_files(api, commit, files, root, fetch_metadata, repo_id=repo)
+        verified = verify_hub(api, commit, expected, partial=True, repo_id=repo)
+        present.update(names)
+        if {_field(row, 'rfilename') for row in _field(verified, 'siblings')} != present:
+            raise ValueError('HTTP LFS batch inventory differs from expected files')
+        revision = commit
+        print(f'HTTP LFS committed: {len(present)}/{len(files)} files, '
+              f'{sum(files[name]["bytes"] for name in present)} bytes, {revision}', flush=True)
+
+
 def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None, target=INKLING):
     """Resume native Hub upload, then seal a metadata-verified publication receipt.
 
     Call only after numerical completion. Native folder/Xet upload handles
     interrupted transfers; no parent repository or CommitOperationCopy is used.
     """
-    from huggingface_hub import HfApi, hf_hub_download
+    from huggingface_hub import HfApi, constants, hf_hub_download
     from huggingface_hub.errors import RepositoryNotFoundError
 
     repo_id = target.repo_id
@@ -330,7 +370,10 @@ def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None, 
         _check_sources(packet['files'])
         arguments = dict(repo_id=repo_id, repo_type='model', folder_path=str(output),
                          allow_patterns=sorted(packet['files']))
-        _upload_with_writer_hashes(api, arguments, packet['files'], target=target)
+        if constants.HF_HUB_DISABLE_XET:
+            _upload_http_lfs(api, head, packet['files'], root, fetch_metadata, target=target)
+        else:
+            _upload_with_writer_hashes(api, arguments, packet['files'], target=target)
         _check_sources(packet['files'])
         head = api.model_info(repo_id, files_metadata=True)
         revision = _field(head, 'sha')
