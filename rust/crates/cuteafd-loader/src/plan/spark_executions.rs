@@ -110,7 +110,7 @@ pub fn descriptor(family: &str) -> anyhow::Result<&'static dyn crate::plan::Fami
 /// ladder, with its default decode lanes. Plan, serve and golden all call this.
 pub fn admit_family(family: &str, exports: &[u32], decode_rows: Option<u32>,
     unit_rows: u64, waves: u64) -> anyhow::Result<SparkExecutions> {
-    let lanes = descriptor(family)?.decode_lanes().default_lanes();
+    let lanes = descriptor(family)?.decode_lanes().default_lanes(1);
     admit_family_lanes(family, exports, decode_rows, unit_rows, waves, lanes)
 }
 

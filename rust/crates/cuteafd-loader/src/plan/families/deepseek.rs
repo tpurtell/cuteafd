@@ -24,8 +24,9 @@ pub static DEEPSEEK_V41: DeepSeek = DeepSeek {
     id: "deepseek_v41",
     architecture: "DeepseekV41ForCausalLM",
     runtime: RuntimeStatus::Serving,
-    // Two until the one-lane A/B (#2460) decides the default.
-    decode_lanes: crate::plan::decode_lanes::LaneSupport::OneOrTwo { default: 2 },
+    // Post-#2760 matched min/max A/Bs (#2460): 1 lane wins 1×RTX C4–C16/32K C8 (+20.4% KV),
+    // while 2 lanes keep the 2×RTX C16 win and 2.28× larger KV pool.
+    decode_lanes: crate::plan::decode_lanes::LaneSupport::OneOrTwo { single_rtx: 1, dual_rtx: 2 },
     decode_rows: cuteafd_core::V41_VERIFY_ROWS as u32,
 };
 pub static DEEPSEEK_V4: DeepSeek = DeepSeek {

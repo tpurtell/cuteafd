@@ -20,8 +20,9 @@ pub enum LaneSupport {
     /// One decode batch only; `reason` records why a second lane is not
     /// wired (a measurement or the predicted cost), and the planner reports it.
     One { reason: &'static str },
-    /// One or two; `default` until a hardware A/B qualifies another default.
-    OneOrTwo { default: u8 },
+    /// One or two lanes; defaults by coordinator RTX GPU count (`single_rtx` on
+    /// 1× RTX, `dual_rtx` on 2× RTX) until an explicit override is passed.
+    OneOrTwo { single_rtx: u8, dual_rtx: u8 },
 }
 
 impl LaneSupport {
@@ -29,19 +30,30 @@ impl LaneSupport {
     pub fn max_lanes(self) -> u8 {
         match self { Self::One { .. } => 1, Self::OneOrTwo { .. } => MAX_DECODE_LANES }
     }
-    /// Lanes a launch without `--decode-lanes` requests.
-    pub fn default_lanes(self) -> u8 {
-        match self { Self::One { .. } => 1, Self::OneOrTwo { default } => default }
+    /// Lanes a launch without `--decode-lanes` requests for `rtx_gpus` coordinator GPUs.
+    pub fn default_lanes(self, rtx_gpus: usize) -> u8 {
+        match self {
+            Self::One { .. } => 1,
+            Self::OneOrTwo { single_rtx, dual_rtx } => if rtx_gpus >= 2 { dual_rtx } else { single_rtx },
+        }
     }
 }
 
 /// Resolve the decode-lane count before layout or any CUDA allocation.
 ///
-/// A family that admits one or two resolves one lane at configured
-/// concurrency one: an idle second lane would cost memory for nothing.
-pub fn resolve(family: &dyn super::Family, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
+/// A family that admits one or two resolves its layout default (`rtx_gpus`),
+/// promotes an unspecified default to two lanes when `concurrency` exceeds one
+/// lane's member cap (`V41_MAX_LANE_MEMBERS` = 32), honors an explicit override
+/// (`requested`), and resolves one lane at configured concurrency one: an idle
+/// second lane would cost memory for nothing.
+pub fn resolve(family: &dyn super::Family, requested: Option<u8>, concurrency: u64, rtx_gpus: usize) -> Result<u8, PlanError> {
     let support = family.decode_lanes();
-    let lanes = requested.unwrap_or(support.default_lanes());
+    let default = match support {
+        LaneSupport::One { .. } => 1,
+        LaneSupport::OneOrTwo { .. } if concurrency > cuteafd_core::V41_MAX_LANE_MEMBERS as u64 => MAX_DECODE_LANES,
+        LaneSupport::OneOrTwo { .. } => support.default_lanes(rtx_gpus),
+    };
+    let lanes = requested.unwrap_or(default);
     if !(1..=MAX_DECODE_LANES).contains(&lanes) {
         return Err(PlanError::InvalidOption { option: "--decode-lanes", reason: "must be 1 or 2".into() });
     }
@@ -72,31 +84,39 @@ mod tests {
     #[test]
     fn every_family_resolves_its_default_and_refuses_what_it_cannot_run() {
         for family in super::super::family::registry() {
-            let default = family.decode_lanes().default_lanes();
-            assert_eq!(resolve(*family, None, 16).unwrap(), default, "{}", family.id());
-            for lanes in [1, 2] {
-                let supported = match family.decode_lanes() {
-                    LaneSupport::One { .. } => lanes == 1,
-                    LaneSupport::OneOrTwo { .. } => true,
-                };
-                let result = resolve(*family, Some(lanes), 16);
-                if supported { assert_eq!(result.unwrap(), lanes); } else {
-                    assert!(matches!(result, Err(PlanError::UnsupportedOption { option: "--decode-lanes", value, .. })
-                        if value == lanes), "{} {lanes}", family.id());
+            for rtx_gpus in [1usize, 2] {
+                let default = family.decode_lanes().default_lanes(rtx_gpus);
+                assert_eq!(resolve(*family, None, 16, rtx_gpus).unwrap(), default, "{} {rtx_gpus}xRTX", family.id());
+                for lanes in [1, 2] {
+                    let supported = match family.decode_lanes() {
+                        LaneSupport::One { .. } => lanes == 1,
+                        LaneSupport::OneOrTwo { .. } => true,
+                    };
+                    let result = resolve(*family, Some(lanes), 16, rtx_gpus);
+                    if supported { assert_eq!(result.unwrap(), lanes); } else {
+                        assert!(matches!(result, Err(PlanError::UnsupportedOption { option: "--decode-lanes", value, .. })
+                            if value == lanes), "{} {lanes}", family.id());
+                    }
+                }
+                for lanes in [0, 3, 255] {
+                    assert!(matches!(resolve(*family, Some(lanes), 16, rtx_gpus), Err(PlanError::InvalidOption { .. })));
                 }
             }
-            for lanes in [0, 3, 255] {
-                assert!(matches!(resolve(*family, Some(lanes), 16), Err(PlanError::InvalidOption { .. })));
-            }
         }
-        // V4.1 runs one or two lanes, two by default, and one at concurrency one
-        // (an idle second lane would hold workspaces, graphs and a Spark
-        // decode execution for nothing).
+        // V4.1 runs one or two lanes: 1 lane by default on 1×RTX, 2 lanes by default
+        // on 2×RTX, explicit 1|2 override on either layout, and 1 at concurrency one
+        // (an idle second lane would hold workspaces, graphs and a Spark decode execution for nothing).
         let v41 = &crate::plan::families::deepseek::DEEPSEEK_V41;
-        assert_eq!(super::super::Family::decode_lanes(v41), LaneSupport::OneOrTwo { default: 2 });
-        for (requested, concurrency, expected) in [(None, 16, 2), (Some(2), 16, 2), (Some(1), 16, 1),
-            (None, 1, 1), (Some(2), 1, 1), (Some(1), 1, 1), (Some(1), 32, 1)] {
-            assert_eq!(resolve(v41, requested, concurrency).unwrap(), expected, "{requested:?} C{concurrency}");
+        assert_eq!(super::super::Family::decode_lanes(v41), LaneSupport::OneOrTwo { single_rtx: 1, dual_rtx: 2 });
+        for (rtx_gpus, requested, concurrency, expected) in [
+            (1, None, 16, 1), (1, Some(1), 16, 1), (1, Some(2), 16, 2),
+            (1, None, 1, 1), (1, Some(2), 1, 1), (1, None, 32, 1), (1, Some(1), 32, 1),
+            (1, None, 33, 2), (1, None, 64, 2),
+            (2, None, 16, 2), (2, Some(2), 16, 2), (2, Some(1), 16, 1),
+            (2, None, 1, 1), (2, Some(2), 1, 1), (2, Some(1), 1, 1), (2, Some(1), 32, 1),
+        ] {
+            assert_eq!(resolve(v41, requested, concurrency, rtx_gpus).unwrap(), expected,
+                "{rtx_gpus}xRTX {requested:?} C{concurrency}");
         }
     }
 
@@ -106,7 +126,7 @@ mod tests {
             let family = crate::plan::spark_executions::descriptor(id).unwrap();
             let LaneSupport::One { reason } = family.decode_lanes() else { panic!("{id} is not One") };
             assert!(reason != DRAFTER && reason.contains("#744"), "{id}: {reason}");
-            assert!(matches!(resolve(family, Some(2), 16),
+            assert!(matches!(resolve(family, Some(2), 16, 2),
                 Err(PlanError::UnsupportedOption { reason: refused, .. }) if refused == reason), "{id}");
         }
     }

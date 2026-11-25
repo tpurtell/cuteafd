@@ -349,6 +349,9 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
     configured!(concurrency, "CONCURRENCY");
     configured!(draft_context_window, "DRAFT_CONTEXT_WINDOW");
     configured!(prefill_waves, "PREFILL_WAVES");
+    if args.decode_lanes.is_none() {
+        args.decode_lanes = get("DECODE_LANES").map(|v| v.parse().context("DECODE_LANES")).transpose()?;
+    }
     if !args.explicit_settings.contains("decode_rows") {
         if let Some(value) = get("DECODE_ROWS") {
             args.decode_rows = value.parse()

@@ -932,7 +932,7 @@ mod tests {
                 items: vec![], kv_tokens: 0 };
             let exports = crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?.exports();
             for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (256, 3)] {
-                let executions = crate::plan::spark_executions::admit_family("deepseek_v41", &exports, None, unit, waves)?;
+                let executions = crate::plan::spark_executions::admit_family_lanes("deepseek_v41", &exports, None, unit, waves, 2)?;
                 assert_eq!(executions.decode.len(), 2);
                 let bytes = owner_bytes(&input, &working, "deepseek_v41", 0)?;
                 let prefill = bytes(executions.owners().last().unwrap())?;

@@ -1144,7 +1144,7 @@ fn v41_full_concurrency_launcher_admission_at_the_native_draft_block() {
             let sms = crate::placement::ArchContext::for_device("sm_120", 96 << 30).sms;
             let programs = crate::placement::families::deepseek_v41::owners::NativePrograms::new(&manifest, sms).unwrap();
             let expected = programs.dspark(&experts, 4096,
-                crate::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS, concurrency, 2, 7, gpus,
+                crate::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS, concurrency, u64::from(report.decode_lanes), 7, gpus,
                 crate::placement::families::deepseek_v41::resident::Fp8Head::Packed).unwrap();
             for owner in expected.iter().filter(|owner| owner.group == "dSpark request lanes") {
                 let actual: u64 = memory.devices[usize::from(owner.gpu)].items.iter()
@@ -1196,6 +1196,79 @@ fn v41_one_decode_lane_charges_one_lane_and_returns_the_rest_to_kv() {
     for lanes in [None, Some(1), Some(2)] {
         assert_eq!(plan(lanes, 1).decode_lanes, 1);
     }
+}
+
+/// V4.1 default decode lanes follow the coordinator RTX count: 1×RTX resolves
+/// to 1 lane, 2×RTX resolves to 2 lanes (at DECODE_ROWS=64), with explicit
+/// 1|2 overrides on either layout, 1 lane at C1, and plan/admission/graph
+/// reserve all following the resolved lane count.
+#[test]
+fn v41_default_decode_lanes_follows_rtx_count() {
+    let dir = strict_v41_snapshot(false);
+    let input = PlanInput::open(dir.path()).unwrap();
+    let plan = |gpus: usize, lanes: Option<u8>, concurrency: u64| {
+        let sparks = if gpus == 1 { 3 } else { 6 };
+        let mut options = wave_plan_options(dir.path(), sparks);
+        options.decode_lanes = lanes;
+        let layout = options.layout.as_mut().unwrap();
+        layout.rtx_bytes = vec![96 << 30; gpus];
+        layout.concurrency = concurrency;
+        layout.context_tokens = 262_144;
+        layout.pool_tokens = None;
+        layout.workspace_manifest = v41_workspace(dir.path());
+        layout.native_mtp_layers = 3;
+        input.plan_spark_count(&options, sparks, Some(sparks)).unwrap()
+    };
+    let graph_bytes = |report: &PlanReport, gpu: usize| -> u64 {
+        report.memory_layout.as_ref().unwrap().devices.iter()
+            .find(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx && d.index == gpu as u32)
+            .unwrap().items.iter()
+            .find(|i| i.group.starts_with("graph reserve")).unwrap().bytes
+    };
+    let lane_bytes = |report: &PlanReport, prefix: &str| -> u64 {
+        report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+            .flat_map(|d| &d.items).filter(|i| i.group.starts_with(prefix)).map(|i| i.bytes).sum()
+    };
+
+    // 1×RTX defaults to 1 lane (64 verify rows), charges no lane-1 owners, and uses 1-lane graph reserve.
+    let min_default = plan(1, None, 16);
+    assert!(min_default.fits, "{}", render(&min_default));
+    assert_eq!(min_default.decode_lanes, 1);
+    assert_eq!(min_default.decode_rows, 64);
+    assert!(render(&min_default).contains("decode     1 lane(s), 64 verify rows"));
+    assert_eq!(lane_bytes(&min_default, "lane 1 "), 0);
+    assert_eq!(graph_bytes(&min_default, 0),
+        crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 1).unwrap().bytes);
+
+    // Explicit DECODE_LANES=2 override works on 1×RTX and scales reserve & lane owners up.
+    let min_two = plan(1, Some(2), 16);
+    assert!(min_two.fits, "{}", render(&min_two));
+    assert_eq!(min_two.decode_lanes, 2);
+    assert!(lane_bytes(&min_two, "lane 1 ") > 0);
+    assert_eq!(graph_bytes(&min_two, 0),
+        crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 2).unwrap().bytes);
+    assert!(graph_bytes(&min_two, 0) > graph_bytes(&min_default, 0));
+
+    // 2×RTX defaults to 2 lanes (64 verify rows), charges lane-1 owners, and uses 2-lane graph reserve.
+    let max_default = plan(2, None, 16);
+    assert!(max_default.fits, "{}", render(&max_default));
+    assert_eq!(max_default.decode_lanes, 2);
+    assert_eq!(max_default.decode_rows, 64);
+    assert!(render(&max_default).contains("decode     2 lane(s), 64 verify rows"));
+    assert!(lane_bytes(&max_default, "lane 1 ") > 0);
+    for gpu in [0usize, 1] {
+        assert_eq!(graph_bytes(&max_default, gpu),
+            crate::placement::families::deepseek_v41::admission::graph_allowance(2, gpu, 2).unwrap().bytes);
+    }
+
+    // Explicit DECODE_LANES=1 override works on 2×RTX; C1 always resolves to 1 lane on both layouts.
+    let max_one = plan(2, Some(1), 16);
+    assert_eq!(max_one.decode_lanes, 1);
+    assert_eq!(lane_bytes(&max_one, "lane 1 "), 0);
+    assert_eq!(plan(1, Some(2), 1).decode_lanes, 1);
+    assert_eq!(plan(2, None, 1).decode_lanes, 1);
+    assert_eq!(plan(2, Some(2), 1).decode_lanes, 1);
 }
 
 /// V4.1 `DECODE_ROWS`: `auto` resolves 64; 128 and 256 grow decode-lane and Spark
@@ -5540,7 +5613,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     // original E4M3-relative and graph-relative headroom, not a real-card claim.
     let source = 129280 * 5120 * 2;
     let head_delta = Fp8Head::configured().resident(source).0 - Fp8Head::All.resident(source).0;
-    let graph_reserve = crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 2).unwrap().bytes;
+    let graph_reserve = crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 1).unwrap().bytes;
     let layout = layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
         drafter_bytes: (4 << 30) - head_delta + 1_048_576_000 - graph_reserve, prefill_rows: 0, ..Default::default() };

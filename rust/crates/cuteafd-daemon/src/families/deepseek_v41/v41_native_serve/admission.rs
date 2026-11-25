@@ -39,7 +39,7 @@ pub(super) fn plan_sparks(args: &crate::cli::NativeServeArgs,
     let slots = super::AdmittedPrefill::resolve(args)?.waves;
     spark_admission(&cuteafd_loader::plan::checkpoint::CheckpointView::select(
         &args.snapshot, cuteafd_loader::plan::checkpoint::CoreView::Original)?, catalog, local_layers, args.peers.len(), capacity, slots,
-        args.decode_lanes, args.resolved_decode_rows()).map(Some)
+        args.resolved_decode_lanes(), args.resolved_decode_rows()).map(Some)
 }
 
 /// The Spark admission for `ranks` workers serving layers `local_layers..`,
@@ -299,7 +299,7 @@ pub(super) fn admit_startup(
     // Every owner serve allocates: the resolved decode lanes, the prefill slots' storage.
     let shape = super::AdmittedPrefill::resolve(args)?;
     let passes = shape.waves;
-    let lanes = args.decode_lanes;
+    let lanes = args.resolved_decode_lanes();
     let decode_rows = args.resolved_decode_rows();
     let mut target = programs.target(u64::from(decode_rows), lanes, shape.reserve_rows() as u64,
         u64::from(capacity), ranks, passes, u64::from(args.concurrency),
@@ -521,7 +521,7 @@ pub(super) fn local_workspace(
     let slots = super::AdmittedPrefill::resolve(args)?.waves;
     let decode_cap = super::decode_expert_capacity(args.resolved_decode_rows())?;
     Ok((lane(rows)?.checked_mul(slots).context("local serving lanes overflow")?
-        + usize::from(args.decode_lanes) * lane(decode_cap)?) as u64)
+        + usize::from(args.resolved_decode_lanes()) * lane(decode_cap)?) as u64)
 }
 
 /// With `draft`, the sample must precede all draft weights, runtime buffers and
@@ -633,7 +633,7 @@ pub(super) fn resolve_with_owners(
     // or replaces the configured reserve.
     let mut allowances = Vec::new();
     for gpu in 0..memory.len() {
-        allowances.push(admission::graph_allowance(memory.len(), gpu, args.decode_lanes)?);
+        allowances.push(admission::graph_allowance(memory.len(), gpu, args.resolved_decode_lanes())?);
     }
     let mut retained = owners.iter().map(Owner::from_demand).collect::<Vec<_>>();
     for (gpu, &bytes) in deferred.iter().enumerate().filter(|(_, &bytes)| bytes > 0) {
@@ -656,7 +656,7 @@ pub(super) fn resolve_with_owners(
     let catalog = cuteafd_loader::read_expert_catalog(&args.snapshot)?;
     let host = admission::HostFacts::prepare(&config,
         &catalog.tensors().iter().map(|tensor| &tensor.metadata).collect::<Vec<_>>(),
-        prefill, args.decode_lanes, ranks, args.peers.len(), context, args.concurrency as u64,
+        prefill, args.resolved_decode_lanes(), ranks, args.peers.len(), context, args.concurrency as u64,
         args.dspark, match args.prefix.host_cache_bytes { crate::shared::prefix::HostBudget::Auto => None,
             crate::shared::prefix::HostBudget::Bytes(bytes) => Some(bytes) },
         args.prefix.host_cache_bytes.enabled() && args.resolved_prefix_entries() > 0,
@@ -1480,7 +1480,7 @@ mod admission_tests {
             }
             assert_eq!(admitted.placement.pool_tokens, args.pool_tokens.unwrap());
             assert_eq!(admitted.reservation_bytes, vec![total; ranks]);
-            let graph_reserves = (0..ranks).map(|rank| graph_reserve_bytes(ranks, rank, args.decode_lanes)).collect::<Result<Vec<_>>>()?;
+            let graph_reserves = (0..ranks).map(|rank| graph_reserve_bytes(ranks, rank, args.resolved_decode_lanes())).collect::<Result<Vec<_>>>()?;
             let exact = admitted
                 .cache_bytes
                 .iter()

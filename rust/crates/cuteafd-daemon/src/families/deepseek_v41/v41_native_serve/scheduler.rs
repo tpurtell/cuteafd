@@ -899,7 +899,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         ensure!(native_coordinator_exact_cap(&manifest)? == NATIVE_COORDINATOR_EXACT_CAP,
             "native coordinator exact cap differs from validated inventory");
     }
-    let lanes = args.decode_lanes;
+    let lanes = args.resolved_decode_lanes();
     ensure!(second.is_some() == (lanes > 1) && second_transport.is_some() == (lanes > 1),
         "V4.1 serve owners differ from the {lanes} resolved decode lane(s)");
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
