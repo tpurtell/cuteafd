@@ -557,7 +557,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         if let Some(draft) = &mut draft { draft.get_mut().visit_graph_banks(f)?; }
         Ok(())
     };
-    crate::families::deepseek_v41::graph_policy::attach(&lib, 2, &mut visit)?;
+    crate::families::deepseek_v41::graph_policy::attach(&lib, 2, lanes, &mut visit)?;
     unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
         crate::shared::decode_graph::device::observe_completed(&lib, &mut visit) }?;
     drop(visit);
