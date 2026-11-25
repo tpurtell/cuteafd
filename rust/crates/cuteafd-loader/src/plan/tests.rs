@@ -2830,14 +2830,18 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
     assert!(crate::placement::families::glm5_flash::expert_workspace(&mul1_catalog,
         Some(&share.join("PROGRAMS.json")), 1, 1).is_ok());
 
-    // Dense core remains MCG-only for GLM (no dense feature/schema drift).
-    let mut mul1_dense = mul1_tensors;
-    mul1_dense.retain(|(name, ..)| !name.starts_with("model.language_model.layers.0.mlp.gate_proj."));
-    let mut dense_proj = exl3("model.language_model.layers.0.mlp.gate_proj", 12288, 4096, 6);
-    dense_proj[3].0 = "model.language_model.layers.0.mlp.gate_proj.mul1".into();
-    mul1_dense.extend(dense_proj);
-    let dense_report = plan(snapshot(config, &mul1_dense).path(), &quant_options(4)).unwrap();
-    assert_eq!(component(&dense_report, Component::DenseFfn).status, Status::MissingKernel);
+    // Native trellis dense core supports MUL1 (K6 and K8) as well as MCG for GLM Flash.
+    for dense_bits in [6usize, 8] {
+        let mut mul1_dense = mul1_tensors.clone();
+        mul1_dense.retain(|(name, ..)| !name.starts_with("model.language_model.layers.0.mlp.gate_proj."));
+        let mut dense_proj = exl3("model.language_model.layers.0.mlp.gate_proj", 12288, 4096, dense_bits);
+        dense_proj[3].0 = "model.language_model.layers.0.mlp.gate_proj.mul1".into();
+        mul1_dense.extend(dense_proj);
+        let mut mul1_cfg = config.clone();
+        mul1_cfg["quantization_config"]["codebook"] = json!("mul1");
+        let dense_report = plan(snapshot(mul1_cfg, &mul1_dense).path(), &quant_options(4)).unwrap();
+        assert_eq!(component(&dense_report, Component::DenseFfn).status, Status::Ready, "{}", render(&dense_report));
+    }
 }
 
 #[test]

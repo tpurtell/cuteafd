@@ -188,6 +188,11 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k8-compact-max/card.svg"><img src="benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k4-mc-2rtx-glmf-mc-k8-compact-max/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC on 2× RTX PRO 6000 @ gpu-powerd 445/380 W (325–450)"></a><br><sub>2× RTX</sub></td>
 </tr>
 <tr>
+<td width="19%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1</sub><br><sub>exl3-k4</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-1rtx-2spark-glmf-mc-mul1-original-min/card.svg"><img src="benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-1rtx-2spark-glmf-mc-mul1-original-min/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1 on 1× RTX PRO 6000 @ gpu-powerd 435 W (425–600) + 2× DGX Spark"></a><br><sub>1× RTX + 2× Spark</sub></td>
+<td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-2rtx-glmf-mc-mul1-original-max/card.svg"><img src="benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-2rtx-glmf-mc-mul1-original-max/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1 on 2× RTX PRO 6000 @ gpu-powerd 420/425 W (250–525)"></a><br><sub>2× RTX</sub></td>
+</tr>
+<tr>
 <td width="19%" valign="top"><a href="docs/models/glm5_flash.md"><b>GLM 5.3 Flash</b></a><br><sub>wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC</sub><br><sub>exl3-k3+exl3-k4</sub></td>
 <td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact)</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k3-25-mc-2rtx-glmf-k325-mc-k8-compact-max/card.svg"><img src="benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k3-25-mc-2rtx-glmf-k325-mc-k8-compact-max/card.svg" alt="wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC on 2× RTX PRO 6000 @ gpu-powerd 440/390 W (335–450)"></a><br><sub>2× RTX</sub></td>

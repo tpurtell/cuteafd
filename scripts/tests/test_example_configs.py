@@ -25,6 +25,7 @@ STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)(?:-(?:fp8|n
 ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-{size}.config" for size in ("min", "max")}
 NEW_PUBLICATIONS = {f"{model}-{size}.config" for model in
                     ("mistral-large4-exl3-k4", "glm53-flash-exl3-k4-mc",
+                     "glm53-flash-exl3-k4-mc-mul1",
                      "glm53-flash-exl3-k325-mc",
                      "glm53-exl3-k4-mc", "step5-exl3-k4-mc", "muse-spark-exl3-k4-mc") for size in ("min", "max")}
 QUALIFICATION = {"inkling2-mxfp8-min.config", "inkling2-mxfp8-max.config",
@@ -74,6 +75,7 @@ CHECKPOINTS = {
     "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6": {**GLMF, "quantization_config": {
         "quant_method": "exl3", "bits": 4.0, "core_bits": 6.0, "head_bits": 6.0, "mtp_bits": 4.0}},
     "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC": {**GLMF, "quantization_config": {"quant_method": "exl3"}},
+    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1": {**GLMF, "quantization_config": {"quant_method": "exl3", "codebook": "mul1"}},
     "nvidia/GLM-5.3-Flash-NVFP4": GLMF,
     "XiaomiMiMo/MiMo-V2.6-Flash-MOPD": {**MIMO, "hidden_size": 4096},
     "XiaomiMiMo/MiMo-V2.6-Pro-MOPD": {**MIMO, "hidden_size": 6144},
@@ -820,6 +822,8 @@ def test_v7_release_cards_match_live_and_retired_inventory():
             for e in v6["entries"] if e["name"] not in V7_RETIREMENTS}
     assert cards == kept | {("hy4_flash", HY4_MC, 1, n) for n in (1, 4)} | {
         ("inkling2_mini", "thinkingmachines/Inkling-2-Mini", 1, 0),
+        ("glm5_flash", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1", 1, 2),
+        ("glm5_flash", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1", 2, 0),
     }
     primary = {(f, m, g) for f, m, g, n in cards if m != HY4_MC or n == 0}
     assert primary == {(row["family"], row["checkpoint"], g) for row in published["cells"]
@@ -1056,6 +1060,8 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         assert values["SPARK_COUNT"] == ("5" if minimum else "6")
         assert values["RTX_GPUS"] == ("1" if minimum else "2")
         assert values["SPECULATOR"] == "dspark" and values["POOL_TOKENS"] == "auto"
+    elif name.startswith("glm53-flash-exl3-k4-mc-mul1-"):
+        expected = keys(EXAMPLES / name.replace("k4-mc-mul1-", "k4-mc-"))
     elif name.startswith("glm53-flash-exl3-k325-mc-"):
         expected = keys(EXAMPLES / name.replace("k325-mc-", "k4-mc-"))
     elif name.startswith("glm53-exl3-k4-mc-"):
@@ -1071,6 +1077,8 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k4-mc-k6-"))
     publication = next((model, revision, doc) for stem, model, revision, doc in [
         ("mistral-", "Mistral-Large-4-EXL3-K4", "9c354cee78cd6feddb057549b8edde6e3b319822", "mistral_large4"),
+        ("glm53-flash-exl3-k4-mc-mul1-", "GLM-5.3-Flash-EXL3-K4-MC-MUL1",
+         "1bca67feffab2747e0e489e571185bc06336ee26", "glm5_flash"),
         ("glm53-flash-exl3-k325-mc-", "GLM-5.3-Flash-EXL3-K3.25-MC",
          "83da6981e57e110fd1ba166e0a989c411e4289b6", "glm5_flash"),
         ("glm53-flash-", "GLM-5.3-Flash-EXL3-K4-MC", "558931fe149f59b49d19b2376a692bd7a12fb8b7", "glm5_flash"),
