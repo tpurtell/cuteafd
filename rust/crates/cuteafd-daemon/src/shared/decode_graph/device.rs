@@ -1009,7 +1009,6 @@ impl LaneCycles {
         let clocks = devices.iter().filter_map(|&device| existing_cache(device))
             .map(|cache| {
                 let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-                cache.concurrent_cycles = concurrent_cycles as u64;
                 cache.lane_max_cycles[lane] = concurrent_cycles as u64;
                 HIT_EPOCHS.with(|epochs| { epochs.borrow_mut().insert(cache.device,
                     cache.clocks.as_ref().each_ref().map(|clock| clock.index.load(Ordering::Acquire))); });
@@ -1111,7 +1110,6 @@ pub(crate) struct DeviceCache {
     reuse_captures: HashSet<u64>,
     selected_epochs: HashMap<u64, [u64; 2]>,
     pending_lanes: [usize; 2],
-    concurrent_cycles: u64,
     donor_always: bool,
     donor_cold_lag: u64,
     lane_max_cycles: [u64; 2],
@@ -1174,7 +1172,7 @@ impl DeviceCache {
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
             chain_only: true, unmeasured: false, pending_destroy: 0, cycle_demand_nodes: 0,
             bank_lanes: HashMap::new(), lanes: std::array::from_fn(|_| LaneEpoch::default()), clocks: Arc::new(std::array::from_fn(|_| EpochClock::default())),
-            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, donor_always: super::donor_always(), donor_cold_lag: super::donor_cold_lag(), lane_max_cycles: [1; 2], site_lanes: HashMap::new(), update_sites: Default::default(), native_graphs: HashMap::new(), bank_native: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
+            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], donor_always: super::donor_always(), donor_cold_lag: super::donor_cold_lag(), lane_max_cycles: [1; 2], site_lanes: HashMap::new(), update_sites: Default::default(), native_graphs: HashMap::new(), bank_native: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
             observer: GrowthObserver::default(), memory_query: None, launch_query: None, captured_since_observation: false,
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
@@ -1599,10 +1597,18 @@ impl DeviceCache {
     #[cfg(test)]
     pub(super) fn mark_victim(&mut self, _frequent_ghost: bool) -> Option<u64> { self.select_victim(None) }
 
-    fn hot(&self, record: &Record) -> bool {
+    /// Shared eviction and donor safety floor. Event-enabled caches also
+    /// require proof that the last use completed; others use cycle age alone.
+    fn cold_age(&self, record: &Record) -> Option<u64> {
+        let used = record.used()?;
         let lane = self.bank_lane(record.identity.bank);
-        record.used().is_some_and(|used| used > self.lanes[lane].index.saturating_sub(self.concurrent_cycles)
-            || (self.lanes[lane].index < self.concurrent_cycles && used == 0))
+        if self.event_completion && used > self.lanes[lane].completed { return None }
+        let age = self.lanes[lane].index.saturating_sub(used);
+        (age > self.lane_max_cycles[lane]).then_some(age)
+    }
+
+    fn hot(&self, record: &Record) -> bool {
+        self.cold_age(record).is_none()
     }
 
     fn select_victim(&mut self, excluded: Option<u64>) -> Option<u64> {
@@ -1763,10 +1769,8 @@ impl DeviceCache {
             record.spans_devices ||
             !matches!(record.list, Some(List::Recent | List::Frequent)) ||
             !self.native_graphs.contains_key(&id) { return None }
+        let age = self.cold_age(record)?;
         let lane = self.bank_lane(record.identity.bank);
-        let used = record.used()?;
-        if self.event_completion && used > self.lanes[lane].completed { return None }
-        let age = self.lanes[lane].index.saturating_sub(used);
         // Pressure keeps the safety floor K; optional extra lag only protects
         // reusable shapes while donor-always is operating below the soft cap.
         let lag = if self.donor_always && self.charged < self.soft.limit && self.charged < self.reserve {
@@ -3053,6 +3057,7 @@ mod tests {
                         cache.lane_max_cycles[0] = k;
                         cache.soft.limit = if pressure { cache.charged } else { 500 };
                         let eligible = age > k + if pressure { 0 } else { lag };
+                        assert_eq!(cache.hot(&cache.records[&donor]), age <= k);
                         assert_eq!(cache.cold_donor(&[3, 7, 11]), eligible.then_some(donor));
                         let ticket = cache.update_ticket(key(2), site(Preference::Capture), None, false);
                         assert_eq!(ticket.is_some(), eligible, "K={k}, lag={lag}, age={age}, pressure={pressure}");
@@ -3321,7 +3326,7 @@ mod tests {
     }
 
     #[test]
-    fn soft_hot_donor_falls_back_to_existing_eviction() {
+    fn soft_hot_donor_runs_eager_without_evicting_protected_graph() {
         let (mut cache, donor) = aged_update_fixture(1, false);
         cache.soft.measured_bytes = Some(10);
         cache.soft.measured_nodes = Some(10);
@@ -3330,7 +3335,8 @@ mod tests {
         let id = update_request(&mut cache, key(2));
         assert_eq!(cache.finish_update(id, |_| panic!(), |_| panic!(), |_| panic!()), None);
         assert!(matches!(cache.fallback_update(id), Miss::Eager));
-        assert!(cache.records[&donor].pending_destroy);
+        assert!(!cache.records[&donor].pending_destroy, "age-K hot donor must not be evicted on fallback");
+        assert_eq!(cache.pending_destroy, 0);
         assert_eq!(cache.counters[&Cycle::Decode].updates_soft, 0);
         assert_eq!(cache.counters[&Cycle::Decode].no_cold_donor_soft, 1);
     }
@@ -3543,7 +3549,7 @@ mod tests {
     fn hot_stamp_without_thread_mirror_uses_locked_owner_epoch() {
         std::thread::spawn(|| {
             let mut cache = epoch_fixture();
-            cache.concurrent_cycles = 2;
+            cache.lane_max_cycles[0] = 2;
             cache.begin_lane(0);
             let id = *cache.records.keys().next().unwrap();
             HIT_EPOCHS.with(|epochs| { epochs.borrow_mut().remove(&cache.device); });
@@ -3565,26 +3571,120 @@ mod tests {
     fn hot_entries_are_not_selected_inside_k1_or_k2_lag_window() {
         for k in [1, 2] {
             let mut cache = epoch_fixture();
-            cache.concurrent_cycles = k;
+            cache.lane_max_cycles[0] = k;
             cache.begin_lane(0);
             let ids: Vec<_> = cache.records.keys().copied().collect();
             for &id in &ids { cache.hit(id); }
             assert!(cache.select_victim(None).is_none());
             cache.complete_lane(0);
-            for _ in 1..k {
+            for _ in 0..k {
                 cache.begin_lane(0);
-                assert!(cache.select_victim(None).is_none());
+                assert!(cache.select_victim(None).is_none(), "age <= K must stay protected");
                 cache.complete_lane(0);
             }
             cache.begin_lane(0);
-            assert!(cache.select_victim(None).is_some(), "exactly K elapsed cycles closes the guard");
+            assert!(cache.select_victim(None).is_some(), "K+1 elapsed cycles closes the guard");
+        }
+    }
+
+    #[test]
+    fn hot_and_donor_share_lane_max_cycles_threshold() {
+        for event_completion in [false, true] {
+            for k in [1, 2] {
+                let (mut cache, donor) = aged_update_fixture(k, false);
+                cache.event_completion = event_completion;
+                cache.lane_max_cycles[0] = k;
+                assert!(cache.hot(&cache.records[&donor]));
+                assert!(cache.select_victim(None).is_none());
+                assert!(cache.donor_age(donor).is_none());
+                assert!(cache.cold_donor(&[3, 7, 11]).is_none());
+                cache.begin_lane(0);
+                cache.complete_lane(0);
+                assert!(!cache.hot(&cache.records[&donor]));
+                assert_eq!(cache.donor_age(donor), Some(k + 1));
+                assert_eq!(cache.cold_donor(&[3, 7, 11]), Some(donor));
+                assert_eq!(cache.select_victim(None), Some(donor));
+            }
+        }
+    }
+
+    #[test]
+    fn uncompleted_old_graph_is_protected_only_with_event_completion() {
+        for event_completion in [false, true] {
+            let (mut cache, donor) = aged_update_fixture(2, false);
+            cache.event_completion = event_completion;
+            let used = cache.records[&donor].used().unwrap();
+            cache.clocks[0].completed.store(used - 1, Ordering::Release);
+            cache.refresh_cycles();
+            assert_eq!(cache.hot(&cache.records[&donor]), event_completion);
+            assert_eq!(cache.donor_age(donor), (!event_completion).then_some(2));
+            assert_eq!(cache.cold_donor(&[3, 7, 11]), (!event_completion).then_some(donor));
+            if event_completion {
+                assert!(cache.select_victim(None).is_none());
+                cache.clocks[0].completed.store(used, Ordering::Release);
+                cache.refresh_cycles();
+                assert!(!cache.hot(&cache.records[&donor]));
+                assert_eq!(cache.donor_age(donor), Some(2));
+                assert_eq!(cache.cold_donor(&[3, 7, 11]), Some(donor));
+            }
+            assert_eq!(cache.select_victim(None), Some(donor));
+        }
+    }
+
+    #[test]
+    fn two_lane_hot_and_donor_use_each_lanes_own_max_cycles() {
+        let mut cache = test_cache(-1035, 1000);
+        cache.lane_max_cycles = [1, 2];
+        cache.assign_bank_lane(1, 0);
+        cache.assign_bank_lane(2, 1);
+        let id0 = capture(&mut cache, 1, false);
+        let key_lane1 = Identity { bank: 2, site: "test", key: 2, shape: "2".into() };
+        let Miss::Capture(id1) = cache.miss(key_lane1, site(Preference::Capture), None, false) else { panic!() };
+        cache.measured_capture(10);
+        cache.soft.limit = 20;
+        cache.charged = 20;
+        cache.event_completion = true;
+        for (id, lane, native, signature) in [(id0, 0, 101, vec![3, 7, 11]), (id1, 1, 102, vec![3, 7, 12])] {
+            cache.records.get_mut(&id).unwrap().last_used = Some(cache.lanes[lane].index);
+            cache.register_native(id, native, signature);
+            for _ in 0..2 { cache.begin_lane(lane); cache.complete_lane(lane); }
+        }
+        assert!(!cache.hot(&cache.records[&id0]) && cache.donor_age(id0) == Some(2));
+        assert!(cache.hot(&cache.records[&id1]) && cache.donor_age(id1).is_none());
+        assert_eq!(cache.cold_donor(&[3, 7, 11]), Some(id0));
+        assert!(cache.cold_donor(&[3, 7, 12]).is_none());
+        assert_eq!(cache.select_victim(Some(id0)), None);
+        assert_eq!(cache.select_victim(None), Some(id0));
+        cache.begin_lane(1); cache.complete_lane(1);
+        assert!(!cache.hot(&cache.records[&id1]) && cache.donor_age(id1) == Some(3));
+        assert_eq!(cache.cold_donor(&[3, 7, 12]), Some(id1));
+        assert_eq!(cache.select_victim(None), Some(id1));
+    }
+
+    #[test]
+    fn soft_room_full_without_cold_candidates_runs_eager() {
+        for (age, event_completion) in [(1, false), (1, true), (2, true)] {
+            let (mut cache, donor) = aged_update_fixture(age, false);
+            cache.event_completion = event_completion;
+            if event_completion && age == 2 {
+                let used = cache.records[&donor].used().unwrap();
+                cache.clocks[0].completed.store(used - 1, Ordering::Release);
+                cache.refresh_cycles();
+            }
+            cache.captured_topology(donor, 10, 1, false);
+            cache.soft.measured_bytes = Some(10);
+            cache.soft.measured_nodes = Some(10);
+            assert_eq!(cache.make_soft_room(10, None), SoftRoom::Full);
+            assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+            assert_eq!(cache.pending_destroy, 0);
+            assert!(!cache.records[&donor].pending_destroy);
         }
     }
 
     #[test]
     fn hot_per_layer_workload_remains_cached_without_evictions() {
         let mut cache = epoch_fixture();
-        cache.concurrent_cycles = 2;
+        cache.lane_max_cycles[0] = 2;
         let ids: Vec<_> = cache.records.keys().copied().collect();
         for _ in 0..20 {
             cache.begin_lane(0);
@@ -3600,7 +3700,7 @@ mod tests {
     #[test]
     fn hot_over_cap_workload_runs_vampires_instead_of_evicting_layers() {
         let mut cache = epoch_fixture();
-        cache.concurrent_cycles = 2;
+        cache.lane_max_cycles[0] = 2;
         cache.begin_lane(0);
         let ids: Vec<_> = cache.records.keys().copied().collect();
         for &id in &ids { cache.hit(id); }

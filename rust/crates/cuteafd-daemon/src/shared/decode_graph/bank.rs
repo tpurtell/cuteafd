@@ -857,6 +857,9 @@ mod device_tests {
             banks[lane].cache_measured(10);
         }
         let cache = banks[0].device.as_ref().unwrap().cache.clone();
+        // Age both idle owners past K before starting the retirement test.
+        cache.lock().unwrap().serial_boundary();
+        cache.lock().unwrap().serial_boundary();
         // SAFETY: fixture owners contain counters, not captured allocations.
         for lane in 0..2 { unsafe { device::lane_cycle(lane, true,
             |visit| visit(-394, "bank-test", false, &mut banks[lane])) }?; }
