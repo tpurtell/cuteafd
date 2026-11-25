@@ -14,6 +14,7 @@ import _pinned_sparkinfer
 
 
 GROUPS = ("ihc", "engram", "attention", "indexer", "pointwise", "projections", "draft")
+HY4_GROUPS = ("ihc", "attention", "indexer", "pointwise", "projections", "draft")
 
 
 def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096, max_context: int = 262144):
@@ -224,9 +225,206 @@ def programs(tp: int, decode_rows: int, max_rows: int, max_context: int):
     ]
 
 
+def hy4_builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096, max_context: int = 1048576):
+    """Shared compiler definitions for Hy4 TP1 (hy4) and TP2 (hy42)."""
+    if tp not in (1, 2):
+        raise ValueError(f"Hy4 supports TP1 or TP2 coordinator shards, got tp={tp}")
+    dsa_heads = 64 // tp
+    dense_inter = 18432 // tp
+    shared_inter = 2048 // tp
+    pages = (max_context + 63) // 64
+
+    if group == "ihc":
+        from b12x.integration.cuteafd import hy4_ihc as ihc
+
+        return {
+            "ihc_pre": lambda: ihc.compile_hy4_ihc_pre_aot(ihc.HY4_IHC),
+            "ihc_post": lambda: ihc.compile_hy4_ihc_post_aot(ihc.HY4_IHC),
+            "ihc_post_pre": lambda: ihc.compile_hy4_ihc_post_pre_aot(ihc.HY4_IHC),
+            "hc_head": lambda: ihc.compile_hy4_hc_head_aot(ihc.HY4_IHC),
+        }
+
+    if group == "attention":
+        from b12x.integration.cuteafd import hy4_mla as mla
+
+        dsa_bf16 = mla.Hy4MlaGeometry(
+            heads=dsa_heads, q_lora_rank=2048, norm_eps=1e-6, window_size=None, kv_cache="bf16"
+        )
+        dsa_fp8 = mla.Hy4MlaGeometry(
+            heads=dsa_heads, q_lora_rank=2048, norm_eps=1e-6, window_size=None, kv_cache="fp8"
+        )
+        entries = {
+            "mla_rank_norm_pack_bf16": lambda: mla.compile_hy4_mla_rank_norm_pack_aot(dsa_bf16),
+            "mla_rank_norm_pack_fp8": lambda: mla.compile_hy4_mla_rank_norm_pack_aot(dsa_fp8),
+            "mla_q_absorb_dsa": lambda: mla.compile_hy4_mla_q_absorb_aot(dsa_bf16),
+            "mla_sink_gate_uv_dsa": lambda: mla.compile_hy4_mla_sink_gate_uv_aot(dsa_bf16),
+            "mla_dsa_decode_bf16": lambda: mla.compile_hy4_mla_attention_aot(
+                dsa_bf16, max_rows=max_rows, max_context=2048, mode="decode", page_size=1
+            ),
+            "mla_dsa_decode_fp8": lambda: mla.compile_hy4_mla_attention_aot(
+                dsa_fp8, max_rows=max_rows, max_context=2048, mode="decode", page_size=1
+            ),
+        }
+        if tp == 2:
+            from b12x.integration.cuteafd import context_split as cs
+
+            dsa64_bf16 = mla.Hy4MlaGeometry(
+                heads=64, q_lora_rank=2048, norm_eps=1e-6, window_size=None, kv_cache="bf16"
+            )
+            dsa64_fp8 = mla.Hy4MlaGeometry(
+                heads=64, q_lora_rank=2048, norm_eps=1e-6, window_size=None, kv_cache="fp8"
+            )
+            entries.update({
+                "mla_dsa_partial_bf16_h0": lambda: mla.compile_hy4_mla_dsa_partial_aot(
+                    dsa64_bf16, max_rows=max_rows, head_begin=0, head_count=32, num_splits=16, row_chunk_size=64
+                ),
+                "mla_dsa_partial_bf16_h32": lambda: mla.compile_hy4_mla_dsa_partial_aot(
+                    dsa64_bf16, max_rows=max_rows, head_begin=32, head_count=32, num_splits=16, row_chunk_size=64
+                ),
+                "mla_dsa_partial_fp8_h0": lambda: mla.compile_hy4_mla_dsa_partial_aot(
+                    dsa64_fp8, max_rows=max_rows, head_begin=0, head_count=32, num_splits=16, row_chunk_size=64
+                ),
+                "mla_dsa_partial_fp8_h32": lambda: mla.compile_hy4_mla_dsa_partial_aot(
+                    dsa64_fp8, max_rows=max_rows, head_begin=32, head_count=32, num_splits=16, row_chunk_size=64
+                ),
+                "lse_combine2": lambda: cs.compile_lse_combine2_aot(heads=32, has_sink=True),
+                "mla_gate_uv_dsa": lambda: mla.compile_hy4_mla_gate_uv_aot(dsa_bf16),
+            })
+        return entries
+
+    if group == "indexer":
+        from b12x.integration.cuteafd import GLM53, glm_indexer as glm_idx, hy4_indexer as idx
+
+        entries = {
+            "index_post": lambda: idx.compile_hy4_index_post_aot(idx.HY4_INDEXER),
+            "index_topk_decode": lambda: glm_idx.compile_glm_index_topk_aot(
+                GLM53, max_rows=decode_rows, max_pages=pages, mode="decode"
+            ),
+            "index_topk_prefill": lambda: glm_idx.compile_glm_index_topk_aot(
+                GLM53, max_rows=max_rows, max_pages=pages, mode="prefill"
+            ),
+        }
+        if tp == 2:
+            from b12x.integration.cuteafd import context_split as cs
+
+            entries.update({
+                "scored_index_topk_decode": lambda: cs.compile_scored_index_topk_aot(
+                    GLM53, max_rows=decode_rows, max_pages=pages, mode="decode"
+                ),
+                "scored_index_topk_prefill": lambda: cs.compile_scored_index_topk_aot(
+                    GLM53, max_rows=max_rows, max_pages=pages, mode="prefill"
+                ),
+                "dsa_candidate_merge": lambda: cs.compile_dsa_candidate_merge_aot(topk=2048, unit_rows=64),
+            })
+        return entries
+
+    import torch
+    from b12x.integration.cuteafd import pointwise as p
+
+    if group == "pointwise":
+        from b12x.integration.cuteafd.dsv4_ffn import compile_dsv4_expert_input_quant_aot
+
+        return {
+            "rms_norm_6144": lambda: p.compile_affine_norm_aot(
+                width=6144, eps=1e-5, input_dtype=torch.bfloat16, parameter_dtype=torch.bfloat16
+            ),
+            "route_weights": lambda: p.compile_route_weights_aot(
+                experts=256, topk=8, epsilon=1e-20, factor=2.827
+            ),
+            "expert_input_quant": lambda: compile_dsv4_expert_input_quant_aot(SimpleNamespace(hidden=6144)),
+            "post_silu_split_dense": lambda: p.compile_post_silu_split_aot(width=dense_inter, limit=1e30),
+            "post_silu_split_shared": lambda: p.compile_post_silu_split_aot(width=shared_inter, limit=1e30),
+        }
+
+    if group == "projections":
+        reduce_dtype = torch.bfloat16 if tp == 1 else torch.float32
+        shapes = {
+            "q_a": (6144, 2048, torch.bfloat16),
+            "kv_a": (6144, 576, torch.bfloat16),
+            "q_b_dsa": (2048, dsa_heads * 256, torch.bfloat16),
+            "linear_gate_dsa": (6144, dsa_heads * 256, torch.bfloat16),
+            "o_proj_dsa": (dsa_heads * 256, 6144, reduce_dtype),
+            "indexer_wq_b": (2048, 4096, torch.bfloat16),
+            "indexer_wk": (6144, 128, torch.bfloat16),
+            "indexer_weights": (6144, 32, torch.bfloat16),
+            "router": (6144, 256, torch.float32),
+            "dense_gate_up": (6144, dense_inter, torch.bfloat16),
+            "dense_down": (dense_inter, 6144, reduce_dtype),
+            "shared_gate_up": (6144, shared_inter, torch.bfloat16),
+            "shared_down": (shared_inter, 6144, reduce_dtype),
+        }
+        return {
+            name: (
+                lambda width=width, outputs=outputs, dtype=dtype: p.compile_bf16_projection_aot(
+                    width=width, outputs=outputs, output_dtype=dtype
+                )
+            )
+            for name, (width, outputs, dtype) in shapes.items()
+        }
+
+    if group == "draft":
+        from b12x.integration.cuteafd import hy4_mla as mla
+        from b12x.integration.cuteafd.context_split import compile_paged_staging_gather_aot
+
+        draft_inter = 18432 // tp
+        reduce_dtype = torch.bfloat16 if tp == 1 else torch.float32
+        draft = {
+            "draft_silu": lambda width=draft_inter: p.compile_post_silu_split_aot(width=width, limit=1e30),
+            "draft_proj_gate_up": lambda outputs=draft_inter: p.compile_bf16_projection_aot(
+                width=6144, outputs=outputs, output_dtype=torch.bfloat16
+            ),
+            "draft_proj_down": lambda width=draft_inter, dtype=reduce_dtype: p.compile_bf16_projection_aot(
+                width=width, outputs=6144, output_dtype=dtype
+            ),
+        }
+        for kv in ("bf16", "fp8"):
+            g = mla.Hy4MlaGeometry(
+                heads=dsa_heads, q_lora_rank=2048, norm_eps=1e-6, window_size=None, kv_cache=kv
+            )
+            draft[f"draft_attention_{kv}"] = lambda g=g: mla.compile_hy4_mla_attention_aot(
+                g, max_rows=7 * 64, max_context=2048 + 7, mode="decode", page_size=1
+            )
+            if tp == 1:
+                draft[f"draft_gather_{kv}"] = lambda g=g: compile_paged_staging_gather_aot(
+                    row_bytes=g.record_bytes, page_rows=1
+                )
+        if tp == 1:
+            draft["draft_gated_residual"] = lambda: p.compile_gated_residual_bf16_aot(width=6144)
+            draft["draft_correction_silu"] = lambda: p.compile_post_silu_split_aot(width=6144, limit=1e30)
+            for name, width, outputs in (
+                ("join", 12288, 6144),
+                ("correction_down", 6144, 6144),
+            ):
+                draft[f"draft_proj_{name}"] = lambda width=width, outputs=outputs: p.compile_bf16_projection_aot(
+                    width=width, outputs=outputs
+                )
+        return draft
+
+    raise ValueError(f"unknown Hy4 export group: {group}")
+
+
+def hy4_programs(tp: int, decode_rows: int, max_rows: int, max_context: int):
+    """Entries for the shared Programs dispatcher in export_b12x_dsv4_aot.py (Hy4)."""
+    def capacity(name):
+        if name.startswith("draft_"):
+            return 7 * 64
+        if name in ("index_topk_decode", "scored_index_topk_decode"):
+            return decode_rows
+        return max_rows
+
+    return [
+        (name, name, {"max_rows": capacity(name)}, build)
+        for group in HY4_GROUPS
+        for name, build in hy4_builders(
+            tp, group, decode_rows=decode_rows, max_rows=max_rows, max_context=max_context
+        ).items()
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--family", choices=("hy4f", "hy4"), default="hy4f")
     parser.add_argument("--tp", type=int, choices=(1, 2), default=1)
     parser.add_argument("--group", choices=GROUPS, default="ihc")
     parser.add_argument("--decode-rows", type=int, default=64)
@@ -242,11 +440,12 @@ def main():
 
     destination = args.output_dir
     destination.mkdir(parents=True, exist_ok=True)
-    tag = "hy4f" if args.tp == 1 else "hy4f2"
+    tag = args.family if args.tp == 1 else f"{args.family}2"
     manifest = destination / f"{tag}_{args.group}.json"
     manifest.unlink(missing_ok=True)
     records = []
-    for name, build in builders(
+    builder_fn = hy4_builders if args.family == "hy4" else builders
+    for name, build in builder_fn(
         args.tp, args.group, decode_rows=args.decode_rows, max_rows=args.max_rows, max_context=args.max_context
     ).items():
         label = f"{tag}_{name}"

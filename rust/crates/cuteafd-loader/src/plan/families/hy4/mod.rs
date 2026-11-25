@@ -829,15 +829,16 @@ impl FamilyModel for Model {
         match operand.encoding {
             Encoding::Exl3 { bits: 4 } => {
                 let is_mul1 = operand.companions.iter().any(|c| c == "mul1");
+                let package = if is_mul1 {
+                    "hy4:exl3-k45-mul1".to_string()
+                } else {
+                    "hy4:exl3-k45".to_string()
+                };
+                let spark_worlds = crate::plan::experts::spark_worlds(&package, self.cfg.moe_intermediate);
                 Some(ExpertContract {
-                    package: if is_mul1 {
-                        "hy4:exl3-k45-mul1".into()
-                    } else {
-                        "hy4:exl3-k45".into()
-                    },
+                    package,
                     block: 128,
-                    // 2048 / 128 = 16 blocks -> Step 3 adds `hy4:exl3` worlds 3..=6 to spark-package-ranges.json (#2550).
-                    spark_worlds: vec![3, 4, 5, 6],
+                    spark_worlds,
                     local: if is_mul1 {
                         Ok("Hy4 RTX EXL3 K4 MUL1 onboarding (whole 2048 or TP2 1024+1024)".into())
                     } else {

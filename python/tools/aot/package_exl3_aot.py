@@ -304,9 +304,11 @@ GEOMETRIES = {
     'inkling2': (4608, 2304, 384, 8),
     # Hy4-flash LatentMoE: 512 experts, top-16 on the 1536 latent, SwiGLU clamped at 10, K4 MUL1 only.
     'hy4f': (1536, 1536, 512, 16),
+    # Hy4 direct MoE: 256 experts, top-8 on hidden 6144, I=2048, SwiGLU clamped at 10, K4 MUL1 only.
+    'hy4': (6144, 2048, 256, 8),
 }
 # Geometries whose published checkpoints ship MUL1 routed experts only (no MCG).
-MUL1_ONLY_GEOMETRIES = frozenset({'hy4f'})
+MUL1_ONLY_GEOMETRIES = frozenset({'hy4f', 'hy4'})
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
 SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0, 'muse': None, 'ml4': None, 'inkling2': None}

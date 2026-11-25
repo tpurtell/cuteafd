@@ -194,7 +194,31 @@ HY4F_SHAPES = (
     ("hy4f_lm_head", 3072, 120832, 1),
     ("hy4f_lm_head_tp2", 3072, 60416, 1),
 )
-FAMILY_SHAPES = {"inkling2": INKLING_SHAPES, "kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES, "muse": MUSE_SHAPES, "ml4": ML4_SHAPES, "hy4f": HY4F_SHAPES}
+# Hy4 (H=6144, q_lora=2048, kv_a=576 padded to 640, uniform DSA 64h,
+# dense layer 0 / DFly2 I=18432, shared I=2048, vocab=120832):
+# every TP1 and TP2 dimension is an exact multiple of 128; MUL1 codebook only.
+HY4_SHAPES = (
+    ("hy4_q_a", 6144, 2048, 1),
+    ("hy4_kv_a_padded", 6144, 640, 1),
+    ("hy4_q_b_dsa", 2048, 16384, 1),
+    ("hy4_q_b_dsa_tp2", 2048, 8192, 1),
+    ("hy4_kv_b_dsa", 512, 28672, 1),
+    ("hy4_kv_b_dsa_tp2", 512, 14336, 1),
+    ("hy4_gate_dsa", 6144, 16384, 1),
+    ("hy4_gate_dsa_tp2", 6144, 8192, 1),
+    ("hy4_o_dsa", 16384, 6144, 1),
+    ("hy4_o_dsa_tp2", 8192, 6144, 2),
+    ("hy4_dense_gate_up", 6144, 18432, 1),
+    ("hy4_dense_gate_up_tp2", 6144, 9216, 1),
+    ("hy4_dense_down", 18432, 6144, 1),
+    ("hy4_dense_down_tp2", 9216, 6144, 2),
+    ("hy4_shared_gate_up_tp2", 6144, 1024, 1),
+    ("hy4_shared_down", 2048, 6144, 1),
+    ("hy4_shared_down_tp2", 1024, 6144, 2),
+    ("hy4_lm_head", 6144, 120832, 1),
+    ("hy4_lm_head_tp2", 6144, 60416, 1),
+)
+FAMILY_SHAPES = {"inkling2": INKLING_SHAPES, "kimik3": KIMI_SHAPES, "glm": GLM_SHAPES, "glmf": GLMF_SHAPES, "step5": STEP5_SHAPES, "muse": MUSE_SHAPES, "ml4": ML4_SHAPES, "hy4f": HY4F_SHAPES, "hy4": HY4_SHAPES}
 F32_OUTPUTS = (163840, 154880, 128896, 202112, 204800, 201088, 100608, 100480, 120832, 60416)
 F32_GEOMETRIES = frozenset({(4096, 8192, 2), (2048, 8192, 2)})
 
@@ -221,7 +245,7 @@ def shapes_for(families):
     result, seen = [], set()
     for family in families:
         for item in (*FAMILY_SHAPES[family], *(tuple((*shape[:4], 8) for shape in FAMILY_SHAPES[family] if _bits(shape) == 6)
-                                                if family in ("kimik3", "glm", "glmf", "muse", "step5", "inkling2", "hy4f") else ())):
+                                                if family in ("kimik3", "glm", "glmf", "muse", "step5", "inkling2", "hy4f", "hy4") else ())):
             if _key(item) not in seen:
                 result.append(item)
                 seen.add(_key(item))
@@ -236,7 +260,7 @@ GROUPED_MAX_ROWS = 4096
 def _codebooks(name):
     if name.startswith("inkling_head_rank"):
         return ("mcg",)
-    if name.startswith("hy4f_"):
+    if name.startswith(("hy4f_", "hy4_")):
         return ("mul1",)
     return ("mcg", "mul1")
 

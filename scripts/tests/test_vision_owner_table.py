@@ -80,7 +80,7 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     assert [(e["head_dim"], e["windowed"], e["pointwise_group"]) for e in entries] == [
         (64, False, ""), (72, False, ""), (96, False, "muse"), (96, True, "muse"), (128, False, "pixtral"),
         (64, False, "pe_inkling2"), (64, False, "pe_inkling2_mini"), (96, False, "pe_step5"),
-        (128, False, "tower_kimi"), (80, False, "tower_minimax"), (72, False, "tower_hy4f")]
+        (128, False, "tower_kimi"), (80, False, "tower_minimax"), (72, False, "tower_hy4f"), (96, False, "tower_hy4")]
     assert entries[0]["programs"] == ["vision_attention_d64"]
     assert entries[1]["programs"] == ["vision_attention_d72"]
     exporter = ROOT / "python/tools/aot/export_b12x_vision_aot.py"
@@ -93,7 +93,7 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
     assert entries[2]["programs"][1:] == entries[3]["programs"][1:]
     rules = (tmp_path / "build/CMakeFiles/cuteafd_vision_attention_export.dir/build.make").read_text()
     exports = [line for line in rules.splitlines() if "-E env" in line and "export_b12x_vision_aot.py" in line]
-    assert len(exports) == 16, exports  # Step reuses Muse; inkling2_mini reuses inkling2; each generic tower adds two groups
+    assert len(exports) == 18, exports  # Step reuses Muse; inkling2_mini reuses inkling2; each generic tower adds two groups
     legacy = [line for line in exports if "--group" not in line]
     assert len(legacy) == 1
     assert legacy[0].endswith("--output-dir " + str(tmp_path / "build/vision_attention") + " --capability 120")
@@ -127,12 +127,17 @@ include(\"{ROOT}/native/cmake/shared/vision_attention.cmake\")
         assert f'--omit-program {program["name"]}' in step_export
         assert not any(Path(p).name == program["name"] + ".o" and "pointwise_pe_step5" in p
                        for p in rules.split())
-    for item, kind, heads, dim in zip(entries[8:], ("kimi", "minimax", "hy4f"), (12, 16, 16), (128, 80, 72), strict=True):
+    for item, kind, heads, dim in zip(entries[8:], ("kimi", "minimax", "hy4f", "hy4"), (12, 16, 16, 16), (128, 80, 72, 96), strict=True):
         inventory = subprocess.check_output(["python3", str(exporter), "--list-tower-programs", "--tower", kind], text=True).strip().split(";")
         assert item["programs"][0] == f"vision_dynamic_attention_h{heads}_d{dim}"
         assert [p["name"] for p in item["programs"][1:]] == inventory[1:]
-        borrowed = [p for p in item["programs"][1:] if p["directory"].endswith("pointwise_muse")]
-        assert [p["name"] for p in borrowed] == (["vision_projection_h4096_o4096", "vision_gelu_h4096"] if kind == "kimi" else [])
+        borrowed = [p for p in item["programs"][1:] if not p["directory"].endswith(f"pointwise_tower_{kind}")]
+        expected_borrowed = (
+            ["vision_projection_h4096_o4096", "vision_gelu_h4096"] if kind == "kimi" else
+            ["vision_patches_raster_p16_t1", "vision_residual_h1536", "vision_gelu_h6144",
+             "vision_biased_projection_h1536_o1536", "vision_biased_projection_h6144_o6144"] if kind == "hy4" else []
+        )
+        assert [p["name"] for p in borrowed] == expected_borrowed
         pointwise = next(line for line in exports if f"/pointwise_tower_{kind} " in line)
         assert f"--omit-program {inventory[0]}" in pointwise
         for program in borrowed:
@@ -303,17 +308,23 @@ def test_inactive_generic_tower_inventory_is_unique_and_has_dynamic_attention_fi
         assert ("vision_vendor_rotary_raster_t1" in names) == (kind=="kimi")
         assert "vision_rotary_raster_t1" not in names
         assert not any("cu130" in name for name in names)
-    # Every tower group links into one native library: export names must be
-    # disjoint across groups (Hy4's patch-16 raster once collided with Kimi's patch-14).
-    groups={kind:set(module.names(kind)) for kind in ("kimi","minimax","hy4f")}
-    for a in groups:
-        for b in groups:
-            assert a>=b or not groups[a]&groups[b], f"{a}/{b} share exports {sorted(groups[a]&groups[b])}"
+    # Every tower group links into one native library: unborrowed export names
+    # must be disjoint across groups (Hy4 explicitly borrows shared objects via CMake).
+    hy4_borrowed = {
+        "vision_patches_raster_p16_t1", "vision_residual_h1536", "vision_gelu_h6144",
+        "vision_biased_projection_h1536_o1536", "vision_biased_projection_h6144_o6144",
+    }
+    groups={kind:set(module.names(kind)) for kind in ("kimi","minimax","hy4f","hy4")}
+    owned={kind:(names - hy4_borrowed if kind == "hy4" else names) for kind, names in groups.items()}
+    for a in owned:
+        for b in owned:
+            assert a>=b or not owned[a]&owned[b], f"{a}/{b} share exports {sorted(owned[a]&owned[b])}"
     hy4=(ROOT / "native/shared/cuda/vision_hy4.cuh").read_text()
     # Literal names (or the literal prefix of a composed one) must resolve to a Hy4 export.
     launched=set(re.findall(r'generic_program\(o,"(vision_\w+)"',hy4))
     assert "vision_patches_raster_p16_t1" in launched
-    assert all(any(name==prefix or name.startswith(prefix) for name in groups["hy4f"]) for prefix in launched), launched
+    for kind in ("hy4f", "hy4"):
+        assert all(any(name==prefix or name.startswith(prefix) for name in groups[kind]) for prefix in launched), (kind, launched)
     native=(ROOT / "native/shared/cuda/vision_runtime.cu").read_text()
     assert "if(s.tower)return false" in native
     assert "return vision_required_impl(s,out,valid_tower);" in native

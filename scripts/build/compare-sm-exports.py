@@ -509,6 +509,12 @@ def opt_in_jobs(scope="all"):
     result.append(("exl3-compact-hy4f-k45-mul1", "package_exl3_aot.py",
                    ["--geometry", "hy4f", "--capacities", EXL3_CAPACITIES,
                     "--bits", "4,5", "--compact-companions", "--codebook", "mul1"]))
+    result.append(("exl3-hy4-k45-mul1", "package_exl3_aot.py",
+                   ["--geometry", "hy4", "--capacities", EXL3_CAPACITIES,
+                    "--bits", "4,5", "--codebook", "mul1"]))
+    result.append(("exl3-compact-hy4-k45-mul1", "package_exl3_aot.py",
+                   ["--geometry", "hy4", "--capacities", EXL3_CAPACITIES,
+                    "--bits", "4,5", "--compact-companions", "--codebook", "mul1"]))
     return result
 
 
