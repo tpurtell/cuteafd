@@ -20,13 +20,15 @@
 //! executor thread keep independent chains.
 use super::LoadStream;
 use anyhow::Result;
-use cuteafd_ffi::NativeLibrary;
-use std::cell::Cell;
+use cuteafd_ffi::{event_waiters::BlockingEventWaiter, NativeLibrary};
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
+
+type FenceWaiter = Rc<RefCell<Option<BlockingEventWaiter>>>;
 
 #[derive(Clone)]
 struct Current {
@@ -38,10 +40,12 @@ struct Current {
     /// later producers read are complete, before its remaining work.
     forks: Rc<[(i32, *mut c_void)]>,
     fork: Rc<Cell<Option<usize>>>,
-    /// Device-ordered passes: per device a stream and two events marking
+    /// Device-ordered passes: per device a stream and two blocking events marking
     /// "everything chained so far" ([`fence_mark`]), and which device marked each.
     fences: Rc<[Fence]>,
     marked: Rc<Cell<[Option<usize>; 2]>>,
+    /// Lazily-spawned sleeping OS waiter thread for host [`fence_wait`].
+    waiter: FenceWaiter,
     /// This pass may run device-ordered ([`deferred`]).
     device: bool,
 }
@@ -54,7 +58,7 @@ struct Fence {
 }
 
 thread_local! {
-    static CURRENT: std::cell::RefCell<Option<Current>> = const { std::cell::RefCell::new(None) };
+    static CURRENT: RefCell<Option<Current>> = const { RefCell::new(None) };
 }
 
 /// Ordering events for one pass owner, one per participating device.
@@ -66,6 +70,7 @@ pub(crate) struct StageChain<'a> {
     fork: Rc<Cell<Option<usize>>>,
     fences: Rc<[Fence]>,
     marked: Rc<Cell<[Option<usize>; 2]>>,
+    waiter: FenceWaiter,
     device: Cell<bool>,
 }
 impl<'a> StageChain<'a> {
@@ -91,7 +96,7 @@ impl<'a> StageChain<'a> {
                 events.push((device, library.cuda_event_create_ordering()?));
                 forks.push((device, library.cuda_event_create_ordering()?));
                 fences.push(Fence { device, stream: library.cuda_stream_create()?,
-                    events: [library.cuda_event_create_ordering()?, library.cuda_event_create_ordering()?] });
+                    events: [library.cuda_event_create_blocking()?, library.cuda_event_create_blocking()?] });
             }
             Ok(())
         })();
@@ -104,14 +109,15 @@ impl<'a> StageChain<'a> {
         }
         Ok(Self { library, events: events.into(), head: Rc::new(Cell::new(None)),
             forks: forks.into(), fork: Rc::new(Cell::new(None)), fences: fences.into(),
-            marked: Rc::new(Cell::new([None; 2])), device: Cell::new(true) })
+            marked: Rc::new(Cell::new([None; 2])), waiter: Rc::new(RefCell::new(None)),
+            device: Cell::new(true) })
     }
     /// An owned handle that can wrap a future borrowing the chain's owner.
     pub fn handle(&self) -> ChainHandle<'a> {
         ChainHandle { library: self.library, current: Current {
             events: self.events.clone(), head: self.head.clone(),
             forks: self.forks.clone(), fork: self.fork.clone(), fences: self.fences.clone(),
-            marked: self.marked.clone(), device: self.device.get() } }
+            marked: self.marked.clone(), waiter: self.waiter.clone(), device: self.device.get() } }
     }
     /// Host wait for everything recorded so far, then forget the head. Call
     /// after the pass (or an aborted pass) before any unscoped consumer.
@@ -120,6 +126,9 @@ impl<'a> StageChain<'a> {
         self.marked.set([None; 2]);
         if let Some(head) = self.head.replace(None) {
             unsafe { self.library.cuda_event_synchronize(self.events[head].1)?; }
+        }
+        if let Some(waiter) = self.waiter.borrow().as_ref() {
+            waiter.flush()?;
         }
         Ok(())
     }
@@ -153,6 +162,8 @@ impl Drop for StageChain<'_> {
     fn drop(&mut self) {
         crate::shared::decode_graph::fatal_drain(self.drain(), "target stage chain");
         drain_fences(self.library, &self.fences);
+        // Join the sleeping fence waiter before destroying any fence events.
+        self.waiter.borrow_mut().take();
         for &(_, event) in self.events.iter().chain(self.forks.iter()) {
             if let Err(error) = unsafe { self.library.cuda_event_destroy(event) } {
                 tracing::error!(%error, "destroying target stage chain event");
@@ -205,27 +216,57 @@ pub(crate) fn fence_mark(library: &NativeLibrary, slot: usize) -> Result<()> {
     Ok(())
 }
 
-/// Waits for fence `slot` (no-op when it was not marked since the last wait),
-/// yielding between polls so another lane on this thread keeps running.
+/// Orders `stream` on the device after fence `slot` (no-op when unmarked),
+/// with no host wait or polling. Use this whenever the consumer is a CUDA stream.
+/// # Safety
+/// `stream` is a live stream on a participating device.
+#[allow(dead_code)]
+pub(crate) unsafe fn fence_wait_stream(library: &NativeLibrary, slot: usize, stream: *mut c_void) -> Result<()> {
+    let Some(current) = current() else { return Ok(()) };
+    let mut slots = current.marked.get();
+    let Some(index) = slots[slot].take() else { return Ok(()) };
+    current.marked.set(slots);
+    let event = current.fences[index].events[slot];
+    // SAFETY: `stream` and `event` are live; cross-device event waits are valid.
+    unsafe { library.cuda_stream_wait_event(stream, event) }
+}
+
+/// Waits on the host for fence `slot` (no-op when it was not marked since the
+/// last wait), using a blocking `cudaEventSynchronize` on a dedicated sleeping
+/// waiter thread instead of busy-polling `cudaStreamQuery`, so another lane on
+/// this runtime thread keeps running with zero idle CPU burn.
 pub(crate) async fn fence_wait(library: &NativeLibrary, slot: usize) -> Result<()> {
     let Some(current) = current() else { return Ok(()) };
     let mut slots = current.marked.get();
     let Some(index) = slots[slot].take() else { return Ok(()) };
     current.marked.set(slots);
     let fence = current.fences[index];
-    // The fence stream holds only marks, and the next mark is queued after this
-    // wait: the stream is idle exactly when this slot's mark has completed.
-    loop {
-        let previous = library.cuda_get_device()?;
-        library.cuda_set_device(fence.device)?;
-        // SAFETY: the fence stream belongs to this chain.
-        let ready = unsafe { library.cuda_stream_query(fence.stream) };
-        library.cuda_set_device(previous)?;
-        if ready? {
-            return Ok(());
-        }
-        tokio::task::yield_now().await;
+    let event = fence.events[slot];
+    // Fast path: one non-blocking query avoids a waiter-thread handoff when
+    // the fence event already completed while waiting on Spark exchange.
+    let previous = library.cuda_get_device()?;
+    library.cuda_set_device(fence.device)?;
+    // SAFETY: `event` belongs to `fence.device` and was recorded by `fence_mark`.
+    let ready = unsafe { library.cuda_event_query(event) };
+    library.cuda_set_device(previous)?;
+    if ready? {
+        return Ok(());
     }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    {
+        let mut slot_waiter = current.waiter.borrow_mut();
+        let waiter = match slot_waiter.as_ref() {
+            Some(waiter) => waiter,
+            None => slot_waiter.insert(BlockingEventWaiter::new(library, "chain-fence-wait")?),
+        };
+        // SAFETY: `StageChain` retains `event` until `drain()` / `Drop` flushes
+        // and joins `waiter`, and callers do not re-mark `slot` before this wait
+        // (or cancellation drain) returns.
+        unsafe {
+            waiter.submit(fence.device, event, Box::new(move |result| { let _ = tx.send(result); }))?;
+        }
+    }
+    rx.await.map_err(|_| anyhow::anyhow!("fence waiter dropped before completion"))?
 }
 
 pub(crate) struct ChainHandle<'a> {
@@ -315,6 +356,9 @@ impl<F> Drop for ChainScope<'_, F> {
             crate::shared::decode_graph::fatal_drain(
                 unsafe { self.library.cuda_event_synchronize(self.current.events[head].1) },
                 "cancelled target stage chain");
+        }
+        if let Some(waiter) = self.current.waiter.borrow().as_ref() {
+            crate::shared::decode_graph::fatal_drain(waiter.flush(), "cancelled target stage chain fence waiter");
         }
         // Field destruction follows this body. Inner stream guards still drain
         // submissions not yet recorded in the chain before releasing their owners.
@@ -530,7 +574,8 @@ mod tests {
                     vec![Fence { device: 0, stream: std::ptr::null_mut(),
                         events: [std::ptr::null_mut(); 2] }; 2]
                 } else { vec![] }.into(),
-                marked: Rc::new(Cell::new([None; 2])), device: Cell::new(true),
+                marked: Rc::new(Cell::new([None; 2])), waiter: Rc::new(RefCell::new(None)),
+                device: Cell::new(true),
             };
             if path == "cancel" {
                 let mut scope = Box::pin(chain.handle().scope(async move {
@@ -795,6 +840,40 @@ mod tests {
         unsafe { library.cuda_event_destroy(published)?; library.cuda_event_destroy(joined)?; }
         assert_eq!(done, !fold, "the fork joiner {} while unit A's publication was held",
             if done { "completed" } else { "stayed pending" });
+        Ok(())
+    }
+
+    #[test]
+    fn fence_wait_and_fence_wait_stream_avoid_stream_query_spin() -> Result<()> {
+        let (_directory, fixture) = crate::shared::memory::cpu_stream_fixture()?;
+        let library = fixture.load()?;
+        let device = Device { library: &library, id: 0 };
+        let producer = Stream::new(device)?;
+        let consumer = Stream::new(device)?;
+        let chain = StageChain::new(&library)?;
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        runtime.block_on(chain.handle().scope(async {
+            // SAFETY: streams and library live through the scope and drain.
+            unsafe {
+                join(&library, producer.raw)?;
+                finish(&library, producer.raw)?;
+                fence_mark(&library, 0)?;
+                fence_wait_stream(&library, 0, consumer.raw)?;
+                fence_mark(&library, 1)?;
+            }
+            fence_wait(&library, 1).await?;
+            // Unmarked slot is a no-op.
+            fence_wait(&library, 1).await?;
+            Ok::<_, anyhow::Error>(())
+        }))?;
+        chain.drain()?;
+        // Verify fence_wait does not spin on cuda_stream_query + yield_now.
+        let src = include_str!("chain.rs");
+        let body = &src[src.find("pub(crate) async fn fence_wait(").unwrap()..];
+        let body = &body[..body.find("pub(crate) struct ChainHandle").unwrap()];
+        assert!(!body.contains("cuda_stream_query"), "fence_wait must not poll cuda_stream_query");
+        assert!(!body.contains("yield_now"), "fence_wait must not spin with yield_now");
+        assert!(body.contains("BlockingEventWaiter"));
         Ok(())
     }
 
