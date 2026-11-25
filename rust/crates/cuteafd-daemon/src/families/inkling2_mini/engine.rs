@@ -223,7 +223,9 @@ impl<'a> Execution<'a> {
             .run(std::slice::from_ref(unit))?;
             let observe = use_graphs && self.graphs.as_ref().is_some_and(DecodeGraphs::needs_boundary);
             if !staged || observe {
+                let wait = std::time::Instant::now();
                 self.completed()?;
+                if staged && observe { crate::shared::decode_graph::device::record_boundary_drain([self.requests.decode.stream.device.id], wait.elapsed()); }
             }
             if observe {
                 self.observe_completed()?;

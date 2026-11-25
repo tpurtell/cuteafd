@@ -140,7 +140,11 @@ impl<'a> Execution<'a> {
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Decode, io: &mut io }.run(std::slice::from_ref(unit))?;
             let observe = self.graph_needs_boundary();
             // Staged logits stay on their producing stream until sampling.
-            if !staged || observe { self.completed()?; }
+            if !staged || observe {
+                let wait = std::time::Instant::now();
+                self.completed()?;
+                if staged && observe { crate::shared::decode_graph::device::record_boundary_drain(std::iter::once(self.requests.decode.stream.device.id).chain(self.peer.iter().map(|p| p.requests.decode.stream.device.id)), wait.elapsed()); }
+            }
             if observe {
                 self.observe_completed()?;
             } else {

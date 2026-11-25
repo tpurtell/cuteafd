@@ -2147,7 +2147,9 @@ impl<'a> Hy4Engine<'a> {
             }
             return Ok(());
         }
+        let wait = std::time::Instant::now();
         self.drain()?;
+        graph_device::record_boundary_drain(self.ranks.iter().map(|r| r.device.id), wait.elapsed());
         // SAFETY: every rank stream is drained; graph owners hold no allocations and
         // engine weights/cache/scratch outlive all banks (cleared in terminate()).
         unsafe {

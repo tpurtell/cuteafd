@@ -646,6 +646,17 @@ fn existing_cache(device: i32) -> Option<SharedCache> {
         .get(&device).and_then(std::sync::Weak::upgrade)
 }
 
+/// Measure an actual host graph-boundary wait, once per physical device.
+pub(crate) fn record_boundary_drain(devices: impl IntoIterator<Item = i32>, elapsed: Duration) {
+    for device in devices {
+        if let Some(cache) = existing_cache(device) {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.epochs.boundary_drains += 1;
+            cache.epochs.boundary_wait_us += elapsed.as_micros().min(u64::MAX as u128) as u64;
+        }
+    }
+}
+
 /// Reuse a periodic report's physical sample; older asynchronous reports may
 /// not replace a newer boundary sample. No CUDA query or graph-level mutation.
 pub(crate) fn monitor_physical(device: i32, sampled_at: Instant, free: u64, tracked: u64) {
