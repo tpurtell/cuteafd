@@ -1003,4 +1003,117 @@ mod tests {
         tensor.meta.byte_length = tensor.meta.shape.iter().product::<usize>() as u64 * 2;
         assert!(CoreInventory::from_checkpoint(&cfg, &changed).is_err());
     }
+
+    #[test]
+    fn dense_core_codebook_resolves_mul1_and_mcg_to_distinct_programs() -> Result<()> {
+        use super::super::core_admission::CoreCharges;
+        use crate::formats::exl3_storage::Exl3Codebook;
+        use serde_json::json;
+
+        for bits in [6usize, 8] {
+            let make_checkpoint = |marker: &str| {
+                let (cfg, mut checkpoint) = fixture();
+                for tensor in &mut checkpoint.tensors {
+                    if tensor.meta.name.ends_with(".trellis") {
+                        tensor.meta.shape[2] = 16 * bits;
+                        tensor.meta.byte_length = tensor.meta.shape.iter().product::<usize>() as u64 * 2;
+                    } else if tensor.meta.name.ends_with(".mcg") && marker != "mcg" {
+                        tensor.meta.name = tensor.meta.name.replacen(".mcg", &format!(".{marker}"), 1);
+                    }
+                }
+                checkpoint.tensors.sort_by(|a, b| a.meta.name.cmp(&b.meta.name));
+                checkpoint.weight_map = checkpoint.tensors.iter()
+                    .map(|t| (t.meta.name.clone(), t.shard.clone())).collect();
+                (cfg, checkpoint)
+            };
+
+            let (cfg, mcg_ckpt) = make_checkpoint("mcg");
+            let (_, mul1_ckpt) = make_checkpoint("mul1");
+            let mcg_core = CoreInventory::from_checkpoint(&cfg, &mcg_ckpt)?;
+            let mul1_core = CoreInventory::from_checkpoint(&cfg, &mul1_ckpt)?;
+
+            assert!(!mcg_core.projections.is_empty());
+            assert!(mcg_core.projections.values().all(|p| p.codebook == Exl3Codebook::Mcg && p.bits == bits));
+            assert!(mul1_core.projections.values().all(|p| p.codebook == Exl3Codebook::Mul1 && p.bits == bits));
+
+            // Build a dual-codebook manifest containing both MCG and MUL1 dense-trellis policies/programs.
+            let base = executable_package(&cfg, &mcg_core)?;
+            let mut dual_policies = Vec::new();
+            let mut dual_programs: BTreeMap<String, serde_json::Value> = base["programs"].as_array().unwrap().iter()
+                .filter(|p| !p["name"].as_str().unwrap().starts_with("dense_trellis_k6_"))
+                .map(|p| (p["name"].as_str().unwrap().to_owned(), p.clone())).collect();
+            for policy in base["families"]["dense_trellis_k6"]["row_policies"].as_array().unwrap() {
+                let k = policy["input_features"].as_u64().unwrap() as usize;
+                let n = policy["output_features"].as_u64().unwrap() as usize;
+                let side = policy["sharded_side"].as_u64().unwrap() as usize;
+                let is_head = n == cfg.vocab_size;
+                for book in ["mcg", "mul1"] {
+                    let shape = format!("k{k}_n{n}_s{side}_k{bits}_{book}");
+                    let routes = [format!("input_{shape}"), format!("core_{shape}"), format!("output_{shape}")];
+                    dual_policies.push(json!({"shape": shape, "input_features": k, "output_features": n,
+                        "sharded_side": side, "bits": bits, "codebook": book,
+                        "native_input": routes[0], "native_program": routes[1], "output_program": routes[2]}));
+                    let geometries = [
+                        json!({"features": k, "input_dtype": "bf16", "max_rows": 4096}),
+                        json!({"abi_version": 1, "input_features": k, "output_features": n, "bits": bits,
+                            "codebook": book, "sharded_side": side, "rotation_count": 1, "max_rows": 4096,
+                            "split_k_blocks": 8, "splits": k.div_ceil(1024), "ctas_per_sm": 4}),
+                        json!({"features": n, "output_dtype": if is_head { "f32" } else { "bf16" }, "max_rows": 4096}),
+                    ];
+                    let pointers = [
+                        vec!["input", "suh", "rotated", "input_block_scales"],
+                        vec!["rotated_inputs", "payload", "input_block_scales", "partial", "output"],
+                        vec!["input", "svh", "output"],
+                    ];
+                    for i in 0..3 {
+                        let name = format!("dense_trellis_k6_{}", routes[i]);
+                        dual_programs.insert(name.clone(), json!({"name": name, "capacity_rows": 4096,
+                            "geometry": geometries[i],
+                            "pointers": pointers[i].iter().map(|p| json!({"name": p})).collect::<Vec<_>>(),
+                            "scalars": vec![json!({"type": "int32"}); if i == 1 { 3 } else { 2 }],
+                            "scratch_bytes_at_capacity": if i == 1 { json!({"partial": 4096 * k.div_ceil(1024) * n * 4}) } else { json!({}) }}));
+                    }
+                }
+            }
+            let manifest_with = |keep_book: Option<&str>| {
+                let policies: Vec<_> = dual_policies.iter()
+                    .filter(|p| keep_book.is_none_or(|b| p["codebook"].as_str() == Some(b)))
+                    .cloned().collect();
+                json!({"capacities": {"max_context": 1_048_576, "decode_rows": 64, "prefill_rows": 4096},
+                    "families": {"dense_trellis_k6": {"abi_version": 1, "row_policies": policies}},
+                    "programs": dual_programs.values().cloned().collect::<Vec<_>>()})
+            };
+
+            let dual_manifest = manifest_with(None);
+            let mcg_only = manifest_with(Some("mcg"));
+            let mul1_only = manifest_with(Some("mul1"));
+
+            for ranks in [1usize, 2] {
+                let mcg_charges = CoreCharges::from_package(&cfg, &mcg_core, cfg.layers, ranks, None,
+                    4096, 1, 64, None, false, &dual_manifest)?;
+                let mul1_charges = CoreCharges::from_package(&cfg, &mul1_core, cfg.layers, ranks, None,
+                    4096, 1, 64, None, false, &dual_manifest)?;
+
+                let mcg_trellis: Vec<_> = mcg_charges.programs.iter()
+                    .filter(|n| n.starts_with("dense_trellis_k6_")).collect();
+                let mul1_trellis: Vec<_> = mul1_charges.programs.iter()
+                    .filter(|n| n.starts_with("dense_trellis_k6_")).collect();
+
+                assert!(!mcg_trellis.is_empty() && !mul1_trellis.is_empty());
+                assert!(mcg_trellis.iter().all(|n| n.ends_with(&format!("_k{bits}_mcg"))),
+                    "MCG dense core must resolve only to mcg programs: {mcg_trellis:?}");
+                assert!(mul1_trellis.iter().all(|n| n.ends_with(&format!("_k{bits}_mul1"))),
+                    "MUL1 dense core must resolve only to mul1 programs: {mul1_trellis:?}");
+
+                // Missing the checkpoint's own codebook must fail closed, never fall back to the other codebook.
+                assert!(CoreCharges::from_package(&cfg, &mul1_core, cfg.layers, ranks, None,
+                    4096, 1, 64, None, false, &mcg_only).is_err(),
+                    "MUL1 dense core must refuse an MCG-only manifest");
+                assert!(CoreCharges::from_package(&cfg, &mcg_core, cfg.layers, ranks, None,
+                    4096, 1, 64, None, false, &mul1_only).is_err(),
+                    "MCG dense core must refuse a MUL1-only manifest");
+            }
+        }
+        Ok(())
+    }
 }
