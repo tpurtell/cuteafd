@@ -718,7 +718,7 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
                 let kind = if self.speculative { cuteafd_transport::ExpertV2SourceKind::MtpVerify }
                     else if self.rows > self.local[0].decode_rows() { cuteafd_transport::ExpertV2SourceKind::Prefill }
                     else { cuteafd_transport::ExpertV2SourceKind::Decode };
-                Some(self.routed.begin(&mut self.local[0], layer, self.rows, kind, routes, wire)?)
+                Some(self.routed.begin(&self.local[0], layer, self.rows, kind, routes, wire)?)
             }
         };
         self.local[0].ffn(layer, self.rows)?;
@@ -1080,8 +1080,8 @@ impl PipelineKernels for Bindings<'_, '_, '_> {
                 let routes = cuteafd_ffi::KimiRoutes {
                     ids: self.local[1].buffer("route ids")?, weights: self.local[1].buffer("route weights")? };
                 let wire = self.local[1].buffer("expert wire")?;
-                let spark = self.routed.begin(&mut self.local[1], layer, self.rows, kind, routes, wire)?;
-                self.local[0].ffn(layer, self.rows)?;
+                let spark = self.routed.begin(&self.local[1], layer, self.rows, kind, routes, wire)?;
+                for local in self.local.iter_mut() { local.ffn(layer, self.rows)?; }
                 Some(spark)
             }
         };
