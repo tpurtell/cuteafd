@@ -16,7 +16,7 @@ use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointView};
 use cuteafd_loader::plan::families::hy4_flash as hy4_plan;
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::{net::SocketAddr, path::{Path, PathBuf}, sync::Arc};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct GoldenArgs {
@@ -50,6 +50,9 @@ pub(crate) struct GoldenArgs {
     /// Attention placement on 2 GPUs (`auto` -> `context`, or explicit `heads` / `context`).
     #[arg(long, default_value = "auto", value_parser = ["auto", "heads", "context"])]
     pub(crate) attention_placement: String,
+    /// Spark worker peer endpoints (`host:port,...`) for routed experts.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) peers: Vec<SocketAddr>,
     /// Validate checkpoint headers, MC views, Engram FP8 shards, and target arenas without CUDA.
     #[arg(long)]
     pub(crate) check_headers: bool,
@@ -226,7 +229,10 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         .map(|ws| ws.iter().map(|w| w.tokens.len()).max().unwrap_or(1))
         .unwrap_or(raw_tokens.len())
         .max(max_resume);
-    let unit = args.prefill_units.unwrap_or(max_seq).min(4096);
+    let unit = args
+        .prefill_units
+        .map(|u| u.min(4096))
+        .unwrap_or_else(|| default_prefill_unit(max_seq));
     let max_pages = if !args.resume_at.is_empty() {
         (max_seq.div_ceil(64) * 3 + 16).max(64)
     } else if args.verify_waves {
@@ -249,7 +255,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         .as_deref()
         .unwrap_or_else(|| Path::new("/opt/cuteafd/lib/libcuteafd_native.so"));
     // SAFETY: trusted native library built by this repository's toolchain.
-    let library = unsafe { NativeLibrary::load(lib_path)? };
+    let library = Arc::new(unsafe { NativeLibrary::load(lib_path)? });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
 
     let mut device_ids = vec![args.device];
@@ -258,6 +264,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         device_ids.push(second);
     }
     let devices: Vec<Device<'_>> = device_ids.iter().map(|&id| Device { library: &library, id }).collect();
+    for dev in &devices {
+        dev.run(|| crate::shared::inventory::preload_native_modules(&library))?;
+    }
     let decode_rows = cuteafd_loader::plan::resolve_decode_rows("hy4_flash",
         cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
             requested: args.decode_rows.as_option(),
@@ -269,6 +278,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         args.expert_package.is_none() || !args.skip_routed_experts,
         "--expert-package conflicts with --skip-routed-experts"
     );
+    ensure!(args.peers.is_empty() || (args.expert_package.is_none() && !args.skip_routed_experts),
+        "--peers conflicts with --expert-package or --skip-routed-experts");
     let onboarded: Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'_>>> =
         if let Some(pkg) = &args.expert_package {
             use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
@@ -368,6 +379,14 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         )?
     };
 
+    if !args.peers.is_empty() {
+        let link = super::super::hy4_common::golden::spark_link(
+            &library, devices[0], &selected, cuteafd_core::ExpertGeometry::HY4_FLASH,
+            Vec::new(), cfg.routed_layers(), &args.peers, unit, decode_rows, prefill_waves,
+        )?;
+        engine.attach_spark(link, Vec::new());
+    }
+
     if args.resume_dfly2 {
         use cuteafd_loader::families::hy4_flash::{draft, Hy4DflyConfig};
         let model = hy4_plan::Model::open(&checkpoint)?;
@@ -399,7 +418,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     if args.resume_verify { engine.allocate_verify_keys()?; }
     engine.dump_dir = args.dump_dir.clone();
     if args.decode_graphs {
-        let layout = cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(devices.len(), 0);
+        let layout = cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(devices.len(), args.peers.len());
         engine.configure_graphs(layout)?;
     }
 
@@ -1074,9 +1093,34 @@ fn run_resume_check(
     Ok(())
 }
 
+fn default_prefill_unit(max_seq: usize) -> usize {
+    let capped = max_seq.min(4096);
+    (capped - capped % 64).max(64)
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+
+    #[test]
+    fn default_prefill_unit_rounds_down_to_page_size_for_a00() -> anyhow::Result<()> {
+        // Published Hy4-flash window a00 has 1802 tokens (1802 % 64 == 10).
+        let a00_unit = super::default_prefill_unit(1802);
+        assert_eq!(a00_unit, 1792);
+        assert_eq!(a00_unit % 64, 0);
+        let spans = crate::shared::prefill_pipeline::prefill_units(1802, a00_unit, 1, 64)?;
+        assert_eq!(spans, vec![0..1792, 1792..1802]);
+
+        // Edge cases: sub-page, exact page multiples, and > 4096 cap.
+        assert_eq!(super::default_prefill_unit(0), 64);
+        assert_eq!(super::default_prefill_unit(37), 64);
+        assert_eq!(super::default_prefill_unit(64), 64);
+        assert_eq!(super::default_prefill_unit(127), 64);
+        assert_eq!(super::default_prefill_unit(128), 128);
+        assert_eq!(super::default_prefill_unit(4096), 4096);
+        assert_eq!(super::default_prefill_unit(8192), 4096);
+        Ok(())
+    }
 
     #[test]
     fn hy4f_golden_cli_parses() {
@@ -1111,6 +1155,17 @@ mod tests {
             .is_err(),
             "--engram-bf16 must be rejected (FP8 Engram only)"
         );
+    }
+
+    #[test]
+    fn hy4f_golden_cli_parses_peers() -> anyhow::Result<()> {
+        let crate::cli::Commands::Hy4fGolden(args) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "hy4f-golden", "--snapshot", "/snapshot", "--golden", "/golden",
+            "--peers", "127.0.0.1:19441,127.0.0.1:19442", "--decode", "--decode-graphs",
+        ])?.command else { anyhow::bail!("expected Hy4fGolden") };
+        assert_eq!(args.peers.len(), 2);
+        assert!(args.decode && args.decode_graphs);
+        Ok(())
     }
 
     #[test]

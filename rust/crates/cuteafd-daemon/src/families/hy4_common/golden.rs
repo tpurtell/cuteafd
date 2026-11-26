@@ -129,3 +129,73 @@ pub(crate) fn load_published_reference(
     ensure!(reference.vocab == vocab, "{label} fidelity vocab {} != {vocab}", reference.vocab);
     Ok(reference)
 }
+
+
+/// Admit and bootstrap real Spark workers for a Hy4-family golden. The
+/// caller owns the link and drains it as part of engine termination.
+pub(crate) fn spark_link<'a>(
+    library: &'a std::sync::Arc<cuteafd_ffi::NativeLibrary>,
+    device: crate::shared::memory::device::Device<'a>,
+    view: &cuteafd_loader::plan::checkpoint::CheckpointView,
+    geometry: cuteafd_core::ExpertGeometry,
+    rtx_layers: Vec<usize>,
+    spark_layers: Vec<usize>,
+    peers: &[std::net::SocketAddr],
+    unit: usize,
+    decode_rows: usize,
+    prefill_waves: usize,
+) -> Result<crate::shared::spark_intake::SparkLink<'a>> {
+    use crate::shared::{placement::{spark_rings, SparkAdmission}, spark_intake::SparkLink};
+    use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
+    use cuteafd_loader::placement::{families::{hy4, hy4_flash}, planner::PrefillShape, SparkWorkingSet};
+    use cuteafd_transport::{
+        expert::{SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
+        worker_selection::ModelAdmission,
+        ExpertV2Dtype, SparkSessionShape, TcpTransportConfig,
+    };
+    let (family, lanes) = match geometry {
+        ExpertGeometry::HY4 => ("hy4", hy4::LANES),
+        ExpertGeometry::HY4_FLASH => ("hy4_flash", hy4_flash::LANES),
+        _ => anyhow::bail!("unsupported Hy4 golden Spark geometry {geometry:?}"),
+    };
+    let catalog = cuteafd_loader::read_expert_catalog_view(view)?;
+    let capacity_rows = unit.max(decode_rows);
+    let working = SparkWorkingSet {
+        rtx_layers,
+        spark_layers,
+        spark_ranks: peers.len(),
+        prefill_lanes: lanes,
+    };
+    let endpoint = SparkEndpoint {
+        ring_depth: None,
+        capacity: u32::try_from(capacity_rows)?,
+        ingress: SparkIngress::Fp8K32,
+        partial_reply_bytes: None,
+    };
+    let tcp = TcpTransportConfig::default();
+    let backend = cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?;
+    let executions = cuteafd_loader::plan::spark_executions::admit_family(
+        family, &backend.exports(), Some(decode_rows as u32), unit as u64, prefill_waves as u64,
+    )?;
+    let model = ModelAdmission::for_clients(geometry, endpoint, spark_rings(tcp.max_frame_bytes)?, 1, executions)?;
+    SparkAdmission::plan_view(view, geometry, Some(&catalog), &working, peers.len(), model, None)?
+        .select(peers)?;
+    let prefill = PrefillShape { rows: capacity_rows as u64, waves: prefill_waves as u64 };
+    let replies = cuteafd_core::spark_reply::requested();
+    let links = match geometry {
+        ExpertGeometry::HY4 => hy4::spark_link(0, peers.len(), prefill, replies),
+        ExpertGeometry::HY4_FLASH => hy4_flash::spark_link(0, peers.len(), prefill, replies),
+        _ => unreachable!("geometry checked above"),
+    }.map_err(|e| anyhow::anyhow!("{family} golden Spark link refused: {e}"))?;
+    let mut link = device.run(|| SparkLink::prepared(
+        library, SparkWorld::canonical(peers.len())?, peers, tcp,
+        links.first().context("golden Spark geometry absent")?.clone(),
+    ))?;
+    link.enable_terminal_ownership(std::sync::Arc::clone(library))?;
+    let mut session = SparkSessionShape::new(
+        u32::try_from(capacity_rows)?, geometry.hidden, geometry.topk, ExpertV2Dtype::Fp8E4m3Ue8m0K32,
+    )?;
+    session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
+    device.run(|| link.bootstrap(&session))?;
+    Ok(link)
+}
