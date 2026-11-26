@@ -644,6 +644,10 @@ fn approximate_lineage_is_scoped_to_its_taint_row_across_device_and_host() {
     second.extend(seq(2000, 30));
     let (partial, _) = lag_round(&mut cache, &family, 1, &second);
     assert_eq!(partial.source.as_ref().unwrap().approximate_from, Some(72));
+    // `partial` is the divergence question (`!restores_mark()`), not the fidelity one (`!exact()`).
+    let divergent = partial.source.as_ref().unwrap();
+    assert!(divergent.partial && !divergent.plan.restores_mark());
+    assert_eq!(divergent.partial, !divergent.plan.restores_mark());
     // Its next turn is an ancestor restore: inherited lineage, labelled, counted as lineage.
     let mut third = second.clone();
     third.extend(seq(3000, 10));
@@ -651,6 +655,9 @@ fn approximate_lineage_is_scoped_to_its_taint_row_across_device_and_host() {
     let (turn, _) = lag_round(&mut cache, &family, 2, &third);
     let source = turn.source.unwrap();
     assert!(source.plan.restores_mark() && !source.plan.exact());
+    // Not exact, yet not a divergent match: a fidelity label must not make it `partial`.
+    assert_eq!(source.partial, !source.plan.restores_mark());
+    assert!(!source.partial);
     assert_eq!(source.approximate_from, Some(72));
     let after = cache.stats().host.unwrap();
     // The ancestor fork shares the second snapshot's device pages: its 25 full pages are host
