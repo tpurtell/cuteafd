@@ -12,6 +12,9 @@ pub enum Op {
     Residual { queries: usize, max_candidates: usize, addend: bool },
     LoopPairNorm { slots: usize, broadcast_dest: bool },
     LoopBlendNorm { slots: usize, broadcast_dest: bool, broadcast_weight: bool },
+    AttnInProjLocal,
+    AttnInProjGlobal,
+    RouterProj,
     Router,
     Gate { precision: Precision },
     Norm { value: bool, precision: Precision },
@@ -51,6 +54,9 @@ impl Op {
                     "Inkling 2 Mini loop blend_norm geometry unsupported");
                 format!("loop_blend_norm_s{slots}{}", if broadcast_dest { "_bcast" } else { "" })
             }
+            Self::AttnInProjLocal => "attn_in_proj_local".into(),
+            Self::AttnInProjGlobal => "attn_in_proj_global".into(),
+            Self::RouterProj => "router_proj".into(),
             Self::Router => "router_e128_k8".into(),
             Self::Gate { precision } => format!("gate_h3072_{}", precision_suffix(precision)),
             Self::Norm { value, precision } => if value {
@@ -69,6 +75,17 @@ impl Op {
             Self::Residual { .. } => &["arena", "addend", "query", "out"],
             Self::LoopPairNorm { .. } => &["dest", "msg", "out"],
             Self::LoopBlendNorm { .. } => &["dest", "msg", "forget_gain", "weight", "out"],
+            Self::AttnInProjLocal => &[
+                "xq", "xk", "xv",
+                "wq", "wr", "wgate", "wsink", "wk", "wv",
+                "out_q", "out_r", "out_gate", "out_sink", "out_k", "out_v",
+            ],
+            Self::AttnInProjGlobal => &[
+                "xq", "xk", "xv",
+                "wq", "wr", "wgate", "wsink", "wk", "wv", "wk_dyn", "wv_dyn",
+                "out_q", "out_r", "out_gate", "out_sink", "out_k", "out_v", "out_k_dyn", "out_v_dyn",
+            ],
+            Self::RouterProj => &["x", "w", "out"],
             Self::Router => &["logits", "bias", "ids", "weights"],
             Self::Gate { .. } => &["x", "gate", "gamma", "out"],
             Self::Norm { .. } => &["x", "weight", "out"],
@@ -131,6 +148,27 @@ impl<'a> Producer<'a> {
                 equal("broadcast_weight", broadcast_weight.into())?;
                 equal("eps", 1e-6.into())?;
             }
+            Op::AttnInProjLocal => {
+                equal("width", 2304.into())?;
+                equal("small_row_max", 8.into())?;
+                equal("global_dynamic", false.into())?;
+                equal("outputs", serde_json::json!([3072, 384, 3072, 24, 1024, 1024]))?;
+                equal("reduction", "ordered_k16".into())?;
+            }
+            Op::AttnInProjGlobal => {
+                equal("width", 2304.into())?;
+                equal("small_row_max", 8.into())?;
+                equal("global_dynamic", true.into())?;
+                equal("outputs", serde_json::json!([3072, 384, 3072, 24, 1024, 1024, 32, 32]))?;
+                equal("reduction", "ordered_k16".into())?;
+            }
+            Op::RouterProj => {
+                equal("width", 2304.into())?;
+                equal("outputs", 128.into())?;
+                equal("output_dtype", "torch.float32".into())?;
+                equal("small_row_max", 8.into())?;
+                equal("reduction", "block_k288_le8_ordered_k16_gt8".into())?;
+            }
             Op::Router => {
                 equal("experts", 128.into())?; equal("topk", 8.into())?; equal("route_scale", 8.0.into())?;
             }
@@ -168,6 +206,24 @@ impl<'a> Producer<'a> {
         ensure!(rows > 0 && rows <= self.rows && buffers.len() == self.op.pointers().len()
             && buffers.iter().all(|b| !b.ptr.is_null() && b.device_id == buffers[0].device_id && b.flags == 0),
             "Inkling 2 Mini producer live rows/device/pointer count differs");
+        let required: Vec<usize> = match self.op {
+            Op::AttnInProjLocal => vec![
+                rows * 2304 * 2, rows * 2304 * 2, rows * 2304 * 2,
+                3072 * 2304 * 2, 384 * 2304 * 2, 3072 * 2304 * 2, 24 * 2304 * 2, 1024 * 2304 * 2, 1024 * 2304 * 2,
+                rows * 3072 * 2, rows * 384 * 2, rows * 3072 * 2, rows * 24 * 4, rows * 1024 * 2, rows * 1024 * 2,
+            ],
+            Op::AttnInProjGlobal => vec![
+                rows * 2304 * 2, rows * 2304 * 2, rows * 2304 * 2,
+                3072 * 2304 * 2, 384 * 2304 * 2, 3072 * 2304 * 2, 24 * 2304 * 2, 1024 * 2304 * 2, 1024 * 2304 * 2,
+                32 * 2304 * 2, 32 * 2304 * 2,
+                rows * 3072 * 2, rows * 384 * 2, rows * 3072 * 2, rows * 24 * 4, rows * 1024 * 2, rows * 1024 * 2,
+                rows * 32 * 4, rows * 32 * 4,
+            ],
+            Op::RouterProj => vec![rows * 2304 * 2, 128 * 2304 * 2, rows * 128 * 4],
+            _ => vec![],
+        };
+        ensure!(buffers.iter().zip(required).all(|(b, size)| b.bytes >= size && b.ptr as usize % 16 == 0),
+            "Inkling 2 Mini projection extent/alignment differs");
         let mut scalars = vec![Scalar::I32(rows as i32)];
         match (self.op, residual) {
             (Op::Residual { max_candidates, .. }, Some((arena_rows, candidates))) => {

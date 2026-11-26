@@ -643,6 +643,11 @@ def inkling2_mini_producer_programs(prefill_rows: int):
     )
     from b12x.integration.cuteafd.inkling2_router import compile_inkling2_router_aot, compile_inkling2_gate_aot
     from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_norm_aot, compile_inkling2_kv_pack_aot
+    from b12x.integration.cuteafd.inkling2_mini_projections import (
+        compile_inkling2_mini_attn_in_proj_global_aot,
+        compile_inkling2_mini_attn_in_proj_local_aot,
+        compile_inkling2_mini_router_proj_aot,
+    )
 
     result = []
     def add(stem, op, compiler, **params):
@@ -688,6 +693,9 @@ def inkling2_mini_producer_programs(prefill_rows: int):
             compile_inkling2_loop_blend_norm_aot, hidden=2304, slots=slots,
             broadcast_dest=bcast, broadcast_weight=bcast)
     add("router_e128_k8", "router", compile_inkling2_router_aot, experts=128, topk=8, route_scale=8.)
+    add("attn_in_proj_local", "attn_in_proj_local", compile_inkling2_mini_attn_in_proj_local_aot)
+    add("attn_in_proj_global", "attn_in_proj_global", compile_inkling2_mini_attn_in_proj_global_aot)
+    add("router_proj", "router_proj", compile_inkling2_mini_router_proj_aot)
     return result
 
 

@@ -104,7 +104,7 @@ impl<'a> MiniKernels<'a> {
                 broadcast_weight,
             });
         }
-        ops.push(Op::Router);
+        ops.extend([Op::Router, Op::AttnInProjLocal, Op::AttnInProjGlobal, Op::RouterProj]);
         let mut producers = BTreeMap::new();
         for op in ops {
             producers.insert(op.name()?, Producer::load(programs, op)?);
@@ -137,9 +137,6 @@ impl<'a> MiniKernels<'a> {
         let projections_bf16 = DraftProjections::load_with_output(
             programs,
             &[
-                (HIDDEN, Q_WIDTH),
-                (HIDDEN, REL_WIDTH),
-                (HIDDEN, KV_WIDTH),
                 (Q_WIDTH, HIDDEN),
                 (64, 1024),
                 (2 * HIDDEN, GATE_RANK),
@@ -150,9 +147,6 @@ impl<'a> MiniKernels<'a> {
         let projections_f32 = DraftProjections::load_with_output(
             programs,
             &[
-                (HIDDEN, HEADS),     // attn_sink_proj -> F32 sinks
-                (HIDDEN, 32),        // dynamic conv weight_proj -> F32 taps
-                (HIDDEN, 128),       // router mlp.gate -> F32 logits
                 (GATE_RANK, 2 * HIDDEN), // controller [forget; gain] -> F32
             ],
             4096,
@@ -545,33 +539,47 @@ pub(crate) fn begin_visit<'a>(
         )
     };
 
-    // 3. Q / R / Gate (BF16) and Sinks (F32).
-    k.project_bf16(owner, xq, w("attn.wq_du.weight")?, b("q")?, rows, HIDDEN, Q_WIDTH)?;
-    k.project_bf16(owner, xq, w("attn.wr_du.weight")?, b("r")?, rows, HIDDEN, REL_WIDTH)?;
-    k.project_bf16(owner, xq, w("attn.gate_attn.weight")?, b("gate")?, rows, HIDDEN, Q_WIDTH)?;
-    k.project_f32(owner, xq, w("attn.attn_sink_proj.weight")?, b("sinks")?, rows, HIDDEN, HEADS)?;
+    // 3. Fused attention-input projections: Q / R / Gate / K / V (BF16) and Sinks [+ k/v dynamic] (F32).
+    if local {
+        // SAFETY: disjoint retained input, weight, and output planes on ordered stream.
+        unsafe {
+            k.producer(Op::AttnInProjLocal)?.launch(
+                &[
+                    xq, xk, xv,
+                    w("attn.wq_du.weight")?, w("attn.wr_du.weight")?, w("attn.gate_attn.weight")?,
+                    w("attn.attn_sink_proj.weight")?, w("attn.wk_dv.weight")?, w("attn.wv_dv.weight")?,
+                    b("q")?, b("r")?, b("gate")?, b("sinks")?, b("k_bf16")?, b("v_bf16")?,
+                ],
+                rows, None, owner.stream().raw,
+            )?;
+        }
+    } else {
+        // SAFETY: disjoint retained input, weight, and output planes on ordered stream.
+        unsafe {
+            k.producer(Op::AttnInProjGlobal)?.launch(
+                &[
+                    xq, xk, xv,
+                    w("attn.wq_du.weight")?, w("attn.wr_du.weight")?, w("attn.gate_attn.weight")?,
+                    w("attn.attn_sink_proj.weight")?, w("attn.wk_dv.weight")?, w("attn.wv_dv.weight")?,
+                    w("attn.k_sconv.weight_proj")?, w("attn.v_sconv.weight_proj")?,
+                    b("q")?, b("r")?, b("gate")?, b("sinks")?, b("k_bf16")?, b("v_bf16")?,
+                    b("k_dynamic")?, b("v_dynamic")?,
+                ],
+                rows, None, owner.stream().raw,
+            )?;
+        }
+    }
 
-    // 4. K & V projections (BF16 -> F32 conv -> BF16).
-    for (x, branch, proj, bf16_name, f32_name, conv_name, history) in [
-        (xk, "k", "wk_dv", "k_bf16", "k_f32", "conv_k", "k_conv_history"),
-        (xv, "v", "wv_dv", "v_bf16", "v_f32", "conv_v", "v_conv_history"),
+    // 4. K & V short-convolution (BF16 -> F32 conv -> BF16).
+    for (branch, bf16_name, f32_name, conv_name, history) in [
+        ("k", "k_bf16", "k_f32", "conv_k", "k_conv_history"),
+        ("v", "v_bf16", "v_f32", "conv_v", "v_conv_history"),
     ] {
-        k.project_bf16(owner, x, w(&format!("attn.{proj}.weight"))?, b(bf16_name)?, rows, HIDDEN, KV_WIDTH)?;
         k.widen_zero(owner, b(bf16_name)?, b(f32_name)?, rows * KV_WIDTH)?;
         let dynamic = if local {
             b(f32_name)?
         } else {
-            let dyn_name = format!("{branch}_dynamic");
-            k.project_f32(
-                owner,
-                x,
-                w(&format!("attn.{branch}_sconv.weight_proj"))?,
-                b(&dyn_name)?,
-                rows,
-                HIDDEN,
-                KV_HEADS * cfg.text.sconv_kernel,
-            )?;
-            b(&dyn_name)?
+            b(&format!("{branch}_dynamic"))?
         };
         k.convolution(
             owner,
@@ -829,15 +837,19 @@ pub(crate) fn prepare_routes<'a>(
     rows: usize,
 ) -> Result<()> {
     let prefix = format!("model.llm.layers.{layer}");
-    k.project_f32(
-        owner,
-        owner.buffer("projection_input")?,
-        target.operand(&format!("{prefix}.mlp.gate.weight"))?.buffer,
-        owner.buffer("route_logits")?,
-        rows,
-        HIDDEN,
-        128,
-    )?;
+    // SAFETY: retained BF16 input/weight and F32 route logits on ordered stream.
+    unsafe {
+        k.producer(Op::RouterProj)?.launch(
+            &[
+                owner.buffer("projection_input")?,
+                target.operand(&format!("{prefix}.mlp.gate.weight"))?.buffer,
+                owner.buffer("route_logits")?,
+            ],
+            rows,
+            None,
+            owner.stream().raw,
+        )?;
+    }
     // SAFETY: F32 router logits/bias -> I32 ids + F32 weights.
     unsafe {
         k.producer(Op::Router)?.launch(
