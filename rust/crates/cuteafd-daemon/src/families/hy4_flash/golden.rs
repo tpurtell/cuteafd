@@ -229,7 +229,10 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         .map(|ws| ws.iter().map(|w| w.tokens.len()).max().unwrap_or(1))
         .unwrap_or(raw_tokens.len())
         .max(max_resume);
-    let unit = args.prefill_units.unwrap_or(max_seq).min(4096);
+    let unit = args
+        .prefill_units
+        .map(|u| u.min(4096))
+        .unwrap_or_else(|| default_prefill_unit(max_seq));
     let max_pages = if !args.resume_at.is_empty() {
         (max_seq.div_ceil(64) * 3 + 16).max(64)
     } else if args.verify_waves {
@@ -1090,9 +1093,34 @@ fn run_resume_check(
     Ok(())
 }
 
+fn default_prefill_unit(max_seq: usize) -> usize {
+    let capped = max_seq.min(4096);
+    (capped - capped % 64).max(64)
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+
+    #[test]
+    fn default_prefill_unit_rounds_down_to_page_size_for_a00() -> anyhow::Result<()> {
+        // Published Hy4-flash window a00 has 1802 tokens (1802 % 64 == 10).
+        let a00_unit = super::default_prefill_unit(1802);
+        assert_eq!(a00_unit, 1792);
+        assert_eq!(a00_unit % 64, 0);
+        let spans = crate::shared::prefill_pipeline::prefill_units(1802, a00_unit, 1, 64)?;
+        assert_eq!(spans, vec![0..1792, 1792..1802]);
+
+        // Edge cases: sub-page, exact page multiples, and > 4096 cap.
+        assert_eq!(super::default_prefill_unit(0), 64);
+        assert_eq!(super::default_prefill_unit(37), 64);
+        assert_eq!(super::default_prefill_unit(64), 64);
+        assert_eq!(super::default_prefill_unit(127), 64);
+        assert_eq!(super::default_prefill_unit(128), 128);
+        assert_eq!(super::default_prefill_unit(4096), 4096);
+        assert_eq!(super::default_prefill_unit(8192), 4096);
+        Ok(())
+    }
 
     #[test]
     fn hy4f_golden_cli_parses() {
