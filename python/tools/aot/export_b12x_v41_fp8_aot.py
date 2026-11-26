@@ -214,7 +214,7 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
     if os.environ.get('CUTEAFD_EXPORT_HC_LAGGED') == '1':
         from b12x.norm.mhc._v41_lagged_aot import compile_v41_lagged_aot
         compile_v41_lagged_aot().export_to_c(str(output), 'v41_hc_lagged', 'cuteafd_v41_hc_lagged')
-        manifest['hc_lagged'] = {'scratch_bytes_per_row': 8000, 'max_rows': 80,
+        manifest['hc_lagged'] = {'scratch_bytes_per_row': 8000, 'max_rows': 256,
             'abi': validate_abi(output / 'v41_hc_lagged.h', 'v41_hc_lagged', 'hc_lagged')}
     dispatch_header(output, manifest)
     artifacts = {"v41_fp8_variants.h": hashlib.sha256((output / "v41_fp8_variants.h").read_bytes()).hexdigest()}

@@ -102,6 +102,18 @@ def test_v41_router_skinny_cap_matches_fork_constant():
     )
 
 
+def test_v41_hc_lagged_cap_matches_decode_ceiling():
+    """Drift guard: hc_lagged max rows in v41_fp8.cc, v41_hc.rs and export_b12x_v41_fp8_aot.py
+    must cover the full V4.1 decode/verify ceiling (256) so verify waves 81..256 never fall
+    back to non-row-invariant hc_mixes_workspace."""
+    fp8_cc = (ROOT / "native/families/deepseek_v41/src/v41_fp8.cc").read_text()
+    hc_rs = (ROOT / "rust/crates/cuteafd-ffi/src/families/deepseek_v41/v41_hc.rs").read_text()
+    exporter = (ROOT / "python/tools/aot/export_b12x_v41_fp8_aot.py").read_text()
+    assert "if(rows<1 || rows>256 || scratch_bytes<uint64_t(rows)*8000)" in fp8_cc
+    assert "if rows > 256 {" in hc_rs
+    assert "'max_rows': 256" in exporter
+
+
 def test_native_wide_dispatch_and_reducer_width():
     source = (ROOT / "native/shared/cuda/expert_router.cu").read_text()
     assert "experts>1024 || topk<1 || topk>16" in source

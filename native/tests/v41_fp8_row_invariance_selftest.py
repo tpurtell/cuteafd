@@ -177,6 +177,83 @@ def main() -> None:
 
         print(f"PASS {name:12s} K={k:5d} N={n:5d} recipes={recipes} rows=1..256", flush=True)
 
+    # 6. Verify V4.1 router (experts=384 backbone and experts=128 dSpark) bitwise row-invariance 1..256.
+    router_init = lib.cuteafd_v41_router_initialize
+    router_init.argtypes, router_init.restype = [], I
+    assert router_init() == 0, "cuteafd_v41_router_initialize failed"
+    router_fn = lib.cuteafd_v41_router
+    router_fn.argtypes, router_fn.restype = [P, P, P, P, P, P, P, P, I, I, P], I
+    stream = torch.cuda.current_stream().cuda_stream
+    for experts, topk in ((384, 6), (128, 3)):
+        torch.manual_seed(279300 + experts)
+        hx = (torch.randn((256, 5120), device="cuda") * 0.5).bfloat16().contiguous()
+        rw = (torch.randn((experts, 5120), device="cuda") * 0.02).bfloat16().contiguous()
+        rb = (torch.randn((experts,), device="cuda", dtype=torch.float32) * 0.05).contiguous()
+
+        def call_router(x_in, rows):
+            sc = torch.empty((rows, experts), device="cuda", dtype=torch.float32)
+            ids = torch.empty((rows, topk), device="cuda", dtype=torch.int32)
+            rt = torch.empty((rows, topk), device="cuda", dtype=torch.float32)
+            assert router_fn(
+                x_in.data_ptr(), rw.data_ptr(), rb.data_ptr(), 0, 0,
+                sc.data_ptr(), ids.data_ptr(), rt.data_ptr(), rows, experts, stream,
+            ) == 0
+            torch.cuda.synchronize()
+            return sc, ids, rt
+
+        ref_sc, ref_ids, ref_rt = [], [], []
+        for r in range(256):
+            s0, i0, r0 = call_router(hx[r:r + 1].contiguous(), 1)
+            ref_sc.append(s0[0]); ref_ids.append(i0[0]); ref_rt.append(r0[0])
+        ref_sc, ref_ids, ref_rt = torch.stack(ref_sc), torch.stack(ref_ids), torch.stack(ref_rt)
+        for rows in TEST_ROWS:
+            sc, ids, rt = call_router(hx, rows)
+            assert torch.equal(sc.view(torch.int32), ref_sc[:rows].view(torch.int32)), ("router_scores", experts, rows)
+            assert torch.equal(ids, ref_ids[:rows]), ("router_ids", experts, rows)
+            assert torch.equal(rt.view(torch.int32), ref_rt[:rows].view(torch.int32)), ("router_weights", experts, rows)
+        print(f"PASS v41_router   E={experts:5d} topk={topk} rows=1..256", flush=True)
+
+    # 7. Verify V4.1 mHC lagged begin (cuteafd_v41_hc_begin) bitwise row-invariance 1..256.
+    hc_init = lib.cuteafd_v41_hc_project_initialize
+    hc_init.argtypes, hc_init.restype = [], I
+    assert hc_init() == 0, "cuteafd_v41_hc_project_initialize failed"
+    hc_begin = lib.cuteafd_v41_hc_begin
+    hc_begin.argtypes, hc_begin.restype = [P, P, P, P, P, P, P, P, P, P, P, U, I, P], I
+    torch.manual_seed(279399)
+    res = (torch.randn((256, 4, 5120), device="cuda") * 0.25).bfloat16().contiguous()
+    hfn = (torch.randn((24, 20480), device="cuda", dtype=torch.float32) * 0.01).contiguous()
+    hsc = torch.tensor([0.1, 0.1, 0.1], device="cuda", dtype=torch.float32).contiguous()
+    hbi = torch.randn((24,), device="cuda", dtype=torch.float32).contiguous() * 0.05
+    hinc = torch.full((256, 4), 0.25, device="cuda", dtype=torch.float32).contiguous()
+    hnorm = torch.ones((5120,), device="cuda", dtype=torch.bfloat16).contiguous()
+
+    def call_hc(res_in, inc_in, rows):
+        pred = torch.empty((rows, 4), device="cuda", dtype=torch.float32)
+        post = torch.empty((rows, 4), device="cuda", dtype=torch.float32)
+        comb = torch.empty((rows, 4, 4), device="cuda", dtype=torch.float32)
+        normed = torch.empty((rows, 5120), device="cuda", dtype=torch.bfloat16)
+        scratch = torch.empty((rows * 8000,), device="cuda", dtype=torch.uint8)
+        assert hc_begin(
+            res_in.data_ptr(), hfn.data_ptr(), hsc.data_ptr(), hbi.data_ptr(),
+            inc_in.data_ptr(), hnorm.data_ptr(), pred.data_ptr(), post.data_ptr(),
+            comb.data_ptr(), normed.data_ptr(), scratch.data_ptr(), rows * 8000, rows, stream,
+        ) == 0
+        torch.cuda.synchronize()
+        return pred, post, comb, normed
+
+    ref_p, ref_po, ref_c, ref_n = [], [], [], []
+    for r in range(256):
+        p0, po0, c0, n0 = call_hc(res[r:r + 1].contiguous(), hinc[r:r + 1].contiguous(), 1)
+        ref_p.append(p0[0]); ref_po.append(po0[0]); ref_c.append(c0[0]); ref_n.append(n0[0])
+    ref_p, ref_po, ref_c, ref_n = torch.stack(ref_p), torch.stack(ref_po), torch.stack(ref_c), torch.stack(ref_n)
+    for rows in TEST_ROWS:
+        pred, post, comb, normed = call_hc(res, hinc, rows)
+        assert torch.equal(pred.view(torch.int32), ref_p[:rows].view(torch.int32)), ("hc_pred", rows)
+        assert torch.equal(post.view(torch.int32), ref_po[:rows].view(torch.int32)), ("hc_post", rows)
+        assert torch.equal(comb.view(torch.int32), ref_c[:rows].view(torch.int32)), ("hc_comb", rows)
+        assert torch.equal(normed.view(torch.uint16), ref_n[:rows].view(torch.uint16)), ("hc_normed", rows)
+    print("PASS v41_hc_begin rows=1..256", flush=True)
+
 
 if __name__ == "__main__":
     main()

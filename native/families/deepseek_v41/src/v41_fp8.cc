@@ -274,7 +274,7 @@ extern "C" int32_t cuteafd_v41_hc_begin(const void* residual, const void* fn,
     const void* scale, const void* bias, const void* incoming, const void* norm,
     void* predicted, void* post, void* comb, void* normalized, void* scratch,
     uint64_t scratch_bytes, int32_t rows, void* stream) {
-  if(rows<1 || rows>80 || scratch_bytes<uint64_t(rows)*8000) return cudaErrorInvalidValue;
+  if(rows<1 || rows>256 || scratch_bytes<uint64_t(rows)*8000) return cudaErrorInvalidValue;
   const void* pointers[]={residual,fn,scale,bias,incoming,norm,predicted,post,comb,normalized,scratch};
   const uint64_t sizes[]={uint64_t(rows)*40960,24*20480*4,12,96,uint64_t(rows)*16,10240,
     uint64_t(rows)*16,uint64_t(rows)*16,uint64_t(rows)*64,uint64_t(rows)*10240,uint64_t(rows)*8000};
