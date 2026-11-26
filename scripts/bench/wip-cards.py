@@ -2982,11 +2982,16 @@ def assert_absent(job):
             raise ValueError('refusing existing (possibly foreign) container: ' + name)
 
 
+def listening_ports():
+    """This host's TCP listen ports."""
+    return bound_ports(run(['ss', '-Hltn']).stdout)
+
+
 def assert_port_free(job):
     """Two separate jobs on disjoint GPUs can share a kit entry's fixed ADDR port;
     the second would then measure the first job's server. Refuse a bound port."""
     port = int(resolve_container_keys(job['entry'])['addr'].rpartition(':')[2])
-    if port in bound_ports(run(['ss', '-Hltn']).stdout):
+    if port in listening_ports():
         raise ValueError(f'refusing card: ADDR port {port} is already bound on raptor (another server is listening)')
 
 
