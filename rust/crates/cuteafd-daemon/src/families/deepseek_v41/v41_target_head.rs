@@ -131,6 +131,7 @@ pub(crate) struct TargetLogits<'a> {
     pub collapsed: CuteafdDeviceBuffer,
     pub normalized: CuteafdDeviceBuffer,
     pub logits: CuteafdDeviceBuffer,
+    pub stream: &'a LoadStream<'a>,
     pub selected_rows: &'a [usize],
     pub token_positions: &'a [u64],
     origin: Option<QueryBinding>,
@@ -546,6 +547,7 @@ impl<'a> TargetHeadWave<'a, '_> {
             collapsed: b(2),
             normalized: b(3),
             logits: b(4),
+            stream: &self.stream,
             selected_rows: &self.selected,
             token_positions: &self.tokens,
             origin: self.origin,
@@ -788,7 +790,7 @@ pub(crate) mod recording_sampler {
 
     fn read_u32s(library: &NativeLibrary, buffer: CuteafdDeviceBuffer, count: usize) -> Vec<u32> {
         let mut bytes = vec![0u8; count * 4];
-        library.copy_d2h(&mut bytes, buffer).unwrap();
+        library.copy_d2h_quiescent(&mut bytes, buffer).unwrap();
         bytes.chunks_exact(4).map(|w| u32::from_ne_bytes(w.try_into().unwrap())).collect()
     }
 
@@ -796,7 +798,7 @@ pub(crate) mod recording_sampler {
         vocab: usize,
     ) -> Vec<f32> {
         let mut bytes = vec![0u8; rows * vocab * 4];
-        library.copy_d2h(&mut bytes, logits).unwrap();
+        library.copy_d2h_quiescent(&mut bytes, logits).unwrap();
         bytes.chunks_exact(4).map(|w| f32::from_ne_bytes(w.try_into().unwrap())).collect()
     }
 
@@ -1239,7 +1241,7 @@ mod sampler_wiring_tests {
         // there: the others' slices stayed zero.
         let mask_device = fixture.wave.mask_device.buffer;
         let mut mask_bytes = vec![0u8; rows * words * 4];
-        fixture.library.copy_d2h(&mut mask_bytes, mask_device).unwrap();
+        fixture.library.copy_d2h_quiescent(&mut mask_bytes, mask_device).unwrap();
         let uploaded: Vec<u32> = mask_bytes.chunks_exact(4)
             .map(|word| u32::from_ne_bytes(word.try_into().unwrap())).collect();
         for row in 0..rows {
@@ -1475,13 +1477,15 @@ mod sampler_wiring_tests {
             &row_bytes, None).unwrap();
         assert_eq!(retained.select(None).unwrap(), draw, "the retained frontier is the stored draw");
         // The fix, serial lane: same decision through the packed-row path.
-        let retained = next.retain_recorded_from_device(&library, fixture.logits_buffer,
+        // Packed rows return without touching the stream; forget the dummy handle so Drop does not destroy null.
+        let dummy_stream = std::mem::ManuallyDrop::new(LoadStream { library: &library, raw: std::ptr::null_mut() });
+        let retained = next.retain_recorded_from_device(fixture.logits_buffer, &dummy_stream,
             frontier).unwrap();
         assert_eq!(retained.select(None).unwrap(), draw);
-        assert!(next.retain_from_device(&library, fixture.logits_buffer, frontier, None).is_err(),
+        assert!(next.retain_from_device(fixture.logits_buffer, &dummy_stream, frontier, None).is_err(),
             "the pre-fix call must still reject the draw on the packed path");
         // A greedy frontier peer still gets the cross-check and still passes it.
-        let retained = next.retain_from_device(&library, fixture.logits_buffer, 0, None).unwrap();
+        let retained = next.retain_from_device(fixture.logits_buffer, &dummy_stream, 0, None).unwrap();
         assert_eq!(retained.select(None).unwrap(), next.best[0]);
     }
 
@@ -1829,7 +1833,7 @@ mod sampler_device_tests {
             let mut cpu_us = Vec::new();
             for iteration in 0..12 {
                 let start = std::time::Instant::now();
-                library.copy_d2h(&mut host_rows, logits_buffer)?;
+                library.copy_d2h_quiescent(&mut host_rows, logits_buffer)?;
                 for (row, params) in params.iter().enumerate() {
                     let row_logits: Vec<f32> = host_rows[row * VOCAB * 4..(row + 1) * VOCAB * 4]
                         .chunks_exact(4).map(|w| f32::from_ne_bytes(w.try_into().unwrap()))
@@ -1842,7 +1846,7 @@ mod sampler_device_tests {
             let mut copy_us = Vec::new();
             for iteration in 0..12 {
                 let start = std::time::Instant::now();
-                library.copy_d2h(&mut host_rows, logits_buffer)?;
+                library.copy_d2h_quiescent(&mut host_rows, logits_buffer)?;
                 if iteration >= 2 { copy_us.push(start.elapsed().as_secs_f64() * 1e6); }
             }
             unsafe { library.cuda_stream_synchronize(stream)?; }
@@ -2020,7 +2024,7 @@ mod sampler_device_tests {
             let mut frontier_us = Vec::new();
             for iteration in 0..40 {
                 let start = std::time::Instant::now();
-                library.copy_d2h(&mut host, one_row)?;
+                library.copy_d2h_quiescent(&mut host, one_row)?;
                 if iteration >= 4 { frontier_us.push(start.elapsed().as_secs_f64() * 1e6); }
             }
             let mut buffer = buffer;
@@ -2300,7 +2304,7 @@ mod sampler_device_tests {
         /// The per-row parameter blocks actually resident on the device.
         fn device_params(&self) -> Result<Vec<u8>> {
             let mut raw = vec![0u8; self.rows * cuteafd_ffi::CUTEAFD_V41_SAMPLER_PARAM_BYTES];
-            self.library.copy_d2h(&mut raw, self.wave.param_device.buffer)?;
+            self.library.copy_d2h_quiescent(&mut raw, self.wave.param_device.buffer)?;
             Ok(raw)
         }
 
@@ -2314,7 +2318,7 @@ mod sampler_device_tests {
                 return Ok(Vec::new());
             }
             let mut raw = vec![0u8; rows * words * 4];
-            self.library.copy_d2h(&mut raw, self.wave.mask_device.buffer)?;
+            self.library.copy_d2h_quiescent(&mut raw, self.wave.mask_device.buffer)?;
             Ok(raw.chunks_exact(4).map(|word| u32::from_ne_bytes(word.try_into().unwrap())).collect())
         }
 
@@ -2325,7 +2329,7 @@ mod sampler_device_tests {
             slice.ptr = unsafe { slice.ptr.cast::<u8>().add(row * VOCAB * 4).cast() };
             slice.bytes = VOCAB * 4;
             let mut bytes = vec![0u8; VOCAB * 4];
-            self.library.copy_d2h(&mut bytes, slice)?;
+            self.library.copy_d2h_quiescent(&mut bytes, slice)?;
             Ok(bytes)
         }
     }
@@ -2677,7 +2681,8 @@ mod sampler_device_tests {
             "the pre-fix classification must reject the draw, else this test is vacuous");
         // The lane's serial `commit_lane` resolves a Device frontier through
         // `retain_from_device`; a packed row must take the same no-transfer path.
-        let retained = next.retain_recorded_from_device(&library, staged.logits, 2)?;
+        let staged_stream = std::mem::ManuallyDrop::new(LoadStream { library: &library, raw: staged.stream });
+        let retained = next.retain_recorded_from_device(staged.logits, &staged_stream, 2)?;
         assert_eq!(retained.select(None)?, draw);
         // The servable peers keep their device ids and the lane does not error.
         assert_eq!(next.best[1], device_ids[1], "the greedy peer keeps its id");

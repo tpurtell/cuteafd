@@ -21,7 +21,7 @@ impl Rank<'_> {
         let c=&self.config.transformer;let lib=self.stream.device.library;
         let count=(c.layers+1)*self.config.taps.len();
         let mut source=vec![0u8;count*2];
-        lib.copy_d2h(&mut source,self.weights.tensors.fuse.buffer)?;
+        lib.copy_d2h_quiescent(&mut source,self.weights.tensors.fuse.buffer)?;
         let values=source.chunks_exact(2).map(|v|f32::from_bits(u32::from(u16::from_le_bytes([v[0],v[1]]))<<16)).collect::<Vec<_>>();
         let alpha=values.chunks_exact(self.config.taps.len()).flat_map(|row| {
             let max=row.iter().copied().fold(f32::NEG_INFINITY,f32::max);

@@ -277,8 +277,9 @@ impl ScoreRows {
     /// retained tokens are checked against what the device was asked to select.
     /// A row that was already downloaded is reused in place, without a second
     /// copy or a second transfer.
-    pub fn retain_from_device(&self, lib: &cuteafd_ffi::NativeLibrary,
-        mut logits: cuteafd_ffi::CuteafdDeviceBuffer, row: usize, mask: Option<&[u32]>,
+    pub fn retain_from_device(&self,
+        mut logits: cuteafd_ffi::CuteafdDeviceBuffer, stream: &crate::shared::memory::LoadStream<'_>,
+        row: usize, mask: Option<&[u32]>,
     ) -> Result<RetainedScores> {
         if self.row_range(row).is_ok() {
             return self.retain_packed(row, mask);
@@ -290,7 +291,7 @@ impl ScoreRows {
         logits.ptr = unsafe { logits.ptr.cast::<u8>().add(row * row_bytes).cast() };
         logits.bytes = row_bytes;
         let mut bytes = vec![0; row_bytes];
-        lib.copy_d2h(&mut bytes, logits)?;
+        stream.copy_d2h(&mut bytes, logits)?;
         self.retain_downloaded_with(row, &bytes, mask)
     }
     /// Retain one row's frontier from device logits, trusting the recorded
@@ -300,8 +301,9 @@ impl ScoreRows {
     /// **stochastic** row: `self.best[row]` is a draw the verification already
     /// consumed, so there is no argmax to cross-check against. The downloaded
     /// row is still stored in full, so a later grammar can re-select from it.
-    pub fn retain_recorded_from_device(&self, lib: &cuteafd_ffi::NativeLibrary,
-        mut logits: cuteafd_ffi::CuteafdDeviceBuffer, row: usize,
+    pub fn retain_recorded_from_device(&self,
+        mut logits: cuteafd_ffi::CuteafdDeviceBuffer, stream: &crate::shared::memory::LoadStream<'_>,
+        row: usize,
     ) -> Result<RetainedScores> {
         if self.row_range(row).is_ok() {
             let range = self.row_range(row)?;
@@ -314,7 +316,7 @@ impl ScoreRows {
         logits.ptr = unsafe { logits.ptr.cast::<u8>().add(row * row_bytes).cast() };
         logits.bytes = row_bytes;
         let mut bytes = vec![0; row_bytes];
-        lib.copy_d2h(&mut bytes, logits)?;
+        stream.copy_d2h(&mut bytes, logits)?;
         self.retain_from_bytes(row, &bytes)
     }
     /// Apply one row's CPU fallback sample and **store it** as that row's

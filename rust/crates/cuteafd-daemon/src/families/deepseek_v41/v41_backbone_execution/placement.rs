@@ -847,8 +847,8 @@ mod tests {
                     for (a, b) in pairs {
                         let mut left = vec![0; a.bytes];
                         let mut right = vec![0; b.bytes];
-                        lib.copy_d2h(&mut left, a)?;
-                        lib.copy_d2h(&mut right, b)?;
+                        lib.copy_d2h_quiescent(&mut left, a)?;
+                        lib.copy_d2h_quiescent(&mut right, b)?;
                         assert_eq!(
                             left, right,
                             "placed query production differs from direct execution"
@@ -1000,7 +1000,7 @@ mod tests {
                     .into_iter()
                     .map(|buffer| {
                         let mut bytes = vec![0; buffer.bytes];
-                        lib.copy_d2h(&mut bytes, buffer)?;
+                        lib.copy_d2h_quiescent(&mut bytes, buffer)?;
                         Ok(bytes)
                     })
                     .collect::<Result<Vec<_>>>()
@@ -1077,7 +1077,7 @@ mod tests {
                     .into_iter()
                     .map(|buffer| {
                         let mut bytes = vec![0; buffer.bytes];
-                        lib.copy_d2h(&mut bytes, buffer)?;
+                        lib.copy_d2h_quiescent(&mut bytes, buffer)?;
                         Ok(bytes)
                     })
                     .collect::<Result<Vec<_>>>()

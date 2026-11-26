@@ -266,7 +266,7 @@ pub(crate) mod tests {
                 let source = CuteafdDeviceBuffer {
                     ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, bytes: count, ..buffer
                 };
-                device.run(|| lib.copy_d2h(&mut actual[..count], source))?;
+                device.run(|| lib.copy_d2h_quiescent(&mut actual[..count], source))?;
                 ensure!(actual[..count] == expected[..count], "vocabulary shard differs on GPU {id} at byte {offset}");
             }
             eprintln!("PASS GPU {id} vocabulary tokens {tokens:?}: all {bytes} bytes match checkpoint");

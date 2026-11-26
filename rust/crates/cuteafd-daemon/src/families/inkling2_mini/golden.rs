@@ -91,11 +91,10 @@ fn read_logits(library: &cuteafd_ffi::NativeLibrary, device_id: i32, logits: &De
         device_id,
         flags: 0,
     };
-    // Engine streams are created with `cudaStreamNonBlocking`, so null-stream `cudaMemcpy`
-    // (`copy_d2h`) does not order against `logits.stream`; drain before reading `logits.ptr`
-    // while the head logits buffer remains live during the callback.
-    library.cuda_device_synchronize()?;
-    library.copy_d2h(&mut bytes, buf)?;
+    crate::shared::memory::device::Device { library, id: device_id }.run(|| {
+        // SAFETY: `logits.stream` produced `logits` on `device_id` and remains live.
+        unsafe { library.copy_d2h(&mut bytes, buf, logits.stream) }
+    })?;
     Ok(bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))

@@ -809,7 +809,7 @@ impl<'a> IndexSelectionWave<'a> {
         dump::record(self.selection_dump.as_deref(), layer, layout, &positions, || {
             self.synchronize()?;
             let mut raw = vec![0u8; rows * 2048];
-            self.storage.stream.library.copy_d2h(&mut raw, slice(self.b(9), 0, rows * 2048))?;
+            self.storage.stream.copy_d2h(&mut raw, slice(self.b(9), 0, rows * 2048))?;
             let ids = dump::i32s(&raw);
             Ok((0..rows).map(|row| Row { position: positions[row], frontier: i32::try_from(metadata[row][1]).unwrap_or(i32::MAX),
                 ids: ids[row * 512..(row + 1) * 512].to_vec() }).collect())
@@ -919,7 +919,7 @@ impl<'a> IndexSelectionWave<'a> {
         let library = self.storage.stream.library;
         let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
             let mut bytes = vec![0; buffer.bytes];
-            if !bytes.is_empty() { library.copy_d2h(&mut bytes, buffer)?; }
+            if !bytes.is_empty() { self.storage.stream.copy_d2h(&mut bytes, buffer)?; }
             Ok(bytes)
         };
         let hash = |bytes: &[u8]| bytes.iter().fold(0xcbf29ce484222325u64,

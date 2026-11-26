@@ -182,7 +182,7 @@ impl<'a> KimiPrefix<'a> {
         self.drain().map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let mut digest = Sha256::new();
         for rank in 0..self.0.kda.len() {
-            let device = self.0.kda[rank].stream.device;
+            let stream = &self.0.kda[rank].stream;
             let mut buffers = self.state_buffers(rank, placement.slot)?;
             for (index, &page) in placement.units.iter().enumerate() {
                 let rows = placement.len.saturating_sub(index * MLA_PAGE_ROWS).min(MLA_PAGE_ROWS);
@@ -190,7 +190,7 @@ impl<'a> KimiPrefix<'a> {
             }
             for buffer in buffers {
                 let mut bytes = vec![0; buffer.bytes];
-                device.run(|| device.library.copy_d2h(&mut bytes, buffer))?;
+                stream.copy_d2h(&mut bytes, buffer)?;
                 digest.update(bytes);
             }
         }
@@ -207,7 +207,7 @@ impl<'a> KimiPrefix<'a> {
                 if rows == 0 { continue; }
                 for buffer in self.page_buffers(rank, page, rows)? {
                     let mut bytes = vec![0; buffer.bytes];
-                    self.0.kda[rank].stream.device.run(|| self.0.kda[rank].stream.device.library.copy_d2h(&mut bytes, buffer))?;
+                    self.0.kda[rank].stream.copy_d2h(&mut bytes, buffer)?;
                     images.push(bytes);
                 }
             }
@@ -594,7 +594,7 @@ mod tests {
             let boxed = |error: BoxError| anyhow::anyhow!("Kimi host fixture: {error}");
             let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
                 let mut bytes = vec![0; buffer.bytes];
-                library.copy_d2h(&mut bytes, buffer)?;
+                library.copy_d2h_quiescent(&mut bytes, buffer)?;
                 Ok(bytes)
             };
             let fill = |buffer: CuteafdDeviceBuffer, seed: usize| -> Result<Vec<u8>> {
@@ -789,7 +789,7 @@ mod tests {
             let family = KimiPrefix::new(&cfg, 256, [k0, k1], [m0, m1])?;
             let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
                 let mut bytes = vec![0; buffer.bytes];
-                library.copy_d2h(&mut bytes, buffer)?;
+                library.copy_d2h_quiescent(&mut bytes, buffer)?;
                 Ok(bytes)
             };
             let fill = |buffer: CuteafdDeviceBuffer, seed: usize| -> Result<Vec<u8>> {

@@ -183,7 +183,7 @@ fn native_fp8_two_stream_slots_are_byte_exact_against_serial() -> Result<()> {
             launch(slot)?;
             // SAFETY: owned stream; all its allocations remain live.
             unsafe { library.cuda_stream_synchronize(streams[slot].raw)?; }
-            library.copy_d2h(&mut serial[slot], outputs[slot].buffer)?;
+            streams[slot].copy_d2h(&mut serial[slot], outputs[slot].buffer)?;
             ensure!(serial[slot].iter().any(|&byte| byte != 0), "zero serial output");
         }
         ensure!(serial[0] != serial[1], "test inputs do not distinguish the executions");
@@ -196,7 +196,7 @@ fn native_fp8_two_stream_slots_are_byte_exact_against_serial() -> Result<()> {
             }
             for slot in 0..2 {
                 let mut actual = vec![0; serial[slot].len()];
-                library.copy_d2h(&mut actual, outputs[slot].buffer)?;
+                streams[slot].copy_d2h(&mut actual, outputs[slot].buffer)?;
                 ensure!(actual == serial[slot], "rows {rows} iteration {iteration} slot {slot}: concurrent bytes differ");
             }
         }
@@ -270,7 +270,7 @@ fn step5_checkpoint_mixed_native_execution_and_graph_replay() -> Result<()> {
         fatal_drain(unsafe { library.cuda_stream_synchronize(stream.raw) }.map_err(Into::into), "expert test warmup");
         result?;
         let mut eager = vec![vec![0; rows * 4096 * 2]; groups.len()];
-        for (output, bytes) in outputs.iter().zip(&mut eager) { library.copy_d2h(bytes, output.buffer)?; }
+        for (output, bytes) in outputs.iter().zip(&mut eager) { stream.copy_d2h(bytes, output.buffer)?; }
         // SAFETY: only precompiled launches over stable allocations occur during capture.
         unsafe { library.cuda_graph_begin_capture(stream.raw)?; }
         let result = launch();
@@ -289,7 +289,7 @@ fn step5_checkpoint_mixed_native_execution_and_graph_replay() -> Result<()> {
             result?;
             for (group, output) in outputs.iter().enumerate() {
                 let mut actual = vec![0; rows * 4096 * 2];
-                library.copy_d2h(&mut actual, output.buffer)?;
+                stream.copy_d2h(&mut actual, output.buffer)?;
                 ensure!(actual == eager[group], "group {group} rows {rows}: graph changed bytes");
                 let (mut dot, mut aa, mut bb, mut error) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
                 for row in 0..rows {

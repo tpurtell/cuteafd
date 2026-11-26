@@ -279,7 +279,7 @@ mod tests {
         testing::replay(device, layout, root.path(), 1, 0)?;
         let read = |allocation: &Allocation<'_>| -> Result<Vec<u8>> {
             let mut bytes = vec![0; allocation.buffer.bytes];
-            library.copy_d2h(&mut bytes, allocation.buffer)?;
+            library.copy_d2h_quiescent(&mut bytes, allocation.buffer)?;
             Ok(bytes)
         };
         for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
@@ -348,8 +348,8 @@ mod tests {
                 owner.inventory(&mut inventory, &expected[index].0)?;
                 let bytes = [12, 6, 24, 36, 4][index];
                 let mut actual = vec![0; bytes]; let mut wanted = vec![0; bytes];
-                device.run(|| { library.copy_d2h(&mut actual, CuteafdDeviceBuffer { bytes, ..owner.buffer })?;
-                    library.copy_d2h(&mut wanted, CuteafdDeviceBuffer { bytes, ..baseline[index].buffer }) })?;
+                device.run(|| { library.copy_d2h_quiescent(&mut actual, CuteafdDeviceBuffer { bytes, ..owner.buffer })?;
+                    library.copy_d2h_quiescent(&mut wanted, CuteafdDeviceBuffer { bytes, ..baseline[index].buffer }) })?;
                 assert_eq!(actual, wanted, "{} recorded={recorded}", expected[index].0);
             }
             assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(), 1);

@@ -246,7 +246,7 @@ impl Workspace<'_> {
         stream.drain()?;
         let read = |buffer: Buffer, bytes: usize| -> Result<Vec<u8>> {
             let mut out = vec![0u8; bytes];
-            self.device.run(|| self.device.library.copy_d2h(&mut out, Buffer { bytes, ..buffer }))?;
+            stream.copy_d2h(&mut out, Buffer { bytes, ..buffer })?;
             Ok(out)
         };
         let positions: Vec<u64> = read(r.positions, r.rows * 8)?.chunks_exact(8)
@@ -575,7 +575,7 @@ mod tests {
 
     fn native_read(device: Device<'_>, buffer: Buffer, bytes: usize) -> Result<Vec<u8>> {
         let mut out = vec![0; bytes];
-        device.run(|| device.library.copy_d2h(&mut out, buffer))?;
+        device.run(|| device.library.copy_d2h_quiescent(&mut out, buffer))?;
         Ok(out)
     }
 

@@ -410,7 +410,7 @@ impl<'w, 'a> Worker<'w, 'a> {
                     self.library.cuda_stream_synchronize(self.stream.raw)?;
                 }
                 let output = super::super::exlr8::view(execution.output()?, 0, rows * output_stride)?;
-                self.library.copy_d2h(&mut exchange.partials[first * output_stride..(first + rows) * output_stride], output)?;
+                self.stream.copy_d2h(&mut exchange.partials[first * output_stride..(first + rows) * output_stride], output)?;
                 if let Some(timing) = &mut self.timing {
                     // SAFETY: the drain above finished both event records.
                     unsafe { timing.publish(identity.0, identity.1, rows as u32, identity.3, "exlr8")?; }

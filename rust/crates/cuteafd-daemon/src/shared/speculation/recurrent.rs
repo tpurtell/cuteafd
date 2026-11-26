@@ -87,13 +87,13 @@ impl<'a> Drafter<'a> {
             self.lead.stream.drain()?;
             let count=sequences.len()*self.lead.config.predictions()*4;
             let mut bytes=vec![0;count];
-            lib.copy_d2h(&mut bytes,Buffer{bytes:count,..selected})?;
+            self.lead.stream.copy_d2h(&mut bytes,Buffer{bytes:count,..selected})?;
             let tokens=bytes.chunks_exact(4).map(|v|u32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
             let predictions=self.lead.config.predictions();
             // Candidate probability per drafted token (exp of the argmax log-softmax),
             // read only while the policy or a speculation trace uses it.
             let confidence=if self.scores.get() {
-                lib.copy_d2h(&mut bytes,Buffer{bytes:count,..self.lead.buffer("head.logprob")?})?;
+                self.lead.stream.copy_d2h(&mut bytes,Buffer{bytes:count,..self.lead.buffer("head.logprob")?})?;
                 bytes.chunks_exact(4).map(|v|f32::from_le_bytes(v.try_into().unwrap()).exp()).collect::<Vec<_>>()
             } else { Vec::new() };
             Ok(tokens.chunks_exact(predictions).enumerate().map(|(index,tokens)|Draft{tokens:tokens.to_vec(),features:vec![],

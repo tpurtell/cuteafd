@@ -113,7 +113,7 @@ mod tests {
             producers[0].drain()?;
             for lane in 0..2 {
                 let mut bytes=vec![0;4096];
-                peer.run(|| lib.copy_d2h(&mut bytes,destination[lane].buffer))?;
+                peer.run(|| lib.copy_d2h_quiescent(&mut bytes,destination[lane].buffer))?;
                 assert_eq!(bytes,vec![11+lane as u8;4096]);
             }
             // An enqueue error after issuing copies must drain captured storage.

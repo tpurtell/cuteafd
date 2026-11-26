@@ -344,7 +344,7 @@ mod tests {
                 for (plane, _) in PAGE_PLANES {
                     let buffer = bank.page(layer, plane, page)?;
                     let mut bytes = vec![0; buffer.bytes];
-                    bank.stream.device.run(|| bank.stream.device.library.copy_d2h(&mut bytes, buffer))?;
+                    bank.stream.copy_d2h(&mut bytes, buffer)?;
                     out.push(bytes);
                 }
             }
@@ -372,10 +372,8 @@ mod tests {
             let length = view(bank.plane("lengths")?, placement.slot * 4, 4)?;
             let mut bytes = vec![0; table.bytes];
             let mut frontier = [0; 4];
-            bank.stream.device.run(|| {
-                bank.stream.device.library.copy_d2h(&mut bytes, table)?;
-                bank.stream.device.library.copy_d2h(&mut frontier, length)
-            })?;
+            bank.stream.copy_d2h(&mut bytes, table)?;
+            bank.stream.copy_d2h(&mut frontier, length)?;
             let ids = bytes.chunks_exact(4).map(|entry| i32::from_le_bytes(entry.try_into().unwrap()))
                 .collect::<Vec<_>>();
             assert_eq!(&ids[..placement.units.len()], placement.units.iter().map(|&id| id as i32)
@@ -514,13 +512,13 @@ mod tests {
             assert_eq!(read_page(&family, page)?, bytes);
         }
         let mut bytes = vec![0; scratch.buffer.bytes];
-        scratch.device.run(|| library.copy_d2h(&mut bytes, scratch.buffer))?;
+        scratch.device.run(|| library.copy_d2h_quiescent(&mut bytes, scratch.buffer))?;
         assert_eq!(bytes[0], 0x5a);
         assert!(bytes[1..].iter().all(|&byte| byte == 0xb3));
         // begin_unit's full residual copy replaces host_tail's byte before the
         // first layer sees it; no permanent model state aliases this scratch.
         scratch.device.run(|| library.copy_h2d(scratch.buffer, &vec![0x61; scratch.buffer.bytes]))?;
-        scratch.device.run(|| library.copy_d2h(&mut bytes, scratch.buffer))?;
+        scratch.device.run(|| library.copy_d2h_quiescent(&mut bytes, scratch.buffer))?;
         assert!(bytes.iter().all(|&byte| byte == 0x61));
         cache.release(&family, &hit.placement.units)?;
         cache.clear(&family)?;

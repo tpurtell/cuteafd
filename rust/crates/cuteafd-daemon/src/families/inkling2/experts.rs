@@ -281,7 +281,7 @@ mod resident_tests {
         resident.enqueue(input.buffer, ids.buffer, weights.buffer, output.buffer, 2, &stream)?;
         stream.drain()?;
         let mut observed = vec![0; output.buffer.bytes];
-        library.copy_d2h(&mut observed, output.buffer)?;
+        library.copy_d2h_quiescent(&mut observed, output.buffer)?;
         assert!(observed.iter().all(|&byte| byte == 0x4d));
         let other = Stream::new(device)?;
         assert!(resident.enqueue(input.buffer, ids.buffer, weights.buffer, output.buffer, 2, &other).is_err());

@@ -95,7 +95,9 @@ impl<'a> DenseEngine<'a> {
         let library = self.stream.device.library;
         let initial = self.mark_regions().into_iter().map(|region| {
             let mut bytes = vec![0; region.bytes];
-            library.copy_d2h(&mut bytes, region)?;
+            let stream = if region.device_id == self.stream.device.id { &self.stream }
+                else { &self.peer.as_ref().expect("admitted peer").stream };
+            stream.copy_d2h(&mut bytes, region)?;
             Ok(bytes)
         }).collect::<Result<Vec<_>>>()?;
         let reset = |engine: &mut Self| -> Result<()> {
@@ -126,7 +128,7 @@ impl<'a> DenseEngine<'a> {
             ensure!(tap.site == TapSite::LayerExit(layer) && tap.rows == rows.len() && tap.hidden == self.cfg.hidden,
                 "dense verify tap ordering/shape differs");
             let mut bytes = vec![0; rows.len() * self.cfg.hidden * 2];
-            self.stream.device.library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { ptr: tap.ptr.cast_mut(),
+            self.stream.copy_d2h(&mut bytes, CuteafdDeviceBuffer { ptr: tap.ptr.cast_mut(),
                 bytes: rows.len() * self.cfg.hidden * 2, device_id: self.stream.device.id,
                 ..CuteafdDeviceBuffer::default() })?;
             tap_bytes.push(bytes);
@@ -143,12 +145,14 @@ impl<'a> DenseEngine<'a> {
         ensure!(active == 7, "dense verify fixture active rows changed");
         self.restore(&original)?;
         let library = self.stream.device.library;
+        let stream_raw = self.stream.raw;
         for (active, &token) in tokens[..7].iter().enumerate() {
             let mut expected_taps = vec![Vec::new(); layers.len()];
             let expected = self.evaluate(&[token], |layer, hidden| {
                 if let Some(index) = layers.iter().position(|&id| id == layer) {
                     expected_taps[index].resize(hidden.bytes, 0);
-                    library.copy_d2h(&mut expected_taps[index], hidden)?;
+                    // SAFETY: `stream_raw` produced `hidden` on rank 0 and remains live.
+                    unsafe { library.copy_d2h(&mut expected_taps[index], hidden, stream_raw)?; }
                 }
                 Ok(())
             })?;
@@ -171,14 +175,18 @@ impl<'a> DenseEngine<'a> {
             let mut replay = Vec::new();
             for region in self.mark_regions() {
                 let mut bytes = vec![0; region.bytes];
-                library.copy_d2h(&mut bytes, region)?;
+                let stream = if region.device_id == self.stream.device.id { &self.stream }
+                    else { &self.peer.as_ref().expect("admitted peer").stream };
+                stream.copy_d2h(&mut bytes, region)?;
                 replay.push(bytes);
             }
             reset(self)?;
             for &token in &tokens[..keep] { self.evaluate(&[token], |_, _| Ok(()))?; }
             for (region, expected) in self.mark_regions().into_iter().zip(replay) {
                 let mut bytes = vec![0; region.bytes];
-                library.copy_d2h(&mut bytes, region)?;
+                let stream = if region.device_id == self.stream.device.id { &self.stream }
+                    else { &self.peer.as_ref().expect("admitted peer").stream };
+                stream.copy_d2h(&mut bytes, region)?;
                 ensure!(bytes == expected, "dense accepted-input replay state differs for keep={keep}");
             }
             reset(self)?;
@@ -222,7 +230,9 @@ impl<'a> DenseEngine<'a> {
             engine.drain()?;
             engine.mark_regions().into_iter().map(|region| {
                 let mut bytes = vec![0; region.bytes];
-                library.copy_d2h(&mut bytes, region)?;
+                let stream = if region.device_id == engine.stream.device.id { &engine.stream }
+                    else { &engine.peer.as_ref().expect("admitted peer").stream };
+                stream.copy_d2h(&mut bytes, region)?;
                 Ok(bytes)
             }).collect()
         };
@@ -274,7 +284,9 @@ impl<'a> DenseEngine<'a> {
                     let offset = (slot.pages[position / 64] as usize * 64 + position % 64) * record;
                     for pool in engine.kv.iter().flatten() {
                         let mut bytes = vec![0; record];
-                        library.copy_d2h(&mut bytes, view(pool.buffer, offset, record)?)?;
+                        let stream = if pool.buffer.device_id == engine.stream.device.id { &engine.stream }
+                            else { &engine.peer.as_ref().expect("admitted peer").stream };
+                        stream.copy_d2h(&mut bytes, view(pool.buffer, offset, record)?)?;
                         output.push(bytes);
                     }
                 }

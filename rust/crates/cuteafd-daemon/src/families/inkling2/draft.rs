@@ -299,8 +299,8 @@ mod tests{
         let hit=host.lookup(&snapshot.meta.tokens).context("host attachment missing")?;
         assert!(matches!(host.restore(hit.key,&RestoreTarget{pages:snapshot.pages.clone(),tail:snapshot.tail.clone(),
             draft:None,scores:vec![]}),RestoreOutcome::Done{..}));
-        for (buffer,expected) in full.iter().zip(&originals){let mut actual=vec![0;buffer.bytes];library.copy_d2h(&mut actual,*buffer)?;assert_eq!(&actual,expected);}
-        let mut actual=vec![0;mark.bytes];library.copy_d2h(&mut actual,mark)?;assert_eq!(actual,mark_bytes);
+        for (buffer,expected) in full.iter().zip(&originals){let mut actual=vec![0;buffer.bytes];library.copy_d2h_quiescent(&mut actual,*buffer)?;assert_eq!(&actual,expected);}
+        let mut actual=vec![0;mark.bytes];library.copy_d2h_quiescent(&mut actual,mark)?;assert_eq!(actual,mark_bytes);
         pool.check_attachment(&attachment)?;
         Ok(())
     }
@@ -336,7 +336,7 @@ mod tests{
         for segment in &segments{library.copy_h2d(*segment,&vec![0;segment.bytes])?;}
         engine.h2d_many(CopyStream::Restore,&copies.iter().map(|(device,host)|(*host,*device)).collect::<Vec<_>>())?;
         engine.synchronize(CopyStream::Restore)?;
-        for (segment,expected) in segments.iter().zip(&originals){let mut actual=vec![0;segment.bytes];library.copy_d2h(&mut actual,*segment)?;assert_eq!(&actual,expected);}
+        for (segment,expected) in segments.iter().zip(&originals){let mut actual=vec![0;segment.bytes];library.copy_d2h_quiescent(&mut actual,*segment)?;assert_eq!(&actual,expected);}
         let weak=Rc::downgrade(&owner);drop(owner);assert!(weak.upgrade().is_some());
         engine.release_chunk(chunk)?;drop(engine);assert!(weak.upgrade().is_none());Ok(())
     }

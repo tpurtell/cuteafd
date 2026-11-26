@@ -954,7 +954,7 @@ mod tests {
                         assert_eq!(view.rows, 80);
                         assert_eq!(view.layer_index, layer);
                         let mut text_mask = vec![0; 80];
-                        lib.copy_d2h(&mut text_mask, view.text_mask)?;
+                        lib.copy_d2h_quiescent(&mut text_mask, view.text_mask)?;
                         assert_eq!(
                             text_mask,
                             batch.image_mask.iter().map(|&m| 1 - m).collect::<Vec<_>>()

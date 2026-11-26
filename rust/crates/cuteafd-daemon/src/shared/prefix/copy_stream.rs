@@ -27,7 +27,7 @@
 //! The reader list must name every stream that touches the rank's prefix
 //! storage; a stream missing from it is not ordered and would race.
 use anyhow::{ensure, Context, Result};
-use cuteafd_ffi::NativeLibrary;
+use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary};
 use std::cell::RefCell;
 use std::ffi::c_void;
 
@@ -179,6 +179,17 @@ impl<'a> PrefixCopies<'a> {
         let result = unsafe { self.library.cuda_stream_synchronize(state.stream) };
         self.library.cuda_set_device(previous)?;
         result
+    }
+
+    /// Copy `dst.len()` bytes from `src` to host memory on rank `rank`'s copy stream.
+    pub(crate) fn copy_d2h(&self, rank: usize, dst: &mut [u8], src: CuteafdDeviceBuffer) -> Result<()> {
+        let state = self.ranks.get(rank).context("prefix copy rank out of range")?.borrow();
+        let previous = self.library.cuda_get_device()?;
+        self.library.cuda_set_device(state.device)?;
+        // SAFETY: the copy stream was created by this owner on `state.device` and is live.
+        let result = unsafe { self.library.copy_d2h(dst, src, state.stream) };
+        let restored = self.library.cuda_set_device(previous);
+        result.and(restored)
     }
 }
 

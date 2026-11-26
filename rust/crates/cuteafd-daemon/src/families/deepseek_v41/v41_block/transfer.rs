@@ -315,7 +315,7 @@ mod tests {
                     .into_iter()
                     .map(|b| {
                         let mut bytes = vec![0; b.bytes];
-                        lib.copy_d2h(&mut bytes, b)?;
+                        lib.copy_d2h_quiescent(&mut bytes, b)?;
                         Ok(bytes)
                     })
                     .collect::<Result<Vec<_>>>()
@@ -345,7 +345,7 @@ mod tests {
                 .into_iter()
                 .map(|b| {
                     let mut bytes = vec![0; b.bytes];
-                    lib.copy_d2h(&mut bytes, b)?;
+                    lib.copy_d2h_quiescent(&mut bytes, b)?;
                     Ok(bytes)
                 })
                 .collect::<Result<Vec<_>>>()
@@ -402,8 +402,8 @@ mod tests {
                 let mut left = vec![0; a.bytes];
                 let mut right = vec![0; b.bytes];
                 devices[1].run(|| {
-                    lib.copy_d2h(&mut left, a)?;
-                    lib.copy_d2h(&mut right, b)
+                    lib.copy_d2h_quiescent(&mut left, a)?;
+                    lib.copy_d2h_quiescent(&mut right, b)
                 })?;
                 assert_eq!(
                     left, right,

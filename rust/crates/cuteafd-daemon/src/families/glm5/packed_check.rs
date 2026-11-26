@@ -25,7 +25,8 @@ fn state(engine: &GlmEngine<'_>, placement: &GlmPlacement) -> Result<Vec<u8>> {
                         let view = crate::shared::prefix::view(buffer, offset, bytes)?;
                         let first = out.len();
                         out.resize(first + bytes, 0);
-                        engine.library.copy_d2h(&mut out[first..], view)?;
+                        // SAFETY: `engine.stream_of(rank)` produced `view` on this device.
+                        unsafe { engine.library.copy_d2h(&mut out[first..], view, engine.stream_of(rank))?; }
                         Ok(())
                     };
                     if let Some((records, row_bytes)) = records {

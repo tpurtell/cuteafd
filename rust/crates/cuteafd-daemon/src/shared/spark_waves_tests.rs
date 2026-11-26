@@ -67,7 +67,7 @@ fn gpu_reply_copy_engine_bandwidth() -> Result<()> {
         samples.sort_by(f64::total_cmp);
         eprintln!("reply_ce case={name} median_gbps={:.3} min_gbps={:.3} max_gbps={:.3}", samples[2], samples[0], samples[4]);
         let mut actual = vec![0u8; BYTES];
-        library.copy_d2h(&mut actual, output.buffer)?;
+        library.copy_d2h_quiescent(&mut actual, output.buffer)?;
         ensure!(actual == host.bytes(), "CE output differs for {name}");
     }
     Ok(())
@@ -145,7 +145,7 @@ fn gpu_reply_ce_land_before_arrival_pressure() -> Result<()> {
         copy_stream.drain()?;
         for stream in &streams { stream.drain()?; }
         let mut actual = vec![0u8; host.buffer.bytes];
-        library.copy_d2h(&mut actual, output.buffer)?;
+        library.copy_d2h_quiescent(&mut actual, output.buffer)?;
         ensure!(actual == host.bytes(), "CE output differs under {pressure}-stream pressure");
     }
     Ok(())
@@ -370,7 +370,7 @@ fn gpu_reply_ce_current_event_depth_three() -> Result<()> {
             let mut actual = vec![0u8; BYTES];
             let view = CuteafdDeviceBuffer { ptr: (output.buffer.ptr as usize + slot * BYTES) as *mut c_void,
                 bytes: BYTES, ..output.buffer };
-            library.copy_d2h(&mut actual, view)?;
+            library.copy_d2h_quiescent(&mut actual, view)?;
             ensure!(actual == host.bytes(), "fixture slot {slot} differs, CE={ce}");
         }
         eprintln!("reply_ce_ring ce={ce} waves={WAVES} depth={SLOTS} bytes={BYTES} arrival_delay_us=19000 rank_skew_us=750 elapsed_ms={:.3} wave_ms={:.3} host_land_wait_ms={:.3} max_ahead={max_ahead}",
@@ -1049,7 +1049,7 @@ fn gpu_exchange_queues_a_step_ahead_and_lands_byte_exact() -> Result<()> {
         for (layer, (output, expected)) in outputs.iter().zip(all).enumerate() {
             let rows = widths[layer];
             let mut actual = vec![0u8; rows * row_bytes];
-            library.copy_d2h(&mut actual, output.buffer)?;
+            library.copy_d2h_quiescent(&mut actual, output.buffer)?;
             if actual != *expected {
                 let first = actual.iter().zip(expected.iter()).position(|(a, e)| a != e).unwrap();
                 let bad = actual.chunks(row_bytes).zip(expected.chunks(row_bytes)).filter(|(a, e)| a != e).count();
@@ -1141,7 +1141,7 @@ fn gpu_decode_reduction_captured_before_first_wave_reads_replay_format() -> Resu
         // SAFETY: this live stream has no concurrent writers.
         unsafe { library.cuda_stream_synchronize(stream.raw())?; }
         let mut actual = vec![0; rows * row_bytes];
-        library.copy_d2h(&mut actual, output.buffer)?;
+        library.copy_d2h_quiescent(&mut actual, output.buffer)?;
         assert!(actual.chunks_exact(2).all(|b| b == 0x4000u16.to_le_bytes()), "replay mode {mode}");
     }
     drop(graph);
@@ -1725,7 +1725,7 @@ fn gpu_pinned_pull_waits_for_its_rank_and_the_control_clobbers() -> Result<()> {
             ((total.to_bits() >> 16) as u16).to_le_bytes()
         }).collect();
         let mut actual = vec![0u8; rows * row_bytes];
-        library.copy_d2h(&mut actual, outputs[1].buffer)?;
+        library.copy_d2h_quiescent(&mut actual, outputs[1].buffer)?;
         if control {
             ensure!(actual != expected, "negative control: a pull without its arrival wait read the reply anyway");
         } else {

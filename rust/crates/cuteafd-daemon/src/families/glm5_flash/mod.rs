@@ -2337,7 +2337,9 @@ impl Opened {
             args.resolved_decode_rows() > engine::DECODE_ROWS))?;
         tracing::info!(loaded, skipped, "GLM 5.3 Flash programs loaded on the coordinator GPU");
         probe("lead-programs")?;
-        let stream = self.library.cuda_stream_create()?;
+        let stream_owner = std::rc::Rc::new(crate::shared::memory::device::Stream::new(
+            crate::shared::memory::device::Device { library: &self.library, id: args.device })?);
+        let stream = stream_owner.raw;
         // The head split's second GPU and its stream; a head split needs its share's programs
         // (`glmf2`) in this build.
         let split_device = match args.split_device {
@@ -2382,17 +2384,21 @@ impl Opened {
         }
         cuteafd_bench::context::set_resolved("attention-placement", &attention.mode.to_string());
         cuteafd_bench::context::set_resolved("index-cache", match index_cache { engine::IndexCache::Compact => "compact", engine::IndexCache::Keys => "keys" });
-        let peer_stream = match split_device {
+        let peer_stream_owner = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
                 self.library.cuda_enable_peer(device)?;
                 self.library.cuda_set_device(device)?;
-                let stream = self.library.cuda_enable_peer(args.device).and_then(|()| self.library.cuda_stream_create());
+                let peer_enabled = self.library.cuda_enable_peer(args.device);
                 self.library.cuda_set_device(args.device)?;
-                Some((device, stream?))
+                peer_enabled?;
+                let owner = std::rc::Rc::new(crate::shared::memory::device::Stream::new(
+                    crate::shared::memory::device::Device { library: &self.library, id: device })?);
+                Some((device, owner))
             }
             None => None,
         };
+        let peer_stream = peer_stream_owner.as_ref().map(|(device, owner)| (*device, owner.raw));
         let started = Instant::now();
         // The prefix mark arena on the layout this engine serves, its index cache resolved above:
         // both admissions reserve these marks, and `prefix_cache` allocates as many.
@@ -2894,7 +2900,7 @@ impl Opened {
         let records = early_workspaces.as_ref().map(|w| w.prefill_scratch()
             .context("shared replay records need prefill lanes")).transpose()?;
         let pages = (pool_tokens + reserved_units as usize * engine::UNIT_ROWS).div_ceil(engine::PAGE_ROWS);
-        let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
+        let mut engine = engine::GlmfEngine::new(&self.library, &programs, self.cfg.clone(), model, std::rc::Rc::clone(&stream_owner),
             max_context, args.prefill_rows, args.prefill_waves, args.prefill_span_rows, pages, args.slots, embedding, index_cache,
             args.kda_state, args.resolved_decode_rows(), records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool,
             &execution, step_experts)?;
@@ -2914,8 +2920,8 @@ impl Opened {
         tracing::info!(target_head = ?engine.target_head, requested = ?args.target_head,
             fp8_head = args.head_format.setting(), head = engine.weights.head.name(),
             "GLM 5.3 Flash target head");
-        if let Some((device, peer_stream)) = peer_stream {
-            engine.attach_peer(device, peer_stream, shares.pop().context("head-split shares")?, &execution)?;
+        if let Some((device, ref peer_owner)) = peer_stream_owner {
+            engine.attach_peer(device, std::rc::Rc::clone(peer_owner), shares.pop().context("head-split shares")?, &execution)?;
             tracing::info!(device = args.device, split_device = device, attention = %attention.mode,
                 "GLM 5.3 Flash head split over two GPUs");
         }
@@ -3049,12 +3055,9 @@ impl Opened {
             }, || engine.check_tp2_routes(), || body(&engine));
         probe("post-checks")?;
         drop(engine);
-        // SAFETY: the engine that used the streams is gone.
-        unsafe { self.library.cuda_stream_destroy(stream)? };
-        if let Some((device, peer_stream)) = peer_stream {
-            crate::shared::peer_split::on_device(&self.library, device,
-                // SAFETY: as above.
-                || unsafe { self.library.cuda_stream_destroy(peer_stream) })?;
+        std::rc::Rc::into_inner(stream_owner).context("glm5_flash lead stream still referenced")?.destroy()?;
+        if let Some((_, peer_owner)) = peer_stream_owner {
+            std::rc::Rc::into_inner(peer_owner).context("glm5_flash peer stream still referenced")?.destroy()?;
         }
         result
     }

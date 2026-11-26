@@ -316,7 +316,7 @@ fn run_fanout_client(
         ring.flush_sends()?;
     }
     let mut output = vec![0_u8; values * std::mem::size_of::<f32>()];
-    native.copy_d2h(&mut output, local)?;
+    native.copy_d2h_quiescent(&mut output, local)?;
     for value in bytes_to_f32(&output) {
         anyhow::ensure!(
             (value - 1.0).abs() < 1.0e-6,

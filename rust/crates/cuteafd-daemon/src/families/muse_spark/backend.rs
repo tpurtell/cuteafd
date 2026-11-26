@@ -98,7 +98,7 @@ impl scheduler::DraftState for DraftState {
 pub(crate) struct MuseBackend<'r, 'a> {
     pub(crate) cfg: &'r MuseSparkConfig,
     pub(crate) ranks: &'r [RankResources<'a>],
-    streams: Vec<*mut c_void>,
+    pub(crate) streams: Vec<*mut c_void>,
     table: &'r TokenEmbedding<'a>,
     experts: RefCell<&'r mut dyn SparkExperts>,
     peer: Option<&'r super::peer::MusePeer<'a>>,

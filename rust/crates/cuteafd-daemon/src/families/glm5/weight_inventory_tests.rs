@@ -561,10 +561,10 @@ fn bf16_kv_b_mount_and_push_match_dev_layout_byte_for_byte() -> Result<()> {
             let expected_v = &raw[base + d * lat * 2..base + (d + v) * lat * 2];
             loader.on_rank(head, |_| {
                 let mut actual = vec![0; k.len()];
-                library.copy_d2h(&mut actual, uk.buffer)?;
+                library.copy_d2h_quiescent(&mut actual, uk.buffer)?;
                 assert_eq!(actual, k);
                 actual.resize(expected_v.len(), 0);
-                library.copy_d2h(&mut actual, uv.buffer)?;
+                library.copy_d2h_quiescent(&mut actual, uv.buffer)?;
                 assert_eq!(actual, expected_v);
                 Ok(())
             })?;
@@ -885,7 +885,7 @@ fn rotary_tables_are_exact_target_arena_views_with_no_new_device_allocation() ->
                     engine::fill_rotary(&library, &cfg, alpha.as_ref(), active, &rotary)?;
                     assert_eq!(rotary.buffer.bytes, bytes, "retain full admitted extent");
                     let mut actual = vec![0; expected.len() * 4];
-                    library.copy_d2h(&mut actual, rotary.buffer)?;
+                    library.copy_d2h_quiescent(&mut actual, rotary.buffer)?;
                     assert_eq!(actual, expected.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<_>>());
                     assert!(engine::fill_rotary(&library, &cfg, alpha.as_ref(), 65, &rotary).is_err());
                     Ok(())
@@ -956,7 +956,7 @@ fn peer_routers_use_one_target_backing_and_replay_identical_push_bytes() -> Resu
                 .find(|(name, _)| name == &format!("operand.{key}"))
                 .context("peer router allocation")?.1;
             let mut actual = vec![0; expected.len()];
-            library.copy_d2h(&mut actual, buffer)?;
+            library.copy_d2h_quiescent(&mut actual, buffer)?;
             assert_eq!(actual, expected, "peer router {name}");
         }
     }
@@ -1055,7 +1055,7 @@ fn glm_and_ml4_k6_min_max_push_plans_preserve_packed_bytes() -> Result<()> {
                 for (buffer, bytes) in [(weights.payload.buffer, &expected.payload),
                     (weights.suh.buffer, &expected.suh), (weights.svh.buffer, &expected.svh)] {
                     let mut actual = vec![0; buffer.bytes];
-                    library.copy_d2h(&mut actual, buffer)?;
+                    library.copy_d2h_quiescent(&mut actual, buffer)?;
                     assert_eq!(&actual, bytes, "{} ranks={ranks} ml4={ml4}", layout.stem);
                 }
             }

@@ -152,7 +152,7 @@ pub(crate) fn initialize<'a>(
                     for range in scalars {
                         ensure!(range.len() % 4 == 0, "partial NVFP4 scalar");
                         let mut image = vec![0; range.len()];
-                        arena.device().run(|| arena.device().library.copy_d2h(
+                        arena.device().run(|| arena.device().library.copy_d2h_quiescent(
                             &mut image, arena.buffer(range.clone())?))?;
                         scalar_convention.validate_bytes(&image)?;
                     }
@@ -165,8 +165,8 @@ pub(crate) fn initialize<'a>(
                         let mut a = vec![0; gate.len()];
                         let mut b = vec![0; up.len()];
                         arena.device().run(|| {
-                            arena.device().library.copy_d2h(&mut a, arena.buffer(gate.clone())?)?;
-                            arena.device().library.copy_d2h(&mut b, arena.buffer(up.clone())?)?;
+                            arena.device().library.copy_d2h_quiescent(&mut a, arena.buffer(gate.clone())?)?;
+                            arena.device().library.copy_d2h_quiescent(&mut b, arena.buffer(up.clone())?)?;
                             cuteafd_loader::formats::fp8_experts::Fp8ExpertTensors::check_input_scales(*layer, &a, &b)
                         })?;
                     }
@@ -399,7 +399,7 @@ pub(crate) fn expand_rows(
         while end > 0 {
             let start = end.saturating_sub(per);
             let mut packed = vec![0; (end - start) * width];
-            device.library.copy_d2h(
+            device.library.copy_d2h_quiescent(
                 &mut packed,
                 arena.buffer(region.start + start * width..region.start + end * width)?,
             )?;
@@ -436,7 +436,7 @@ pub(crate) fn widen_scales(
         while end > 0 {
             let start = end.saturating_sub(per);
             let mut raw = vec![0; (end - start) * 2];
-            device.library.copy_d2h(
+            device.library.copy_d2h_quiescent(
                 &mut raw,
                 arena.buffer(region.start + start * 2..region.start + end * 2)?,
             )?;
@@ -484,7 +484,7 @@ pub(crate) fn exl3(
                     let mut image = vec![0; count];
                     device
                         .library
-                        .copy_d2h(&mut image, sub(owner, base + start, count)?)?;
+                        .copy_d2h_quiescent(&mut image, sub(owner, base + start, count)?)?;
                     ensure!(
                         image
                             .chunks_exact(2)
@@ -528,7 +528,7 @@ pub(crate) fn exlr8(
             arena
                 .device()
                 .library
-                .copy_d2h(&mut signs, sub(owner, offset, residency.hidden)?)?;
+                .copy_d2h_quiescent(&mut signs, sub(owner, offset, residency.hidden)?)?;
             ensure!(
                 signs.iter().all(|v| matches!(v, 1 | 255)),
                 "EXLR8 sign vector contains a value other than +/-1"

@@ -726,7 +726,7 @@ mod tests {
                     self.stream
                         .device
                         .library
-                        .copy_d2h(&mut output, self.planes[plane].buffer)
+                        .copy_d2h_quiescent(&mut output, self.planes[plane].buffer)
                 })?;
                 Ok(output)
             };
@@ -904,7 +904,7 @@ mod tests {
                     _ => HIDDEN,
                 };
                 let mut actual = vec![0; rows * width * if f32 { 4 } else { 2 }];
-                device.run(|| library.copy_d2h(&mut actual, chain.planes[index + 1].buffer))?;
+                device.run(|| library.copy_d2h_quiescent(&mut actual, chain.planes[index + 1].buffer))?;
                 let a = values(&actual, f32)?;
                 let mut exact = false;
                 for oracle in ["official_native", "official_f32"] {
@@ -967,7 +967,7 @@ mod tests {
             for (index, expected) in eager.iter().enumerate() {
                 let mut actual = vec![0; expected.len()];
                 device
-                    .run(|| library.copy_d2h(&mut actual, graph.pins.planes[index + 1].buffer))?;
+                    .run(|| library.copy_d2h_quiescent(&mut actual, graph.pins.planes[index + 1].buffer))?;
                 ensure!(
                     actual == *expected,
                     "dense graph replay differs at boundary {index}"
@@ -995,7 +995,7 @@ mod tests {
                     &format!("official_native_r{rows}_{output}"),
                 )?;
                 let mut actual = vec![0; expected.len()];
-                device.run(|| library.copy_d2h(&mut actual, chain.planes[stage + 1].buffer))?;
+                device.run(|| library.copy_d2h_quiescent(&mut actual, chain.planes[stage + 1].buffer))?;
                 if matches!(stage, 2 | 4) {
                     eprintln!(
                         "isolated rows={rows} op={output} byte_exact={}",

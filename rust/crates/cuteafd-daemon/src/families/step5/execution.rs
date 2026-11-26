@@ -1361,7 +1361,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
         };
         self.execution.stages[rank].stream.drain()?;
         let mut bytes = vec![0; self.rows() * H * 4];
-        device.run(|| device.library.copy_d2h(&mut bytes, output))?;
+        self.execution.stages[rank].stream.copy_d2h(&mut bytes, output)?;
         self.execution.diagnostic_outputs.borrow_mut().insert(layer, bytes);
         Ok(())
     }
@@ -1535,10 +1535,10 @@ impl<E: CopyEngine> LayerKernels for Bindings<'_, '_, '_, '_, '_, E> {
             for rank in 0..2 {
                 self.execution.stages[rank].stream.drain()?;
                 let (owner, _) = self.execution.diagnostic_layer0(rank)?;
-                let device = self.execution.caches[rank].borrow().stream.device;
-                super::golden::dump_plane(directory, &format!("rank{rank}-attention_input"), device,
+                let stream = &self.execution.stages[rank].stream;
+                super::golden::dump_plane(directory, &format!("rank{rank}-attention_input"), stream,
                     owner.diagnostic_norm(), self.rows(), true)?;
-                super::golden::dump_plane(directory, &format!("rank{rank}-o_partial"), device,
+                super::golden::dump_plane(directory, &format!("rank{rank}-o_partial"), stream,
                     owner.projection_partial()?, self.rows(), false)?;
             }
         }

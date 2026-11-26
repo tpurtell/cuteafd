@@ -1481,7 +1481,7 @@ mod tests {
             self.bank.stream.drain()?;
             self.bank.stream.device.run(|| {
                 let mut out = vec![0; buffer.bytes];
-                self.bank.stream.device.library.copy_d2h(&mut out, buffer)?;
+                self.bank.stream.device.library.copy_d2h_quiescent(&mut out, buffer)?;
                 Ok(out)
             })
         }
@@ -1882,7 +1882,7 @@ mod tests {
             let control = units[1].split_plane("control")?;
             let words = || -> Result<[u32; 2]> {
                 let mut bytes = vec![0; 64];
-                units[1].stream.device.run(|| library.copy_d2h(&mut bytes, control))?;
+                units[1].stream.device.run(|| library.copy_d2h_quiescent(&mut bytes, control))?;
                 let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
                 Ok([word(32), word(44)])
             };

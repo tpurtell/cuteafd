@@ -198,17 +198,17 @@ mod tests {
             assert!(window.queue_ring(1, first, at(2)).is_err());
             while !window.ring_ready(1)? { std::thread::yield_now(); }
             let mut actual = vec![0; bytes];
-            lib.copy_d2h(&mut actual, slice(at(2), 0, bytes))?;
+            lib.copy_d2h_quiescent(&mut actual, slice(at(2), 0, bytes))?;
             assert_eq!(actual, vec![29; bytes]);
             window.queue_ring(1, second, at(2))?;
             window.abort_ring(1)?;
             window.release(second)?;
             assert!(window.release(first).is_err());
             while !window.ring_ready(0)? { std::thread::yield_now(); }
-            lib.copy_d2h(&mut actual, slice(at(1), 0, bytes))?;
+            lib.copy_d2h_quiescent(&mut actual, slice(at(1), 0, bytes))?;
             assert_eq!(actual, original);
             let mut direct = vec![0; bytes];
-            lib.copy_d2h(&mut direct, slice(at(0), 0, bytes))?;
+            lib.copy_d2h_quiescent(&mut direct, slice(at(0), 0, bytes))?;
             assert_eq!(actual, direct);
             window.release(first)?;
         }
@@ -234,7 +234,7 @@ mod tests {
             let resumed = window.begin_request(1, 3)?;
             window.restore_ring(resumed, saved, storage.buffer)?;
             let mut restored = vec![0; bytes];
-            lib.copy_d2h(&mut restored, slice(window.ring.buffer, V41DsparkCache::SLOT_BYTES, bytes))?;
+            lib.copy_d2h_quiescent(&mut restored, slice(window.ring.buffer, V41DsparkCache::SLOT_BYTES, bytes))?;
             assert_eq!(restored, original);
             assert_eq!(window.committed_end(resumed)?, Some(end));
             assert!(window.validate(old).is_err());

@@ -216,7 +216,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
                 let output = suffix.output()?;
                 let mut bytes = Vec::new();
                 for buffer in [output.residual, output.pre] {
-                    let mut value = vec![0; buffer.bytes]; lib.copy_d2h(&mut value, buffer)?;
+                    let mut value = vec![0; buffer.bytes]; lib.copy_d2h_quiescent(&mut value, buffer)?;
                     bytes.extend_from_slice(&value);
                 }
                 if let Some(expected) = &expected { assert!(&bytes == expected, "encoder pair differs at {left}+{right}+{tail}"); }
@@ -268,7 +268,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             let output = suffix.output()?;
             let mut bytes = Vec::new();
             for buffer in [output.residual, output.pre] {
-                let mut value = vec![0; buffer.bytes]; lib.copy_d2h(&mut value, buffer)?;
+                let mut value = vec![0; buffer.bytes]; lib.copy_d2h_quiescent(&mut value, buffer)?;
                 bytes.extend_from_slice(&value);
             }
             if let Some(expected) = &expected { assert!(&bytes == expected, "five-chunk encoder stream differs"); }
@@ -425,7 +425,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             .iter()
             .all(|&p| p == committed + count as u64 - 1));
         let mut bytes = vec![0; logits.logits.bytes];
-        lib.copy_d2h(&mut bytes, logits.logits)?;
+        lib.copy_d2h_quiescent(&mut bytes, logits.logits)?;
         let values = bytes
             .chunks_exact(4)
             .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
@@ -453,7 +453,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
                 && a.position == b.position
                 && a.kind == b.kind));
         let mut tap_bytes = vec![0; taps.values().bytes];
-        lib.copy_d2h(&mut tap_bytes, taps.values())?;
+        lib.copy_d2h_quiescent(&mut tap_bytes, taps.values())?;
         assert!(tap_bytes.chunks_exact(2).all(|b| f32::from_bits(
             (u16::from_le_bytes(b.try_into().unwrap()) as u32) << 16
         )
@@ -471,7 +471,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
                 unsafe { main.execute_rows(taps.values(), taps.batch_identity(), taps.rows())? };
             let output = proposal.output()?;
             let mut bytes = vec![0; output.bytes];
-            lib.copy_d2h(&mut bytes, output)?;
+            lib.copy_d2h_quiescent(&mut bytes, output)?;
             assert!(bytes.chunks_exact(2).all(|b| f32::from_bits(
                 (u16::from_le_bytes(b.try_into().unwrap()) as u32) << 16
             )
@@ -480,7 +480,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
             for stage in 0..3 {
                 let output = proposal.kv_output(stage)?;
                 let mut bytes = vec![0; output.bytes];
-                lib.copy_d2h(&mut bytes, output)?;
+                lib.copy_d2h_quiescent(&mut bytes, output)?;
                 assert!(bytes.chunks_exact(2).all(|b| f32::from_bits(
                     (u16::from_le_bytes(b.try_into().unwrap()) as u32) << 16
                 )
@@ -675,7 +675,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
                         .iter()
                         .map(|&buffer| {
                             let mut bytes = vec![0; buffer.bytes];
-                            lib.copy_d2h(&mut bytes, buffer)?;
+                            lib.copy_d2h_quiescent(&mut bytes, buffer)?;
                             Ok(bytes)
                         })
                         .collect()
@@ -766,7 +766,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
                     pass.execute(&requests, &mut verify, &mut transport, 0, &selected)
                 })?;
                 let mut bytes = vec![0; output.logits.bytes];
-                lib.copy_d2h(&mut bytes, output.logits)?;
+                lib.copy_d2h_quiescent(&mut bytes, output.logits)?;
                 let values = bytes
                     .chunks_exact(4)
                     .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
@@ -839,7 +839,7 @@ fn real_target_prefill_commit_and_decode() -> Result<()> {
                         pass.execute(&requests, &mut resumed, &mut transport, 0, &[0])
                     })?;
                     let mut bytes = vec![0; output.logits.bytes];
-                    lib.copy_d2h(&mut bytes, output.logits)?;
+                    lib.copy_d2h_quiescent(&mut bytes, output.logits)?;
                     resumed_next = Some(
                         bytes
                             .chunks_exact(4)
@@ -942,7 +942,7 @@ fn qualify_main_prefixes(
     let check_untouched = |windows: &[DsparkWindow<'_>]| -> Result<()> {
         for window in windows {
             let mut bytes = vec![0; window.ring_for_test().bytes];
-            lib.copy_d2h(&mut bytes, window.ring_for_test())?;
+            lib.copy_d2h_quiescent(&mut bytes, window.ring_for_test())?;
             assert!(bytes.iter().all(|&b| b == 0x5a));
         }
         Ok(())
@@ -1074,8 +1074,8 @@ fn qualify_main_prefixes(
     for stage in 0..3 {
         let mut actual = vec![0; windows[stage].ring_for_test().bytes];
         let mut expected = vec![0; full[stage].ring_for_test().bytes];
-        lib.copy_d2h(&mut actual, windows[stage].ring_for_test())?;
-        lib.copy_d2h(&mut expected, full[stage].ring_for_test())?;
+        lib.copy_d2h_quiescent(&mut actual, windows[stage].ring_for_test())?;
+        lib.copy_d2h_quiescent(&mut expected, full[stage].ring_for_test())?;
         for slot in 0..16 {
             let n = accepted[slot] as usize;
             let begin = slot * STRIDE;

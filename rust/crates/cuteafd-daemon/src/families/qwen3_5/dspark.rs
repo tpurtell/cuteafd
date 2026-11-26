@@ -77,7 +77,8 @@ fn tapped_rows(library: &NativeLibrary, drafter: &DsparkDrafter<'_>, rows: usize
     let bytes = rows * drafter.cfg.taps.len() * drafter.cfg.hidden * 2;
     ensure!(rows <= TAP_ROWS, "dense draft tap read exceeds capacity");
     let mut host = vec![0; bytes];
-    library.copy_d2h(&mut host, CuteafdDeviceBuffer { bytes, ..drafter.taps.buffer })?;
+    // SAFETY: `drafter.stream_raw()` produced `drafter.taps` on this device and remains live.
+    unsafe { library.copy_d2h(&mut host, CuteafdDeviceBuffer { bytes, ..drafter.taps.buffer }, drafter.stream_raw())?; }
     Ok(host)
 }
 
@@ -100,8 +101,11 @@ fn check_draft_prefix(library: &NativeLibrary, drafter: &DsparkDrafter<'_>, taps
             for segment in drafter.page_segments(page)? {
                 let len = segment.bytes / 64 * rows;
                 let mut host = vec![0; len];
-                library.copy_d2h(&mut host, CuteafdDeviceBuffer { ptr: segment.addr as *mut _,
-                    bytes: len, device_id: library.cuda_get_device()?, ..CuteafdDeviceBuffer::default() })?;
+                // SAFETY: `drafter.stream_raw()` produced this page segment on this device.
+                unsafe {
+                    library.copy_d2h(&mut host, CuteafdDeviceBuffer { ptr: segment.addr as *mut _,
+                        bytes: len, device_id: library.cuda_get_device()?, ..CuteafdDeviceBuffer::default() }, drafter.stream_raw())?;
+                }
                 bytes.push(host);
             }
         }

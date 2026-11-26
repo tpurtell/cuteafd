@@ -699,7 +699,8 @@ pub(crate) fn prefill_digest(engine: &GlmfEngine<'_>, placement: &mut GlmfPlacem
 fn download(engine: &GlmfEngine<'_>, rank: usize, range: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
     engine.synchronize()?;
     let mut bytes = vec![0u8; range.bytes];
-    engine.on(rank, || engine.library.copy_d2h(&mut bytes, range))?;
+    // SAFETY: `engine.stream_of(rank)` produced `range` on rank's device.
+    engine.on(rank, || unsafe { engine.library.copy_d2h(&mut bytes, range, engine.stream_of(rank)) })?;
     Ok(bytes)
 }
 

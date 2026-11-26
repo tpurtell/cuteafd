@@ -253,7 +253,7 @@ mod tests {
             .into_iter()
             .map(|b| {
                 let mut bytes = vec![0; b.bytes];
-                lib.copy_d2h(&mut bytes, b)?;
+                lib.copy_d2h_quiescent(&mut bytes, b)?;
                 Ok(bytes)
             })
             .collect()

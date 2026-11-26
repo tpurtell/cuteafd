@@ -205,6 +205,10 @@ impl<'a> VisionRuntime<'a> {
     pub fn encode(&mut self, image: &V41Image) -> Result<Buffer> {
         self.encode_patches(image.patches(), image.grid(), None)
     }
+    pub(super) fn stream(&self) -> &LoadStream<'a> {
+        &self.stream
+    }
+
     // Optional observer is only for numerical qualification, and sees completed
     // outputs. Normal execution queues the entire image before one final drain.
     pub(super) fn encode_patches(
@@ -442,7 +446,7 @@ mod push_tests {
             let mut error = None;
             runtime.weights.visit("", &mut |name, buffer| {
                 let mut bytes = vec![0u8; buffer.bytes];
-                match lib.copy_d2h(&mut bytes, buffer) { Ok(()) => out.push((name, bytes)), Err(e) => error = Some(e) }
+                match lib.copy_d2h_quiescent(&mut bytes, buffer) { Ok(()) => out.push((name, bytes)), Err(e) => error = Some(e) }
             });
             error.map_or(Ok(out), Err)
         };

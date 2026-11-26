@@ -120,13 +120,13 @@ mod tests {
                     assert_eq!(bank.attention_device(layer)?.id,expected);
                     assert_eq!(view.device_end.device_id,expected);
                     let mut end = [255;8];
-                    bank.attention_device(layer)?.run(|| lib.copy_d2h(&mut end,view.device_end))?;
+                    bank.attention_device(layer)?.run(|| lib.copy_d2h_quiescent(&mut end,view.device_end))?;
                     assert_eq!(end,[0;8]);
                     if replicated {
                         let replica=bank.windows[layer].replica().unwrap();
                         let peer=unsafe { replica.view(&bank.windows[layer],request.windows[layer])? };
                         assert_eq!(peer.device_end.device_id,1-expected);
-                        replica.device().run(||lib.copy_d2h(&mut end,peer.device_end))?;
+                        replica.device().run(||lib.copy_d2h_quiescent(&mut end,peer.device_end))?;
                         assert_eq!(end,[0;8]);
                     }
                 }
@@ -143,7 +143,7 @@ mod tests {
                         let peer=unsafe { replica.view(bank.sources[index].source_cache(),0,0)? };
                         assert_eq!(peer.values.device_id,1-gpu as i32);
                         let mut end=[255;8];
-                        replica.device().run(||lib.copy_d2h(&mut end,peer.device_rows))?;
+                        replica.device().run(||lib.copy_d2h_quiescent(&mut end,peer.device_rows))?;
                         assert_eq!(end,[0;8]);
                     }
                 }

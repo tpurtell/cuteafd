@@ -362,7 +362,8 @@ fn download(engine: &Qwen4Engine<'_>, range: CuteafdDeviceBuffer) -> Result<Vec<
         // SAFETY: the owner stream retires every write to this live range.
         unsafe { engine.library.cuda_stream_synchronize(stream)? };
         let mut bytes = vec![0u8; range.bytes];
-        engine.library.copy_d2h(&mut bytes, range)?;
+        // SAFETY: `stream` owns `range`'s writes on `range.device_id` and remains live.
+        unsafe { engine.library.copy_d2h(&mut bytes, range, stream)?; }
         Ok(bytes)
     })
 }

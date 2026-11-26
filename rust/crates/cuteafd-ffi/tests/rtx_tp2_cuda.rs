@@ -159,7 +159,10 @@ fn rtx_expert_capacities_initialize_and_launch_on_both_devices() -> Result<()> {
                     lib.cuda_stream_synchronize(arenas[device].stream)?;
                 }
                 let mut actual = vec![0; output.bytes];
-                lib.copy_d2h(&mut actual, *output)?;
+                // SAFETY: `arenas[device].stream` produced `*output` on this device.
+                unsafe {
+                    lib.copy_d2h(&mut actual, *output, arenas[device].stream)?;
+                }
                 ensure!(
                     actual
                         .chunks_exact(4)
@@ -291,14 +294,20 @@ fn rtx_combine_and_geometry_route_sums_match_exact_formula() -> Result<()> {
                     }
                     for rank in 0..2 {
                         let mut actual = vec![0; partials[rank].bytes];
-                        lib.copy_d2h(&mut actual, partials[rank])?;
+                        // SAFETY: `arena.stream` produced/consumed `partials[rank]` on this device.
+                        unsafe {
+                            lib.copy_d2h(&mut actual, partials[rank], arena.stream)?;
+                        }
                         ensure!(
                             actual == payloads[rank],
                             "partial mismatch {dtype:?} count={count} rank={rank} device={device}"
                         );
                     }
                     let mut actual = vec![0; output.bytes];
-                    lib.copy_d2h(&mut actual, output)?;
+                    // SAFETY: `arena.stream` produced `output` on this device.
+                    unsafe {
+                        lib.copy_d2h(&mut actual, output, arena.stream)?;
+                    }
                     ensure!(
                         actual == expected,
                         "sum mismatch {dtype:?} count={count} device={device}"
@@ -354,7 +363,10 @@ fn rtx_combine_and_geometry_route_sums_match_exact_formula() -> Result<()> {
                 lib.cuda_stream_synchronize(arena.stream)?;
             }
             let mut actual = vec![0; sums.bytes];
-            lib.copy_d2h(&mut actual, sums)?;
+            // SAFETY: `arena.stream` produced `sums` on this device.
+            unsafe {
+                lib.copy_d2h(&mut actual, sums, arena.stream)?;
+            }
             ensure!(
                 actual == expected,
                 "geometry sum differs for {geometry:?} on device {device}"
@@ -364,8 +376,8 @@ fn rtx_combine_and_geometry_route_sums_match_exact_formula() -> Result<()> {
                 unsafe {
                     reducer.sum_routes(routes, sums, rows as u32, arena.stream)?;
                     lib.cuda_stream_synchronize(arena.stream)?;
+                    lib.copy_d2h(&mut actual, sums, arena.stream)?;
                 }
-                lib.copy_d2h(&mut actual, sums)?;
                 ensure!(
                     actual == expected,
                     "new sum is not byte-exact against V4.1 legacy sum"

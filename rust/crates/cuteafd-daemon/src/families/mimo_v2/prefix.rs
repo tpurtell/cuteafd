@@ -417,7 +417,7 @@ impl PrefixFamily for MimoPrefix<'_, '_> {
             // The metadata words are written only by the copy stream.
             self.copies.synchronize(0)?;
             let mut bytes = [0u8; 8];
-            self.engine.library.copy_d2h(&mut bytes, target)?;
+            self.copies.copy_d2h(0, &mut bytes, target)?;
             self.draft_floors.borrow_mut()[ring] = usize::try_from(u64::from_le_bytes(bytes))?;
         }
         placement.len = len;
@@ -508,7 +508,7 @@ mod tests {
                         // SAFETY: retire every queued copy before host inspection or storage release.
                         unsafe { library.cuda_stream_synchronize(stream.raw)?; }
                         let mut actual = vec![0; destination.bytes];
-                        library.copy_d2h(&mut actual, destination)?;
+                        library.copy_d2h_quiescent(&mut actual, destination)?;
                         let mut expected = vec![0; destination.bytes];
                         for (ring_row, _, rows) in runs(1, ring_rows, state.rows, len) {
                             let at = (ring_row % ring_rows) * row;

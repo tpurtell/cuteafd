@@ -125,7 +125,9 @@ pub(crate) fn packed_state(engine: &RefCell<DenseEngine<'_>>, placement: &Placem
     let mut bytes = Vec::new();
     for region in regions {
         let mut data = vec![0; region.bytes];
-        target.stream.device.library.copy_d2h(&mut data, region)?;
+        let stream = if region.device_id == target.stream.device.id { &target.stream }
+            else { &target.peer.as_ref().expect("admitted peer").stream };
+        stream.copy_d2h(&mut data, region)?;
         bytes.extend(data);
     }
     Ok(bytes)
@@ -143,7 +145,9 @@ pub(crate) fn check(engine: &RefCell<DenseEngine<'_>>, tokens: &[u32]) -> Result
         target.drain()?;
         DensePrefix::state(&target, 0).into_iter().map(|region| {
             let mut bytes = vec![0; region.bytes];
-            target.stream.device.library.copy_d2h(&mut bytes, region)?;
+            let stream = if region.device_id == target.stream.device.id { &target.stream }
+                else { &target.peer.as_ref().expect("admitted peer").stream };
+            stream.copy_d2h(&mut bytes, region)?;
             Ok(bytes)
         }).collect()
     };
@@ -204,7 +208,10 @@ pub(crate) fn check_backend_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens:
         }
         let mut bytes = regions.into_iter().map(|region| {
             let mut bytes = vec![0; region.bytes];
-            library.copy_d2h(&mut bytes, region)?;
+            let target = engine.borrow();
+            let stream = if region.device_id == target.stream.device.id { &target.stream }
+                else { &target.peer.as_ref().expect("admitted peer").stream };
+            stream.copy_d2h(&mut bytes, region)?;
             Ok(bytes)
         }).collect::<Result<Vec<_>>>()?;
         if let Some(saved) = family.capture_draft_pages(placement, placement.len).map_err(boxed)? {
@@ -217,7 +224,7 @@ pub(crate) fn check_backend_frontiers(engine: &RefCell<DenseEngine<'_>>, tokens:
                     let segment_bytes = if family.mtp.is_some() && part > 0 { segment.bytes }
                         else { segment.bytes / 64 * rows };
                     let mut data = vec![0; segment_bytes];
-                    library.copy_d2h(&mut data, CuteafdDeviceBuffer { ptr: segment.addr as *mut _,
+                    engine.borrow().stream.copy_d2h(&mut data, CuteafdDeviceBuffer { ptr: segment.addr as *mut _,
                         bytes: segment_bytes, device_id: library.cuda_get_device()?, ..Default::default() })?;
                     bytes.push(data);
                 }

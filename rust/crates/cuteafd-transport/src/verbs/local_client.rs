@@ -977,7 +977,7 @@ mod tests {
                                 // SAFETY: the slot lies inside the allocated plane, whose wave landed.
                                 let view = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>()
                                     .add(offset) }.cast(), bytes: got.len(), ..buffer };
-                                library.copy_d2h(&mut got, view)?;
+                                library.copy_d2h_quiescent(&mut got, view)?;
                             }
                             anyhow::ensure!(landed == plane.is_some(), "request {} landed={landed}", request.header.request_id);
                             anyhow::ensure!(got == expected, "request {} echo differs (offset {offset})", request.header.request_id);
@@ -1093,7 +1093,7 @@ mod tests {
                         if !chunk.landed { got.copy_from_slice(chunk.partial_output_payload.as_ref()); }
                         Ok(())
                     })? {}
-                    if let Some(buffer) = plane.filter(|_| landed) { library.copy_d2h(&mut got, buffer)?; }
+                    if let Some(buffer) = plane.filter(|_| landed) { library.copy_d2h_quiescent(&mut got, buffer)?; }
                     anyhow::ensure!(frames == 1, "the echo arrived as {frames} receive completions");
                     anyhow::ensure!(got == expected, "request {} echo differs", index + 1);
                 }

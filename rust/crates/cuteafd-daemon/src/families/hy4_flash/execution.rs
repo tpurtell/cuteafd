@@ -2448,9 +2448,7 @@ impl<'a> Hy4Engine<'a> {
         r0.stream.drain()?;
         std::fs::create_dir_all(dir)?;
         let mut raw = vec![0u8; elems * 2];
-        r0.device.run(|| {
-            r0.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes: elems * 2, ..buf })
-        })?;
+        r0.stream.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes: elems * 2, ..buf })?;
         let f32_bytes: Vec<u8> = raw
             .chunks_exact(2)
             .flat_map(|b| (u32::from(u16::from_le_bytes([b[0], b[1]])) << 16).to_le_bytes())
@@ -2465,9 +2463,7 @@ impl<'a> Hy4Engine<'a> {
         r0.stream.drain()?;
         std::fs::create_dir_all(dir)?;
         let mut raw = vec![0u8; elems * 4];
-        r0.device.run(|| {
-            r0.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes: elems * 4, ..buf })
-        })?;
+        r0.stream.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes: elems * 4, ..buf })?;
         std::fs::write(dir.join(format!("{name}.f32")), raw)?;
         Ok(())
     }
@@ -5356,9 +5352,7 @@ impl<'a> Hy4Engine<'a> {
         r0.stream.drain()?;
         let bytes = rows * HC * H * 2;
         let mut raw = vec![0u8; bytes];
-        r0.device.run(|| {
-            r0.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes, ..r0.waves[0].r_a.buffer })
-        })?;
+        r0.stream.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes, ..r0.waves[0].r_a.buffer })?;
         Ok(raw
             .chunks_exact(2)
             .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))

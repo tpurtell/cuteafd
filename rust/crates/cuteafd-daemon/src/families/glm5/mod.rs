@@ -1005,7 +1005,9 @@ impl Opened {
             split_family: args.split_device.and(self.cfg.split_program_family()) };
         let programs = programs.with_sparse_mla_precision(args.attention.attention_precision, |name| selected.contains(name))?
             .with_attention_plan(attention_plan, |name| selected.contains(name))?;
-        let stream = self.library.cuda_stream_create()?;
+        let stream_owner = std::rc::Rc::new(crate::shared::memory::device::Stream::new(
+            crate::shared::memory::device::Device { library: &self.library, id: args.device })?);
+        let stream = stream_owner.raw;
         // The head split's second GPU and its stream (load kernels, then the engine's).
         // A head split needs its share's programs (`glm2`) in this build.
         let split_device = match args.split_device {
@@ -1021,17 +1023,21 @@ impl Opened {
         let split_device = crate::shared::peer_split::probed_device(&self.library, args.device, split_device)?;
         ensure!(!native || args.split_device.is_none() || split_device.is_some(),
             "EXLR8 two-coordinator execution cannot fall back to one GPU");
-        let peer_stream = match split_device {
+        let peer_stream_owner = match split_device {
             Some(device) => {
                 ensure!(device != args.device, "--split-device must differ from --device");
                 self.library.cuda_enable_peer(device)?;
                 self.library.cuda_set_device(device)?;
-                let stream = self.library.cuda_enable_peer(args.device).and_then(|()| self.library.cuda_stream_create());
+                let peer_enabled = self.library.cuda_enable_peer(args.device);
                 self.library.cuda_set_device(args.device)?;
-                Some((device, stream?))
+                peer_enabled?;
+                let owner = std::rc::Rc::new(crate::shared::memory::device::Stream::new(
+                    crate::shared::memory::device::Device { library: &self.library, id: device })?);
+                Some((device, owner))
             }
             None => None,
         };
+        let peer_stream = peer_stream_owner.as_ref().map(|(device, owner)| (*device, owner.raw));
         let devices: Vec<_> = std::iter::once(args.device).chain(split_device).collect();
         ensure!(!args.tp2_dflash || (split_device.is_some() && (args.draft.is_some() || args.dspark)),
             "TP2 DFlash requires --split-device and a DFlash2 (--draft) or ML4 mtp_dspark (--dspark) drafter");
@@ -1740,7 +1746,7 @@ impl Opened {
         if let Some(drafter) = &drafter { drafter.prepare_workspace()?; }
         self.startup_probe(&devices, "glm/draft-before-kv", None, false)?;
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill_lanes, args.prefill_rows)?;
-        let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
+        let mut engine = engine::GlmEngine::new(&self.library, &programs, self.cfg.clone(), model, std::rc::Rc::clone(&stream_owner),
             max_context, args.prefill_rows, pages, embedding, depth, context.filter(|_| context_kv), rotary.remove(0))?;
         engine.initialize_usage(admitted.expert_usage.clone(), args.expert_usage_reader.clone())?;
         engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;
@@ -1754,9 +1760,9 @@ impl Opened {
         if tp2_range.is_some() && exchange_f32 {
             engine.set_tp2_exchange(crate::shared::experts::rtx::ExchangeDtype::F32);
         }
-        if let Some((device, stream)) = peer_stream {
+        if let Some((device, ref peer_owner)) = peer_stream_owner {
             let peer_layers = shares.pop().context("head-split shares")?;
-            engine.attach_peer_with_exchange(device, stream, peer_layers, rotary.remove(0), shared_exchange)?;
+            engine.attach_peer_with_exchange(device, std::rc::Rc::clone(peer_owner), peer_layers, rotary.remove(0), shared_exchange)?;
         }
         // Both rotary tables now own the generated values; release the load-only source.
         engine.weights.rope_alpha = None;
@@ -1916,15 +1922,9 @@ impl Opened {
         drop(self.startup_audit.borrow_mut().take());
         drop(engine);
         drop(transport);
-        // SAFETY: the engine that used the streams is gone.
-        unsafe {
-            self.library.cuda_stream_destroy(stream)?;
-            if let Some((device, stream)) = peer_stream {
-                self.library.cuda_set_device(device)?;
-                let destroyed = self.library.cuda_stream_destroy(stream);
-                self.library.cuda_set_device(args.device)?;
-                destroyed?;
-            }
+        std::rc::Rc::into_inner(stream_owner).context("glm5 lead stream still referenced")?.destroy()?;
+        if let Some((_, peer_owner)) = peer_stream_owner {
+            std::rc::Rc::into_inner(peer_owner).context("glm5 peer stream still referenced")?.destroy()?;
         }
         result
     }

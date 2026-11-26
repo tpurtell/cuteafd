@@ -42,7 +42,7 @@ impl<'a> BackboneCache<'a> {
         let mut read = |buffer: CuteafdDeviceBuffer| -> Result<()> {
             let start = bytes.len();
             bytes.resize(start + buffer.bytes, 0);
-            library.copy_d2h(&mut bytes[start..], buffer)
+            self.prefix_stream.copy_d2h(&mut bytes[start..], buffer)
         };
         for (layer, &(begin, end)) in meta.windows.iter().enumerate() {
             let first = begin.max(end.saturating_sub(128));
@@ -427,7 +427,7 @@ impl<'a> BackboneCache<'a> {
             let copied = device.run(|| pages[..rows.div_ceil(PAGE_ROWS)].iter().map(|&page| {
                 state.source_cache().page_segments(page).iter().map(|&segment| {
                     let mut bytes = vec![0; segment.bytes];
-                    library.copy_d2h(&mut bytes, segment)?;
+                    library.copy_d2h_quiescent(&mut bytes, segment)?;
                     Ok(bytes)
                 }).collect::<Result<Vec<_>>>().map(|planes| planes.concat())
             }).collect::<Result<Vec<_>>>())?;
@@ -571,11 +571,11 @@ mod rollback_tests {
         bank.copy_unit_rows(0, 1, 200)?;
         let tail = bank.sources[0].source_cache().page_segments(to[0][0])[0];
         let mut bytes = vec![0; tail.bytes];
-        lib.copy_d2h(&mut bytes, tail)?;
+        lib.copy_d2h_quiescent(&mut bytes, tail)?;
         assert_eq!(bytes[0], 0x59, "fork is not visible before the copy drains");
         bank.bind_sources(lease, [&to[0], &to[1], &to[2], &to[3]], bank.source_rows(200))?;
         assert_eq!(bank.restore_encoder_prefix(lease, 200, 72, 225)?, 72);
-        lib.copy_d2h(&mut bytes, tail)?;
+        lib.copy_d2h_quiescent(&mut bytes, tail)?;
         assert_eq!(bytes[0], 0x2a, "replay can read the copied tail at publication");
         assert_eq!(bank.history_end(lease)?, 72);
         assert_eq!(bank.committed_end(lease)?, 200);
@@ -643,8 +643,8 @@ mod rollback_tests {
         for ((state, &x), &y) in bank.windows.iter().zip(&a.windows).zip(&b.windows) {
             assert_eq!(state.span(x)?, state.span(y)?);
             let mut x_end = [0; 8]; let mut y_end = [0; 8];
-            lib.copy_d2h(&mut x_end, state.view(x)?.device_end)?;
-            lib.copy_d2h(&mut y_end, state.view(y)?.device_end)?;
+            lib.copy_d2h_quiescent(&mut x_end, state.view(x)?.device_end)?;
+            lib.copy_d2h_quiescent(&mut y_end, state.view(y)?.device_end)?;
             assert_eq!(x_end, y_end);
         }
         for (state, &lease) in bank.sources.iter().zip(&a.sources) {

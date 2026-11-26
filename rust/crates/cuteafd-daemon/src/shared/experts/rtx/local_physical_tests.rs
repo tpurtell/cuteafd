@@ -230,7 +230,7 @@ fn glm_exl3_local_physical_equals_serving() -> Result<()> {
                                     device_id: physical[rank], flags: 0,
                                 };
                                 let mut actual = vec![0; slice.bytes()];
-                                devices[rank].run(|| library.copy_d2h(&mut actual, buffer))?;
+                                devices[rank].run(|| library.copy_d2h_quiescent(&mut actual, buffer))?;
                                 // Each compact destination row skips the other rank's source columns.
                                 for row in 0..slice.rows {
                                     let source = row * slice.source_row_bytes + slice.column_start_bytes;

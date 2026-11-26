@@ -219,7 +219,7 @@ mod tests {
                             lib.cuda_stream_synchronize(stream.raw)?;
                         }
                         let mut bytes = [0; 16];
-                        lib.copy_d2h(&mut bytes, output.buffer)?;
+                        lib.copy_d2h_quiescent(&mut bytes, output.buffer)?;
                         let actual = bytes
                             .chunks_exact(4)
                             .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
@@ -433,8 +433,8 @@ mod tests {
                         assert_eq!(a.device_id, gpu as i32);
                         let mut left = vec![0; a.bytes];
                         let mut right = vec![0; b.bytes];
-                        lib.copy_d2h(&mut left, a)?;
-                        lib.copy_d2h(&mut right, b)?;
+                        lib.copy_d2h_quiescent(&mut left, a)?;
+                        lib.copy_d2h_quiescent(&mut right, b)?;
                         assert_eq!(left, right, "placed index output differs at layer {layer}");
                     }
                     if layer >= 20 {

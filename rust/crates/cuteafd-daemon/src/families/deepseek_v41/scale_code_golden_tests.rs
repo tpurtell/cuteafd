@@ -49,7 +49,7 @@ fn compare(library: &NativeLibrary, buffer: CuteafdDeviceBuffer, offset: usize, 
     let selected = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() },
         bytes: expected.len(), ..buffer };
     let mut actual = vec![0; expected.len()];
-    Device { library, id: buffer.device_id }.run(|| library.copy_d2h(&mut actual, selected))?;
+    Device { library, id: buffer.device_id }.run(|| library.copy_d2h_quiescent(&mut actual, selected))?;
     assert_eq!(actual, expected, "{name}");
     Ok(())
 }

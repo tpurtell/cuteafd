@@ -58,7 +58,7 @@ fn independently_backed_target_and_draft_share_serial_scratch_exactly() -> Resul
     let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
         let mut bytes = vec![0; rows * hidden * 4];
         let extent = bytes.len();
-        library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { bytes: extent, ..buffer })?;
+        library.copy_d2h_quiescent(&mut bytes, CuteafdDeviceBuffer { bytes: extent, ..buffer })?;
         Ok(bytes)
     };
     let mut expected = Vec::new();
@@ -119,7 +119,7 @@ fn shared_capacity_scratch_matches_private_and_graph_replay() -> Result<()> {
         library.copy_h2d(inputs[2].buffer, &(0..4096*k).flat_map(|_| (1f32/k as f32).to_ne_bytes()).collect::<Vec<_>>())?;
         let stream = LoadStream { library: &library, raw: library.cuda_stream_create()? };
         let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
-            let mut bytes = vec![0; buffer.bytes]; library.copy_d2h(&mut bytes, buffer)?; Ok(bytes)
+            let mut bytes = vec![0; buffer.bytes]; library.copy_d2h_quiescent(&mut bytes, buffer)?; Ok(bytes)
         };
         let input_buffers = || std::array::from_fn(|i| inputs[i].buffer);
         let mut graphs = Vec::new();

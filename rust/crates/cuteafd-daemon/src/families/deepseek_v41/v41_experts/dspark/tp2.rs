@@ -120,7 +120,7 @@ mod tests {
                                 device.run(||library.copy_h2d(shared.buffer,&bytes))?;
                                 device.run(||unsafe {library.cuda_graph_launch(graph,stream.raw)})?;
                                 stream.drain()?;
-                                let mut actual=vec![0;count*2];device.run(||library.copy_d2h(&mut actual,output.buffer))?;
+                                let mut actual=vec![0;count*2];device.run(||library.copy_d2h_quiescent(&mut actual,output.buffer))?;
                                 for index in 0..count {
                                     let (row,col)=(index/5120,index%5120);let mut total=0f32;let mut wrong=0f32;
                                     for route in 0..topk {

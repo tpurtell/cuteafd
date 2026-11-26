@@ -132,7 +132,7 @@ mod tests {
             let mut results = Vec::new();
             for (device, output) in [(devices[0], x?), (devices[1], y?)] {
                 let mut host = vec![0; output.bytes];
-                device.run(|| lib.copy_d2h(&mut host, output))?;
+                device.run(|| lib.copy_d2h_quiescent(&mut host, output))?;
                 assert!(host
                     .chunks_exact(2)
                     .all(|v| (u16::from_ne_bytes([v[0], v[1]]) & 0x7f80) != 0x7f80));
@@ -197,7 +197,7 @@ mod tests {
         };
         let output = runtime.block_on(unsafe { first.execute(0, capacity, 0, make_inputs()) })?;
         let mut host = vec![0; output.bytes];
-        devices[0].run(|| lib.copy_d2h(&mut host, output))?;
+        devices[0].run(|| lib.copy_d2h_quiescent(&mut host, output))?;
         ensure!(
             host.chunks_exact(2)
                 .all(|v| u16::from_ne_bytes([v[0], v[1]]) & 0x7fff == 0),
@@ -286,7 +286,7 @@ mod tests {
             let expected = (((va + vb) * if token_sums { 1. } else { 6. }).to_bits() >> 16) as u16;
             for (device, output) in [(d0, x?), (d1, y?)] {
                 let mut host = vec![0; output.bytes];
-                device.run(|| lib.copy_d2h(&mut host, output))?;
+                device.run(|| lib.copy_d2h_quiescent(&mut host, output))?;
                 assert!(host
                     .chunks_exact(2)
                     .all(|v| u16::from_ne_bytes([v[0], v[1]]) == expected));

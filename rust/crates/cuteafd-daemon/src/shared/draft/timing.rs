@@ -331,6 +331,7 @@ impl<'a> DraftTiming<'a> {
         buffer: cuteafd_ffi::CuteafdDeviceBuffer,
         rows: usize,
         width: usize,
+        stream: *mut c_void,
     ) -> Result<()> {
         let Some(state) = &self.0 else { return Ok(()) };
         let mut state = state.borrow_mut();
@@ -353,10 +354,14 @@ impl<'a> DraftTiming<'a> {
             state.host, state.family, state.device
         ));
         let mut input = vec![0u8; bytes];
-        state.library.copy_d2h(
-            &mut input,
-            cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer },
-        )?;
+        // SAFETY: `stream` produced `buffer` on this device and remains live.
+        unsafe {
+            state.library.copy_d2h(
+                &mut input,
+                cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer },
+                stream,
+            )?;
+        }
         std::fs::write(path, input)?;
         state.dumped.insert(rows, round + 1);
         Ok(())

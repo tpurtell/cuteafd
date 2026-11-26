@@ -1259,7 +1259,7 @@ mod tests {
         chain
             .stream
             .device
-            .run(|| chain.stream.device.library.copy_d2h(&mut output, buffer))?;
+            .run(|| chain.stream.device.library.copy_d2h_quiescent(&mut output, buffer))?;
         Ok(output)
     }
     fn upload(chain: &CsaLayer<'_>, plane: usize, offset: usize, bytes: &[u8]) -> Result<()> {
@@ -1599,7 +1599,7 @@ mod tests {
             );
         }
         let mut output = vec![0; rows * H * 4];
-        device.run(|| library.copy_d2h(&mut output, chain.output()))?;
+        device.run(|| library.copy_d2h_quiescent(&mut output, chain.output()))?;
         ensure!(
             metrics(&output, &load("output")?, 4, 4, H)? < 0.03,
             "layer91 full output"
@@ -1613,11 +1613,11 @@ mod tests {
         upload(&chain, X, 0, &load("residual")?)?;
         chain.enqueue(rows, 0)?;
         chain.stream.drain()?;
-        device.run(|| library.copy_d2h(&mut output, chain.output()))?;
+        device.run(|| library.copy_d2h_quiescent(&mut output, chain.output()))?;
         chain.enqueue(rows, rows - 7)?;
         chain.stream.drain()?;
         let mut suffix = vec![0; output.len()];
-        device.run(|| library.copy_d2h(&mut suffix, chain.output()))?;
+        device.run(|| library.copy_d2h_quiescent(&mut suffix, chain.output()))?;
         ensure!(suffix == output, "dense suffix view changed output");
         Ok(())
     }

@@ -28,7 +28,7 @@ fn installed(repo: &str) -> Result<PathBuf> {
 
 fn read(library: &NativeLibrary, buffer: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
     let mut bytes = vec![0u8; buffer.bytes];
-    library.copy_d2h(&mut bytes, buffer)?;
+    library.copy_d2h_quiescent(&mut bytes, buffer)?;
     Ok(bytes)
 }
 

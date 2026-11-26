@@ -360,7 +360,7 @@ fn native_tp2_gqa_cross_owner_restore_is_byte_exact() -> Result<()> {
                         for ring in [&attention.k_ring, &attention.v_ring] {
                             let bytes = ring.buffer.bytes / 2;
                             let mut snapshot = vec![0; bytes];
-                            library.copy_d2h(&mut snapshot, draft_view(ring.buffer, 0, bytes)?)?;
+                            library.copy_d2h_quiescent(&mut snapshot, draft_view(ring.buffer, 0, bytes)?)?;
                             // Restore to another sequence's physical ring on each owner, then
                             // poison the old owner. A fresh projection must recreate those bytes.
                             library.copy_h2d(draft_view(ring.buffer, bytes, bytes)?, &snapshot)?;
@@ -378,7 +378,7 @@ fn native_tp2_gqa_cross_owner_restore_is_byte_exact() -> Result<()> {
                     let bytes = snapshot.len();
                     for offset in [0, bytes] {
                         let mut actual = vec![0; bytes];
-                        library.copy_d2h(&mut actual, draft_view(ring, offset, bytes)?)?;
+                        library.copy_d2h_quiescent(&mut actual, draft_view(ring, offset, bytes)?)?;
                         assert_eq!(actual, snapshot, "rank {rank}, {representation:?}, {kv}, offset {offset}");
                     }
                     Ok(())
@@ -402,7 +402,7 @@ fn native_tp2_gqa_cross_owner_restore_is_byte_exact() -> Result<()> {
             let work = workspace.as_ref().context("missing proof workspace")?;
             let bytes = cfg.block * cfg.hidden * 2;
             let mut hidden = vec![0; 2 * bytes];
-            library.copy_d2h(&mut hidden, draft_view(work.n.buffer, 0, 2 * bytes)?)?;
+            library.copy_d2h_quiescent(&mut hidden, draft_view(work.n.buffer, 0, 2 * bytes)?)?;
             assert_eq!(&hidden[..bytes], &hidden[bytes..], "restored draft hidden rows differ");
             println!("TP2 GQA cross-owner exact restore: {representation:?}, {kv}; {} layers on both GPUs", cfg.layers);
         }
@@ -646,7 +646,7 @@ fn prompt_window_snapshot_restores_exact_ring_bytes_and_committed_frontier() -> 
         draft.copy_mla_windows(0,&buffers,false)?;
         draft.restore_mla_windows(0,end)?;
         for (&window,expected) in windows.iter().zip(&bytes) {
-            let mut actual=vec![0;window.bytes];draft.library.copy_d2h(&mut actual,window)?;
+            let mut actual=vec![0;window.bytes];draft.library.copy_d2h_quiescent(&mut actual,window)?;
             assert_eq!(&actual,expected,"restored FP8/BF16 ring bytes differ");
         }
         let state=context.state.borrow();
@@ -1007,7 +1007,7 @@ fn mla_drafter_load_peak_and_weight_hash_on_gpu() -> Result<()> {
                         bytes: n,
                         ..alloc.buffer
                     };
-                    library.copy_d2h(&mut buf[..n], slice)?;
+                    library.copy_d2h_quiescent(&mut buf[..n], slice)?;
                     hasher.update(&buf[..n]);
                     offset += n;
                 }

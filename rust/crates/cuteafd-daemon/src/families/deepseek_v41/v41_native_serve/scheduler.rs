@@ -2108,7 +2108,7 @@ async fn execute_logits<'a>(lib: &'a NativeLibrary, pass: &mut TargetPass<'_, 'a
         }
         let logits = unsafe { pass.execute_decode(requests, batch, transport, 0, &selected).await? };
         let mut bytes = vec![0; logits.logits.bytes];
-        lib.copy_d2h(&mut bytes, logits.logits)?;
+        logits.stream.copy_d2h(&mut bytes, logits.logits)?;
         ScoreRows::new(VOCAB, bytes)
     }.await;
     pass.set_route_capture(false);
@@ -2887,12 +2887,12 @@ fn commit_lane<'w, 'a>(lib: &'a NativeLibrary, lane: usize,
     let frontier: Vec<(usize, usize, Option<Vec<u32>>, FrontierRetain)> =
         std::mem::take(&mut decision.frontier_downloads);
     for (member, row, mask, retain) in frontier {
-        let logits = pass.output(batch)?.logits;
+        let output = pass.output(batch)?;
         decision.next_after_commit[member] = Some(match retain {
             FrontierRetain::Checked =>
-                next.retain_from_device(lib, logits, row, mask.as_deref())?,
+                next.retain_from_device(output.logits, output.stream, row, mask.as_deref())?,
             FrontierRetain::RecordedSample =>
-                next.retain_recorded_from_device(lib, logits, row)?,
+                next.retain_recorded_from_device(output.logits, output.stream, row)?,
         });
     }
     if let Some(draft) = draft.as_deref_mut() { draft.commit_batch(pass, requests, batch, &decision.accepted)?; }

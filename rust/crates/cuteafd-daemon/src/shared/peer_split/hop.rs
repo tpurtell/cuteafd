@@ -558,7 +558,7 @@ mod cuda_tests {
                         // SAFETY: the destination stream waited for the push; the source drains with its stream.
                         unsafe { library.cuda_stream_synchronize(ranks[to].stream)? };
                         unsafe { library.cuda_stream_synchronize(ranks[from].stream) }.ok();
-                        library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { ptr: landed, bytes,
+                        library.copy_d2h_quiescent(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { ptr: landed, bytes,
                             device_id: to as i32, flags: 0 })
                     })?;
                     assert_eq!(out, pattern, "lane {lane} hop {index}");

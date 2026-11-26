@@ -180,7 +180,7 @@ impl<'a> Binding<'a> {
         let mask = d.run(|| {
             let extent = cfg.hidden * 2;
             let mut bytes = vec![0u8; extent];
-            d.library.copy_d2h(&mut bytes, Buffer { ptr: embed.ptr.wrapping_byte_add(cfg.mask_token as usize * extent), bytes: extent, ..embed })?;
+            d.library.copy_d2h_quiescent(&mut bytes, Buffer { ptr: embed.ptr.wrapping_byte_add(cfg.mask_token as usize * extent), bytes: extent, ..embed })?;
             Ok(bytes)
         })?;
         let file = crate::shared::speculation::dflash::prefetch(&layout.snapshot).join()

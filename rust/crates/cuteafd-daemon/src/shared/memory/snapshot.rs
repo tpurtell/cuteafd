@@ -140,7 +140,7 @@ mod tests {
         // Outstanding storage owns the arena even when its allocator is dropped.
         drop(pool);
         let mut actual = [0; 129];
-        lib.copy_d2h(&mut actual, second.buffer)?;
+        lib.copy_d2h_quiescent(&mut actual, second.buffer)?;
         assert_eq!(actual, [29; 129]);
         Ok(())
     }

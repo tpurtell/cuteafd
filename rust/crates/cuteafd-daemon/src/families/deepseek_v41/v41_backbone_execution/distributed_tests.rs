@@ -20,7 +20,7 @@ fn encoder_bytes(lib: &NativeLibrary, lane: &BackboneLane<'_, '_>) -> Result<Vec
     let mut bytes = Vec::new();
     for buffer in [out.residual, out.pre] {
         let start = bytes.len(); bytes.resize(start + buffer.bytes, 0);
-        lib.copy_d2h(&mut bytes[start..], buffer)?;
+        lib.copy_d2h_quiescent(&mut bytes[start..], buffer)?;
     }
     Ok(bytes)
 }
@@ -35,7 +35,7 @@ fn production_bytes(lib: &NativeLibrary, bank: &BackboneCache<'_>, batch: &Cache
             s.index_scales, s.kv_values, s.kv_scales]);
     }
     buffers.into_iter().map(|buffer| {
-        let mut bytes = vec![0; buffer.bytes]; lib.copy_d2h(&mut bytes, buffer)?; Ok(bytes)
+        let mut bytes = vec![0; buffer.bytes]; lib.copy_d2h_quiescent(&mut bytes, buffer)?; Ok(bytes)
     }).collect()
 }
 fn check_queued_production<'w, 'a>(lib: &NativeLibrary, runtime: &tokio::runtime::Runtime,
@@ -77,7 +77,7 @@ fn check_queued_production<'w, 'a>(lib: &NativeLibrary, runtime: &tokio::runtime
         let expected = reference_index.output(layer, &cache)?;
         let actual = index.output(layer, &cache)?;
         let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
-            let mut bytes = vec![0; buffer.bytes]; lib.copy_d2h(&mut bytes, buffer)?; Ok(bytes)
+            let mut bytes = vec![0; buffer.bytes]; lib.copy_d2h_quiescent(&mut bytes, buffer)?; Ok(bytes)
         };
         assert_eq!(read(expected.selected)?, read(actual.selected)?, "queued selections differ at layer {layer}");
         assert_eq!(expected.candidate_blocks().map(read).transpose()?, actual.candidate_blocks().map(read).transpose()?,
@@ -274,9 +274,9 @@ fn real_layer_zero_executes_embedding_attention_tp4_and_mhc() -> Result<()> {
         assert_eq!(output.layer, 0);
         assert_eq!(output.tokens, positions);
         let mut residual = vec![0; output.residual.bytes];
-        lib.copy_d2h(&mut residual, output.residual)?;
+        lib.copy_d2h_quiescent(&mut residual, output.residual)?;
         let mut pre = vec![0; output.pre.bytes];
-        lib.copy_d2h(&mut pre, output.pre)?;
+        lib.copy_d2h_quiescent(&mut pre, output.pre)?;
         assert!(residual
             .chunks_exact(2)
             .all(|b| u16::from_ne_bytes(b.try_into().unwrap()) & 0x7f80 != 0x7f80));
@@ -310,7 +310,7 @@ fn real_layer_zero_executes_embedding_attention_tp4_and_mhc() -> Result<()> {
         assert_eq!(prepared.layer, 1);
         assert_eq!(prepared.tokens, positions);
         let mut gated = vec![0; prepared.residual.bytes];
-        lib.copy_d2h(&mut gated, prepared.residual)?;
+        lib.copy_d2h_quiescent(&mut gated, prepared.residual)?;
         assert_ne!(
             gated,
             *previous.as_ref().unwrap(),
@@ -320,7 +320,7 @@ fn real_layer_zero_executes_embedding_attention_tp4_and_mhc() -> Result<()> {
         assert_eq!(query.layer, 1);
         assert_eq!(query.tokens()?, positions);
         let mut rotated = vec![0; query.rotated.bytes];
-        lib.copy_d2h(&mut rotated, query.rotated)?;
+        lib.copy_d2h_quiescent(&mut rotated, query.rotated)?;
         for bytes in [&gated, &rotated] {
             assert!(bytes
                 .chunks_exact(2)

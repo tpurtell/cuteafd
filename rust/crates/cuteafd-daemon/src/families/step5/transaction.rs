@@ -1544,7 +1544,7 @@ pub(super) mod tests {
 
     fn read(device: Device<'_>, buffer: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
         let mut bytes = vec![0; buffer.bytes];
-        device.run(|| device.library.copy_d2h(&mut bytes, buffer))?;
+        device.run(|| device.library.copy_d2h_quiescent(&mut bytes, buffer))?;
         Ok(bytes)
     }
 

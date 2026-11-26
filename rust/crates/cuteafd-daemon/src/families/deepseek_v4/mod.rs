@@ -428,7 +428,9 @@ pub(crate) fn with_engine<T>(
     let programs = loaded.library.programs()?.with_manifest(&args.manifest)?
         .with_sparse_mla_precision(args.attention_precision, |name| selected.contains(name))?;
     let caps = &loaded.manifest["capacities"];
-    let stream = loaded.library.cuda_stream_create()?;
+    let stream_owner = std::rc::Rc::new(crate::shared::memory::device::Stream::new(
+        crate::shared::memory::device::Device { library: &loaded.library, id: args.device })?);
+    let stream = stream_owner.raw;
     // The head split's second GPU and its stream (load kernels, then the engine's).
     // A head split needs its share's programs (`dsv4f2` / `dsv4p2`) in this build.
     let share_program = format!("{}2_wo_m{}", loaded.family, caps["decode_rows"].as_u64().unwrap_or(64));
@@ -683,7 +685,7 @@ pub(crate) fn with_engine<T>(
         prefill_span_rows: usize::try_from(prefill.span_rows)?,
         c128_width: usize::try_from(cuteafd_loader::serving_capacity::compiled_c128_width(&loaded.manifest, loaded.family)?)?,
         max_context,
-        stream,
+        stream_owner: std::rc::Rc::clone(&stream_owner),
         sms: args.sms,
         shape,
         embedding,
@@ -848,9 +850,9 @@ pub(crate) fn with_engine<T>(
     }
     drop(engine);
     drop(transports);
-    // SAFETY: the engine that used the streams is gone.
+    std::rc::Rc::into_inner(stream_owner).context("deepseek_v4 lead stream still referenced")?.destroy()?;
+    // SAFETY: the engine that used the peer stream is gone.
     unsafe {
-        loaded.library.cuda_stream_destroy(stream)?;
         if let Some((device, stream)) = peer_stream {
             loaded.library.cuda_set_device(device)?;
             let destroyed = loaded.library.cuda_stream_destroy(stream);

@@ -166,11 +166,11 @@ impl Capture {
         let rows = self.rows.len();
         // Hooks run before scratch reuse; drain only this exact producer stream.
         stream.drain()?;
-        let download = |buffer: cuteafd_ffi::CuteafdDeviceBuffer| stream.device.run(|| {
+        let download = |buffer: cuteafd_ffi::CuteafdDeviceBuffer| -> Result<Vec<u8>> {
             let mut bytes = vec![0; buffer.bytes];
-            stream.device.library.copy_d2h(&mut bytes, buffer)?;
+            stream.copy_d2h(&mut bytes, buffer)?;
             Ok(bytes)
-        });
+        };
         let rank = site["rank"].as_u64().context("capture rank absent")?;
         let kind = site["kind"].as_str().context("capture kind absent")?;
         let dir = self.root.join(format!("layer-{layer:02}-rank-{rank}-{kind}"));

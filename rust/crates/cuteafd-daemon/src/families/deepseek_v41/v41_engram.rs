@@ -369,7 +369,7 @@ mod tests {
         chain.drain()?; owner.synchronize()?;
         assert!(source.copy_ready()?);
         let mut bytes = vec![0; observed.buffer.bytes];
-        lib.copy_d2h(&mut bytes, observed.buffer)?;
+        lib.copy_d2h_quiescent(&mut bytes, observed.buffer)?;
         let expected = [0x80, 0x3f].repeat(24 * 256);
         if guarded || !held { assert_eq!(bytes, expected, "L1 gate read clobbered"); }
         else { assert_ne!(bytes, expected, "skip-wait control failed to clobber"); }
@@ -420,7 +420,7 @@ mod tests {
             assert!(!unsafe { lib.cuda_event_query(owner.completed[1])? }, "L14 must remain pending");
             if !wrong_stream {
                 let mut bytes = vec![0; observed.buffer.bytes];
-                lib.copy_d2h(&mut bytes, observed.buffer)?;
+                lib.copy_d2h_quiescent(&mut bytes, observed.buffer)?;
                 assert_eq!(bytes, [0x80, 0x3f].repeat(24 * 256), "L1 gate must read its own rows");
             }
         }
@@ -550,7 +550,7 @@ mod tests {
         assert!(wait_event(lib, owners[k].completed[0], std::time::Duration::from_secs(3))?,
             "fresh L1 must complete while every L14 lease is held on the host");
         let mut bytes = vec![0; rows * 24 * 512];
-        lib.copy_d2h(&mut bytes, owners[k].storage.embeddings.buffer)?;
+        lib.copy_d2h_quiescent(&mut bytes, owners[k].storage.embeddings.buffer)?;
         assert_eq!(bytes, [0x80, 0x3f].repeat(rows * 24 * 256), "fresh L1 bytes");
         for index in 0..k {
             if held {
@@ -561,7 +561,7 @@ mod tests {
             runtime.block_on(owners[index].wait_enqueue(1, std::time::Duration::from_secs(3)))?;
             owners[index].enqueue_source(&mut leases[index])?;
             owners[index].synchronize()?;
-            lib.copy_d2h(&mut bytes, owners[index].storage.embeddings.buffer)?;
+            lib.copy_d2h_quiescent(&mut bytes, owners[index].storage.embeddings.buffer)?;
             assert_eq!(bytes, [0, 0x40].repeat(rows * 24 * 256), "L14 bytes unit {index}");
             for pending in index + 1..k { assert_eq!(owners[pending].can_enqueue(1)?, !held); }
         }
@@ -621,10 +621,10 @@ mod tests {
                             let view = if cooperative { runtime.block_on(owner.upload_cooperative(&gathered))? }
                                 else { owner.upload(&gathered)? };
                             let mut actual = vec![0; view.embeddings.bytes];
-                            library.copy_d2h(&mut actual, view.embeddings)?;
+                            library.copy_d2h_quiescent(&mut actual, view.embeddings)?;
                             assert_eq!(actual, expected[..rows*24*512], "GPU {device}, layer {layer}, rows {rows}");
                             let mut actual_mask = vec![0; rows];
-                            library.copy_d2h(&mut actual_mask, view.text_mask)?;
+                            library.copy_d2h_quiescent(&mut actual_mask, view.text_mask)?;
                             assert_eq!(actual_mask, mask[..rows]);
                         }
                         runtime.block_on(owner.check_cooperative(&gathered))?;
@@ -640,7 +640,7 @@ mod tests {
                     };
                     let view = runtime.block_on(owner.upload_cooperative(&gathered))?;
                     let mut actual = vec![0; view.embeddings.bytes];
-                    library.copy_d2h(&mut actual, view.embeddings)?;
+                    library.copy_d2h_quiescent(&mut actual, view.embeddings)?;
                     assert!(actual.chunks_exact(2).all(|v| v == [0x80, 0x3f]));
                 }
             }

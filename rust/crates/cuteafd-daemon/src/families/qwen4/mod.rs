@@ -663,7 +663,9 @@ impl Opened {
             &self.cfg, self.experts.as_ref(), layers, with_mtp, manifest_json.as_ref(),
             cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context),
             &inventory)?;
-        let stream = self.library.cuda_stream_create()?;
+        let stream_owner = std::rc::Rc::new(crate::shared::memory::device::Stream::new(
+            crate::shared::memory::device::Device { library: &self.library, id: device })?);
+        let stream = stream_owner.raw;
         let started = Instant::now();
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
             fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream,
@@ -751,7 +753,7 @@ impl Opened {
         loaded_weights.check(0, crate::shared::memory::budget::resident_weight_limit())?;
         let max_context = crate::shared::context::pool_context("qwen4", cuteafd_loader::placement::planner::Context::resolve(args.max_context as u64, requested_context), pool_tokens)?;
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
-        let mut engine = engine::Qwen4Engine::new_with_decode_rows(&self.library, &programs, self.cfg.clone(), model, ple, stream,
+        let mut engine = engine::Qwen4Engine::new_with_decode_rows(&self.library, &programs, self.cfg.clone(), model, ple, std::rc::Rc::clone(&stream_owner),
             max_context, args.prefill_rows, pages, args.slots, decode_rows, args.kv_format, embedding)?;
         engine.prefill_shape = prefill_shape;
         engine.attention_plan = attention_plan;
@@ -778,8 +780,7 @@ impl Opened {
         crate::shared::memory_report::release_load_staging(&self.library)?;
         let result = body(&engine);
         drop(engine);
-        // SAFETY: the engine that used the stream is gone.
-        unsafe { self.library.cuda_stream_destroy(stream)? };
+        std::rc::Rc::into_inner(stream_owner).context("qwen4 lead stream still referenced")?.destroy()?;
         result
     }
 

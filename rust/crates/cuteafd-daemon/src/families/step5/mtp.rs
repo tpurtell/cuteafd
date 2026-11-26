@@ -363,7 +363,7 @@ impl<'a> StageOwner<'a> {
         let components = self.cache_components(cache, sequence)?;
         cache.drain()?;
         let mut encoded = [0; 8];
-        cache.stream.device.run(|| cache.stream.device.library.copy_d2h(&mut encoded, components[2]))?;
+        cache.stream.copy_d2h(&mut encoded, components[2])?;
         ensure!(u64::from_le_bytes(encoded) == base, "Step-5 predictor frontier differs from committed cache");
         for (buffer, bytes) in [(embedding.buffer, rows * H * 2),
             (previous_hidden.buffer, rows * H * 4)] {
@@ -942,7 +942,7 @@ mod tests {
                     let buffer = owner.propose(&cache, 0, (frontier - stage - 1) as u64, 19, &selected, &embedding)?;
                     stream.drain()?;
                     let mut bytes = [0; 8];
-                    device.run(|| library.copy_d2h(&mut bytes, slice(buffer, 0, 8)?))?;
+                    device.run(|| library.copy_d2h_quiescent(&mut bytes, slice(buffer, 0, 8)?))?;
                     ensure!(bytes[4..] == [0; 4], "non-finite drained predictor logits");
                     tokens.push(u32::from_le_bytes(bytes[..4].try_into()?));
                     selected.push(buffer);
@@ -952,7 +952,7 @@ mod tests {
             cache.capture(0, usize::from(queued) as u64, frontier as u64)?;
             cache.drain()?;
             let mut bytes = vec![0; layout.ranks[0].mark_bytes as usize];
-            device.run(|| library.copy_d2h(&mut bytes, cache.mark_view(u32::from(queued))?))?;
+            device.run(|| library.copy_d2h_quiescent(&mut bytes, cache.mark_view(u32::from(queued))?))?;
             if let Some((expected_tokens, expected_bytes)) = &reference {
                 ensure!(draft == *expected_tokens && bytes == *expected_bytes,
                     "queued predictor chain changed tokens or canonical cache bytes");
@@ -997,7 +997,7 @@ mod tests {
                 == Some(format!("{:x}", Sha256::digest(&target_hidden)).as_str()), "MTP target history fixture");
         let read = |buffer: CuteafdDeviceBuffer, bytes: usize| -> Result<Vec<u8>> {
             let mut data = vec![0; bytes];
-            device.run(|| library.copy_d2h(&mut data, slice(buffer, 0, bytes)?))?;
+            device.run(|| library.copy_d2h_quiescent(&mut data, slice(buffer, 0, bytes)?))?;
             Ok(data)
         };
         let same_input = match std::env::var("CUTEAFD_STEP5_MTP_INPUT_MODE").as_deref() {

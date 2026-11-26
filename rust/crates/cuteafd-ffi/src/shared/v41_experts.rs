@@ -1447,7 +1447,7 @@ mod tests {
                         library.cuda_stream_synchronize(std::ptr::null_mut())?;
                     }
                     let mut actual = vec![0u8; rows * 5120 * 2];
-                    library.copy_d2h(&mut actual, output)?;
+                    library.copy_d2h_quiescent(&mut actual, output)?;
                     for (i, bytes) in actual.chunks_exact(2).enumerate() {
                         let row = i / 5120;
                         let col = i % 5120;
@@ -1511,7 +1511,7 @@ mod tests {
                         library.cuda_stream_synchronize(std::ptr::null_mut())?;
                     }
                     let mut actual = vec![0u8; out.bytes];
-                    library.copy_d2h(&mut actual, out)?;
+                    library.copy_d2h_quiescent(&mut actual, out)?;
                     for i in 0..rows * 5120 {
                         let sum: f32 = (0..6).map(|route| value(i / 5120, route, i % 5120)).sum();
                         let compact = f32::from_bits((bf16(sum) as u32) << 16);
@@ -1528,7 +1528,7 @@ mod tests {
                         library.cuda_stream_synchronize(std::ptr::null_mut())?;
                     }
                     let mut legacy = vec![0u8; rows * 10240];
-                    library.copy_d2h(&mut legacy, out)?;
+                    library.copy_d2h_quiescent(&mut legacy, out)?;
                     assert_eq!(legacy, actual[..legacy.len()]);
                 }
             }
@@ -1593,7 +1593,7 @@ mod tests {
                         library.cuda_stream_synchronize(std::ptr::null_mut())?;
                     }
                     let mut actual = vec![0u8; out.bytes];
-                    library.copy_d2h(&mut actual, out)?;
+                    library.copy_d2h_quiescent(&mut actual, out)?;
                     for i in 0..rows * 5120 {
                         let mut sum = value(0, i);
                         for rank in 1..ranks { sum += value(rank, i); }

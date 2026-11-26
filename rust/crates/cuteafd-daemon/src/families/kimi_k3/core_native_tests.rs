@@ -122,7 +122,7 @@ fn k6_checkpoint_load_forward_matches_dequant() -> Result<()> {
                 }
                 launched?;
                 let mut bytes=vec![0;8*256*4];
-                device.run(||library.copy_d2h(&mut bytes,output.buffer))?;
+                device.run(||library.copy_d2h_quiescent(&mut bytes,output.buffer))?;
                 let actual=bytes.chunks_exact(4).map(|b|f32::from_le_bytes(b.try_into().unwrap())as f64).collect::<Vec<_>>();
                 let (rel,peak)=errors(&actual,&reference)?;
                 eprintln!("K6 {stem} side={side_id} rows=8 rel_l2={rel} max_abs_over_peak={peak}");

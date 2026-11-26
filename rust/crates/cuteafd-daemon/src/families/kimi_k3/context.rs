@@ -750,7 +750,7 @@ mod tests {
         };
         let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
             let mut bytes = vec![0; buffer.bytes];
-            Device { library: &library, id: buffer.device_id }.run(|| library.copy_d2h(&mut bytes, buffer))?;
+            Device { library: &library, id: buffer.device_id }.run(|| library.copy_d2h_quiescent(&mut bytes, buffer))?;
             Ok(bytes)
         };
         let ints = |values: Vec<i32>| values.into_iter().flat_map(i32::to_le_bytes).collect::<Vec<_>>();

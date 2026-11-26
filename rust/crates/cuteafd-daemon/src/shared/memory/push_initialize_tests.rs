@@ -89,7 +89,7 @@ fn fp8_scale_widening_and_generated_padding_are_exact() -> Result<()> {
     widen_scales(&arena, 0..halves.len() * 4, 12)?;
     let ready = arena.initialize(|_| Ok(()))?;
     let mut output = vec![0xa5; halves.len() * 4 + 16];
-    library.copy_d2h(&mut output, ready.region(0)?.buffer())?;
+    library.copy_d2h_quiescent(&mut output, ready.region(0)?.buffer())?;
     let expected = halves
         .iter()
         .flat_map(|v| (u32::from(*v) << 16).to_le_bytes())
@@ -147,7 +147,7 @@ fn padded_rows_coalesce_and_failed_zero_drains_before_free() -> Result<()> {
         assert_eq!(result.is_ok(), enqueue == 0 && drain == 0);
         if result.is_ok() {
             let mut actual = vec![0; 24];
-            library.copy_d2h(&mut actual, arena.region(0)?)?;
+            library.copy_d2h_quiescent(&mut actual, arena.region(0)?)?;
             assert_eq!(actual, [7, 7, 7, 0, 0, 0].repeat(4));
         }
         drop(arena);
@@ -253,7 +253,7 @@ fn exl3_semantics_reject_nonfinite_and_upload_exact_descriptors() -> Result<()> 
         0,
     )?;
     let mut actual = vec![0xa5; 272];
-    library.copy_d2h(&mut actual, ready.region(0)?.buffer())?;
+    library.copy_d2h_quiescent(&mut actual, ready.region(0)?.buffer())?;
     assert_eq!(&actual[..8], source);
     assert!(actual[8..256].iter().all(|&v| v == 0));
     assert_eq!(
@@ -350,7 +350,7 @@ fn native_out_of_place_planes_match_mount_reference() -> Result<()> {
             };
             scratch.native(&arena, 0, &layout, &scalars)?;
             let mut actual = vec![0; raw.len()];
-            library.copy_d2h(&mut actual, arena.region(0)?)?;
+            library.copy_d2h_quiescent(&mut actual, arena.region(0)?)?;
             for plane in 0..4 {
                 let (offset, bytes) = layout.expert_plane(plane, 0)?;
                 let expected = if nv && plane % 2 == 0 {
@@ -474,7 +474,7 @@ fn exlr8_relocated_and_compact_descriptors_match_mount() -> Result<()> {
             0,
         )?;
         let mut actual = vec![0; residency.resident_bytes];
-        library.copy_d2h(&mut actual, ready.region(0)?.buffer())?;
+        library.copy_d2h_quiescent(&mut actual, ready.region(0)?.buffer())?;
         assert_eq!(
             &actual[512..512 + pointers.len() * 8],
             pointers
@@ -642,7 +642,7 @@ fn fp8_header_plans_widen_pad_and_validate_like_mount() -> Result<()> {
             }
             let ready = initialize(arena.done()?, &[recipe], None, 0)?;
             let mut actual = vec![0; cursor];
-            library.copy_d2h(&mut actual, ready.region(0)?.buffer())?;
+            library.copy_d2h_quiescent(&mut actual, ready.region(0)?.buffer())?;
             assert_eq!(actual, expected, "nv={nv} rank={rank}");
         }
     }
@@ -653,7 +653,7 @@ fn fp8_header_plans_widen_pad_and_validate_like_mount() -> Result<()> {
         let ready = initialize(arena, &[Layer::Fp8 { widen: vec![], scalars: vec![0..raw.len()],
             scalar_convention: convention, inputs: None, expand: vec![] }], None, 0)?;
         let mut actual = vec![0; raw.len()];
-        library.copy_d2h(&mut actual, ready.region(0)?.buffer())?;
+        library.copy_d2h_quiescent(&mut actual, ready.region(0)?.buffer())?;
         assert_eq!(actual, raw, "push initialization changes checkpoint globals: {convention:?}");
     }
     for value in [0., -1., f32::NAN, f32::INFINITY] {

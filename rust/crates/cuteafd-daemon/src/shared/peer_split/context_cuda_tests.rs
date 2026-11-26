@@ -91,7 +91,7 @@ impl Drop for Buffer<'_> {
 
 fn read(library: &NativeLibrary, device: i32, ptr: *mut c_void, bytes: usize) -> Result<Vec<u8>> {
     let mut out = vec![0u8; bytes];
-    on_device(library, device, || library.copy_d2h(&mut out, CuteafdDeviceBuffer { ptr, bytes, device_id: device,
+    on_device(library, device, || library.copy_d2h_quiescent(&mut out, CuteafdDeviceBuffer { ptr, bytes, device_id: device,
         flags: 0 }))?;
     Ok(out)
 }

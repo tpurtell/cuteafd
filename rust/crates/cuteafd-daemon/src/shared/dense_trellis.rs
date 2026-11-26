@@ -409,7 +409,7 @@ mod retained_tests {
                 GroupedWorkspace::pointer_table(scratch.buffers["rotated"])?
             } else { (scratch.buffers["rotated"].ptr as u64).to_le_bytes().to_vec() };
             let mut actual = vec![0; expected.len()];
-            device.run(|| library.copy_d2h(&mut actual, scratch.buffers["table"]))?;
+            device.run(|| library.copy_d2h_quiescent(&mut actual, scratch.buffers["table"]))?;
             assert_eq!(actual, expected);
             let mut inventory = Inventory::new(CoordinatorDevices::new(&[0])?, "packed",
                 Lifetime::TARGET, Category::Workspace, "projection");
@@ -637,7 +637,7 @@ mod upload_tests {
                 ("svh",&actual.svh,&baseline.svh)] {
                 a.inventory(&mut inventory,name)?;
                 let mut got=vec![0;a.buffer.bytes]; let mut expected=vec![0;b.buffer.bytes];
-                device.run(|| { library.copy_d2h(&mut got,a.buffer)?; library.copy_d2h(&mut expected,b.buffer) })?;
+                device.run(|| { library.copy_d2h_quiescent(&mut got,a.buffer)?; library.copy_d2h_quiescent(&mut expected,b.buffer) })?;
                 assert_eq!(got,expected,"K{bits} {name}");
             }
             assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(),1);

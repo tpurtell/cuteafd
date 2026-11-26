@@ -10,7 +10,7 @@ fn host(device: Device<'_>, buffer: CuteafdDeviceBuffer, bytes: usize) -> Result
     device.run(|| {
         device
             .library
-            .copy_d2h(&mut data, CuteafdDeviceBuffer { bytes, ..buffer })
+            .copy_d2h_quiescent(&mut data, CuteafdDeviceBuffer { bytes, ..buffer })
     })?;
     Ok(data)
 }

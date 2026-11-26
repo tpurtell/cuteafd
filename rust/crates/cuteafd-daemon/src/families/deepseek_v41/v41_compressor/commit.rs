@@ -265,7 +265,7 @@ mod tests {
                 (kv.values, V41Kv::COMPRESSED_VALUE_BYTES), (kv.scales, V41Kv::COMPRESSED_SCALE_BYTES)] {
                 let start = bytes.len(); bytes.resize(start+width, 0);
                 let source = CuteafdDeviceBuffer { ptr: unsafe { buffer.ptr.cast::<u8>().add(physical*width).cast() }, bytes: width, ..buffer };
-                lib.copy_d2h(&mut bytes[start..], source)?;
+                lib.copy_d2h_quiescent(&mut bytes[start..], source)?;
             }
         }
         Ok(bytes)
@@ -314,7 +314,7 @@ mod tests {
         let carry = |state: &CompressorState<'_>, slot: usize| -> Result<Vec<u8>> {
             let mut bytes = vec![0; 4096];
             for (k, pending) in state.pending.as_ref().context("ratio-two carry")?.iter().enumerate() {
-                lib.copy_d2h(&mut bytes[k*2048..(k+1)*2048], CuteafdDeviceBuffer {
+                lib.copy_d2h_quiescent(&mut bytes[k*2048..(k+1)*2048], CuteafdDeviceBuffer {
                     ptr: unsafe { pending.buffer.ptr.cast::<u8>().add(slot * 2048).cast() }, bytes: 2048, ..pending.buffer })?;
             }
             Ok(bytes)
@@ -493,17 +493,17 @@ mod tests {
                             let slice=|buffer:CuteafdDeviceBuffer| CuteafdDeviceBuffer {
                                 ptr:unsafe { buffer.ptr.cast::<u8>().add(physical*width).cast() },bytes:width,..buffer };
                             let mut left=vec![0;width];let mut right=left.clone();
-                            lib.copy_d2h(&mut left,slice(a))?;
-                            replica.device().run(||lib.copy_d2h(&mut right,slice(b)))?;
+                            lib.copy_d2h_quiescent(&mut left,slice(a))?;
+                            replica.device().run(||lib.copy_d2h_quiescent(&mut right,slice(b)))?;
                             assert_eq!(left,right);
                         }
                     }
                     let mut rows=[0;8];
-                    replica.device().run(||lib.copy_d2h(&mut rows,peer.device_rows))?;
+                    replica.device().run(||lib.copy_d2h_quiescent(&mut rows,peer.device_rows))?;
                     assert_eq!(u64::from_ne_bytes(rows),original.rows as u64);
                     let mut pages=vec![0;original.pages.len()*4];
                     let page_bytes=pages.len();
-                    replica.device().run(||lib.copy_d2h(&mut pages,
+                    replica.device().run(||lib.copy_d2h_quiescent(&mut pages,
                         CuteafdDeviceBuffer { bytes:page_bytes,..peer.device_pages }))?;
                     assert_eq!(pages,original.pages.iter().flat_map(|p|p.to_ne_bytes()).collect::<Vec<_>>());
                 }
@@ -511,8 +511,8 @@ mod tests {
             if let (Some(actual), Some(expected)) = (&state.pending, &reference.pending) {
                 for (a, b) in actual.iter().zip(expected) {
                     let mut left = vec![0; 2048]; let mut right = left.clone();
-                    lib.copy_d2h(&mut left, CuteafdDeviceBuffer { bytes: 2048, ..a.buffer })?;
-                    lib.copy_d2h(&mut right, CuteafdDeviceBuffer { bytes: 2048, ..b.buffer })?;
+                    lib.copy_d2h_quiescent(&mut left, CuteafdDeviceBuffer { bytes: 2048, ..a.buffer })?;
+                    lib.copy_d2h_quiescent(&mut right, CuteafdDeviceBuffer { bytes: 2048, ..b.buffer })?;
                     assert_eq!(left, right);
                 }
             }

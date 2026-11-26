@@ -269,7 +269,7 @@ fn bf16_output_projection_records_column_shares_and_replays_mount_bytes() -> Res
                 row[rank * shape[1] * 2 / ranks..(rank + 1) * shape[1] * 2 / ranks].iter().copied()).collect();
             for allocation in [&mounted[rank], &pushed[rank]] {
                 let mut actual = vec![0; expected.len()];
-                library.copy_d2h(&mut actual, allocation.buffer)?;
+                library.copy_d2h_quiescent(&mut actual, allocation.buffer)?;
                 assert_eq!(actual, expected);
             }
         }

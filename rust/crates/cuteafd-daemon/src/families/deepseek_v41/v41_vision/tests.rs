@@ -95,7 +95,7 @@ fn native_full_vision_vectors() -> Result<()> {
             }
             let filename = format!("{prefix}-{name}.bin");
             let mut bytes = vec![0; buffer.bytes];
-            lib.copy_d2h(&mut bytes, buffer)?;
+            lib.copy_d2h_quiescent(&mut bytes, buffer)?;
             std::fs::write(output.join(&filename), bytes)?;
             traces.push(json!({"name":name,"file":filename,"bytes":buffer.bytes}));
             Ok(())
@@ -104,14 +104,14 @@ fn native_full_vision_vectors() -> Result<()> {
         let result = runtime.encode_patches(&patches, grid, Some(&mut observe))?;
         let traced_seconds = started.elapsed().as_secs_f64();
         let mut span = vec![0; result.bytes];
-        lib.copy_d2h(&mut span, result)?;
+        lib.copy_d2h_quiescent(&mut span, result)?;
         std::fs::write(output.join(format!("{prefix}-span.bin")), &span)?;
         // Repeat without observation to establish stable output and ordinary time.
         let started = Instant::now();
         let again = runtime.encode_patches(&patches, grid, None)?;
         let encode_seconds = started.elapsed().as_secs_f64();
         let mut repeated = vec![0; again.bytes];
-        lib.copy_d2h(&mut repeated, again)?;
+        lib.copy_d2h_quiescent(&mut repeated, again)?;
         assert_eq!(repeated, span, "repeat changed vision output");
         let mut short = patches.clone();
         short.pop();

@@ -69,7 +69,7 @@ int main() {
       check(cuteafd_cuda_stream_query(pending, &ready) == CUTEAFD_STATUS_OK && ready == 0);
       gate.release.store(true, std::memory_order_release);
       check(cuteafd_cuda_stream_synchronize(pending) == CUTEAFD_STATUS_OK);
-      check(cuteafd_copy_d2h(host.data(), dst, bytes) == CUTEAFD_STATUS_OK);
+      check(cuteafd_copy_d2h(host.data(), dst, bytes, consumer) == CUTEAFD_STATUS_OK);
       for (auto value : host) check(value == pattern);
     }
     cuteafd_device_buffer_t local{};
@@ -100,7 +100,7 @@ int main() {
       check(cuteafd_cuda_stream_query(pending, &ready) == CUTEAFD_STATUS_OK && ready == 0);
       gate.release.store(true, std::memory_order_release);
       check(cuteafd_cuda_stream_synchronize(pending) == CUTEAFD_STATUS_OK);
-      check(cuteafd_copy_d2h(host.data(), dst, bytes) == CUTEAFD_STATUS_OK);
+      check(cuteafd_copy_d2h(host.data(), dst, bytes, consumer) == CUTEAFD_STATUS_OK);
       for (size_t i = 0; i < bytes; ++i) {
         const size_t row = i / 43, column = i % 43;
         check(host[i] == (row < 19 && column < 17 ? values[row * 31 + column] : 255));

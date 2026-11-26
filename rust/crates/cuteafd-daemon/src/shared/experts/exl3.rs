@@ -639,7 +639,7 @@ mod tests {
                             let source = CuteafdDeviceBuffer { ptr: unsafe {
                                 source.ptr.cast::<u8>().add(offset).cast() }, bytes, ..source };
                             let mut actual = vec![0; bytes];
-                            device.run(|| library.copy_d2h(&mut actual, source))?;
+                            device.run(|| library.copy_d2h_quiescent(&mut actual, source))?;
                             assert_eq!(actual, staging[..bytes]);
                         }
                     }
@@ -763,7 +763,7 @@ mod tests {
                     view.ptr = unsafe { view.ptr.cast::<u8>().add(offset).cast() };
                     view.bytes = size;
                     let mut actual = vec![0; size];
-                    library.copy_d2h(&mut actual, view)?;
+                    library.copy_d2h_quiescent(&mut actual, view)?;
                     ensure!(actual == staging[..size], "uploaded EXL3 bytes differ for {}", owned.layout.loads[index].tensor);
                     checked += 1;
                 }
@@ -774,7 +774,7 @@ mod tests {
                 continue;
             }
             let mut actual = vec![0; spec.bytes];
-            library.copy_d2h(&mut actual, owned.buffer(&spec.name)?)?;
+            library.copy_d2h_quiescent(&mut actual, owned.buffer(&spec.name)?)?;
             let expected: Vec<_> = spec
                 .initial_words
                 .iter()

@@ -171,9 +171,9 @@ impl RankDevice<'_, '_> {
         for &(name, stride) in components {
             let row = trace.row(self.lane.rows(name, step.rows)?, stride)?;
             if name == "route_weights" {
-                crate::shared::activation_trace::write_f32(self.library, &trace.directory, layer, name, row)?;
+                crate::shared::activation_trace::write_f32(self.library, &trace.directory, layer, name, row, self.stream)?;
             } else {
-                crate::shared::activation_trace::write_device(self.library, &trace.directory, layer, name, row)?;
+                crate::shared::activation_trace::write_device(self.library, &trace.directory, layer, name, row, self.stream)?;
             }
         }
         Ok(())

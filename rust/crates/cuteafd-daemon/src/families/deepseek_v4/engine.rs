@@ -122,6 +122,7 @@ pub(crate) struct Engine<'a> {
     /// Longest sequence the exported programs' cache extents cover.
     pub max_context: usize,
     pub stream: *mut c_void,
+    stream_owner: std::rc::Rc<crate::shared::memory::device::Stream<'a>>,
     quantize_grid: Fp8QuantizeGrid,
     attention_reduction: AttentionReductionPlan,
     pub shape: PoolShape,
@@ -329,7 +330,7 @@ pub(crate) struct EngineParts<'a> {
     pub prefill_span_rows: usize,
     pub c128_width: usize,
     pub max_context: usize,
-    pub stream: *mut c_void,
+    pub stream_owner: std::rc::Rc<crate::shared::memory::device::Stream<'a>>,
     pub sms: Option<usize>,
     pub shape: PoolShape,
     pub embedding: TokenEmbedding<'a>,
@@ -489,6 +490,11 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The CUDA device index of rank `rank`.
+    pub(crate) fn device_of(&self, rank: usize) -> i32 {
+        self.peer.as_ref().filter(|_| rank == 1).map_or(self.device, |peer| peer.device)
+    }
+
     /// Runs `body` with rank `rank`'s device current, preserving the caller's device.
     pub(crate) fn on<T>(&self, rank: usize, body: impl FnOnce() -> Result<T>) -> Result<T> {
         let device = self.peer.as_ref().filter(|_| rank == 1).map_or(self.device, |peer| peer.device);
@@ -637,7 +643,8 @@ impl<'a> Engine<'a> {
             prefill_span_rows: parts.prefill_span_rows,
             c128_width: parts.c128_width,
             max_context: parts.max_context,
-            stream: parts.stream,
+            stream: parts.stream_owner.raw,
+            stream_owner: parts.stream_owner,
             quantize_grid,
             attention_reduction,
             shape: parts.shape,
@@ -864,7 +871,7 @@ impl<'a> Engine<'a> {
     fn download(&self, allocation: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
         self.sync()?;
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..allocation.buffer })?;
+        self.stream_owner.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..allocation.buffer })?;
         Ok(out)
     }
 

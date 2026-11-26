@@ -527,7 +527,7 @@ mod tests {
                 if let Some(head) = &globals.head_bf16 {
                     let expected = crate::shared::checkpoint_read::read_tensor(&checkpoint, "lm_head.weight")?;
                     let mut actual = vec![0; head.buffer.bytes];
-                    device.run(|| library.copy_d2h(&mut actual, head.buffer))?;
+                    device.run(|| library.copy_d2h_quiescent(&mut actual, head.buffer))?;
                     assert_eq!(actual, expected.bytes);
                     assert_eq!(head.weight_backing().context("BF16 head lost arena")?.buffer.bytes, arena.layout().bytes());
                 }
@@ -546,7 +546,7 @@ mod tests {
                         let owner = &weights.operands[name];
                         assert_eq!(owner.weight_backing().context("Muse view lost backing")?.buffer.bytes, backing_bytes);
                         let mut actual = vec![0; bytes.len()];
-                        device.run(|| library.copy_d2h(&mut actual, owner.buffer))?;
+                        device.run(|| library.copy_d2h_quiescent(&mut actual, owner.buffer))?;
                         assert_eq!(&actual, bytes, "TP{ranks} rank{rank} layer{layer} {name}");
                     }
                 }
@@ -636,7 +636,7 @@ mod tests {
                         for (owner, bytes) in [(&actual.payload, &expected.shard.payload),
                             (&actual.suh, &expected.shard.suh), (&actual.svh, &expected.shard.svh)] {
                             let mut landed = vec![0; bytes.len()];
-                            device.run(|| library.copy_d2h(&mut landed, owner.buffer))?;
+                            device.run(|| library.copy_d2h_quiescent(&mut landed, owner.buffer))?;
                             assert_eq!(&landed, bytes, "TP{ranks} rank{rank} {}", shared.stem);
                         }
                     }
@@ -664,7 +664,7 @@ mod tests {
                             .chain(actual.scales.iter().zip(expected.scales.iter())) {
                             let mut a = vec![0; actual.buffer.bytes];
                             let mut b = vec![0; expected.buffer.bytes];
-                            device.run(|| { library.copy_d2h(&mut a, actual.buffer)?; library.copy_d2h(&mut b, expected.buffer) })?;
+                            device.run(|| { library.copy_d2h_quiescent(&mut a, actual.buffer)?; library.copy_d2h_quiescent(&mut b, expected.buffer) })?;
                             assert_eq!(a, b, "native TP{ranks} rank{rank} {} compact={compact}", layout.stem);
                         }
                     }

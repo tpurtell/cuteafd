@@ -16,7 +16,7 @@ pub(crate) type Digests = BTreeMap<String, String>;
 
 fn digest(library: &NativeLibrary, allocation: &Allocation<'_>) -> Result<String> {
     let mut bytes = vec![0u8; allocation.buffer.bytes];
-    allocation.device.run(|| library.copy_d2h(&mut bytes, allocation.buffer))?;
+    allocation.device.run(|| library.copy_d2h_quiescent(&mut bytes, allocation.buffer))?;
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
@@ -99,7 +99,7 @@ pub(crate) fn layer_digests(library: &NativeLibrary, prefix: &str, weights: &Lay
             if let Some(allocation) = allocation {
                 let mut bytes = vec![0u8; allocation.buffer.bytes];
                 Device { library, id: allocation.buffer.device_id }.run(||
-                    library.copy_d2h(&mut bytes, allocation.buffer))?;
+                    library.copy_d2h_quiescent(&mut bytes, allocation.buffer))?;
                 out.insert(format!("{prefix}.{name}.{part}"), format!("{:x}", Sha256::digest(&bytes)));
             }
         }
@@ -592,7 +592,7 @@ fn native_fp8_arena_bytes_match_checkpoint_tp_rectangles_on_mount_and_push() -> 
                 // The min-256 allocation tail is not initialized tensor data.
                 let mut actual = vec![0; expected.len()];
                 let buffer = cuteafd_ffi::CuteafdDeviceBuffer { bytes: actual.len(), ..owner.buffer };
-                Device { library: &library, id: buffer.device_id }.run(|| library.copy_d2h(&mut actual, buffer))?;
+                Device { library: &library, id: buffer.device_id }.run(|| library.copy_d2h_quiescent(&mut actual, buffer))?;
                 assert_eq!(actual, expected, "{} TP{ranks} rank{} push={push}", layout.stem, layout.rank);
                 let ids = [0, 1];
                 let mut inventory = crate::shared::memory::receipts::Inventory::new(

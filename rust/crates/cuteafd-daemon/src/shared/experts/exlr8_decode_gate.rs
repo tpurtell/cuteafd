@@ -142,7 +142,7 @@ fn native_exlr8_decode_widths_finite_and_row_invariant() -> Result<()> {
                 unsafe { library.cuda_stream_synchronize(stream.raw)?; }
                 crate::shared::spark_waves::healthy()?;
                 let mut wave = vec![0; output.buffer.bytes];
-                library.copy_d2h(&mut wave, output.buffer)?;
+                stream.copy_d2h(&mut wave, output.buffer)?;
                 wave.truncate(rows * row_bytes);
                 if alone.len() < MAX_ROWS {
                     ensure!(wave.chunks_exact(2).all(|v|

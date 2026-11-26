@@ -223,8 +223,8 @@ mod tests {
             unsafe { library.cuda_stream_synchronize(std::ptr::null_mut())?; }
             let mut actual = vec![0u8;rows*n*4];
             let mut reference = vec![0u8;rows*n*4];
-            library.copy_d2h(&mut actual,output.buffer)?;
-            library.copy_d2h(&mut reference,expected.buffer)?;
+            library.copy_d2h_quiescent(&mut actual,output.buffer)?;
+            library.copy_d2h_quiescent(&mut reference,expected.buffer)?;
             assert_eq!(actual,reference,"Muse shared head changed bytes at {rows} rows");
         }
         assert_eq!(device.id,output.buffer.device_id);

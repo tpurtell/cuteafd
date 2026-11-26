@@ -164,7 +164,7 @@ mod tests {
             {
                 for (offset, rows) in spans(begin, end) {
                     let mut bytes = vec![0; rows * width];
-                    lib.copy_d2h(&mut bytes, slice(buffer, offset * width, rows * width))?;
+                    lib.copy_d2h_quiescent(&mut bytes, slice(buffer, offset * width, rows * width))?;
                     assert_eq!(bytes, expected[offset * width..(offset + rows) * width]);
                 }
             }

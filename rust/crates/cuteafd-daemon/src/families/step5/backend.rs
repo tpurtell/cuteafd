@@ -313,7 +313,7 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             let device = cache.stream.device;
             let read = |buffer: cuteafd_ffi::CuteafdDeviceBuffer| -> Result<Vec<u8>> {
                 let mut bytes = vec![0; buffer.bytes];
-                device.run(|| device.library.copy_d2h(&mut bytes, buffer))?;
+                device.run(|| device.library.copy_d2h_quiescent(&mut bytes, buffer))?;
                 Ok(bytes)
             };
             state.push(read(cache.mark_view(slot as u32)?)?);

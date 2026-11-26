@@ -405,7 +405,7 @@ mod tests {
                 if cancel { drop(pending); continue; }
                 let output=runtime.block_on(pending.complete())?;
                 let mut actual=vec![0;output.values.bytes];
-                devices[0].run(||library.copy_d2h(&mut actual,output.values))?;
+                devices[0].run(||library.copy_d2h_quiescent(&mut actual,output.values))?;
                 for row in 0..4 { for half in 0..2 {
                     let n=(row+1) as f32;
                     let expected=value*n/(n+if half==0 {1.0} else {3.0});
@@ -475,7 +475,7 @@ mod shared_storage_tests {
         let mut private=DualAttentionWave::new(devices,4,DualAttentionWave::device_bytes(4)?)?;
         initialize(&private)?;enqueue(&mut private,0)?;
         let output=runtime.block_on(PendingDualAttention {wave:Some(&mut private),cold:[false;2],rows:4,layer:0}.complete())?;
-        let mut want=vec![0;4*64*1024];lib.copy_d2h(&mut want,output.values)?;
+        let mut want=vec![0;4*64*1024];lib.copy_d2h_quiescent(&mut want,output.values)?;
         initialize(&slots[0])?;
         for seed in 0..2 {
             enqueue(&mut slots[seed],seed)?;
@@ -510,7 +510,7 @@ mod shared_storage_tests {
         devices[1].run(|| {drop(gate);Ok(())})?;
         for chain in &chains {chain.drain()?;}reader.drain()?;
         assert_eq!(done,!guarded,"dual B completion before A reader release");
-        let mut got=vec![0;want.len()];devices[1].run(||lib.copy_d2h(&mut got,saved.buffer))?;
+        let mut got=vec![0;want.len()];devices[1].run(||lib.copy_d2h_quiescent(&mut got,saved.buffer))?;
         if guarded {assert_eq!(got,want);}else {assert_ne!(got,want,"unguarded dual gather did not clobber");}
         Ok(())
     }

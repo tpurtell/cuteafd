@@ -75,10 +75,10 @@ fn installed_inkling_recurrent_forward_matches_real_weight_reference()->Result<(
         rank.recurrent_tokens(1,rank.buffer("step.ids")?,targets["model.llm.unembed.weight"].buffer)?;
         stream.drain()?;
         let expected=tensor(&file,"hidden")?;let mut actual=vec![0;expected.len()];
-        library.copy_d2h(&mut actual,Buffer{bytes:expected.len(),..rank.buffer("step.normalized")?})?;
+        stream.copy_d2h(&mut actual,Buffer{bytes:expected.len(),..rank.buffer("step.normalized")?})?;
         compare(&actual,&expected,&format!("rows{rows}.hidden"))?;
         let expected=tensor(&file,"tokens")?;let mut actual=vec![0;expected.len()];
-        library.copy_d2h(&mut actual,Buffer{bytes:expected.len(),..rank.buffer("head.tokens")?})?;
+        stream.copy_d2h(&mut actual,Buffer{bytes:expected.len(),..rank.buffer("head.tokens")?})?;
         ensure!(actual==expected,"recurrent oracle rows{rows}: seven predicted token ids differ");
     }
     Ok(())
@@ -134,7 +134,7 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
         let download = |buffer:Buffer, bytes:usize| -> Result<Vec<u8>> {
             ensure!(bytes<=buffer.bytes,"fold oracle download extent");
             let mut host=vec![0;bytes];
-            library.copy_d2h(&mut host,Buffer{bytes,..buffer})?;
+            stream.copy_d2h(&mut host,Buffer{bytes,..buffer})?;
             Ok(host)
         };
         if let ProjectionWeight::Fp8(w)=weight {
@@ -241,7 +241,7 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
                 stream.drain()?;
                 let mut values=vec![0;rows*stored*4];
                 let bytes=values.len();
-                library.copy_d2h(&mut values,Buffer{bytes,..output.buffer})?;
+                stream.copy_d2h(&mut values,Buffer{bytes,..output.buffer})?;
                 if let Some(previous)=&prefix {
                     let previous: &Vec<u8> = previous;
                     ensure!(values.starts_with(previous), "{mode} head prefix changes at M={rows}");
@@ -295,7 +295,7 @@ fn installed_inkling_recurrent_head_baseline() -> Result<()> {
         if mode == CoreView::Original && std::env::var_os("CUTEAFD_TEST_BATCHED_HEAD").is_some() {
             let read_tokens = |out: Buffer| -> Result<Vec<u8>> {
                 let mut bytes = vec![0; rows*predictions*4];
-                library.copy_d2h(&mut bytes, Buffer { bytes: rows*predictions*4, ..out })?;
+                stream.copy_d2h(&mut bytes, Buffer { bytes: rows*predictions*4, ..out })?;
                 Ok(bytes)
             };
             let old = rank.recurrent_tokens_measured(rows, anchors, None, base, |_, _| Ok(()))?;

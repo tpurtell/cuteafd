@@ -932,7 +932,8 @@ mod tests {
         library.copy_h2d(buffers[5], &source)?;
         op.narrow(17, views[5], views[6], stream)?;
         let mut actual = vec![0u8; 17 * 32 * 2];
-        library.copy_d2h(&mut actual, buffers[6])?;
+        // SAFETY: `stream` produced `buffers[6]` and remains live on this device.
+        unsafe { library.copy_d2h(&mut actual, buffers[6], stream)?; }
         for (index, bytes) in actual.chunks_exact(2).enumerate() {
             assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), expected[index % expected.len()]);
         }

@@ -2735,7 +2735,55 @@ extern "C" cuteafd_status_t cuteafd_copy_h2d_2d_async(
   return ok();
 }
 
-extern "C" cuteafd_status_t cuteafd_copy_d2h(void* dst, cuteafd_device_buffer_t src, size_t bytes) {
+extern "C" cuteafd_status_t cuteafd_copy_d2h(void* dst, cuteafd_device_buffer_t src, size_t bytes,
+                                             void* cuda_stream) {
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  if (cuda_stream == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT,
+                "stream-ordered device-to-host copy requires a non-null CUDA stream");
+  }
+#else
+  if (cuda_stream != nullptr) {
+    return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
+                "CUDA stream-ordered device-to-host copy is unavailable in this build");
+  }
+#endif
+  if (bytes == 0) {
+    return ok();
+  }
+  if (dst == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "destination host pointer is null");
+  }
+  if (src.ptr == nullptr) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "source device buffer is null");
+  }
+  if (bytes > src.bytes) {
+    return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "copy exceeds source device buffer size");
+  }
+#if CUTEAFD_NATIVE_ENABLE_CUDA
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+  cudaError_t err = cudaMemcpyAsync(dst, src.ptr, bytes, cudaMemcpyDeviceToHost, stream);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_COPY_FAILED, "cudaMemcpyAsync device-to-host failed", err);
+  }
+  err = cudaStreamSynchronize(stream);
+  if (err != cudaSuccess) {
+    return fail_cuda(CUTEAFD_STATUS_COPY_FAILED,
+                     "stream-ordered device-to-host synchronization failed", err);
+  }
+  if (graph_census_enabled()) {
+    int device = -1;
+    cuteafd::diagnostic_cuda(cudaGetDevice(&device));
+    drain_census_spans(device);
+  }
+#else
+  std::memcpy(dst, src.ptr, bytes);
+#endif
+  return ok();
+}
+
+extern "C" cuteafd_status_t cuteafd_copy_d2h_quiescent(void* dst, cuteafd_device_buffer_t src,
+                                                       size_t bytes) {
   if (bytes == 0) {
     return ok();
   }

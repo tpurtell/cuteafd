@@ -459,6 +459,7 @@ impl<'a> StepRows<'a> {
 pub(crate) struct GlmPeer<'a> {
     pub device: i32,
     pub stream: *mut c_void,
+    stream_owner: Rc<crate::shared::memory::device::Stream<'a>>,
     released: crate::shared::memory::device::Event<'a>,
     pub layers: Vec<GlmLayer<'a>>,
     kv: Vec<Dev<'a>>,
@@ -539,6 +540,7 @@ pub(crate) struct GlmEngine<'a> {
     pub cfg: GlmDsaConfig,
     pub weights: GlmWeights<'a>,
     pub stream: *mut c_void,
+    stream_owner: Rc<crate::shared::memory::device::Stream<'a>>,
     pub max_context: usize,
     pub prefill_rows: usize,
     packed_row_cap: Cell<Option<usize>>,
@@ -754,9 +756,10 @@ pub struct StartupGraphCapture {
 impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmDsaConfig,
-        weights: GlmWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, pages: usize,
+        weights: GlmWeights<'a>, stream_owner: Rc<crate::shared::memory::device::Stream<'a>>, max_context: usize, prefill_rows: usize, pages: usize,
         embedding: TokenEmbedding<'a>, depth: crate::shared::prefill_depth::PrefillDepth,
         context_mode: Option<GlmContext>, cos_sin: Dev<'a>) -> Result<Self> {
+        let stream = stream_owner.raw;
         let prefill_lanes = depth.waves;
         ensure!((1..=4).contains(&prefill_lanes), "GLM prefill lanes must match admitted inventory");
         ensure!(depth.unit_rows == prefill_rows, "GLM prefill depth runs {}-row units, the engine {prefill_rows}",
@@ -768,7 +771,7 @@ impl<'a> GlmEngine<'a> {
         let (kv, index, cos_sin) = caches(library, &cfg, &weights.layers, local, max_context, weights.rope_alpha.as_ref(), cos_sin)?;
         let device = library.cuda_get_device()?;
         Ok(Self { admitted_host_config: None, max_pool_tokens_no_onboard: None, packed_row_cap: Cell::new(None), packed_fallback_reason: RefCell::new(String::new()), quantize_grid, device, exlr8_prefill_activations: super::Exlr8PrefillActivations::A16, native_experts: Vec::new(), native_dense: Vec::new(), native_scratch: Vec::new(), core_programs: Vec::new(), core_admission: None, peer: None, exchange: None, tp2: None, whole: None, tp2_exchange: ExchangeDtype::Bf16, force_route_check: Cell::new(false), context_mode, context: None, layer_execution: None,
-            context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, max_context, prefill_rows, pages, kv, index, cos_sin,
+            context_units: RefCell::new(Vec::new()), library, programs, cfg, weights, stream, stream_owner, max_context, prefill_rows, pages, kv, index, cos_sin,
             decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
             prefill_lanes, depth,
             staged: Cell::new(library.cuda_event_create_ordering()?),
@@ -909,14 +912,15 @@ impl<'a> GlmEngine<'a> {
     /// `layers` (every layer's rank-1 share, see `GlmLoader::model`). Enables
     /// peer access both ways, loads the programs there, and allocates its
     /// caches, RoPE table and the exchange (four slots per prefill lane).
-    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmLayer<'a>>, cos_sin: Dev<'a>) -> Result<()> {
-        self.attach_peer_with_exchange(device, stream, layers, cos_sin, None)
+    pub fn attach_peer(&mut self, device: i32, stream_owner: Rc<crate::shared::memory::device::Stream<'a>>, layers: Vec<GlmLayer<'a>>, cos_sin: Dev<'a>) -> Result<()> {
+        self.attach_peer_with_exchange(device, stream_owner, layers, cos_sin, None)
     }
 
     /// Like [`Self::attach_peer`], reusing a pre-created shared [`PeerExchange`]
     /// already bound to a TP2 drafter (zero extra exchange allocations).
-    pub(crate) fn attach_peer_with_exchange(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmLayer<'a>>,
+    pub(crate) fn attach_peer_with_exchange(&mut self, device: i32, stream_owner: Rc<crate::shared::memory::device::Stream<'a>>, layers: Vec<GlmLayer<'a>>,
         cos_sin: Dev<'a>, shared: Option<std::rc::Rc<PeerExchange<'a>>>) -> Result<()> {
+        let stream = stream_owner.raw;
         ensure!(layers.len() == self.weights.layers.len() && layers.iter().chain(&self.weights.layers).all(|l| l.split),
             "attach_peer needs the head-split shares of every loaded layer");
         let rows = self.prefill_rows.max(DECODE_ROWS);
@@ -945,7 +949,7 @@ impl<'a> GlmEngine<'a> {
                 self.weights.rope_alpha.as_ref(), cos_sin)?;
             let released = crate::shared::memory::device::Event::new(
                 crate::shared::memory::device::Device { library: self.library, id: device })?;
-            Ok(GlmPeer { device, stream, released, layers, kv, index, cos_sin, decode_workspace: RefCell::new(None),
+            Ok(GlmPeer { device, stream, stream_owner, released, layers, kv, index, cos_sin, decode_workspace: RefCell::new(None),
                 prefill_slots: RefCell::new(Vec::new()), graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()),
                 l2: None })
         })?;
@@ -989,6 +993,19 @@ impl<'a> GlmEngine<'a> {
             (1, Some(peer)) => peer.stream,
             _ => self.stream,
         }
+    }
+
+    /// The `Stream` wrapper of rank `rank`.
+    pub(crate) fn rank_stream(&self, rank: usize) -> &crate::shared::memory::device::Stream<'a> {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.stream_owner,
+            _ => &self.stream_owner,
+        }
+    }
+
+    /// The CUDA device index of rank `rank`.
+    pub(crate) fn device_of(&self, rank: usize) -> i32 {
+        self.peer.as_ref().filter(|_| rank == 1).map_or(self.device, |peer| peer.device)
     }
 
     /// Runs `body` with rank `rank`'s device current, preserving the caller's device.
@@ -1272,10 +1289,9 @@ impl<'a> GlmEngine<'a> {
     }
 
     fn download(&self, dev: &Buf<'_>, bytes: usize) -> Result<Vec<u8>> {
-        // SAFETY: the engine owns this stream.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        self.stream_owner.drain()?;
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
+        self.stream_owner.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
         Ok(out)
     }
 
@@ -2849,10 +2865,10 @@ impl<'a> GlmEngine<'a> {
             let width = self.cfg.index_topk;
             let bytes = rows * width * 4;
             let raw = self.on(rank, || {
-                // SAFETY: the rank's own stream; draining it completes the top-k.
-                unsafe { self.library.cuda_stream_synchronize(self.stream_of(rank))? };
+                let stream = self.rank_stream(rank);
+                stream.drain()?;
                 let mut out = vec![0u8; bytes];
-                self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..w.indices.buffer })?;
+                stream.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..w.indices.buffer })?;
                 Ok(out)
             })?;
             let slots = dump::i32s(&raw);

@@ -134,7 +134,7 @@ impl<'a> Head<'a> {
         ensure!(!bytes.is_empty() && bytes.len() <= self.rows * 6144 * 2
             && bytes.len() % (6144 * 2) == 0, "MiniMax normalized tap extent");
         self.stream.drain()?;
-        self.stream.device.run(|| self.stream.device.library.copy_d2h(bytes, self.normalized.buffer))
+        self.stream.copy_d2h(bytes, self.normalized.buffer)
     }
     /// Logits borrow this admitted head until the next projection. Selection or
     /// scoring must consume them on the producing stream before scratch reuse.
@@ -183,7 +183,7 @@ impl<'a> Head<'a> {
         self.project_device(weights, residual, rows)?;
         self.stream.drain()?;
         let mut bytes = vec![0; rows * self.vocab * 4];
-        self.stream.device.run(|| self.stream.device.library.copy_d2h(&mut bytes, self.logits.buffer))?;
+        self.stream.copy_d2h(&mut bytes, self.logits.buffer)?;
         let logits = bytes.chunks_exact(4).map(|v| f32::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
         ensure!(logits.iter().all(|value| value.is_finite()), "MiniMax nonfinite head logits");
         Ok(logits)

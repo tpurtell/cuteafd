@@ -140,7 +140,7 @@ fn committed_prefix_survives_append_but_private_boundary_stays_exact() -> Result
                         lib.cuda_stream_synchronize(stream.raw)?;
                     }
                     let mut bytes = vec![0; output.buffer.bytes];
-                    lib.copy_d2h(&mut bytes, output.buffer)?;
+                    lib.copy_d2h_quiescent(&mut bytes, output.buffer)?;
                     Ok(bytes)
                 };
                 let prefix = run(1, 0)?;
@@ -188,7 +188,7 @@ fn committed_prefix_survives_append_but_private_boundary_stays_exact() -> Result
                     lib.cuda_stream_synchronize(append_stream.raw)?;
                 }
                 let mut bytes = vec![0; outputs.buffer.bytes];
-                lib.copy_d2h(&mut bytes, outputs.buffer)?;
+                lib.copy_d2h_quiescent(&mut bytes, outputs.buffer)?;
                 for (iteration, actual) in bytes.chunks_exact(65536).enumerate() {
                     assert!(actual == prefix,
                         "concurrent append changed prefix attention: gpu={gpu}, iteration={iteration}, split={}", split.is_some());
@@ -262,7 +262,7 @@ fn compact_wave_batch_graph_consumes_local_buffers() -> Result<()> {
                 unsafe { lib.cuda_graph_launch(graph,wave.storage.stream.raw)?; }
                 wave.synchronize()?;
                 let mut output=vec![0u8;4*32768];
-                lib.copy_d2h(&mut output,slice(wave.storage.output.buffer,0,4*32768))?;
+                lib.copy_d2h_quiescent(&mut output,slice(wave.storage.output.buffer,0,4*32768))?;
                 for (row,value) in [0.5f32,0.5,2.0/3.0,0.75].into_iter().enumerate() {
                     let bits=value.to_bits();
                     let expected=if replay==0 { ((bits+0x7fff+((bits>>16)&1))>>16) as u16 } else { 0 };

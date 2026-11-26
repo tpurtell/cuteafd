@@ -158,15 +158,15 @@ fn exlr8_ring_commit_corruption_and_failure_drain_before_mount() -> Result<()> {
                 for (&destination, source) in unit.destination.iter().zip(&unit.source) {
                     let mut a = vec![0; source.bytes];
                     let mut b = vec![0; source.bytes];
-                    library.copy_d2h(&mut a, crate::shared::experts::exlr8::view(
+                    library.copy_d2h_quiescent(&mut a, crate::shared::experts::exlr8::view(
                         pushed.image(), destination, source.bytes)?)?;
-                    library.copy_d2h(&mut b, crate::shared::experts::exlr8::view(
+                    library.copy_d2h_quiescent(&mut b, crate::shared::experts::exlr8::view(
                         mount.image(), destination, source.bytes)?)?;
                     assert_eq!(a, b);
                 }
             }
             let mut actual = vec![0; pushed.pointers()?.bytes];
-            library.copy_d2h(&mut actual, pushed.pointers()?)?;
+            library.copy_d2h_quiescent(&mut actual, pushed.pointers()?)?;
             let expected = pushed.layout.descriptors(pushed.image().ptr as u64)?.0
                 .into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>();
             assert_eq!(actual, expected);

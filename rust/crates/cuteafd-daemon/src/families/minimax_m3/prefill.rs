@@ -60,8 +60,7 @@ impl LayerTaps {
         if !self.layers.contains(&layer) || (self.residual_only && stage != "residual") { return Ok(()); }
         ensure!(count <= self.bytes.len() && count <= buffer.bytes, "MiniMax tap exceeds admitted host buffer");
         owner.stream.drain()?;
-        owner.stream.device.run(|| owner.stream.device.library.copy_d2h(
-            &mut self.bytes[..count], buffer))?;
+        owner.stream.copy_d2h(&mut self.bytes[..count], buffer)?;
         self.write_bytes(layer, stage, unit.rows.start, &self.bytes[..count])
     }
     pub fn router(&mut self, layer: usize, weights: &TargetWeights<'_>, unit: &Unit,

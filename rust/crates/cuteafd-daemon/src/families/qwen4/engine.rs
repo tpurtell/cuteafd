@@ -766,6 +766,7 @@ pub(crate) struct Qwen4Engine<'a> {
     pub weights: Qwen4Weights<'a>,
     pub ple: Option<super::ple::PleTable<'a>>,
     pub stream: *mut c_void,
+    rank_streams: Vec<Rc<crate::shared::memory::device::Stream<'a>>>,
     pub max_context: usize,
     pub prefill_rows: usize,
     pub(super) prefill_shape: Option<cuteafd_loader::serving_capacity::PrefillShape>,
@@ -887,14 +888,14 @@ impl<'a> Qwen4Engine<'a> {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
-        ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
+        ple: Option<super::ple::PleTable<'a>>, stream: Rc<crate::shared::memory::device::Stream<'a>>, max_context: usize, prefill_rows: usize,
         pages: usize, slots: usize, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, embedding: TokenEmbedding<'a>) -> Result<Self> {
         Self::new_with_decode_rows(library, programs, cfg, weights, ple, stream, max_context, prefill_rows, pages, slots, DECODE_ROWS, kv_format, embedding)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_decode_rows(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
-        ple: Option<super::ple::PleTable<'a>>, stream: *mut c_void, max_context: usize, prefill_rows: usize,
+        ple: Option<super::ple::PleTable<'a>>, stream: Rc<crate::shared::memory::device::Stream<'a>>, max_context: usize, prefill_rows: usize,
         pages: usize, slots: usize, decode_rows: usize, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, embedding: TokenEmbedding<'a>) -> Result<Self> {
         let device = Device { library, id: library.cuda_get_device()? };
         let owners = vec![0; weights.layers.len()];
@@ -907,7 +908,7 @@ impl<'a> Qwen4Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new_placed(library: &'a NativeLibrary, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, owners: &[usize],
-        ranks: &[(Device<'a>, &'a Programs<'a>, *mut c_void)], max_context: usize,
+        ranks: &[(Device<'a>, &'a Programs<'a>, Rc<crate::shared::memory::device::Stream<'a>>)], max_context: usize,
         prefill_rows: usize, pages: usize, slots: usize,
         kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, embedding: TokenEmbedding<'a>) -> Result<Self> {
         Self::new_placed_with_decode_rows(library, cfg, weights, ple, owners, ranks, max_context, prefill_rows,
@@ -917,7 +918,7 @@ impl<'a> Qwen4Engine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new_placed_with_decode_rows(library: &'a NativeLibrary, cfg: Qwen4Config, weights: Qwen4Weights<'a>,
         ple: Option<super::ple::PleTable<'a>>, owners: &[usize],
-        ranks: &[(Device<'a>, &'a Programs<'a>, *mut c_void)], max_context: usize,
+        ranks: &[(Device<'a>, &'a Programs<'a>, Rc<crate::shared::memory::device::Stream<'a>>)], max_context: usize,
         prefill_rows: usize, pages: usize, slots: usize, decode_rows: usize,
         kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache, embedding: TokenEmbedding<'a>) -> Result<Self> {
         let decode_rows = cuteafd_loader::families::qwen4::decode_capacity(decode_rows);
@@ -927,7 +928,8 @@ impl<'a> Qwen4Engine<'a> {
         ensure!(ranks.iter().all(|(device, _, _)| std::ptr::eq(device.library, library)),
             "Qwen attention owners use different native libraries");
         ensure!(ranks.len() == 1 || ranks[0].0.id != ranks[1].0.id, "duplicate Qwen owner device");
-        let (home, programs, stream) = ranks[0];
+        let (home, programs, stream) = (ranks[0].0, ranks[0].1, ranks[0].2.raw);
+        let rank_streams: Vec<_> = ranks.iter().map(|(_, _, s)| Rc::clone(s)).collect();
         let _home_scope = home.enter()?;
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         validate_layer_owners(owners, ranks.len())?;
@@ -935,12 +937,12 @@ impl<'a> Qwen4Engine<'a> {
             device.run(|| Ok(Fp8QuantizeGrid::new(library.sm_count()?, None)?))).collect::<Result<Vec<_>>>()?;
         ensure!(embedding.hidden() == cfg.hidden, "embedding rows of {} for hidden {}", embedding.hidden(), cfg.hidden);
         cfg.check_programs()?;
-        for &(_, programs, _) in ranks {
+        for (_, programs, _) in ranks {
             super::programs::validate_all(&cfg, programs, max_context)?;
         }
         let kv_record_bytes = kv_format.record_bytes(cfg.kv_heads, cfg.head_dim);
         let kv_suffix = if kv_format == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 { "_kv_fp8" } else { "" };
-        for (owner, &(_, owner_programs, _)) in ranks.iter().enumerate() {
+        for (owner, (_, owner_programs, _)) in ranks.iter().enumerate() {
             for cap in [decode_cap, "m4096"] {
                 for layer in weights.layers.iter().enumerate()
                     .filter(|(global, _)| owners[*global] == owner).map(|(_, layer)| layer)
@@ -981,8 +983,8 @@ impl<'a> Qwen4Engine<'a> {
                 }
             }
         }
-        let gdn_banks = ranks.iter().enumerate().map(|(owner, &(device, programs, stream))|
-            device.own(|| GdnBank::new_with_replay_rows(library, programs, stream, cfg.gdn_geometry(), state_map.gdn_layers[owner], slots, gdn_commit_program, decode_rows)))
+        let gdn_banks = ranks.iter().enumerate().map(|(owner, (device, programs, stream))|
+            device.own(|| GdnBank::new_with_replay_rows(library, programs, stream.raw, cfg.gdn_geometry(), state_map.gdn_layers[owner], slots, gdn_commit_program, decode_rows)))
             .collect::<Result<Vec<_>>>()?;
         ensure!(weights.head.allocations().iter().all(|a| a.device.id == home.id)
             && weights.mixer.iter().all(|a| a.device.id == home.id), "Qwen head must stay on owner zero");
@@ -1014,7 +1016,7 @@ impl<'a> Qwen4Engine<'a> {
             (None, None)
         };
         let graphs = (0..gdn_banks.len()).map(|_| GraphBank::new()).collect::<Vec<_>>();
-        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, max_context, prefill_rows, prefill_shape: None, host_prefix_config: None, host_memory_admitted: false, admitted_host: None, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
+        Ok(Self { terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), quantize_grids, active_owner: Cell::new(0), library, programs, cfg, weights, ple, stream, rank_streams, max_context, prefill_rows, prefill_shape: None, host_prefix_config: None, host_memory_admitted: false, admitted_host: None, request_id: Cell::new(1), pages, slots, kv_format, kv_record_bytes, kv, state_map, gdn_banks, index, ple_state, ple_replay, ple_pending: RefCell::new(None),
             mtp_kv, mtp_pending,
             last_streams: std::cell::Cell::new((false, 0)), last_stream_offset: Cell::new(0), mtp_streams: std::cell::Cell::new((false, 0)),
             pool_pages, workspace: RefCell::new(None), mtp_prefill_workspace: RefCell::new(None),
@@ -1304,9 +1306,9 @@ impl<'a> Qwen4Engine<'a> {
             self.drain_state()?;
             buffers.iter().map(|&buffer| {
                 let mut bytes = vec![0; buffer.bytes];
-                Device { library: self.library, id: buffer.device_id }.run(|| {
-                    self.library.copy_d2h(&mut bytes, buffer)
-                })?;
+                let stream = self.rank_streams.iter().find(|s| s.device.id == buffer.device_id)
+                    .context("Qwen state stream missing for device")?;
+                stream.copy_d2h(&mut bytes, buffer)?;
                 Ok(bytes)
             }).collect()
         };
@@ -1364,7 +1366,7 @@ impl<'a> Qwen4Engine<'a> {
                 let mut selected = vec![0u8; rows * 4];
                 let mut status = vec![0u8; rows * 4];
                 for (ptr, bytes) in [(ids, &mut selected), (statuses, &mut status)] {
-                    self.library.copy_d2h(bytes, cuteafd_ffi::CuteafdDeviceBuffer {
+                    self.rank_streams[self.active_owner.get()].copy_d2h(bytes, cuteafd_ffi::CuteafdDeviceBuffer {
                         ptr: ptr.cast_mut(), bytes: rows * 4, device_id: device, ..Default::default()
                     })?;
                 }
@@ -1887,10 +1889,10 @@ impl<'a> Qwen4Engine<'a> {
     }
 
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
-        // SAFETY: the engine owns this stream.
-        unsafe { self.library.cuda_stream_synchronize(self.execution_stream())? };
+        let stream = &self.rank_streams[self.active_owner.get()];
+        stream.drain()?;
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
+        stream.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..dev.buffer })?;
         Ok(out)
     }
 
@@ -4424,7 +4426,7 @@ mod packed_route_fixture {
             // SAFETY: the engine retains the region and its owning execution stream.
             unsafe { engine.library.cuda_stream_synchronize(engine.state_stream(buffer.device_id)?)?; }
             let mut bytes = vec![0; buffer.bytes];
-            engine.library.copy_d2h(&mut bytes, buffer)?;
+            engine.library.copy_d2h_quiescent(&mut bytes, buffer)?;
             Ok(bytes)
         }).collect()
     }

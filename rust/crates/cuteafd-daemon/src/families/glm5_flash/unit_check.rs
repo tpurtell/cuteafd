@@ -41,7 +41,8 @@ pub(crate) fn unit_bytes(engine: &GlmfEngine<'_>, placement: &GlmfPlacement) -> 
                         let Some(unit) = local_unit(global, rank, engine.context_kv()) else { continue };
                         let unit = crate::shared::prefix::view(buffer, unit as usize * per_unit, per_unit)?;
                         let mut bytes = vec![0u8; per_unit];
-                        engine.library.copy_d2h(&mut bytes, unit)?;
+                        // SAFETY: `engine.stream_of(rank)` produced `unit` on rank's device.
+                        unsafe { engine.library.copy_d2h(&mut bytes, unit, engine.stream_of(rank))?; }
                         out.extend(bytes);
                     }
                 }

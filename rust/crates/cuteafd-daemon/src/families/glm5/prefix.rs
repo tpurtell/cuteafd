@@ -554,7 +554,13 @@ fn download(engine: &GlmEngine<'_>, addr: u64, bytes: usize, template: CuteafdDe
         engine.on(rank, || unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank)) })?;
     }
     let mut out = vec![0u8; bytes];
-    engine.library.copy_d2h(&mut out, CuteafdDeviceBuffer { ptr: addr as *mut std::ffi::c_void, bytes, ..template })?;
+    let rank = (0..engine.ranks())
+        .find(|&r| engine.device_of(r) == template.device_id)
+        .unwrap_or(0);
+    // SAFETY: `engine.stream_of(rank)` owns this device's work and remains live.
+    engine.on(rank, || unsafe {
+        engine.library.copy_d2h(&mut out, CuteafdDeviceBuffer { ptr: addr as *mut std::ffi::c_void, bytes, ..template }, engine.stream_of(rank))
+    })?;
     Ok(out)
 }
 

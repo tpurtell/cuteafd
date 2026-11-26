@@ -700,7 +700,7 @@ impl<'w, 'a> BackboneBlockWave<'w, 'a> {
         let Phase::Ffn(expected, rows) = self.phase else { anyhow::bail!("test requires pending FFN"); };
         let read = |library: &NativeLibrary, buffers: &[CuteafdDeviceBuffer]| -> Result<Vec<Vec<u8>>> {
             buffers.iter().map(|&buffer| { let mut out = vec![0; buffer.bytes];
-                library.copy_d2h(&mut out, buffer)?; Ok(out) }).collect()
+                library.copy_d2h_quiescent(&mut out, buffer)?; Ok(out) }).collect()
         };
         let library = self.library;
         let reference = { let out = unsafe { self.finish_ffn(binding, result)? };
@@ -784,7 +784,7 @@ mod capture_rejection_tests {
             [block.graph_normalized_storage(1), block.ffn.inputs()[0], block.ffn.inputs()[1]]
                 .into_iter().map(|buffer| {
                     let mut bytes = vec![0; buffer.bytes];
-                    library.copy_d2h(&mut bytes, buffer)?; Ok(bytes)
+                    library.copy_d2h_quiescent(&mut bytes, buffer)?; Ok(bytes)
                 }).collect()
         };
         let mut reference = make()?;
@@ -911,7 +911,7 @@ mod input_storage_tests {
             block(1, boundaries[2].clone(), boundaries[3].clone())?];
         let read = |buffers: &[CuteafdDeviceBuffer]| -> Result<Vec<Vec<u8>>> {
             buffers.iter().map(|&buffer| {
-                let mut bytes = vec![0; buffer.bytes]; library.copy_d2h(&mut bytes, buffer)?; Ok(bytes)
+                let mut bytes = vec![0; buffer.bytes]; library.copy_d2h_quiescent(&mut bytes, buffer)?; Ok(bytes)
             }).collect()
         };
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
@@ -1094,7 +1094,7 @@ mod input_storage_tests {
                 _ => unsafe { private_gate.execute_captured(residuals[0].buffer,
                     &private_uploads[0].view()?)? },
             };
-            library.copy_d2h(&mut want, expected)?;
+            library.copy_d2h_quiescent(&mut want, expected)?;
         }
         let first = produce(0, &mut embeddings, &mut uploads, &mut gates)?;
         produce(1, &mut embeddings, &mut uploads, &mut gates)?;
@@ -1137,7 +1137,7 @@ mod input_storage_tests {
         for chain in &chains { chain.drain()?; }
         unsafe { library.cuda_stream_synchronize(reader.raw)?; }
         let mut got = vec![0; bytes];
-        library.copy_d2h(&mut got, copy.buffer)?;
+        library.copy_d2h_quiescent(&mut got, copy.buffer)?;
         if guarded { assert_eq!(got, want, "scratch kind {kind}: guarded reader clobbered"); }
         else { assert_ne!(got, want, "scratch kind {kind}: negative control did not clobber"); }
         eprintln!("PASS input scratch kind={kind} guarded={guarded} writer_done_before_release={done}");

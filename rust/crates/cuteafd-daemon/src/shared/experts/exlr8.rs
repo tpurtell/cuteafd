@@ -324,7 +324,7 @@ mod tests {
                             let mut cursor = 0;
                             for (source, &offset) in unit.source.iter().zip(&unit.destination) {
                                 let mut actual = vec![0; source.bytes];
-                                device.run(|| library.copy_d2h(&mut actual,
+                                device.run(|| library.copy_d2h_quiescent(&mut actual,
                                     view(weight.buffer, offset, source.bytes)?))?;
                                 assert_eq!(actual, staged[cursor..cursor + source.bytes]);
                                 cursor += source.bytes;
@@ -332,14 +332,14 @@ mod tests {
                         }
                         for (index, signs) in weight.layout.signs.iter().enumerate() {
                             let mut actual = vec![0; signs.len()];
-                            device.run(|| library.copy_d2h(&mut actual, weight.signs(index != 0)?))?;
+                            device.run(|| library.copy_d2h_quiescent(&mut actual, weight.signs(index != 0)?))?;
                             assert_eq!(&actual, signs);
                         }
                         let (pointers, bits) = weight.layout.descriptors(weight.buffer.ptr as u64)?;
                         for (buffer, expected) in [(weight.pointers()?, pointers.iter().flat_map(|n| n.to_le_bytes()).collect::<Vec<_>>()),
                             (weight.bits()?, bits.iter().flat_map(|n| n.to_le_bytes()).collect())] {
                             let mut actual = vec![0; buffer.bytes];
-                            device.run(|| library.copy_d2h(&mut actual, buffer))?;
+                            device.run(|| library.copy_d2h_quiescent(&mut actual, buffer))?;
                             assert_eq!(actual, expected);
                         }
                     }

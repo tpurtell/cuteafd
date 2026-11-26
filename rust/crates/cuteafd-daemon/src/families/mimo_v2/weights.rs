@@ -356,7 +356,8 @@ impl<'a> MimoLoader<'a> {
                 drop(staging);
                 if kmajor_scale {
                     let mut bytes = vec![0u8; scales.buffer.bytes];
-                    self.library.copy_d2h(&mut bytes, scales.buffer)?;
+                    // Quiescent: load-time static weight scales immediately after `cuda_stream_synchronize(stream)` above.
+                    self.library.copy_d2h_quiescent(&mut bytes, scales.buffer)?;
                     bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect()
                 } else { Vec::new() }
             };

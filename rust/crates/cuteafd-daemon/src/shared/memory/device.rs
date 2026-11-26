@@ -382,6 +382,20 @@ impl<'a> Stream<'a> {
     pub(crate) fn drain(&self) -> Result<()> {
         self.device.run(|| unsafe { self.device.library.cuda_stream_synchronize(self.raw) })
     }
+    /// Copy `dst.len()` bytes from `src` to host memory, ordered after all prior
+    /// work on this stream and synchronizing only this stream.
+    pub(crate) fn copy_d2h(&self, dst: &mut [u8], src: CuteafdDeviceBuffer) -> Result<()> {
+        // SAFETY: this Stream owns `self.raw` on `self.device` and enters its device scope.
+        self.device.run(|| unsafe { self.device.library.copy_d2h(dst, src, self.raw) })
+    }
+    /// Destroy this stream explicitly and surface any CUDA teardown error.
+    pub(crate) fn destroy(self) -> Result<()> {
+        let device = self.device;
+        let raw = self.raw;
+        std::mem::forget(self);
+        // SAFETY: `self` exclusively owned `raw` on `device` and will not run `Drop`.
+        device.run(|| unsafe { device.library.cuda_stream_destroy(raw) })
+    }
     pub(crate) fn drain_or_abort(&self, site: &str) {
         crate::shared::decode_graph::fatal_drain(self.drain(), site);
     }
@@ -789,7 +803,7 @@ mod tests {
         assert!(producer.ready()?);
         assert_eq!(lib.cuda_get_device()?, 0);
         let mut bytes = [0u8; 4096];
-        d1.run(|| lib.copy_d2h(&mut bytes, output.buffer))?;
+        d1.run(|| lib.copy_d2h_quiescent(&mut bytes, output.buffer))?;
         assert_eq!(bytes, [73u8; 4096]);
         Ok(())
     }
@@ -828,9 +842,9 @@ mod tests {
             })?;
             assert_eq!(lib.cuda_get_device()?, 0);
             let mut output = vec![0u8; BYTES];
-            a.run(|| lib.copy_d2h(&mut output, target_a.buffer))?;
+            a.run(|| lib.copy_d2h_quiescent(&mut output, target_a.buffer))?;
             assert_eq!(output, input_b);
-            b.run(|| lib.copy_d2h(&mut output, target_b.buffer))?;
+            b.run(|| lib.copy_d2h_quiescent(&mut output, target_b.buffer))?;
             assert_eq!(output, input_a);
         }
         drop((ab, ba, producer_a, producer_b, source_a, source_b, target_a, target_b));
@@ -890,7 +904,7 @@ mod tests {
         for chain in &chains { chain.drain()?; }
         lib.cuda_device_synchronize()?;
         let mut seen = vec![0u8; 4096];
-        d1.run(|| lib.copy_d2h(&mut seen, check.buffer))?;
+        d1.run(|| lib.copy_d2h_quiescent(&mut seen, check.buffer))?;
         d1.run(|| unsafe { lib.cuda_event_destroy(written) })?;
         assert_eq!(done, !ordered, "the guarded write {} while the reader was held", if done { "completed" } else { "stayed pending" });
         assert_eq!(seen[0], if ordered { 1 } else { 2 }, "the reader saw {} data", if seen[0] == 2 { "the overwrite's" } else { "its own" });

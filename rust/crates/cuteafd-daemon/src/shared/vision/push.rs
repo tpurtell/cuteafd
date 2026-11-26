@@ -281,7 +281,7 @@ pub(crate) mod tests {
         let records = prepare(allocation.buffer.ptr as usize)?;
         let layout = dense::RankLayout::new(records.operands, records.steps, 0)?;
         dense::testing::replay(device, layout, snapshot, 1, 0)?;
-        library.copy_d2h(&mut actual, allocation.buffer)?;
+        library.copy_d2h_quiescent(&mut actual, allocation.buffer)?;
         assert_eq!(actual.len(), mounted.len());
         assert!(actual == mounted, "pushed arena differs at byte {:?}",
             actual.iter().zip(mounted).position(|(a, b)| a != b));

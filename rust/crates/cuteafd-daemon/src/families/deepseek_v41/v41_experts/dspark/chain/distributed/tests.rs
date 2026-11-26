@@ -87,7 +87,7 @@ fn check_chain(tp2:bool,full_reference:bool) -> Result<()> {
     let download = |buffers: [CuteafdDeviceBuffer; 3]| -> Result<Vec<Vec<u8>>> {
         buffers.into_iter().map(|buffer| {
             let mut bytes = vec![0; buffer.bytes];
-            devices[1].run(|| lib.copy_d2h(&mut bytes, buffer))?;
+            devices[1].run(|| lib.copy_d2h_quiescent(&mut bytes, buffer))?;
             Ok(bytes)
         }).collect()
     };
@@ -161,7 +161,7 @@ fn check_chain(tp2:bool,full_reference:bool) -> Result<()> {
                         let expected=reference.stages[stage].expert_diagnostics();
                         for (field,((a,b),(stride,element))) in actual.into_iter().zip(expected).zip([(10240,2),(12,4),(12,4),(10240,2)]).enumerate() {
                             let mut a_bytes=vec![0;count*width*stride];let mut b_bytes=a_bytes.clone();
-                            devices[1].run(|| {lib.copy_d2h(&mut a_bytes,a)?;lib.copy_d2h(&mut b_bytes,b)})?;
+                            devices[1].run(|| {lib.copy_d2h_quiescent(&mut a_bytes,a)?;lib.copy_d2h_quiescent(&mut b_bytes,b)})?;
                             let changed=a_bytes.chunks_exact(element).zip(b_bytes.chunks_exact(element)).filter(|(a,b)|a!=b).count();
                             let decode=|x:&[u8]| if element==2 {f32::from_bits(u32::from(u16::from_ne_bytes(x.try_into().unwrap()))<<16)} else {f32::from_ne_bytes(x.try_into().unwrap())};
                             let mut squared=0f64;let mut norm=0f64;let mut maximum=0f32;

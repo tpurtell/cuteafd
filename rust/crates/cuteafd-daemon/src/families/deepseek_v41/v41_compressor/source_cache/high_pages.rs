@@ -73,7 +73,7 @@ fn highest_physical_page_scatter_score_attention_and_fork() -> Result<()> {
         (&cache.kv_scales, KV_SCALES, 0x38),
     ] {
         let mut actual = vec![0; width];
-        library.copy_d2h(
+        stream.copy_d2h(
             &mut actual,
             slice(allocation.buffer, 67_108_863 * width, width),
         )?;
@@ -135,7 +135,7 @@ fn highest_physical_page_scatter_score_attention_and_fork() -> Result<()> {
             library.cuda_stream_synchronize(stream.raw)?;
         }
         let mut bytes = [0; 12];
-        library.copy_d2h(&mut bytes, scores.buffer)?;
+        stream.copy_d2h(&mut bytes, scores.buffer)?;
         let actual: Vec<_> = bytes
             .chunks_exact(4)
             .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
@@ -194,7 +194,7 @@ fn highest_physical_page_scatter_score_attention_and_fork() -> Result<()> {
         library.cuda_stream_synchronize(stream.raw)?;
     }
     let mut actual = vec![0; 65536];
-    library.copy_d2h(&mut actual, output.buffer)?;
+    stream.copy_d2h(&mut actual, output.buffer)?;
     assert!(actual
         .chunks_exact(2)
         .all(|b| u16::from_ne_bytes(b.try_into().unwrap()) == 0x3eab));

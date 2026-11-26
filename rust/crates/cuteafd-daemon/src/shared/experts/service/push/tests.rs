@@ -284,7 +284,7 @@ fn spark_exl3_ring_to_shared_owner_is_mount_exact_and_drops_before_retry() -> Re
             for (weight, image) in weights.iter().zip(expected) {
                 for (spec, expected) in weight.layout.buffers.iter().zip(image) {
                     let mut actual = vec![0; expected.len()];
-                    library.copy_d2h(&mut actual, weight.buffer(&spec.name)?)?;
+                    library.copy_d2h_quiescent(&mut actual, weight.buffer(&spec.name)?)?;
                     assert_eq!(actual, expected, "{}", spec.name);
                 }
             }

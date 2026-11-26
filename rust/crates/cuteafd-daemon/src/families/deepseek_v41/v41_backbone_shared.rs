@@ -508,7 +508,7 @@ mod shared_storage_tests {
             lib.copy_h2d(source.buffer, &hidden)?; Ok(source)
         }).into_iter().collect::<Result<Vec<_>>>()?;
         let read = |buffer| -> Result<Vec<u8>> {
-            let mut bytes = vec![0; rows * 10240]; lib.copy_d2h(&mut bytes, buffer)?; Ok(bytes)
+            let mut bytes = vec![0; rows * 10240]; lib.copy_d2h_quiescent(&mut bytes, buffer)?; Ok(bytes)
         };
         let mut expected = Vec::new();
         for source in &inputs {

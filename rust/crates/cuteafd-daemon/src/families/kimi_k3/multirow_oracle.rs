@@ -21,7 +21,7 @@ pub(in super::super) fn record(stream: &Stream<'_>, layer: usize, rows: usize,
     for buffer in [indices, scores] {
         let mut bytes = vec![0; rows * 2048 * 4];
         let buffer = crate::shared::prefix::view(buffer, 0, bytes.len())?;
-        stream.device.run(|| stream.device.library.copy_d2h(&mut bytes, buffer))?;
+        stream.copy_d2h(&mut bytes, buffer)?;
         values.push(bytes);
     }
     SELECTED.with(|selected| {

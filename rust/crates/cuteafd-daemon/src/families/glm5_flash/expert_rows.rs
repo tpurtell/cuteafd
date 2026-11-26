@@ -111,7 +111,7 @@ pub(super) fn check(args: &EngineArgs, opened: &Opened, max_rows: usize) -> Resu
                 // SAFETY: this stream owns the launch and all its buffers stay live.
                 unsafe { library.cuda_stream_synchronize(stream.raw)? };
                 let mut output = vec![0u8; hidden * 2];
-                library.copy_d2h(
+                stream.copy_d2h(
                     &mut output,
                     cuteafd_ffi::CuteafdDeviceBuffer {
                         bytes: hidden * 2,

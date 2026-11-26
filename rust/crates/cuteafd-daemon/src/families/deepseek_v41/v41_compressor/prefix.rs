@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(state.index_cache(resumed)?.rows, 0);
         for (i, buffer) in state.pending.as_ref().unwrap().iter().enumerate() {
             let mut bytes = vec![0; 2048];
-            lib.copy_d2h(&mut bytes, slice(buffer.buffer, 2048, 2048))?;
+            lib.copy_d2h_quiescent(&mut bytes, slice(buffer.buffer, 2048, 2048))?;
             assert_eq!(bytes, vec![0x31 + i as u8; 2048]);
         }
         assert!(state.validate(original).is_err());

@@ -498,7 +498,7 @@ mod shared_storage_tests {
             queries.push(units);
         }
         let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
-            let mut bytes = vec![0; buffer.bytes]; library.copy_d2h(&mut bytes, buffer)?; Ok(bytes)
+            let mut bytes = vec![0; buffer.bytes]; library.copy_d2h_quiescent(&mut bytes, buffer)?; Ok(bytes)
         };
         // Private references include each source/follower output and the source
         // blocks that must survive both units' later reindex hooks.

@@ -1464,7 +1464,7 @@ mod cold_capture_tests {
             let expected = unsafe {
                 let output = wave.execute(&state, &chunks)?;
                 let mut bytes = vec![0; output.buffer.bytes];
-                library.copy_d2h(&mut bytes, output.buffer)?;
+                library.copy_d2h_quiescent(&mut bytes, output.buffer)?;
                 bytes
             };
             let eager_snapshot = wave.ready.as_ref().context("eager proposal missing")?.snapshot;
@@ -1477,12 +1477,12 @@ mod cold_capture_tests {
             assert_eq!(wave.selected_graph().is_some(), admitted);
             let output = wave.output(&state)?;
             let mut actual = vec![0; output.buffer.bytes];
-            library.copy_d2h(&mut actual, output.buffer)?;
+            library.copy_d2h_quiescent(&mut actual, output.buffer)?;
             assert_eq!(actual, expected, "cold result differs, admitted={admitted}");
             // A subsequent real query exercises replay or repeated eager denial.
             unsafe { wave.execute_query(&state, &chunks, &produced)?; }
             let output = wave.output(&state)?;
-            library.copy_d2h(&mut actual, output.buffer)?;
+            library.copy_d2h_quiescent(&mut actual, output.buffer)?;
             assert_eq!(actual, expected, "next query differs, admitted={admitted}");
         }
         Ok(())

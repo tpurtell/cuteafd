@@ -170,7 +170,7 @@ mod tests {
         assert_eq!(inventory.receipts.iter().filter(|r|r.allocation.view.is_some()).count(),4);
         let table=rotary.get(recipe)?;
         let mut bytes=vec![0;table.cos.buffer.bytes];
-        device.run(|| library.copy_d2h(&mut bytes,table.cos.buffer))?;
+        device.run(|| library.copy_d2h_quiescent(&mut bytes,table.cos.buffer))?;
         assert!(bytes.iter().all(|&b|b==37));
         // An absent ABI must refuse before invoking a storage callback.
         let programs=library.programs()?;

@@ -239,7 +239,7 @@ mod reuse_tests {
     }
     fn bytes(library: &NativeLibrary, buffer: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
         let mut result = vec![0; buffer.bytes];
-        library.copy_d2h(&mut result, buffer)?;
+        library.copy_d2h_quiescent(&mut result, buffer)?;
         Ok(result)
     }
     #[test]
@@ -994,9 +994,9 @@ impl RouterOutput<'_> {
         let mut hidden = vec![0; self.rows as usize * hidden_row_bytes];
         let mut ids = vec![0; self.rows as usize * 24];
         let mut weights = vec![0; self.rows as usize * 24];
-        library.copy_d2h(&mut hidden, if self.request_nvfp4 { self.input } else { self.expert_input })?;
-        library.copy_d2h(&mut ids, self.ids)?;
-        library.copy_d2h(&mut weights, self.routing)?;
+        library.copy_d2h_quiescent(&mut hidden, if self.request_nvfp4 { self.input } else { self.expert_input })?;
+        library.copy_d2h_quiescent(&mut ids, self.ids)?;
+        library.copy_d2h_quiescent(&mut weights, self.routing)?;
         Ok((hidden, ids, weights))
     }
 
@@ -1249,7 +1249,7 @@ mod expert_usage_tests {
                 // SAFETY: the real launch uses 13 initialized rows, never capacity 144.
                 let output = unsafe { wave.execute_selected(13, Some(phase))? };
                 let mut ids = vec![0; 13 * 24];
-                library.copy_d2h(&mut ids, output.ids)?;
+                library.copy_d2h_quiescent(&mut ids, output.ids)?;
                 let expected = match phase { UsagePhase::Prefill => &mut expected_prefill,
                     UsagePhase::Decode => &mut expected_decode };
                 for bytes in ids.chunks_exact(4) {
@@ -1321,7 +1321,7 @@ mod shared_storage_tests {
         let read = |wave: &BackboneRouterWave<'_, '_>| -> Result<Vec<Vec<u8>>> {
             (0..6).map(|i| {
                 let mut bytes = vec![0; rows * ROW_BYTES[i]];
-                lib.copy_d2h(&mut bytes, wave.b(i))?; Ok(bytes)
+                lib.copy_d2h_quiescent(&mut bytes, wave.b(i))?; Ok(bytes)
             }).collect()
         };
         let mut expected = Vec::new();

@@ -177,11 +177,11 @@ mod tests {
                 let check=|state:&WindowState<'_>,lease,values:&[u8],scales:&[u8]|->Result<()> {
                     let view=unsafe { replica.view(state,lease)? };
                     peer.run(|| {
-                        let mut actual=vec![0;values.len()];lib.copy_d2h(&mut actual,view.values)?;
+                        let mut actual=vec![0;values.len()];lib.copy_d2h_quiescent(&mut actual,view.values)?;
                         assert_eq!(actual,values);
-                        let mut actual=vec![0;scales.len()];lib.copy_d2h(&mut actual,view.scales)?;
+                        let mut actual=vec![0;scales.len()];lib.copy_d2h_quiescent(&mut actual,view.scales)?;
                         assert_eq!(actual,scales);
-                        let mut end=[0u8;8];lib.copy_d2h(&mut end,view.device_end)?;
+                        let mut end=[0u8;8];lib.copy_d2h_quiescent(&mut end,view.device_end)?;
                         assert_eq!(u64::from_ne_bytes(end),view.end);Ok(())
                     })
                 };

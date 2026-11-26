@@ -1215,7 +1215,9 @@ impl Opened {
         let draft_file = draft_dir.as_deref().map(|dir| -> Result<_> {
             Ok(if PushPolicy::for_snapshot(dir)? == PushPolicy::Mount { Some(dflash::prefetch(dir)) } else { None })
         }).transpose()?.flatten();
-        let stream = self.library.cuda_stream_create()?;
+        let stream_owner = std::rc::Rc::new(crate::shared::memory::device::Stream::new(
+            crate::shared::memory::device::Device { library: &self.library, id: args.device })?);
+        let stream = stream_owner.raw;
 
         let peer_stream = match split_device {
             Some(device) => {
@@ -1358,7 +1360,7 @@ impl Opened {
             split_gib = format!("{:.2}", peer_bytes as f64 / (1u64 << 30) as f64),
             "MiMo coordinator weights resident after Spark admission (elapsed includes wait)");
         let pages = usize::try_from(preflight.capacity.allocated_gpu_kv_tokens)? / engine::PAGE_ROWS;
-        let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, stream,
+        let mut engine = engine::MimoEngine::new(&self.library, &programs, self.cfg.clone(), model, std::rc::Rc::clone(&stream_owner),
             args.max_context, args.prefill_rows, args.prefill_span_rows, pages, args.rings, embedding, args.kv_formats(), prefill_output)?;
         engine.max_pool_tokens_no_onboard = preflight.placement.max_pool_tokens_no_onboard;
         engine.prefill_unit_waves = args.prefill_waves;
@@ -1410,7 +1412,7 @@ impl Opened {
                     devices.push(crate::shared::memory::device::Device { library: &self.library, id: exchange.device(1) });
                 }
                 let drafter = crate::shared::experts::rtx::push::load_alone(dir, &devices, ||
-                    dflash::MimoDrafter::load(&self.library, &programs, dir, file, stream, capacity.context_slots,
+                    dflash::MimoDrafter::load(&self.library, &programs, dir, file, std::rc::Rc::clone(&stream_owner), capacity.context_slots,
                         capacity.max_batch_sequences, representation, self.weight_formats.head == MimoProjectionRepresentation::Bf16,
                         args.fp8_scales, args.draft_kv_cache, exchange))?;
                 engine.drafter = Some(drafter);
@@ -1538,11 +1540,14 @@ impl Opened {
         drop(engine);
         // SAFETY: both stream handles were created here and remain owned here.
         // All native/transport/copy consumers have drained before engine Drop.
+        let mut stream_owner = Some(stream_owner);
         unsafe {
             teardown::finish(result, peer_stream.is_some(), |step| match step {
                 teardown::CleanupStep::LeadStream => {
                     self.library.cuda_set_device(args.device)?;
-                    self.library.cuda_stream_destroy(stream).map_err(Into::into)
+                    std::rc::Rc::into_inner(stream_owner.take().context("mimo lead stream already destroyed")?)
+                        .context("mimo lead stream still referenced")?
+                        .destroy()
                 }
                 teardown::CleanupStep::PeerStream => {
                     if let Some((device, stream)) = peer_stream {
@@ -2250,8 +2255,9 @@ fn kv_rows(engine: &engine::MimoEngine<'_>, placement: &engine::MimoPlacement, f
                     ensure!(offset + bytes <= buffer.bytes, "KV rows outside their buffer");
                     let start = out.len();
                     out.resize(start + bytes, 0);
-                    engine.library.copy_d2h(&mut out[start..], cuteafd_ffi::CuteafdDeviceBuffer {
-                        ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })?;
+                    // SAFETY: `engine.stream_of(rank)` owns rank's KV writes on this device.
+                    unsafe { engine.library.copy_d2h(&mut out[start..], cuteafd_ffi::CuteafdDeviceBuffer {
+                        ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer }, engine.stream_of(rank))?; }
                     position += rows;
                 }
             }
@@ -2263,8 +2269,9 @@ fn kv_rows(engine: &engine::MimoEngine<'_>, placement: &engine::MimoPlacement, f
 
 fn opened_copy(engine: &engine::MimoEngine<'_>, out: &mut [u8], source: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
     // SAFETY: the engine owns this stream; draining it retires every write to `source`.
-    unsafe { engine.library.cuda_stream_synchronize(engine.stream)? };
-    engine.library.copy_d2h(out, source)
+    unsafe { engine.library.cuda_stream_synchronize(engine.stream)?; }
+    // SAFETY: `engine.stream` produced `source` on this device and remains live.
+    unsafe { engine.library.copy_d2h(out, source, engine.stream) }
 }
 
 fn resume_mtp_check(engine: &engine::MimoEngine<'_>, tokens: &[u32], at: usize,
@@ -2358,8 +2365,9 @@ fn resume_check(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, tokens: &[u3
             crate::shared::memory::device::Device { library: engine.library, id: template.device_id }.run(|| {
                 // SAFETY: this rank owns the stream; retire its capture before reading its mark.
                 unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))?; }
-                engine.library.copy_d2h(&mut bytes[start..], cuteafd_ffi::CuteafdDeviceBuffer {
-                    ptr: range.addr as *mut std::ffi::c_void, bytes: range.bytes, ..template })
+                // SAFETY: `engine.stream_of(rank)` owns this rank's mark on `template.device_id`.
+                unsafe { engine.library.copy_d2h(&mut bytes[start..], cuteafd_ffi::CuteafdDeviceBuffer {
+                    ptr: range.addr as *mut std::ffi::c_void, bytes: range.bytes, ..template }, engine.stream_of(rank)) }
             })?;
         }
         ensure!(bytes.len() == family.mark_bytes(), "positional mark byte coverage differs from its layout");

@@ -108,7 +108,7 @@ fn mixed_fp8_push_matches_host_bytes_on_each_rank_and_split() -> Result<()> {
             .write_all_at(&raw(&tensor.meta.name), tensor.meta.byte_offset)?;
     }
     let read = |buffer: CuteafdDeviceBuffer, bytes| -> Result<Vec<u8>> {
-        let mut out = vec![0; bytes]; library.copy_d2h(&mut out, buffer)?; Ok(out)
+        let mut out = vec![0; bytes]; library.copy_d2h_quiescent(&mut out, buffer)?; Ok(out)
     };
     for rule in [crate::shared::fp8_linear::Fp8Scales::Pow2, crate::shared::fp8_linear::Fp8Scales::Amax] {
         let (q, grid) = super::super::fp8::quantize(&raw(&names[1]), 256, 256, super::super::fp8::Layout::Block, rule);
@@ -228,8 +228,8 @@ fn nvfp4_dense_push_matches_mount_operands_and_checks_fc1_scales() -> Result<()>
         let bytes = if key.starts_with("nvfp4_w") { cfg.hidden * cfg.dense_intermediate / 2 }
             else { cfg.hidden * cfg.dense_intermediate / 16 + 8 };
         let (mut mount_bytes, mut push_bytes) = (vec![0; bytes], vec![0; bytes]);
-        library.copy_d2h(&mut mount_bytes, expected.buffer)?;
-        library.copy_d2h(&mut push_bytes, actual[key].buffer)?;
+        library.copy_d2h_quiescent(&mut mount_bytes, expected.buffer)?;
+        library.copy_d2h_quiescent(&mut push_bytes, actual[key].buffer)?;
         assert_eq!(push_bytes, mount_bytes, "{key}");
     }
     let step = records.steps.iter().find(|s| s.jobs.iter().any(|j| matches!(j, Job::Equal { .. })))
@@ -326,7 +326,7 @@ fn golden_path() -> std::path::PathBuf {
 
 fn digest(library: &NativeLibrary, buffer: CuteafdDeviceBuffer) -> Result<String> {
     let mut bytes = vec![0u8; buffer.bytes];
-    library.copy_d2h(&mut bytes, buffer)?;
+    library.copy_d2h_quiescent(&mut bytes, buffer)?;
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 

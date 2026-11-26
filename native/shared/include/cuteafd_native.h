@@ -491,7 +491,17 @@ cuteafd_status_t cuteafd_cuda_graph_update_kv_cache_write_bytes_node(
     cuteafd_device_buffer_t src, cuteafd_device_buffer_t cache, size_t cache_offset_bytes,
     size_t bytes);
 cuteafd_status_t cuteafd_copy_h2d(cuteafd_device_buffer_t dst, const void* src, size_t bytes);
-cuteafd_status_t cuteafd_copy_d2h(void* dst, cuteafd_device_buffer_t src, size_t bytes);
+// Stream-ordered device-to-host copy: enqueues cudaMemcpyAsync on `cuda_stream`
+// and synchronizes only `cuda_stream` (never device-wide). Rejects a null stream
+// in CUDA builds so callers cannot silently fall back to the legacy default
+// stream, which does not synchronize with cudaStreamNonBlocking engine streams.
+cuteafd_status_t cuteafd_copy_d2h(void* dst, cuteafd_device_buffer_t src, size_t bytes,
+                                  void* cuda_stream);
+// Quiescent device-to-host copy for storage with no in-flight non-blocking
+// stream writes (e.g. committed static weights, synchronous copy_h2d/copy_d2d
+// fixtures, CPU-only builds, or after an explicit device drain). Uses the
+// legacy default stream (cudaMemcpy) and does not wait on engine streams.
+cuteafd_status_t cuteafd_copy_d2h_quiescent(void* dst, cuteafd_device_buffer_t src, size_t bytes);
 cuteafd_status_t cuteafd_copy_d2d(cuteafd_device_buffer_t dst, cuteafd_device_buffer_t src, size_t bytes);
 cuteafd_status_t cuteafd_copy_h2d_async(cuteafd_device_buffer_t dst, const void* src, size_t bytes,
                                     void* cuda_stream);

@@ -462,7 +462,7 @@ mod tests {
             let pristine = || -> Result<Vec<Vec<u8>>, BoxError> {
                 counters.iter().map(|&(rank, span, _)| {
                     let mut bytes = vec![0; span.bytes as usize];
-                    device.run(|| library.copy_d2h(&mut bytes, ranks[rank].borrow().request_component(span, 0)?))?;
+                    device.run(|| library.copy_d2h_quiescent(&mut bytes, ranks[rank].borrow().request_component(span, 0)?))?;
                     Ok(bytes)
                 }).collect()
             };
@@ -536,7 +536,7 @@ mod tests {
             family.copy_rows(TailCopy { from: first, to: 7, rows, owner: None })?;
             for plane in owner.borrow().page_views(7)? {
                 let mut bytes = vec![0; plane.bytes];
-                device.run(|| library.copy_d2h(&mut bytes, plane))?;
+                device.run(|| library.copy_d2h_quiescent(&mut bytes, plane))?;
                 let retained = rows * plane.bytes / 64;
                 assert!(bytes[..retained].iter().all(|b| *b == 0x19));
                 assert!(bytes[retained..].iter().all(|b| *b == 0xa5));
@@ -571,7 +571,7 @@ mod tests {
         // and entry metadata are valid, but no local capture ever used slot 1.
         let mark = owner.borrow().mark_view(0)?;
         let mut saved = vec![0; mark.bytes];
-        device.run(|| library.copy_d2h(&mut saved, mark))?;
+        device.run(|| library.copy_d2h_quiescent(&mut saved, mark))?;
         device.run(|| library.copy_h2d(owner.borrow().mark_view(1)?, &saved))?;
         let plan = RestorePlan { snapshot_end: 65, target_end: 66,
             lag: cuteafd_engine::prefix::LaggedState { source_end: 65, replay_start: 65 },
@@ -609,14 +609,14 @@ mod tests {
         assert_ne!(resumed.placement.pages[1], tail);
         for plane in owner.borrow().page_views(resumed.placement.pages[1])? {
             let mut bytes = vec![0; plane.bytes];
-            device.run(|| library.copy_d2h(&mut bytes, plane))?;
+            device.run(|| library.copy_d2h_quiescent(&mut bytes, plane))?;
             assert!(bytes[..plane.bytes / 64].iter().all(|b| *b == 0x29));
         }
         for span in &spans {
             let full = components(span);
             let plane = owner.borrow().component(full)?;
             let mut bytes = vec![0; plane.bytes];
-            device.run(|| library.copy_d2h(&mut bytes, plane))?;
+            device.run(|| library.copy_d2h_quiescent(&mut bytes, plane))?;
             let stride = full.bytes as usize;
             assert!(bytes[..stride].iter().all(|b| *b == 0xa5));
             let offset = (span.offset - full.offset) as usize;
@@ -633,7 +633,7 @@ mod tests {
             let span = region.summaries.unwrap();
             let plane = owner.borrow().request_component(span, 1)?;
             let mut bytes = vec![0; plane.bytes];
-            device.run(|| library.copy_d2h(&mut bytes, plane))?;
+            device.run(|| library.copy_d2h_quiescent(&mut bytes, plane))?;
             assert!(bytes[..8 * 256].iter().all(|b| *b == 0x39));
         }
         assert!(owner.borrow().page_views(8).is_err());

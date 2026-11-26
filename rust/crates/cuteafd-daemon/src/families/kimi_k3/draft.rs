@@ -1175,7 +1175,7 @@ mod tests {
             };
             for (index, owner) in planes.into_iter().enumerate() {
                 let mut data = vec![0;owner.buffer.bytes];
-                devices[0].run(||library.copy_d2h(&mut data,owner.buffer))?;
+                devices[0].run(||library.copy_d2h_quiescent(&mut data,owner.buffer))?;
                 assert_eq!(data,(0..data.len()).map(|i| ((i*17+bits*3)%251) as u8).collect::<Vec<_>>());
                 owner.inventory(&mut inventory,&format!("plane.{index}"))?;
             }
@@ -1224,7 +1224,7 @@ mod tests {
         assert_eq!(&fixture.events()?[before..], "RWCRW");
         bridge.synchronize()?;
         let mut actual = vec![0; 32];
-        device.run(|| library.copy_d2h(&mut actual, destination.buffer))?;
+        device.run(|| library.copy_d2h_quiescent(&mut actual, destination.buffer))?;
         assert_eq!(actual, bytes[16..48]);
         let before = fixture.events()?;
         let foreign = CuteafdDeviceBuffer { device_id: 1, ..view };

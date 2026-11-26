@@ -1127,7 +1127,7 @@ mod replay_tests {
             let view = state.view(lease)?;
             assert_eq!((view.begin, view.end), (position, position));
             let mut bytes = [0; 8];
-            library.copy_d2h(&mut bytes, view.device_end)?;
+            library.copy_d2h_quiescent(&mut bytes, view.device_end)?;
             assert_eq!(u64::from_ne_bytes(bytes), position);
             state.release(lease)?;
             assert!(state.begin_replay(lease, 0).is_err());
@@ -1195,7 +1195,7 @@ mod cold_capture_tests {
             let expected = unsafe {
                 let output = wave.execute(&state, &chunks)?;
                 let mut bytes = vec![0; output.values.bytes];
-                library.copy_d2h(&mut bytes, output.values)?;
+                library.copy_d2h_quiescent(&mut bytes, output.values)?;
                 bytes
             };
             let eager_snapshot = wave.ready.as_ref().context("eager proposal missing")?.snapshot;
@@ -1208,12 +1208,12 @@ mod cold_capture_tests {
             assert_eq!(wave.current_graph().is_some(), admitted);
             let output = wave.output(&state)?;
             let mut actual = vec![0; output.values.bytes];
-            library.copy_d2h(&mut actual, output.values)?;
+            library.copy_d2h_quiescent(&mut actual, output.values)?;
             assert_eq!(actual, expected, "cold result differs, admitted={admitted}");
             // A subsequent real query exercises replay or repeated eager denial.
             unsafe { wave.execute_query(&state, &chunks, &produced)?; }
             let output = wave.output(&state)?;
-            library.copy_d2h(&mut actual, output.values)?;
+            library.copy_d2h_quiescent(&mut actual, output.values)?;
             assert_eq!(actual, expected, "next query differs, admitted={admitted}");
         }
         Ok(())

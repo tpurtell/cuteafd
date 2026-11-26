@@ -118,7 +118,7 @@ fn compare(exl3: bool) -> Result<()> {
     };
     let read = |device: Device<'_>, buffer: CuteafdDeviceBuffer| -> Result<Vec<f32>> {
         let mut data = vec![0; buffer.bytes];
-        device.run(|| lib.copy_d2h(&mut data, buffer))?;
+        device.run(|| lib.copy_d2h_quiescent(&mut data, buffer))?;
         Ok(data
             .chunks_exact(4)
             .map(|x| f32::from_ne_bytes(x.try_into().unwrap()))

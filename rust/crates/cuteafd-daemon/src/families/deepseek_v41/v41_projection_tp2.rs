@@ -519,7 +519,7 @@ mod tests {
                         scratch.buffer,alpha.buffer,output.buffer,rows,stream.raw) })?;
                     stream.drain()?;
                     let mut expected=vec![0;rows as usize*n*2];
-                    devices[0].run(||lib.copy_d2h(&mut expected,CuteafdDeviceBuffer { bytes:rows as usize*n*2,..output.buffer }))?;
+                    devices[0].run(||lib.copy_d2h_quiescent(&mut expected,CuteafdDeviceBuffer { bytes:rows as usize*n*2,..output.buffer }))?;
                     // Poll once and discard an unpublished submission, then reuse
                     // the same owner; its guard drains any work already issued.
                     runtime.block_on(async {
@@ -545,7 +545,7 @@ mod tests {
                         else { first_graphs=Some(graph_handles); }
                     }
                     for (device,result) in devices.into_iter().zip([a?,b?]) {
-                        let mut actual=vec![0;expected.len()];device.run(||lib.copy_d2h(&mut actual,result))?;
+                        let mut actual=vec![0;expected.len()];device.run(||lib.copy_d2h_quiescent(&mut actual,result))?;
                         let mut max_error=0f32;
                         for (a,b) in actual.chunks_exact(2).zip(expected.chunks_exact(2)) {
                             let decode=|v:&[u8]|f32::from_bits(u32::from(u16::from_ne_bytes([v[0],v[1]]))<<16);
@@ -597,7 +597,7 @@ mod shared_storage_tests {
         let runtime=tokio::runtime::Builder::new_current_thread().build()?;
         let mut private=Wave::new(banks,unit,0,Wave::device_bytes(&lib,kind,unit,0)?)?;
         let expected=runtime.block_on(unsafe {private.execute(2,rows,inputs[0].buffer)})?;
-        let mut want=vec![0;rows as usize*n*2];lib.copy_d2h(&mut want,expected)?;
+        let mut want=vec![0;rows as usize*n*2];lib.copy_d2h_quiescent(&mut want,expected)?;
         let storage=Storage::new(devices,kind,unit,0)?;
         let mut slots=[Wave::on_storage(banks,storage.clone())?,Wave::on_storage(banks,storage.clone())?];
         for (i,slot) in slots.iter_mut().enumerate() {
@@ -627,7 +627,7 @@ mod shared_storage_tests {
         }
         drop(gate);for chain in &chains {chain.drain()?;}reader.drain()?;
         assert_eq!(done,!guarded,"projection B completion before A peer-reader release");
-        let mut got=vec![0;want.len()];devices[1].run(||lib.copy_d2h(&mut got,saved.buffer))?;
+        let mut got=vec![0;want.len()];devices[1].run(||lib.copy_d2h_quiescent(&mut got,saved.buffer))?;
         if guarded {assert_eq!(got,want);} else {assert_ne!(got,want,"negative control did not clobber gather output");}
         Ok(())
     }

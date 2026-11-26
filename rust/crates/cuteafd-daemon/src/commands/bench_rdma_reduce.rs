@@ -880,7 +880,7 @@ fn validate_reduction_output(
     codec: &str,
 ) -> Result<ReductionQualityReport> {
     let mut bytes = vec![0_u8; std::mem::size_of_val(expected)];
-    native.copy_d2h(&mut bytes, output)?;
+    native.copy_d2h_quiescent(&mut bytes, output)?;
     let actual = bytes_to_f32(&bytes).collect::<Vec<_>>();
     let mut error_squared = 0.0_f64;
     let mut expected_squared = 0.0_f64;

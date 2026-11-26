@@ -259,9 +259,9 @@ mod padding_numeric_tests {
             let mut extended = source.clone(); extended.resize(stored*k*2,0);
             let (expected_q,expected_s) = crate::families::glm5_flash::fp8::quantize(&extended,stored,k,
                 crate::families::glm5_flash::fp8::Layout::Block,crate::shared::fp8_linear::Fp8Scales::Amax);
-            let mut q = vec![0;values.buffer.bytes]; library.copy_d2h(&mut q,values.buffer)?;
+            let mut q = vec![0;values.buffer.bytes]; library.copy_d2h_quiescent(&mut q,values.buffer)?;
             assert_eq!(q,expected_q);
-            let mut grid = vec![0;scales.buffer.bytes];library.copy_d2h(&mut grid,scales.buffer)?;
+            let mut grid = vec![0;scales.buffer.bytes];library.copy_d2h_quiescent(&mut grid,scales.buffer)?;
             let real_blocks=n.div_ceil(128)*(k/128);
             let real:Vec<u8>=expected_s[..real_blocks].iter().flat_map(|scale|scale.to_le_bytes()).collect();
             assert_eq!(grid[..real.len()],real);

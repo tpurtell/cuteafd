@@ -143,6 +143,7 @@ pub(crate) struct MimoDrafter<'a> {
     timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
     stream: *mut c_void,
+    stream_owner: Option<Rc<crate::shared::memory::device::Stream<'a>>>,
     /// The draft round's host wait: sleeps instead of spinning the engine thread.
     round: std::cell::RefCell<crate::shared::memory::BlockingWait<'a>>,
     /// Ring slots (sequences with a drafter context).
@@ -514,7 +515,7 @@ mod mask_tests {
         for ((expected, actual), operand) in mounted.iter().zip(&pushed).zip(&records.operands) {
             let read = |owner: &Dev<'_>| {
                 let mut bytes = vec![0; operand.bytes];
-                library.copy_d2h(&mut bytes, owner.buffer)?;
+                library.copy_d2h_quiescent(&mut bytes, owner.buffer)?;
                 Ok::<_, anyhow::Error>(bytes)
             };
             assert_eq!(read(expected)?, read(actual)?);
@@ -576,16 +577,16 @@ impl<'a> MimoDrafter<'a> {
     /// Loads the drafter's weights from `file` (its safetensors bytes, see
     /// [`prefetch`]) and allocates `slots` ring contexts; draft steps take up
     /// to `max_sequences` sequences. The trained mask keeps its host fallback row.
-    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, dir: &Path, file: Vec<u8>, stream: *mut c_void, slots: usize,
+    pub fn load(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>, dir: &Path, file: Vec<u8>, stream_owner: Rc<crate::shared::memory::device::Stream<'a>>, slots: usize,
         max_sequences: usize, representation: MimoDraftRepresentation, bf16_head: bool,
         scales: fp8_linear::Fp8Scales, kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
         exchange: Option<Rc<PeerExchange<'a>>>) -> Result<Self> {
         let ranks = if exchange.is_some() { 2 } else { 1 };
-        let mut lead = Self::load_rank(library, programs, dir, Some(file), stream, slots, max_sequences,
+        let mut lead = Self::load_rank(library, programs, dir, Some(file), stream_owner.raw, Some(stream_owner), slots, max_sequences,
             representation, scales, kv_cache, bf16_head, 0, ranks)?;
         if let Some(exchange) = exchange {
             let device = Device { library, id: exchange.device(1) };
-            let peer = device.own(|| Self::load_rank(library, programs, dir, None, exchange.stream(1),
+            let peer = device.own(|| Self::load_rank(library, programs, dir, None, exchange.stream(1), None,
                 slots, max_sequences, representation, scales, kv_cache, bf16_head, 1, ranks).map(Box::new))?;
             lead.peer = Some(peer);
             lead.exchange = Some(exchange);
@@ -595,7 +596,8 @@ impl<'a> MimoDrafter<'a> {
 
     #[allow(clippy::too_many_arguments)]
     fn load_rank(library: &'a NativeLibrary, programs: &'a cuteafd_ffi::programs::Programs<'a>,
-        dir: &Path, file: Option<Vec<u8>>, stream: *mut c_void, slots: usize, max_sequences: usize,
+        dir: &Path, file: Option<Vec<u8>>, stream: *mut c_void,
+        stream_owner: Option<Rc<crate::shared::memory::device::Stream<'a>>>, slots: usize, max_sequences: usize,
         representation: MimoDraftRepresentation, scales: fp8_linear::Fp8Scales,
         kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache, bf16_head: bool, rank: usize, ranks: usize) -> Result<Self> {
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("drafter");
@@ -673,6 +675,7 @@ impl<'a> MimoDrafter<'a> {
             kv_cache,
             library, projections,
             stream,
+            stream_owner,
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
             slots,
             max_sequences,
@@ -1082,7 +1085,7 @@ impl<'a> MimoDrafter<'a> {
             self.round.borrow_mut().wait(s)?;
         }
         self.timing.publish_completed()?;
-        self.timing.dump_head_input(w.n.buffer, rows, h)?;
+        self.timing.dump_head_input(w.n.buffer, rows, h, s)?;
         let (unary, candidates) = output.landing.bytes()[..2 * drafted * 64].split_at(drafted * 64);
         let word = |b: &[u8], i: usize| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap());
         let drafts = (0..s_count).map(|i| {
@@ -1176,7 +1179,10 @@ impl<'a> MimoDrafter<'a> {
         let w = slot.as_ref().context("no draft step ran")?;
         let bytes = sequences * self.cfg.block * self.cfg.hidden * 2;
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..w.n.buffer })?;
+        self.stream_owner
+            .as_ref()
+            .context("MiMo drafter lead stream missing")?
+            .copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..w.n.buffer })?;
         Ok(out)
     }
 
