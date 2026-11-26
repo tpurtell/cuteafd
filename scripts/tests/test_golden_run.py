@@ -991,6 +991,70 @@ def test_dry_run_reports_locks_without_argv_and_takes_nothing(spark_env, monkeyp
     assert not (spark_env['home'] / '.cache/cuteafd/builds/gr/golden').exists()
 
 
+def family_spark_argv(env, *options, golden_args=()):
+    return SPARK_BASE + ['--model', 'org/model', '--arm', 'a=i1:s1', '--gpus', '1',
+                         '--config', str(env['config']), '--spark-hosts', 'dodo', '--worker-poll', '0.05',
+                         *options, '--', '--snapshot', '{snapshot}', '--peers', '{peers}', *golden_args]
+
+
+@pytest.mark.parametrize('options,golden_args,expected', [
+    ([], ['--core-view', 'k8-compact'], 'k8-compact'),
+    (['--env', 'CUTEAFD_CORE_VIEW=k6-compact'], ['--core-view=k8-compact'], 'k8-compact'),
+    (['--arm-arg=a:--core-view', '--arm-arg=a:fp8-compact'], [], 'fp8-compact'),
+    (['--env', 'CUTEAFD_CORE_VIEW=k6-compact'], [], 'k6-compact'),
+    (['--worker-arg=--core-view=k8-compact'], ['--core-view', 'k8-compact'], 'k8-compact'),
+    (['--worker-env', 'CUTEAFD_CORE_VIEW=k8-compact'], ['--core-view', 'k8-compact'], 'k8-compact'),
+    ([], [], None),
+])
+def test_worker_core_view_argv(spark_env, options, golden_args, expected):
+    assert golden.main(family_spark_argv(spark_env, *options, golden_args=golden_args)) == 0
+    command = next(shlex.split(c) for _, c in ssh_calls(spark_env) if 'expertd-native' in c)
+    view_options = [a for a in command if a == '--core-view' or a.startswith('--core-view=')]
+    assert len(view_options) == (1 if expected is not None else 0)
+    if expected is not None:
+        assert ('--core-view=' + expected in command or
+                command[command.index('--core-view') + 1] == expected)
+    else:
+        assert not any(a.startswith('CUTEAFD_CORE_VIEW=') for a in command)
+
+
+def test_core_view_per_arm(spark_env, capsys):
+    argv = family_spark_argv(spark_env, '--arm', 'b=i1:s1', '--env', 'CUTEAFD_CORE_VIEW=k8-compact',
+                             '--arm-env', 'b:CUTEAFD_CORE_VIEW=k6-compact', '--dry-run')
+    assert golden.main(argv) == 0
+    out = capsys.readouterr().out
+    assert '# arm a worker argv: --core-view k8-compact' in out
+    assert '# arm b worker argv: --core-view k6-compact' in out
+    assert not runs(spark_env)
+    assert not any(c[:2] == ['run', '-d'] for c in docker_calls(spark_env))
+
+
+@pytest.mark.parametrize('options,golden_args,source,expected', [
+    (['--worker-arg=--core-view', '--worker-arg=k6-compact'], ['--core-view=k8-compact'],
+     '--worker-arg --core-view', 'k8-compact'),
+    (['--arm-env', 'a:CUTEAFD_CORE_VIEW=k8-compact', '--worker-env', 'CUTEAFD_CORE_VIEW=k6-compact'], [],
+     'worker CUTEAFD_CORE_VIEW', 'k8-compact'),
+    (['--worker-env', 'CUTEAFD_CORE_VIEW=k8-compact', '--arm-worker-env', 'a:CUTEAFD_CORE_VIEW=k6-compact'],
+     ['--core-view=k8-compact'], 'worker CUTEAFD_CORE_VIEW', 'k8-compact'),
+    (['--worker-arg=--core-view=k8-compact'], [], '--worker-arg --core-view', 'original'),
+])
+def test_core_view_mismatch_refused_before_preflight(spark_env, options, golden_args, source, expected, capsys):
+    assert golden.main(family_spark_argv(spark_env, *options, golden_args=golden_args)) == 2
+    err = capsys.readouterr().err
+    assert f'arm a: {source}=' in err
+    assert f'disagrees with coordinator core view {expected!r}' in err
+    assert not docker_calls(spark_env) and not ssh_calls(spark_env)
+
+
+@pytest.mark.parametrize('options,expected', [
+    (['--arm-env', 'a:CUTEAFD_CORE_VIEW=k8-compact'], 'k8-compact'),
+    (['--worker-arg=--core-view=k6-compact'], 'k6-compact'),
+])
+def test_native_core_view_env_or_manual_override(spark_env, options, expected, capsys):
+    assert golden.main(spark_argv(spark_env, *options, '--dry-run')) == 0
+    assert f'# arm a worker argv: --core-view {expected}' in capsys.readouterr().out
+
+
 def test_spark_hosts_without_lanes_in_config(spark_env, capsys):
     spark_env['config'].write_text('SPARK_0_HOST=dodo\nSPARK_0_LANE_A=10.9.0.1\n')
     assert golden.main(spark_argv(spark_env)) == 2
@@ -1229,6 +1293,7 @@ Options:
       --resume-span <RESUME_SPAN>
       --resume-decode <RESUME_DECODE>
       --peers <PEERS>
+      --core-view <CORE_VIEW> [default: original]
       --prefill-rows <PREFILL_ROWS>
       --prefill-waves <PREFILL_WAVES>
 """
