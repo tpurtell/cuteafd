@@ -21,23 +21,27 @@ pub(crate) enum Section {
     DraftFusion,
     DraftLayer,
     DraftCorrection,
-    /// Full IndexCache layer pre-topk: optional prev-FFN iHC + MLA Q/KV/absorb + indexer projections & index_post.
+    /// Full IndexCache layer pre-topk (TP1 local / TP2): optional prev-FFN iHC + MLA Q/KV/absorb + indexer projections & index_post.
     DsaFullPre,
-    /// Shared IndexCache layer pre-attention: optional prev-FFN iHC + MLA Q/KV/absorb (zero indexer compute).
+    /// Shared IndexCache layer pre-attention (TP2): optional prev-FFN iHC + MLA Q/KV/absorb (zero indexer compute).
     DsaSharedPre,
+    /// TP1 Spark-routed layer (Full and Shared IndexCache): optional prev-FFN iHC + MLA Q/KV/absorb
+    /// + optional full-indexer `index_post` & `index_topk_decode` + `mla_dsa_decode` + sink/UV + o_proj
+    /// + post-attn iHC + router.
+    DsaSpark,
     /// 2-GPU ContextSplit DSA dual partials (h0 + h32 over parity-owned local pages).
     DsaPartial,
     /// TP1 local DSA post-indexer: `mla_dsa_decode` + sink/UV + o_proj + post-attn + Dense/MoE+EXL3+post-FFN.
     DsaLocalPost,
-    /// DSA attention output only (TP2 before peer reduce, or Spark-routed).
+    /// DSA attention output only (TP2 before peer reduce).
     DsaAttnOut,
-    /// Post-attn iHC + Dense/MoE frontend (TP2 or Spark-routed; includes TP2 local EXL3 when onboarded).
+    /// Post-attn iHC + Dense/MoE frontend (TP2 local/dense; includes TP2 local EXL3 when onboarded).
     FfnFrontend,
-    /// Spark-routed post-attention and router, before request staging.
+    /// Spark-routed post-attention and router, before request staging (TP2).
     SparkRouter,
-    /// Shared expert FFN launched after staging, ahead of the landed wait.
+    /// Shared expert FFN launched after staging, ahead of the landed wait (TP2; TP1 runs eagerly in the RDMA shadow).
     SparkShared,
-    /// Post-FFN combine + iHC post (TP2 or Spark-routed; no sandwich norm in Hy4).
+    /// Post-FFN combine + iHC post (non-deferred fallback).
     FfnFinish,
     /// Rank-0 final layer post-FFN combine + iHC post + terminal `hc_head`.
     Tail,
@@ -48,6 +52,45 @@ pub(crate) struct Key {
     pub(crate) layer: usize,
     pub(crate) rows: usize,
     pub(crate) section: Section,
+    /// Bucketed decode page-table width/stride (`decode_page_stride`) when this
+    /// section captures `index_topk_decode`, or `0` when it does not read the page table.
+    pub(crate) table_width: usize,
+    /// True when the preceding layer's deferred FFN finish is fused into this section's start.
+    pub(crate) prev_ffn: bool,
+}
+
+impl Key {
+    pub(crate) const fn new(layer: usize, rows: usize, section: Section) -> Self {
+        Self { layer, rows, section, table_width: 0, prev_ffn: false }
+    }
+
+    pub(crate) const fn with_prev_ffn(layer: usize, rows: usize, section: Section, prev_ffn: bool) -> Self {
+        Self { layer, rows, section, table_width: 0, prev_ffn }
+    }
+
+    pub(crate) const fn with_table(
+        layer: usize,
+        rows: usize,
+        section: Section,
+        table_width: usize,
+        prev_ffn: bool,
+    ) -> Self {
+        Self { layer, rows, section, table_width, prev_ffn }
+    }
+}
+
+/// Per-layer graph sections emitted on GPU 0 for a TP1 Spark-routed decode layer.
+///
+/// Both Full IndexCache layers (with bucketed `pt_stride` captured inside `index_topk_decode`)
+/// and Shared IndexCache layers (with `table_width = 0`) execute as a single `DsaSpark`
+/// segment from the previous layer's deferred FFN finish through this layer's router.
+/// `shared_ffn` runs eagerly between `waves.send` and `waves.land` in the Spark RDMA shadow.
+pub(crate) fn tp1_spark_layer_sections(can_capture_topk: bool, is_full_indexer: bool) -> &'static [Section] {
+    if !is_full_indexer || can_capture_topk {
+        &[Section::DsaSpark]
+    } else {
+        &[Section::DsaFullPre, Section::DsaAttnOut, Section::SparkRouter]
+    }
 }
 
 pub(crate) struct Hy4Graphs<'a> {
@@ -125,7 +168,7 @@ impl<'a> Hy4Graphs<'a> {
         stream: &Stream<'a>,
         work: impl FnMut() -> Result<()>,
     ) -> Result<()> {
-        self.run(Key { layer: stage, rows, section }, stream, work)
+        self.run(Key::new(stage, rows, section), stream, work)
     }
 
     pub(crate) fn tick(&self) {
@@ -267,6 +310,7 @@ mod tests {
                 for section in [
                     Section::DsaFullPre,
                     Section::DsaSharedPre,
+                    Section::DsaSpark,
                     Section::DsaPartial,
                     Section::DsaLocalPost,
                     Section::DsaAttnOut,
@@ -277,12 +321,26 @@ mod tests {
                     Section::Tail,
                 ] {
                     assert!(bank
-                        .cache_ticket(&Key { layer, rows: 1, section }, false, None)
+                        .cache_ticket(&Key::new(layer, 1, section), false, None)
                         .is_none());
                 }
             }
             bank.cache_tick();
             assert!(!bank.cache_needs_boundary());
         }
+    }
+
+    #[test]
+    fn tp1_spark_layer_section_sequence_is_one_segment_per_layer() {
+        // Both Full IndexCache and Shared IndexCache Spark-routed layers execute in 1 graph segment.
+        assert_eq!(tp1_spark_layer_sections(true, true), &[Section::DsaSpark]);
+        assert_eq!(tp1_spark_layer_sections(true, false), &[Section::DsaSpark]);
+        assert_eq!(tp1_spark_layer_sections(false, false), &[Section::DsaSpark]);
+        // Keys normalize table_width=0 for shared-indexer layers and distinguish prev_ffn/table_width.
+        let shared = Key::with_table(2, 1, Section::DsaSpark, 0, true);
+        let full_4k = Key::with_table(1, 1, Section::DsaSpark, 64, false);
+        let full_8k = Key::with_table(1, 1, Section::DsaSpark, 128, false);
+        assert_ne!(full_4k, full_8k);
+        assert_ne!(shared, Key { prev_ffn: false, ..shared });
     }
 }

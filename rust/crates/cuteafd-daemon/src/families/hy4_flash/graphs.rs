@@ -23,31 +23,39 @@ pub(crate) enum Section {
     DraftFusion,
     DraftLayer,
     DraftCorrection,
-    /// TP1 local SWA layer: optional Engram compute + MLA SWA + post-attn + Dense/MoE+EXL3+post-FFN.
+    /// TP1 local SWA layer: optional prev-FFN finish + optional Engram compute + MLA SWA + post-attn + Dense/MoE+EXL3+post-FFN.
     SwaLocal,
-    /// SWA attention section (TP2 before peer reduce, or Spark-routed before FFN frontend).
+    /// TP1 Spark-routed single-row SWA layer: optional prev-FFN finish + optional Engram compute + MLA SWA + post-attn + router.
+    SwaSpark,
+    /// SWA attention section (TP2 before peer reduce).
     SwaAttn,
     /// Multi-row SWA pre-attention before eager `mla_swa_extend`.
     SwaExtendPre,
-    /// Multi-row SWA post-attention after eager `mla_swa_extend`.
+    /// Multi-row SWA post-attention after eager `mla_swa_extend` (TP1 local or TP2).
     SwaExtendPost,
-    /// DSA pre-indexer: optional Engram compute + MLA Q/KV/absorb + indexer_wk + rms_norm_128.
+    /// Multi-row TP1 Spark-routed SWA post-attention + post-attn iHC + router after eager `mla_swa_extend`.
+    SwaExtendSpark,
+    /// DSA pre-indexer (short context <=2048, or TP1 local / TP2): optional prev-FFN finish + optional Engram compute + MLA Q/KV/absorb + indexer_wk + rms_norm_128.
     DsaPre,
-    /// DSA >2048 indexer query projections + RoPE (3 kernels).
+    /// TP1 Spark-routed DSA pre-indexer at >2048 context: `DsaPre` + `dsa_index_q` (eliminates separate `DsaIndexQ` launch).
+    DsaPreScored,
+    /// DSA >2048 indexer query projections + RoPE (3 kernels; TP1 local / TP2).
     DsaIndexQ,
     /// 2-GPU ContextSplit DSA dual partials (h0 + h16 over local pages).
     DsaPartial,
     /// TP1 local DSA post-indexer: `mla_dsa_decode` + sink/UV + o_proj + post-attn + MoE+EXL3+post-FFN.
     DsaLocalPost,
-    /// DSA attention output only (TP2 before peer reduce, or Spark-routed): `mla_dsa_decode` + sink/UV + o_proj.
+    /// TP1 Spark-routed DSA post-indexer: `mla_dsa_decode` + sink/UV + o_proj + post-attn + router.
+    DsaSparkPost,
+    /// DSA attention output only (TP2 before peer reduce): `mla_dsa_decode` + sink/UV + o_proj.
     DsaAttnOut,
-    /// Post-attn iHC + Dense/MoE frontend (TP2 or Spark-routed; includes TP2 local EXL3 when onboarded).
+    /// Post-attn iHC + Dense/MoE frontend (TP2 local/dense; includes TP2 local EXL3 when onboarded).
     FfnFrontend,
-    /// Spark-routed post-attention and router, before request staging.
+    /// Spark-routed post-attention and router, before request staging (TP2).
     SparkRouter,
-    /// Shared expert FFN launched after staging, ahead of the landed wait.
+    /// Shared expert FFN launched after staging, ahead of the landed wait (TP2; TP1 runs eagerly in the RDMA shadow).
     SparkShared,
-    /// Post-FFN combine + norm + iHC post (TP2 or Spark-routed).
+    /// Post-FFN combine + norm + iHC post (non-deferred fallback).
     FfnFinish,
     /// Rank-0 final layer post-FFN combine + norm + iHC post + terminal `hc_head`.
     Tail,
@@ -58,6 +66,42 @@ pub(crate) struct Key {
     pub(crate) layer: usize,
     pub(crate) rows: usize,
     pub(crate) section: Section,
+    /// True when the preceding layer's deferred FFN finish is fused into this section's start.
+    pub(crate) prev_ffn: bool,
+}
+
+impl Key {
+    pub(crate) const fn new(layer: usize, rows: usize, section: Section) -> Self {
+        Self { layer, rows, section, prev_ffn: false }
+    }
+
+    pub(crate) const fn with_prev_ffn(layer: usize, rows: usize, section: Section, prev_ffn: bool) -> Self {
+        Self { layer, rows, section, prev_ffn }
+    }
+}
+
+/// Per-layer graph sections emitted on GPU 0 for a TP1 Spark-routed decode layer.
+///
+/// The previous layer's `FfnFinish` fuses into the start of the first section
+/// (`prev_ffn: true` for every layer after a Spark-routed predecessor), `SparkRouter`
+/// fuses into the end of the last section, and `shared_ffn` runs eagerly between
+/// `waves.send` and `waves.land` in the Spark RDMA shadow (matching GLM 5.3).
+pub(crate) fn tp1_spark_layer_sections(
+    is_sparse: bool,
+    all_single_row: bool,
+    need_score: bool,
+) -> &'static [Section] {
+    if !is_sparse {
+        if all_single_row {
+            &[Section::SwaSpark]
+        } else {
+            &[Section::SwaExtendPre, Section::SwaExtendSpark]
+        }
+    } else if need_score {
+        &[Section::DsaPreScored, Section::DsaSparkPost]
+    } else {
+        &[Section::DsaPre, Section::DsaSparkPost]
+    }
 }
 
 pub(crate) struct Hy4Graphs<'a> {
@@ -155,7 +199,7 @@ impl<'a> Hy4Graphs<'a> {
         &self, rows: usize, stage: usize, section: Section, stream: &Stream<'a>,
         work: impl FnMut() -> Result<()>,
     ) -> Result<()> {
-        self.run(Key { layer: stage, rows, section }, stream, work)
+        self.run(Key::new(stage, rows, section), stream, work)
     }
 
     pub(crate) fn run(
@@ -278,22 +322,27 @@ mod tests {
             for layer in 0..42 {
                 for section in [
                     Section::SwaLocal,
+                    Section::SwaSpark,
                     Section::SwaAttn,
                     Section::SwaExtendPre,
                     Section::SwaExtendPost,
+                    Section::SwaExtendSpark,
                     Section::DsaPre,
+                    Section::DsaPreScored,
                     Section::DsaIndexQ,
                     Section::DsaPartial,
                     Section::DsaLocalPost,
+                    Section::DsaSparkPost,
                     Section::DsaAttnOut,
                     Section::FfnFrontend,
                     Section::SparkRouter,
                     Section::SparkShared,
                     Section::FfnFinish,
+                    Section::Tail,
                 ] {
                     for rows in [1, 4, 16, 64] {
                         assert!(bank
-                            .cache_ticket(&Key { layer, rows, section }, false, None)
+                            .cache_ticket(&Key::new(layer, rows, section), false, None)
                             .is_none());
                     }
                 }
@@ -302,36 +351,38 @@ mod tests {
             assert!(!bank.cache_needs_boundary());
         }
         assert!(bank
-            .cached_launch(&Key {
-                layer: 0,
-                rows: 1,
-                section: Section::SwaLocal,
-            })
+            .cached_launch(&Key::new(0, 1, Section::SwaLocal))
             .is_none());
     }
 
     #[test]
     fn keys_are_geometry_only() {
-        let key = Key {
-            layer: 8,
-            rows: 16,
-            section: Section::SwaLocal,
-        };
-        assert_eq!(
-            key,
-            Key {
-                layer: 8,
-                rows: 16,
-                section: Section::SwaLocal,
-            }
-        );
+        let key = Key::new(8, 16, Section::SwaLocal);
+        assert_eq!(key, Key::new(8, 16, Section::SwaLocal));
         assert_ne!(key, Key { rows: 4, ..key });
-        assert_ne!(
-            key,
-            Key {
-                section: Section::DsaPre,
-                ..key
-            }
+        assert_ne!(key, Key { section: Section::DsaPre, ..key });
+        assert_ne!(key, Key { prev_ffn: true, ..key });
+    }
+
+    #[test]
+    fn tp1_spark_layer_section_sequence_is_minimal() {
+        // Single-row SWA Spark layer: 1 segment (prev FFN finish + Engram + SWA + post-attn + router).
+        assert_eq!(tp1_spark_layer_sections(false, true, false), &[Section::SwaSpark]);
+        assert_eq!(tp1_spark_layer_sections(false, true, true), &[Section::SwaSpark]);
+        // Multi-row verify SWA Spark layer: 2 segments around eager mla_swa_extend.
+        assert_eq!(
+            tp1_spark_layer_sections(false, false, false),
+            &[Section::SwaExtendPre, Section::SwaExtendSpark]
+        );
+        // Short-context (<=2048) DSA Spark layer: 2 segments around eager pending D2D + topk.
+        assert_eq!(
+            tp1_spark_layer_sections(true, true, false),
+            &[Section::DsaPre, Section::DsaSparkPost]
+        );
+        // Long-context (>2048) DSA Spark layer: 2 segments (dsa_index_q folded into DsaPreScored).
+        assert_eq!(
+            tp1_spark_layer_sections(true, true, true),
+            &[Section::DsaPreScored, Section::DsaSparkPost]
         );
     }
 }
