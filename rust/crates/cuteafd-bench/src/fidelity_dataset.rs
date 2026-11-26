@@ -69,6 +69,9 @@ pub const HY4_MANIFEST_SHA256: &str = "9ffaf7dac6afa70d5360b1bc9c54c3ade21c3a26d
 pub const HY4_FULL_REVISION: &str = "ac045b800155a747ac4292a48ea9155728f5863a";
 pub const HY4_FULL_CONFIG: &str = "hy4-v1_20261122_own-text-bf16-f32";
 pub const HY4_FULL_MANIFEST_SHA256: &str = "5b7a2ab20bb152393566ea23a5a4734c374f4db7ceb356d1527f375883e3ad7c";
+pub const ERNIE55_FLASH_REVISION: &str = "9a56c66355e8927559a4f8ffde912ab6354157bf";
+pub const ERNIE55_FLASH_CONFIG: &str = "ernie55-flash-v1_20261126_own-text-bf16-f32";
+pub const ERNIE55_FLASH_MANIFEST_SHA256: &str = "f428474964b4f33bc25c879b97452dc3a548da810e85169f4e51d216f0fc7560";
 
 /// Sealed bench subset v1: agentic A at three context lengths, human code C,
 /// structured/tool D, plain E and the frozen context anchor. Never resample.
@@ -375,6 +378,7 @@ pub fn download(agent: &ureq::Agent, cache: &Path, repo: &str, commit: &str, con
             (INKLING2_MINI_REVISION, INKLING2_MINI_CONFIG) => Some(INKLING2_MINI_MANIFEST_SHA256),
             (HY4_REVISION, HY4_CONFIG) => Some(HY4_MANIFEST_SHA256),
             (HY4_FULL_REVISION, HY4_FULL_CONFIG) => Some(HY4_FULL_MANIFEST_SHA256),
+            (ERNIE55_FLASH_REVISION, ERNIE55_FLASH_CONFIG) => Some(ERNIE55_FLASH_MANIFEST_SHA256),
             (MIMO_PRO_MEDIA_REVISION, MIMO_PRO_MEDIA_CONFIG) => Some(MIMO_PRO_MEDIA_MANIFEST_SHA256),
             (GLM_REVISION, GLM_CONFIG) => Some("cc973cec8df82119ccd53367d014c73b271808a561f81d3629b06093de3b00e0"),
             (V4PRO_REVISION, V4PRO_CONFIG) => Some("7b4fd7b51670ff03fbfab6a21b72d999163ddee9bd3eec34c89f1d6c2f83488f"),
@@ -642,6 +646,46 @@ fn hy4_full_reference_sources(provenance: &Value, manifest: &Value) -> bool {
             && numeric_check(&layers[2]["active_indexer_relative_l2"]))
 }
 
+pub(crate) const ERNIE55_FLASH_ROOT: &str = "baidu/ERNIE-5.5-Flash-Preview-BF16";
+const ERNIE55_FLASH_ROOT_REVISION: &str = "33a9925b17506c5ff57accac2b31a6520c951c4e";
+const ERNIE55_FLASH_VLLM_ERNIE_FILES: [(&str, &str); 7] = [
+    ("src/vllm_ernie/models/ernie5_5/config.py", "f16d057b11bd8b8e920259657b41651d003908f99ff8aff4a94118a4912c343d"),
+    ("src/vllm_ernie/models/ernie5_5/mhc.py", "02d9cf6c7789d77e655e0c2aea57e64c72ae03e717543e965a36bb83d3aab9f5"),
+    ("src/vllm_ernie/models/ernie5_5/nvidia/model.py", "5ed1b6d243472f75cc13154a84f89a61e8db79ef875f49312812e69f40fe4473"),
+    ("src/vllm_ernie/models/ernie5_5/nvidia/attention.py", "c01daadbef2df1263e158d7139f4046d1cbcadc6e7e088249c231fb4362989f5"),
+    ("src/vllm_ernie/models/ernie5_5/nvidia/moe.py", "da723ed088ed7ed1552edf7756f5a85dd6989b1bfd41b34d7e4653609d591d74"),
+    ("src/vllm_ernie/models/ernie5_5/nvidia/flashindexer.py", "e56618630aaf5d7ecafa7dde2fe405caaaa5a9b54264c323786f16ce7980f1fb"),
+    ("src/vllm_ernie/models/ernie5_5/nvidia/dspark.py", "1b962cd4f74f9c48d701bab370b5502f9764aa72a716a4a186b32ecfd124f929"),
+];
+const ERNIE55_FLASH_SGLANG_FILES: [(&str, &str); 4] = [
+    ("python/sglang/srt/configs/ernie55.py", "1f9e2a3cb1cb8f09a8343b96a2381459864ec9592e86a75265abf46069647af9"),
+    ("python/sglang/srt/models/ernie55.py", "b68b2b722bf0f2d8ce77955823491a00337d25b1e388ea118e9ed893fa972957"),
+    ("python/sglang/srt/models/ernie55_dspark.py", "865b72142d6c4f3da25ba5520f4474f864dc03726c3f331fa3c70123aa225bd8"),
+    ("python/sglang/srt/layers/attention/ernie55_backend.py", "01e8beae23aa871f9d606dd51506033f4bf657247d2d7d7bbff538075ae5dc6e"),
+];
+
+fn ernie55_flash_reference_sources(provenance: &Value, manifest: &Value) -> bool {
+    let source = &provenance["source_pin"];
+    let sha256 = |value: &Value| value.as_str().is_some_and(|s| s.len() == 64 &&
+        s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+    manifest["root_checkpoint"]["id"] == ERNIE55_FLASH_ROOT
+        && manifest["root_checkpoint"]["revision"] == ERNIE55_FLASH_ROOT_REVISION
+        && manifest["vocab"] == 201216
+        && provenance["source_identity_provider"] == "families.ernie55_flash.golden"
+        && source["checkpoint"] == ERNIE55_FLASH_ROOT && source["revision"] == ERNIE55_FLASH_ROOT_REVISION
+        && source["vllm_ernie_revision"] == "ba322a5634f91d3e6f96ae711df72ddaf3c38b6e"
+        && source["vllm_version"] == "0.32.0"
+        && source["sglang_revision"] == "5ff04f14f46ac86072e8d2596faa8a734b6f1133"
+        && source["config_sha256"] == provenance["snapshot_identity"]["config_sha256"]
+        && source["index_sha256"] == "c66d18a9144f65af4ab10c33d40ff2df4720aa2bf58b27a71d2c6340baaf12f2"
+        && source["flashindexer_sha256"] == "44fd87744c1546365eded8ca9131d6b4e0e250330a824b4a772daae949013fd2"
+        && ["config_sha256", "index_sha256", "flashindexer_sha256", "common_sha256",
+            "model_sha256", "golden_sha256", "sources_sha256", "layer_major_sha256"]
+            .iter().all(|key| sha256(&source[*key]))
+        && ERNIE55_FLASH_VLLM_ERNIE_FILES.iter().all(|(path, digest)| source["vllm_ernie_files"][*path] == *digest)
+        && ERNIE55_FLASH_SGLANG_FILES.iter().all(|(path, digest)| source["sglang_files"][*path] == *digest)
+}
+
 fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'static str> {
     ensure!(qualification["set_sha256"] == manifest["set_sha256"] && qualification["qualifies"] == true,
         "unqualified or mismatched dataset set");
@@ -675,6 +719,8 @@ fn qualification_label(qualification: &Value, manifest: &Value) -> Result<&'stat
             hy4_reference_sources(provenance, manifest)
         } else if manifest["family"] == "hy4" {
             hy4_full_reference_sources(provenance, manifest)
+        } else if manifest["family"] == "ernie55_flash" {
+            ernie55_flash_reference_sources(provenance, manifest)
         } else if manifest["family"] == "inkling2" {
             inkling_reference_sources(provenance, manifest)
         } else if manifest["family"] == "inkling2_mini" {
@@ -978,6 +1024,43 @@ mod tests {
         wrong_family["family"] = json!("inkling2");
         assert!(qualification_label(&qualification, &wrong_family).is_err());
         for key in ["transformers", "sglang", "snapshot", "inkling_primitives_sha256"] {
+            let mut changed = qualification.clone();
+            changed["reference_provenance"]["source_pin"][key] = Value::Null;
+            assert!(qualification_label(&changed, &manifest).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn ernie55_flash_reference_requires_its_own_checkpoint_and_vendor_pins() {
+        let (mut qualification, mut manifest) = kimi_reference_qualification();
+        manifest["family"] = json!("ernie55_flash");
+        manifest["vocab"] = json!(201216);
+        manifest["root_checkpoint"] = json!({"id": ERNIE55_FLASH_ROOT, "revision": ERNIE55_FLASH_ROOT_REVISION});
+        for path in ["reference_provenance", "prefix_qualification"] {
+            qualification[path]["snapshot_identity"]["checkpoint"] = json!(ERNIE55_FLASH_ROOT);
+            qualification[path]["snapshot_identity"]["snapshot_revision"] = json!(ERNIE55_FLASH_ROOT_REVISION);
+        }
+        qualification["prefix_qualification"]["vocab"] = json!(201216);
+        let provenance = &mut qualification["reference_provenance"];
+        provenance["source_identity_provider"] = json!("families.ernie55_flash.golden");
+        let mut source = json!({
+            "checkpoint": ERNIE55_FLASH_ROOT,
+            "revision": ERNIE55_FLASH_ROOT_REVISION,
+            "vllm_ernie_revision": "ba322a5634f91d3e6f96ae711df72ddaf3c38b6e",
+            "vllm_version": "0.32.0",
+            "sglang_revision": "5ff04f14f46ac86072e8d2596faa8a734b6f1133",
+            "config_sha256": provenance["snapshot_identity"]["config_sha256"],
+            "index_sha256": "c66d18a9144f65af4ab10c33d40ff2df4720aa2bf58b27a71d2c6340baaf12f2",
+            "flashindexer_sha256": "44fd87744c1546365eded8ca9131d6b4e0e250330a824b4a772daae949013fd2",
+            "vllm_ernie_files": ERNIE55_FLASH_VLLM_ERNIE_FILES.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+            "sglang_files": ERNIE55_FLASH_SGLANG_FILES.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+        });
+        for key in ["common_sha256", "model_sha256", "golden_sha256", "sources_sha256", "layer_major_sha256"] {
+            source[key] = json!("d".repeat(64));
+        }
+        provenance["source_pin"] = source;
+        assert_eq!(qualification_label(&qualification, &manifest).unwrap(), "reference");
+        for key in ["vllm_ernie_revision", "sglang_revision", "flashindexer_sha256", "model_sha256"] {
             let mut changed = qualification.clone();
             changed["reference_provenance"]["source_pin"][key] = Value::Null;
             assert!(qualification_label(&changed, &manifest).is_err(), "{key}");
@@ -1422,7 +1505,8 @@ mod tests {
             (MUSE_SPARK_REVISION, MUSE_SPARK_CONFIG), (MISTRAL_LARGE4_REVISION, MISTRAL_LARGE4_CONFIG),
             (MINIMAX_M3_REVISION, MINIMAX_M3_CONFIG), (INKLING2_REVISION, INKLING2_CONFIG),
             (INKLING2_MINI_REVISION, INKLING2_MINI_CONFIG),
-            (HY4_REVISION, HY4_CONFIG), (HY4_FULL_REVISION, HY4_FULL_CONFIG)] {
+            (HY4_REVISION, HY4_CONFIG), (HY4_FULL_REVISION, HY4_FULL_CONFIG),
+            (ERNIE55_FLASH_REVISION, ERNIE55_FLASH_CONFIG)] {
             let root = temporary.path().join("wrldsuksgo2mars--cuteafd-fidelity").join(revision);
             std::fs::create_dir_all(root.join(config)).unwrap();
             let manifest = b"{}";
@@ -1512,6 +1596,19 @@ mod tests {
             let balance = standard_balance(&reference);
             assert_eq!(balance["decode"]["generated_positions"], 13557);
             assert_eq!(balance["prefill"]["generated_positions"], 12634);
+        }
+        if commit == ERNIE55_FLASH_REVISION && config == ERNIE55_FLASH_CONFIG {
+            assert_eq!(reference.checkpoint, ERNIE55_FLASH_ROOT);
+            assert_eq!(reference.windows.len(), 64);
+            assert_eq!(identity["qualification"], "reference");
+            assert_eq!(identity["text_checkpoint"], ERNIE55_FLASH_ROOT);
+            assert_eq!((reference.expect.top1_min, reference.expect.kl_max), (0.90, 0.06));
+            assert_eq!(quick_windows(&reference).unwrap().len(), 8);
+            assert_eq!(standard_windows(&reference, "decode", false).unwrap().len(), 64);
+            for (half, generated) in [("decode", 11142), ("prefill", 10200)] {
+                assert_eq!(standard_windows(&reference, half, true).unwrap().len(), 32);
+                assert_eq!(standard_balance(&reference)[half]["generated_positions"], generated);
+            }
         }
         if commit == INKLING2_MINI_REVISION && config == INKLING2_MINI_CONFIG {
             assert_eq!(reference.checkpoint, INKLING2_MINI_ROOT);

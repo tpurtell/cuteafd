@@ -29,6 +29,7 @@ pub const PUBLICATIONS: &[Publication] = &[
     Publication { root: "MiniMaxAI/MiniMax-M3.1-Flash", siblings: &["MiniMaxAI/MiniMax-M3.1-Flash"], revision: dataset::MINIMAX_M3_REVISION, config: dataset::MINIMAX_M3_CONFIG },
     Publication { root: "tencent/Hy4-flash", siblings: &["tencent/Hy4-flash"], revision: dataset::HY4_REVISION, config: dataset::HY4_CONFIG },
     Publication { root: "tencent/Hy4", siblings: &["tencent/Hy4", "tencent/Hy4-FP8"], revision: dataset::HY4_FULL_REVISION, config: dataset::HY4_FULL_CONFIG },
+    Publication { root: dataset::ERNIE55_FLASH_ROOT, siblings: &[dataset::ERNIE55_FLASH_ROOT, "baidu/ERNIE-5.5-Flash-Preview-FP8", "baidu/ERNIE-5.5-Flash-Preview"], revision: dataset::ERNIE55_FLASH_REVISION, config: dataset::ERNIE55_FLASH_CONFIG },
     Publication { root: dataset::INKLING2_MINI_ROOT, siblings: &[dataset::INKLING2_MINI_ROOT], revision: dataset::INKLING2_MINI_REVISION, config: dataset::INKLING2_MINI_CONFIG },
     Publication { root: "thinkingmachines/Inkling-2-Small-MXFP8", siblings: &["thinkingmachines/Inkling-2-Small-MXFP8", "thinkingmachines/Inkling-2-Small"], revision: dataset::INKLING2_REVISION, config: dataset::INKLING2_CONFIG },
     // Official FP8 block-128 release; Mistral publishes no BF16 master.
@@ -55,6 +56,7 @@ pub const OFFICIAL_ROOTS: &[(&str, &[&str])] = &[
     ("moonshotai/Kimi-K3.1-Pro", &["moonshotai/Kimi-K3.1-Pro"]),
     ("tencent/Hy4-flash", &["tencent/Hy4-flash"]),
     ("tencent/Hy4", &["tencent/Hy4", "tencent/Hy4-FP8"]),
+    (dataset::ERNIE55_FLASH_ROOT, &[dataset::ERNIE55_FLASH_ROOT, "baidu/ERNIE-5.5-Flash-Preview-FP8", "baidu/ERNIE-5.5-Flash-Preview"]),
     (dataset::INKLING2_MINI_ROOT, &[dataset::INKLING2_MINI_ROOT]),
     ("thinkingmachines/Inkling-2-Small-MXFP8", &["thinkingmachines/Inkling-2-Small-MXFP8", "thinkingmachines/Inkling-2-Small"]),
 ];
@@ -448,6 +450,33 @@ mod tests {
         }
         assert!(official_root("tencent/Hy4-unverified").is_none());
         assert!(resolve_in("someone/Hy4-unverified", None, tmp.path()).is_err());
+    }
+
+    #[test]
+    fn ernie55_flash_official_root_maps_fp8_and_mxfp4_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dataset::ERNIE55_FLASH_ROOT;
+        let fp8 = "baidu/ERNIE-5.5-Flash-Preview-FP8";
+        let mxfp4 = "baidu/ERNIE-5.5-Flash-Preview";
+        for model in [root, fp8, mxfp4] {
+            assert_eq!(official_root(model), Some(root));
+            let reference = resolve_in(model, None, tmp.path()).unwrap();
+            assert_eq!(reference.reference_match, "name");
+            assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+                (root, dataset::ERNIE55_FLASH_REVISION, dataset::ERNIE55_FLASH_CONFIG));
+        }
+        for (model, parent) in [("test/ernie55-bf16-quant", root), ("test/ernie55-fp8-quant", fp8), ("test/ernie55-mxfp4-quant", mxfp4)] {
+            let quant = add(tmp.path(), model, &format!("base_model: {parent}\nbase_model_relation: quantized"));
+            let reference = resolve_in(model, Some(&quant), tmp.path()).unwrap();
+            assert_eq!(reference.reference_match, "base_model");
+            assert_eq!((reference.reference_root.as_str(), reference.revision.as_str(), reference.config.as_str()),
+                (root, dataset::ERNIE55_FLASH_REVISION, dataset::ERNIE55_FLASH_CONFIG));
+            let mut chain = vec![model.to_string(), parent.to_string()];
+            if parent != root { chain.push(root.to_string()); }
+            assert_eq!(reference.resolved_chain, vec![chain]);
+        }
+        assert!(official_root("baidu/ERNIE-5.5-Flash-Preview-unverified").is_none());
+        assert!(resolve_in("someone/ERNIE-5.5-Flash-Preview-unverified", None, tmp.path()).is_err());
     }
 
     #[test]
