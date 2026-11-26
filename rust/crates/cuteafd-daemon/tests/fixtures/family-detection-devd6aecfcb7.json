@@ -157,6 +157,11 @@
       "family": "glm5_flash"
     },
     {
+      "model": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1",
+      "revision": "1bca67feffab2747e0e489e571185bc06336ee26",
+      "family": "glm5_flash"
+    },
+    {
       "model": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
       "revision": "aedda90d25bd02bb6520bcaf88e06e6c9bc932c4",
       "family": "step5"
