@@ -32,7 +32,7 @@ use cuteafd_core::memory_layout::{arena_class, ArenaTag};
 use cuteafd_ffi::expert_usage::{ExpertUsage, UsageDevice, UsagePhase, UsageStorage};
 use cuteafd_ffi::peer_exchange::PeerPlane;
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
-use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, CuteafdHostBuffer, F32Add};
+use cuteafd_ffi::{Bf16Add, Bf16F32Add, CuteafdDeviceBuffer, CuteafdHostBuffer, F32Add};
 use cuteafd_loader::families::hy4_flash::engram::advance_tail;
 use cuteafd_loader::families::hy4_flash::execution::{
     context_chunk_rows, context_exchange_rows, hy4_context_buffers, hy4_dsa_partial_scratch_bytes, hy4_peer_ffn_routed_offset,
@@ -685,6 +685,7 @@ struct RankRuntime<'a> {
     waves: Vec<WaveScratch<'a>>,
     bf16_add: Bf16Add<'a>,
     f32_add: F32Add<'a>,
+    bf16_f32_add: Bf16F32Add<'a>,
     quantize_grid: Fp8QuantizeGrid,
     onboarded_experts: RefCell<Option<Exl3Tp2<'a>>>,
 }
@@ -1408,6 +1409,29 @@ impl<'a> RankRuntime<'a> {
         }
     }
 
+    /// Narrow just the wire partial, before native svh egress. The destination
+    /// is the existing final BF16 output view, reused after the exchange.
+    fn narrow_peer_partial(&self, rows: usize, width: usize, src: CuteafdDeviceBuffer,
+        dst: CuteafdDeviceBuffer) -> Result<()> {
+        // SAFETY: both buffers belong to this rank; the projection producer precedes
+        // this conversion, and the peer push precedes overwriting dst on this stream.
+        unsafe { self.device.library.cuda_f32_to_bf16_async(src, dst, rows * width, self.stream.raw) }
+    }
+
+    fn reduce_peer_bf16(&self, rank: usize, rows: usize, width: usize, stem: Option<&str>,
+        local_and_output: CuteafdDeviceBuffer, peer: *mut std::ffi::c_void) -> Result<()> {
+        let elems = rows * width;
+        let peer = CuteafdDeviceBuffer { ptr: peer, bytes: elems * 2, device_id: self.device.id, flags: 0 };
+        let (a, b) = if rank == 0 { (local_and_output, peer) } else { (peer, local_and_output) };
+        // SAFETY: the peer wait orders both partials; the F32 sum is disjoint from them.
+        unsafe { self.bf16_f32_add.launch(a, b, self.shared.delta_sum_f32.buffer, elems, self.stream.raw)?; }
+        if let Some(linear) = stem.and_then(|s| self.weights.native.get(s)) {
+            linear.egress(rows, self.shared.delta_sum_f32.buffer, local_and_output, self.stream.raw)
+        } else {
+            self.narrow_peer_partial(rows, width, self.shared.delta_sum_f32.buffer, local_and_output)
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn finish_deferred_ffn_local(
         &self,
@@ -1753,6 +1777,7 @@ impl<'a> Hy4Engine<'a> {
             }
             let bf16_add = device.run(|| device.library.bf16_add())?;
             let f32_add = device.run(|| device.library.f32_add())?;
+            let bf16_f32_add = device.run(|| device.library.bf16_f32_add())?;
             let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
             ranks.push(RankRuntime {
                 graphs: Hy4Graphs::new(),
@@ -1766,6 +1791,7 @@ impl<'a> Hy4Engine<'a> {
                 waves,
                 bf16_add,
                 f32_add,
+                bf16_f32_add,
                 quantize_grid,
                 onboarded_experts: RefCell::new(onboarded_experts[rank].take()),
             });
@@ -2451,6 +2477,42 @@ impl<'a> Hy4Engine<'a> {
         Ok(())
     }
 
+    /// Same TP2 FFN exchange, but prefill sends BF16 partials (the native F32
+    /// accumulator and post-reduction egress remain unchanged). Decode/verify
+    /// retain their existing graph-stable F32 receive planes.
+    fn exchange_ffn_prefill(&self, wave_slot: usize, rows: usize, is_dense: bool,
+        reduce_routed: bool, rank0_only: bool) -> Result<()> {
+        let exchange = self.peer_exchange()?;
+        let shared_bytes = rows * H * 2;
+        let routed_bytes = rows * LATENT_H * 2;
+        for (rank, r) in self.ranks.iter().enumerate() {
+            let (src, dst) = if is_dense { (r.shared.delta_f32.buffer, r.shared.delta.buffer) }
+                else { (r.waves[wave_slot].shared_f32.buffer, r.waves[wave_slot].shared_out.buffer) };
+            r.device.run(|| {
+                r.narrow_peer_partial(rows, H, src, dst)?;
+                if !is_dense && reduce_routed {
+                    r.narrow_peer_partial(rows, LATENT_H, routed_f32_input(r, rows, self.skip_routed_experts)?,
+                        r.shared.routed_latent.buffer)?;
+                }
+                Ok(())
+            })?;
+            if rank == 0 && rank0_only { continue; }
+            if is_dense || (!reduce_routed && rank == 1) {
+                exchange.push(rank, PEER_SLOT_FFN, dst.ptr, shared_bytes)?;
+            } else {
+                let recv = exchange.recv(1 - rank, PEER_SLOT_FFN)?;
+                let routed_dst = if reduce_routed { recv.wrapping_byte_add(self.ffn_routed_recv_offset) }
+                    else { self.ranks[1].shared.routed_latent.buffer.ptr };
+                self.peer_push_two_planes(rank, PEER_SLOT_FFN,
+                    (recv, dst.ptr, shared_bytes),
+                    (routed_dst, r.shared.routed_latent.buffer.ptr, routed_bytes))?;
+            }
+        }
+        exchange.wait(0, PEER_SLOT_FFN)?;
+        if !rank0_only { exchange.wait(1, PEER_SLOT_FFN)?; }
+        Ok(())
+    }
+
     /// Stage metadata, Engram lookups, and token embeddings for a multi-sequence unit.
     #[allow(clippy::too_many_arguments)]
     fn begin_batch(
@@ -2974,7 +3036,7 @@ impl<'a> Hy4Engine<'a> {
 
         let write_draft = i32::from(self.draft.as_ref().is_some_and(|d| d.captures_layer(layer)));
         let query_half_bytes = 16 * KV_A_DIM * 2;
-        let ctx_chunk = context_chunk_rows(self.max_rows, self.decode_rows, batch.decode_attention);
+        let ctx_chunk = context_chunk_rows(self.max_rows, self.decode_rows, batch.usage_phase == UsagePhase::Decode);
 
         // 3. Chunked ContextSplit exchange + dual partials + combine (1 pass on decode/verify,
         // otherwise one pass per admitted prefill tile; MLA internally uses 64-row scratch).
@@ -3747,23 +3809,28 @@ impl<'a> Hy4Engine<'a> {
             }
         }
         if gpus == 2 {
-            self.exchange_attn_tp2(rows)?;
-            let attn_recv = [
-                self.peer_exchange()?.recv(0, PEER_SLOT_ATTN)?,
-                self.peer_exchange()?.recv(1, PEER_SLOT_ATTN)?,
-            ];
+            let bf16_wire = batch.usage_phase == UsagePhase::Prefill;
+            let exchange = self.peer_exchange()?;
+            if bf16_wire {
+                for (rank, r) in self.ranks.iter().enumerate() {
+                    r.device.run(|| r.narrow_peer_partial(rows, H, r.shared.delta_f32.buffer, r.shared.delta.buffer))?;
+                    exchange.push(rank, PEER_SLOT_ATTN, r.shared.delta.buffer.ptr, rows * H * 2)?;
+                }
+                exchange.wait(0, PEER_SLOT_ATTN)?;
+                exchange.wait(1, PEER_SLOT_ATTN)?;
+            } else {
+                self.exchange_attn_tp2(rows)?;
+            }
+            let attn_recv = [exchange.recv(0, PEER_SLOT_ATTN)?, exchange.recv(1, PEER_SLOT_ATTN)?];
             let o_stem = format!("{p}.self_attn.o_proj");
             for (rank, r) in self.ranks.iter().enumerate() {
                 r.device.run(|| {
-                    r.reduce_f32_to_bf16_local(
-                        rank,
-                        rows,
-                        H,
-                        Some(&o_stem),
-                        r.shared.delta_f32.buffer,
-                        attn_recv[rank],
-                        r.shared.delta.buffer,
-                    )
+                    if bf16_wire {
+                        r.reduce_peer_bf16(rank, rows, H, Some(&o_stem), r.shared.delta.buffer, attn_recv[rank])
+                    } else {
+                        r.reduce_f32_to_bf16_local(rank, rows, H, Some(&o_stem), r.shared.delta_f32.buffer,
+                            attn_recv[rank], r.shared.delta.buffer)
+                    }
                 })?;
             }
         }
@@ -3873,7 +3940,10 @@ impl<'a> Hy4Engine<'a> {
         let wave_slot = batch.wave_slot;
         let rank0_only = batch.rank0_only_tail && layer == batch.final_layer;
 
-        if gpus == 2 {
+        let bf16_wire = gpus == 2 && batch.usage_phase == UsagePhase::Prefill;
+        if bf16_wire {
+            self.exchange_ffn_prefill(wave_slot, rows, is_dense, reduce_routed_tp2, rank0_only)?;
+        } else if gpus == 2 {
             self.exchange_ffn_tp2(wave_slot, rows, is_dense, reduce_routed_tp2, rank0_only)?;
         }
 
@@ -3909,6 +3979,21 @@ impl<'a> Hy4Engine<'a> {
                         })
                     },
                 )?;
+            } else if bf16_wire {
+                r.device.run(|| {
+                    let p = format!("model.layers.{layer}");
+                    if is_dense {
+                        r.reduce_peer_bf16(rank, rows, H, Some(&format!("{p}.mlp.down_proj")), r.shared.delta.buffer, recv_ptr)?;
+                    } else {
+                        if reduce_routed_tp2 {
+                            r.reduce_peer_bf16(rank, rows, LATENT_H, None, r.shared.routed_latent.buffer,
+                                recv_ptr.wrapping_byte_add(routed_off))?;
+                        }
+                        r.reduce_peer_bf16(rank, rows, H, Some(&format!("{p}.mlp.shared_experts.down_proj")),
+                            r.waves[wave_slot].shared_out.buffer, recv_ptr)?;
+                    }
+                    r.ffn_combine_post(&p, is_dense, wave_slot, rows, use_a)
+                })?;
             } else {
                 r.device.run(|| {
                     r.finish_deferred_ffn_local(
