@@ -446,8 +446,6 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
             },
         )?;
         *placement = next.into_iter().next().unwrap();
-        static FIRST_RECONCILE: std::sync::Once = std::sync::Once::new();
-        FIRST_RECONCILE.call_once(|| crate::shared::memory_report::reconcile::capture("first_request"));
         Ok(last)
     }
 
@@ -689,5 +687,51 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
     fn cancel(&self, _placement: &Hy4Placement) -> Result<()> {
         let _ = self.pending.borrow_mut().take();
         self.engine.borrow().drain()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_records_hy4_prefill_units_and_avoids_duplicate_first_request_reconciliation() -> Result<()> {
+        use crate::shared::prefill_pipeline::{FfnRoute, PrefillHooks, run_prefill_units};
+        use crate::shared::qwen::scheduler::observe_prefill;
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+
+        struct NoopHooks;
+        impl PrefillHooks for NoopHooks {
+            type Ticket = ();
+            fn route(&self, _: usize) -> FfnRoute { FfnRoute::Spark }
+            fn begin_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+            fn attention(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn local_ffn(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn send_experts(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn land_experts(&mut self, _: usize, _: &Unit, _: ()) -> Result<()> { Ok(()) }
+            fn end_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+            fn commit_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+        }
+
+        let seed = Some(Probe::new(ProbeSpec { record_rows: 1, ..ProbeSpec::default() }));
+        let ((), seed_units) = observe_prefill(|| {
+            let units = sequence_units(2752, 2752, 3, 2)?;
+            run_prefill_units(&mut NoopHooks, &units, 3)
+        })?;
+        probe::prefill_units(&seed, seed_units);
+        assert_eq!(seed.as_ref().unwrap().record().last_prefill_units, Some(2));
+
+        let warm = Some(Probe::new(ProbeSpec { record_rows: 1, ..ProbeSpec::default() }));
+        let ((), warm_units) = observe_prefill(|| {
+            let units = sequence_units(64, 2752, 3, 2)?;
+            run_prefill_units(&mut NoopHooks, &units, 3)
+        })?;
+        probe::prefill_units(&warm, warm_units);
+        assert_eq!(warm.as_ref().unwrap().record().last_prefill_units, Some(1));
+
+        let backend = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(!backend.contains("reconcile::capture(\"first_request\")"),
+            "Hy4 must rely on the shared scheduler's post-retirement first_request reconciliation");
+        Ok(())
     }
 }

@@ -471,6 +471,41 @@ pub(crate) fn prefill_schedule(routes: &[FfnRoute], units: &[Unit], waves: usize
     Ok(steps)
 }
 
+thread_local! {
+    static LAST_PREFILL_UNITS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Scoped observer for the unit count of the final [`run_prefill_units`] /
+/// [`run_prefill_units_async`] call executed on this thread while alive.
+pub(crate) struct PrefillUnitObserver {
+    previous: Option<usize>,
+}
+
+impl PrefillUnitObserver {
+    pub(crate) fn begin() -> Self {
+        Self { previous: LAST_PREFILL_UNITS.replace(None) }
+    }
+
+    pub(crate) fn finish(self) -> Option<usize> {
+        LAST_PREFILL_UNITS.get()
+    }
+}
+
+impl Drop for PrefillUnitObserver {
+    fn drop(&mut self) {
+        LAST_PREFILL_UNITS.set(self.previous);
+    }
+}
+
+/// Runs `body` and returns both its result and the unit count of the final
+/// [`run_prefill_units`] / [`run_prefill_units_async`] call executed on this
+/// thread inside `body`, if any.
+pub(crate) fn observe_prefill_units<T>(body: impl FnOnce() -> T) -> (T, Option<usize>) {
+    let observer = PrefillUnitObserver::begin();
+    let output = body();
+    (output, observer.finish())
+}
+
 // Expand only the hook calls' await syntax so both drivers use one step walk
 // and exactly the same ticket, admission, FIFO and error handling.
 macro_rules! drive_prefill_units {
@@ -478,6 +513,7 @@ macro_rules! drive_prefill_units {
         let layers = $units.iter().map(|unit| unit.layers.end).max().unwrap_or(0);
         let routes = (0..layers).map(|layer| $hooks.route(layer)).collect::<Vec<_>>();
         let steps = prefill_schedule(&routes, $units, $waves)?;
+        LAST_PREFILL_UNITS.set(Some($units.len()));
         let mut tickets: Vec<Option<(usize, H::Ticket)>> = (0..$units.len()).map(|_| None).collect();
         let mut outstanding = std::collections::VecDeque::new();
         let timed = tracing::enabled!(target: "cuteafd::prefill_hooks", tracing::Level::DEBUG);
@@ -1278,5 +1314,40 @@ mod tests {
             .expect("try_join did not propagate the lane error");
             assert_eq!(result, Err("encoder failed"));
         }
+    }
+
+    #[test]
+    fn observe_prefill_units_records_final_executed_unit_count_and_restores_outer_scope() -> anyhow::Result<()> {
+        struct Noop;
+        impl PrefillHooks for Noop {
+            type Ticket = ();
+            fn route(&self, _: usize) -> FfnRoute { FfnRoute::Spark }
+            fn begin_unit(&mut self, _: &Unit) -> anyhow::Result<()> { Ok(()) }
+            fn attention(&mut self, _: usize, _: &Unit) -> anyhow::Result<()> { Ok(()) }
+            fn local_ffn(&mut self, _: usize, _: &Unit) -> anyhow::Result<()> { Ok(()) }
+            fn send_experts(&mut self, _: usize, _: &Unit) -> anyhow::Result<()> { Ok(()) }
+            fn land_experts(&mut self, _: usize, _: &Unit, _: ()) -> anyhow::Result<()> { Ok(()) }
+            fn end_unit(&mut self, _: &Unit) -> anyhow::Result<()> { Ok(()) }
+            fn commit_unit(&mut self, _: &Unit) -> anyhow::Result<()> { Ok(()) }
+        }
+
+        let ((), none) = observe_prefill_units(|| ());
+        assert_eq!(none, None);
+
+        let (result, count) = observe_prefill_units(|| -> anyhow::Result<()> {
+            let seed = sequence_units(3 * 2752, 2752, 3, 2)?;
+            run_prefill_units(&mut Noop, &seed, 3)?;
+            // Nested observation restores outer state when it exits.
+            let (inner_res, inner_count) = observe_prefill_units(|| {
+                let short = sequence_units(64, 2752, 3, 2)?;
+                run_prefill_units(&mut Noop, &short, 3)
+            });
+            inner_res?;
+            assert_eq!(inner_count, Some(1));
+            Ok(())
+        });
+        result?;
+        assert_eq!(count, Some(3));
+        Ok(())
     }
 }

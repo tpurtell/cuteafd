@@ -1714,6 +1714,8 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
     let memory_before = first_prefill_sample(&first_prefill_seen, media_index != 0, prefill_memory_sample);
     let (result, phases) = isolated_phases(&engine.profile, || -> Result<()> {
         let start = p.placement.len;
+        let decode = cold_replay_decode(&p.job.probe, p.chunks);
+        let units = crate::shared::prefill_pipeline::PrefillUnitObserver::begin();
         let logits = if cold_replay_decode(&p.job.probe, p.chunks) {
             // Text replay must use serving's captured/fused decode, not eager scoring arithmetic.
             if p.media.spans().is_empty() {
@@ -1724,11 +1726,15 @@ fn prefill_chunk<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
         } else {
             engine.prefill_draft_chunk(&mut p.placement, chunk, Some(&p.media), draft_end)?
         };
+        let units = (!decode).then(|| units.finish().unwrap_or(1));
         if end == p.tokens.len() {
             // The first token, while this prompt's logits are the workspace's.
             let logits = logits.context("prefill produced no logits")?;
             if caching && !probe::cold(&p.job.probe) && p.resume < p.tokens.len() {
                 p.prompt_row = Some(logits.row_host(library, 0)?);
+            }
+            if let Some(units) = units {
+                probe::prefill_units(&p.job.probe, units);
             }
             if probe::wants_first(&p.job.probe) {
                 probe::device_rows(library, &p.job.probe, &logits, 0, 1, p.tokens.len())?;
@@ -1842,28 +1848,35 @@ fn prefill_group<'a>(cx: &PrefillCx<'_, '_, 'a>, selector: &mut TokenSelector<'_
             sequences.push((placement, &tokens[*done..end]));
             firsts.push((&*job, constraint, first, prompt_row, *resume, len, end));
         }
-        let (segments, outcomes) = engine.prefill_packed_draft_ends(&mut sequences, &draft_ends, &mut |i, logits| {
-            let (job, constraint, first, prompt_row, resume, len, end) = &mut firsts[i];
-            if *end < *len {
-                return Ok(Ok(()));
-            }
-            // The first token, while this prompt's logits are the workspace's. The device work
-            // (the row download, the selection) is the pass's: its failure fails every member.
-            // The prompt's probe, grammar mask and token are its own: they fail it alone.
-            if cx.caching && !probe::cold(&job.probe) && *resume < *len {
-                **prompt_row = Some(logits.row_host(cx.library, 0)?);
-            }
-            if probe::wants_first(&job.probe) {
-                probe::device_rows(cx.library, &job.probe, &logits, 0, 1, *len)?;
-            }
-            let mut batch = SelectBatch::default();
-            if let Err(error) = batch.push_next(job.sampling, constraint.as_mut(), *end as u64) {
-                return Ok(Err(error));
-            }
-            let selected = selector.select(&logits, &batch)?;
-            Ok(take(constraint.as_mut(), &selected[0]).map(|token| **first = Some(token)))
+        let ((segments, outcomes), units) = crate::shared::qwen::scheduler::observe_prefill(|| {
+            engine.prefill_packed_draft_ends(&mut sequences, &draft_ends, &mut |i, logits| {
+                let (job, constraint, first, prompt_row, resume, len, end) = &mut firsts[i];
+                if *end < *len {
+                    return Ok(Ok(()));
+                }
+                // The first token, while this prompt's logits are the workspace's. The device work
+                // (the row download, the selection) is the pass's: its failure fails every member.
+                // The prompt's probe, grammar mask and token are its own: they fail it alone.
+                if cx.caching && !probe::cold(&job.probe) && *resume < *len {
+                    **prompt_row = Some(logits.row_host(cx.library, 0)?);
+                }
+                if probe::wants_first(&job.probe) {
+                    probe::device_rows(cx.library, &job.probe, &logits, 0, 1, *len)?;
+                }
+                let mut batch = SelectBatch::default();
+                if let Err(error) = batch.push_next(job.sampling, constraint.as_mut(), *end as u64) {
+                    return Ok(Err(error));
+                }
+                let selected = selector.select(&logits, &batch)?;
+                Ok(take(constraint.as_mut(), &selected[0]).map(|token| **first = Some(token)))
+            })
         })?;
         drop((sequences, firsts));
+        for ((p, &end), outcome) in group.iter().zip(&ends).zip(&outcomes) {
+            if outcome.is_ok() && end == p.tokens.len() {
+                probe::prefill_units(&p.job.probe, units);
+            }
+        }
         // Each healthy prompt's tapped tail becomes its drafter context before the next step (a
         // failed prompt's slot is released with its placement).
         if let Some(drafter) = engine.drafter.as_ref() {
@@ -2262,5 +2275,56 @@ mod verify_rows_tests {
         let (committed, error) = accept_rows(&[4, 5, 6],
             |j| if j == 1 { anyhow::bail!("grammar") } else { Ok((5, false)) });
         assert_eq!((committed, error.unwrap_err().to_string()), (2, "grammar".to_string()));
+    }
+
+    #[test]
+    fn prefill_probe_records_last_prefill_units_for_multi_unit_seed_and_short_continuation() -> Result<()> {
+        use crate::shared::prefill_pipeline::{FfnRoute, PrefillHooks, Unit, prefill_units, run_prefill_units};
+        use crate::shared::qwen::scheduler::observe_prefill;
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+
+        struct NoopHooks;
+        impl PrefillHooks for NoopHooks {
+            type Ticket = ();
+            fn route(&self, _: usize) -> FfnRoute { FfnRoute::Spark }
+            fn begin_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+            fn attention(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn local_ffn(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn send_experts(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn land_experts(&mut self, _: usize, _: &Unit, _: ()) -> Result<()> { Ok(()) }
+            fn end_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+            fn commit_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+        }
+
+        let run_glmf_units = |tokens: usize, unit_rows: usize, waves: usize| -> Result<usize> {
+            let ((), count) = observe_prefill(|| {
+                let units = prefill_units(tokens, unit_rows, waves, 256)?
+                    .into_iter().enumerate().map(|(index, rows)| Unit {
+                        index, sequence: 0, segments: Vec::new(), rows, layers: 0..2, slot: index % waves, barrier: false,
+                    }).collect::<Vec<_>>();
+                run_prefill_units(&mut NoopHooks, &units, waves)
+            })?;
+            Ok(count)
+        };
+
+        let seed = Some(Probe::new(ProbeSpec { record_rows: 1, ..ProbeSpec::default() }));
+        crate::shared::probe::prefill_units(&seed, run_glmf_units(3 * 2752, 2752, 3)?);
+        assert_eq!(seed.as_ref().unwrap().record().last_prefill_units, Some(3));
+
+        let warm = Some(Probe::new(ProbeSpec { record_rows: 1, ..ProbeSpec::default() }));
+        crate::shared::probe::prefill_units(&warm, run_glmf_units(64, 2752, 3)?);
+        assert_eq!(warm.as_ref().unwrap().record().last_prefill_units, Some(1));
+
+        let packed = Some(Probe::new(ProbeSpec { record_rows: 1, ..ProbeSpec::default() }));
+        let ((), packed_units) = observe_prefill(|| Ok(()))?;
+        crate::shared::probe::prefill_units(&packed, packed_units);
+        assert_eq!(packed.as_ref().unwrap().record().last_prefill_units, Some(1));
+
+        let source = include_str!("serve.rs").split_once("\nfn prefill_chunk").unwrap().1
+            .split_once("\n#[cfg(test)]").unwrap().0;
+        assert!(source.contains("PrefillUnitObserver::begin()"));
+        assert!(source.contains("observe_prefill(|| {\n            engine.prefill_packed_draft_ends("));
+        assert_eq!(source.matches("probe::prefill_units(&p.job.probe, units)").count(), 2);
+        Ok(())
     }
 }
