@@ -971,7 +971,8 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         shutil.copytree(checkpoint_source, staged, dirs_exist_ok=True, copy_function=os.link)
     if family_config.get("model_type") == "glm_moe_dsa" and not (hf / "hub/models--incoai--GLM-5.3-DFlash2").exists():
         _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
-    if family_config.get("model_type") == "inkling2_loop":
+    if family_config.get("model_type") == "inkling2_loop" and not (
+            hf / "hub/models--incoai--Inkling-2-Mini-DFlash2").exists():
         _snapshot(hf, "incoai/Inkling-2-Mini-DFlash2", {"architectures": ["DFlash2DraftModel"]},
                   "4f9088ea66c21f2b99ed657d1941c306b03e84d2")
     if family_config.get("model_type") == "muse_spark" and not (
@@ -1450,7 +1451,7 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     hub.mkdir(parents=True)
     for model in (config.get("SPECULATOR_MODEL_ID"), "incoai/GLM-5.3-Flash-DFlash2",
                   "incoai/GLM-5.3-DFlash2", "nvidia/Muse-Spark-Open-816B-A42B-DFlash2",
-                  "Inferact/Kimi-K3.1-Pro-DSpark"):
+                  "Inferact/Kimi-K3.1-Pro-DSpark", "incoai/Inkling-2-Mini-DFlash2"):
         if model:
             cache = "models--" + model.replace("/", "--")
             source = hf_home / "hub" / cache
