@@ -401,7 +401,7 @@ mod tests {
                     assert!(row.cap_bytes > 0);
                 }
             }
-            let mark_bytes = live.cache.ranks.iter().map(|r| r.bytes).sum::<u64>();
+            let mark_bytes = live.cache.ranks.iter().map(|r| r.mark_bytes).sum::<u64>();
             let expected_slots = if entries == 0 { 0 } else if host != Some(0) { 2 } else {
                 cuteafd_core::prefix::mark_slots_for(16, entries, mark_bytes, opts.mimo_prefix_mark_bytes) as usize
             };

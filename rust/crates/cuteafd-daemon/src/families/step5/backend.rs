@@ -319,9 +319,9 @@ impl<'e, 'a> Step5Backend<'e, 'a> {
             state.push(read(cache.mark_view(slot as u32)?)?);
             for (logical, &physical) in placement.pages.iter().take(placement.committed.div_ceil(64)).enumerate() {
                 let rows = (placement.committed - logical * 64).min(64);
-                for plane in cache.page_views(physical)? {
+                for (plane, visible) in cache.page_parts(physical, rows as u64)? {
                     let mut bytes = read(plane)?;
-                    bytes.truncate(bytes.len() / 64 * rows);
+                    bytes.truncate(visible);
                     state.push(bytes);
                 }
             }

@@ -94,7 +94,7 @@ impl<'e, 'a, T> Step5Prefix<'e, 'a, T> {
             let geometry = &shape.geometry.ranks[rank];
             page_bytes = page_bytes.checked_add(usize::try_from(geometry.persistent_unit_bytes)?)
                 .ok_or_else(|| anyhow::anyhow!("Step-5 page size overflow"))?;
-            mark_bytes = mark_bytes.checked_add(usize::try_from(shape.ranks[rank].bytes)?)
+            mark_bytes = mark_bytes.checked_add(usize::try_from(shape.ranks[rank].mark_bytes)?)
                 .ok_or_else(|| anyhow::anyhow!("Step-5 mark size overflow"))?;
         }
         ensure!(pages <= u32::MAX as u64 && slots <= u32::MAX as u64,
@@ -129,6 +129,7 @@ impl<'e, 'a, T> Step5Prefix<'e, 'a, T> {
         }
         for owner in &self.ranks {
             owner.borrow().restore_retained(placement.sequence, u64::from(slot.0), len as u64)?;
+            owner.borrow().restore_summaries(placement.sequence, &placement.pages, len as u64)?;
         }
         placement.committed = len;
         Ok(())
@@ -141,8 +142,8 @@ impl<T> PrefixFamily<Frontier> for Step5Prefix<'_, '_, T> {
     fn layout(&self) -> FamilyLayout { self.layout }
     fn record_format(&self) -> &'static str {
         match self.kv_format {
-            cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16 => "step5_bf16_csa64_dense_e4m3_marks_v1",
-            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 => "step5_fp8_head_scales_csa64_dense_e4m3_marks_v1",
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Bf16 => "step5_bf16_csa64_paged_e4m3_marks_v2",
+            cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8 => "step5_fp8_head_scales_csa64_paged_e4m3_marks_v2",
         }
     }
     fn pages<'p>(&self, placement: &'p Placement) -> &'p [u32] { &placement.pages }
@@ -196,6 +197,7 @@ impl<T> PrefixFamily<Frontier> for Step5Prefix<'_, '_, T> {
         // restore_with and the entry's self-describing frontier instead.
         for owner in &self.ranks {
             owner.borrow_mut().restore(placement.sequence, u64::from(slot.0), len as u64)?;
+            owner.borrow().restore_summaries(placement.sequence, &placement.pages, len as u64)?;
         }
         placement.committed = len;
         Ok(())
@@ -239,8 +241,8 @@ impl<T> PrefixFamily<Frontier> for Step5Prefix<'_, '_, T> {
     }
 
     fn page_segments(&self, page: u32) -> Vec<DeviceRange> {
-        self.ranks.iter().flat_map(|owner| owner.borrow().page_views(page)
-            .expect("shared prefix pool passed an invalid Step-5 page").into_iter().map(range)).collect()
+        self.ranks.iter().flat_map(|owner| owner.borrow().page_parts(page, 64)
+            .expect("shared prefix pool passed an invalid Step-5 page").into_iter().map(|(buffer, _)| range(buffer))).collect()
     }
 
     fn mark_segments(&self, slot: MarkSlot) -> Vec<DeviceRange> {
@@ -450,7 +452,7 @@ mod tests {
                         stage += 1;
                         (span, value)
                     })) {
-                    let at = span.offset as usize;
+                    let at = state.mark_component(span)?.offset as usize;
                     bytes[at..at + 8].copy_from_slice(&value.to_le_bytes());
                     counters.push((rank, span, value));
                 }
@@ -470,7 +472,7 @@ mod tests {
             for &(rank, span, value) in &counters {
                 let mark = ranks[rank].borrow().mark_view(0)?;
                 let encoded = cuteafd_ffi::CuteafdDeviceBuffer { ptr: mark.ptr
-                    .wrapping_byte_add(span.offset as usize), bytes: 8, ..mark };
+                    .wrapping_byte_add(shape.ranks[rank].mark_component(span)?.offset as usize), bytes: 8, ..mark };
                 device.run(|| library.copy_h2d(encoded, &(value - 1).to_le_bytes()))?;
                 assert!(family.restore_with(Some(&Mark::Slot(MarkSlot(0))), Some(&saved),
                     &mut destination, &plan, &context).is_err());
@@ -541,6 +543,11 @@ mod tests {
             }
         }
         for plane in owner.borrow().page_views(tail)? { set(plane, 0x29)?; }
+        for &page in &[first, tail] {
+            for (plane, _) in owner.borrow().page_parts(page, 64)?.into_iter().skip(shape.ranks[0].regions.len() * 2) {
+                set(plane, 0x39)?;
+            }
+        }
         let spans = shape.snapshot_spans(0, 65, &[0; 3])?;
         let components = |span: &cuteafd_loader::serving_capacity::step5::ByteSpan| {
             let state = &shape.ranks[0];
@@ -621,6 +628,13 @@ mod tests {
             } else {
                 assert!(retained.iter().all(|b| *b == 0x39));
             }
+        }
+        for region in &shape.ranks[0].regions {
+            let span = region.summaries.unwrap();
+            let plane = owner.borrow().request_component(span, 1)?;
+            let mut bytes = vec![0; plane.bytes];
+            device.run(|| library.copy_d2h(&mut bytes, plane))?;
+            assert!(bytes[..8 * 256].iter().all(|b| *b == 0x39));
         }
         assert!(owner.borrow().page_views(8).is_err());
         assert!(owner.borrow().copy_page_rows(0, 1, 65).is_err());

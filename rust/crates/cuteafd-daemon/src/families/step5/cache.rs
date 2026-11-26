@@ -2,7 +2,7 @@
 use crate::shared::memory::{device::{Allocation, Device, Event, Stream}, Tag};
 use anyhow::{ensure, Context, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer;
-use cuteafd_loader::serving_capacity::step5::{ByteSpan, Step5CacheLayout};
+use cuteafd_loader::serving_capacity::step5::{summary_prefix_bytes, ByteSpan, Step5CacheLayout, PAGE_ROWS, PROXY_DIM, REGION_ROWS, SUMMARY_PAGE_BYTES};
 use std::{cell::{Cell, RefCell}, rc::{Rc, Weak}};
 
 pub(super) use cuteafd_loader::plan::families::step5::admission::Reservation;
@@ -188,13 +188,92 @@ impl<'a> CacheRank<'a> {
         let bytes = regions[at].page_bytes.checked_mul(self.page_count)
             .context("Step-5 CSA plane overflow")?;
         let offset = regions[..at].iter().try_fold(0u64, |sum, r|
-            sum.checked_add(r.page_bytes.checked_mul(2)?.checked_mul(self.page_count)?))
+            sum.checked_add(r.persistent_page_bytes().checked_mul(self.page_count)?))
             .context("Step-5 CSA plane offset overflow")?;
         let pool = self.pages.as_ref().context("Step-5 rank has no CSA storage")?.buffer;
         Ok((view(pool, ByteSpan { offset, bytes })?,
             view(pool, ByteSpan { offset: offset.checked_add(bytes).context("Step-5 V plane overflow")?, bytes })?))
     }
 
+    /// Each complete region is immutable once its eight token rows commit.
+    /// Its persistent backing follows the same page id and COW as CSA K/V.
+    pub(super) fn summary_plane(&self, layer: usize) -> Result<Option<CuteafdDeviceBuffer>> {
+        let regions = &self.layout.ranks[self.rank].regions;
+        let region = regions.iter().find(|r| r.layer == layer).context("Step-5 layer is not CSA")?;
+        if region.summaries.is_none() { return Ok(None); }
+        let (_, value) = self.csa_planes(layer)?;
+        let pool = self.page_pool();
+        let offset = (value.ptr as usize).checked_sub(pool.ptr as usize)
+            .and_then(|at| at.checked_add(value.bytes)).context("Step-5 summary plane offset")?;
+        Ok(Some(view(pool, ByteSpan { offset: offset as u64,
+            bytes: SUMMARY_PAGE_BYTES.checked_mul(self.page_count).context("Step-5 summary plane extent")? })?))
+    }
+
+    /// Copy whole-region runs between dense kernel state and page-indexed retention.
+    /// The caller orders this on the producing stream, or on the maintenance fence.
+    pub(super) fn summary_runs(&self, layer: usize, sequence: u64, pages: &[u32],
+        start: u64, end: u64) -> Result<Vec<(CuteafdDeviceBuffer, CuteafdDeviceBuffer)>> {
+        let region = self.layout.ranks[self.rank].regions.iter().find(|r| r.layer == layer)
+            .context("Step-5 layer is not CSA")?;
+        let Some(span) = region.summaries else { return Ok(Vec::new()); };
+        ensure!(start <= end && end <= self.layout.context.div_ceil(REGION_ROWS), "Step-5 summary extent");
+        let dense = self.request_component(span, sequence)?;
+        let pool = self.summary_plane(layer)?.context("Step-5 summary pool missing")?;
+        let mut runs = Vec::new();
+        let per_page = PAGE_ROWS / REGION_ROWS;
+        let mut at = start;
+        while at < end {
+            let page = u64::from(*pages.get((at / per_page) as usize).context("Step-5 summary page missing")?);
+            ensure!(page < self.page_count, "Step-5 summary page outside pool");
+            let mut count = (per_page - at % per_page).min(end - at);
+            // Coalesce consecutive physical pages; the common restore path is a
+            // contiguous run, not one launch per region page.
+            while at + count < end && (at + count) % per_page == 0 {
+                let next = (at + count) / per_page;
+                let expected = page + (next - at / per_page);
+                if expected >= self.page_count || pages.get(next as usize).map(|&p| u64::from(p)) != Some(expected) {
+                    break;
+                }
+                count += per_page.min(end - at - count);
+            }
+            let bytes = count * PROXY_DIM;
+            runs.push((view(dense, ByteSpan { offset: at * PROXY_DIM, bytes })?,
+                view(pool, ByteSpan { offset: page * SUMMARY_PAGE_BYTES + at % per_page * PROXY_DIM, bytes })?));
+            at += count;
+        }
+        Ok(runs)
+    }
+
+    pub(super) fn restore_summaries(&self, sequence: u64, pages: &[u32], frontier: u64) -> Result<()> {
+        self.check_idle(sequence)?;
+        let mut guard = self.stream.cancellation_guard("Step-5 summary restore");
+        self.ordered(|| {
+            for region in &self.layout.ranks[self.rank].regions {
+                for (dense, page) in self.summary_runs(region.layer, sequence, pages, 0, frontier / REGION_ROWS)? {
+                    self.copy(dense, page)?;
+                }
+            }
+            Ok(())
+        })?;
+        guard.complete = true;
+        Ok(())
+    }
+
+    /// Page ranges and the number of bytes of each range visible at `rows`.
+    pub(super) fn page_parts(&self, page: u32, rows: u64) -> Result<Vec<(CuteafdDeviceBuffer, usize)>> {
+        ensure!(rows <= PAGE_ROWS, "Step-5 CSA page row extent");
+        let mut result = self.page_views(page)?.into_iter().map(|plane|
+            (plane, plane.bytes / PAGE_ROWS as usize * rows as usize)).collect::<Vec<_>>();
+        for region in &self.layout.ranks[self.rank].regions {
+            if let Some(plane) = self.summary_plane(region.layer)? {
+                let part = view(plane, ByteSpan { offset: u64::from(page) * SUMMARY_PAGE_BYTES, bytes: SUMMARY_PAGE_BYTES })?;
+                result.push((part, summary_prefix_bytes(rows) as usize));
+            }
+        }
+        Ok(result)
+    }
+
+    /// K/V planes only, for the native attention ABI and diagnostic callers.
     pub fn page_views(&self, page: u32) -> Result<Vec<CuteafdDeviceBuffer>> {
         ensure!(u64::from(page) < self.page_count(), "Step-5 CSA page outside pool");
         let mut result = Vec::new();
@@ -210,7 +289,7 @@ impl<'a> CacheRank<'a> {
 
     pub fn mark_view(&self, slot: u32) -> Result<CuteafdDeviceBuffer> {
         ensure!(u64::from(slot) < self.slots, "Step-5 mark outside arena");
-        let bytes = self.layout.ranks[self.rank].bytes;
+        let bytes = self.layout.ranks[self.rank].mark_bytes;
         view(self.marks.as_ref().context("Step-5 prefix retention is disabled")?.buffer,
             ByteSpan { offset: u64::from(slot).checked_mul(bytes).context("Step-5 mark offset overflow")?, bytes })
     }
@@ -219,12 +298,11 @@ impl<'a> CacheRank<'a> {
         ensure!(rows <= cuteafd_loader::serving_capacity::step5::PAGE_ROWS as usize,
             "Step-5 CSA tail longer than a page");
         ensure!(from != to, "Step-5 CSA COW requires distinct pages");
-        let source = self.page_views(from)?;
-        let target = self.page_views(to)?;
+        let source = self.page_parts(from, rows as u64)?;
+        let target = self.page_parts(to, rows as u64)?;
         let mut guard = self.stream.cancellation_guard("Step-5 CSA tail copy");
         self.ordered(|| {
-            for (source, target) in source.into_iter().zip(target) {
-                let bytes = source.bytes / 64 * rows;
+            for ((source, bytes), (target, _)) in source.into_iter().zip(target) {
                 if bytes > 0 {
                     self.copy(view(target, ByteSpan { offset: 0, bytes: bytes as u64 })?,
                         view(source, ByteSpan { offset: 0, bytes: bytes as u64 })?)?;
@@ -293,7 +371,7 @@ impl<'a> CacheRank<'a> {
         let mark = slot.map(|slot| self.mark_view(u32::try_from(slot)?)).transpose()?;
         self.layout.ranks[self.rank].mtp_lengths.iter().map(|&span| {
             ensure!(span.bytes == 8, "Step-5 predictor frontier width");
-            let source = if let Some(mark) = mark { view(mark, span)? }
+            let source = if let Some(mark) = mark { view(mark, self.layout.ranks[self.rank].mark_component(span)?)? }
                 else { self.request_component(span, sequence)? };
             let mut encoded = [0; 8];
             self.stream.device.run(|| self.stream.device.library.copy_d2h(&mut encoded, source))?;
@@ -339,7 +417,7 @@ impl<'a> CacheRank<'a> {
         self.ordered(|| {
             self.stream.device.run(|| {
                 // SAFETY: this owned slot is unpublished until the cache drains.
-                // Host snapshots store the full slot, including unused summary capacity.
+                // Deterministic padding and unused short-window rows in this compact mark.
                 unsafe { self.stream.device.library.cuda_zero_bytes_async(mark, mark.bytes, self.stream.raw) }
             })?;
             for copy in copies {
@@ -376,7 +454,8 @@ impl<'a> CacheRank<'a> {
         let stages = self.predictor_frontiers(sequence, Some(slot))?;
         self.snapshot_copies(sequence, slot, frontier, &stages)?;
         let mark = self.mark_view(u32::try_from(slot)?)?;
-        let length = self.layout.ranks[self.rank].length;
+        let state = &self.layout.ranks[self.rank];
+        let length = state.mark_component(state.length)?;
         ensure!(length.bytes == 8, "Step-5 canonical mark length width");
         let source = view(mark, length)?;
         let mut encoded = [0; 8];
@@ -522,9 +601,10 @@ pub(super) mod tests {
         let layout = layout();
         let state = layout.ranks[0].bytes as usize;
         let page = layout.geometry.ranks[0].persistent_unit_bytes as usize;
-        let expected = state * 3 + state * 34 + page * 2;
+        let marks = layout.ranks[0].mark_bytes as usize;
+        let expected = state * 3 + marks * 34 + page * 2;
         let r = Reservation::new(&layout, 0, 3, 34, 2, expected).unwrap();
-        assert_eq!(r, Reservation { active: state * 3, marks: state * 34, pages: page * 2, total: expected });
+        assert_eq!(r, Reservation { active: state * 3, marks: marks * 34, pages: page * 2, total: expected });
         assert!(Reservation::new(&layout, 0, 3, 34, 2, expected - 1).is_err());
         assert!(Reservation::new(&layout, 1, 3, 34, 2, usize::MAX).is_err());
         assert!(Reservation::new(&layout, 0, u64::MAX, 34, 2, usize::MAX).is_err());
@@ -541,9 +621,9 @@ pub(super) mod tests {
         layout.ranks[1].regions.clear();
         layout.geometry.ranks[1].persistent_unit_bytes = 0;
         let state = layout.ranks[1].bytes as usize;
-        let reservation = Reservation::new(&layout, 1, 3, 2, 16, state * 5).unwrap();
+        let reservation = Reservation::new(&layout, 1, 3, 2, 16, state * 3 + layout.ranks[1].mark_bytes as usize * 2).unwrap();
         assert_eq!(reservation.pages, 0);
-        assert_eq!(reservation.total, state * 5);
+        assert_eq!(reservation.total, state * 3 + layout.ranks[1].mark_bytes as usize * 2);
         layout.geometry.ranks[1].persistent_unit_bytes = 1;
         assert!(Reservation::new(&layout, 1, 3, 2, 16, usize::MAX).is_err());
     }
@@ -591,7 +671,7 @@ pub(super) mod tests {
         for (i, copy) in restored.iter().enumerate() {
             let at = copy.active.offset as usize;
             let predictor_length = layout.ranks[0].mtp_lengths.iter().position(|s|
-                copy.mark.offset == s.offset).map(|stage| stages[stage].to_le_bytes());
+                copy.mark.offset == layout.ranks[0].mark_component(*s).unwrap().offset).map(|stage| stages[stage].to_le_bytes());
             for n in 0..copy.active.bytes as usize {
                 expected[at + n] = if let Some(length) = predictor_length { length[n] } else { (n.wrapping_mul(37) + i) as u8 };
             }

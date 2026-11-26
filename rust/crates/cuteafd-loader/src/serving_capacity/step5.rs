@@ -7,6 +7,14 @@ use crate::{families::qwen4::Qwen4KvCache, plan::families::step5::Config};
 pub const PAGE_ROWS: u64 = 64;
 pub const REGION_ROWS: u64 = 8;
 pub const PROXY_DIM: u64 = 256;
+pub const SUMMARY_PAGE_BYTES: u64 = PAGE_ROWS / REGION_ROWS * PROXY_DIM;
+
+/// Bytes of completed summaries in the first `rows` token rows of a page.
+/// The unfinished region is represented by the committed BF16 pending bank.
+pub fn summary_prefix_bytes(rows: u64) -> u64 {
+    debug_assert!(rows <= PAGE_ROWS);
+    rows / REGION_ROWS * PROXY_DIM
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ByteSpan {
@@ -45,9 +53,19 @@ pub struct RegionState {
     pub summaries: Option<ByteSpan>,
 }
 
-/// Component offsets in one mark slot. Active storage is component-major:
-/// component.offset * sequences, followed by contiguous request-sized records.
-/// Marks are slot-major, so snapshot copies use explicit source/destination offsets.
+impl RegionState {
+    pub fn summary_page_bytes(&self) -> u64 {
+        if self.summaries.is_some() { SUMMARY_PAGE_BYTES } else { 0 }
+    }
+
+    pub fn persistent_page_bytes(&self) -> u64 {
+        2 * self.page_bytes + self.summary_page_bytes()
+    }
+}
+
+/// Active storage is component-major: component.offset * sequences, followed
+/// by contiguous request-sized records. Marks are slot-major, with independent
+/// offsets for canonical committed windows (no proposal slack or CSA summaries).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RankState {
     pub sliding: Vec<SlidingState>,
@@ -60,6 +78,8 @@ pub struct RankState {
     /// Each predictor's own F32 residual history, never target-hidden aliases.
     pub mtp_stage_hidden: Vec<ByteSpan>,
     pub bytes: u64,
+    pub mark_bytes: u64,
+    mark_components: Vec<(ByteSpan, ByteSpan)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +134,20 @@ impl RankState {
             .map(|end| end & !255)
             .ok_or(CacheGeometryError::Overflow("Step-5 sequence state"))?;
         Ok(span)
+    }
+
+    fn reserve_mark(&mut self, active: ByteSpan, bytes: u64) -> Result<(), CacheGeometryError> {
+        let mark = ByteSpan { offset: self.mark_bytes, bytes };
+        self.mark_bytes = self.mark_bytes.checked_add(bytes).and_then(|end| end.checked_add(255))
+            .map(|end| end & !255)
+            .ok_or(CacheGeometryError::Overflow("Step-5 canonical mark"))?;
+        self.mark_components.push((active, mark));
+        Ok(())
+    }
+
+    pub fn mark_component(&self, active: ByteSpan) -> Result<ByteSpan, CacheGeometryError> {
+        self.mark_components.iter().find_map(|&(component, mark)| (component == active).then_some(mark))
+            .ok_or_else(|| invalid("component is not positional mark state"))
     }
 
     fn ring(&mut self, layer: usize, mtp: bool, query_heads: usize, bytes: u64) -> Result<(), CacheGeometryError> {
@@ -185,7 +219,7 @@ impl Step5CacheLayout {
                 length: ByteSpan { offset: 0, bytes: 0 },
                 next_length: ByteSpan { offset: 0, bytes: 0 },
                 mtp_lengths: Vec::new(), mtp_hidden: None,
-                mtp_stage_hidden: Vec::new(), bytes: 0,
+                mtp_stage_hidden: Vec::new(), bytes: 0, mark_bytes: 0, mark_components: Vec::new(),
             };
             state.length = state.reserve(8)?;
             state.next_length = state.reserve(8)?;
@@ -199,8 +233,6 @@ impl Step5CacheLayout {
                 let record = kv_format.plane_record_bytes(groups, cfg.dim) as u64;
                 if cfg.full[layer] {
                     let plane = mul(&[PAGE_ROWS, record])?;
-                    page_bytes = page_bytes.checked_add(mul(&[plane, 2])?)
-                        .ok_or(CacheGeometryError::Overflow("Step-5 page layers"))?;
                     let pending_key = state.reserve(REGION_ROWS * PROXY_DIM * 2)?;
                     let pending_z = state.reserve(REGION_ROWS * PROXY_DIM * 2)?;
                     let next_key = state.reserve(REGION_ROWS * PROXY_DIM * 2)?;
@@ -208,8 +240,11 @@ impl Step5CacheLayout {
                     let summaries = if ownership.is_some() || rank == 0 {
                         Some(state.reserve(mul(&[capacity, PROXY_DIM])?)?)
                     } else { None };
-                    state.regions.push(RegionState { layer, query_heads: heads, page_bytes: plane,
-                        pending_key, pending_z, next_key, next_z, summaries });
+                    let region = RegionState { layer, query_heads: heads, page_bytes: plane,
+                        pending_key, pending_z, next_key, next_z, summaries };
+                    page_bytes = page_bytes.checked_add(region.persistent_page_bytes())
+                        .ok_or(CacheGeometryError::Overflow("Step-5 page layers"))?;
+                    state.regions.push(region);
                 } else {
                     state.ring(layer, false, heads, mul(&[ring.rows, record])?)?;
                 }
@@ -225,10 +260,32 @@ impl Step5CacheLayout {
                 }
                 state.mtp_hidden = Some(state.reserve(mul(&[mtp_hidden_rows, cfg.hidden as u64, 2])?)?);
             }
+            // Fixed mark slots retain only the committed positional state. The
+            // context-scaled complete regions belong to the shared CSA pages.
+            state.reserve_mark(state.length, state.length.bytes)?;
+            for component in state.mtp_lengths.clone() {
+                state.reserve_mark(component, component.bytes)?;
+            }
+            for sliding in state.sliding.clone() {
+                let layout = if sliding.mtp { mtp_ring } else { ring };
+                for component in [sliding.key, sliding.value] {
+                    state.reserve_mark(component, mul(&[component.bytes / layout.rows, layout.window])?)?;
+                }
+            }
+            for region in state.regions.clone() {
+                for component in [region.pending_key, region.pending_z] {
+                    state.reserve_mark(component, component.bytes)?;
+                }
+            }
+            if let Some(history) = mtp_history {
+                for component in state.mtp_hidden.into_iter().chain(state.mtp_stage_hidden.clone()) {
+                    state.reserve_mark(component, mul(&[component.bytes / history.rows, history.window])?)?;
+                }
+            }
             costs.push(RankCacheGeometry {
                 persistent_unit_bytes: page_bytes,
                 active_state_per_sequence_bytes: state.bytes,
-                retained_mark_bytes: state.bytes,
+                retained_mark_bytes: state.mark_bytes,
                 // Staged proposals belong to the actual lane workspace, not committed state.
                 ..Default::default()
             });
@@ -300,10 +357,6 @@ impl Step5CacheLayout {
             for component in [region.pending_key, region.pending_z] {
                 parts.push((component, 0, 0, component.bytes));
             }
-            if let Some(summary) = region.summaries {
-                let bytes = mul(&[frontier / REGION_ROWS, PROXY_DIM])?;
-                if bytes > 0 { parts.push((summary, 0, 0, bytes)); }
-            }
         }
         for &component in &state.mtp_lengths {
             parts.push((component, 0, 0, component.bytes));
@@ -330,12 +383,16 @@ impl Step5CacheLayout {
         }
         let state = self.ranks.get(rank).ok_or_else(|| invalid("snapshot rank"))?;
         let total_active = mul(&[state.bytes, sequences])?;
-        let total_marks = mul(&[state.bytes, slots])?;
+        let total_marks = mul(&[state.mark_bytes, slots])?;
         self.snapshot_parts(rank, frontier, stages)?.into_iter().map(|(component, offset, canonical, bytes)| {
             let active = mul(&[component.offset, sequences])?.checked_add(mul(&[sequence, component.bytes])?)
                 .and_then(|at| at.checked_add(offset))
                 .ok_or(CacheGeometryError::Overflow("Step-5 active copy offset"))?;
-            let mark = mul(&[slot, state.bytes])?.checked_add(component.offset)
+            let retained = state.mark_component(component)?;
+            if canonical.checked_add(bytes).is_none_or(|end| end > retained.bytes) {
+                return Err(invalid("snapshot canonical component extent"));
+            }
+            let mark = mul(&[slot, state.mark_bytes])?.checked_add(retained.offset)
                 .and_then(|at| at.checked_add(canonical))
                 .ok_or(CacheGeometryError::Overflow("Step-5 mark copy offset"))?;
             if active.checked_add(bytes).is_none_or(|end| end > total_active)
@@ -354,21 +411,24 @@ impl Step5CacheLayout {
     pub fn window(&self) -> u64 { self.window }
 
     /// Partial CSA pages copy every retained K/V row, including the causal
-    /// current region; summary state is copied separately by snapshot_spans.
+    /// current region; summary state includes completed regions only.
     pub fn csa_tail_bytes(&self, rank: usize, rows: u64) -> Result<u64, CacheGeometryError> {
         if rows > PAGE_ROWS { return Err(invalid("CSA tail longer than a page")); }
         let geometry = self.geometry.ranks.get(rank).ok_or_else(|| invalid("CSA tail rank"))?;
-        mul(&[geometry.persistent_unit_bytes / PAGE_ROWS, rows])
+        let state = &self.ranks[rank];
+        let summary = state.regions.iter().filter(|r| r.summaries.is_some()).count() as u64;
+        let kv = geometry.persistent_unit_bytes - summary * SUMMARY_PAGE_BYTES;
+        Ok(mul(&[kv / PAGE_ROWS, rows])? + summary * summary_prefix_bytes(rows))
     }
 
     /// Retention follows the shared slot policy. Its active-lane floor can
     /// exceed the nominal mark budget, so charge every resulting slot.
     pub fn prefix_arena_bytes(&self, lanes: u64, entries: u64, budget: u64)
         -> Result<(u64, Vec<u64>), CacheGeometryError> {
-        let mark = self.ranks.iter().try_fold(0u64, |sum, rank| sum.checked_add(rank.bytes)
+        let mark = self.ranks.iter().try_fold(0u64, |sum, rank| sum.checked_add(rank.mark_bytes)
             .ok_or(CacheGeometryError::Overflow("Step-5 combined mark")))?;
         let slots = cuteafd_core::prefix::mark_slots_for(lanes, entries, mark, budget);
-        let bytes = self.ranks.iter().map(|rank| mul(&[slots, rank.bytes])).collect::<Result<_, _>>()?;
+        let bytes = self.ranks.iter().map(|rank| mul(&[slots, rank.mark_bytes])).collect::<Result<_, _>>()?;
         Ok((slots, bytes))
     }
 }

@@ -65,7 +65,7 @@ impl Reservation {
             .regions
             .iter()
             .try_fold(0u64, |sum, region| {
-                sum.checked_add(region.page_bytes.checked_mul(2)?)
+                sum.checked_add(region.persistent_page_bytes())
             })
             .context("Step-5 CSA page geometry overflow")?;
         ensure!(
@@ -79,7 +79,7 @@ impl Reservation {
             )?)
         };
         let active = bytes(state.bytes, sequences)?;
-        let marks = bytes(state.bytes, slots)?;
+        let marks = bytes(state.mark_bytes, slots)?;
         let pages = bytes(geometry.persistent_unit_bytes, pages)?;
         let total = active
             .checked_add(marks)
@@ -1249,7 +1249,7 @@ mod tests {
         inputs.marks.entries = 24;
         inputs.peer_diagnostics = true;
         let retained = run(&inputs)?;
-        let mark_bytes = checked_sum(retained.cache.ranks.iter().map(|r| r.bytes))?;
+        let mark_bytes = checked_sum(retained.cache.ranks.iter().map(|r| r.mark_bytes))?;
         assert_eq!(
             retained.marks,
             inputs.marks.slots(usize::try_from(mark_bytes)?)
@@ -1258,7 +1258,7 @@ mod tests {
         for rank in 0..2 {
             assert_eq!(
                 retained.reservations[rank].marks as u64,
-                retained.cache.ranks[rank].bytes * retained.marks as u64
+                retained.cache.ranks[rank].mark_bytes * retained.marks as u64
             );
             let transport = |a: &Admission| {
                 checked_sum(
