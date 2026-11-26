@@ -327,15 +327,51 @@ impl SharedScratchLayout {
         local_vocab: usize,
         context_split: bool,
     ) -> Result<Self> {
+        Self::new_for_layers(
+            cfg,
+            rank,
+            tp,
+            max_rows,
+            decode_rows,
+            max_seq_pages,
+            max_sequences,
+            local_vocab,
+            context_split,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_layers(
+        cfg: &Hy4FlashConfig,
+        rank: usize,
+        tp: usize,
+        max_rows: usize,
+        decode_rows: usize,
+        max_seq_pages: usize,
+        max_sequences: usize,
+        local_vocab: usize,
+        context_split: bool,
+        layers_split: bool,
+    ) -> Result<Self> {
         ensure!(
-            matches!(tp, 1 | 2) && rank < tp && max_rows > 0 && decode_rows > 0 && max_sequences > 0
-                && (!context_split || tp == 2),
+            matches!(tp, 1 | 2)
+                && rank < tp
+                && max_rows > 0
+                && decode_rows > 0
+                && max_sequences > 0
+                && (!context_split || tp == 2)
+                && (!layers_split || tp == 2)
+                && !(context_split && layers_split),
             "invalid Hy4-flash SharedScratchLayout shape"
         );
+        let layer_tp = if layers_split { 1 } else { tp };
+        let head_rank = if layers_split { tp - 1 } else { 0 };
+        let split_head = tp == 2 && !layers_split;
         let h = cfg.hidden;
         let hc = cfg.hc_mult;
-        let max_heads = cfg.swa_heads.max(cfg.sparse_heads) / tp;
-        let max_inter = cfg.intermediate / tp;
+        let max_heads = cfg.swa_heads.max(cfg.sparse_heads) / layer_tp;
+        let max_inter = cfg.intermediate / layer_tp;
         let pages = max_seq_pages.max(16);
         let max_seq_groups = pages * (PAGE_ROWS / cfg.indexer_compress_ratio);
         let idx_score_floats = max_rows
@@ -373,7 +409,7 @@ impl SharedScratchLayout {
             ("uv_out".into(), (max_rows * max_heads * cfg.v_head_dim * 2).max(256)),
             (
                 "attn_scratch".into(),
-                mla_split_scratch_bytes(decode_rows, tp)
+                mla_split_scratch_bytes(decode_rows, layer_tp)
                     .max(if context_split { hy4_dsa_partial_scratch_bytes(context_exchange_rows(max_rows, decode_rows)) } else { 0 })
                     .max(ATTN_SCRATCH_BYTES)
                     .max(256),
@@ -401,7 +437,7 @@ impl SharedScratchLayout {
             ("routed_out".into(), (max_rows * h * 2).max(256)),
             (
                 "logits_tile".into(),
-                if tp == 2 { (HEAD_TILE_ROWS * local_vocab * 4).max(256) } else { 256 },
+                if split_head { (HEAD_TILE_ROWS * local_vocab * 4).max(256) } else { 256 },
             ),
         ];
         if context_split {
@@ -415,7 +451,7 @@ impl SharedScratchLayout {
             views.push(("ctx_lse_peer".into(), (ctx_rows * half_dsa_heads * 4).max(256)));
             views.push(("ctx_draft_slots".into(), (ctx_rows * cfg.indexer_candidate_topk * 4).max(256)));
         }
-        if rank == 0 {
+        if rank == head_rank {
             views.push(("head_logits_f32".into(), (HEAD_TILE_ROWS * cfg.vocab_size * 4).max(256)));
         }
         let arena = WeightArenaLayout::new(Self::arena_id(rank), views)?;

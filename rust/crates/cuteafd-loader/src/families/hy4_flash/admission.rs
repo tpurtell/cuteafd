@@ -365,15 +365,8 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         )
     })?;
 
-    let head_gpu = if modes
-        .iter()
-        .all(|m| matches!(m, LayerMode::HeadSplit | LayerMode::ContextSplit))
-    {
-        0u8
-    } else {
-        (gpus - 1) as u8
-    };
-    let links = hy4_flash::spark_link(head_gpu, ranks, link_shape, request.replies).map_err(|error| {
+    // SparkLink always attaches to coordinator GPU 0 (rank 0 stages and reduces Spark replies).
+    let links = hy4_flash::spark_link(0, ranks, link_shape, request.replies).map_err(|error| {
         refused(
             format!("Hy4-flash Spark transport refused: {error}"),
             "Use supported Spark rank count and prefill shape.",
@@ -586,6 +579,13 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         ))?;
 
     let context_split = modes.iter().any(|m| *m == LayerMode::ContextSplit);
+    let layers_split = gpus == 2 && request.attention == AttentionPlacement::Layers;
+    if request.dfly2 && layers_split {
+        return Err(refused(
+            "Hy4-flash DFly2 speculative decoding is not supported with ATTENTION_PLACEMENT=layers",
+            "Use ATTENTION_PLACEMENT=context (default) or SPECULATOR=off.",
+        ));
+    }
     if request.tp2_dflash && (!request.dfly2 || gpus != 2) {
         return Err(refused(
             "Hy4-flash TP2_DFLASH requires two coordinator GPUs and DFly2",
