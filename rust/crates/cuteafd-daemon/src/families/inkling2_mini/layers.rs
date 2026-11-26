@@ -605,7 +605,7 @@ pub(crate) fn begin_visit<'a>(
     k.project_bf16(owner, xq, w("attn.gate_attn.weight")?, b("gate")?, rows, HIDDEN, Q_WIDTH)?;
     k.project_f32(owner, xq, w("attn.attn_sink_proj.weight")?, b("sinks")?, rows, HIDDEN, HEADS)?;
 
-    if rows <= 64 && owner.convolution_strides().is_some() {
+    if rows <= 64 && owner.decode_attention() && owner.convolution_strides().is_some() {
         let (slot_stride, lag_stride, _slots) = owner.convolution_strides().unwrap();
         k.project_bf16(owner, xk, w("attn.wk_dv.weight")?, b("k_bf16")?, rows, HIDDEN, KV_WIDTH)?;
         k.project_bf16(owner, xv, w("attn.wv_dv.weight")?, b("v_bf16")?, rows, HIDDEN, KV_WIDTH)?;
@@ -860,7 +860,7 @@ pub(crate) fn begin_visit<'a>(
     let partial = b("partial")?;
     let arena = b("residual_arena")?;
     let stride = owner.layout().rows * HIDDEN * 4;
-    if rows <= 64 && owner.convolution_strides().is_some() {
+    if rows <= 64 && owner.decode_attention() && owner.convolution_strides().is_some() {
         let (slot_stride, lag_stride, _slots) = owner.convolution_strides().unwrap();
         ensure!(
             !site.starts_block || site.attention_candidates + 1 == site.mlp_candidates,
@@ -988,9 +988,11 @@ pub(crate) fn prepare_routes<'a>(
         HIDDEN,
         128,
     )?;
-    // SAFETY: single-warp F32 router logits/bias -> I32 ids + F32 weights.
+    // SAFETY: F32 router logits/bias -> I32 ids + F32 weights.
+    // Keep stock 128-thread router at decode/verify rows (faster at M=1..64 than single-warp).
+    let router_op = if rows > 64 { Op::FastRouter } else { Op::Router };
     unsafe {
-        k.producer(Op::FastRouter)?.launch(
+        k.producer(router_op)?.launch(
             &[
                 owner.buffer("route_logits")?,
                 target.operand(&format!("{prefix}.mlp.gate.bias"))?.buffer,
@@ -1064,7 +1066,7 @@ pub(crate) fn join_visit<'a>(
     let partial = b("partial")?;
     let base = if site.starts_block { b("attention")? } else { b("branch")? };
 
-    if rows <= 64 && owner.convolution_strides().is_some() {
+    if rows <= 64 && owner.decode_attention() && owner.convolution_strides().is_some() {
         let (slot_stride, lag_stride, _slots) = owner.convolution_strides().unwrap();
         let (replay, rep_buf, rep_stride) = match owner.convolution_replay("mlp_conv_history")? {
             Some((buf, s)) => (true, buf, s),
