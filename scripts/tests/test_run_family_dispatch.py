@@ -6189,3 +6189,13 @@ def test_inkling2_mini_refuses_non_heads_attention_placement(tmp_path):
     )
     assert result.returncode == 2
     assert "inkling2_mini attention placement is TP1-only (heads)" in result.stderr
+
+
+def test_inkling2_mini_external_dflash_dispatch(tmp_path):
+    config = {"model_type": "inkling2_loop", "text_config": {"num_hidden_layers": 24}}
+    result = _family_launch_result(tmp_path, config, "thinkingmachines/Inkling-2-Mini",
+        "RTX_GPUS=1\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nVISION=off\nAUDIO=off\n"
+        "SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/draft\nDRAFT_KV_CACHE=bf16\n")
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-inkling2-mini" in line)
+    assert "--dspark=false" in serve and "--draft " in serve and "--draft-kv-cache bf16" in serve

@@ -1,4 +1,4 @@
-//! Inkling 2 Mini TP1 binding of the shared 3-layer recurrent dSpark drafter & FIR verifier.
+//! Inkling 2 Mini TP1 binding of shared DFlash2/recurrent dSpark and FIR verification.
 use super::{draft_taps::TapBuffer, verify::Verify};
 use crate::shared::{
     memory::device::Stream,
@@ -168,6 +168,10 @@ impl<'a> Binding<'a> {
             Ok(())
         };
         check(layout.arena.id(), layout.arena.bytes())?;
+        let weights = layout.physical.weight_owners().map(|o| &o.id).collect::<std::collections::BTreeSet<_>>();
+        for owner in layout.physical.owners().iter().filter(|o| !weights.contains(&o.id)) {
+            check(&format!("inkling2_mini.dflash.{}", owner.id), usize::try_from(owner.bytes)?)?;
+        }
         for (name, bytes) in &layout.target { check(&format!("inkling2_mini.draft.target.{name}"), *bytes)?; }
         let mask = d.run(|| {
             let extent = cfg.hidden * 2;
@@ -187,6 +191,19 @@ impl<'a> Binding<'a> {
             body.prepare_workspace()?;
             Ok(body)
         })?;
+        let physical_devices = [d.id];
+        let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical_devices)?;
+        let receipts = d.run(|| body.allocation_receipts(devices, "inkling2_mini.dflash"))?;
+        let roots = receipts.iter().filter(|r| r.allocation.view.is_none()).collect::<Vec<_>>();
+        ensure!(roots.iter().filter(|r| r.allocation.id == layout.arena.id()).count() == 1,
+            "Mini DFlash requires one packed arena backing");
+        for receipt in roots {
+            let actual = &receipt.allocation;
+            let planned = admitted.facts.allocations.iter().find(|o| o.id == actual.id)
+                .with_context(|| format!("Mini DFlash unadmitted actual owner {}", actual.id))?;
+            ensure!(planned.bytes == actual.bytes && planned.location == actual.location,
+                "Mini DFlash actual owner differs {}", actual.id);
+        }
         let marks = if mark_slots == 0 { None } else {
             check("inkling2_mini.dflash.marks", layout.mark_bytes * mark_slots)?;
             let planes = body.gqa_window_planes(0)?.iter().map(|p| p.bytes).collect();
@@ -229,8 +246,41 @@ impl<'a> Binding<'a> {
     pub fn propose(&self, rows: &[DraftSeq], embed: Buffer, norm: Buffer, head: Buffer) -> Result<Vec<Draft>> {
         if let Some(d) = &self.drafter { return d.draft(rows, embed, norm, |n,a| self.select(n,a,head)); }
         let gqa = self.dflash.as_ref().context("Mini GQA drafter missing")?;
+        for row in rows { ensure!(self.frontier(row.slot)?.1 == row.position, "Mini DFlash proposal frontier differs"); }
         gqa.stream.device.run(|| gqa.body.draft_raw_table(rows, embed, TargetHead::Bf16Buffer(&head)))
     }
+    /// Compare real-weight block proposals with the independent reference generator.
+    pub fn check_oracle(&self, path: &std::path::Path, embed: Buffer, norm: Buffer, head: Buffer) -> Result<()> {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct Test { anchor: u32, tokens: Vec<u32> }
+        #[derive(Deserialize)]
+        struct Fixture { rows: usize, results: Vec<Test> }
+        let fixture: Fixture = serde_json::from_slice(&std::fs::read(path.join("meta.json"))?)?;
+        let features = std::fs::read(path.join("taps.bin"))?;
+        let g = self.dflash.as_ref().context("Mini GQA oracle requires DFlash2")?;
+        self.bind_slot(0, 0, None)?;
+        let tap = &self.prefill[0];
+        ensure!(features.len() == fixture.rows * self.sites.len() * self.hidden * 2 && features.len() <= tap.output.buffer.bytes,
+            "Mini oracle features outside admitted tap owner");
+        g.stream.drain()?;
+        g.stream.device.run(|| g.stream.device.library.copy_h2d(tap.output.buffer, &features))?;
+        self.update(tap, 0, 0, 0, fixture.rows)?;
+        self.set_scores(true, true);
+        let mut matched = 0;
+        let mut total = 0;
+        for test in fixture.results {
+            let actual = self.propose(&[DraftSeq { slot: 0, anchor: test.anchor, position: fixture.rows, valid_from: 0 }], embed, norm, head)?;
+            ensure!(actual[0].tokens.len() == test.tokens.len(), "Mini oracle block length differs");
+            matched += actual[0].tokens.iter().zip(&test.tokens).filter(|(a,b)| a == b).count();
+            total += test.tokens.len();
+            println!("Mini draft anchor {}: actual {:?}, expected {:?}", test.anchor, actual[0].tokens, test.tokens);
+        }
+        ensure!(total > 0 && matched == total, "Mini DFlash2 block oracle {matched}/{total}");
+        println!("Mini DFlash2 real-weight oracle {matched}/{total}");
+        Ok(())
+    }
+
     pub fn mark_bytes(&self) -> usize { self.marks.iter().map(|m| m.bytes()).sum::<usize>() +
         self.dflash.as_ref().and_then(|g| g.marks.as_ref()).map_or(0, |m| m.mark_bytes()) }
     pub fn capture(&self, slot: usize, mark: usize, frontier: usize) -> Result<()> {

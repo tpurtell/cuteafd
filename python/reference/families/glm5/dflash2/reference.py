@@ -49,10 +49,10 @@ from safetensors import safe_open
 EPS = 1e-5
 
 
-def rms(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+def rms(x: torch.Tensor, w: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     """Qwen3RMSNorm: the unit-RMS value is rounded to BF16 before the weight."""
     xf = x.float()
-    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + EPS)
+    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
     return w * xf.to(x.dtype)
 
 
@@ -91,6 +91,8 @@ class Drafter:
         self.head_dim, self.theta = self.cfg["head_dim"], float(self.cfg["rope_parameters"]["rope_theta"])
         self.window, self.layers = self.cfg["sliding_window"], self.cfg["num_hidden_layers"]
         self.device = device
+        self.eps = self.cfg["rms_norm_eps"]
+        self.post_softcap = dc.get("final_logit_softcapping") if dc.get("selector_softcap_mode") == "after_correction" else None
         f = safe_open(str(draft / "model.safetensors"), framework="pt", device=device)
         self.w = {k: f.get_tensor(k) for k in f.keys()}
         index = json.loads((target / "model.safetensors.index.json").read_text())["weight_map"]
@@ -105,18 +107,25 @@ class Drafter:
         target_cfg = json.loads((target / "config.json").read_text())
         self.mhc = target_cfg.get("model_type") == "glm5_next"
         prefix = "model.language_model." if self.mhc else "model."
-        self.embed = target_tensor(prefix + "embed_tokens.weight")
-        self.lm_head = target_tensor("lm_head.weight").to(device)
+        self.inkling = target_cfg.get("model_type") == "inkling2_loop"
+        if self.inkling:
+            self.embed = target_tensor("model.llm.embed.weight")
+            self.lm_head = target_tensor("model.llm.unembed.weight").to(device)
+            self.valid_vocab = target_cfg["text_config"]["unpadded_vocab_size"]
+        else:
+            self.embed = target_tensor(prefix + "embed_tokens.weight")
+            self.lm_head = target_tensor("lm_head.weight").to(device)
+            self.valid_vocab = self.cfg["vocab_size"]
 
     def context(self, taps: torch.Tensor, positions: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Per-layer context K (roped) and V for tap rows [n, 6 * hidden]."""
-        fused = rms(F.linear(taps, self.w["fc.weight"]), self.w["hidden_norm.weight"])
+        fused = rms(F.linear(taps, self.w["fc.weight"]), self.w["hidden_norm.weight"], self.eps)
         out = []
         for l in range(self.layers):
             p = f"layers.{l}.self_attn."
             k = F.linear(fused, self.w[p + "k_proj.weight"]).view(-1, self.kv_heads, self.head_dim)
             v = F.linear(fused, self.w[p + "v_proj.weight"]).view(-1, self.kv_heads, self.head_dim)
-            out.append((rope(rms(k, self.w[p + "k_norm.weight"]), positions, self.theta), v))
+            out.append((rope(rms(k, self.w[p + "k_norm.weight"], self.eps), positions, self.theta), v))
         return out
 
     def body(self, anchor: int, position: int, ctx: list[tuple[torch.Tensor, torch.Tensor]],
@@ -133,7 +142,7 @@ class Drafter:
         tokens = torch.tensor([anchor] + [self.mask] * (self.block - 1))
         h = self.embed[tokens].to(self.device)
         positions = torch.arange(position, position + self.block, device=self.device)
-        n = rms(h, self.w["layers.0.input_layernorm.weight"])
+        n = rms(h, self.w["layers.0.input_layernorm.weight"], self.eps)
         for l in range(self.layers):
             p = f"layers.{l}."
             dyn = F.linear(n, self.w[p + "attention_conv.kernel_projection.weight"])
@@ -143,8 +152,8 @@ class Drafter:
             q = F.linear(x, self.w[a + "q_proj.weight"]).view(self.block, self.heads, self.head_dim)
             k = F.linear(x, self.w[a + "k_proj.weight"]).view(self.block, self.kv_heads, self.head_dim)
             v = F.linear(x, self.w[a + "v_proj.weight"]).view(self.block, self.kv_heads, self.head_dim)
-            q = rope(rms(q, self.w[a + "q_norm.weight"]), positions, self.theta)
-            k = rope(rms(k, self.w[a + "k_norm.weight"]), positions, self.theta)
+            q = rope(rms(q, self.w[a + "q_norm.weight"], self.eps), positions, self.theta)
+            k = rope(rms(k, self.w[a + "k_norm.weight"], self.eps), positions, self.theta)
             kc, vc = ctx[l]
             keys, values = torch.cat([kc, k]), torch.cat([vc, v])
             attn = F.scaled_dot_product_attention(q.transpose(0, 1)[None], keys.transpose(0, 1)[None],
@@ -153,7 +162,7 @@ class Drafter:
             attn = attn[0].transpose(0, 1).reshape(self.block, -1)
             o = F.linear(attn, self.w[a + "o_proj.weight"])
             h = h + conv(o, dyn, base, 1, self.group)
-            n = rms(h, self.w[p + "post_attention_layernorm.weight"])
+            n = rms(h, self.w[p + "post_attention_layernorm.weight"], self.eps)
             dyn = F.linear(n, self.w[p + "mlp_conv.kernel_projection.weight"])
             base = self.w[p + "mlp_conv.base_kernel"]
             x = conv(n, dyn, base, 0, self.group)
@@ -162,13 +171,13 @@ class Drafter:
             d = F.linear(act, self.w[m + "down_proj.weight"])
             h = h + conv(d, dyn, base, 1, self.group)
             last = l + 1 == self.layers
-            n = rms(h, self.w["norm.weight" if last else f"layers.{l + 1}.input_layernorm.weight"])
+            n = rms(h, self.w["norm.weight" if last else f"layers.{l + 1}.input_layernorm.weight"], self.eps)
         return n
 
     def select(self, anchor: int, hidden: torch.Tensor) -> tuple[list[int], list[list[float]]]:
         """Greedy candidate path over rows 1.. of the block."""
         rows = hidden[1:]
-        logits = F.linear(rows, self.lm_head)
+        logits = F.linear(rows, self.lm_head[:self.valid_vocab])
         unary, candidates = torch.topk(logits, self.topk, dim=-1)
         projected = F.linear(rows, self.w["candidate_selector.hidden_projection.weight"])
         pred_cb = self.w["candidate_selector.predecessor_codebook"]
@@ -177,7 +186,10 @@ class Drafter:
         for i in range(rows.shape[0]):
             conditioned = pred_cb[previous] * projected[i]
             transition = torch.einsum("r,kr->k", conditioned, succ_cb[candidates[i]])
-            scores = (unary[i] + transition).float()
+            scores = unary[i] + transition
+            if self.post_softcap is not None:
+                scores = self.post_softcap * torch.tanh(scores / self.post_softcap)
+            scores = scores.float()
             best = scores.max()
             index = int((scores == best).nonzero()[0])
             runner = torch.where(torch.arange(self.topk, device=scores.device) == index,
@@ -190,6 +202,26 @@ class Drafter:
             previous = int(candidates[i, index])
             tokens.append(previous)
         return tokens, features
+
+
+def mini_fixture(draft: Path, target: Path, out: Path, device: str):
+    """Real checkpoint oracle on deterministic, fixed BF16 context inputs."""
+    model = Drafter(draft, target, device)
+    assert model.inkling
+    out.mkdir(parents=True, exist_ok=True)
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+    with torch.inference_mode():
+        rows = 1031
+        width = len(model.taps) * model.cfg["hidden_size"]
+        taps = ((torch.arange(rows * width, device=device, dtype=torch.int64) * 17 % 251).float() / 128 - 1).reshape(rows, width).bfloat16()
+        taps.cpu().view(torch.int16).numpy().tofile(out / "taps.bin")
+        ctx = model.context(taps, torch.arange(rows, device=device))
+        result = []
+        for anchor in (101, 501, 1013, 200006):
+            h = model.body(anchor, rows, ctx, True)
+            tokens, features = model.select(anchor, h)
+            result.append(dict(anchor=anchor, tokens=tokens, features=features))
+        (out / "meta.json").write_text(json.dumps(dict(rows=rows, results=result)))
 
 
 def parse_positions(spec: str) -> list[int]:
@@ -207,13 +239,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--draft", type=Path, required=True)
     parser.add_argument("--target", type=Path, required=True)
-    parser.add_argument("--golden", type=Path, required=True)
-    parser.add_argument("--positions", required=True, help="anchor positions, e.g. 64:1500:16,1510")
+    parser.add_argument("--golden", type=Path)
+    parser.add_argument("--mini-fixture", action="store_true")
+    parser.add_argument("--positions", help="anchor positions, e.g. 64:1500:16,1510")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--row-window", type=int, choices=(0, 1), help="per-row sliding window (default: 1 for a "
                         "glm5_next target, else 0)")
     args = parser.parse_args()
+    if args.mini_fixture:
+        return mini_fixture(args.draft, args.target, args.out, args.device)
+    if args.golden is None or args.positions is None:
+        parser.error("--golden and --positions are required without --mini-fixture")
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
     drafter = Drafter(args.draft, args.target, args.device)
     tokens = torch.frombuffer(bytearray((args.golden / "tokens.bin").read_bytes()), dtype=torch.int32)
@@ -230,7 +267,7 @@ def main() -> None:
     taps = torch.cat(taps, -1).to(args.device)
     positions = parse_positions(args.positions)
     rows = torch.arange(taps.shape[0], device=args.device)
-    row_window = bool(drafter.mhc if args.row_window is None else args.row_window)
+    row_window = bool((drafter.mhc or drafter.inkling) if args.row_window is None else args.row_window)
     with torch.no_grad():
         ctx = drafter.context(taps, rows)
         drafts, features, hidden = [], [], []
