@@ -117,10 +117,18 @@ mod tests {
             (32, 64, true, 96, 762, 916, 936),
             (48, 64, true, 112, 888, 1066, 1086),
             (64, 64, true, 128, 1014, 1218, 1238),
+            (64, 128, false, 64, 508, 610, 630),
             (64, 128, true, 192, 1522, 1828, 1848),
         ] {
             let keys = KeySpace::for_config(sequences, decode_rows, has_draft);
             assert_eq!(keys.total_keys(), total_keys);
+            if sequences == 64 && decode_rows == 128 && has_draft {
+                assert_eq!(keys, KeySpace { decode_keys: 64, verify_keys: 128 });
+                assert_eq!(keys.total_keys() as u64 * PER_KEY_BYTES, 1_594_884_096);
+            }
+            if sequences == 64 && decode_rows == 128 && !has_draft {
+                assert_eq!(keys, KeySpace { decode_keys: 64, verify_keys: 0 });
+            }
             let ws = working_set(keys);
             assert_eq!(ws.w1, w1_mib * MIB, "seq={sequences} rows={decode_rows} draft={has_draft}");
             assert_eq!(ws.step_growth, 10 * MIB);

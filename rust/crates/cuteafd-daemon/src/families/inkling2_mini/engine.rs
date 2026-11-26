@@ -169,7 +169,10 @@ impl<'a> Execution<'a> {
     ) -> Result<DeviceLogits> {
         self.require_live()?;
         ensure!(
-            !placements.is_empty() && placements.len() == tokens.len() && unit.rows.len() <= 64 && unit.slot == 0,
+            !placements.is_empty()
+                && placements.len() == tokens.len()
+                && unit.rows.len() <= self.requests.decode.layout.rows
+                && unit.slot == 0,
             "Inkling 2 Mini decode exceeds admitted head/owner"
         );
         let mode = if self.requests.decode.replaying() {
@@ -272,12 +275,18 @@ impl<'a> Execution<'a> {
             return Ok((0, 0));
         };
         let has_draft = self.draft.is_some();
-        let keys = super::graphs::shipping_prewarm_keys(max_sequences, has_draft);
+        let decode_rows = self.requests.decode.layout.rows;
+        let keys = super::graphs::shipping_prewarm_keys(max_sequences, decode_rows, has_draft);
         if keys.is_empty() {
             return Ok((0, 0));
         }
-        let max_decode = max_sequences.clamp(1, 64);
-        let warm_tokens = vec![0u32; 64];
+        let max_decode = cuteafd_loader::serving_capacity::inkling2_mini_graphs::KeySpace::for_config(
+            max_sequences as u64,
+            decode_rows,
+            has_draft,
+        )
+        .decode_keys;
+        let warm_tokens = vec![0u32; decode_rows];
 
         let run_one = |exec: &mut Self, rows: usize, mode: Mode, capture: bool| -> Result<bool> {
             let replay = if mode == Mode::Verify {
@@ -301,7 +310,7 @@ impl<'a> Execution<'a> {
                     }
                 }
                 let mut placements = [Placement {
-                    units: vec![0],
+                    units: (0..rows.div_ceil(64) as u32).collect(),
                     slot: 0,
                     len: 0,
                     state_len: 0,
@@ -366,7 +375,7 @@ impl<'a> Execution<'a> {
         //    measuring graph arena growth.
         run_one(self, max_decode, Mode::Decode, false)?;
         if has_draft {
-            run_one(self, 64, Mode::Verify, false)?;
+            run_one(self, decode_rows, Mode::Verify, false)?;
         }
         self.completed()?;
         let device = self.requests.decode.stream.device;

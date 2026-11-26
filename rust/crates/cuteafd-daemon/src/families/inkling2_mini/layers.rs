@@ -54,6 +54,11 @@ pub(crate) struct MiniKernels<'a> {
 
 impl<'a> MiniKernels<'a> {
     pub fn bind(programs: &'a Programs<'a>, kv_format: InklingKvCache) -> Result<Self> {
+        Self::bind_rows(programs, kv_format, 64)
+    }
+
+    pub fn bind_rows(programs: &'a Programs<'a>, kv_format: InklingKvCache, decode_rows: usize) -> Result<Self> {
+        let decode_cap = cuteafd_loader::families::inkling2_mini::execution::replay_capacity(decode_rows);
         let fir = [(HIDDEN, false), (KV_WIDTH, false), (KV_WIDTH, true)];
         let mut ops = Vec::new();
         for precision in [Precision::Bf16, Precision::F32] {
@@ -131,7 +136,7 @@ impl<'a> MiniKernels<'a> {
             .collect::<Result<BTreeMap<_, _>>>()?;
         let replay = fir
             .into_iter()
-            .map(|g| Ok((g, cuteafd_ffi::fir_replay::Convolution::load(programs, g.0, g.1)?)))
+            .map(|g| Ok((g, cuteafd_ffi::fir_replay::Convolution::load_rows(programs, g.0, g.1, decode_cap)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
 
         let projections_bf16 = DraftProjections::load_with_output(
@@ -165,8 +170,8 @@ impl<'a> MiniKernels<'a> {
             projections_f32,
             local: Attention::load(programs, Kind::Local, Route::Prefill, false)?,
             global: Attention::load(programs, Kind::Global, Route::Prefill, fp8)?,
-            local_decode: Attention::load(programs, Kind::Local, Route::Decode, false)?,
-            global_decode: Attention::load(programs, Kind::Global, Route::Decode, fp8)?,
+            local_decode: Attention::load_rows(programs, Kind::Local, Route::Decode, false, decode_cap)?,
+            global_decode: Attention::load_rows(programs, Kind::Global, Route::Decode, fp8, decode_cap)?,
             kv_format,
             producers,
             strided,

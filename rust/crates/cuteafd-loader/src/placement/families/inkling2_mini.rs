@@ -18,7 +18,7 @@ use super::super::{
 };
 use crate::families::inkling2::execution::SequenceLayout;
 use crate::families::inkling2_mini::{
-    execution::{MiniUnitLayout, DECODE_ROWS},
+    execution::MiniUnitLayout,
     weight_layout::{MiniLayerExperts, MiniTargetWeights},
     Inkling2MiniConfig, InklingKvCache,
 };
@@ -27,6 +27,10 @@ use cuteafd_core::memory_layout::{Category, MemoryKind};
 
 pub const PAGE_ROWS: u64 = 64;
 pub const LANES: u64 = 1;
+/// Default decode/verify rows per step (`DECODE_ROWS=auto`).
+pub const DECODE_ROWS: u32 = 64;
+/// Maximum decode/verify rows per step supported by exported Inkling 2 Mini decode programs.
+pub const MAX_DECODE_ROWS: u32 = 128;
 const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
 
 /// TP1-only executor modes for Inkling 2 Mini.
@@ -74,6 +78,8 @@ pub struct MiniInputs {
     pub context: Context,
     pub pool: crate::placement::PoolPolicy,
     pub prefill: PrefillShape,
+    /// Admitted per-lane decode/verify row budget (`DECODE_ROWS`, 1..=128).
+    pub decode_rows: u32,
     pub sequences: u64,
     pub prefix_entries: u64,
     pub prefix_mark_budget: u64,
@@ -177,7 +183,7 @@ impl MiniInputs {
         HopSpec {
             storage: HopStorage::ReceiveSlots,
             row_bytes: (self.cfg.text.residual_blocks() as u64 + 1) * self.cfg.text.hidden as u64 * 4,
-            rows: self.prefill.rows.max(DECODE_ROWS as u64),
+            rows: self.prefill.rows.max(u64::from(self.decode_rows)),
             lanes: LANES,
             entry_gpu: 0,
             head_gpu: 0,
@@ -282,7 +288,7 @@ impl MiniInputs {
         let location = Location::coordinator(0);
         let context = usize::try_from(self.context.maximum).map_err(|_| Refusal::Overflow("Mini context"))?;
         let layout = if decode {
-            MiniUnitLayout::serving_decode(&self.cfg, context, self.kv_format, self.sequences as usize)
+            MiniUnitLayout::serving_decode_rows(&self.cfg, rows as usize, context, self.kv_format, self.sequences as usize)
         } else {
             MiniUnitLayout::serving(&self.cfg, rows as usize, context, self.kv_format, self.sequences as usize)
         }
@@ -395,7 +401,7 @@ impl MiniInputs {
             maximum,
         ));
 
-        out.extend(self.unit_owners("inkling2_mini.decode.0", DECODE_ROWS as u32, true, maximum)?);
+        out.extend(self.unit_owners("inkling2_mini.decode.0", self.decode_rows, true, maximum)?);
         for slot in 0..self.prefill.waves {
             out.extend(self.unit_owners(&format!("inkling2_mini.unit.0.{slot}"), rows, false, maximum)?);
         }
@@ -439,7 +445,7 @@ impl MiniInputs {
 
     fn head_owners(&self, maximum: u64) -> Result<Vec<Component>, Refusal> {
         let t = &self.cfg.text;
-        let rows = DECODE_ROWS as u64;
+        let rows = u64::from(self.decode_rows);
         let location = Location::coordinator(0);
         let mut out = Vec::new();
         for (name, bytes) in [
@@ -472,6 +478,7 @@ impl Recipe for MiniInputs {
             || self.experts.len() != self.routed.len()
             || self.prefill.rows == 0
             || self.prefill.waves == 0
+            || !(1..=MAX_DECODE_ROWS).contains(&self.decode_rows)
             || self.sequences == 0
         {
             return Err(invalid("invalid extent or empty domain"));
@@ -484,7 +491,7 @@ impl Recipe for MiniInputs {
                     location: Location::coordinator(0),
                     capacity: usize::try_from(self.sequences)
                         .map_err(|_| Refusal::Overflow("Mini selector"))?
-                        .max(DECODE_ROWS),
+                        .max(self.decode_rows as usize),
                     vocab: t.unpadded_vocab_size,
                     device_sampling: self.device_sampling,
                 },

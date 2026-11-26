@@ -34,6 +34,7 @@ pub(crate) struct Options<'a> {
     pub manifest: &'a Path,
     pub native_lib: &'a Path,
     pub prefill: PrefillShape,
+    pub decode_rows: u32,
     pub sequences: u64,
     pub context_tokens: u64,
     pub pool_tokens: Option<u64>,
@@ -74,6 +75,12 @@ fn validate(options: &Options<'_>, cfg: &Inkling2MiniConfig) -> Result<()> {
         "Inkling 2 Mini prefill differs from shared export/wave capacity"
     );
     ensure!(
+        (1..=shared::MAX_DECODE_ROWS).contains(&options.decode_rows),
+        "Inkling 2 Mini decode_rows {} exceeds supported 1..={}",
+        options.decode_rows,
+        shared::MAX_DECODE_ROWS
+    );
+    ensure!(
         options.prefix.prefix_partial == crate::shared::prefix::Toggle::Off,
         "Inkling 2 Mini requires exact captured 48-slot SWA/conv frontiers"
     );
@@ -100,13 +107,15 @@ pub(crate) fn prepare<'a>(
     let selected_weights = SelectedWeights::new(checkpoint, cfg, options.drafter.is_some())?;
     let mut kernels = None;
     let mut module_pins = Vec::new();
+    let replay_cap = cuteafd_loader::families::inkling2_mini::execution::replay_capacity(options.decode_rows as usize);
+    let fir_commit = if replay_cap == 64 { "fir_history_commit" } else { "fir_history_commit_m128" };
     let devices = [options.device];
     let runtime = RuntimeInventory::measure(library, &devices, InventoryPhase::PreWeight, |_| {
         programs.program("inkling2_padded_transpose_bf16_r16_c1024_p64", &["source", "output"])?;
-        kernels = Some(MiniKernels::bind(programs, options.kv_format)?);
+        kernels = Some(MiniKernels::bind_rows(programs, options.kv_format, options.decode_rows as usize)?);
         if options.drafter.is_some() || options.dflash.is_some() {
             programs.load_matching(|name| {
-                name.starts_with("inkling_draft_") || name.starts_with("draft_bf16_") || name == "fir_history_commit"
+                name.starts_with("inkling_draft_") || name.starts_with("draft_bf16_") || name == fir_commit
             })?;
         }
         if let Some(tensors) = catalog.fp8() {
@@ -147,6 +156,7 @@ pub(crate) fn prepare<'a>(
             loaded_code: 0,
         },
         prefill: options.prefill,
+        decode_rows: options.decode_rows,
         context_tokens: options.context_tokens,
         pool_tokens: options.pool_tokens,
         target_pool_tokens: None,
@@ -172,6 +182,7 @@ pub(crate) fn prepare<'a>(
     runtime.record("inkling2_mini", &sampled_free);
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &admitted.solved.served_context().to_string());
+    cuteafd_bench::context::set_resolved("decode-rows", &options.decode_rows.to_string());
     Ok(Prepared {
         kernels,
         encoding,
@@ -256,13 +267,15 @@ pub(crate) fn whole<'a>(
     let LocalPackage::Installed { backings } = &inputs.local else {
         anyhow::bail!("Inkling 2 Mini admitted resident expert backings absent");
     };
-    let head = super::head::MiniHead::new(stream.clone(), cfg, DECODE_ROWS)?;
+    let decode_rows = inputs.decode_rows as usize;
+    let body_rows = usize::try_from(inputs.prefill.rows.max(u64::from(inputs.decode_rows)))?;
+    let head = super::head::MiniHead::new(stream.clone(), cfg, decode_rows)?;
     let local = super::experts::serving_dispatchers(
         stream.clone(),
         &catalog,
         options.native_lib,
         backings,
-        usize::try_from(inputs.prefill.rows.max(DECODE_ROWS as u64))?,
+        body_rows,
         pushed,
     )?;
     let mut execution = super::engine::Execution::new(requests, head, target, kernels, local, cfg.clone())?;
@@ -304,6 +317,7 @@ pub(crate) fn whole<'a>(
             unembed,
             usize::try_from(inputs.prefill.rows)?,
             usize::try_from(inputs.prefill.waves)?,
+            decode_rows,
             inputs.prefix_mark_slots,
         )?));
     }
@@ -312,7 +326,7 @@ pub(crate) fn whole<'a>(
         let embed = execution.target.operand("model.llm.embed.weight")?.buffer;
         execution.draft = Some(std::rc::Rc::new(super::draft::Binding::new_dflash(
             programs, stream.clone(), layout, &admitted.solved, embed, cfg.text.unpadded_vocab_size, cfg.text.rms_norm_eps as f32,
-            usize::try_from(inputs.prefill.rows)?, usize::try_from(inputs.prefill.waves)?, inputs.prefix_mark_slots)?));
+            usize::try_from(inputs.prefill.rows)?, usize::try_from(inputs.prefill.waves)?, decode_rows, inputs.prefix_mark_slots)?));
         let report = crate::shared::draft::report::admitted(crate::shared::draft::report::Kind::Dflash2,
             crate::shared::draft::report::Placement::Whole, 0, &physical, &admitted.solved)?;
         crate::shared::draft::report::publish(report);
@@ -361,7 +375,7 @@ pub(crate) fn whole<'a>(
 
     let graph_keys = cuteafd_loader::serving_capacity::inkling2_mini_graphs::KeySpace::for_config(
         inputs.sequences,
-        DECODE_ROWS,
+        decode_rows,
         inputs.drafter.is_some() || inputs.dflash.is_some(),
     );
     let graph_policy = cuteafd_loader::serving_capacity::inkling2_mini_graphs::policy(0, graph_keys)?;

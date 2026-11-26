@@ -39,8 +39,9 @@ pub fn mark_bytes(cfg: &GlmDflashConfig, kv: Qwen4KvCache) -> usize {
 }
 
 impl Layout {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(snapshot: &Path, target: &Inkling2MiniConfig, slots: usize, prefill: usize,
-        waves: usize, sms: usize, kv_cache: Qwen4KvCache, manifest: Option<&serde_json::Value>) -> Result<Self> {
+        waves: usize, decode_rows: usize, sms: usize, kv_cache: Qwen4KvCache, manifest: Option<&serde_json::Value>) -> Result<Self> {
         let config = config(snapshot, target)?;
         let capacity = GlmDraftCapacity::new(slots, slots.min(8), config.block)?;
         let representation = GlmDraftRepresentation::Bf16Only;
@@ -52,7 +53,7 @@ impl Layout {
             }
         }
         let (target, _) = crate::families::inkling2::draft::target_owners(config.hidden, config.taps.len(),
-            slots, prefill, waves, super::execution::DECODE_ROWS, 1)?;
+            slots, prefill, waves, decode_rows, 1)?;
         let mark_bytes = mark_bytes(&config, kv_cache);
         Ok(Self { snapshot: snapshot.into(), config, capacity, physical, arena, target, mark_bytes, kv_cache })
     }

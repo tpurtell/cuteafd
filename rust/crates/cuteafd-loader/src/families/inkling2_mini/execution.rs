@@ -8,8 +8,15 @@ use std::collections::BTreeMap;
 pub const PREFILL_TILE_ROWS: usize = 21;
 /// Decode/verify attention tile size (1 row/tile).
 pub const DECODE_TILE_ROWS: usize = 1;
-/// Decode/verify bounded batch width (C16 or C8 x 8-token MTP block).
+/// Default decode/verify bounded batch width (`DECODE_ROWS=auto`).
 pub const DECODE_ROWS: usize = 64;
+/// Maximum decode/verify rows per step supported by exported Inkling 2 Mini decode programs.
+pub const MAX_DECODE_ROWS: usize = 128;
+
+/// Compiled decode attention and FIR replay capacity covering `decode_rows`.
+pub fn replay_capacity(decode_rows: usize) -> usize {
+    if decode_rows > 64 { 128 } else { 64 }
+}
 
 /// Contiguous 16-byte-aligned device layout for all 9 read-only per-unit metadata planes.
 /// Uploaded once in `begin_unit` via a single batched H2D copy and read by all 48 visits.
@@ -246,7 +253,25 @@ impl MiniUnitLayout {
         kv_format: InklingKvCache,
         sequences: usize,
     ) -> Result<Self> {
-        let mut layout = Self::serving(cfg, DECODE_ROWS, context, kv_format, sequences)?;
+        Self::serving_decode_rows(cfg, DECODE_ROWS, context, kv_format, sequences)
+    }
+
+    pub fn serving_decode_rows(
+        cfg: &Inkling2MiniConfig,
+        decode_rows: usize,
+        context: usize,
+        kv_format: InklingKvCache,
+        sequences: usize,
+    ) -> Result<Self> {
+        ensure!(
+            (1..=MAX_DECODE_ROWS).contains(&decode_rows),
+            "Inkling 2 Mini decode rows {decode_rows} outside 1..={MAX_DECODE_ROWS} export"
+        );
+        let mut layout = Self::serving(cfg, decode_rows, context, kv_format, sequences)?;
+        let cap = replay_capacity(decode_rows);
+        layout
+            .buffers
+            .insert("attention_scratch".into(), cap * 32 * cfg.text.heads * (128 * 4 + 4));
         layout.buffers.insert(
             "decode_zero_bf16".into(),
             layout.buffers["attended"].max(layout.buffers["expert_output"]),
@@ -415,7 +440,15 @@ mod tests {
         assert_eq!(decode.buffers["prev_pass_arena"], 2 * 64 * 2304 * 4);
         assert_eq!(decode.buffers["cross_pass_msg"], 4 * 64 * 2304 * 4);
         assert_eq!(decode.buffers["expert_wire"], 64 * 2376);
+        assert_eq!(decode.buffers["attention_scratch"], 64 * 32 * 24 * (128 * 4 + 4));
         assert!(decode.buffers.contains_key("decode_zero_bf16"));
+
+        let wide = MiniUnitLayout::serving_decode_rows(&cfg, 128, 262_144, InklingKvCache::Fp8, 16)?;
+        assert_eq!(wide.rows, 128);
+        assert_eq!(wide.buffers["residual_arena"], 5 * 128 * 2304 * 4);
+        assert_eq!(wide.buffers["expert_wire"], 128 * 2376);
+        assert_eq!(wide.buffers["attention_scratch"], 128 * 32 * 24 * (128 * 4 + 4));
+        assert!(MiniUnitLayout::serving_decode_rows(&cfg, 129, 262_144, InklingKvCache::Fp8, 16).is_err());
 
         let prefill = MiniUnitLayout::serving(&cfg, 2048, 262_144, InklingKvCache::Fp8, 16)?;
         assert!(!prefill.buffers.contains_key("ring"));

@@ -628,6 +628,13 @@ def inkling2_mini_attention_programs(decode_rows: int, prefill_rows: int):
                 result.append((f"{kind}_attention_{route}_{kv_format}_v2_m{rows}",
                                "attention", params,
                                partial(compile_inkling2_attention_aot, INKLING2_MINI, **params)))
+    if decode_rows < 128:
+        for kind in ("local", "global"):
+            for kv_format in (("bf16", "fp8") if kind == "global" else ("bf16",)):
+                params = dict(kind=kind, route="decode", max_rows=128, kv_format=kv_format)
+                result.append((f"{kind}_attention_decode_{kv_format}_v2_m128",
+                               "attention", params,
+                               partial(compile_inkling2_attention_aot, INKLING2_MINI, **params)))
     return result
 
 
@@ -737,6 +744,13 @@ def inkling2_mini_fir_programs():
                                           ("strided", 4096, compile_inkling2_convolution_strided_aot)):
             out.append((f"conv_{kind}_h{width}_f32_{suffix}", f"convolution_{suffix}", {"max_rows": capacity},
                         partial(compile_, **params)))
+    out.append(("fir_history_commit_m128", "fir_history_commit", {"max_rows": 128},
+                partial(compile_fir_history_commit_aot, max_rows=128)))
+    for width, dynamic in ((2304, False), (1024, False), (1024, True)):
+        kind = "dynamic" if dynamic else "static"
+        params = dict(width=width, heads=width // 128 if dynamic else 1, dynamic=dynamic)
+        out.append((f"conv_{kind}_h{width}_f32_replay_m128", "convolution_replay", {"max_rows": 128},
+                    partial(compile_inkling2_convolution_replay_aot, max_rows=128, **params)))
     return out
 
 
@@ -2506,8 +2520,8 @@ def main() -> None:
                          functools.partial(compile_padded_transpose_aot, dtype=torch.bfloat16, rows=16, cols=1024, padded_cols=64)))
             existing_all.add(("inkling2", "padded_transpose_bf16_r16_c1024_p64"))
         for suffix, op, params, compile_ in inkling2_mini_fir_programs():
-            family = "fir" if suffix == "fir_history_commit" else "inkling2"
-            name = "history_commit" if family == "fir" else suffix
+            family = "fir" if suffix.startswith("fir_history_commit") else "inkling2"
+            name = suffix.removeprefix("fir_") if family == "fir" else suffix
             if (family, name) not in existing_all:
                 work.append((family, name, op, params, compile_))
                 existing_all.add((family, name))

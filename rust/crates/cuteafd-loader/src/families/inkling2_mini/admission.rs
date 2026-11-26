@@ -2,7 +2,6 @@
 use crate::families::inkling2::draft::{prefix_mark_slots, DraftLayout, Selection};
 use crate::families::inkling2::execution::SequenceLayout;
 use crate::families::inkling2_mini::{
-    execution::DECODE_ROWS,
     weight_layout::{layer_experts, MiniTargetWeights},
     Inkling2MiniConfig, InklingKvCache,
 };
@@ -66,6 +65,8 @@ pub struct FactsRequest<'a> {
     pub manifest: Option<Arc<serde_json::Value>>,
     pub coordinator: Coordinator,
     pub prefill: PrefillShape,
+    /// Admitted per-lane decode/verify row budget (`DECODE_ROWS`, 1..=128).
+    pub decode_rows: u32,
     pub context_tokens: u64,
     pub pool_tokens: Option<u64>,
     pub target_pool_tokens: Option<u64>,
@@ -193,6 +194,16 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         ));
     }
     let shape = request.prefill;
+    let decode_rows = request.decode_rows;
+    if !(1..=shared::MAX_DECODE_ROWS).contains(&decode_rows) {
+        return Err(refused(
+            format!(
+                "Inkling 2 Mini decode_rows {decode_rows} exceeds supported 1..={}",
+                shared::MAX_DECODE_ROWS
+            ),
+            "Set DECODE_ROWS to auto or 1..=128.",
+        ));
+    }
     let routed: Vec<usize> = (0..t.layers).collect();
     let SelectedWeights { target, drafter } = weights;
     let mut mount = target
@@ -208,7 +219,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
     let local = local_package(
         request.catalog,
         request.manifest_path,
-        shape.rows.max(DECODE_ROWS as u64),
+        shape.rows.max(u64::from(decode_rows)),
         allow_fallback,
     );
     let program_set = match (&request.coordinator, request.manifest.as_deref()) {
@@ -232,7 +243,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
     };
     let graph_keys = crate::serving_capacity::inkling2_mini_graphs::KeySpace::for_config(
         request.sequences,
-        DECODE_ROWS,
+        decode_rows as usize,
         request.drafter.is_some() || request.dflash.is_some(),
     );
     let graph_reserve = crate::serving_capacity::inkling2_mini_graphs::policy(0, graph_keys)
@@ -254,7 +265,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         .map_err(|error| refused(format!("Inkling 2 Mini 48-slot state refused: {error}"), "Check window geometry."))?;
     let dflash = request.dflash.map(|(snapshot, selection)| {
         super::dflash::Layout::new(snapshot, cfg, usize::try_from(request.sequences)?,
-            usize::try_from(shape.rows)?, usize::try_from(shape.waves)?, selection.sms,
+            usize::try_from(shape.rows)?, usize::try_from(shape.waves)?, decode_rows as usize, selection.sms,
             selection.kv_cache, request.manifest.as_deref())
     }).transpose().map_err(|error| refused(format!("Mini DFlash2 inventory refused: {error:#}"),
         "Provide complete DFlash2 checkpoint headers and native BF16 projection exports."))?;
@@ -351,7 +362,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         .drafter
         .zip(drafter)
         .map(|(selection, (config, weights, _))| {
-            DraftLayout::from_weights(
+            DraftLayout::from_weights_for_decode_rows(
                 config,
                 weights,
                 usize::try_from(request.sequences)?,
@@ -360,6 +371,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
                 usize::try_from(pool.maximum_tokens())?,
                 usize::try_from(shape.rows)?,
                 usize::try_from(shape.waves)?,
+                decode_rows as usize,
                 selection.sms,
                 selection.kv_cache,
                 request.manifest.as_deref(),
@@ -375,6 +387,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         context: ctx,
         pool,
         prefill: shape,
+        decode_rows,
         sequences: request.sequences,
         prefix_entries: request.prefix_entries,
         prefix_mark_budget: request.prefix_mark_budget,

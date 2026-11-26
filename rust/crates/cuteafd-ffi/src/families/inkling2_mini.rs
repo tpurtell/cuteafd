@@ -23,24 +23,40 @@ pub struct Attention<'a> {
     program: Program<'a>,
     kind: Kind,
     route: Route,
+    capacity: usize,
     scratch: usize,
     fp8: bool,
 }
 
 impl<'a> Attention<'a> {
     pub fn load(programs: &'a Programs<'a>, kind: Kind, route: Route, fp8: bool) -> Result<Self> {
+        Self::load_rows(programs, kind, route, fp8, route_capacity(route))
+    }
+
+    pub fn load_rows(
+        programs: &'a Programs<'a>,
+        kind: Kind,
+        route: Route,
+        fp8: bool,
+        capacity: usize,
+    ) -> Result<Self> {
         ensure!(!fp8 || kind == Kind::Global, "Inkling 2 Mini FP8 local ring unsupported");
+        let valid_cap = match route {
+            Route::Decode => matches!(capacity, 64 | 128),
+            Route::Prefill => capacity == 4096,
+        };
+        ensure!(valid_cap, "Inkling 2 Mini attention capacity {capacity} unsupported for {route:?}");
         let name = format!(
             "inkling2_mini_{}_attention_{}_{}_v2_m{}",
             kind_name(kind),
             route_name(route),
             if fp8 { "fp8" } else { "bf16" },
-            route_capacity(route),
+            capacity,
         );
         let pointers = if kind == Kind::Local { LOCAL } else { GLOBAL };
         let program = programs.program(&name, pointers)?;
-        let scratch = validate_manifest(program.spec(), kind, route, fp8)?;
-        Ok(Self { program, kind, route, scratch, fp8 })
+        let scratch = validate_manifest(program.spec(), kind, route, fp8, capacity)?;
+        Ok(Self { program, kind, route, capacity, scratch, fp8 })
     }
 
     pub fn scratch_bytes(&self) -> usize { self.scratch }
@@ -115,7 +131,7 @@ impl<'a> Attention<'a> {
     }
 
     fn common(&self, b: Batch) -> Result<Vec<(Buffer, usize, usize)>> {
-        ensure!((1..=route_capacity(self.route)).contains(&b.rows) && (1..=b.rows).contains(&b.tiles),
+        ensure!((1..=self.capacity).contains(&b.rows) && (1..=b.rows).contains(&b.tiles),
             "Inkling 2 Mini attention live rows exceed export");
         Ok(vec![
             (b.tile_rows, b.tiles * 4, 4),
@@ -129,7 +145,7 @@ impl<'a> Attention<'a> {
     }
 }
 
-fn validate_manifest(spec: &ProgramSpec, kind: Kind, route: Route, fp8: bool) -> Result<usize> {
+fn validate_manifest(spec: &ProgramSpec, kind: Kind, route: Route, fp8: bool, capacity: usize) -> Result<usize> {
     let pointers = if kind == Kind::Local { LOCAL } else { GLOBAL };
     let scalars: &[u8] = match (kind, route) {
         (Kind::Local, _) => b"ii",
@@ -138,7 +154,7 @@ fn validate_manifest(spec: &ProgramSpec, kind: Kind, route: Route, fp8: bool) ->
     };
     ensure!(spec.pointers.iter().map(String::as_str).eq(pointers.iter().copied())
         && spec.scalar_kinds == scalars
-        && spec.capacity_rows as usize == route_capacity(route),
+        && spec.capacity_rows as usize == capacity,
         "Inkling 2 Mini attention export ABI/capacity differs");
     let g = &spec.geometry;
     for (key, value) in [
@@ -152,7 +168,7 @@ fn validate_manifest(spec: &ProgramSpec, kind: Kind, route: Route, fp8: bool) ->
         ("page_rows", PAGE_ROWS),
         ("ring_rows", RING_ROWS),
         ("extent", 1024),
-        ("max_rows", route_capacity(route)),
+        ("max_rows", capacity),
         ("window", if kind == Kind::Local { 1024 } else { 0 }),
         ("max_splits", if kind == Kind::Global && route == Route::Decode { 32 } else { 1 }),
         ("rows_per_cta", if route == Route::Decode { 1 } else { PREFILL_TOKENS }),
@@ -165,7 +181,7 @@ fn validate_manifest(spec: &ProgramSpec, kind: Kind, route: Route, fp8: bool) ->
         && g["sinks"] == "per_row_head",
         "Inkling 2 Mini attention bias/sink convention differs");
     let expected = if kind == Kind::Global && route == Route::Decode {
-        route_capacity(route) * 32 * HEADS * (HEAD_DIM * 4 + 4)
+        capacity * 32 * HEADS * (HEAD_DIM * 4 + 4)
     } else {
         1024
     };
@@ -194,4 +210,72 @@ fn validate_buffers(buffers: &[(Buffer, usize, usize)], writers: &[Buffer]) -> R
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(kind: Kind, route: Route, fp8: bool, capacity: usize) -> ProgramSpec {
+        let pointers = if kind == Kind::Local { LOCAL } else { GLOBAL };
+        let scalar_kinds = match (kind, route) {
+            (Kind::Local, _) => b"ii".to_vec(),
+            (Kind::Global, Route::Prefill) => b"iii".to_vec(),
+            (Kind::Global, Route::Decode) => b"iiii".to_vec(),
+        };
+        let scratch = if kind == Kind::Global && route == Route::Decode {
+            capacity * 32 * HEADS * (HEAD_DIM * 4 + 4)
+        } else {
+            1024
+        };
+        ProgramSpec {
+            name: format!(
+                "inkling2_mini_{}_attention_{}_{}_v2_m{capacity}",
+                kind_name(kind),
+                route_name(route),
+                if fp8 { "fp8" } else { "bf16" },
+            ),
+            pointers: pointers.iter().map(|s| (*s).into()).collect(),
+            scalar_kinds,
+            capacity_rows: capacity as u32,
+            scratch: [("scratch".into(), scratch as u64)].into(),
+            geometry: serde_json::json!({
+                "heads": HEADS,
+                "kv_heads": KV_HEADS,
+                "head_dim": HEAD_DIM,
+                "record_elems": 2048,
+                "record_bytes": if fp8 { FP8_RECORD_BYTES } else { RECORD_BYTES },
+                "cache_abi": 2,
+                "kv_format": if fp8 { "fp8" } else { "bf16" },
+                "scale_offset": if fp8 { 2048 } else { 0 },
+                "page_rows": PAGE_ROWS,
+                "ring_rows": RING_ROWS,
+                "extent": 1024,
+                "max_rows": capacity,
+                "window": if kind == Kind::Local { 1024 } else { 0 },
+                "max_splits": if kind == Kind::Global && route == Route::Decode { 32 } else { 1 },
+                "rows_per_cta": if route == Route::Decode { 1 } else { PREFILL_TOKENS },
+                "kind": kind_name(kind),
+                "route": route_name(route),
+                "sinks": "per_row_head",
+            }),
+        }
+    }
+
+    #[test]
+    fn decode_manifest_validates_64_and_128_row_geometry_and_scratch() {
+        for cap in [64usize, 128] {
+            for (kind, fp8) in [(Kind::Local, false), (Kind::Global, false), (Kind::Global, true)] {
+                let s = spec(kind, Route::Decode, fp8, cap);
+                let expected = if kind == Kind::Global {
+                    cap * 32 * HEADS * (HEAD_DIM * 4 + 4)
+                } else {
+                    1024
+                };
+                assert_eq!(validate_manifest(&s, kind, Route::Decode, fp8, cap).unwrap(), expected);
+                let other = if cap == 64 { 128 } else { 64 };
+                assert!(validate_manifest(&s, kind, Route::Decode, fp8, other).is_err());
+            }
+        }
+    }
 }

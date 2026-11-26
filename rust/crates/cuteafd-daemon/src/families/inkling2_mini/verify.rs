@@ -48,14 +48,22 @@ pub(crate) struct Verify<'a> {
     layout: Layout,
     mark_layout: MarkLayout,
     stream: Rc<Stream<'a>>,
+    decode_rows: usize,
     owner: u64,
     generation: Cell<u64>,
     pending: RefCell<Option<Vec<Submitted>>>,
 }
 
 impl<'a> Verify<'a> {
-    pub fn new(programs: &'a Programs<'a>, stream: Rc<Stream<'a>>, slots: usize, width: usize) -> Result<Self> {
-        let layout = Layout::contiguous(slots, width)?;
+    pub fn new(
+        programs: &'a Programs<'a>,
+        stream: Rc<Stream<'a>>,
+        slots: usize,
+        width: usize,
+        decode_rows: usize,
+    ) -> Result<Self> {
+        let replay_rows = cuteafd_loader::families::inkling2_mini::execution::replay_capacity(decode_rows);
+        let layout = Layout::contiguous_rows(slots, width, replay_rows)?;
         let commit = Commit::load(programs, layout)?;
         let mark_layout = MarkLayout::new(&[(stream.device.id, layout.history_bytes()?)])?;
         let checkpoint = Rc::new(Allocation::new(
@@ -68,7 +76,11 @@ impl<'a> Verify<'a> {
             layout.replay_bytes()?,
             Tag::workspace("inkling2_mini/verify-conv-replay"),
         )?;
-        let table = Allocation::new(stream.device, 64 * 12, Tag::workspace("inkling2_mini/verify-conv-table"))?;
+        let table = Allocation::new(
+            stream.device,
+            replay_rows * 12,
+            Tag::workspace("inkling2_mini/verify-conv-table"),
+        )?;
         let owner = NEXT_OWNER
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_| anyhow::anyhow!("Inkling 2 Mini verify owner identity exhausted"))?;
@@ -80,6 +92,7 @@ impl<'a> Verify<'a> {
             layout,
             mark_layout,
             stream,
+            decode_rows,
             owner,
             generation: Cell::new(0),
             pending: Default::default(),
@@ -144,7 +157,7 @@ impl<'a> Verify<'a> {
             );
             total += row.rows;
         }
-        ensure!(total <= 64, "Mini verified rows exceed bounded replay");
+        ensure!(total <= self.decode_rows, "Mini verified rows exceed bounded replay");
         *self.pending.borrow_mut() = Some(rows);
         Ok(())
     }

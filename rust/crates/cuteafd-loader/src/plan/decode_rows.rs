@@ -279,4 +279,15 @@ mod tests {
             assert!(err.to_string().contains("inkling2_*_m256"), "{err}");
         }
     }
+
+    #[test]
+    fn inkling2_mini_supports_128_and_refuses_above_128() {
+        let mini = &crate::plan::families::inkling2_mini::INKLING2_MINI;
+        assert_eq!(resolve(mini, req(None, 16, 1, 1, None)).unwrap(), 64);
+        assert_eq!(resolve(mini, req(Some(128), 16, 1, 1, None)).unwrap(), 128);
+        assert_eq!(resolve(mini, req(Some(128), 48, 1, 1, None)).unwrap(), 128);
+        let err = resolve(mini, req(Some(256), 32, 1, 1, None)).unwrap_err();
+        assert!(matches!(err, PlanError::UnsupportedDecodeRows { value: 256, capacity: 128, .. }), "{err}");
+        assert!(err.to_string().contains("inkling2_mini_*_m256"), "{err}");
+    }
 }

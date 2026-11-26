@@ -59,6 +59,10 @@ impl<'a> MiniHead<'a> {
         })
     }
 
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
     pub fn inventory(&self, inventory: &mut crate::shared::memory::receipts::Inventory<'_>, prefix: &str) -> Result<()> {
         for (name, owner) in [
             ("tokens", &self.tokens),
