@@ -28,7 +28,7 @@ from checkpoint_tokenizer import load_tokenizer, tokenizer_identity
 from fidelity_generation import token_ids
 
 FAMILIES = ("deepseek_v41", "mimo_v2", "qwen4", "qwen3_5", "glm5_flash", "deepseek_v4", "glm5", "step5", "kimi_k3", "kimi_k31",
-            "muse_spark", "mistral_large4", "minimax_m3", "inkling2", "inkling2_mini", "hy4_flash", "hy4")
+            "muse_spark", "mistral_large4", "minimax_m3", "inkling2", "inkling2_mini", "hy4_flash", "hy4", "ernie55_flash")
 REPO_FILES = ["rust/crates/cuteafd-api/src/openai/probe.rs", "scripts/bench/bench-agentic-session.py",
               "python/reference/families/deepseek_v41/golden.py", "rust/crates/cuteafd-bench/src/client.rs",
               "scripts/bench/make-fidelity-reference.py", "rust/crates/cuteafd-bench/src/reference.rs",
@@ -512,7 +512,7 @@ def build_set(*, family: str, model: str, checkpoint: str, version: str, arm: di
         generate(f"b{i:02d}", "B", [{"role": "user", "content": f"Explain invariants and propose a small safe modification to {files[i % len(files)]}.\n" + (root / files[i % len(files)]).read_text()}], 10240 + (i % 3) * 1024)
     # Hy4's hosted prompts use only the small public fixture repo. Plain-code
     # windows are scored locally and can use the usual longer source files.
-    code_files = REPO_FILES if family in ("hy4_flash", "hy4") and probe.identity.get("text_source") == "api" else files
+    code_files = REPO_FILES if family in ("hy4_flash", "hy4", "ernie55_flash") and probe.identity.get("text_source") == "api" else files
     code_sources = [source(root, path) for path in code_files] if code_files is not files else sources
     for i in range(10):
         ids = token_ids(tokenizer, (root / code_files[i % len(code_files)]).read_text())

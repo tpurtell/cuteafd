@@ -414,7 +414,7 @@ def verify_snapshot(manifest: dict, snapshot: Path) -> dict:
     generation = manifest.get("generation_arm", {})
     if generation.get("chat_template_kind") == "checkpoint_encoder":
         encoder_file = generation.get("chat_encoder_file")
-        if encoder_file != "encoding/encoding.py":
+        if encoder_file not in ("encoding/encoding.py", "encoding_ernie.py"):
             raise ValueError("unsupported checkpoint chat encoder path")
         encoder = snapshot / encoder_file
         if (not encoder.is_file() or hashlib.sha256(encoder.read_bytes()).hexdigest()

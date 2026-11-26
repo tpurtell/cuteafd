@@ -55,9 +55,10 @@ class ChatRenderer:
         self.template_date = template_date
         self.native = getattr(tokenizer, "_fidelity_identity", None)
         self.encoder = getattr(tokenizer, "_fidelity_encode_messages", None)
+        self.segment_renderer = getattr(tokenizer, "_fidelity_render_chat", None)
         if template_date is not None and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", template_date):
             raise ValueError("template date must be YYYY-MM-DD")
-        if self.encoder:
+        if self.encoder or self.segment_renderer:
             self.identity = tokenizer._fidelity_chat_identity
         elif self.native:
             self.identity = {**self.native, "chat_template_kind": "checkpoint_python",
@@ -78,7 +79,7 @@ class ChatRenderer:
         effort = nested if nested is not None else effort
         if self.native:
             return {"thinking_effort": effort} if effort is not None else {}
-        if self.encoder:
+        if self.encoder or self.segment_renderer:
             # Checkpoint encoders take effort/thinking directly in render(); no Jinja options.
             return {}
         template = self.tokenizer.get_chat_template()
@@ -92,10 +93,23 @@ class ChatRenderer:
             options["response_format"] = body["response_format"]
         return options
 
+    def _render_segments(self, body, messages, *, add_generation_prompt):
+        effort = (body.get("reasoning") or {}).get("effort") or body.get("reasoning_effort") or "high"
+        enable_thinking = body.get("thinking", {}).get("type") != "disabled"
+        return self.segment_renderer(
+            normalized_messages(messages),
+            tools=body.get("tools"),
+            add_generation_prompt=add_generation_prompt,
+            enable_thinking=enable_thinking,
+            reasoning_effort=effort,
+        )
+
     def render(self, body, assistant=None):
         messages = normalized_messages(body["messages"])
         if assistant is not None:
             messages += normalized_messages([assistant])
+        if self.segment_renderer:
+            return self._render_segments(body, messages, add_generation_prompt=assistant is None).text
         if self.encoder:
             if body.get("tools"):
                 if not messages or messages[0]["role"] != "system":
@@ -112,6 +126,12 @@ class ChatRenderer:
         """Render a full conversation (no generation prompt) to checkpoint token ids."""
         rendered = copy.deepcopy(body)
         rendered["messages"] = messages
+        if self.segment_renderer:
+            chat = self._render_segments(rendered, messages, add_generation_prompt=False)
+            ids = self.tokenizer.encode_segments(chat.segments)
+            if self.tokenizer.decode(ids, skip_special_tokens=False, clean_up_tokenization_spaces=False) != chat.text:
+                raise ValueError("conversation does not re-tokenize losslessly")
+            return ids
         if self.native:
             options = self.template_options(rendered)
             conversation = normalized_messages(messages)
@@ -139,6 +159,9 @@ class ChatRenderer:
         return ids
 
     def prompt(self, body):
+        if self.segment_renderer:
+            chat = self._render_segments(body, body["messages"], add_generation_prompt=True)
+            return self.tokenizer.encode_segments(chat.segments)
         if self.native:
             return list(self.tokenizer.apply_chat_template(
                 normalized_messages(body["messages"]), tools=body.get("tools"),
@@ -151,7 +174,13 @@ class ChatRenderer:
             raise ValueError("checkpoint template rewrites the generation prefix; cannot reconstruct API span")
         text = full[len(prompt):]
         prompt_ids = self.prompt(body)
-        if self.native:
+        if self.segment_renderer:
+            chat = self._render_segments(body, body["messages"] + [assistant], add_generation_prompt=False)
+            full_ids = self.tokenizer.encode_segments(chat.segments)
+            if full_ids[:len(prompt_ids)] != prompt_ids:
+                raise ValueError("checkpoint tokenizer rewrites the generation prefix")
+            generated = full_ids[len(prompt_ids):]
+        elif self.native:
             full_ids = list(self.tokenizer.apply_chat_template(
                 normalized_messages(body["messages"] + [assistant]), tools=body.get("tools"),
                 tokenize=True, add_generation_prompt=False, **self.template_options(body)))
@@ -297,12 +326,12 @@ class APIClient(TextGenerator):
         request = copy.deepcopy(body)
         request["model"] = self.model
         request.update(self.extra_body)
-        explicit_inkling_effort = (self.family in ("inkling2", "inkling2_mini")
+        explicit_effort = (self.family in ("inkling2", "inkling2_mini", "ernie55_flash")
             and (request.get("reasoning") or {}).get("effort") is not None)
-        if explicit_inkling_effort:
+        if explicit_effort:
             request.pop("reasoning_effort", None)
         record = self.cache.find(request)
-        if (record is None and not explicit_inkling_effort
+        if (record is None and not explicit_effort
                 and urllib.parse.urlsplit(self.endpoint).hostname == "openrouter.ai"):
             # Reuse old exact requests first; budget only newly purchased responses.
             reasoning_options = copy.deepcopy(request.get("reasoning") or {})
