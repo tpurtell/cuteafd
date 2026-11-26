@@ -41,16 +41,22 @@ locks are free again (bound + HARD_STOP_S), or null without --max-run. A
 request with --max-run, not --gate, not inside a live gate, may start before
 older live tickets that want some of its locks only when all of these hold:
   - none of its locks is flocked or named by a live holder record;
-  - for every such older ticket T (still waiting: a granted gate's locks are
-    named by its holder record), each lock T wants beyond ours is free or held by recorded holders that
-    all have a release_by; at least one is held; and our own release_by is no
-    later than W(T), the earliest of those release_by values (T cannot start
-    before that blocker is gone, and it must be gone by then).
+  - for every such older ticket T, our own release_by is no later than its
+    blocking deadline W(T). Compute W in ticket order, considering only older
+    overlapping tickets. If T has held locks, W(T) is the earliest recorded
+    blocker deadline, as before. If all T's locks are free, apply this same
+    backfill rule to T: if it could start now, W(T) is now; otherwise inherit
+    the earliest deadline of the older tickets that prevent its grant. An
+    unbounded or gate request cannot itself backfill.
 A lock held outside the queue (plain flock, `cuteafd bench smoke`) or by a
 holder without a bound counts as "may free any moment", so nobody backfills
-past a ticket waiting on it. A backfilled job is gone by W(T), so it keeps T
-waiting at most until W(T); every backfill fits under the same W(T), so no
-number of small jobs moves T's start past it. The bound must cover the
+past a ticket waiting on it, directly or through an older blocking ticket.
+A granted gate's locks are named by its holder record even when not flocked;
+its own children retain their gate exemption, not a backfill grant.
+A backfilled job is gone by W(T), preserving the existing no-delay guarantee
+at the recorded deadlines (a holder may in fact finish earlier). Every
+backfill fits under that same deadline; a convoy of waiting tickets does not
+make it later. The bound must cover the
 at-grant preflight and CMD's own teardown. Inside a live gate the gate's own
 bound applies (its children take flocks without tickets or records).
 A request without --max-run never backfills and queues exactly as before.
@@ -153,9 +159,11 @@ def _publish(queue: Path, seq: int, suffix: str, data: dict) -> tuple[Path, obje
     return path, handle
 
 
-def _take_ticket(queue: Path, locks: list[str], max_run: float | None = None) -> tuple[int, Path, object]:
+def _take_ticket(queue: Path, locks: list[str], max_run: float | None = None,
+                 gate: bool = False) -> tuple[int, Path, object]:
     seq = _next_seq(queue)
-    data = dict(locks=locks, pid=os.getpid(), host=socket.gethostname(), created=time.time(), argv=sys.argv[1:][:8])
+    data = dict(locks=locks, pid=os.getpid(), host=socket.gethostname(), created=time.time(), argv=sys.argv[1:][:8],
+                gate=gate, gate_ancestors=sorted(gate_ancestors()))
     if max_run is not None:
         data['max_run'] = max_run
     path, handle = _publish(queue, seq, 'ticket', data)
@@ -227,28 +235,71 @@ def backfill_check(queue: Path, locks: list[str], seq: int, max_run: float, now:
     for _, _, data in holders:
         for name in data.get('locks', []):
             release.setdefault(name, []).append(data.get('release_by'))
-    # A granted ticket's record names all of its locks, so an older ticket that
-    # holds its turn (a gate) and overlaps ours is refused here too.
+    # Snapshot the physical lock state at most once per name, including locks
+    # held without a queue record. A granted gate counts as holding its locks.
+    busy: dict[str, bool] = {}
+
+    def lock_busy(name):
+        if name not in busy:
+            busy[name] = _lock_busy(name)
+        return busy[name]
+
     for name in locks:
-        if name in release:
+        if name in release or lock_busy(name):
             return False, f'{name} is held'
-    wanted, ancestors, passed = set(locks), gate_ancestors(), []
+
+    # Each entry is (locks, blocking deadline, reason). A None deadline means
+    # the ticket could start now or its blocker may disappear at any moment.
+    # Evaluate only earlier tickets, so the dependency walk cannot cycle.
+    waiting = {}
+    ancestors = gate_ancestors()
     for other, _, data in _live_entries(queue, 'ticket'):
+        if other >= seq:
+            break
         theirs = set(data.get('locks', []))
-        if other >= seq or other in ancestors or not wanted & theirs:
-            continue
         bounds = []
-        for name in sorted(theirs - wanted):
+        reason = ''
+        for name in sorted(theirs):
             if name in release:
                 if any(bound is None for bound in release[name]):
-                    return False, f'ticket {other} waits on {name}, held without a bound'
+                    reason = f'ticket {other} waits on {name}, held without a bound'
+                    break
                 bounds.append(max(release[name]))
-            elif _lock_busy(name):
-                return False, f'ticket {other} waits on {name}, held outside the queue'
-        if not bounds:
-            return False, f'ticket {other} could start now'
-        if ours > min(bounds):
-            return False, f'our bound ends {ours - min(bounds):.0f} s after ticket {other}\'s first blocker must release'
+            elif lock_busy(name):
+                reason = f'ticket {other} waits on {name}, held outside the queue'
+                break
+        if reason:
+            deadline = None
+        elif bounds:
+            deadline = min(bounds)
+        else:
+            # Free physical locks alone do not mean a ticket can start. Check
+            # the same backfill budget it would have to satisfy at this poll.
+            # Legacy tickets lack gate metadata; assuming a bounded one can
+            # backfill is conservative (it may instead have to wait).
+            budget = data.get('max_run')
+            end = now + budget + HARD_STOP_S if budget is not None and not data.get('gate') else None
+            exempt = set(data.get('gate_ancestors', []))
+            blockers = [(bound, why) for older, (wanted, bound, why) in waiting.items()
+                        if older not in exempt and theirs & wanted
+                        and (end is None or bound is None or end > bound)]
+            if blockers:
+                deadline, reason = min(blockers, key=lambda entry: entry[0] if entry[0] is not None else now)
+                if deadline is None:
+                    reason = f'ticket {other} waits behind {reason}'
+            else:
+                deadline = None
+                reason = f'ticket {other} could start now'
+        waiting[other] = (theirs, deadline, reason)
+
+    wanted, passed = set(locks), []
+    for other, (theirs, deadline, reason) in waiting.items():
+        if other in ancestors or not wanted & theirs:
+            continue
+        if deadline is None:
+            return False, reason
+        if ours > deadline:
+            return False, f'our bound ends {ours - deadline:.0f} s after ticket {other}\'s first blocker must release'
         passed.append(other)
     return True, 'ahead of ticket(s) ' + ','.join(map(str, passed))
 
@@ -429,7 +480,7 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
             for handle in held:
                 handle.close()
         return
-    seq, path, ticket = _take_ticket(queue, locks, max_run)
+    seq, path, ticket = _take_ticket(queue, locks, max_run, gate)
     GATE_SEQ[0] = seq
     deadline = time.monotonic() + wait
     held, announced, backfill = None, False, False

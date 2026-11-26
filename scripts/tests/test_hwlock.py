@@ -507,6 +507,101 @@ def test_backfill_rule_matrix(lockdir):
         item.close()
 
 
+def test_backfill_transitive_convoy(lockdir):
+    # The live 2026-11-26 queue: GPU0 blocks the full-cluster head, which
+    # blocks a long GPU1+Spark job even though its locks are all free.
+    queue = hwlock._queue()
+    now = time.time()
+    keep = hwlock._try_flocks(['gpu0'])
+
+    def publish(seq, suffix, **data):
+        path, handle = hwlock._publish(queue, seq, suffix, data)
+        keep.append(handle)
+        return path, handle
+
+    publish(1, 'held', locks=['gpu0'], release_by=now + 6900)
+    publish(2, 'ticket', locks=WHOLE.split(','), max_run=6375)
+    long = ['sparks', 'gpu1', 'rhea', 'moa']
+    publish(3, 'ticket', locks=long, max_run=22350)
+    publish(4, 'ticket', locks=['gpu1'], max_run=18150)
+    try:
+        assert not hwlock.backfill_check(queue, long, 3, 22350, now)[0]
+        assert not hwlock.backfill_check(queue, ['gpu1'], 4, 18150, now)[0]
+        for seq, seconds in enumerate((300, 720, 2880, 5400), 5):
+            path, handle = publish(seq, 'ticket', locks=['gpu1'], max_run=seconds)
+            assert hwlock.backfill_check(queue, ['gpu1'], seq, seconds, now)[0]
+            # Preserve FIFO among eligible jobs. Later short ones can run
+            # after the first short ticket leaves, not overtake it.
+            allowed, reason = hwlock.backfill_check(queue, ['gpu1'], seq + 1, 100, now)
+            assert not allowed and f'ticket {seq} could start now' in reason
+            handle.close()
+            path.unlink()
+        assert hwlock.backfill_check(queue, ['gpu1'], 10, 6900 - hwlock.HARD_STOP_S, now)[0]
+        assert not hwlock.backfill_check(queue, ['gpu1'], 10, 6901 - hwlock.HARD_STOP_S, now)[0]
+    finally:
+        for handle in keep:
+            handle.close()
+
+
+@pytest.mark.parametrize('holder', ['bounded', 'unbounded', 'external'])
+def test_backfill_transitive_disjoint_head(lockdir, holder):
+    # The candidate does not overlap the head directly. The intermediate
+    # ticket carries the head's deadline (or lack thereof) across the chain.
+    queue = hwlock._queue()
+    now = time.time()
+    keep = hwlock._try_flocks(['gpu0'])
+    if holder != 'external':
+        keep.append(hwlock._publish(queue, 1, 'held', dict(
+            locks=['gpu0'], release_by=now + 1000 if holder == 'bounded' else None))[1])
+    keep.append(hwlock._publish(queue, 2, 'ticket', dict(locks=['gpu0', 'sparks']))[1])
+    keep.append(hwlock._publish(queue, 3, 'ticket', dict(locks=['sparks', 'gpu1'], max_run=2000))[1])
+    keep.append(hwlock._publish(queue, 4, 'ticket', dict(locks=['gpu1', 'rhea'], max_run=2000))[1])
+    try:
+        assert hwlock.backfill_check(queue, ['rhea'], 5, 100, now)[0] == (holder == 'bounded')
+        assert not hwlock.backfill_check(queue, ['rhea'], 5, 1000, now)[0]
+    finally:
+        for handle in keep:
+            handle.close()
+
+
+@pytest.mark.parametrize('metadata,allowed', [({'gate': True, 'max_run': 100}, True), ({}, True),
+                                             ({'max_run': 100}, False)])
+def test_backfill_older_ticket_eligibility(lockdir, metadata, allowed):
+    queue = hwlock._queue()
+    now = time.time()
+    keep = hwlock._try_flocks(['gpu0'])
+    keep.append(hwlock._publish(queue, 1, 'held', dict(locks=['gpu0'], release_by=now + 1000))[1])
+    keep.append(hwlock._publish(queue, 2, 'ticket', dict(locks=['gpu0', 'sparks']))[1])
+    keep.append(hwlock._publish(queue, 3, 'ticket', dict(locks=['sparks', 'gpu1'], **metadata))[1])
+    try:
+        assert hwlock.backfill_check(queue, ['gpu1'], 4, 100, now)[0] == allowed
+    finally:
+        for handle in keep:
+            handle.close()
+
+
+def test_backfill_respects_gate_ancestor_exemption(lockdir, monkeypatch):
+    queue = hwlock._queue()
+    now = time.time()
+    path, handle = hwlock._publish(queue, 1, 'ticket', dict(locks=['gpu1']))
+    try:
+        assert not hwlock.backfill_check(queue, ['gpu1'], 2, 100, now)[0]
+        monkeypatch.setenv(hwlock.GATE_ENV, '1')
+        assert hwlock.backfill_check(queue, ['gpu1'], 2, 100, now)[0]
+        # Our ancestor exemption must not be used to infer another ticket's
+        # eligibility, nor vice versa.
+        path2, handle2 = hwlock._publish(queue, 2, 'ticket', dict(
+            locks=['gpu1', 'rhea'], gate_ancestors=[1]))
+        try:
+            assert not hwlock.backfill_check(queue, ['rhea'], 3, 100, now)[0]
+        finally:
+            handle2.close()
+            path2.unlink()
+    finally:
+        handle.close()
+        path.unlink()
+
+
 def test_bounded_small_job_backfills_ahead_of_a_waiting_whole_cluster_ticket(lockdir):
     # 2026-11-23: A held sparks,gpu1; B (older) wanted the whole cluster; C wanted gpu0 and GPU0 idled.
     a = spawn_bounded(lockdir, 'sparks,gpu1', 4.0, lockdir / 'a', max_run=60)
