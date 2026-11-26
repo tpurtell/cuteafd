@@ -532,8 +532,8 @@ impl<'a> VisitOps<'a> for StatefulOps<'_, '_, 'a> {
         let rows = unit.rows.len();
         let experts = self.local[visit.layer].as_ref();
         layers::prepare_routes(self.kernels, state.unit, self.target, experts, visit.layer, rows)?;
-        layers::dispatch_experts(state.unit, experts, rows)?;
-        layers::join_visit(self.kernels, state, self.target, cfg, visit, rows)
+        let expert_output = layers::dispatch_experts(state.unit, experts, rows)?;
+        layers::join_visit(self.kernels, state, self.target, cfg, visit, expert_output, rows)
     }
 
     fn end_io(&mut self, unit: &Unit, owner: &UnitOwner<'a>) -> Result<()> {
