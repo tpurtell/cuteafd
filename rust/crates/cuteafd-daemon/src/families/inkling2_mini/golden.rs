@@ -66,6 +66,10 @@ pub(crate) struct GoldenArgs {
     pub prefill_waves: u64,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub dspark: bool,
+    #[arg(long)]
+    pub draft: Option<PathBuf>,
+    #[arg(long, requires = "draft")]
+    pub draft_oracle: Option<PathBuf>,
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[command(flatten)]
@@ -155,7 +159,8 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             context_tokens: tokens.len().max(4096) as u64,
             pool_tokens: args.pool_tokens,
             kv_format: args.kv_format,
-            drafter: args.dspark.then_some(args.draft_kv_cache),
+            drafter: (args.dspark && args.draft.is_none()).then_some(args.draft_kv_cache),
+            dflash: args.draft.as_deref().map(|p| (p, args.draft_kv_cache)),
             prefix: &args.prefix,
             resident_weights: crate::shared::memory::budget::resident_weight_limit(),
             expert_usage: false,
@@ -163,6 +168,14 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             vision: &vision,
         },
     )?;
+
+    if let Some(oracle) = &args.draft_oracle {
+        let binding = execution.draft.as_ref().ok_or_else(|| anyhow::anyhow!("Mini draft oracle missing body"))?;
+        let embed = execution.target.operand("model.llm.embed.weight")?.buffer;
+        let norm = execution.target.operand("model.llm.embed_norm.weight")?.buffer;
+        let head = execution.target.operand("model.llm.unembed.weight")?.buffer;
+        return binding.check_oracle(oracle, embed, norm, head);
+    }
 
     let pages_needed = tokens.len().div_ceil(64) as u32;
     let pool_pages = admitted.solved.pool_tokens.div_ceil(64) as u32;

@@ -971,6 +971,10 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         shutil.copytree(checkpoint_source, staged, dirs_exist_ok=True, copy_function=os.link)
     if family_config.get("model_type") == "glm_moe_dsa" and not (hf / "hub/models--incoai--GLM-5.3-DFlash2").exists():
         _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
+    if family_config.get("model_type") == "inkling2_loop" and not (
+            hf / "hub/models--incoai--Inkling-2-Mini-DFlash2").exists():
+        _snapshot(hf, "incoai/Inkling-2-Mini-DFlash2", {"architectures": ["DFlash2DraftModel"]},
+                  "4f9088ea66c21f2b99ed657d1941c306b03e84d2")
     if family_config.get("model_type") == "muse_spark" and not (
             hf / "hub/models--nvidia--Muse-Spark-Open-816B-A42B-DFlash2").exists():
         # Muse's plan reads the drafter it charges, so stage the shipped
@@ -1447,7 +1451,7 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
     hub.mkdir(parents=True)
     for model in (config.get("SPECULATOR_MODEL_ID"), "incoai/GLM-5.3-Flash-DFlash2",
                   "incoai/GLM-5.3-DFlash2", "nvidia/Muse-Spark-Open-816B-A42B-DFlash2",
-                  "Inferact/Kimi-K3.1-Pro-DSpark"):
+                  "Inferact/Kimi-K3.1-Pro-DSpark", "incoai/Inkling-2-Mini-DFlash2"):
         if model:
             cache = "models--" + model.replace("/", "--")
             source = hf_home / "hub" / cache
@@ -2574,7 +2578,8 @@ def test_mistral_large4_defaults_to_its_bundled_drafter_and_honors_explicit_off(
     assert plan[plan.index("--attention-placement") + 1] == "auto"
     serve = next(shlex.split(line) for line in result.stderr.splitlines()
                  if "docker run -d" in line and "serve-glm" in line)
-    assert "--dspark" in serve and "--draft" not in serve and "dflash2" not in " ".join(serve)
+    assert "--dspark" in serve and "--draft" not in serve
+    assert not any(arg.startswith("--draft=") for arg in serve)
     assert plan[plan.index("--speculator") + 1] == "dspark"
     assert "--draft-block" not in serve  # The bundled checkpoint supplies its native depth.
     assert ("--split-device" in serve) == (gpus == 2)
@@ -6161,7 +6166,9 @@ def test_other_family_refuses_unimplemented_context_window(tmp_path):
 
 
 @pytest.mark.parametrize("extra,want_dspark,want_graphs", [
-    ("", True, "1"),
+    ("", False, "1"),
+    ("SPECULATOR=auto\n", False, "1"),
+    ("SPECULATOR=dspark\n", True, "1"),
     ("SPECULATOR=off\nDECODE_GRAPHS=off\n", False, "0"),
 ])
 def test_inkling2_mini_tp1_launch_dispatch(tmp_path, extra, want_dspark, want_graphs):
@@ -6179,6 +6186,10 @@ def test_inkling2_mini_tp1_launch_dispatch(tmp_path, extra, want_dspark, want_gr
         assert "--draft-kv-cache fp8" in serve
     else:
         assert "--dspark=false" in serve
+        if "SPECULATOR=off" not in extra:
+            assert "--draft " in serve and "4f9088ea66c21f2b99ed657d1941c306b03e84d2" in serve
+        else:
+            assert "--draft " not in serve
 
 
 def test_inkling2_mini_refuses_non_heads_attention_placement(tmp_path):
@@ -6189,3 +6200,13 @@ def test_inkling2_mini_refuses_non_heads_attention_placement(tmp_path):
     )
     assert result.returncode == 2
     assert "inkling2_mini attention placement is TP1-only (heads)" in result.stderr
+
+
+def test_inkling2_mini_external_dflash_dispatch(tmp_path):
+    config = {"model_type": "inkling2_loop", "text_config": {"num_hidden_layers": 24}}
+    result = _family_launch_result(tmp_path, config, "thinkingmachines/Inkling-2-Mini",
+        "RTX_GPUS=1\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nVISION=off\nAUDIO=off\n"
+        "SPECULATOR=dflash2\nSPECULATOR_MODEL_ID=test/draft\nDRAFT_KV_CACHE=bf16\n")
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-inkling2-mini" in line)
+    assert "--dspark=false" in serve and "--draft " in serve and "--draft-kv-cache bf16" in serve

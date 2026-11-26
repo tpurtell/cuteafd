@@ -755,6 +755,10 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
         layout.glm5_drafter_disabled = args.speculator == "off";
         layout.minimax_dspark = family == "minimax_m3" && args.speculator == "dspark";
         layout.inkling_dspark = matches!(family, "inkling2" | "inkling2_mini") && args.speculator == "dspark";
+        if family == "inkling2_mini" && args.speculator == "dflash2" {
+            layout.inkling_mini_dflash = Some(file_args(args.clone(), &snapshot)?.drafter_snapshot
+                .context("Inkling 2 Mini DFlash2 planning requires its checkpoint")?);
+        }
         resolve_mimo_drafter(layout, &args.speculator);
         if family == "qwen3_5" { layout.dense_qwen_mtp = args.speculator == "mtp"; }
         if family == "qwen3_5" && args.speculator == "dspark" {
@@ -1107,7 +1111,8 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
             (args.speculator != "auto").then_some(args.speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str), kimi_qualification(&args, &cfg))?.value;
     }
     let default = match family {
-        "minimax_m3" | "inkling2" | "inkling2_mini" => "dspark",
+        "minimax_m3" | "inkling2" => "dspark",
+        "inkling2_mini" => "dflash2",
         "hy4_flash" if (args.include_speculator || (args.speculator == "auto"
             && cfg.get("SPECULATOR").is_none_or(|value| value == "auto")))
             && cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(
@@ -1154,7 +1159,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
-        (_, "off") | ("hy4_flash", "dfly2") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2"|"dspark") | ("muse_spark", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
+        (_, "off") | ("hy4_flash", "dfly2") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2"|"dspark") | ("muse_spark" | "inkling2_mini", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "auto") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41" | "mistral_large4" | "minimax_m3" | "inkling2" | "inkling2_mini", "dspark") => true,
         _ => false,
@@ -1211,6 +1216,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
                 ("kimi_k3", "dspark") => Some(cuteafd_core::launch_settings::KIMI_K31_DSPARK),
                 ("glm5", "dflash2") => Some("incoai/GLM-5.3-DFlash2"),
                 ("muse_spark", "dflash2") => Some("nvidia/Muse-Spark-Open-816B-A42B-DFlash2"),
+                ("inkling2_mini", "dflash2") => Some(cuteafd_loader::families::inkling2_mini::dflash::MODEL),
                 ("glm5_flash", "dflash2") => Some("incoai/GLM-5.3-Flash-DFlash2"),
                 ("glm5_flash", "dspark") => Some("RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"),
                 _ => None,
@@ -1221,6 +1227,9 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
                 .filter(|v| !v.is_empty()).map(String::as_str).or_else(|| {
                     if family == "kimi_k3" && model == cuteafd_core::launch_settings::KIMI_K31_DSPARK {
                         return Some(cuteafd_core::launch_settings::KIMI_K31_DSPARK_REVISION);
+                    }
+                    if family == "inkling2_mini" && model == cuteafd_loader::families::inkling2_mini::dflash::MODEL {
+                        return Some(cuteafd_loader::families::inkling2_mini::dflash::REVISION);
                     }
                     if family == "muse_spark" && model == "nvidia/Muse-Spark-Open-816B-A42B-DFlash2" {
                         return Some("22e2669e4c60689f9bff0749a34d9d8e59ce7cd6");
@@ -1949,6 +1958,18 @@ mod tests {
         assert_eq!(options(&args).unwrap().layout.unwrap().draft_kv_cache, Qwen4KvCache::Bf16);
         args.draft_fp8 = Some(true);
         assert!(resolve_family_config(&mut args, "inkling2", &config).is_err());
+    }
+
+    #[test]
+    fn mini_speculator_defaults_to_dflash2_and_preserves_explicit_modes() {
+        use cuteafd_loader::plan::spec::DraftOwnership;
+        for (requested, expected) in [("auto", "dflash2"), ("dflash2", "dflash2"), ("dspark", "dspark"), ("off", "off")] {
+            let mut request = args(std::path::Path::new("/model"), 0, false);
+            request.speculator = requested.into();
+            resolve_speculator(&mut request, std::path::Path::new("/model"), "inkling2_mini", &Default::default()).unwrap();
+            assert_eq!(request.speculator, expected);
+            assert_eq!(DraftOwnership::selected("inkling2_mini", expected).uses_checkpoint(), expected == "dspark");
+        }
     }
 
     #[test]

@@ -5,6 +5,7 @@
 pub mod admission;
 pub mod config;
 pub mod execution;
+pub mod dflash;
 pub mod weight_layout;
 
 pub use crate::families::inkling2::{Inkling2MtpConfig, Inkling2VisionConfig, InklingKvCache};

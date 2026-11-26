@@ -100,6 +100,7 @@ CHECKPOINTS = {
     "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4": {"model_type": "mistral_large4", "text_config": {
         "model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}},
     # Drafters the starting configs name.
+    "incoai/Inkling-2-Mini-DFlash2": {"architectures": ["DFlash2DraftModel"]},
     "incoai/GLM-5.3-DFlash2": {"architectures": ["DFlash2DraftModel"]},
     "incoai/GLM-5.3-Flash-DFlash2": {"architectures": ["DFlash2DraftModel"]},
 }
@@ -143,6 +144,8 @@ def _hub(tmp_path: Path) -> Path:
         (root / "snapshots" / "abc" / "config.json").write_text(json.dumps(config))
     draft = hf / "hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots"
     (draft / "85ef153be924f17ce4bf62726954eeaa4a73e854").symlink_to(draft / "abc")
+    mini = hf / "hub/models--incoai--Inkling-2-Mini-DFlash2/snapshots"
+    (mini / "4f9088ea66c21f2b99ed657d1941c306b03e84d2").symlink_to(mini / "abc")
     return hf
 
 
@@ -665,7 +668,7 @@ GATE_SPECULATOR_DEFAULTS = {"deepseek_v41": "dspark", "deepseek_v4": "dspark",
                             "glm5": "dflash2", "glm5_flash": "dflash2",
                             "mimo_v2": "dflash2", "qwen4": "mtp", "step5": "mtp",
                             "muse_spark": "dflash2", "minimax_m3": "dspark", "hy4_flash": "dfly2",
-                            "inkling2_mini": "dspark"}
+                            "inkling2_mini": "dflash2"}
 def _default_speculator(family: str, model: str) -> str:
     if family == "kimi_k3":
         return "dspark" if "K3.1" in model else "dflash2"

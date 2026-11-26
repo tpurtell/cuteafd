@@ -155,3 +155,17 @@ def test_forward_refuses_missing_last_committed_features_and_invalid_tp():
         model.forward(3, features[:0])
     with pytest.raises(ValueError, match="TP split"):
         model.forward(3, features, ranks=3)
+
+
+def test_mini_dflash_normalizes_anchor_and_mask_embeddings():
+    from families.glm5.dflash2.reference import Drafter
+    model = Drafter.__new__(Drafter)
+    model.inkling, model.block, model.mask, model.device = True, 8, 1, "cpu"
+    model.embed = torch.tensor([[1., 2., 3., 4.], [2., 3., 4., 5.]], dtype=torch.bfloat16)
+    model.embed_norm = torch.tensor([1., 2., 1., 3.], dtype=torch.bfloat16)
+    model.embed_eps = 1e-6
+    raw = model.embed[torch.tensor([0] + [1]*7)]
+    expected = (raw.float() * torch.rsqrt(raw.float().square().mean(-1, keepdim=True) + model.embed_eps)
+                * model.embed_norm.float()).bfloat16()
+    assert torch.equal(model.block_embeddings(0), expected)
+    assert not torch.equal(expected, raw)

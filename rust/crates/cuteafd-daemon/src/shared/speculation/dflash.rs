@@ -823,6 +823,7 @@ enum DraftInput<'r, 'e> {
     Rows(&'r [u8]),
     /// Gathered on the device from the target's embedding table by token id.
     Table(&'r TokenEmbedding<'e>),
+    NormalizedTable { table: CuteafdDeviceBuffer, norm: CuteafdDeviceBuffer, eps: f32 },
     /// A device-ordered gather/transport bridge owned by the target.
     Launch(&'r InputLaunch<'r>),
 }
@@ -841,6 +842,7 @@ pub(crate) struct DflashDrafter<'a> {
     library: &'a NativeLibrary,
     timing: crate::shared::draft::timing::DraftTiming<'a>,
     pub cfg: DflashConfig,
+    valid_vocab: usize,
     stream: *mut c_void,
     /// The draft round's host wait (`--host-wait`).
     round: std::cell::RefCell<crate::shared::memory::BlockingWait<'a>>,
@@ -1062,11 +1064,12 @@ impl<'a> DflashDrafter<'a> {
         let h = cfg.hidden;
         let mut shapes = Vec::new();
         if representation == GlmDraftRepresentation::Bf16Only {
-            shapes.extend([(h, 2 * cfg.intermediate), (cfg.intermediate, h)]);
-            if !ml4 {
-                shapes.extend([(h * cfg.taps.len(), h), (h, cfg.conv_width()), (h, cfg.rank)]);
-                if !mla {
-                    shapes.extend([(h, cfg.qkv_width()), (h, 2 * cfg.kv_width()), (cfg.heads * cfg.head_dim, h)]);
+            if !mla && !ml4 {
+                shapes.extend(cfg.projection_shapes());
+            } else {
+                shapes.extend([(h, 2 * cfg.intermediate), (cfg.intermediate, h)]);
+                if !ml4 {
+                    shapes.extend([(h * cfg.taps.len(), h), (h, cfg.conv_width()), (h, cfg.rank)]);
                 }
             }
         }
@@ -1277,6 +1280,7 @@ impl<'a> DflashDrafter<'a> {
             fp8_rows: Cell::new(fp8_rows),
             fp8_admitted: fp8_rows,
             physical: Some(physical), head_split: None,
+            valid_vocab: cfg.vocab,
             cfg,
         })
     }
@@ -1392,7 +1396,7 @@ impl<'a> DflashDrafter<'a> {
             mask_row: Vec::new(), mask_rows: None, markov_workspace: None, target_projection, workspace: RefCell::new(Some(workspace)), startup_primed: Cell::new(false), trace_features: Cell::new(false), policy_scores: Cell::new(false), representation,
             fp8_workspace: if representation == GlmDraftRepresentation::Fp8Only { Some(owners.take("fp8_scratch")?) } else { None },
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_rows), fp8_admitted: fp8_rows,
-            timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mla-dflash")?, cfg,
+            timing: crate::shared::draft::timing::DraftTiming::from_env(library, "mla-dflash")?, valid_vocab: cfg.vocab, cfg,
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
         };
         owners.finish()?;
@@ -1571,7 +1575,7 @@ impl<'a> DflashDrafter<'a> {
             representation: GlmDraftRepresentation::Bf16Only, fp8_workspace: None,
             head_mode: Cell::new(DraftHead::Exact), fp8_rows: Cell::new(fp8_linear::Fp8Rows::default()),
             fp8_admitted: fp8_linear::Fp8Rows::default(),
-            timing: crate::shared::draft::timing::DraftTiming::from_env(library, "ml4-dspark")?, cfg,
+            timing: crate::shared::draft::timing::DraftTiming::from_env(library, "ml4-dspark")?, valid_vocab: cfg.vocab, cfg,
             round: std::cell::RefCell::new(crate::shared::memory::BlockingWait::new(library)),
         };
         // SAFETY: absorption/norms launches were queued on this live stream above.
@@ -1597,6 +1601,14 @@ impl<'a> DflashDrafter<'a> {
     }
 
     /// Land selector features for diagnostics and/or candidate probabilities for history.
+    /// Restrict candidate IDs to the target's true vocabulary without changing
+    /// the checkpoint's stored head/codebook stride or physical allocation.
+    pub(crate) fn set_valid_vocab(&mut self, vocab: usize) -> Result<()> {
+        ensure!((16..=self.cfg.vocab).contains(&vocab), "invalid DFlash target vocabulary");
+        self.valid_vocab = vocab;
+        Ok(())
+    }
+
     pub(crate) fn set_selector_readback(&self, traced: bool, scored: bool) {
         self.trace_features.set(traced);
         self.policy_scores.set(scored);
@@ -1772,6 +1784,31 @@ impl<'a> DflashDrafter<'a> {
                 .map(|(name, buffer)| (format!("drafter/peer/{name}"), buffer)));
         }
         ranges
+    }
+
+    /// Complete rank-local GQA ring planes for one sequence, in layer/K/V order.
+    pub(crate) fn gqa_window_planes(&self, slot: usize) -> Result<Vec<CuteafdDeviceBuffer>> {
+        ensure!(slot < self.slots && self.head_split.is_none(), "GQA window mark requires one admitted rank");
+        let bytes = RING * self.kv_cache.plane_record_bytes(self.cfg.kv_heads, self.cfg.head_dim);
+        let mut planes = Vec::new();
+        for layer in &self.layers {
+            let layer = layer.attention.gqa()?;
+            for plane in [&layer.k_ring, &layer.v_ring] {
+                planes.push(draft_view(plane.buffer, slot * bytes, bytes)?);
+            }
+        }
+        Ok(planes)
+    }
+
+    /// Ingest already-packed target features. The producer and drafter share the stream.
+    pub(crate) fn append_gqa_features(&self, slot: usize, start: usize, features: CuteafdDeviceBuffer,
+        rows: usize) -> Result<()> {
+        let bytes = rows * self.cfg.taps.len() * self.cfg.hidden * 2;
+        ensure!(rows <= TAP_ROWS && features.bytes >= bytes && slot < self.slots,
+            "GQA feature update outside admitted extent");
+        // SAFETY: both retained owners share the stream, with nonoverlapping extents.
+        unsafe { self.library.copy_d2d_async(self.taps.buffer, features, bytes, self.stream)?; }
+        self.update(&(0..rows).map(|tap_row| ContextRow { tap_row, slot, position: start + tap_row }).collect::<Vec<_>>())
     }
 
     /// Writes the context K/V of committed tapped rows (in tap-row order).
@@ -2750,6 +2787,12 @@ impl<'a> DflashDrafter<'a> {
         self.draft_from(sequences, DraftInput::Table(embedding), self.head_call(&head)?, true)
     }
 
+    /// Borrow the target BF16 embedding and apply its RMSNorm to the full block.
+    pub(crate) fn draft_normalized_table(&self, sequences: &[DraftSeq], table: CuteafdDeviceBuffer, norm: CuteafdDeviceBuffer, eps: f32, head: TargetHead<'_>) -> Result<Vec<Draft>> {
+        ensure!(table.bytes == self.cfg.vocab * self.cfg.hidden * 2 && table.device_id == self.library.cuda_get_device()?, "DFlash raw target table geometry");
+        self.draft_from(sequences, DraftInput::NormalizedTable { table, norm, eps }, self.head_call(&head)?, true)
+    }
+
     /// Diagnostic device-input replay retains the explicit head arithmetic selection.
     pub fn draft_device_diagnostic(&self, sequences: &[DraftSeq], embedding: &TokenEmbedding<'_>,
         head: TargetHead<'_>) -> Result<Vec<Draft>> {
@@ -2802,7 +2845,7 @@ impl<'a> DflashDrafter<'a> {
             "MLA draft borrows the target device embedding; host mask-row fallback is not admitted");
         let rows_ok = match input {
             DraftInput::Rows(r) => r.len() == s_count * h * 2,
-            DraftInput::Table(_) | DraftInput::Launch(_) => true,
+            DraftInput::Table(_) | DraftInput::NormalizedTable { .. } | DraftInput::Launch(_) => true,
         };
         ensure!(s_count > 0 && s_count <= self.max_sequences && rows_ok, "draft step of {s_count} sequences");
         let rows = s_count * block;
@@ -2892,6 +2935,18 @@ impl<'a> DflashDrafter<'a> {
             DraftInput::Table(embedding) => {
                 let ids = draft_input_ids(sequences, c.mask_token, block);
                 embedding.embed(&ids, w.head()?.ids.buffer, 1, w.h.buffer, self.stream)?;
+            }
+            DraftInput::NormalizedTable { table, norm, eps } => {
+                let ids = draft_input_ids(sequences, c.mask_token, block);
+                self.put(&w.head()?.ids, bytes_of(&ids))?;
+                // Inkling get_input_embeddings normalizes every token, including masks.
+                // SAFETY: disjoint admitted scratch and residual owners share the stream.
+                unsafe {
+                    self.library.cuda_embedding_lookup_bf16_async(table, w.head()?.ids.buffer,
+                        w.n.buffer, rows, c.vocab, h, self.stream)?;
+                    self.library.cuda_ds4_rmsnorm_bf16_rne_async(w.n.buffer, norm, w.h.buffer,
+                        i32::try_from(rows)?, i32::try_from(h)?, eps, self.stream)?;
+                }
             }
             DraftInput::Launch(input) => {
                 let ids = draft_input_ids(sequences, c.mask_token, block);
@@ -3028,15 +3083,30 @@ impl<'a> DflashDrafter<'a> {
                 DraftHeadOps::Peer => anyhow::bail!("peer drafter cannot launch selection"),
                 DraftHeadOps::Selector { projection, predecessor, successor } => {
                     let top_k = match &self.context { DraftContext::Mla(context) => context.cfg.selector_top_k, _ => 16 };
-                    l.dflash_topk_width(w.head()?.logits.buffer.ptr, w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr,
-                        w.head()?.topk_workspace.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.vocab, top_k, s)?;
+                    let (logits, unary, candidates, scratch) = (w.head()?.logits.buffer.ptr,
+                        w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr,
+                        w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr,
+                        w.head()?.topk_workspace.as_ref().context("selector workspace missing")?.buffer.ptr);
+                    if self.valid_vocab == c.vocab {
+                        l.dflash_topk_width(logits, unary, candidates, scratch, s_count, block, c.drafts(), c.vocab, top_k, s)?;
+                    } else {
+                        l.dflash_topk_valid(logits, unary, candidates, scratch, s_count, block, c.drafts(), self.valid_vocab, c.vocab, top_k, s)?;
+                    }
                     self.timing.end(head_span, s)?;
                     let select_span = self.timing.begin("selector_confidence", None, rows, s)?;
                     self.linear(w.n.buffer.ptr, projection, 0,
                         w.head()?.projected.as_ref().context("selector workspace missing")?.buffer.ptr, rows, h, c.rank)?;
-                    l.dflash_select_width(predecessor.buffer.ptr, successor.buffer.ptr, w.head()?.projected.as_ref().context("selector workspace missing")?.buffer.ptr,
-                        w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr, w.head()?.anchors.buffer.ptr, w.head()?.tokens.buffer.ptr,
-                        w.head()?.features.as_ref().context("selector workspace missing")?.buffer.ptr, s_count, block, c.drafts(), c.rank, top_k, s)?;
+                    let (projected, anchors, tokens, features) = (
+                        w.head()?.projected.as_ref().context("selector workspace missing")?.buffer.ptr,
+                        w.head()?.anchors.buffer.ptr, w.head()?.tokens.buffer.ptr,
+                        w.head()?.features.as_ref().context("selector workspace missing")?.buffer.ptr);
+                    if let Some(cap) = c.post_selector_softcap {
+                        l.dflash_select_post_softcap(predecessor.buffer.ptr, successor.buffer.ptr, projected,
+                            candidates, unary, anchors, tokens, features, s_count, block, c.drafts(), c.rank, top_k, cap, s)?;
+                    } else {
+                        l.dflash_select_width(predecessor.buffer.ptr, successor.buffer.ptr, projected,
+                            candidates, unary, anchors, tokens, features, s_count, block, c.drafts(), c.rank, top_k, s)?;
+                    }
                     self.timing.end(select_span, s)?;
                 }
                 DraftHeadOps::RnnMarkov { softcap, embedding, joint_w, joint_b, output, norms, rank } => {
@@ -3129,7 +3199,6 @@ impl<'a> DflashDrafter<'a> {
     }
 
     /// Retained vocabulary-head rows, including the anchor row, before selection.
-    #[cfg(test)]
     pub(crate) fn last_logits(&self, sequences: usize) -> Result<Vec<f32>> {
         let slot = self.workspace.borrow();
         let w = slot.as_ref().context("no draft step ran")?;
@@ -4123,7 +4192,7 @@ mod checkpoint_header_tests {
     fn small_config() -> DflashConfig {
         DflashConfig { hidden: 128, intermediate: 128, layers: 2, heads: 1, kv_heads: 1, head_dim: 128,
             eps: 1e-6, theta: 10000., block: 8, group: 16, mask_token: 0, rank: 256,
-            taps: vec![0], vocab: 16, window: RING, row_window: false, sample_from_anchor: false }
+            taps: vec![0], vocab: 16, window: RING, row_window: false, sample_from_anchor: false, post_selector_softcap: None }
     }
 
     fn complete_headers(cfg: &DflashConfig) -> (HashMap<String, SafetensorsTensorMetadata>, u64) {

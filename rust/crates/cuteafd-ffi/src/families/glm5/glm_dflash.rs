@@ -209,6 +209,36 @@ impl NativeLibrary {
             i(sequences)?, i(block_rows)?, i(drafts)?, i(rank)?, i(top_k)?, stream) }, "width select")
     }
 
+    /// Top-k over the valid prefix of each stored-width vocabulary row.
+    ///
+    /// # Safety
+    /// As [`Self::dflash_topk_width`]; logits are stored with the supplied stride.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dflash_topk_valid(&self, logits: P, unary: M, candidates: M, workspace: M,
+        sequences: usize, block_rows: usize, drafts: usize, vocab: usize, stride: usize,
+        top_k: usize, stream: M) -> Result<()> {
+        anyhow::ensure!(top_k == 16 && vocab >= top_k && stride >= vocab, "invalid DFlash valid vocabulary");
+        type F = unsafe extern "C" fn(P, M, M, M, i32, i32, i32, i32, i32, i32, M) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_dflash_topk_valid") }?;
+        check(unsafe { f(logits, unary, candidates, workspace, i(sequences)?, i(block_rows)?,
+            i(drafts)?, i(vocab)?, i(stride)?, i(top_k)?, stream) }, "valid-vocab top-k")
+    }
+
+    /// Apply the trained softcap after adding the candidate correction.
+    ///
+    /// # Safety
+    /// As [`Self::dflash_select_width`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn dflash_select_post_softcap(&self, pred_cb: P, succ_cb: P, projected: P,
+        candidates: P, unary: P, anchors: P, tokens: M, features: M, sequences: usize,
+        block_rows: usize, drafts: usize, rank: usize, top_k: usize, softcap: f32, stream: M) -> Result<()> {
+        anyhow::ensure!(top_k == 16 && softcap.is_finite() && softcap > 0.0, "invalid DFlash post-softcap selector");
+        type F = unsafe extern "C" fn(P, P, P, P, P, P, M, M, i32, i32, i32, i32, i32, f32, M) -> i32;
+        let f = *unsafe { self.lib.get::<F>(b"cuteafd_dflash_select_post_softcap") }?;
+        check(unsafe { f(pred_cb, succ_cb, projected, candidates, unary, anchors, tokens, features,
+            i(sequences)?, i(block_rows)?, i(drafts)?, i(rank)?, i(top_k)?, softcap, stream) }, "post-softcap select")
+    }
+
     /// Greedy candidate-selector walk: tokens [sequences, drafts] U32 and
     /// features [sequences, drafts, 4] F32.
     ///

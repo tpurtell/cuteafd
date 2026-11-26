@@ -5,7 +5,6 @@ use crate::shared::memory::{
 };
 use anyhow::{ensure, Result};
 use cuteafd_ffi::CuteafdDeviceBuffer as Buffer;
-use cuteafd_loader::formats::block_dspark::recurrent::RecurrentBlockConfig;
 use std::{collections::BTreeMap, rc::Rc};
 
 pub(crate) struct TapBuffer<'a> {
@@ -20,9 +19,8 @@ pub(crate) struct TapBuffer<'a> {
 }
 
 impl<'a> TapBuffer<'a> {
-    pub fn new(stream: Rc<Stream<'a>>, config: &RecurrentBlockConfig, rows: usize) -> Result<Self> {
-        let hidden = config.transformer.hidden;
-        let taps = config.taps.len();
+    pub fn new(stream: Rc<Stream<'a>>, hidden: usize, sites: &[cuteafd_core::TapSite], rows: usize) -> Result<Self> {
+        let taps = sites.len();
         ensure!(rows > 0 && rows <= 4096, "Inkling 2 Mini tap staging row capacity");
         let output = Allocation::new(
             stream.device,
@@ -35,7 +33,7 @@ impl<'a> TapBuffer<'a> {
             Tag::drafter_workspace("inkling2_mini/target-tap-narrow"),
         )?;
         let copy = stream.device.run(|| stream.device.library.device_row_copy())?;
-        let visits = config.taps.iter().copied().enumerate().map(|(tap, site)| (site, tap)).collect();
+        let visits = sites.iter().copied().enumerate().map(|(tap, site)| (site, tap)).collect();
         Ok(Self {
             stream,
             output,

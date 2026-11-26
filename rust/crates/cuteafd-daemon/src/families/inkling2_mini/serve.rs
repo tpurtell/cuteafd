@@ -31,6 +31,8 @@ pub(crate) struct ServeArgs {
     pub kv_format: InklingKvCache,
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
     pub dspark: bool,
+    #[arg(long)]
+    pub draft: Option<PathBuf>,
     #[arg(long, default_value = "fp8")]
     pub draft_kv_cache: cuteafd_loader::families::qwen4::Qwen4KvCache,
     #[arg(long = "max-context-tokens", value_parser = crate::shared::context::parse_tokens::<usize>)]
@@ -150,7 +152,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     context_tokens: worker_args.max_context.unwrap_or(0) as u64,
                     pool_tokens: worker_args.pool_tokens,
                     kv_format: worker_args.kv_format,
-                    drafter: worker_args.dspark.then_some(worker_args.draft_kv_cache),
+                    drafter: (worker_args.dspark && worker_args.draft.is_none()).then_some(worker_args.draft_kv_cache),
+                    dflash: worker_args.draft.as_deref().map(|p| (p, worker_args.draft_kv_cache)),
                     prefix: &worker_args.prefix,
                     resident_weights: crate::shared::memory::budget::resident_weight_limit(),
                     expert_usage: false,
@@ -170,7 +173,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 .transpose()?;
             let drafts = execution.draft.as_ref().map_or(scheduler::Drafts::None, |draft| {
                 scheduler::Drafts::Neural {
-                    depth: draft.layout.config.transformer.block - 1,
+                    depth: draft.block - 1,
                 }
             });
             let binding = crate::shared::vision::perception::Binding::new(

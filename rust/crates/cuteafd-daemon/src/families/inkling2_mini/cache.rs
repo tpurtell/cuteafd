@@ -360,7 +360,7 @@ impl<'a> MiniPrefix<'a> {
         self.bank.reset(placement.slot)?;
         self.bank.drain()?;
         if let Some(draft) = &self.draft {
-            draft.drafter.bind_slot(placement.slot, 0, admit_capacity)?;
+            draft.bind_slot(placement.slot, 0, admit_capacity)?;
         }
         placement.state_len = 0;
         Ok(())
@@ -384,7 +384,7 @@ impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
                 + self
                     .draft
                     .as_ref()
-                    .map_or(0, |draft| draft.marks.iter().map(|m| m.bytes()).sum()),
+                    .map_or(0, |draft| draft.mark_bytes()),
             draft_bytes: 0,
             rule: ReuseRule::EXACT,
             mark_store: MarkStore::Arena,
@@ -396,42 +396,42 @@ impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
         &placement.units
     }
     fn draft_page_bytes(&self) -> usize {
-        self.draft.as_ref().map_or(0, |draft| draft.drafter.page_bytes())
+        self.draft.as_ref().and_then(|d| d.drafter.as_ref()).map_or(0, |d| d.page_bytes())
     }
     fn quarantine_draft_pages(&self, placement: &Placement) {
-        if let Some(draft) = &self.draft {
-            draft.drafter.quarantine_pages(placement.slot);
+        if let Some(draft) = self.draft.as_ref().and_then(|d| d.drafter.as_ref()) {
+            draft.quarantine_pages(placement.slot);
         }
     }
     fn draft_demand(&self, placement: &Placement) -> Option<cuteafd_engine::reserve::DraftDemand> {
-        self.draft.as_ref()?.drafter.reservation(placement.slot)
+        self.draft.as_ref()?.drafter.as_ref()?.reservation(placement.slot)
     }
     fn draft_reservable(&self) -> Option<usize> {
-        Some(self.draft.as_ref()?.drafter.reservable())
+        Some(self.draft.as_ref()?.drafter.as_ref()?.reservable())
     }
     fn draft_lifetime_rows(&self) -> Option<usize> {
-        Some(self.draft.as_ref()?.drafter.lifetime_rows())
+        Some(self.draft.as_ref()?.drafter.as_ref()?.lifetime_rows())
     }
     fn draft_admission(&self, origin: usize) -> Option<cuteafd_engine::reserve::DraftDemand> {
-        Some(self.draft.as_ref()?.drafter.admission(origin))
+        Some(self.draft.as_ref()?.drafter.as_ref()?.admission(origin))
     }
     fn admit_draft_pages(&self, p: &mut Placement, capacity: usize) -> Result<(), cuteafd_engine::prefix::BoxError> {
-        if let Some(draft) = &self.draft {
-            draft.drafter.admit_pages(p.slot, capacity)?;
+        if let Some(draft) = self.draft.as_ref().and_then(|d| d.drafter.as_ref()) {
+            draft.admit_pages(p.slot, capacity)?;
         }
         Ok(())
     }
     fn draft_pages_valid(&self, a: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
-        self.draft.as_ref().is_some_and(|d| d.drafter.pages_valid(a))
+        self.draft.as_ref().and_then(|d| d.drafter.as_ref()).is_some_and(|d| d.pages_valid(a))
     }
     fn draft_pages_revocable(&self, a: &cuteafd_engine::prefix::DraftPageAttachment) -> bool {
-        self.draft.as_ref().is_some_and(|d| d.drafter.pages_revocable(a))
+        self.draft.as_ref().and_then(|d| d.drafter.as_ref()).is_some_and(|d| d.pages_revocable(a))
     }
     fn retain_draft_pages(&self, a: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), cuteafd_engine::prefix::BoxError> {
         self.draft
             .as_ref()
             .context("Inkling 2 Mini prefix has no drafter")?
-            .drafter
+            .drafter.as_ref().context("Mini recurrent pages absent")?
             .retain_pages(a)?;
         Ok(())
     }
@@ -443,14 +443,15 @@ impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
         Ok(self
             .draft
             .as_ref()
-            .map(|draft| draft.drafter.capture_pages(p.slot, len))
+            .and_then(|d| d.drafter.as_ref())
+            .map(|draft| draft.capture_pages(p.slot, len))
             .transpose()?)
     }
     fn release_draft_pages(&self, a: &cuteafd_engine::prefix::DraftPageAttachment) -> Result<(), cuteafd_engine::prefix::BoxError> {
         self.draft
             .as_ref()
             .context("Inkling 2 Mini prefix has no drafter")?
-            .drafter
+            .drafter.as_ref().context("Mini recurrent pages absent")?
             .release_pages(a)?;
         Ok(())
     }
@@ -460,14 +461,14 @@ impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
         p: &mut Placement,
         frontier: usize,
     ) -> Result<(), cuteafd_engine::prefix::BoxError> {
-        if let Some(draft) = &self.draft {
+        if let Some(draft) = self.draft.as_ref().and_then(|d| d.drafter.as_ref()) {
             if let Some(a) = a {
-                draft.drafter.restore_pages(p.slot, a, frontier)?;
+                draft.restore_pages(p.slot, a, frontier)?;
             } else {
                 if frontier != 0 {
                     return Err("Inkling 2 Mini draft restore needs exact full-context attachment".into());
                 }
-                draft.drafter.reset_context(p.slot, 0)?;
+                draft.reset_context(p.slot, 0)?;
             }
         }
         Ok(())
@@ -480,13 +481,12 @@ impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
             .draft
             .as_ref()
             .context("Inkling 2 Mini prefix has no drafter")?
-            .drafter
+            .drafter.as_ref().context("Mini recurrent pages absent")?
             .promote_pages(a)?)
     }
     fn draft_page_segments(&self, page: cuteafd_engine::prefix::DraftPageId) -> Vec<cuteafd_hostcache::copy::DeviceRange> {
-        self.draft.as_ref().map_or_else(Vec::new, |d| {
-            d.drafter
-                .page_segments(page)
+        self.draft.as_ref().and_then(|d| d.drafter.as_ref()).map_or_else(Vec::new, |d| {
+            d.page_segments(page)
                 .expect("admitted draft page")
                 .into_iter()
                 .map(crate::shared::prefix::cuda_copy::range)
@@ -502,7 +502,7 @@ impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
     fn discard(&self, placement: &mut Placement) -> Result<(), cuteafd_engine::prefix::BoxError> {
         self.bank.reset(placement.slot)?;
         if let Some(draft) = &self.draft {
-            draft.drafter.reset_context(placement.slot, 0)?;
+            draft.bind_slot(placement.slot, 0, None)?;
         }
         placement.state_len = 0;
         Ok(())
@@ -532,15 +532,7 @@ impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
         }
         self.bank.capture(placement.slot, slot.0 as usize)?;
         if let Some(draft) = &self.draft {
-            let (origin, frontier) = draft.drafter.frontier(placement.slot)?;
-            if frontier != len {
-                return Err("Mini draft snapshot frontier differs from target".into());
-            }
-            for (rank, marks) in draft.ranks().zip(&draft.marks) {
-                rank.stream
-                    .device
-                    .run(|| marks.capture(rank, placement.slot, slot.0 as usize, origin, frontier))?;
-            }
+            draft.capture(placement.slot, slot.0 as usize, len)?;
         }
         Ok(())
     }
@@ -555,11 +547,7 @@ impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
         let slot = mark.context("Inkling 2 Mini exact restore requires its 48-slot SWA/conv mark")?;
         self.bank.restore(slot.0 as usize, placement.slot)?;
         if let Some(draft) = &self.draft {
-            for (rank, marks) in draft.ranks().zip(&draft.marks) {
-                rank.stream
-                    .device
-                    .run(|| marks.restore(rank, placement.slot, slot.0 as usize, len))?;
-            }
+            draft.restore(placement.slot, slot.0 as usize, len)?;
         }
         placement.len = len;
         placement.state_len = len;
@@ -578,10 +566,7 @@ impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
     fn drain(&self) -> Result<(), cuteafd_engine::prefix::BoxError> {
         self.bank.drain()?;
         if let Some(draft) = &self.draft {
-            for marks in &draft.marks {
-                marks.drain()?;
-            }
-            draft.drafter.drain()?;
+            draft.drain()?;
         }
         Ok(())
     }
@@ -605,13 +590,7 @@ impl cuteafd_engine::prefix::PrefixFamily for MiniPrefix<'_> {
             .map(crate::shared::prefix::cuda_copy::range)
             .collect::<Vec<_>>();
         if let Some(draft) = &self.draft {
-            segments.extend(
-                draft
-                    .marks
-                    .iter()
-                    .filter_map(|m| m.mark(slot.0 as usize).ok())
-                    .map(crate::shared::prefix::cuda_copy::range),
-            );
+            segments.extend(draft.mark_buffers(slot.0 as usize).into_iter().map(crate::shared::prefix::cuda_copy::range));
         }
         segments
     }
