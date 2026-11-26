@@ -156,8 +156,17 @@ class DirectMCWriter(BaseWriter):
     prove_shared_source = True
 
     def __init__(self, output, source, identity, **kwargs):
-        if identity.get("codebook") != "mul1" or identity.get("codebook_multiplier") != mc.MUL1:
-            raise ValueError("expected frozen MUL1 identity")
+        if identity.get("schema") != "ernie55-causal-mc-v1":
+            raise ValueError("expected a frozen ERNIE producer identity")
+        inputs = identity["inputs"]
+        recipe = inputs["recipe"]
+        if (recipe.get("codebook") != "mul1" or recipe.get("codebook_multiplier") != mc.MUL1
+                or inputs["source_revision"] != BASE_REVISION):
+            raise ValueError("expected pinned source and frozen MUL1 recipe")
+        # Preserve the full producer receipt; mirror the declarations consumed
+        # by the common MC validator and by the generated model card.
+        identity = dict(producer=identity, codebook=recipe["codebook"], codebook_multiplier=mc.MUL1,
+                        dataset=inputs["corpus"]["dataset"], components=inputs["corpus"]["components"])
         self.header = source
         inv = source.as_inventory()
         total = source.payload_bytes

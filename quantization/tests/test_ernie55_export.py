@@ -53,8 +53,11 @@ def encode_fixture(path, selection, bits):
 def test_direct_package_with_bare_parameter_and_auxiliary_source(tmp_path):
     src = fixture(tmp_path / "source")
     out = tmp_path / "mc"
-    identity = dict(codebook="mul1", codebook_multiplier=mc.MUL1, dataset=dict(repo_id="test/panel"),
-                    components={key: {"tokens": 42} for key in ("agentic", "exl3_standard")})
+    identity = dict(schema="ernie55-causal-mc-v1", inputs=dict(source_revision=export.BASE_REVISION,
+        recipe=dict(codebook="mul1", codebook_multiplier=mc.MUL1), corpus=dict(dataset=dict(repo_id="test/panel"),
+        components={key: {"tokens": 42} for key in ("agentic", "exl3_standard")})))
+    with pytest.raises(ValueError, match="frozen ERNIE"):
+        export.DirectMCWriter(out, src, {"status": "candidate", "inputs": identity["inputs"]})
     writer = export.DirectMCWriter(out, src, identity)
     native, core, experts = export.projection_inventory(src)
     core_names = [mc.original_tensor_name(writer.family, m) for m in core]

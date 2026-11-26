@@ -34,7 +34,7 @@ def test_real_pinned_source_and_unindexed_flashindexer():
     assert actual.audit["indexed_bytes"] == 599573371912
     assert actual.payload_bytes - actual.audit["indexed_bytes"] == 3146496
     for name in actual.audit["flashindexer"]:
-        assert actual.source_entries([name])[name] == (snapshot / source.FLASHINDEXER_FILE, name)
+        assert actual.source_entries([name])[name] == (snapshot.resolve() / source.FLASHINDEXER_FILE, name)
         assert actual.specs[name][0] == "BF16"
         assert actual.specs[name][1] == ([64] if name.endswith("_bias") else [64, 4096])
 
