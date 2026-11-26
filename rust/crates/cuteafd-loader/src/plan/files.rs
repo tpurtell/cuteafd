@@ -52,7 +52,7 @@ pub fn required_tensors(checkpoint: &Checkpoint, role: ReadRole) -> Result<BTree
             super::spec::DraftOwnership::selected(family.id(),
                 match family.id() {
                     "deepseek_v4" | "deepseek_v41" => "dspark",
-                    "hy4_flash" => "dfly2",
+                    "hy4" | "hy4_flash" => "dfly2",
                     _ => "mtp",
                 }),
         _ => super::spec::DraftOwnership::None,

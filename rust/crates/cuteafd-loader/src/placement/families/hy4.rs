@@ -193,6 +193,7 @@ pub struct Hy4Inputs {
     pub sequences: u64,
     pub targets: Vec<CoordinatorWeights>,
     pub target_mount_load: crate::shared::dense_read::MountLoad,
+    pub draft: Option<crate::families::hy4::draft::Admission>,
     pub index_topk: IndexTopkScratch,
     pub placement: AttentionPlacement,
     pub modes: Vec<LayerMode>,
@@ -517,6 +518,89 @@ impl Hy4Inputs {
             .get(gpu)
             .ok_or_else(|| invalid("missing target arena"))?;
         out.extend(target.weight_components(maximum)?);
+        if let Some(draft) = &self.draft {
+            if let Some(local) = draft.rank(gpu) {
+                out.extend(weight_arena_components(
+                    &local.weights.arena,
+                    location,
+                    Lifetime::RESIDENT,
+                    maximum,
+                    MemoryKind::DrafterWeights,
+                )?);
+                let ws_id = local.workspace.id().to_owned();
+                let ws_bytes = local.workspace.bytes() as u64;
+                out.extend(buffer(
+                    ws_id.clone(),
+                    location,
+                    ws_bytes,
+                    Lifetime::TARGET,
+                    Category::Drafter,
+                    "DFly2 proposal workspace",
+                    maximum,
+                ));
+                if ws_bytes > 0 {
+                    out.extend(exact_owner_tail(
+                        format!("{ws_id}.tail"),
+                        ws_id,
+                        location,
+                        Lifetime::TARGET,
+                        vec![ws_bytes],
+                        maximum,
+                    )?);
+                }
+                let trellis_id = crate::families::hy4::draft::trellis_id(gpu, draft.tp);
+                let trellis_bytes = local.trellis_bytes as u64;
+                out.extend(buffer(
+                    trellis_id.clone(),
+                    location,
+                    trellis_bytes,
+                    Lifetime::TARGET,
+                    Category::Drafter,
+                    "DFly2 serialized K8 projection",
+                    maximum,
+                ));
+                if trellis_bytes > 0 {
+                    out.extend(exact_owner_tail(
+                        format!("{trellis_id}.tail"),
+                        trellis_id,
+                        location,
+                        Lifetime::TARGET,
+                        vec![trellis_bytes],
+                        maximum,
+                    )?);
+                }
+                let mount_life = Lifetime {
+                    first: Phase::DraftLoad,
+                    last: Phase::DraftLoad,
+                };
+                for (i, &bytes) in local.conversion_requests.iter().enumerate() {
+                    let mount_id = if draft.tp == 1 {
+                        format!("hy4/dfly2/kv-b-mount/{i}")
+                    } else {
+                        format!("hy4/dfly2/kv-b-mount/gpu{gpu}/{i}")
+                    };
+                    out.extend(buffer(
+                        mount_id.clone(),
+                        location,
+                        bytes,
+                        mount_life,
+                        Category::Staging,
+                        "DFly2 absorbed KV-B conversion",
+                        maximum,
+                    ));
+                    if bytes > 0 {
+                        out.extend(exact_owner_tail(
+                            format!("{mount_id}.tail"),
+                            mount_id,
+                            location,
+                            mount_life,
+                            vec![bytes],
+                            maximum,
+                        )?);
+                    }
+                }
+            }
+        }
         if !target.core.is_empty() {
             out.push(crate::shared::dense_read::trellis_device_staging(
                 gpu as u8, maximum,
@@ -689,7 +773,13 @@ impl Hy4Inputs {
         }
 
         if self.gpus == 2 {
-            let sizes = hy4_peer_slot_sizes(cfg, capacity_rows);
+            let peer_rows = capacity_rows.max(
+                self.draft
+                    .as_ref()
+                    .filter(|d| d.tp == 2)
+                    .map_or(0, |d| d.draft_rows()),
+            );
+            let sizes = hy4_peer_slot_sizes(cfg, peer_rows);
             let peer = crate::serving_capacity::PeerStorageLayout::new(
                 sizes.len(),
                 sizes[1],

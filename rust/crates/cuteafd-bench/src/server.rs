@@ -167,7 +167,7 @@ fn quant(snapshot: &Path, spark_ranks: usize) -> Vec<QuantGroup> {
 
 /// The speculator the options select.
 pub(crate) fn speculator(family: Option<&str>, settings: &[Setting]) -> Option<String> {
-    if family == Some("hy4_flash") && setting(settings, &["speculator"]) == Some("dfly2") {
+    if matches!(family, Some("hy4" | "hy4_flash")) && setting(settings, &["speculator"]) == Some("dfly2") {
         return Some("DFly2".into());
     }
     let truthy = |names: &[&str]| setting(settings, names).is_some_and(|v| v == "true");

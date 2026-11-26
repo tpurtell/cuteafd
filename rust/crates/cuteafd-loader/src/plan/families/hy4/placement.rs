@@ -111,12 +111,24 @@ pub(super) fn layout(
     };
     let spark_bytes: Vec<u64> = (0..ranks).map(|rank| opts.spark_capacity(rank)).collect();
 
+    let tp2_dflash = opts.hy4_dfly2 && gpus == 2 && opts.tp2_dflash;
+    if opts.tp2_dflash && (!opts.hy4_dfly2 || gpus != 2) {
+        report.refuse_placement(
+            "Hy4 TP2_DFLASH requires two coordinator GPUs and SPECULATOR=dfly2".into(),
+            "Use --rtx 2 with --speculator dfly2, or set TP2_DFLASH=off.",
+        );
+        return empty(notes);
+    }
+    report.tp2_dflash = Some(tp2_dflash);
+
     let facts_req = FactsRequest {
         checkpoint: input.checkpoint(),
         catalog,
         cfg,
         model_core: &model.core,
         kv_format,
+        dfly2: opts.hy4_dfly2,
+        tp2_dflash,
         manifest_path: manifest_path.as_deref(),
         coordinator: Coordinator::Planned {
             rtx_bytes: opts.rtx_bytes.clone(),

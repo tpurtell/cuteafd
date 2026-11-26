@@ -18,6 +18,9 @@ use std::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Section {
+    DraftFusion,
+    DraftLayer,
+    DraftCorrection,
     /// Full IndexCache layer pre-topk: optional prev-FFN iHC + MLA Q/KV/absorb + indexer projections & index_post.
     DsaFullPre,
     /// Shared IndexCache layer pre-attention: optional prev-FFN iHC + MLA Q/KV/absorb (zero indexer compute).
@@ -97,8 +100,29 @@ impl<'a> Hy4Graphs<'a> {
         self.bank.borrow_mut().cache_clear_drained();
     }
 
+    pub(super) fn retained_draft_rows(&self, rows: usize) -> usize {
+        self.bank.borrow().count(|key| {
+            key.rows == rows
+                && matches!(
+                    key.section,
+                    Section::DraftFusion | Section::DraftLayer | Section::DraftCorrection
+                )
+        })
+    }
+
     pub(crate) fn retained_rows(&self, rows: usize) -> usize {
         self.bank.borrow().count(|key| key.rows == rows)
+    }
+
+    pub(super) fn draft(
+        &self,
+        rows: usize,
+        stage: usize,
+        section: Section,
+        stream: &Stream<'a>,
+        work: impl FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.run(Key { layer: stage, rows, section }, stream, work)
     }
 
     pub(crate) fn tick(&self) {
