@@ -158,38 +158,26 @@ class Drafter:
             dyn = F.linear(n, self.w[p + "attention_conv.kernel_projection.weight"])
             base = self.w[p + "attention_conv.base_kernel"]
             x = conv(n, dyn, base, 0, self.group)
-            self.dump(f"layer-{l}-attn-dyn", dyn)
-            self.dump(f"layer-{l}-attn-conv", x)
             a = p + "self_attn."
             q = F.linear(x, self.w[a + "q_proj.weight"]).view(self.block, self.heads, self.head_dim)
             k = F.linear(x, self.w[a + "k_proj.weight"]).view(self.block, self.kv_heads, self.head_dim)
             v = F.linear(x, self.w[a + "v_proj.weight"]).view(self.block, self.kv_heads, self.head_dim)
-            self.dump(f"layer-{l}-qkv", torch.cat([q.flatten(1), k.flatten(1), v.flatten(1)], dim=-1))
             q = rope(rms(q, self.w[a + "q_norm.weight"], self.eps), positions, self.theta)
             k = rope(rms(k, self.w[a + "k_norm.weight"], self.eps), positions, self.theta)
-            self.dump(f"layer-{l}-q-rope", q)
-            self.dump(f"layer-{l}-k-rope", k)
             kc, vc = ctx[l]
             keys, values = torch.cat([kc, k]), torch.cat([vc, v])
             attn = F.scaled_dot_product_attention(q.transpose(0, 1)[None], keys.transpose(0, 1)[None],
                 values.transpose(0, 1)[None], attn_mask=mask, is_causal=False, enable_gqa=True,
                 scale=1.0 / math.sqrt(self.head_dim))
             attn = attn[0].transpose(0, 1).reshape(self.block, -1)
-            self.dump(f"layer-{l}-attn", attn)
             o = F.linear(attn, self.w[a + "o_proj.weight"])
-            self.dump(f"layer-{l}-attn-out", o)
             h = h + conv(o, dyn, base, 1, self.group)
             n = rms(h, self.w[p + "post_attention_layernorm.weight"], self.eps)
-            self.dump(f"layer-{l}-post-attn", h)
-            self.dump(f"layer-{l}-post-attn-norm", n)
             dyn = F.linear(n, self.w[p + "mlp_conv.kernel_projection.weight"])
             base = self.w[p + "mlp_conv.base_kernel"]
             x = conv(n, dyn, base, 0, self.group)
             m = p + "mlp."
-            gate, up = F.linear(x, self.w[m + "gate_proj.weight"]), F.linear(x, self.w[m + "up_proj.weight"])
-            self.dump(f"layer-{l}-gate-up", torch.cat([gate, up], dim=-1))
-            act = F.silu(gate) * up
-            self.dump(f"layer-{l}-act", act)
+            act = F.silu(F.linear(x, self.w[m + "gate_proj.weight"])) * F.linear(x, self.w[m + "up_proj.weight"])
             d = F.linear(act, self.w[m + "down_proj.weight"])
             h = h + conv(d, dyn, base, 1, self.group)
             last = l + 1 == self.layers
