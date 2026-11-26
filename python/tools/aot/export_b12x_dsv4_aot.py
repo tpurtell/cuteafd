@@ -763,6 +763,9 @@ def inkling2_mini_projection_shapes():
         (2304, 3072), (2304, 384), (2304, 1024), (2304, 24), (3072, 2304), (64, 1024), (4608, 64),
         # Bundled 3-layer MTP BF16 projections
         (2304, 9216), (9216, 2304), (2304, 201024), (256, 201024),
+        # Standard GQA DFlash2: merged QKV/KV, output, convolution, selector, and MLP.
+        (2304, 6144), (2304, 2048), (4096, 2304), (2304, 576), (2304, 256),
+        (2304, 13824), (6912, 2304),
     }
     f32 = {
         # Target F32 islands: dynamic conv taps, router, controller [forget; gain], plus fallback F32

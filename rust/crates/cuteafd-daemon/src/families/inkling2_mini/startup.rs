@@ -39,6 +39,7 @@ pub(crate) struct Options<'a> {
     pub pool_tokens: Option<u64>,
     pub kv_format: InklingKvCache,
     pub drafter: Option<cuteafd_loader::families::qwen4::Qwen4KvCache>,
+    pub dflash: Option<(&'a Path, cuteafd_loader::families::qwen4::Qwen4KvCache)>,
     pub prefix: &'a PrefixArgs,
     pub resident_weights: ResidentWeights,
     pub expert_usage: bool,
@@ -103,7 +104,7 @@ pub(crate) fn prepare<'a>(
     let runtime = RuntimeInventory::measure(library, &devices, InventoryPhase::PreWeight, |_| {
         programs.program("inkling2_padded_transpose_bf16_r16_c1024_p64", &["source", "output"])?;
         kernels = Some(MiniKernels::bind(programs, options.kv_format)?);
-        if options.drafter.is_some() {
+        if options.drafter.is_some() || options.dflash.is_some() {
             programs.load_matching(|name| {
                 name.starts_with("inkling_draft_") || name.starts_with("draft_bf16_") || name == "fir_history_commit"
             })?;
@@ -138,6 +139,7 @@ pub(crate) fn prepare<'a>(
             kv_cache,
             sms: library.sm_count().unwrap_or(1) as usize,
         }),
+        dflash: options.dflash.map(|(snapshot, kv_cache)| (snapshot, Selection { kv_cache, sms: library.sm_count().unwrap_or(1) as usize })),
         manifest_path: Some(options.manifest),
         manifest: Some(manifest),
         coordinator: Coordinator::Measured {
@@ -306,6 +308,16 @@ pub(crate) fn whole<'a>(
         )?));
     }
 
+    if let Some(layout) = &inputs.dflash {
+        let embed = execution.target.operand("model.llm.embed.weight")?.buffer;
+        execution.draft = Some(std::rc::Rc::new(super::draft::Binding::new_dflash(
+            programs, stream.clone(), layout, &admitted.solved, embed, cfg.text.unpadded_vocab_size,
+            usize::try_from(inputs.prefill.rows)?, usize::try_from(inputs.prefill.waves)?, inputs.prefix_mark_slots)?));
+        let report = crate::shared::draft::report::admitted(crate::shared::draft::report::Kind::Dflash2,
+            crate::shared::draft::report::Placement::Whole, 0, &physical, &admitted.solved)?;
+        crate::shared::draft::report::publish(report);
+    }
+
     let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?;
     let mut weights_inv = crate::shared::memory::receipts::Inventory::new(
         devices,
@@ -374,7 +386,8 @@ pub(crate) fn whole<'a>(
     let total_secs = total_start.elapsed().as_secs_f64();
     let resident_bytes: u64 = inputs.target.execution_arena()?.bytes() as u64
         + backings.iter().map(|b| b.arena.bytes() as u64).sum::<u64>()
-        + inputs.drafter.as_ref().map_or(0, |d| d.layout.weights[0].arena.bytes() as u64);
+        + inputs.drafter.as_ref().map_or(0, |d| d.layout.weights[0].arena.bytes() as u64)
+        + inputs.dflash.as_ref().map_or(0, |d| d.arena.bytes() as u64);
     let resident_gb = resident_bytes as f64 / 1e9;
     tracing::info!(
         admit_secs = format_args!("{admit_secs:.3}"),

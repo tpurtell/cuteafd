@@ -76,3 +76,15 @@ def test_fir_exports_keep_wide_prefill_separate_from_bounded_replay(monkeypatch)
         assert compile_()[1]["width"] in (512, 1024, 4608)
         assert compile_()[1]["max_rows"] == 128
         assert op == "convolution_replay"
+
+
+def test_mini_exports_cover_gqa_dflash2():
+    path = ROOT / "python/tools/aot/export_b12x_dsv4_aot.py"
+    tree = ast.parse(path.read_text())
+    node = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                and node.name == "inkling2_mini_projection_shapes")
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    bf16, _ = namespace["inkling2_mini_projection_shapes"]()
+    assert {(2304, 13824), (6912, 2304), (9216, 2304), (2304, 576), (2304, 256),
+            (2304, 6144), (2304, 2048), (4096, 2304)} <= bf16

@@ -156,6 +156,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             pool_tokens: args.pool_tokens,
             kv_format: args.kv_format,
             drafter: args.dspark.then_some(args.draft_kv_cache),
+            dflash: None,
             prefix: &args.prefix,
             resident_weights: crate::shared::memory::budget::resident_weight_limit(),
             expert_usage: false,

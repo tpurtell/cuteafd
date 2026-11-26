@@ -61,6 +61,7 @@ pub struct FactsRequest<'a> {
     pub cfg: &'a Inkling2MiniConfig,
     pub kv_format: InklingKvCache,
     pub drafter: Option<Selection>,
+    pub dflash: Option<(&'a Path, Selection)>,
     pub manifest_path: Option<&'a Path>,
     pub manifest: Option<Arc<serde_json::Value>>,
     pub coordinator: Coordinator,
@@ -246,13 +247,19 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         .map(|slot| SequenceLayout::new(t, cfg.cache_slot_is_local(slot), 1).map(|l| l.bytes as u64))
         .sum::<anyhow::Result<u64>>()
         .map_err(|error| refused(format!("Inkling 2 Mini 48-slot state refused: {error}"), "Check window geometry."))?;
+    let dflash = request.dflash.map(|(snapshot, selection)| {
+        super::dflash::Layout::new(snapshot, cfg, usize::try_from(request.sequences)?,
+            usize::try_from(shape.rows)?, usize::try_from(shape.waves)?, selection.sms,
+            selection.kv_cache, request.manifest.as_deref())
+    }).transpose().map_err(|error| refused(format!("Mini DFlash2 inventory refused: {error:#}"),
+        "Provide complete DFlash2 checkpoint headers and native BF16 projection exports."))?;
     let draft_mark = request
         .drafter
         .zip(drafter.as_ref())
         .map(|(selection, (config, _, _))| config.window_mark_bytes(selection.kv_cache, 0, 1, 0))
         .transpose()
         .map_err(|error| refused(format!("Mini drafter mark inventory refused: {error:#}"), "Check bundled MTP config."))?
-        .unwrap_or(0) as u64;
+        .unwrap_or(0) as u64 + dflash.as_ref().map_or(0, |d| d.mark_bytes as u64);
 
     let host_prefix = if request.host_cache_bytes == Some(0) || request.prefix_entries == 0 {
         serving::HostPrefixOwners {
@@ -372,6 +379,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         experts,
         local,
         drafter,
+        dflash,
         vision,
         budgets,
         code,

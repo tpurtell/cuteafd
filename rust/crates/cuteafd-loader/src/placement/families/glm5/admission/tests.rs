@@ -189,7 +189,7 @@ fn gqa_layout(representation: crate::families::glm5::draft_representation::GlmDr
     let cfg = GlmDflashConfig { hidden: 256, intermediate: 512, layers: 2, heads: 4,
         kv_heads: 2, head_dim: 64, eps: 1e-5, theta: 10000., block: 4, group: 2,
         mask_token: 0, rank: 256, taps: vec![0, 1], vocab: 64, window: 2048,
-        row_window: false, sample_from_anchor: false };
+        row_window: false, sample_from_anchor: false, post_selector_softcap: None };
     GlmDflashPhysicalLayout::new(&cfg, representation, GlmDraftCapacity::new(20, 16, cfg.block).unwrap(),
         188, 0, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap()
 }
@@ -201,7 +201,7 @@ fn packed_draft_is_charged_once_during_push_target_load() {
     let draft = GlmDflashConfig { hidden: 256, intermediate: 512, layers: 2, heads: 4,
         kv_heads: 2, head_dim: 64, eps: 1e-5, theta: 10000., block: 4, group: 2,
         mask_token: 0, rank: 256, taps: vec![0, 1], vocab: 64, window: 2048,
-        row_window: false, sample_from_anchor: false };
+        row_window: false, sample_from_anchor: false, post_selector_softcap: None };
     for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
         let layout = GlmDflashPhysicalLayout::new(&draft, representation,
             GlmDraftCapacity::new(20, 16, draft.block).unwrap(), 188, 0,
@@ -430,7 +430,7 @@ fn tp2_gqa_draft_splits_arenas_charges_standalone_tails_and_balances_embedding()
     let draft_cfg = GlmDflashConfig { hidden: 256, intermediate: 512, layers: 2, heads: 4,
         kv_heads: 2, head_dim: 64, eps: 1e-5, theta: 10000., block: 4, group: 2,
         mask_token: 0, rank: 256, taps: vec![0, 1], vocab: 64, window: 2048,
-        row_window: false, sample_from_anchor: false };
+        row_window: false, sample_from_anchor: false, post_selector_softcap: None };
     std::fs::write(draft_dir.path().join("config.json"), serde_json::to_vec(&serde_json::json!({
         "hidden_size": draft_cfg.hidden, "intermediate_size": draft_cfg.intermediate,
         "num_hidden_layers": draft_cfg.layers, "num_attention_heads": draft_cfg.heads,

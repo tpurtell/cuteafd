@@ -40,6 +40,10 @@ struct RawDflash {
     selector_rank: usize,
     selector_top_k: usize,
     target_layer_ids: Vec<usize>,
+    #[serde(default)]
+    selector_softcap_mode: Option<String>,
+    #[serde(default)]
+    final_logit_softcapping: Option<f32>,
 }
 
 /// The drafter geometry the kernels are written for, read from `config.json`.
@@ -68,6 +72,8 @@ pub struct GlmDflashConfig {
     /// Every block row is a prediction (dSpark's anchor-as-first: `block`
     /// drafts); off, the anchor row only carries context (`block - 1`).
     pub sample_from_anchor: bool,
+    /// The selector applies this cap to the corrected score, not the unary logit.
+    pub post_selector_softcap: Option<f32>,
 }
 
 impl GlmDflashConfig {
@@ -96,6 +102,13 @@ impl GlmDflashConfig {
         ensure!(d.conv_kernel_size == 2 && d.selector_rank == 256 && d.selector_top_k == 16,
             "DFlash2 kernels take two-tap convolutions and a rank-256 top-16 selector");
         ensure!(raw.sliding_window == RING, "DFlash2 window {} (the ring holds {RING})", raw.sliding_window);
+        let post_selector_softcap = match d.selector_softcap_mode.as_deref() {
+            None | Some("before_correction") => None,
+            Some("after_correction") => Some(d.final_logit_softcapping
+                .filter(|cap| cap.is_finite() && *cap > 0.0)
+                .context("DFlash2 after_correction requires positive final_logit_softcapping")?),
+            Some(mode) => anyhow::bail!("unsupported DFlash2 selector_softcap_mode {mode}"),
+        };
         Ok(Self {
             hidden: raw.hidden_size,
             intermediate: raw.intermediate_size,
@@ -115,6 +128,7 @@ impl GlmDflashConfig {
             window: raw.sliding_window,
             row_window: false,
             sample_from_anchor: false,
+            post_selector_softcap,
         })
     }
 
@@ -123,7 +137,15 @@ impl GlmDflashConfig {
             heads: cfg.mla.heads, kv_heads: cfg.mla.heads, head_dim: cfg.mla.nope + cfg.mla.rope,
             eps: cfg.eps as f32, theta: 0.0, block: cfg.block, group: cfg.group,
             mask_token: cfg.mask_token, rank: cfg.selector_rank, taps: cfg.taps.clone(), vocab: cfg.vocab,
-            window: 0, row_window: false, sample_from_anchor: cfg.drafts() == cfg.block }
+            window: 0, row_window: false, sample_from_anchor: cfg.drafts() == cfg.block, post_selector_softcap: None }
+    }
+
+    /// Native BF16 body projections used by the shared GQA executor.
+    pub fn projection_shapes(&self) -> [(usize, usize); 8] {
+        let h = self.hidden;
+        [(h, 2 * self.intermediate), (self.intermediate, h),
+            (h * self.taps.len(), h), (h, self.conv_width()), (h, self.rank),
+            (h, self.qkv_width()), (h, 2 * self.kv_width()), (self.heads * self.head_dim, h)]
     }
 
     pub fn drafts(&self) -> usize {
@@ -515,7 +537,7 @@ mod arena_tests {
         use crate::families::glm5::draft_representation::{draft_weight_role, DraftWeightRole};
         let cfg = GlmDflashConfig { hidden:256,intermediate:256,layers:2,heads:2,kv_heads:1,head_dim:128,
             eps:1e-6,theta:10000.,block:8,group:16,mask_token:0,rank:256,taps:vec![0,1],vocab:32,
-            window:2048,row_window:true,sample_from_anchor:false };
+            window:2048,row_window:true,sample_from_anchor:false, post_selector_softcap: None };
         let native = gqa_arena_requests(&cfg,GlmDraftRepresentation::Bf16Only,0,1)?
             .into_iter().collect::<std::collections::BTreeMap<_,_>>();
         let fp8 = gqa_arena_requests(&cfg,GlmDraftRepresentation::Fp8Only,0,1)?
@@ -548,6 +570,14 @@ mod arena_tests {
                 "mask_token_id":0, "selector_rank":256, "selector_top_k":16,
                 "target_layer_ids":[0]}});
         let cfg = GlmDflashConfig::from_value(&value)?;
+        assert_eq!(cfg.post_selector_softcap, None);
+        let mut post = value.clone();
+        post["dflash_config"]["selector_softcap_mode"] = "after_correction".into();
+        assert!(GlmDflashConfig::from_value(&post).is_err());
+        post["dflash_config"]["final_logit_softcapping"] = 30.0.into();
+        assert_eq!(GlmDflashConfig::from_value(&post)?.post_selector_softcap, Some(30.0));
+        post["dflash_config"]["selector_softcap_mode"] = "unknown".into();
+        assert!(GlmDflashConfig::from_value(&post).is_err());
         let root = tempfile::tempdir()?;
         std::fs::write(root.path().join("config.json"), serde_json::to_vec(&value)?)?;
         let shapes = cfg.tensor_shapes();
