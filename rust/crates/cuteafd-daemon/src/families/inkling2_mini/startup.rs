@@ -359,7 +359,12 @@ pub(crate) fn whole<'a>(
     execution.head.inventory(&mut inventory, "inkling2_mini.head")?;
     super::admission::reconcile_requests(&admitted.solved, &inputs, &inventory.receipts)?;
 
-    let graph_policy = cuteafd_loader::serving_capacity::inkling2_mini_graphs::policy(0)?;
+    let graph_keys = cuteafd_loader::serving_capacity::inkling2_mini_graphs::KeySpace::for_config(
+        inputs.sequences,
+        DECODE_ROWS,
+        inputs.drafter.is_some() || inputs.dflash.is_some(),
+    );
+    let graph_policy = cuteafd_loader::serving_capacity::inkling2_mini_graphs::policy(0, graph_keys)?;
     ensure!(
         inputs.graph_reserve == graph_policy.bytes,
         "Mini graph cache disagrees with admission"

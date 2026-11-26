@@ -899,4 +899,43 @@ mod tests {
         for rows in [0, limit + 1, usize::MAX] { assert!(Inputs::bytes(rows).is_err()); }
         Ok(())
     }
+
+    #[test]
+    fn probe_records_step5_prefill_units_for_multi_unit_seed_and_short_continuation() -> Result<()> {
+        use crate::shared::prefill_pipeline::{FfnRoute, PrefillHooks, Unit, prefill_units, run_prefill_units};
+        use crate::shared::qwen::scheduler::observe_prefill;
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+
+        struct NoopHooks;
+        impl PrefillHooks for NoopHooks {
+            type Ticket = ();
+            fn route(&self, _: usize) -> FfnRoute { FfnRoute::Spark }
+            fn begin_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+            fn attention(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn local_ffn(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn send_experts(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn land_experts(&mut self, _: usize, _: &Unit, _: ()) -> Result<()> { Ok(()) }
+            fn end_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+            fn commit_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+        }
+
+        // Seed prompt (> unit_rows, waves > 1) runs `enqueue_units` -> `run_prefill_units`.
+        let seed = Some(Probe::new(ProbeSpec { record_rows: 1, ..ProbeSpec::default() }));
+        let ((), seed_units) = observe_prefill(|| {
+            let units = prefill_units(3 * 2048, 2048, 4, 64)?
+                .into_iter().enumerate().map(|(index, rows)| Unit {
+                    index, sequence: 0, segments: Vec::new(), rows, layers: 0..2, slot: index % 4, barrier: false,
+                }).collect::<Vec<_>>();
+            run_prefill_units(&mut NoopHooks, &units, 4)
+        })?;
+        crate::shared::probe::prefill_units(&seed, seed_units);
+        assert_eq!(seed.as_ref().unwrap().record().last_prefill_units, Some(3));
+
+        // 64-token continuation (<= unit_rows) runs Step-5's single-unit `enqueue` without `run_prefill_units`.
+        let warm = Some(Probe::new(ProbeSpec { record_rows: 1, ..ProbeSpec::default() }));
+        let ((), warm_units) = observe_prefill(|| Ok(()))?;
+        crate::shared::probe::prefill_units(&warm, warm_units);
+        assert_eq!(warm.as_ref().unwrap().record().last_prefill_units, Some(1));
+        Ok(())
+    }
 }

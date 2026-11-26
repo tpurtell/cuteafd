@@ -1017,7 +1017,14 @@ mod tests {
         )?;
         owner.decode_attention = true;
         let mut uploads = owner.uploads(&cfg, 2)?;
-        let policy = cuteafd_loader::serving_capacity::inkling2_mini_graphs::policy(0)?;
+        let policy = cuteafd_loader::serving_capacity::inkling2_mini_graphs::policy(
+            0,
+            cuteafd_loader::serving_capacity::inkling2_mini_graphs::KeySpace::for_config(
+                2,
+                cuteafd_loader::families::inkling2_mini::execution::DECODE_ROWS,
+                true,
+            ),
+        )?;
         let mut graphs = DecodeGraphs::new_for_test(&stream, -270_101, policy)?;
 
         // Structural guard: decode/verify captured paths must stay kernel-only (no captured

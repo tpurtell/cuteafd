@@ -106,6 +106,6 @@ MXFP8 unchanged since `#430` (`306d4902be`) — strictly monotonic in `us/row`, 
   pooled generated-row **KL ≤ 0.05 nats** and **top-1 ≥ 0.93** (standard tier = 64 decode windows;
   quick tier = 8 windows). Byte-exact gates apply to `N=1` vs `N` width invariance, graph vs eager parity,
   exact 48-slot prefix restore, and same-input QDQ kernel oracles (`div.rn` tie vector + exact-decode negative control).
-- Exact-row CUDA decode graphs per visit (`(visit, rows, section, mode)`) bounded by the shared
-  `#2697` soft-cap working-set reserve (`CUTEAFD_INKLING2_MINI_GRAPHS=1|0`).
+- Monolithic 48-visit exact-row CUDA decode/verify graphs (`inkling2_mini.step`, keyed by `(rows, mode, taps)`) bounded by the shared
+  `#2697` soft-cap working-set reserve scaled to the resolved key space (`Decode 1..=clamp(CONCURRENCY, 1, 64)` plus `Verify 1..=64` with `dspark`, `8,306,688` B/key, `10 MiB` capture/step growth; `CUTEAFD_INKLING2_MINI_GRAPHS=1|0`).
 - Exact 48-slot prefix cache (prompt-end and turn-end marks, host offload).

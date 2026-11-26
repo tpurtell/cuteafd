@@ -303,19 +303,20 @@ pub(super) fn step<'a>(
 }
 
 /// Shipping startup pre-capture key list (`(rows, mode)`), covering the full
-/// producible key space (`Decode 1..=max_sequences` + `Verify 1..=64` = 80 keys
-/// for `dspark` at `max_sequences=16`; `Decode 1..=max_sequences` = 16 keys for
-/// `off`), sized to fit inside `#2697` `W1 = 628 MiB`, `soft = 754 MiB`, `hard = 770 MiB`.
+/// producible key space (`Decode 1..=max_sequences` + `Verify 1..=DECODE_ROWS`
+/// when `has_draft` is true), matching `inkling2_mini_graphs::KeySpace`.
 pub(super) fn shipping_prewarm_keys(max_sequences: usize, has_draft: bool) -> Vec<(usize, Mode)> {
-    let max_decode = max_sequences.clamp(1, 64);
-    let mut keys = Vec::new();
-    for rows in 1..=max_decode {
+    let space = cuteafd_loader::serving_capacity::inkling2_mini_graphs::KeySpace::for_config(
+        max_sequences as u64,
+        cuteafd_loader::families::inkling2_mini::execution::DECODE_ROWS,
+        has_draft,
+    );
+    let mut keys = Vec::with_capacity(space.total_keys());
+    for rows in 1..=space.decode_keys {
         keys.push((rows, Mode::Decode));
     }
-    if has_draft {
-        for rows in 1..=64 {
-            keys.push((rows, Mode::Verify));
-        }
+    for rows in 1..=space.verify_keys {
+        keys.push((rows, Mode::Verify));
     }
     keys
 }
@@ -361,18 +362,26 @@ mod tests {
 
     #[test]
     fn shipping_prewarm_covers_all_dspark_verify_rows_and_decode_bands() {
-        let dspark = shipping_prewarm_keys(16, true);
-        assert_eq!(dspark.len(), 80);
-        for rows in 1..=16 {
-            assert!(dspark.contains(&(rows, Mode::Decode)));
-        }
-        for rows in 1..=64 {
-            assert!(dspark.contains(&(rows, Mode::Verify)));
-        }
-        let off = shipping_prewarm_keys(16, false);
-        assert_eq!(off.len(), 16);
-        for rows in 1..=16 {
-            assert!(off.contains(&(rows, Mode::Decode)));
+        use cuteafd_loader::{
+            families::inkling2_mini::execution::DECODE_ROWS,
+            serving_capacity::inkling2_mini_graphs::KeySpace,
+        };
+        for max_seq in [1, 16, 32, 48, 64] {
+            for has_draft in [false, true] {
+                let keys = shipping_prewarm_keys(max_seq, has_draft);
+                let space = KeySpace::for_config(max_seq as u64, DECODE_ROWS, has_draft);
+                assert_eq!(keys.len(), space.total_keys());
+                for rows in 1..=max_seq {
+                    assert!(keys.contains(&(rows, Mode::Decode)));
+                }
+                if has_draft {
+                    for rows in 1..=DECODE_ROWS {
+                        assert!(keys.contains(&(rows, Mode::Verify)));
+                    }
+                } else {
+                    assert!(keys.iter().all(|&(_, mode)| mode == Mode::Decode));
+                }
+            }
         }
     }
 }
