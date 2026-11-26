@@ -113,6 +113,11 @@ while IFS='=' read -r key value; do
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "${SPARK_COUNT:-}" ]] || { cfg[SPARK_COUNT]="$SPARK_COUNT"; cfg_file[SPARK_COUNT]=1; }
 [[ -z "${SPARK_HOSTS:-}" ]] || { cfg[SPARK_HOSTS]="$SPARK_HOSTS"; cfg_file[SPARK_HOSTS]=1; }
+for key in "${!cfg[@]}"; do
+  if [[ "$key" == *_HOST || "$key" == *_HOSTS || "$key" == WIP_BUILD_SEED ]]; then
+    release_validate_host_value "$key" "${cfg[$key]}"
+  fi
+done
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
 # Attention compute never inherits a weight or cache format.
 attention_precision="$(get ATTENTION_PRECISION)"

@@ -25,6 +25,12 @@ BASELINE_CAPTURES = {
 def release_entry(entry: dict) -> dict:
     """Apply all smoke overrides while keeping process fixtures portable."""
     entry = {**entry, "set": {**MATRIX["defaults"]["set"], **entry.get("set", {})}}
+    cfg_path = ROOT / entry["config"]
+    for line in cfg_path.read_text().splitlines():
+        if line.startswith("SPARK_") and "_HOST=" in line:
+            key, val = line.split("=", 1)
+            if "replace-me" in val.lower() and key not in entry["set"]:
+                entry["set"][key] = f"worker-{key.split('_')[1]}"
     for key in entry["set"]:
         if key.startswith("SPARK_") and key.endswith("_HOST"):
             entry["set"][key] = f"worker-{key.split('_')[1]}"

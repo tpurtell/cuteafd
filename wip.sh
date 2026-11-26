@@ -130,6 +130,7 @@ done
 [[ "$slot" != "$from_slot" ]] || release_die "--from-slot must differ from --slot"
 [[ -z "$seed_option" || "$seed_option" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
   release_die "invalid WIP seed host: $seed_option"
+release_validate_host_value "WIP_SEED_HOST" "$seed_option"
 case "$role" in coordinator|expert|both) ;; *) release_die "--role must be coordinator, expert, or both" ;; esac
 ((!recreate || !refresh_containers)) ||
   release_die "--recreate and --refresh-containers cannot be combined"
