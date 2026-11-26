@@ -141,7 +141,7 @@ impl ServeArgs {
     }
 }
 
-fn resolve_expert_package(
+pub(super) fn resolve_expert_package(
     native_lib: &Path,
     explicit: Option<&Path>,
     gpus: usize,
@@ -592,8 +592,69 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let admitted_context = usize::try_from(inputs.context.maximum)?;
             let host_quota = inputs.host_prefix.quota_bytes;
 
-            let spark_link = if !worker_args.peers.is_empty() && !spark_layers.is_empty() {
+            let rtx_plan = if onboarded_layers.is_empty() {
+                None
+            } else {
+                let expert_pkg = resolve_expert_package(
+                    &worker_args.native_lib,
+                    worker_args.expert_package.as_deref(),
+                    gpus,
+                    &catalog,
+                )?;
+                let peak_budgets: Vec<usize> = if gpus == 1 {
+                    vec![usize::try_from(admitted.placement.expert_ranges[0].peak_bytes)?]
+                } else {
+                    let tp2 = admitted
+                        .placement
+                        .tp2
+                        .as_ref()
+                        .context("Hy4 missing admitted TP2 expert range")?;
+                    vec![usize::try_from(tp2.peak_bytes[0])?, usize::try_from(tp2.peak_bytes[1])?]
+                };
+                let workspace = if gpus == 1 {
+                    Exl3Tp2::whole_workspace_bytes(
+                        &expert_pkg,
+                        capacity_rows,
+                        cuteafd_core::ExpertGeometry::HY4,
+                        RtxSelectionPolicy::CanonicalDecode,
+                    )?
+                } else {
+                    let row_policy =
+                        crate::shared::experts::exl3::execution::Exl3RowPolicy::for_geometry(
+                            cuteafd_core::ExpertGeometry::HY4,
+                        );
+                    Exl3Tp2::workspace_bytes_for_selection(
+                        &expert_pkg,
+                        cfg.hidden,
+                        capacity_rows,
+                        row_policy,
+                        RtxSelectionPolicy::CanonicalDecode,
+                    )?
+                };
+                let payload_budgets: Vec<usize> = peak_budgets
+                    .iter()
+                    .map(|&peak| {
+                        peak.checked_sub(workspace)
+                            .context("Hy4 onboarded expert workspace exceeds admitted peak")
+                    })
+                    .collect::<Result<_>>()?;
+                Some((expert_pkg, peak_budgets, payload_budgets))
+            };
+
+            let head_rows = capacity_rows.min(hy4_place::DECODE_ROWS as usize);
+            let (spark_link, preloaded_weights, onboarded): (
+                Option<crate::shared::spark_intake::SparkLink<'_>>,
+                Option<Vec<super::weights::Hy4RankWeights<'_>>>,
+                Vec<Option<Exl3Tp2<'_>>>,
+            ) = if !worker_args.peers.is_empty() && !spark_layers.is_empty() {
                 use crate::shared::{
+                    experts::{
+                        layer::ExpertLayer,
+                        rtx::{
+                            dense,
+                            push::{CoordinatorExperts, CoordinatorPush, PushPolicy, WholeOwner},
+                        },
+                    },
                     placement::{spark_rings, SparkAdmission},
                     spark_intake::SparkLink,
                 };
@@ -633,7 +694,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     1,
                     executions,
                 )?;
-                SparkAdmission::plan_view(
+                let spark_adm = SparkAdmission::plan_view(
                     &view,
                     ExpertGeometry::HY4,
                     Some(&catalog),
@@ -641,8 +702,181 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     worker_args.peers.len(),
                     model_adm,
                     None,
-                )?
-                .select(&worker_args.peers)?;
+                )?;
+
+                // Unified SparkNest push group: Spark workers + coordinator dense target
+                // weights + onboarded RTX EXL3 experts in one group (mount fallback outside SparkNest).
+                let policy = PushPolicy::for_snapshot(&checkpoint.snapshot)?;
+                let planned = if spark_adm.coordinator_pushes() {
+                    policy.plan(|| -> Result<_> {
+                        let (weights, records) = dense::recording(|| {
+                            super::weights::Hy4RankWeights::record_all(
+                                &devices,
+                                &programs,
+                                &checkpoint,
+                                &cfg,
+                                capacity_rows,
+                                head_rows,
+                            )
+                        })?;
+                        let (operands, steps) = (records.operands.len(), records.steps.len());
+                        let dense = dense::plan_records(
+                            &checkpoint.snapshot,
+                            records,
+                            &devices,
+                            worker_args.peers.len(),
+                        )?;
+                        let experts = rtx_plan.as_ref().map(|(_, _, payload_budgets)| {
+                            if gpus == 1 {
+                                CoordinatorExperts::Whole {
+                                    owners: vec![WholeOwner {
+                                        rank: 0,
+                                        selections: onboarded_layers
+                                            .iter()
+                                            .map(|&layer| ExpertLayer::BackboneFull { layer })
+                                            .collect(),
+                                        budget: payload_budgets[0],
+                                    }],
+                                }
+                            } else {
+                                CoordinatorExperts::Tp2 {
+                                    layers: onboarded_layers.clone(),
+                                    budgets: payload_budgets.clone(),
+                                }
+                            }
+                        });
+                        let prepared = CoordinatorPush::prepare_view(
+                            &view,
+                            Some(&catalog),
+                            gpus,
+                            experts,
+                        )?;
+                        Ok((prepared, weights, dense, operands, steps))
+                    })?
+                } else {
+                    None
+                };
+                let (planned, ranks) = match planned {
+                    Some(((push, streams, ranks), weights, dense, operands, steps)) => {
+                        (Some((push, weights, dense, operands, steps)), Some((streams, ranks)))
+                    }
+                    None => (None, None),
+                };
+                let pending = spark_adm.start_with(&worker_args.peers, ranks)?;
+                let (weights, pushed) = match planned {
+                    Some((push, weights, dense, operands, steps)) => {
+                        let started = std::time::Instant::now();
+                        let (pushed, ()) = push.receive_with(
+                            devices.to_vec(),
+                            Some(&catalog),
+                            worker_args.peers.len(),
+                            Some(Ok(dense)),
+                            || (),
+                        );
+                        let pushed = policy.committed(pushed)?;
+                        tracing::info!(
+                            pushed = pushed.is_some(),
+                            operands,
+                            steps,
+                            onboard_layers = onboarded_layers.len(),
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "Hy4 unified SparkNest push group committed"
+                        );
+                        (weights, pushed)
+                    }
+                    None => {
+                        let weights = super::weights::Hy4RankWeights::load_all(
+                            &devices,
+                            &programs,
+                            &checkpoint,
+                            &cfg,
+                            capacity_rows,
+                            head_rows,
+                            Default::default(),
+                        )?;
+                        (weights, None)
+                    }
+                };
+                pending.wait()?;
+                if pushed.is_some() {
+                    super::weights::Hy4RankWeights::finish_kv_b(
+                        &weights,
+                        &programs,
+                        &checkpoint,
+                        &cfg,
+                    )?;
+                }
+
+                let pushed_exl3 = pushed
+                    .map(|ranks| {
+                        ranks
+                            .into_iter()
+                            .map(|r| r.exl3())
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .transpose()?;
+                let onboarded: Vec<Option<Exl3Tp2<'_>>> = match &rtx_plan {
+                    None => (0..gpus).map(|_| None).collect(),
+                    Some((expert_pkg, peak_budgets, _)) => {
+                        if gpus == 1 {
+                            let w = match pushed_exl3 {
+                                Some(mut ranks) => {
+                                    ensure!(ranks.len() == 1, "Hy4 pushed whole expert rank count");
+                                    Exl3Tp2::pushed_whole_weights(
+                                        devices[0],
+                                        &catalog,
+                                        expert_pkg,
+                                        onboarded_layers.clone(),
+                                        capacity_rows,
+                                        peak_budgets[0],
+                                        RtxSelectionPolicy::CanonicalDecode,
+                                        ranks.pop().unwrap(),
+                                    )?
+                                }
+                                None => Exl3Tp2::load_whole_weights(
+                                    devices[0],
+                                    &catalog,
+                                    expert_pkg,
+                                    onboarded_layers.clone(),
+                                    capacity_rows,
+                                    peak_budgets[0],
+                                    RtxSelectionPolicy::CanonicalDecode,
+                                )?,
+                            };
+                            vec![Some(w.execution()?)]
+                        } else {
+                            let [w0, w1] = match pushed_exl3 {
+                                Some(ranks) => {
+                                    let pair = ranks.try_into().map_err(|_| {
+                                        anyhow::anyhow!("Hy4 pushed TP2 expert rank count")
+                                    })?;
+                                    Exl3Tp2::pushed_pair_weights(
+                                        [devices[0], devices[1]],
+                                        &catalog,
+                                        ExpertGeometry::HY4,
+                                        [expert_pkg.as_path(), expert_pkg.as_path()],
+                                        onboarded_layers.clone(),
+                                        capacity_rows,
+                                        [peak_budgets[0], peak_budgets[1]],
+                                        RtxSelectionPolicy::CanonicalDecode,
+                                        pair,
+                                    )?
+                                }
+                                None => Exl3Tp2::load_pair_weights(
+                                    [devices[0], devices[1]],
+                                    &catalog,
+                                    ExpertGeometry::HY4,
+                                    [expert_pkg.as_path(), expert_pkg.as_path()],
+                                    onboarded_layers.clone(),
+                                    capacity_rows,
+                                    [peak_budgets[0], peak_budgets[1]],
+                                    RtxSelectionPolicy::CanonicalDecode,
+                                )?,
+                            };
+                            vec![Some(w0.execution()?), Some(w1.execution()?)]
+                        }
+                    }
+                };
 
                 let geometry = inputs
                     .links
@@ -667,55 +901,56 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 )?;
                 session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
                 devices[0].run(|| link.bootstrap(&session))?;
-                Some(link)
+                (Some(link), Some(weights), onboarded)
             } else {
-                None
+                let weights = super::weights::Hy4RankWeights::load_all(
+                    &devices,
+                    &programs,
+                    &checkpoint,
+                    &cfg,
+                    capacity_rows,
+                    head_rows,
+                    Default::default(),
+                )?;
+                let onboarded = match &rtx_plan {
+                    None => (0..gpus).map(|_| None).collect(),
+                    Some((expert_pkg, peak_budgets, _)) => {
+                        if gpus == 1 {
+                            let w = Exl3Tp2::load_whole_weights(
+                                devices[0],
+                                &catalog,
+                                expert_pkg,
+                                onboarded_layers.clone(),
+                                capacity_rows,
+                                peak_budgets[0],
+                                RtxSelectionPolicy::CanonicalDecode,
+                            )?;
+                            vec![Some(w.execution()?)]
+                        } else {
+                            let [w0, w1] = Exl3Tp2::load_pair_weights(
+                                [devices[0], devices[1]],
+                                &catalog,
+                                cuteafd_core::ExpertGeometry::HY4,
+                                [expert_pkg.as_path(), expert_pkg.as_path()],
+                                onboarded_layers.clone(),
+                                capacity_rows,
+                                [peak_budgets[0], peak_budgets[1]],
+                                RtxSelectionPolicy::CanonicalDecode,
+                            )?;
+                            vec![Some(w0.execution()?), Some(w1.execution()?)]
+                        }
+                    }
+                };
+                (None, Some(weights), onboarded)
             };
 
             library.cuda_set_device(worker_args.device)?;
-
-            let onboarded: Vec<Option<Exl3Tp2<'_>>> = if onboarded_layers.is_empty() {
-                (0..gpus).map(|_| None).collect()
-            } else {
-                let expert_pkg = resolve_expert_package(
-                    &worker_args.native_lib,
-                    worker_args.expert_package.as_deref(),
-                    gpus,
-                    &catalog,
-                )?;
-                let avail: Vec<usize> = (0..gpus)
-                    .map(|gpu| Ok(usize::try_from(admitted.solved.budgets[gpu].available()?)?))
-                    .collect::<Result<_>>()?;
-                if gpus == 1 {
-                    let w = Exl3Tp2::load_whole_weights(
-                        devices[0],
-                        &catalog,
-                        &expert_pkg,
-                        onboarded_layers.clone(),
-                        capacity_rows,
-                        avail[0],
-                        RtxSelectionPolicy::CanonicalDecode,
-                    )?;
-                    vec![Some(w.execution()?)]
-                } else {
-                    let [w0, w1] = Exl3Tp2::load_pair_weights(
-                        [devices[0], devices[1]],
-                        &catalog,
-                        cuteafd_core::ExpertGeometry::HY4,
-                        [expert_pkg.as_path(), expert_pkg.as_path()],
-                        onboarded_layers.clone(),
-                        capacity_rows,
-                        [avail[0], avail[1]],
-                        RtxSelectionPolicy::CanonicalDecode,
-                    )?;
-                    vec![Some(w0.execution()?), Some(w1.execution()?)]
-                }
-            };
 
             let mut engine = Hy4Engine::new_serving(
                 &devices,
                 &programs,
                 Some(preloaded_programs),
+                preloaded_weights,
                 Some(&worker_args.manifest),
                 &checkpoint,
                 cfg.clone(),
