@@ -18,6 +18,9 @@ SPEC.loader.exec_module(cards)
 OBSERVER_GPU_UUIDS = cards.observer_gpu_uuids
 
 
+REAL_LISTENING_PORTS = cards.listening_ports
+
+
 @pytest.fixture(autouse=True)
 def no_stop_handlers(monkeypatch, tmp_path):
     """main() would install its stop handlers in the pytest process; tests that
@@ -27,6 +30,9 @@ def no_stop_handlers(monkeypatch, tmp_path):
     monkeypatch.setattr(cards, '_LIVE', {})
     # Tests must never enqueue against the shared cluster hardware queue.
     monkeypatch.setattr(cards.hwlock, 'LOCK_DIR', tmp_path / 'locks')
+    # Nor read the live host's listening sockets: a real card serving a kit's fixed
+    # ADDR port would fail every grant-time preflight. Guard tests stub `run` directly.
+    monkeypatch.setattr(cards, 'listening_ports', lambda: set())
     monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
     monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
     cards.bench_panels.cache_clear()
@@ -312,6 +318,7 @@ def test_prelaunch_foreign_container_refused(entry, tmp_path, monkeypatch):
 
 def test_prelaunch_bound_addr_port_refused(entry, tmp_path, monkeypatch):
     job = make(entry, tmp_path)
+    monkeypatch.setattr(cards, 'listening_ports', REAL_LISTENING_PORTS)
     port = int(cards.resolve_container_keys(job['entry'])['addr'].rpartition(':')[2])
     listening = f'LISTEN 0 128 0.0.0.0:{port} 0.0.0.0:*\n'
     monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout=listening if cmd[0] == 'ss' else ''))
@@ -321,6 +328,7 @@ def test_prelaunch_bound_addr_port_refused(entry, tmp_path, monkeypatch):
 
 def test_prelaunch_free_addr_port_passes(entry, tmp_path, monkeypatch):
     job = make(entry, tmp_path)
+    monkeypatch.setattr(cards, 'listening_ports', REAL_LISTENING_PORTS)
     port = int(cards.resolve_container_keys(job['entry'])['addr'].rpartition(':')[2])
     other = f'LISTEN 0 128 0.0.0.0:{port + 1} 0.0.0.0:*\nLISTEN 0 128 [::]:22 [::]:*\n'
     monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout=other if cmd[0] == 'ss' else ''))
@@ -3318,6 +3326,7 @@ def test_omitted_expert_port_uses_launcher_default_in_preflight_and_assert_absen
         *((host, f'cuteafd-spark-expert-{host}-19441') for host in omitted['sparks']),
     ]
     seen = []
+    monkeypatch.setattr(cards, 'listening_ports', REAL_LISTENING_PORTS)
     monkeypatch.setattr(cards, 'run', lambda cmd: seen.append(cmd) or SimpleNamespace(stdout=''))
     cards.preflight_at_grant(job, {'instance': 'b', 'slot': 's'})
     # One container listing per host, then one listen-port check on raptor.
