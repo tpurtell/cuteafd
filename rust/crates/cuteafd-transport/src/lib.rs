@@ -121,11 +121,14 @@ pub struct TcpTransportConfig {
 }
 
 impl Default for TcpTransportConfig {
+    /// Startup-only: resolves `timing` from the process environment once, so
+    /// every family that builds its transport from the default honours
+    /// `CUTEAFD_PROTOCOL_V2_TCP_TIMING` without threading it by hand.
     fn default() -> Self {
         Self {
             timeout: DEFAULT_TIMEOUT,
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
-            timing: false,
+            timing: protocol_v2_timing_from_env(),
         }
     }
 }
