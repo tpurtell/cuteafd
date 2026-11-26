@@ -829,9 +829,16 @@ def test_v7_release_cards_match_live_and_retired_inventory():
     assert primary == {(row["family"], row["checkpoint"], g) for row in published["cells"]
                        for g in (1, 2) if row[f"{g}rtx"]["status"] != "na"}
     assert {(row["family"], row["checkpoint"], row["spark_ranks"], row["1rtx"]["status"])
-            for row in published["supplemental"]} == {("hy4_flash", HY4_MC, n, "pending") for n in (1, 4)}
+            for row in published["supplemental"]} == {("hy4_flash", HY4_MC, n, "current") for n in (1, 4)}
     hy4, = [row for row in published["cells"] if row["checkpoint"] == HY4_MC]
-    assert hy4["1rtx"]["status"] == hy4["2rtx"]["status"] == "pending"
+    assert hy4["1rtx"]["status"] == hy4["2rtx"]["status"] == "current"
+    # #2675 / #2782: the K8-compact v7 smoke cards are published, each on its own report.
+    for row in published["cells"] + published["supplemental"]:
+        if row["checkpoint"] in MC_CHECKPOINTS | {HY4_MC}:
+            for key in ("1rtx", "2rtx"):
+                cell = row.get(key)
+                if cell and cell["status"] == "current":
+                    assert (ROOT / cell["report"] / "report.json").is_file(), cell["report"]
 
 
 def test_v7_comparisons_change_only_view_and_endpoints_from_the_k8_max():
@@ -876,7 +883,8 @@ def test_v7_comparisons_change_only_view_and_endpoints_from_the_k8_max():
                 snapshot = Path(report["server"]["configuration"]["snapshot"])
                 assert snapshot.name == revision, (study["checkpoint"], view, snapshot.name, revision)
         if study["checkpoint"] == HY4_MC:
-            assert not any(study["views"].values())
+            # #2675: Hy4-flash has only its K8 main card (2x+0); compare views are unmeasured.
+            assert {v for v, d in study["views"].items() if d} == {"k8-compact"}
 
 
 @pytest.mark.parametrize("path", starting_configs(), ids=lambda p: p.name)
@@ -1376,11 +1384,12 @@ def test_glmf_mc_comparison_keeps_compact_modes_supplementary() -> None:
     published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     assert not any(row["checkpoint"] == old_model for row in published["cells"])
     current = next(row for row in published["cells"] if row["checkpoint"] == config["MODEL_ID"])
-    assert current["1rtx"]["status"] == "pending"
-    assert current["2rtx"]["status"] == "current"
-    report = json.loads((ROOT / current["2rtx"]["report"] / "report.json").read_text())
-    settings = {item["name"]: item["value"] for item in report["server"]["configuration"]["settings"]}
-    assert settings["core-view"] == "k8-compact"
+    # #2675: v7 main cards are K8 compact on both columns.
+    assert current["1rtx"]["status"] == current["2rtx"]["status"] == "current"
+    for column in ("1rtx", "2rtx"):
+        report = json.loads((ROOT / current[column]["report"] / "report.json").read_text())
+        settings = {item["name"]: item["value"] for item in report["server"]["configuration"]["settings"]}
+        assert settings["core-view"] == "k8-compact", column
     for suffix in ("5090", "min", "max"):
         retired = next(entry for entry in published["retired"] if entry["name"] == f"glm53f-exl3-k6-{suffix}")
         assert retired["release_note"] == "replaced by K4 MC original"
@@ -1464,8 +1473,9 @@ def test_kimi_k31_mc_cards_keep_original_primary_and_k6_supplementary() -> None:
     published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     row, = [row for row in published["cells"] if row["checkpoint"] == model]
     assert row["family"] == "kimi_k3"
-    assert row["1rtx"]["status"] == "pending"
-    assert row["2rtx"]["status"] == "current"
+    # #2675: v7 main cards are K8 compact on both columns.
+    assert row["1rtx"]["status"] == row["2rtx"]["status"] == "current"
+    assert row["1rtx"]["report"].endswith("-kimi-k31-mc-k8-compact-min")
     study, = [entry for entry in published["mc_views"] if entry["checkpoint"] == model]
     assert study["views"]["k8-compact"] == row["2rtx"]["report"]
     for view in ("k8-compact", "k6-compact", "fp8-compact"):
