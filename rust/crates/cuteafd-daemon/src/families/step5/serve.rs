@@ -1060,6 +1060,8 @@ mod tests {
         use super::super::prefix::Placement;
         let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let mut args = live_mtp_args();
+        // The text-only oracle starts routed experts, not remote vision workers.
+        args.vision.vision = cuteafd_loader::plan::MediaMode::Off;
         args.kv_cache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
             .unwrap_or_else(|_| "bf16".into()).parse()?;
         args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
