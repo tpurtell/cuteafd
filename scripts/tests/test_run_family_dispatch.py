@@ -1453,7 +1453,8 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
             source = hf_home / "hub" / cache
             if source.is_dir() and not (hub / cache).exists():
                 (hub / cache).symlink_to(source.resolve(), target_is_directory=True)
-    keys = "\n".join(line for line in raw.splitlines()
+    # The launcher refuses template REPLACE-ME hosts; give the copy it reads real-looking ones.
+    keys = "\n".join(line.replace("REPLACE-ME-spark-", "spark-") for line in raw.splitlines()
                      if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
     output = temporary / "resolver-deployment.json"
     identity = config.get("MODEL_ID", "test/resolver-parity")
