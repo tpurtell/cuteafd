@@ -269,6 +269,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         args.expert_package.is_none() || !args.skip_routed_experts,
         "--expert-package conflicts with --skip-routed-experts"
     );
+    ensure!(args.peers.is_empty() || (args.expert_package.is_none() && !args.skip_routed_experts),
+        "--peers conflicts with --expert-package or --skip-routed-experts");
     let onboarded: Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'_>>> =
         if let Some(pkg) = &args.expert_package {
             use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
@@ -361,92 +363,11 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         )?
     };
 
-    if !args.peers.is_empty() && !args.skip_routed_experts {
-        use crate::shared::{
-            placement::{spark_rings, SparkAdmission},
-            spark_intake::SparkLink,
-        };
-        use cuteafd_core::{ExpertGeometry, SparkEndpoint, SparkIngress};
-        use cuteafd_loader::placement::families::hy4 as hy4_place;
-        use cuteafd_loader::placement::planner::PrefillShape;
-        use cuteafd_loader::placement::SparkWorkingSet;
-        use cuteafd_transport::{
-            expert::{SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
-            worker_selection::ModelAdmission,
-            ExpertV2Dtype, SparkSessionShape, TcpTransportConfig,
-        };
-        let catalog = cuteafd_loader::read_expert_catalog_view(
-            checkpoint.view.as_ref().context("Hy4 checkpoint view required for Spark")?,
+    if !args.peers.is_empty() {
+        let link = super::super::hy4_common::golden::spark_link(
+            &library, devices[0], &selected, cuteafd_core::ExpertGeometry::HY4,
+            cfg.routed_layers(), &args.peers, unit, decode_rows, prefill_waves,
         )?;
-        let capacity_rows = unit.max(decode_rows);
-        let spark_layers = cfg.routed_layers();
-        let working = SparkWorkingSet {
-            rtx_layers: Vec::new(),
-            spark_layers,
-            spark_ranks: args.peers.len(),
-            prefill_lanes: hy4_place::LANES,
-        };
-        let endpoint = SparkEndpoint {
-            ring_depth: None,
-            capacity: u32::try_from(capacity_rows)?,
-            ingress: SparkIngress::Fp8K32,
-            partial_reply_bytes: None,
-        };
-        let tcp = TcpTransportConfig::default();
-        let backend_exec =
-            cuteafd_loader::plan::spark_executions::SparkBackend::for_catalog(&catalog)?;
-        let executions = cuteafd_loader::plan::spark_executions::admit_family(
-            "hy4",
-            &backend_exec.exports(),
-            Some(decode_rows as u32),
-            unit as u64,
-            prefill_waves as u64,
-        )?;
-        let model_adm = ModelAdmission::for_clients(
-            ExpertGeometry::HY4,
-            endpoint,
-            spark_rings(tcp.max_frame_bytes)?,
-            1,
-            executions,
-        )?;
-        SparkAdmission::plan_view(
-            &selected,
-            ExpertGeometry::HY4,
-            Some(&catalog),
-            &working,
-            args.peers.len(),
-            model_adm,
-            None,
-        )?
-        .select(&args.peers)?;
-        let links = hy4_place::spark_link(
-            0,
-            args.peers.len(),
-            PrefillShape {
-                rows: capacity_rows as u64,
-                waves: prefill_waves as u64,
-            },
-            cuteafd_core::spark_reply::requested(),
-        )
-        .map_err(|e| anyhow::anyhow!("Hy4 golden Spark link refused: {e}"))?;
-        let mut link = devices[0].run(|| {
-            SparkLink::prepared(
-                &library,
-                SparkWorld::canonical(args.peers.len())?,
-                &args.peers,
-                tcp,
-                links[0].clone(),
-            )
-        })?;
-        link.enable_terminal_ownership(Arc::clone(&library))?;
-        let mut session = SparkSessionShape::new(
-            u32::try_from(capacity_rows)?,
-            u32::try_from(cfg.hidden)?,
-            u32::try_from(cfg.topk)?,
-            ExpertV2Dtype::Fp8E4m3Ue8m0K32,
-        )?;
-        session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
-        devices[0].run(|| link.bootstrap(&session))?;
         engine.attach_spark(link, Vec::new());
     }
 

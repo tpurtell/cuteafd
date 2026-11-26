@@ -16,7 +16,7 @@ use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
 use cuteafd_loader::plan::checkpoint::{Checkpoint, CheckpointView};
 use cuteafd_loader::plan::families::hy4_flash as hy4_plan;
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::{net::SocketAddr, path::{Path, PathBuf}, sync::Arc};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct GoldenArgs {
@@ -50,6 +50,9 @@ pub(crate) struct GoldenArgs {
     /// Attention placement on 2 GPUs (`auto` -> `context`, or explicit `heads` / `context`).
     #[arg(long, default_value = "auto", value_parser = ["auto", "heads", "context"])]
     pub(crate) attention_placement: String,
+    /// Spark worker peer endpoints (`host:port,...`) for routed experts.
+    #[arg(long, value_delimiter = ',')]
+    pub(crate) peers: Vec<SocketAddr>,
     /// Validate checkpoint headers, MC views, Engram FP8 shards, and target arenas without CUDA.
     #[arg(long)]
     pub(crate) check_headers: bool,
@@ -249,7 +252,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         .as_deref()
         .unwrap_or_else(|| Path::new("/opt/cuteafd/lib/libcuteafd_native.so"));
     // SAFETY: trusted native library built by this repository's toolchain.
-    let library = unsafe { NativeLibrary::load(lib_path)? };
+    let library = Arc::new(unsafe { NativeLibrary::load(lib_path)? });
     let programs = library.programs()?.with_manifest(&args.manifest)?;
 
     let mut device_ids = vec![args.device];
@@ -269,6 +272,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         args.expert_package.is_none() || !args.skip_routed_experts,
         "--expert-package conflicts with --skip-routed-experts"
     );
+    ensure!(args.peers.is_empty() || (args.expert_package.is_none() && !args.skip_routed_experts),
+        "--peers conflicts with --expert-package or --skip-routed-experts");
     let onboarded: Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'_>>> =
         if let Some(pkg) = &args.expert_package {
             use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
@@ -367,6 +372,14 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             onboarded,
         )?
     };
+
+    if !args.peers.is_empty() {
+        let link = super::super::hy4_common::golden::spark_link(
+            &library, devices[0], &selected, cuteafd_core::ExpertGeometry::HY4_FLASH,
+            cfg.routed_layers(), &args.peers, unit, decode_rows, prefill_waves,
+        )?;
+        engine.attach_spark(link, Vec::new());
+    }
 
     if args.resume_dfly2 {
         use cuteafd_loader::families::hy4_flash::{draft, Hy4DflyConfig};
@@ -1111,6 +1124,17 @@ mod tests {
             .is_err(),
             "--engram-bf16 must be rejected (FP8 Engram only)"
         );
+    }
+
+    #[test]
+    fn hy4f_golden_cli_parses_peers() -> anyhow::Result<()> {
+        let crate::cli::Commands::Hy4fGolden(args) = crate::cli::Cli::try_parse_from([
+            "cuteafd", "hy4f-golden", "--snapshot", "/snapshot", "--golden", "/golden",
+            "--peers", "127.0.0.1:19441,127.0.0.1:19442", "--decode", "--decode-graphs",
+        ])?.command else { anyhow::bail!("expected Hy4fGolden") };
+        assert_eq!(args.peers.len(), 2);
+        assert!(args.decode && args.decode_graphs);
+        Ok(())
     }
 
     #[test]
