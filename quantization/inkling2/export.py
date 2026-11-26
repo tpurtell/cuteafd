@@ -104,7 +104,7 @@ class DirectMCWriter:
         for name, location in inv['locations'].items():
             if set(location) != {'shard', 'source_name'} or location['shard'] != inv['mapping'][name]:
                 raise ValueError('source alias inventory differs')
-            _basename(location['shard'])
+            package.check_source_shard(self.family, location['shard'])
         identity = dict(deepcopy(identity), schema='cuteafd-core-package-v1', family=self.family,
                         source_repo=source_repo, source_revision=source_revision)
         self.identity = json.loads(canonical(identity))
@@ -265,7 +265,7 @@ class DirectMCWriter:
                 raise ValueError('K6 drafter fallback must reference the existing K8 encode')
             for rows in (mappings, sizes, specs):
                 rows['k6-compact'][name] = rows['k8-compact'][name]
-        expected = {'original': {module + '.weight': ['BF16', [g['out_features'], g['in_features']]]
+        expected = {'original': {package.original_tensor_name(self.family, module): ['BF16', [g['out_features'], g['in_features']]]
                                   for module, g in core_selection.items()}}
         for view, bits in (('k8-compact', 8), ('k6-compact', 6)):
             expected[view] = {n: [dtype, shape] for m, g in core_selection.items()
