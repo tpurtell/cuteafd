@@ -630,6 +630,9 @@ fn hy4_layers_placement_plan_equals_runtime_admission() {
         replies: layout.spark_reply_formats,
         expert_usage: layout.expert_usage,
         resident_weight_limit: Some(ResidentWeights(opts.coordinator_budget_bytes)),
+        vision: report.vision,
+        vision_replicas: layout.vision_replicas,
+        media_cache_bytes: layout.media_cache_bytes,
     };
     let inputs = admission::gather(&facts_req).expect("runtime gather");
     let solve_req = hy4_place::request(
