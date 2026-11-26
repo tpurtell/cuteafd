@@ -319,8 +319,10 @@ impl<'s, 'w, 'a> PendingLaneFfn<'s, 'w, 'a> {
                     if cached.is_some() && !crate::shared::decode_graph::census::eager("layer_row") {
                         lane.block.prepare_ffn_graph_replay(binding,rows)?;
                     }
-                    crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows,
-                        cached.map(|(raw,_)|raw), || lane.block.enqueue_ffn(binding,rows,projected,stream).map(|_| ()))?;
+                    if crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows,
+                        cached.map(|(raw,_)|raw), || lane.block.enqueue_ffn(binding,rows,projected,stream).map(|_| ()))? {
+                        graphs.bank.record_launch();
+                    }
                     Ok((lane.block.graph_normalized_storage(rows),stream,projected))
                 }).await? };
             if cached.is_none() && !windowed && !crate::shared::decode_graph::census::eager("layer_row") {

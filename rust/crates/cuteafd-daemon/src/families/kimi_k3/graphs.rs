@@ -392,7 +392,7 @@ impl<'a> Graphs<'a> {
             ensure!(device == stream.device.id, "Kimi graph replay device changed");
             // SAFETY: the bank owns immutable capture pointers and LocalLane
             // retains this exact stream until every launch has drained.
-            stream.device.run(|| unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw) })?;
+            stream.device.run(|| unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw, self.bank(key.op).launch_tally()) })?;
             self.replays += 1;
             return Ok(());
         }
@@ -406,7 +406,7 @@ impl<'a> Graphs<'a> {
         let (device, raw) = (owner.device(), owner.raw);
         ensure!(device == stream.device.id, "Kimi graph captured a foreign device");
         // SAFETY: just instantiated on this device and not yet launched.
-        stream.device.run(|| unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw) })?;
+        stream.device.run(|| unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw, self.bank(key.op).launch_tally()) })?;
         self.replays += 1;
         Ok(())
     }

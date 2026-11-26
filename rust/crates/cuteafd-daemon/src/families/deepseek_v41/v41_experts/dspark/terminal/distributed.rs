@@ -97,9 +97,9 @@ impl<'w, 'a> DistributedDsparkTerminal<'w, 'a> {
             let graph = sampling.then(|| self.graphs.cached_launch(&key)).flatten().map(|owner| owner.raw);
             let span = terminal.timing.begin(if sampling { "graph_selector_confidence" } else { "graph_terminal_norm" },
                 None, requests * terminal.width, terminal.stream.raw)?;
-            crate::shared::decode_graph::census::dispatch(device.library, terminal.stream.raw, c"dspark", requests,
+            if crate::shared::decode_graph::census::dispatch(device.library, terminal.stream.raw, c"dspark", requests,
                 graph, || if sampling { terminal.enqueue_sampling_on(requests, terminal.stream.raw) }
-                    else { terminal.enqueue_normalize_on(requests, terminal.stream.raw) })?;
+                    else { terminal.enqueue_normalize_on(requests, terminal.stream.raw) })? { self.graphs.record_launch(); }
             terminal.timing.end(span, terminal.stream.raw)
         })
     }

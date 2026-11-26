@@ -492,7 +492,7 @@ impl AttentionQueryWave<'_, '_> {
         };
         ensure!(count == rows, "attention query capture row count differs");
         let launched = unsafe {
-            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw)
+            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw, self.graphs.launch_tally())
         };
         launched.and(unsafe { crate::shared::memory::chain::finish(self.storage.stream.library, self.storage.stream.raw) })?;
         self.ready = Some(rows);
@@ -593,8 +593,9 @@ impl AttentionQueryWave<'_, '_> {
             prepare(self.storage.stream.raw, self.input())?;
             // The normalized input is complete here; cache producers fork from it.
             crate::shared::memory::chain::mark_fork(self.storage.stream.library, self.storage.stream.raw)?;
-            crate::shared::decode_graph::census::dispatch(self.storage.stream.library, self.storage.stream.raw, c"layer_row",
-                rows as usize, graph.map(|(raw, _)| raw), || self.enqueue(rows))
+            if crate::shared::decode_graph::census::dispatch(self.storage.stream.library, self.storage.stream.raw, c"layer_row",
+                rows as usize, graph.map(|(raw, _)| raw), || self.enqueue(rows))? { self.graphs.record_launch(); }
+            Ok(())
         } })();
         let drained = if queued.is_err() { self.storage.stream.wait().await }
             else { unsafe { crate::shared::memory::chain::finish_cooperative(&self.storage.stream).await } };
@@ -654,8 +655,8 @@ impl AttentionQueryWave<'_, '_> {
             self.storage.stream.library.copy_host_buffer_h2d_async(self.positions(),self.position_staging.buffer,
                 tokens.len()*8,self.storage.stream.raw)?;
             prepare(self.storage.stream.raw,self.input())?;
-            crate::shared::decode_graph::census::dispatch(self.storage.stream.library, self.storage.stream.raw, c"layer_row",
-                rows as usize, graph.map(|(raw, _)| raw), || self.enqueue_rank(rows))?;
+            if crate::shared::decode_graph::census::dispatch(self.storage.stream.library, self.storage.stream.raw, c"layer_row",
+                rows as usize, graph.map(|(raw, _)| raw), || self.enqueue_rank(rows))? { self.graphs.record_launch(); }
             projection.execute_after(self.weights.layer,rows,self.b(2),Some(self.storage.stream.raw),|projected,stream| {
                 self.storage.stream.library.copy_d2d_async(self.b(3),projected,rows as usize*ROW_BYTES[3],stream)?;
                 #[cfg(test)]
@@ -981,9 +982,9 @@ mod bounded_graph_tests {
             // SAFETY: eager closure has no device operands; the cache miss must
             // choose it rather than trying to launch a nonexistent executable.
             unsafe {
-                crate::shared::decode_graph::census::dispatch(&library, std::ptr::null_mut(), c"layer_row", 16,
+                let _ = crate::shared::decode_graph::census::dispatch(&library, std::ptr::null_mut(), c"layer_row", 16,
                     graph, || { eager_runs += 1; Ok(()) })?;
-                crate::shared::decode_graph::census::dispatch(&library, std::ptr::null_mut(), c"layer_row", 16,
+                let _ = crate::shared::decode_graph::census::dispatch(&library, std::ptr::null_mut(), c"layer_row", 16,
                     rows.cached_launch(16), || { eager_runs += 1; Ok(()) })?;
             }
         }

@@ -2040,15 +2040,13 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_end_capture_topology(
 namespace {
 struct GraphHandle {
   cudaGraphExec_t exec = nullptr;
-  std::atomic<uint64_t> launches{0};
   const std::thread::id executor = std::this_thread::get_id();
   bool uploaded = false;
   void* uploaded_stream = nullptr;
 };
 // GraphOwner pins the handle through every synchronous launch. All mutation of
 // one executable is on its owning executor (both V4.1 lanes are polled there).
-// Telemetry may run elsewhere, but only reads the atomic counter under the
-// registry mutex. The registry protects lookup/lifetime on rare paths, not replay.
+// The registry protects lookup/lifetime on rare paths, not replay.
 bool graph_executor(const GraphHandle& handle) {
   return handle.executor == std::this_thread::get_id();
 }
@@ -2431,13 +2429,12 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, voi
   // The caller retains GraphOwner until submission returns. A transferred old
   // owner retains its own tombstone, so stale generations fail without a map
   // lookup and cannot name the receiver's new executable.
-  GraphHandle* counted = nullptr;
   auto target = reinterpret_cast<cudaGraphExec_t>(cuda_graph_exec);
   if (reinterpret_cast<uintptr_t>(cuda_graph_exec) & uintptr_t(1)) {
-    counted = reinterpret_cast<GraphHandle*>(reinterpret_cast<uintptr_t>(cuda_graph_exec) & ~uintptr_t(1));
-    if (!graph_executor(*counted))
+    const auto* handle = reinterpret_cast<GraphHandle*>(reinterpret_cast<uintptr_t>(cuda_graph_exec) & ~uintptr_t(1));
+    if (!graph_executor(*handle))
       return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "graph launch must run on its owning executor thread");
-    target = counted->exec;
+    target = handle->exec;
     if (!target) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "stale transferred graph handle");
   }
   cudaError_t err = cudaGraphLaunch(target,
@@ -2445,26 +2442,10 @@ extern "C" cuteafd_status_t cuteafd_cuda_graph_launch(void* cuda_graph_exec, voi
   if (err != cudaSuccess) {
     return fail_cuda(CUTEAFD_STATUS_INTERNAL_ERROR, "cudaGraphLaunch failed", err);
   }
-  if (counted) counted->launches.fetch_add(1, std::memory_order_relaxed);
   return ok();
 #else
   return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE,
               "CUDA graph launch is unavailable in this build");
-#endif
-}
-
-// The serving executor serializes launch, snapshot and retirement on its host
-// thread. This is a host counter read only: no device query or synchronization.
-extern "C" cuteafd_status_t cuteafd_cuda_graph_launch_count(void* exec, uint64_t* out) {
-  if (!out) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "null graph launch count");
-#if CUTEAFD_NATIVE_ENABLE_CUDA
-  std::lock_guard<std::mutex> guard(graph_handles_mutex);
-  const auto found = graph_handles.find(exec);
-  if (found == graph_handles.end()) return fail(CUTEAFD_STATUS_INVALID_ARGUMENT, "unknown graph handle");
-  *out = found->second->launches.load(std::memory_order_relaxed);
-  return ok();
-#else
-  return fail(CUTEAFD_STATUS_CUDA_UNAVAILABLE, "graph launch count unavailable");
 #endif
 }
 

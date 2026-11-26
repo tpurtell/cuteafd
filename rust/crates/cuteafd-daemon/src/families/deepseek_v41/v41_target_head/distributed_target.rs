@@ -50,7 +50,7 @@ impl<'w, 'a> Normalize<'w, 'a> {
                 }
                 first += count;
             }
-            crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
+            let _ = crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
                 None, || self.enqueue(rows))?;
             crate::shared::memory::chain::finish(lib, self.stream.raw)
         }
@@ -69,7 +69,7 @@ impl<'w, 'a> Normalize<'w, 'a> {
                 first += count;
             }
             crate::shared::decode_graph::census::dispatch(self.weights.library, self.stream.raw, c"head", rows,
-                None, || self.enqueue(rows))
+                None, || self.enqueue(rows)).map(|_| ())
         } })();
         let drained = self.stream.wait().await;
         queued.and(drained)

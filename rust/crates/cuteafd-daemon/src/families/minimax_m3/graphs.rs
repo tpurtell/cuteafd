@@ -145,7 +145,7 @@ impl<'a, P> Graphs<'a, P> {
             let raw = graph.raw;
             return self.stream.device.run(|| {
                 // SAFETY: P retains captured storage and this owner's exact stream.
-                unsafe { decode_graph::launch(self.stream.device.library, raw, self.stream.raw) }
+                unsafe { decode_graph::launch(self.stream.device.library, raw, self.stream.raw, self.bank.launch_tally()) }
             });
         }
         let Some(mut ticket) = self.bank.cache_ticket(&key, false, estimate) else { return work() };
@@ -190,7 +190,7 @@ impl<'a, P> Graphs<'a, P> {
             self.bank.census_capture_key("section", key.rank as i32, None, &key, raw);
             self.bank.cache_commit(key, graph, ticket, nodes as u64, width, spans || self.spans_devices);
             // SAFETY: newly committed executable and storage remain retained.
-            unsafe { decode_graph::launch(library, raw, self.stream.raw) }
+            unsafe { decode_graph::launch(library, raw, self.stream.raw, self.bank.launch_tally()) }
         })
     }
 

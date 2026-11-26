@@ -1322,11 +1322,12 @@ impl<'a> Engine<'a> {
             _ => &self.graphs,
         };
         let stream = self.stream_of(rank);
-        if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
+        let cached = graphs.borrow_mut().cached_launch(&key).map(|graph| graph.0);
+        if let Some(raw) = cached {
             if self.capture_only.get() { return Ok(()); }
             self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::Replay, "hit");
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) });
+            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, raw, stream, graphs.borrow().launch_tally()) });
         }
         let pinned = self.graph_pinned(&key);
         let mut ticket = match graphs.borrow_mut().cache_ticket(&key, pinned, None) {
@@ -1385,7 +1386,7 @@ impl<'a> Engine<'a> {
         self.coverage_legacy(rank, key, crate::shared::decode_graph::census::Launch::CaptureLaunch, "first-miss");
         let bank = graphs.borrow();
         let graph = bank.get(&key).context("inserted graph")?;
-        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) })
+        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream, bank.launch_tally()) })
     }
 
     /// Rank 1's decode segment of `layer`: the previous layer's FFN close, then this

@@ -2369,9 +2369,10 @@ impl<'a> MimoEngine<'a> {
         if !self.decode_graphs || self.graphs_first_touch.get() { return segment(); }
         let graphs = match (rank, &self.peer) { (1, Some(peer)) => &peer.graphs, _ => &self.graphs };
         let stream = self.stream_of(rank);
-        if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
+        let cached = graphs.borrow_mut().cached_launch(&key).map(|graph| graph.0);
+        if let Some(raw) = cached {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) });
+            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, raw, stream, graphs.borrow().launch_tally()) });
         }
         // Before the startup prewarm every segment runs eagerly: the prewarm
         // pass, and then serving misses, are the only capture paths.
@@ -2416,7 +2417,7 @@ impl<'a> MimoEngine<'a> {
         graphs.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
         let bank = graphs.borrow();
         let graph = bank.get(&key).context("inserted graph")?;
-        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) })?;
+        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream, bank.launch_tally()) })?;
         Ok(())
     }
 

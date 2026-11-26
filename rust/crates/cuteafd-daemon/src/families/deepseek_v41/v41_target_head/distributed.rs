@@ -77,7 +77,7 @@ impl<'w, 'a> Rank<'w, 'a> {
                 lib.copy_peer_async(self.input.buffer, input, rows * 10240, self.stream.raw)?;
             }
             let span = self.draft_timing.as_ref().map(|timing| timing.begin("head_shard", None, rows, self.stream.raw)).transpose()?.flatten();
-            crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
+            let _ = crate::shared::decode_graph::census::dispatch(lib, self.stream.raw, c"head", rows,
                 None, || self.enqueue(rows, greedy))?;
             if let Some(timing) = &self.draft_timing { timing.end(span, self.stream.raw)?; }
             Ok(())

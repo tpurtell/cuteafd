@@ -21,28 +21,7 @@ pub struct GraphSource<'a> {
     pub inspection_error: Option<String>,
 }
 
-/// Lifetime-pinned host counter reader. Called at telemetry/retirement boundaries.
-pub struct GraphLaunchQuery {
-    _module: Arc<Library>,
-    count: unsafe extern "C" fn(*mut c_void, *mut u64) -> CuteafdStatus,
-}
-impl GraphLaunchQuery {
-    pub fn sample(&self, exec: usize) -> u64 {
-        let mut count = 0;
-        // SAFETY: module pins the ABI; native validates the handle without dereferencing it.
-        let status = unsafe { (self.count)(exec as *mut c_void, &mut count) };
-        if status != CUTEAFD_STATUS_OK { tracing::warn!(status, "graph launch count unavailable"); }
-        count
-    }
-}
-
 impl NativeLibrary {
-    pub fn graph_launch_query(&self) -> Result<GraphLaunchQuery> {
-        // SAFETY: fixed ABI owned by the retained native module.
-        let count = unsafe { *self.lib.get(b"cuteafd_cuda_graph_launch_count")? };
-        Ok(GraphLaunchQuery { _module: Arc::clone(&self.lib), count })
-    }
-
     /// # Safety
     /// The caller exclusively owns the active stream capture and all operands.
     pub unsafe fn cuda_graph_capture_source(&self, stream: *mut c_void) -> Result<GraphSource<'_>> {
@@ -175,17 +154,12 @@ mod tests {
         // SAFETY: CPU fixture has no CUDA work or operand pointers.
         let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
         let donor = source.instantiate(std::ptr::null_mut())?;
-        let counts = library.graph_launch_query()?;
-        assert_eq!(counts.sample(donor as usize), 0);
         // SAFETY: fixture submits no device work.
         unsafe { library.cuda_graph_launch(donor, std::ptr::null_mut())?; }
-        assert_eq!(counts.sample(donor as usize), 1);
         let before = library.cuda_memory_info()?;
         assert!(source.update(donor as usize)?.accepted());
         let receiver = source.transfer(donor as usize)? as *mut c_void;
         assert_ne!(receiver, donor);
-        assert_eq!(counts.sample(donor as usize), 1);
-        assert_eq!(counts.sample(receiver as usize), 0);
         // SAFETY: fixture handles are valid; donor must reject, receiver survives.
         unsafe {
             assert!(library.cuda_graph_upload(donor, std::ptr::null_mut()).is_err());
@@ -196,7 +170,6 @@ mod tests {
             library.cuda_graph_launch(receiver, std::ptr::null_mut())?;
         }
         assert_eq!(fixture.events()?, "GuLUguL");
-        assert_eq!(counts.sample(receiver as usize), 1);
         assert_eq!(before, library.cuda_memory_info()?);
         // SAFETY: receiver exclusively owns the still-live executable.
         unsafe { library.cuda_graph_exec_destroy(receiver)?; }

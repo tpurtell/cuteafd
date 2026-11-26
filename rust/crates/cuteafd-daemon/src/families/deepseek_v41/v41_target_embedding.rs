@@ -180,7 +180,7 @@ impl<'w, 'a> TargetEmbeddingWave<'w, 'a> {
                 rows * 4, self.storage.stream.raw)?;
         }
         let launched = unsafe { crate::shared::decode_graph::census::dispatch(
-            self.storage.stream.library, self.storage.stream.raw, c"layer_row", rows, None, || self.enqueue(rows)) };
+            self.storage.stream.library, self.storage.stream.raw, c"layer_row", rows, None, || self.enqueue(rows)).map(|_| ()) };
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         // SAFETY: every output write precedes this chain publication.
         unsafe { chain::finish(self.storage.stream.library, self.storage.stream.raw)?; }

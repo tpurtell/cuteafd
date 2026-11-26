@@ -83,7 +83,7 @@ impl<'a> DecodeGraphs<'a> {
         let library = stream.device.library;
         if let Some(raw) = self.bank.cached_launch(&key).map(|owner| owner.raw) {
             // SAFETY: the same decode stream, geometry and rank-local owners outlive replay.
-            return stream.device.run(|| unsafe { decode_graph::launch(library, raw, stream.raw) });
+            return stream.device.run(|| unsafe { decode_graph::launch(library, raw, stream.raw, self.bank.launch_tally()) });
         }
         let Some(mut ticket) = self.bank.cache_ticket(&key, false, None) else { return work(); };
         stream.device.run(|| {
@@ -125,7 +125,7 @@ impl<'a> DecodeGraphs<'a> {
             self.bank.census_capture_key("section", self.rank as i32, None, &key, raw);
             self.bank.cache_commit(key, graph, ticket, nodes as u64, width, spans);
             // SAFETY: the bank owns the executable through this ordered launch.
-            unsafe { decode_graph::launch(library, raw, stream.raw) }
+            unsafe { decode_graph::launch(library, raw, stream.raw, self.bank.launch_tally()) }
         })
     }
 }

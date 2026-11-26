@@ -1998,9 +1998,10 @@ impl<'a> GlmEngine<'a> {
             _ => &self.graphs,
         };
         let stream = self.stream_of(rank);
-        if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
+        let cached = graphs.borrow_mut().cached_launch(&key).map(|graph| graph.raw);
+        if let Some(raw) = cached {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.raw, stream) });
+            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, raw, stream, graphs.borrow().launch_tally()) });
         }
         if !self.graphs_ready.get() { return segment(); }
         ensure!(self.selection_dump.is_none(), "{} refuses CUDA graph capture",
@@ -2050,7 +2051,7 @@ impl<'a> GlmEngine<'a> {
         graphs.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
         let bank = graphs.borrow();
         let graph = bank.get(&key).context("inserted graph")?;
-        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.raw, stream) })?;
+        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.raw, stream, bank.launch_tally()) })?;
         Ok(())
     }
 

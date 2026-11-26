@@ -429,7 +429,7 @@ impl IndexQueryWave<'_, '_> {
         };
         ensure!(count == rows, "index query capture row count differs");
         let launched = unsafe {
-            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw)
+            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw, self.graphs.launch_tally())
         };
         launched.and(self.synchronize())?;
         self.ready = Some(rows);
@@ -513,8 +513,9 @@ impl IndexQueryWave<'_, '_> {
                 (self.storage.hidden.buffer, query.hidden), (self.storage.positions.buffer, query.positions)] {
                 self.storage.stream.library.copy_d2d_async(dst, src, src.bytes, self.storage.stream.raw)?;
             }
-            crate::shared::decode_graph::census::dispatch(self.storage.stream.library, self.storage.stream.raw, c"layer_row",
-                rows as usize, graph.map(|(raw,_)|raw), || self.enqueue(rows))
+            if crate::shared::decode_graph::census::dispatch(self.storage.stream.library, self.storage.stream.raw, c"layer_row",
+                rows as usize, graph.map(|(raw,_)|raw), || self.enqueue(rows))? { self.graphs.record_launch(); }
+            Ok(())
         }})();
         if result.is_err() { self.abort_pending()?; }
         result

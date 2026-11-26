@@ -118,8 +118,8 @@ impl<'w, 'a> DistributedDsparkChain<'w, 'a> {
             let graph = chain.graphs.cached_launch(&(count, chain.width)).map(|owner| owner.raw);
             let stream = chain.stream.raw;
             let span = chain.timing.begin("graph_forward", None, count * chain.width, stream)?;
-            crate::shared::decode_graph::census::dispatch(lib, stream, c"dspark", count, graph,
-                || chain.enqueue(&pending.reads, count))?;
+            if crate::shared::decode_graph::census::dispatch(lib, stream, c"dspark", count, graph,
+                || chain.enqueue(&pending.reads, count))? { chain.graphs.record_launch(); }
             chain.timing.end(span, stream)?;
             let source = chain.stages[2].output_storage();
             let target = self.terminal.inputs();

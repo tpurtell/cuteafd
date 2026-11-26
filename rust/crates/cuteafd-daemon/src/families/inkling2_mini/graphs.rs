@@ -214,7 +214,7 @@ impl<'a> DecodeGraphs<'a> {
             // SAFETY: retained TP1 stream, geometry, and persistent owners outlive replay.
             return stream
                 .device
-                .run(|| unsafe { decode_graph::launch(library, raw, stream.raw) });
+                .run(|| unsafe { decode_graph::launch(library, raw, stream.raw, self.bank.launch_tally()) });
         }
         let Some(mut ticket) = self.bank.cache_ticket(&key, false, None) else {
             if decode_graph::census::enabled() {
@@ -282,7 +282,7 @@ impl<'a> DecodeGraphs<'a> {
             self.captures += 1;
             self.last_launched_exec = Some(raw as usize);
             // SAFETY: bank owns executable through this ordered launch.
-            unsafe { decode_graph::launch(library, raw, stream.raw) }
+            unsafe { decode_graph::launch(library, raw, stream.raw, self.bank.launch_tally()) }
         })
     }
 }

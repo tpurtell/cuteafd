@@ -73,11 +73,12 @@ impl<'a> Graphs<'a> {
             self.first_touch_pending.set(true);
             return work();
         }
-        if let Some(raw) = self.bank.borrow_mut().cached_launch(&key).map(|graph| graph.raw) {
+        let cached = self.bank.borrow_mut().cached_launch(&key).map(|graph| graph.raw);
+        if let Some(raw) = cached {
             return stream.device.run(|| {
                 // SAFETY: containing execution and staging owners retain every captured buffer;
                 // all rank streams drain before retirement or scratch reuse by another step.
-                unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw) }
+                unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw, self.bank.borrow().launch_tally()) }
             });
         }
         let Some(mut ticket) = self.bank.borrow_mut().cache_ticket(&key, self.pins.contains(&key.rows), None) else { return work() };
@@ -121,7 +122,7 @@ impl<'a> Graphs<'a> {
             }
             self.bank.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
             // SAFETY: the committed executable retains the same persistent pointer contract.
-            unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw) }
+            unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw, self.bank.borrow().launch_tally()) }
         })
     }
 }

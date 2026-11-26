@@ -125,7 +125,7 @@ impl DsparkMarkov<'_, '_> {
             return unsafe { self.execute(rows) };
         };
         unsafe {
-            crate::shared::decode_graph::launch(&self.standalone.device.library, graph, self.standalone.get()?.raw)?;
+            crate::shared::decode_graph::launch(&self.standalone.device.library, graph, self.standalone.get()?.raw, self.graph.launch_tally())?;
         }
         self.synchronize()?;
         self.ready_rows = Some(rows);

@@ -62,9 +62,10 @@ pub(crate) fn arm() -> u8 { EAGER.load(Ordering::Relaxed) }
 
 /// # Safety
 /// Inputs and captured storage remain live through queued work on this stream.
+/// Returns `true` when a cached graph executable was actually launched.
 pub(crate) unsafe fn dispatch(library: &cuteafd_ffi::NativeLibrary,
     stream: *mut std::ffi::c_void, bank: &std::ffi::CStr, rows: usize,
-    graph: Option<*mut std::ffi::c_void>, eager_call: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    graph: Option<*mut std::ffi::c_void>, eager_call: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<bool> {
     let replay = graph.is_some() && !eager(bank.to_str().expect("static census bank"));
     let call = || {
         if replay {
@@ -74,8 +75,9 @@ pub(crate) unsafe fn dispatch(library: &cuteafd_ffi::NativeLibrary,
     };
     if enabled() {
         // SAFETY: caller owns this stream and the closure preserves its device.
-        unsafe { library.cuda_graph_census_call(stream, bank, rows, replay, arm(), call) }
-    } else { call() }
+        unsafe { library.cuda_graph_census_call(stream, bank, rows, replay, arm(), call)?; }
+    } else { call()?; }
+    Ok(replay)
 }
 
 /// Count-only coverage: no device events, synchronization or census timing.

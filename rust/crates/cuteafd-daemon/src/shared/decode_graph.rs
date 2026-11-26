@@ -134,9 +134,12 @@ pub(crate) unsafe fn end_capture(library: &cuteafd_ffi::NativeLibrary,
 /// The executable comes from an attached bank. Its captured allocations and
 /// stream remain live until every queued consumer has drained.
 pub(crate) unsafe fn launch(library: &cuteafd_ffi::NativeLibrary,
-    graph: *mut std::ffi::c_void, stream: *mut std::ffi::c_void) -> anyhow::Result<()> {
+    graph: *mut std::ffi::c_void, stream: *mut std::ffi::c_void,
+    tally: Option<&device::BankLaunches>) -> anyhow::Result<()> {
     // SAFETY: forwarded executable, stream and captured-storage contract.
-    unsafe { library.cuda_graph_launch(graph, stream) }
+    unsafe { library.cuda_graph_launch(graph, stream)?; }
+    if let Some(tally) = tally { tally.record(); }
+    Ok(())
 }
 
 /// Asynchronously uploads an executable on `stream` ahead of its next launch.

@@ -756,7 +756,7 @@ impl WindowWave<'_, '_> {
             self.upload(&prepared)?;
             let dispatch = || unsafe {
                 if capture || forced_eager { self.enqueue(prepared.rows) }
-                else { crate::shared::decode_graph::launch(&self.stream().library, self.current_graph().unwrap().0, self.stream().raw) }
+                else { crate::shared::decode_graph::launch(&self.stream().library, self.current_graph().unwrap().0, self.stream().raw, self.graphs.launch_tally()) }
             };
             if crate::shared::decode_graph::census::enabled() {
                 unsafe { self.stream().library.cuda_graph_census_call(self.stream().raw, c"window", prepared.rows,
@@ -933,7 +933,7 @@ impl WindowWave<'_, '_> {
         let launched = self.upload(&p).and_then(|()| {
             let eager = crate::shared::decode_graph::census::eager("window");
             let dispatch = || unsafe {
-                if eager { self.enqueue(p.rows) } else { crate::shared::decode_graph::launch(&self.stream().library, g, self.stream().raw) }
+                if eager { self.enqueue(p.rows) } else { crate::shared::decode_graph::launch(&self.stream().library, g, self.stream().raw, self.graphs.launch_tally()) }
             };
             if crate::shared::decode_graph::census::enabled() {
                 unsafe { self.stream().library.cuda_graph_census_call(self.stream().raw, c"window", p.rows, !eager,

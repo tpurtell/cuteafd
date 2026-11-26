@@ -173,14 +173,15 @@ impl<'a> DualAttentionWave<'a> {
         key.extend([rows,self.storage.output.buffer.ptr as usize]);
         let graph=if self.window.is_windowed() { None } else { self.tails.cached_launch(&(layer,key.clone())).map(|graph|graph.raw) };
         let library=self.halves[0].device.library;
-        let (attention,stream)=unsafe { self.complete_owned_then(|attention,stream| {
+        let (attention,stream,replayed)=unsafe { self.complete_owned_then(|attention,stream| {
             tail.prepare(stream)?;
             let eager = crate::shared::decode_graph::census::eager("layer_row");
             if graph.is_some() && !eager { tail.replay_state()?; }
-            crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows,
+            let replayed = crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows,
                 graph, || tail.enqueue(&attention,stream))?;
-            Ok((attention,stream))
+            Ok((attention,stream,replayed))
         }).await? };
+        if replayed { self.tails.record_launch(); }
         if graph.is_some() || self.window.is_windowed() || crate::shared::decode_graph::census::eager("layer_row") {
             return Ok(());
         }
@@ -220,7 +221,7 @@ impl<'a> DualAttentionWave<'a> {
                 layer,rows,device=owner.id,key=?key,bank=?(&wave.tails as *const _),
                 "captured graph binding");
             wave.tails.cache_commit((layer,key),exec,ticket,nodes as u64,width,spans);
-            crate::shared::decode_graph::launch(&library, graph,stream)
+            crate::shared::decode_graph::launch(&library, graph,stream, wave.tails.launch_tally())
         })?;
         owner.future(wave.halves[0].wait_chain()).await?;
         guard.wave=None;

@@ -13,6 +13,8 @@ macro_rules! cache_methods {
             self.bank.attach_device(library, device, reserve, site)
         }
         pub fn cache_cycle(&mut self, cycle: Cycle) { self.bank.cache_cycle(cycle); }
+        pub fn launch_tally(&self) -> Option<&super::device::BankLaunches> { self.bank.launch_tally() }
+        pub fn record_launch(&self) { self.bank.record_launch(); }
         pub fn cache_needs_boundary(&self) -> bool { self.bank.cache_needs_boundary() }
         pub fn cache_measured(&mut self, bytes: u64) { self.bank.cache_measured(bytes); }
         pub fn cache_tick(&mut self) { self.bank.cache_tick(); }

@@ -517,7 +517,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
         };
         self.insert_graph((plan.layer, plan.fingerprint), graph.0, plan.ticket, graph.1, graph.2, graph.3)?;
         let graph = graph.0;
-        let launched = unsafe { crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw) };
+        let launched = unsafe { crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw, self.graphs.launch_tally()) };
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         Ok(QueuedSparseAttention { values: slice(self.storage.output.buffer, 0, plan.rows * (HEADS*1024)),
             layer: plan.layer, rows: plan.rows })
@@ -847,7 +847,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             if crate::shared::decode_graph::census::enabled() {
                 unsafe {
                     self.storage.stream.library.cuda_graph_census_call(self.storage.stream.raw, c"sparse", rows, true,
-                        crate::shared::decode_graph::census::arm(), || crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw))?;
+                        crate::shared::decode_graph::census::arm(), || crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw, self.graphs.launch_tally()))?;
                 }
                 return Ok(Some(queued));
             }
@@ -902,7 +902,7 @@ impl<'a,const HEADS:usize> LocalSparseAttentionWave<'a,HEADS> {
             graph.0
         };
         let launched = unsafe {
-            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw)
+            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw, self.graphs.launch_tally())
         };
         launched?;
         Ok(Some(QueuedSparseAttention {

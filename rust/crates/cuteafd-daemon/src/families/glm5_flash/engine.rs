@@ -4169,9 +4169,10 @@ impl<'a> GlmfEngine<'a> {
         self.require_live()?;
         let graphs = self.graphs_of(rank);
         let stream = self.stream_of(rank);
-        if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
+        let cached = graphs.borrow_mut().cached_launch(&key).map(|graph| graph.raw);
+        if let Some(raw) = cached {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.raw, stream) });
+            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, raw, stream, graphs.borrow().launch_tally()) });
         }
         let Some(mut ticket) = graphs.borrow_mut().cache_ticket(&key, false, None) else {
             return segment();
@@ -4218,7 +4219,7 @@ impl<'a> GlmfEngine<'a> {
         graphs.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
         let bank = graphs.borrow();
         let graph = bank.get(&key).context("inserted graph")?;
-        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.raw, stream) })?;
+        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.raw, stream, bank.launch_tally()) })?;
         Ok(())
     }
 
