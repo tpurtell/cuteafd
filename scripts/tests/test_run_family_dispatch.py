@@ -890,6 +890,17 @@ def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
         assert got == case["line"], (case["name"], out.stderr)
 
 
+def _real_planner_keys(raw: str, drop: tuple[str, ...] = ()) -> str:
+    """A shipped example's keys for a real-planner launch: the snapshot supplies the model.
+
+    The launcher refuses template REPLACE-ME hosts (#2736), so the copy it reads gets
+    real-looking ones; host names never reach the planner. `drop` removes further keys.
+    """
+    dropped = ("MODEL_ID=", "MODEL_REVISION=", *(f"{key}=" for key in drop))
+    return "\n".join(line.replace("REPLACE-ME-spark-", "spark-") for line in raw.splitlines()
+                     if not line.startswith(dropped)) + "\nMODEL_REVISION=\n"
+
+
 def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys: str,
                           physical_gpus: tuple[int, ...] | None = None, *, preflight_error: bool = False,
                           busy_gpus: tuple[int, ...] = (), plan_rtx_bytes: int | None = None,
@@ -1413,8 +1424,7 @@ def _capture_real_planner_launch(snapshot: Path, example: Path, binary: Path,
     config = dict(line.split("=", 1) for line in raw.splitlines()
                   if line and not line.startswith("#") and "=" in line)
     gpus = int(config["RTX_GPUS"])
-    keys = "\n".join(line for line in raw.splitlines()
-                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    keys = _real_planner_keys(raw)
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
         model, keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
@@ -1457,9 +1467,7 @@ def capture_resolver_config_parity(snapshot: Path, example: Path, binary: Path,
             source = hf_home / "hub" / cache
             if source.is_dir() and not (hub / cache).exists():
                 (hub / cache).symlink_to(source.resolve(), target_is_directory=True)
-    # The launcher refuses template REPLACE-ME hosts; give the copy it reads real-looking ones.
-    keys = "\n".join(line.replace("REPLACE-ME-spark-", "spark-") for line in raw.splitlines()
-                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    keys = _real_planner_keys(raw)
     output = temporary / "resolver-deployment.json"
     identity = config.get("MODEL_ID", "test/resolver-parity")
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
@@ -1523,8 +1531,7 @@ def capture_glm_flash_real_planner_launch(snapshot: Path, example: Path, binary:
         raw = example.read_text()
         config = dict(line.split("=", 1) for line in raw.splitlines()
                       if line and not line.startswith("#") and "=" in line)
-        keys = "\n".join(line for line in raw.splitlines()
-                          if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+        keys = _real_planner_keys(raw)
         gpus = int(config["RTX_GPUS"])
         strict_keys = "\n".join(line for line in keys.splitlines()
                                 if not line.startswith("VISION=")) + "\nVISION=rtx\n"
@@ -1562,8 +1569,7 @@ def capture_v41_real_planner_launch(snapshot: Path, example: Path, binary: Path,
     gpus = int(config["RTX_GPUS"])
     # Fake only hardware and execution: the planner reads the actual snapshot,
     # drafter and native export manifests, not a canned deployment response.
-    keys = "\n".join(line for line in raw.splitlines()
-                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    keys = _real_planner_keys(raw)
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
         "test/v41-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
@@ -1602,8 +1608,7 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
     config = dict(line.split("=", 1) for line in raw.splitlines()
                   if line and not line.startswith("#") and "=" in line)
     gpus = int(config["RTX_GPUS"])
-    keys = "\n".join(line for line in raw.splitlines()
-                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION=", "ATTENTION_PLACEMENT="))) + "\nMODEL_REVISION=\n"
+    keys = _real_planner_keys(raw, drop=("ATTENTION_PLACEMENT",))
     # Keep actual drafter headers for speculating examples in the isolated HF root.
     if drafter_id := config.get("SPECULATOR_MODEL_ID"):
         drafter = "models--" + drafter_id.replace("/", "--")
@@ -1650,8 +1655,7 @@ def capture_v4_real_planner_launch(snapshot: Path, example: Path, binary: Path,
     gpus = int(config["RTX_GPUS"])
     # Fake only hardware and execution: the planner reads the real checkpoint,
     # drafter and exporter metadata through the shared V4 Recipe.
-    keys = "\n".join(line for line in raw.splitlines()
-                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    keys = _real_planner_keys(raw)
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
         "test/v4-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
@@ -1691,8 +1695,7 @@ def capture_qwen_real_planner_launch(snapshot: Path, example: Path, binary: Path
         staged.symlink_to(installed)
     # Fake only hardware and execution. The planner reads the actual snapshot
     # and exporter metadata, not a canned deployment response.
-    keys = "\n".join(line for line in raw.splitlines()
-                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    keys = _real_planner_keys(raw)
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
         "test/qwen-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
@@ -1723,8 +1726,7 @@ def capture_qwen4_real_planner_launch(snapshot: Path, example: Path, binary: Pat
                   if line and not line.startswith("#") and "=" in line)
     gpus = int(config["RTX_GPUS"])
     assert int(config["SPARK_COUNT"]) == 0, "Qwen shipped configs are RTX-only (0 Sparks)"
-    keys = "\n".join(line for line in raw.splitlines()
-                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    keys = _real_planner_keys(raw)
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
         "test/qwen-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
@@ -1806,8 +1808,7 @@ def capture_mimo_real_planner_launch(snapshot: Path, example: Path, binary: Path
     sparks = int(config["SPARK_COUNT"])
     # Fake only hardware and execution. The planner reads the actual snapshot
     # and exporter metadata, not a canned deployment response.
-    keys = "\n".join(line for line in raw.splitlines()
-                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    keys = _real_planner_keys(raw)
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
         "test/mimo-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
@@ -5599,8 +5600,7 @@ def capture_step5_real_planner_launch(snapshot: Path, example: Path, binary: Pat
     gpus = int(config["RTX_GPUS"])
     # Fake only hardware and execution. The planner reads the actual snapshot,
     # drafter and exporter metadata, not a canned deployment response.
-    keys = "\n".join(line for line in raw.splitlines()
-                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+    keys = _real_planner_keys(raw)
     output = temporary / "real-deployment.json"
     result = _family_launch_result(temporary, json.loads((snapshot / "config.json").read_text()),
         "test/step5-real-plan", keys, physical_gpus=tuple(range(gpus)), root_launcher=True,
