@@ -37,7 +37,7 @@ def main():
     key = inputs_key(inputs)
     raw = load_bootstrap(TASK,key)
     stages = Stages(TASK/"bootstrap-packed",packed_identity(inputs,key))
-    model = ErnieForward.from_snapshot(SOURCE,"cuda")
+    model = ErnieForward.from_snapshot(SOURCE,"cuda:0")
     c, weights = model.config, model.load_layer(0)
     embedding = model.checkpoint.load(reference.OUTER_NAMES[0])
     held = {"all":[], "compressor":[]}
@@ -55,10 +55,10 @@ def main():
         module = PREFIX+name
         w = weights["self_attn."+name+".weight"]
         metrics = []
-        values = encode(module,w,raw[module+".weight"],(8,6),"cuda",metrics)
+        values = encode(module,w,raw[module+".weight"],(8,6),"cuda:0",metrics)
         x = torch.cat(held[kind])
         for row in metrics:
-            matrix = reconstruction(values,module,row["bits"],w.shape,"cuda")
+            matrix = reconstruction(values,module,row["bits"],w.shape,"cuda:0")
             gates.evaluated(row,x,w,matrix,"last-16-actual-inputs-per-heldout-prompt",
                             projection=lambda _,rows,weight: reference.linear(rows,weight))
         stages.write_batches(label,[(0,values)],dict(metrics=metrics))
