@@ -1811,17 +1811,6 @@ impl<'a> DflashDrafter<'a> {
         self.update(&(0..rows).map(|tap_row| ContextRow { tap_row, slot, position: start + tap_row }).collect::<Vec<_>>())
     }
 
-    fn oracle_dump(&self, name: &str, buffer: CuteafdDeviceBuffer, bytes: usize) -> Result<()> {
-        let Some(dir) = std::env::var_os("CUTEAFD_DIAG_DFLASH_TENSORS") else { return Ok(()) };
-        let dir = std::path::PathBuf::from(dir);
-        std::fs::create_dir_all(&dir)?;
-        self.drain_mla()?;
-        let mut raw = vec![0; bytes];
-        self.library.copy_d2h(&mut raw, draft_view(buffer, 0, bytes)?)?;
-        std::fs::write(dir.join(format!("{name}.bin")), raw)?;
-        Ok(())
-    }
-
     /// Writes the context K/V of committed tapped rows (in tap-row order).
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
         let Some(split) = &self.head_split else { return self.update_with(rows, || Ok(())); };
@@ -1876,8 +1865,7 @@ impl<'a> DflashDrafter<'a> {
                 self.fused.buffer.ptr, n, width, h)?;
             self.library.glm_dflash_rmsnorm(self.fused.buffer.ptr, self.hidden_norm.buffer.ptr,
                 self.fused_norm.buffer.ptr, n, h, self.cfg.eps, s)?;
-            self.oracle_dump("context-norm", self.fused_norm.buffer, n*h*2)?;
-            for (index, layer) in self.layers.iter().enumerate() {
+            for layer in &self.layers {
                 let layer = layer.attention.gqa()?;
                 let q_rows = self.cfg.heads * self.cfg.head_dim;
                 self.linear(self.fused_norm.buffer.ptr, &layer.qkv, q_rows,
@@ -1887,7 +1875,6 @@ impl<'a> DflashDrafter<'a> {
                     std::ptr::null_mut(), layer.k_ring.buffer.ptr, layer.v_ring.buffer.ptr, n, 0, self.cfg.kv_heads,
                     self.cfg.theta, self.cfg.eps, self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8,
                     self.cfg.head_dim, s)?;
-                self.oracle_dump(&format!("context-{index}-kv"), context.kv.buffer, n*2*kv*2)?;
             }
         }
         self.timing.end(context_span, s)?;
@@ -2979,9 +2966,7 @@ impl<'a> DflashDrafter<'a> {
         // SAFETY: every workspace buffer holds `rows` rows of its width and the
         // weights their checkpoint shapes; the stream orders the chain.
         unsafe {
-            self.oracle_dump("input", w.h.buffer, rows*h*2)?;
             l.glm_dflash_rmsnorm(w.h.buffer.ptr, self.layers[0].input_norm.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
-            self.oracle_dump("input-norm", w.n.buffer, rows*h*2)?;
             if let Some(split) = self.head_split.as_ref().filter(|_| paired) {
                 match &self.context {
                     DraftContext::Gqa(_) => self.checked_head_split(||
@@ -3074,8 +3059,6 @@ impl<'a> DflashDrafter<'a> {
                             w.h.buffer.ptr, w.n.buffer.ptr, rows, h, eps, s)?;
                     }
                 }
-                self.oracle_dump(&format!("layer-{index}"), w.h.buffer, rows*h*2)?;
-                self.oracle_dump(&format!("layer-{index}-norm"), w.n.buffer, rows*h*2)?;
                 self.timing.end(layer_span, s)?;
             }
             }
@@ -3095,7 +3078,6 @@ impl<'a> DflashDrafter<'a> {
                 DraftHeadOps::Peer => anyhow::bail!("peer drafter cannot launch selection"),
                 DraftHeadOps::Selector { projection, predecessor, successor } => {
                     let top_k = match &self.context { DraftContext::Mla(context) => context.cfg.selector_top_k, _ => 16 };
-                    self.oracle_dump("logits", w.head()?.logits.buffer, rows*c.vocab*4)?;
                     let (logits, unary, candidates, scratch) = (w.head()?.logits.buffer.ptr,
                         w.head()?.unary.as_ref().context("selector workspace missing")?.buffer.ptr,
                         w.head()?.candidates.as_ref().context("selector workspace missing")?.buffer.ptr,
@@ -3120,10 +3102,6 @@ impl<'a> DflashDrafter<'a> {
                         l.dflash_select_width(predecessor.buffer.ptr, successor.buffer.ptr, projected,
                             candidates, unary, anchors, tokens, features, s_count, block, c.drafts(), c.rank, top_k, s)?;
                     }
-                    self.oracle_dump("unary", w.head()?.unary.as_ref().context("selector unary")?.buffer, s_count*c.drafts()*top_k*4)?;
-                    self.oracle_dump("candidates", w.head()?.candidates.as_ref().context("selector candidates")?.buffer, s_count*c.drafts()*top_k*4)?;
-                    self.oracle_dump("projected", w.head()?.projected.as_ref().context("selector projected")?.buffer, rows*c.rank*2)?;
-                    self.oracle_dump("features", w.head()?.features.as_ref().context("selector features")?.buffer, s_count*c.drafts()*16)?;
                     self.timing.end(select_span, s)?;
                 }
                 DraftHeadOps::RnnMarkov { softcap, embedding, joint_w, joint_b, output, norms, rank } => {
