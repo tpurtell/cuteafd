@@ -103,7 +103,7 @@ def forecast(now, remaining, rates, scope):
                 excludes=["head", "dSpark", "export", "upload", "placement"])
 
 
-def production_state(run, now, active):
+def production_state(run, now, active, failed=()):
     prod = run / "production"
     status = receipt(prod / "status.json")
     attempt = receipt(prod / "attempt.json")
@@ -151,6 +151,11 @@ def production_state(run, now, active):
         blocker = attempt.get("detail") or status.get("error") or "numerical worker failed"
     elif not terminal and not numerical and status and "production" not in active:
         blocker = blocker or "production unit inactive; check latest receipt and boot before resuming"
+    for stage in ("postproduction", "publish", "handoff", "cleanup"):
+        if stage in failed:
+            phase = f"{stage} failed"
+            blocker = f"cuteafd-ernie55-{stage}.service failed; inspect its log and receipts"
+            break
     if eta and blocker:
         eta["assumes_resume_now"] = True
     if not remaining and target:
@@ -175,8 +180,16 @@ def main():
     active = {phase for phase in ("preflight", "pilot", "production", "publish", "handoff") if subprocess.run(
         ["systemctl", "--user", "is-active", "--quiet", f"cuteafd-ernie55-{phase}.service"],
         timeout=10).returncode == 0}
-    reader = production_state if args.production else state
-    snapshot = reader(TASK, datetime.now(TAIPEI), active)
+    now = datetime.now(TAIPEI)
+    if args.production:
+        result = subprocess.run(["systemctl", "--user", "list-units", "--state=failed", "--plain",
+                                 "--no-legend", "cuteafd-ernie55-*.service"],
+                                capture_output=True, text=True, check=True, timeout=10)
+        failed = {line.split()[0].removeprefix("cuteafd-ernie55-").removesuffix(".service")
+                  for line in result.stdout.splitlines() if line.strip()}
+        snapshot = production_state(TASK, now, active, failed)
+    else:
+        snapshot = state(TASK, now, active)
     path = TASK / "progress-updates/latest.json"
     path.parent.mkdir(exist_ok=True)
     temp = path.with_suffix(f".{os.getpid()}.tmp")

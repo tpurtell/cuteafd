@@ -70,7 +70,7 @@ def publication_fixture(tmp_path, layout, pins):
     ref = managed / layout.model / 'refs/main'
     ref.parent.mkdir(parents=True)
     ref.write_text(REVISION)
-    keep = ref.parent / handoff.KEEP_REF
+    keep = ref.parent / layout.keep_ref
     keep.parent.mkdir()
     keep.write_text(REVISION)
     return root, output, managed, metadata
@@ -83,7 +83,7 @@ class Native:
         self.snapshot = nest.NAMESPACE / layout.model / "snapshots" / REVISION
         self.blobs = self.snapshot.parent.parent / "blobs"
         self.ref = self.snapshot.parent.parent / "refs/main"
-        self.keep = self.ref.parent / handoff.KEEP_REF
+        self.keep = self.ref.parent / layout.keep_ref
         self.files = files
         self.shared_blobs = shared_blobs
         self.physical = {}
@@ -95,7 +95,7 @@ class Native:
         self.calls = []
         self.rules = {}
         self.plans = {}
-        self.placements = {name: {'maxq'} for name in (*files, 'refs/main', 'refs/' + handoff.KEEP_REF)}
+        self.placements = {name: {'maxq'} for name in (*files, 'refs/main', 'refs/' + self.layout.keep_ref)}
         self.jobs = {}
         self.fail_wait = None
         self.change_show = False
@@ -180,7 +180,7 @@ class Native:
                                           hosts=sorted(self.placements['refs/main'])), dict(name='keep', kind='directory')])
             case ('ls', path) if path == self.keep.parent:
                 return dict(entries=[dict(name=self.keep.name, kind='regular', size=len(REVISION),
-                                          hosts=sorted(self.placements['refs/' + handoff.KEEP_REF]))])
+                                          hosts=sorted(self.placements['refs/' + self.layout.keep_ref]))])
             case ('ls', path) if path == self.snapshot:
                 return dict(entries=[dict(name=name, kind='symlink', target='../../blobs/' + row['hub_oid'])
                                      for name, row in self.files.items()])
@@ -329,14 +329,16 @@ def test_hy4_refuses_adoption_eviction_before_any_apply(published):
     assert not any(args[:2] == ('plan', 'apply') for args in call.calls)
     assert output.is_dir() and not (root / 'handoff-complete.json').exists()
 
-def test_full_hy4_places_once_without_pin_rules(tmp_path, monkeypatch):
-    from hy4.handoff import LAYOUT
+@pytest.mark.parametrize("family", ["hy4", "ernie55_flash"])
+def test_places_once_without_pin_rules(tmp_path, monkeypatch, family):
+    from importlib import import_module
+    LAYOUT = import_module(f"{family}.handoff").LAYOUT
 
     root, output, managed, record = publication_fixture(tmp_path, LAYOUT, ())
     native = Native(record["files"], shared_blobs=True, layout=LAYOUT)
     stage = root / "handoff-stage"
     result = handoff.handoff(root, output, stage, layout=LAYOUT, call=native, managed=managed)
-    assert result["revision"] == REVISION and result["schema"] == "cuteafd-hy4-handoff-complete-v2"
+    assert result["revision"] == REVISION and result["schema"] == f"cuteafd-{family}-handoff-complete-v2"
     assert result["one_fabric_copy_per_file"] and result["distribution_bytes"] == dict.fromkeys(nest.TARGETS, 100)
     assert result["pinned_files"] == [] and result["pinned_host"] is None and result["pinned_bytes"] == 0
     assert not any(args[0] in ("rule", "reconcile") for args in native.calls)

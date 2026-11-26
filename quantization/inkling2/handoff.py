@@ -475,7 +475,7 @@ def retain_metadata(root, identity, leaves, *, family='inkling2'):
 
 def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused, repo_id=TARGET_REPO,
            family='inkling2', build_prefix='inkling2-', verified_staging=None,
-           placement_check='one_copy_per_file'):
+           placement_check='one_copy_per_file', task_intermediates=()):
     """Retain receipts, then delete explicit payload leaves after native placement."""
     root = Path(root).resolve()
     published, complete = (load(root / n) for n in ('publication-complete.json', 'handoff-complete.json'))
@@ -499,6 +499,16 @@ def retire(root, *, intermediates=(), build_root=None, inspect=assert_unused, re
             raise ValueError('intermediate must be an explicit task-owned payload leaf')
         paths.append(p)
         categories[p] = (Path('intermediates') / p.relative_to(root), False)
+    # Additional sibling scratch is a fixed list in the family layout, never
+    # obtained from an operator-supplied cleanup manifest.
+    for relative in map(Path, task_intermediates):
+        if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+            raise ValueError('invalid task intermediate')
+        leaf = root.parent / relative
+        if any(leaf == p or leaf in p.parents or p in leaf.parents for p in (root, output, stage)):
+            raise ValueError('overlapping task intermediate')
+        paths.append(leaf)
+        categories[leaf] = (Path('intermediates/task') / relative, False)
     if verified_staging is not None:
         staging = Path(verified_staging).absolute()
         if staging.parent != root.parent or staging in (root, output, stage):
