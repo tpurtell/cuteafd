@@ -401,4 +401,358 @@ impl<'a> Binding<'a> {
         }
         Ok(())
     }
+
+    pub fn update_batch(
+        &self,
+        taps: &TapBuffer<'a>,
+        spans: &[crate::shared::speculation::recurrent_cache::ContextSpan],
+    ) -> Result<()> {
+        if spans.is_empty() {
+            return Ok(());
+        }
+        if let &[span] = spans {
+            if span.rows == 0 {
+                return Ok(());
+            }
+            return self.update(taps, span.slot, span.start, span.first_row, span.rows);
+        }
+        let max_rows = self.context_rows;
+        let min_window = if let Some(drafter) = &self.drafter {
+            drafter
+                .lead
+                .config
+                .context
+                .iter()
+                .filter_map(|p| match p {
+                    cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::BlockAnchoredWindow(w) => Some(*w),
+                    cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::Full => None,
+                })
+                .min()
+                .unwrap_or(usize::MAX)
+        } else {
+            cuteafd_loader::families::glm5::draft_physical::RING
+        };
+        let flush = |batch: &[crate::shared::speculation::recurrent_cache::ContextSpan]| -> Result<()> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            if let Some(drafter) = &self.drafter {
+                drafter.append_context_batch(taps.output.buffer, batch)
+            } else if let Some(gqa) = &self.dflash {
+                {
+                    let frontiers = gqa.frontier.borrow();
+                    for span in batch {
+                        ensure!(
+                            frontiers.get(span.slot).copied() == Some(span.start),
+                            "Mini DFlash batched context gap"
+                        );
+                    }
+                }
+                gqa.stream
+                    .device
+                    .run(|| gqa.body.append_gqa_batch(taps.output.buffer, batch))?;
+                let mut frontiers = gqa.frontier.borrow_mut();
+                for span in batch {
+                    frontiers[span.slot] = span.start + span.rows;
+                }
+                Ok(())
+            } else {
+                Ok(())
+            }
+        };
+        let mut batch = Vec::with_capacity(spans.len());
+        let mut batch_rows = 0usize;
+        let mut seen = std::collections::BTreeSet::new();
+        for &span in spans {
+            if span.rows == 0 {
+                continue;
+            }
+            if span.rows > min_window || span.rows > max_rows {
+                flush(&batch)?;
+                batch.clear();
+                batch_rows = 0;
+                seen.clear();
+                self.update(taps, span.slot, span.start, span.first_row, span.rows)?;
+                continue;
+            }
+            if batch_rows + span.rows > max_rows || !seen.insert(span.slot) {
+                flush(&batch)?;
+                batch.clear();
+                batch_rows = 0;
+                seen.clear();
+                seen.insert(span.slot);
+            }
+            batch.push(span);
+            batch_rows += span.rows;
+        }
+        flush(&batch)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+    use crate::shared::{
+        memory::device::{Allocation, Device},
+        speculation::{dflash::DraftSeq, recurrent_cache::ContextSpan},
+    };
+    use cuteafd_core::memory_layout::Tag;
+    use cuteafd_loader::{
+        families::qwen4::Qwen4KvCache,
+        formats::block_dspark::recurrent::{loading::RecurrentSource, runtime::RecurrentRuntimeLayout},
+        plan::{
+            checkpoint::{Checkpoint, CheckpointView, CoreView},
+        },
+        serving_capacity::WeightArenaLayout,
+    };
+    use crate::shared::{
+        experts::rtx::dense::{DenseLoad, Operand, Rect},
+        memory::weight_arena::DeviceWeightArena,
+    };
+
+    /// Real Inkling 2 Mini bundled drafter GPU oracle (run via `golden-run.py --native-test`):
+    /// Proves batched context update (both contiguous C64 decode and gapped speculative verify)
+    /// produces bitwise-identical `cache.last_features`, logits, confidences, and drafted tokens
+    /// compared to per-request `append_context`.
+    #[test]
+    #[ignore = "requires real Inkling 2 Mini snapshot, native programs and GPU; golden-run only"]
+    fn installed_inkling_mini_drafter_batch_and_context_invariance() -> Result<()> {
+        let library = unsafe {
+            cuteafd_ffi::NativeLibrary::load_for_experts(
+                std::env::var("CUTEAFD_NATIVE_LIB")?,
+                cuteafd_core::ExpertGeometry::INKLING2_MINI,
+            )?
+        };
+        let programs = library
+            .programs()?
+            .with_manifest(std::path::Path::new(&std::env::var("CUTEAFD_PROGRAM_MANIFEST")?))?;
+        let snapshot = std::path::PathBuf::from(std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?);
+        let device = Device {
+            library: &library,
+            id: 0,
+        };
+        let stream = Rc::new(Stream::new(device)?);
+        let view = CheckpointView::select(&snapshot, CoreView::Original)?;
+        let source = RecurrentSource::open(&view)?;
+        let config = source.config.clone();
+        let target = Checkpoint::open_for_role(&snapshot, "mini-draft-batch-test", |name| {
+            matches!(
+                name,
+                "model.llm.embed.weight" | "model.llm.embed_norm.weight" | "model.llm.unembed.weight"
+            )
+        })?;
+        let names = [
+            "model.llm.embed.weight",
+            "model.llm.embed_norm.weight",
+            "model.llm.unembed.weight",
+        ];
+        let target_arena = DeviceWeightArena::new(
+            device,
+            WeightArenaLayout::new(
+                "mini-draft-test/target",
+                names
+                    .iter()
+                    .map(|&name| {
+                        Ok((
+                            name.to_owned(),
+                            usize::try_from(target.header(name).context("target header missing")?.byte_length)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            )?,
+            cuteafd_core::memory_layout::ArenaTag::weights("mini-draft-test/target"),
+        )?;
+        let dense = DenseLoad::mount(&library);
+        let mut targets = std::collections::BTreeMap::new();
+        for name in names {
+            let rect = Rect::tensor(&target, name, None, None)?;
+            let bytes = rect.bytes();
+            let owner = target_arena.view(name, bytes)?;
+            dense.operand(Operand {
+                device: 0,
+                buffer: owner.buffer,
+                lands: vec![(rect, 0)],
+                bytes,
+            })?;
+            targets.insert(name, owner);
+        }
+        dense.release();
+        let embed = targets["model.llm.embed.weight"].buffer;
+        let embed_norm = targets["model.llm.embed_norm.weight"].buffer;
+        let unembed = targets["model.llm.unembed.weight"].buffer;
+
+        let make_drafter = |kv: Qwen4KvCache| -> Result<Drafter<'_>> {
+            let weights = Weights::load(device, &source, source.rank(0, 1, 0)?, stream.raw)?;
+            let runtime = RecurrentRuntimeLayout::new(
+                &config,
+                64,
+                64,
+                2048,
+                4096,
+                64 * 1536,
+                library.sm_count()? as usize,
+                kv,
+                0,
+                1,
+                0,
+            )?;
+            let kernels = ProgramsForRank::load(&programs, &weights, &config, &runtime, device)?;
+            let rank = Rank::allocate(weights, Rc::clone(&stream), config.clone(), runtime.clone(), kernels)?;
+            rank.initialize_derived()?;
+            rank.fold_head(unembed)?;
+            stream.drain()?;
+            let context = ContextBank {
+                state: RefCell::new(ContextState::new(
+                    runtime.slots,
+                    4096,
+                    runtime.cache.target_tokens,
+                    0x494e4b4d494e49,
+                )?),
+            };
+            let drafter = Drafter::whole(rank, context)?;
+            drafter.set_score_readback(true);
+            Ok(drafter)
+        };
+
+        let hidden = config.transformer.hidden;
+        let taps = config.taps.len();
+        let pitch = taps * hidden * 2;
+        let fill_taps = |rows: usize, seed: u64| -> Vec<u8> {
+            let pattern = [0x3b80u16, 0xbb80, 0x3c00, 0xbc00, 0x3a80, 0xba80, 0x3c40, 0xbc40];
+            let mut out = Vec::with_capacity(rows * pitch);
+            for r in 0..rows {
+                for c in 0..(taps * hidden) {
+                    let h = ((r as u64).wrapping_mul(2654435761) ^ (c as u64).wrapping_mul(40503) ^ seed) as usize;
+                    out.extend_from_slice(&pattern[h % pattern.len()].to_le_bytes());
+                }
+            }
+            out
+        };
+
+        for kv in [Qwen4KvCache::Fp8, Qwen4KvCache::Bf16] {
+            let serial = make_drafter(kv)?;
+            let batched = make_drafter(kv)?;
+            let seq_lens: Vec<usize> = (0..64)
+                .map(|i| {
+                    let base = [
+                        17, 33, 64, 128, 192, 256, 583, 1024, 1500, 31, 95, 311, 777, 1024, 48, 600,
+                        19, 45, 72, 130, 200, 300, 512, 900, 1100, 65, 193, 400, 800, 1025, 24, 1400,
+                    ];
+                    base[i % base.len()] + (i / base.len()) * 13
+                })
+                .collect();
+            let tap_stage = Allocation::new(device, 2048 * pitch, Tag::drafter_workspace("test/taps"))?;
+            for (slot, &len) in seq_lens.iter().enumerate() {
+                serial.bind_slot(slot, 0, Some(len + 64))?;
+                batched.bind_slot(slot, 0, Some(len + 64))?;
+                let bytes = fill_taps(len, 1000 + slot as u64);
+                library.copy_h2d(Buffer { bytes: bytes.len(), ..tap_stage.buffer }, &bytes)?;
+                serial.append_context(slot, 0, Buffer { bytes: bytes.len(), ..tap_stage.buffer }, len)?;
+                batched.append_context(slot, 0, Buffer { bytes: bytes.len(), ..tap_stage.buffer }, len)?;
+            }
+
+            // Part 1a: Batched contiguous decode update (64 slots x 1 row) vs serial per-slot update.
+            let decode_bytes = fill_taps(64, 7777);
+            library.copy_h2d(Buffer { bytes: decode_bytes.len(), ..tap_stage.buffer }, &decode_bytes)?;
+            let decode_spans: Vec<ContextSpan> = (0..64)
+                .map(|slot| ContextSpan {
+                    slot,
+                    start: seq_lens[slot],
+                    first_row: slot,
+                    rows: 1,
+                })
+                .collect();
+            for span in &decode_spans {
+                serial.append_context(
+                    span.slot,
+                    span.start,
+                    Buffer {
+                        ptr: tap_stage.buffer.ptr.wrapping_byte_add(span.first_row * pitch),
+                        bytes: pitch,
+                        ..tap_stage.buffer
+                    },
+                    1,
+                )?;
+            }
+            batched.append_context_batch(tap_stage.buffer, &decode_spans)?;
+
+            // Part 1b: Batched gapped speculative verify update (varying kept 1..4 with rejected gaps) vs serial.
+            let mut gapped_spans = Vec::new();
+            let mut cursor = 0usize;
+            for slot in 0..16 {
+                let verified = 1 + (slot % 4);
+                let kept = 1 + (slot % verified);
+                gapped_spans.push(ContextSpan {
+                    slot,
+                    start: seq_lens[slot] + 1,
+                    first_row: cursor,
+                    rows: kept,
+                });
+                cursor += verified; // leaves rejected rows as gaps between kept spans
+            }
+            let gap_bytes = fill_taps(cursor, 9999);
+            library.copy_h2d(Buffer { bytes: gap_bytes.len(), ..tap_stage.buffer }, &gap_bytes)?;
+            for span in &gapped_spans {
+                serial.append_context(
+                    span.slot,
+                    span.start,
+                    Buffer {
+                        ptr: tap_stage.buffer.ptr.wrapping_byte_add(span.first_row * pitch),
+                        bytes: span.rows * pitch,
+                        ..tap_stage.buffer
+                    },
+                    span.rows,
+                )?;
+            }
+            batched.append_context_batch(tap_stage.buffer, &gapped_spans)?;
+
+            // Check bitwise equality of `cache.last_features` across all 64 slots.
+            let lf_bytes = 64 * hidden * 2;
+            let mut lf_serial = vec![0u8; lf_bytes];
+            let mut lf_batched = vec![0u8; lf_bytes];
+            library.copy_d2h(&mut lf_serial, Buffer { bytes: lf_bytes, ..serial.lead.buffer("cache.last_features")? })?;
+            library.copy_d2h(&mut lf_batched, Buffer { bytes: lf_bytes, ..batched.lead.buffer("cache.last_features")? })?;
+            ensure!(lf_serial == lf_batched, "kv={kv:?}: cache.last_features differs between serial and batched update");
+
+            // Check bitwise equality of proposals, confidences, hidden states, and logits: serial vs batched.
+            let draft_seq = |slot: usize, drafter: &Drafter<'_>| -> Result<DraftSeq> {
+                Ok(DraftSeq {
+                    slot,
+                    anchor: 500 + (slot as u32) * 17,
+                    position: drafter.frontier(slot)?.1,
+                    valid_from: 0,
+                })
+            };
+            let all_64_serial: Vec<_> = (0..64).map(|s| draft_seq(s, &serial)).collect::<Result<_>>()?;
+            let all_64_batched: Vec<_> = (0..64).map(|s| draft_seq(s, &batched)).collect::<Result<_>>()?;
+            let out_serial = serial.draft(&all_64_serial, embed, embed_norm, |n, a| {
+                serial.lead.recurrent_tokens(n, a, unembed)
+            })?;
+            let out_batched = batched.draft(&all_64_batched, embed, embed_norm, |n, a| {
+                batched.lead.recurrent_tokens(n, a, unembed)
+            })?;
+            let logits_bytes = 64 * config.valid_vocab * 4;
+            let mut logits_serial = vec![0u8; logits_bytes];
+            let mut logits_batched = vec![0u8; logits_bytes];
+            library.copy_d2h(&mut logits_serial, Buffer { bytes: logits_bytes, ..serial.lead.buffer("head.logits")? })?;
+            library.copy_d2h(&mut logits_batched, Buffer { bytes: logits_bytes, ..batched.lead.buffer("head.logits")? })?;
+            ensure!(logits_serial == logits_batched, "kv={kv:?}: head.logits differ between serial and batched context update");
+            for slot in 0..64 {
+                ensure!(
+                    out_serial[slot].tokens == out_batched[slot].tokens,
+                    "kv={kv:?}: slot {slot} tokens differ between serial and batched context update"
+                );
+                let conf_s: Vec<u32> = out_serial[slot].confidence.iter().map(|v| v.to_bits()).collect();
+                let conf_b: Vec<u32> = out_batched[slot].confidence.iter().map(|v| v.to_bits()).collect();
+                ensure!(
+                    conf_s == conf_b,
+                    "kv={kv:?}: slot {slot} confidence bits differ between serial and batched context update"
+                );
+            }
+
+            eprintln!("MINI_DRAFTER_BATCH_CONTEXT kv={kv:?} passed: serial==batched (contiguous C64 + gapped) bitwise exact");
+        }
+        Ok(())
+    }
 }

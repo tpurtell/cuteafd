@@ -18,7 +18,9 @@ impl Rank<'_> {
     /// destinations[layer] are physical rows in that layer's rank-local plane.
     /// A caller holds a shared page-pool reservation until this stream drains,
     /// then publishes only the accepted prefix. No rejected row is published.
-    pub fn store_context(&self,features:Buffer,positions:&[i64],destinations:&[Vec<i64>])->Result<()> {
+    /// When `single_sequence` is true, rows overwritten inside a single sequence's
+    /// local ring may be skipped; batched multi-sequence appends project all rows.
+    pub fn store_context(&self,features:Buffer,positions:&[i64],destinations:&[Vec<i64>],single_sequence:bool)->Result<()> {
         let c=&self.config.transformer;let rank=self.layout.rank;
         let rows=positions.len();let lib=self.stream.device.library;let stream=self.stream.raw;
         ensure!(rows>0 && rows<=self.layout.context_rows && destinations.len()==c.layers
@@ -28,12 +30,14 @@ impl Rank<'_> {
         let total_rows=rows;
         let kv=rank.kv_heads*c.head_dim;
         for index in 0..c.layers {
-            // Context projections are independent per position: rows that the
-            // same append overwrites in a local ring need not be computed.
-            let first=match self.config.context[index] {
-                cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::BlockAnchoredWindow(window)=>total_rows.saturating_sub(window),
-                cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::Full=>0,
-            };
+            // Context projections are independent per position: for a single
+            // sequence, rows overwritten in its local ring need not be computed.
+            let first=if single_sequence {
+                match self.config.context[index] {
+                    cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::BlockAnchoredWindow(window)=>total_rows.saturating_sub(window),
+                    cuteafd_loader::formats::block_dspark::recurrent::ContextPolicy::Full=>0,
+                }
+            } else { 0 };
             let rows=total_rows-first;
             let pitch=self.config.taps.len()*c.hidden*2;
             let features=view(features,first*pitch,rows*pitch)?;
@@ -80,5 +84,46 @@ impl Rank<'_> {
         // SAFETY: one complete raw feature row and immutable final mixture;
         // output is a distinct persistent per-slot BF16 feature record.
         unsafe{self.programs.mix.launch(&[last_taps,row,head.dflare_norm.buffer,output],1,c.rms_norm_eps as f32,0,self.stream.raw)}
+    }
+
+    /// Refresh a batch of distinct sequences' head features from packed last-tap rows
+    /// (`[slots.len(), taps, hidden]` BF16) using one batched `mix` launch.
+    pub fn recurrent_features(&self,last_taps:Buffer,slots:&[usize])->Result<()> {
+        ensure!(!slots.is_empty() && slots.len()<=self.layout.context_rows,"recurrent feature batch exceeds admission");
+        let c=&self.config.transformer;
+        let width=c.hidden*2;
+        let f=self.buffer("cache.last_features")?;
+        if slots.len()==1 {
+            let slot=slots[0];
+            ensure!(slot<self.layout.slots,"recurrent feature slot exceeds admission");
+            return self.recurrent_feature(last_taps,view(f,slot*width,width)?);
+        }
+        let mut seen=std::collections::BTreeSet::new();
+        ensure!(slots.iter().all(|&slot|slot<self.layout.slots && seen.insert(slot)),
+            "recurrent feature batch aliases or exceeds slots");
+        let head=self.weights.tensors.head.as_ref().ok_or_else(||anyhow::anyhow!("recurrent feature requires lead head"))?;
+        let alpha=self.weights.derived("derived.fuse_alpha")?.buffer;
+        let row=view(alpha,c.layers*self.config.taps.len()*2,self.config.taps.len()*2)?;
+        let mixed=self.buffer("context.mixed")?;
+        // SAFETY: packed last-tap rows and immutable head mixture produce disjoint
+        // per-row BF16 features in `context.mixed`, then scatter into persistent slots.
+        unsafe{self.programs.mix.launch(&[last_taps,row,head.dflare_norm.buffer,mixed],
+            slots.len(),c.rms_norm_eps as f32,0,self.stream.raw)?;}
+        let lib=self.stream.device.library;
+        let mut i=0;
+        while i<slots.len() {
+            let start_slot=slots[i];
+            let mut run=1;
+            while i+run<slots.len() && slots[i+run]==start_slot+run {
+                run+=1;
+            }
+            let bytes=run*width;
+            // SAFETY: `context.mixed` and `cache.last_features` are disjoint admitted
+            // planes; stream order guarantees `mix` completes before scatter copies.
+            unsafe{lib.copy_d2d_async(view(f,start_slot*width,bytes)?,
+                view(mixed,i*width,bytes)?,bytes,self.stream.raw)?;}
+            i+=run;
+        }
+        Ok(())
     }
 }

@@ -162,6 +162,74 @@ mod tests {
                 "{name} adopted recurrent_cache; wire it to the shared bind_slot entry point and cover it here");
         }
     }
+
+    #[test]
+    fn batched_reservations_roll_back_atomically_on_later_span_failure() -> Result<()> {
+        let mut state = ContextState::new(4, 1024, 8 * 64, 404)?;
+        for slot in 0..4 {
+            state.bind_slot(slot, 0, None)?;
+        }
+        let initial_free = state.pool.free();
+        let spans = [
+            ContextSpan { slot: 0, start: 0, first_row: 0, rows: 65 }, // allocates 2 pages
+            ContextSpan { slot: 1, start: 0, first_row: 65, rows: 65 }, // allocates 2 pages
+            ContextSpan { slot: 2, start: 5, first_row: 130, rows: 1 }, // bad frontier (expected 0)
+        ];
+        let mut reserved = Vec::new();
+        let outcome = (|| -> Result<()> {
+            for span in spans {
+                let binding = state.binding(span.slot)?;
+                let (origin, frontier) = state.pool.frontier(binding)?;
+                ensure!(
+                    frontier == span.start
+                        && span.start.checked_add(span.rows).is_some_and(|end| end <= state.context)
+                        && origin <= span.start,
+                    "bad frontier"
+                );
+                let res = state.pool.reserve(binding, span.start, span.rows)?;
+                reserved.push(res);
+            }
+            Ok(())
+        })();
+        assert!(outcome.is_err());
+        assert_eq!(reserved.len(), 2);
+        for res in reserved {
+            state.pool.commit(res, 0)?;
+        }
+        assert_eq!(state.pool.free(), initial_free, "failed multi-span reserve leaked pages");
+        for slot in 0..4 {
+            assert_eq!(state.pool.frontier(state.binding(slot)?)?, (0, 0));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn buffers_overlap_detects_aliasing_and_disjoint_ranges() {
+        let base = Buffer { ptr: 0x1000 as *mut libc::c_void, bytes: 256, device_id: 0, flags: 0 };
+        let inside = Buffer { ptr: 0x1080 as *mut libc::c_void, bytes: 64, device_id: 0, flags: 0 };
+        let adjacent = Buffer { ptr: 0x1100 as *mut libc::c_void, bytes: 64, device_id: 0, flags: 0 };
+        let other_dev = Buffer { ptr: 0x1000 as *mut libc::c_void, bytes: 256, device_id: 1, flags: 0 };
+        assert!(buffers_overlap(base, inside));
+        assert!(buffers_overlap(inside, base));
+        assert!(!buffers_overlap(base, adjacent));
+        assert!(!buffers_overlap(adjacent, base));
+        assert!(!buffers_overlap(base, other_dev));
+    }
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) struct ContextSpan {
+    pub slot:usize,
+    pub start:usize,
+    pub first_row:usize,
+    pub rows:usize,
+}
+
+fn buffers_overlap(a:Buffer,b:Buffer)->bool {
+    if a.device_id!=b.device_id || a.bytes==0 || b.bytes==0 { return false; }
+    let (a0,b0)=(a.ptr as usize,b.ptr as usize);
+    let (a1,b1)=(a0.saturating_add(a.bytes),b0.saturating_add(b.bytes));
+    a0<b1 && b0<a1
 }
 
 pub(crate) struct ContextBank { pub state:RefCell<ContextState> }
@@ -192,9 +260,9 @@ impl ContextBank {
                 ensure!(features.bytes>=bytes && input.bytes>=bytes,"recurrent peer feature extent differs");
                 split.exchange.push_to(split.lead,DIRECT,features.ptr,input.ptr,bytes)?;
                 split.exchange.wait(1-split.lead,DIRECT)?;
-                split.peer.stream.device.run(||split.peer.store_context(input,&positions,&destinations))?;
+                split.peer.stream.device.run(||split.peer.store_context(input,&positions,&destinations,true))?;
             }
-            rank.store_context(features,&positions,&destinations)?;
+            rank.store_context(features,&positions,&destinations,true)?;
             if rank.layout.rank.rank==rank.layout.rank.lead {
                 let width=rank.config.transformer.hidden*2;
                 let taps=rank.config.taps.len()*width;
@@ -216,6 +284,171 @@ impl ContextBank {
             }
             rank.stream.drain_or_abort("recurrent failed context append");
             self.state.borrow_mut().pool.commit(reservation,0)?;
+        }
+        result
+    }
+
+    /// Batched multi-sequence context append with one stream drain across all
+    /// spans. Preserves exact per-slot destinations, RoPE positions and head
+    /// features without per-request host syncs.
+    pub fn append_batch_ranked(&self,rank:&Rank<'_>,split:Option<&super::gqa_tp2::GqaHeadSplit<'_,Rank<'_>>>,
+        features:Buffer,spans:&[ContextSpan])->Result<()> {
+        if spans.is_empty() { return Ok(()); }
+        if let &[span] = spans {
+            let pitch=rank.config.taps.len()*rank.config.transformer.hidden*2;
+            let end_row=span.first_row.checked_add(span.rows).context("recurrent context feature row overflow")?;
+            ensure!(end_row.checked_mul(pitch).is_some_and(|end|end<=features.bytes),
+                "recurrent context feature span outside owner");
+            let slice=Buffer{ptr:features.ptr.wrapping_byte_add(span.first_row*pitch),bytes:span.rows*pitch,..features};
+            return self.append_ranked(rank,split,span.slot,span.start,slice,span.rows);
+        }
+        let mut total_rows=0usize;
+        let mut seen_slots=std::collections::BTreeSet::new();
+        let pitch=rank.config.taps.len()*rank.config.transformer.hidden*2;
+        let min_window=rank.config.context.iter().filter_map(|p|match p {
+            ContextPolicy::BlockAnchoredWindow(w)=>Some(*w),ContextPolicy::Full=>None,
+        }).min();
+        for span in spans {
+            ensure!(span.rows>0,"recurrent context append span is empty");
+            ensure!(seen_slots.insert(span.slot),"recurrent context append aliases a slot");
+            if spans.len()>1 {
+                if let Some(window)=min_window {
+                    ensure!(span.rows<=window,"batched recurrent context span exceeds local window");
+                }
+            }
+            let end_row=span.first_row.checked_add(span.rows).context("recurrent context feature row overflow")?;
+            ensure!(end_row.checked_mul(pitch).is_some_and(|end|end<=features.bytes),
+                "recurrent context feature span outside owner");
+            total_rows=total_rows.checked_add(span.rows).context("recurrent context batch row overflow")?;
+        }
+        ensure!(total_rows>0 && total_rows<=rank.layout.context_rows,"recurrent context append row capacity");
+        let mut reservations=Vec::with_capacity(spans.len());
+        let mut physicals=Vec::with_capacity(spans.len());
+        {
+            let mut state=self.state.borrow_mut();
+            let reserve_all=(||->Result<()>{
+                for span in spans {
+                    let binding=state.binding(span.slot)?;
+                    let (origin,frontier)=state.pool.frontier(binding)?;
+                    ensure!(frontier==span.start && span.start.checked_add(span.rows).is_some_and(|end|end<=state.context)
+                        && origin<=span.start,"recurrent context append is not canonical");
+                    let reservation=state.pool.reserve(binding,span.start,span.rows)?;
+                    let physical=state.pool.destinations(reservation)?;
+                    reservations.push((reservation,span.rows));
+                    physicals.push(physical);
+                }
+                Ok(())
+            })();
+            if let Err(error)=reserve_all {
+                for (reservation,_) in reservations { let _=state.pool.commit(reservation,0); }
+                return Err(error);
+            }
+        }
+        let mut positions=Vec::with_capacity(total_rows);
+        for span in spans { positions.extend((span.start..span.start+span.rows).map(|p|p as i64)); }
+        let destinations=rank.config.context.iter().map(|policy|match policy {
+            ContextPolicy::Full=>physicals.iter().flat_map(|rows|rows.iter().copied()).collect(),
+            ContextPolicy::BlockAnchoredWindow(window)=>{
+                let mut dst=Vec::with_capacity(total_rows);
+                for span in spans {
+                    dst.extend((span.start..span.start+span.rows).map(|p|(span.slot*window+p%window) as i64));
+                }
+                dst
+            }
+        }).collect::<Vec<_>>();
+        let first_row=spans[0].first_row;
+        let contiguous=spans.iter().scan(first_row,|expected,span|{
+            let ok=span.first_row==*expected;
+            *expected=span.first_row.saturating_add(span.rows);
+            Some(ok)
+        }).all(|ok|ok);
+        let single_sequence=spans.len()==1;
+        let result=(||{
+            let lib=rank.stream.device.library;
+            let packed_features=if contiguous {
+                Buffer{ptr:features.ptr.wrapping_byte_add(first_row*pitch),bytes:total_rows*pitch,..features}
+            } else {
+                let stage=rank.buffer("context.taps")?;
+                ensure!(!buffers_overlap(features,stage),"batched recurrent context source aliases context.taps");
+                let mut dst_row=0usize;
+                let mut i=0usize;
+                while i<spans.len() {
+                    let src_first=spans[i].first_row;
+                    let mut run_rows=spans[i].rows;
+                    let mut j=i+1;
+                    while j<spans.len() && spans[j].first_row==src_first+run_rows {
+                        run_rows+=spans[j].rows;
+                        j+=1;
+                    }
+                    let bytes=run_rows*pitch;
+                    // SAFETY: disjoint tap source and admitted context.taps staging on this stream.
+                    unsafe{lib.copy_d2d_async(
+                        Buffer{ptr:stage.ptr.wrapping_byte_add(dst_row*pitch),bytes,..stage},
+                        Buffer{ptr:features.ptr.wrapping_byte_add(src_first*pitch),bytes,..features},
+                        bytes,rank.stream.raw)?;}
+                    dst_row+=run_rows;
+                    i=j;
+                }
+                Buffer{bytes:total_rows*pitch,..stage}
+            };
+            if let Some(split)=split {
+                use crate::shared::peer_split::DIRECT;
+                let input=split.peer.buffer("context.taps")?;
+                let bytes=total_rows*pitch;
+                ensure!(packed_features.bytes>=bytes && input.bytes>=bytes,"recurrent peer feature extent differs");
+                split.exchange.push_to(split.lead,DIRECT,packed_features.ptr,input.ptr,bytes)?;
+                split.exchange.wait(1-split.lead,DIRECT)?;
+                split.peer.stream.device.run(||split.peer.store_context(input,&positions,&destinations,single_sequence))?;
+            }
+            rank.store_context(packed_features,&positions,&destinations,single_sequence)?;
+            if rank.layout.rank.rank==rank.layout.rank.lead {
+                if single_sequence {
+                    let width=rank.config.transformer.hidden*2;
+                    let last=Buffer{ptr:packed_features.ptr.wrapping_byte_add((total_rows-1)*pitch),bytes:pitch,..packed_features};
+                    let f=rank.buffer("cache.last_features")?;
+                    rank.recurrent_feature(last,Buffer{ptr:f.ptr.wrapping_byte_add(spans[0].slot*width),bytes:width,..f})?;
+                } else {
+                    let slots=spans.iter().map(|s|s.slot).collect::<Vec<_>>();
+                    let last_taps=if spans.iter().all(|s|s.rows==1) {
+                        packed_features
+                    } else {
+                        let stage=rank.buffer("context.taps")?;
+                        ensure!(!buffers_overlap(features,stage),"batched recurrent last-feature gather aliases context.taps");
+                        for (index,span) in spans.iter().enumerate() {
+                            let src_row=span.first_row+span.rows-1;
+                            // SAFETY: `store_context` already consumed `context.taps` on this stream,
+                            // and `features` is disjoint from `context.taps`.
+                            unsafe{lib.copy_d2d_async(
+                                Buffer{ptr:stage.ptr.wrapping_byte_add(index*pitch),bytes:pitch,..stage},
+                                Buffer{ptr:features.ptr.wrapping_byte_add(src_row*pitch),bytes:pitch,..features},
+                                pitch,rank.stream.raw)?;}
+                        }
+                        Buffer{bytes:spans.len()*pitch,..stage}
+                    };
+                    rank.recurrent_features(last_taps,&slots)?;
+                }
+            }
+            rank.stream.drain()?;
+            if let Some(split)=split{split.peer.stream.drain()?;}
+            let mut state=self.state.borrow_mut();
+            for &(reservation,rows) in &reservations {
+                state.pool.commit(reservation,rows)?;
+            }
+            Ok(())
+        })();
+        if result.is_err(){
+            // A failed producer may still read/write the provisional pages.
+            // Never return them to the pool until native stream retirement.
+            if let Some(split)=split {
+                let drained=(||{split.exchange.publish_abort()?;split.exchange.drain_compute()})();
+                split.exchange.finish_terminal(drained.is_ok());
+                crate::shared::decode_graph::fatal_drain(drained,"recurrent failed peer context append");
+            }
+            rank.stream.drain_or_abort("recurrent failed context append");
+            let mut state=self.state.borrow_mut();
+            for &(reservation,_) in &reservations {
+                let _=state.pool.commit(reservation,0);
+            }
         }
         result
     }
