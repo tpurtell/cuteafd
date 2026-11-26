@@ -19,7 +19,6 @@ use crate::shared::memory::{HostAllocation, Tag};
 use crate::shared::memory::weight_arena::DeviceArena;
 use crate::shared::peer_split::{
     context::{self, ContextExchange},
-    hop::HopLink,
     PeerExchange, RankDevice, DIRECT,
 };
 use crate::shared::prefill_pipeline::{run_prefill_units, FfnRoute, PrefillHooks, Unit, UnitSegment};
@@ -40,10 +39,8 @@ use cuteafd_loader::families::hy4_flash::execution::{
     hy4_peer_slot_sizes, mla_split_scratch_bytes, wave_metadata_layout_for_rank,
     SharedScratchLayout, WaveScratchLayout, PAGE_ROWS, WAVE_METADATA,
 };
-use cuteafd_loader::placement::families::hy4_flash::{self as hy4_place, DECODE_ROWS};
-use cuteafd_loader::placement::{
-    plan_hops, AttentionPlacement, HopSpec, HopStorage, LayerMode, TerminalHome,
-};
+use cuteafd_loader::placement::AttentionPlacement;
+use cuteafd_loader::placement::families::hy4_flash::DECODE_ROWS;
 use cuteafd_loader::families::hy4_flash::{Hy4FlashConfig, Hy4KvCache};
 use cuteafd_loader::formats::mapped_table::ReadPriority;
 use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
@@ -372,7 +369,6 @@ impl<'a> SharedScratch<'a> {
         cfg: &Hy4FlashConfig,
         rank: usize,
         tp: usize,
-        layers_split: bool,
         max_rows: usize,
         decode_rows: usize,
         max_seq_pages: usize,
@@ -383,7 +379,7 @@ impl<'a> SharedScratch<'a> {
         native_layout: Option<&ProjectionScratchLayout>,
         native_head_layout: Option<&ProjectionScratchLayout>,
     ) -> Result<Self> {
-        let layout = SharedScratchLayout::new_for_layers(
+        let layout = SharedScratchLayout::new_with_context(
             cfg,
             rank,
             tp,
@@ -393,9 +389,7 @@ impl<'a> SharedScratch<'a> {
             max_sequences,
             local_vocab,
             context_split,
-            layers_split,
         )?;
-        let head_rank = if layers_split { tp - 1 } else { 0 };
         let arena = DeviceArena::new(
             device,
             layout.arena.clone(),
@@ -433,7 +427,7 @@ impl<'a> SharedScratch<'a> {
         } else {
             None
         };
-        let head_logits_f32 = if rank == head_rank {
+        let head_logits_f32 = if rank == 0 {
             Some(view("head_logits_f32")?)
         } else {
             None
@@ -1454,7 +1448,6 @@ impl<'a> RankRuntime<'a> {
         &self,
         rank: usize,
         gpus: usize,
-        layers_split: bool,
         prev: DeferredFfn,
         wave_slot: usize,
         rows: usize,
@@ -1464,21 +1457,6 @@ impl<'a> RankRuntime<'a> {
         routed_recv_offset: usize,
     ) -> Result<()> {
         let prev_p = format!("model.layers.{}", prev.layer);
-        if layers_split {
-            if !prev.is_dense && prev.reduce_routed_tp2 {
-                let routed_in = routed_f32_input(self, rows, skip_routed)?;
-                self.reduce_f32_to_bf16_local(
-                    rank,
-                    rows,
-                    LATENT_H,
-                    None,
-                    routed_in,
-                    ffn_recv_ptr,
-                    self.shared.routed_latent.buffer,
-                )?;
-            }
-            return self.ffn_combine_post(&prev_p, prev.is_dense, wave_slot, rows, use_a);
-        }
         if gpus == 2 {
             if prev.is_dense {
                 self.reduce_f32_to_bf16_local(
@@ -1552,7 +1530,6 @@ struct ActiveMember {
 #[derive(Clone, Copy, Debug)]
 struct DeferredFfn {
     layer: usize,
-    owner: usize,
     is_dense: bool,
     reduce_routed_tp2: bool,
 }
@@ -1595,19 +1572,12 @@ pub(crate) struct Hy4Engine<'a> {
     pub(crate) dump_dir: Option<std::path::PathBuf>,
     max_seq_pages: usize,
     context_split: bool,
-    layers_split: bool,
-    cut: usize,
-    head_rank: usize,
     graphs_enabled: Cell<bool>,
     swa_pt_host: Vec<i32>,
     metadata_uploads: Vec<Vec<MetadataUpload<'a>>>,
     ranks: Vec<RankRuntime<'a>>,
-    // ContextExchange and HopLink borrow PeerExchange's abort words, so they must drop before peer_exchange.
+    // ContextExchange borrows PeerExchange's abort words, so it must drop before peer_exchange.
     context_exchange: Option<ContextExchange<'a>>,
-    hop_link: Option<HopLink<'a>>,
-    r0_spark_staged: Option<Event<'a>>,
-    r1_routed_consumed: Option<Event<'a>>,
-    tp2_routes_consumed: [Option<Event<'a>>; 2],
     peer_exchange: Option<PeerExchange<'a>>,
     ffn_routed_recv_offset: usize,
     head_handoff: Option<Handoff<'a>>,
@@ -1700,17 +1670,12 @@ impl<'a> Hy4Engine<'a> {
         let max_rows = unit_rows.max(decode_rows);
         let gpus = devices.len();
         ensure!(matches!(gpus, 1 | 2), "Hy4Engine supports 1 or 2 GPUs, got {gpus}");
-        let (context_split, layers_split) = match (gpus, attention) {
-            (1, AttentionPlacement::Heads) => (false, false),
-            (2, AttentionPlacement::Heads) => (false, false),
-            (2, AttentionPlacement::Context) => (true, false),
-            (2, AttentionPlacement::Layers) => (false, true),
+        let context_split = match (gpus, attention) {
+            (1, AttentionPlacement::Heads) => false,
+            (2, AttentionPlacement::Heads) => false,
+            (2, AttentionPlacement::Context) => true,
             _ => anyhow::bail!("Hy4Engine does not support attention placement {attention:?} on {gpus} GPU(s)"),
         };
-        let layer_tp = if layers_split { 1 } else { gpus };
-        let cut = if layers_split { cfg.layers.div_ceil(2) } else { cfg.layers };
-        let head_rank = if layers_split { 1 } else { 0 };
-        let modes = hy4_place::layer_modes(&cfg, gpus, attention);
         ensure!(onboarded_experts.len() == gpus, "onboarded_experts rank count mismatch");
         ensure!(
             max_sequences > 0 && max_pages > 0 && unit_rows > 0 && (1..=4).contains(&prefill_waves),
@@ -1737,7 +1702,7 @@ impl<'a> Hy4Engine<'a> {
         // Prefill scoring can project a full head tile, independently of the
         // configured decode-row budget.
         let head_rows = max_rows.min(DECODE_ROWS as usize);
-        let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, attention, max_rows, head_rows, media)?;
+        let weights_all = Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, head_rows, media)?;
         // SAFETY: checkpoint shard files remain immutable for the duration of the engine.
         let engram = unsafe { Hy4EngramHost::open(devices[0].library, checkpoint, &cfg, unit_rows, prefill_waves, decode_rows)? };
         let max_seq_pages = admitted_context.div_ceil(PAGE_ROWS).max(16);
@@ -1747,7 +1712,7 @@ impl<'a> Hy4Engine<'a> {
                 .map(|rank| {
                     (0..prefill_waves)
                         .map(|slot| {
-                            let wave = WaveScratchLayout::new(&cfg, rank, slot, layer_tp, max_rows, max_seq_pages, max_sequences)?;
+                            let wave = WaveScratchLayout::new(&cfg, rank, slot, gpus, max_rows, max_seq_pages, max_sequences)?;
                             MetadataUpload::new(&[devices[rank]], wave_metadata_layout_for_rank(rank, slot, &wave.arena)?)
                         })
                         .collect::<Result<Vec<_>>>()
@@ -1756,7 +1721,7 @@ impl<'a> Hy4Engine<'a> {
         } else {
             vec![(0..prefill_waves)
                 .map(|slot| {
-                    let wave = WaveScratchLayout::new(&cfg, 0, slot, layer_tp, max_rows, max_seq_pages, max_sequences)?;
+                    let wave = WaveScratchLayout::new(&cfg, 0, slot, gpus, max_rows, max_seq_pages, max_sequences)?;
                     MetadataUpload::new(devices, wave_metadata_layout_for_rank(0, slot, &wave.arena)?)
                 })
                 .collect::<Result<Vec<_>>>()?]
@@ -1767,7 +1732,7 @@ impl<'a> Hy4Engine<'a> {
             let stream = Rc::new(Stream::new(device)?);
             let progs = match preloaded_programs.as_mut() {
                 Some(pre) => pre.remove(0),
-                None => device.run(|| Hy4Programs::load(programs, layer_tp, kv_format, context_split))?,
+                None => device.run(|| Hy4Programs::load(programs, gpus, kv_format, context_split))?,
             };
             let sms = device.run(|| device.library.sm_count())?;
             let mla_splits = MlaSplitPlan::new(&progs, max_context, decode_rows, sms)?;
@@ -1780,29 +1745,12 @@ impl<'a> Hy4Engine<'a> {
                 }
             }
             // Split-capable launches never exceed the admitted decode/verify rows.
-            let attn_scratch = mla_split_scratch_bytes(decode_rows, layer_tp)
+            let attn_scratch = mla_split_scratch_bytes(decode_rows, gpus)
                 .max(if context_split { hy4_dsa_partial_scratch_bytes(context_exchange_rows(max_rows, decode_rows)) } else { 0 });
-            let mut owned_dsa = 0usize;
-            let mut owned_swa = 0usize;
-            for (layer, &mode) in modes.iter().enumerate() {
-                let owns = match mode {
-                    LayerMode::Whole { gpu: owner, .. } => usize::from(owner) == rank,
-                    LayerMode::HeadSplit | LayerMode::ContextSplit => true,
-                };
-                if owns {
-                    if cfg.sparse_layer[layer] {
-                        owned_dsa += 1;
-                    } else {
-                        owned_swa += 1;
-                    }
-                }
-            }
-            let cache = Rc::new(Hy4CacheRank::new_owned(
+            let cache = Rc::new(Hy4CacheRank::new(
                 vec![stream.clone()],
                 &cfg,
                 kv_format,
-                owned_dsa,
-                owned_swa,
                 max_pages,
                 max_sequences,
                 max_rows,
@@ -1815,7 +1763,6 @@ impl<'a> Hy4Engine<'a> {
                 &cfg,
                 rank,
                 gpus,
-                layers_split,
                 max_rows,
                 decode_rows,
                 max_seq_pages,
@@ -1833,7 +1780,7 @@ impl<'a> Hy4Engine<'a> {
                     &cfg,
                     rank,
                     slot,
-                    layer_tp,
+                    gpus,
                     max_rows,
                     max_seq_pages,
                     max_sequences,
@@ -1901,68 +1848,24 @@ impl<'a> Hy4Engine<'a> {
         } else {
             None
         };
-        let hop_link = if layers_split {
-            let peer = peer_exchange.as_ref().context("Hy4-flash layers placement requires TP2 PeerExchange")?;
-            let abort = [
-                peer.abort_word(0)?.context("Hy4-flash rank 0 exchange not abortable")?,
-                peer.abort_word(1)?.context("Hy4-flash rank 1 exchange not abortable")?,
-            ];
-            let spec = HopSpec {
-                storage: HopStorage::ReceiveSlots,
-                row_bytes: (HC * H * 2) as u64,
-                rows: max_rows as u64,
-                lanes: 1,
-                entry_gpu: 0,
-                head_gpu: 1,
-                terminal: TerminalHome::AttentionOwner,
-            };
-            let hops = plan_hops(&modes, &spec).map_err(anyhow::Error::msg)?;
-            ensure!(
-                hops.len() == 1 && hops[0].from == 0 && hops[0].to == 1,
-                "Hy4-flash layers placement requires a single GPU0->GPU1 boundary hop"
-            );
-            let mut link = HopLink::new(
-                devices[0].library,
-                [
-                    RankDevice { device: ranks[0].device.id, stream: ranks[0].stream.raw },
-                    RankDevice { device: ranks[1].device.id, stream: ranks[1].stream.raw },
-                ],
-                &hops,
-                spec,
-                decode_rows * HC * H * 2,
-            )?;
-            link.attach_abort(abort)?;
-            Some(link)
-        } else {
-            None
-        };
-        let r0_spark_staged = if layers_split { Some(Event::new(devices[0])?) } else { None };
-        let r1_routed_consumed = if layers_split { Some(Event::new(devices[1])?) } else { None };
-        let tp2_routes_consumed = if layers_split {
-            [Some(Event::new(devices[0])?), Some(Event::new(devices[1])?)]
-        } else {
-            [None, None]
-        };
-        let head_handoff = if gpus == 2 && !layers_split {
+        let head_handoff = if gpus == 2 {
             Some(Handoff::new(ranks[0].stream.clone(), ranks[1].stream.clone())?)
         } else {
             None
         };
 
-        let mut dsa_index_of = BTreeMap::new();
-        let mut swa_index_of = BTreeMap::new();
-        let mut dsa_counts = [0usize; 2];
-        let mut swa_counts = [0usize; 2];
-        for layer in 0..cfg.layers {
-            let owner = if layers_split && layer >= cut { 1 } else { 0 };
-            if cfg.sparse_layer[layer] {
-                dsa_index_of.insert(layer, dsa_counts[owner]);
-                dsa_counts[owner] += 1;
-            } else {
-                swa_index_of.insert(layer, swa_counts[owner]);
-                swa_counts[owner] += 1;
-            }
-        }
+        let dsa_index_of: BTreeMap<usize, usize> = cfg
+            .sparse_layers()
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| (l, i))
+            .collect();
+        let swa_index_of: BTreeMap<usize, usize> = cfg
+            .swa_layers()
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| (l, i))
+            .collect();
         let engram_index_of: BTreeMap<usize, usize> = cfg
             .engram_layers
             .iter()
@@ -1988,18 +1891,11 @@ impl<'a> Hy4Engine<'a> {
             dump_dir: None,
             max_seq_pages: max_seq_pages.max(16),
             context_split,
-            layers_split,
-            cut,
-            head_rank,
             graphs_enabled: Cell::new(false),
             swa_pt_host,
             metadata_uploads,
             ranks,
             context_exchange,
-            hop_link,
-            r0_spark_staged,
-            r1_routed_consumed,
-            tp2_routes_consumed,
             peer_exchange,
             ffn_routed_recv_offset,
             head_handoff,
@@ -2359,16 +2255,8 @@ impl<'a> Hy4Engine<'a> {
     pub(crate) fn configure_expert_usage(&mut self, geometry: Option<&cuteafd_core::expert_usage::Geometry>,
         reader: cuteafd_core::expert_usage::Reader) -> Result<()> {
         if let Some(geometry) = geometry {
-            let devices: Vec<UsageDevice> = if self.layers_split {
-                self.ranks
-                    .iter()
-                    .enumerate()
-                    .map(|(logical, r)| UsageDevice { logical: logical as u8, cuda: r.device.id })
-                    .collect()
-            } else {
-                vec![UsageDevice { logical: 0, cuda: self.lead_device_id() }]
-            };
-            self.expert_usage = Some(ExpertUsage::new(self.library(), geometry.clone(), &devices, reader)?);
+            self.expert_usage = Some(ExpertUsage::new(self.library(), geometry.clone(),
+                &[UsageDevice { logical: 0, cuda: self.lead_device_id() }], reader)?);
         }
         Ok(())
     }
@@ -2377,83 +2265,11 @@ impl<'a> Hy4Engine<'a> {
         self.count_expert_usage = self.expert_usage.is_some();
     }
 
-    fn layer_owner(&self, layer: usize) -> usize {
-        if self.layers_split && layer >= self.cut { 1 } else { 0 }
-    }
-
-    fn record_order_event(event: Option<&Event<'a>>, stream: &Stream<'a>) -> Result<()> {
-        let Some(event) = event else { return Ok(()); };
-        // SAFETY: event and stream share the same device and live through engine drain.
-        stream
-            .device
-            .run(|| unsafe { stream.device.library.cuda_event_record(event.raw, stream.raw) })
-    }
-
-    fn wait_order_event(event: Option<&Event<'a>>, stream: &Stream<'a>) -> Result<()> {
-        let Some(event) = event else { return Ok(()); };
-        // SAFETY: event is valid (unrecorded waits are CUDA no-ops) and stream lives through engine drain.
-        stream
-            .device
-            .run(|| unsafe { stream.device.library.cuda_stream_wait_event(stream.raw, event.raw) })
-    }
-
-    fn peer_push_routes_and_wire(&self, from: usize, to: usize, rows: usize) -> Result<()> {
-        let exchange = self.peer_exchange()?;
-        let src = &self.ranks[from];
-        let dst = &self.ranks[to];
-        let ids_bytes = rows * TOPK * 4;
-        let weights_bytes = rows * TOPK * 4;
-        let wire_bytes = rows * (LATENT_H + LATENT_H / 32);
-        let decode_cap = (self.decode_rows * HC * H * 2).max(self.decode_rows * (H + LATENT_H) * 4);
-        let specs = [
-            (dst.shared.route_ids.buffer.ptr, src.shared.route_ids.buffer.ptr.cast_const(), ids_bytes),
-            (dst.shared.route_weights.buffer.ptr, src.shared.route_weights.buffer.ptr.cast_const(), weights_bytes),
-            (dst.shared.wire_in.buffer.ptr, src.shared.wire_in.buffer.ptr.cast_const(), wire_bytes),
-        ];
-        if ids_bytes + weights_bytes + wire_bytes <= decode_cap {
-            let planes: [PeerPlane; 3] = specs.map(|(destination, source, bytes)| PeerPlane {
-                destination,
-                source,
-                rows: 1,
-                row_bytes: bytes as u64,
-                destination_pitch: bytes as u64,
-                source_pitch: bytes as u64,
-            });
-            exchange.push_planes(from, DIRECT, &planes)?;
-        } else {
-            let peer_dev = dst.device.id;
-            src.device.run(|| unsafe {
-                for (d_ptr, s_ptr, bytes) in specs {
-                    let dst_buf = CuteafdDeviceBuffer { ptr: d_ptr, bytes, device_id: peer_dev, flags: 0 };
-                    let src_buf = CuteafdDeviceBuffer { ptr: s_ptr.cast_mut(), bytes, device_id: src.device.id, flags: 0 };
-                    src.device.library.copy_d2d_async(dst_buf, src_buf, bytes, src.stream.raw)?;
-                }
-                Ok(())
-            })?;
-            exchange.signal(from, DIRECT)?;
-        }
-        exchange.wait(to, DIRECT)
-    }
-
-    fn hop_to_rank1(&self, wave_slot: usize, rows: usize, use_a: bool) -> Result<()> {
-        let hops = self.hop_link.as_ref().context("Hy4-flash layers placement missing HopLink")?;
-        let w0 = &self.ranks[0].waves[wave_slot];
-        let w1 = &self.ranks[1].waves[wave_slot];
-        let (src_r, dst_r) = if use_a {
-            (w0.r_a.buffer, w1.r_a.buffer)
-        } else {
-            (w0.r_b.buffer, w1.r_b.buffer)
-        };
-        let ticket = hops.send_into(0, 0, src_r.ptr, rows, Some(dst_r))?;
-        let _ = hops.land(ticket)?;
-        Ok(())
-    }
-
     fn record_expert_usage(&self, layer: usize, batch: &ActiveBatch) -> Result<()> {
         if !self.count_expert_usage || self.skip_routed_experts || self.cfg.dense_layer[layer] {
             return Ok(());
         }
-        let rank = &self.ranks[self.layer_owner(layer)];
+        let rank = &self.ranks[0];
         let usage = self.expert_usage.as_ref().context("Hy4 expert usage owner missing")?;
         let tally = usage.routes(rank.device.id, layer, batch.usage_phase)?;
         // SAFETY: the canonical router wrote the exact row width on this stream;
@@ -2489,11 +2305,6 @@ impl<'a> Hy4Engine<'a> {
                 retained_inv.device(&format!("hy4_flash.peer.{rank}.{name}"), buf)?;
             }
         }
-        if let Some(hops) = &self.hop_link {
-            for (name, buf) in hops.backing_inventory("hy4_flash.hops") {
-                retained_inv.device(&name, buf)?;
-            }
-        }
         if let Some(exchange) = &self.context_exchange {
             for (rank, buf) in exchange.allocation_buffers().into_iter().enumerate() {
                 retained_inv.device(&format!("hy4_flash.context_exchange.{rank}"), buf)?;
@@ -2513,14 +2324,14 @@ impl<'a> Hy4Engine<'a> {
         Ok(())
     }
 
-    fn dump_bf16(&self, rank: usize, name: &str, buf: CuteafdDeviceBuffer, elems: usize) -> Result<()> {
+    fn dump_bf16(&self, name: &str, buf: CuteafdDeviceBuffer, elems: usize) -> Result<()> {
         let Some(dir) = &self.dump_dir else { return Ok(()); };
-        let r = &self.ranks[rank];
-        r.stream.drain()?;
+        let r0 = &self.ranks[0];
+        r0.stream.drain()?;
         std::fs::create_dir_all(dir)?;
         let mut raw = vec![0u8; elems * 2];
-        r.device.run(|| {
-            r.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes: elems * 2, ..buf })
+        r0.device.run(|| {
+            r0.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes: elems * 2, ..buf })
         })?;
         let f32_bytes: Vec<u8> = raw
             .chunks_exact(2)
@@ -2530,14 +2341,14 @@ impl<'a> Hy4Engine<'a> {
         Ok(())
     }
 
-    fn dump_f32(&self, rank: usize, name: &str, buf: CuteafdDeviceBuffer, elems: usize) -> Result<()> {
+    fn dump_f32(&self, name: &str, buf: CuteafdDeviceBuffer, elems: usize) -> Result<()> {
         let Some(dir) = &self.dump_dir else { return Ok(()); };
-        let r = &self.ranks[rank];
-        r.stream.drain()?;
+        let r0 = &self.ranks[0];
+        r0.stream.drain()?;
         std::fs::create_dir_all(dir)?;
         let mut raw = vec![0u8; elems * 4];
-        r.device.run(|| {
-            r.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes: elems * 4, ..buf })
+        r0.device.run(|| {
+            r0.device.library.copy_d2h(&mut raw, CuteafdDeviceBuffer { bytes: elems * 4, ..buf })
         })?;
         std::fs::write(dir.join(format!("{name}.f32")), raw)?;
         Ok(())
@@ -3031,7 +2842,7 @@ impl<'a> Hy4Engine<'a> {
                 Ok(())
             })?;
         }
-        if self.ranks.len() == 2 && !self.layers_split {
+        if self.ranks.len() == 2 {
             let bytes = rows * HC * H * 2;
             let exchange = self.peer_exchange()?;
             exchange.push_to(
@@ -3055,11 +2866,10 @@ impl<'a> Hy4Engine<'a> {
             std::fs::create_dir_all(dir)?;
             let tok_bytes: Vec<u8> = flat_tokens[..dump_rows].iter().flat_map(|t| t.to_le_bytes()).collect();
             std::fs::write(dir.join("tokens.u32"), tok_bytes)?;
-            self.dump_bf16(0, "embed", self.ranks[0].waves[wave_slot].r_a.buffer, dump_rows * HC * H)?;
+            self.dump_bf16("embed", self.ranks[0].waves[wave_slot].r_a.buffer, dump_rows * HC * H)?;
         }
         let final_layer = unit.layers.end.saturating_sub(1);
         let rank0_only_tail = self.ranks.len() == 2
-            && !self.layers_split
             && unit.layers.end == self.cfg.layers
             && head_mode != HeadMode::None
             && dump_rows == 0;
@@ -3454,10 +3264,7 @@ impl<'a> Hy4Engine<'a> {
         let is_dense = self.cfg.dense_layer[layer];
         let attn = self.cfg.attention(layer);
         let gpus = self.ranks.len();
-        let layers_split = self.layers_split;
-        let owner = self.layer_owner(layer);
-        let layer_tp = if layers_split { 1 } else { gpus };
-        let local_heads = attn.heads / layer_tp;
+        let local_heads = attn.heads / gpus;
         let rows = batch.rows;
         let use_a = batch.use_a;
         let engram_slot = self.engram_index_of.get(&layer).copied();
@@ -3466,38 +3273,37 @@ impl<'a> Hy4Engine<'a> {
         // (A) Engram host-to-device staging (always eager outside graph capture: variable lease ptr + TP2 P2P).
         if let Some(slot) = engram_slot {
             let (mut lease, raw_bytes, masked_bytes) = batch.engram_wave.take_layer(layer)?;
-            let target_rank = if layers_split { owner } else { 0 };
             {
-                let r_dst = &mut self.ranks[target_rank];
-                let result = r_dst.device.run(|| {
+                let r0 = &mut self.ranks[0];
+                let result = r0.device.run(|| {
                     let pinned = lease.slot_mut().context("empty Hy4 Engram lease")?;
-                    // SAFETY: pinned staging lease stays retained through copied_on; destination
-                    // engram_raw[slot] and engram_masked[slot] are consumed in r_dst.stream order.
+                    // SAFETY: pinned staging lease stays retained through copied_on; rank-0
+                    // engram_raw[slot] and engram_masked[slot] are consumed in r0.stream order.
                     let copied = unsafe {
                         enqueue_table_h2d(
-                            r_dst.device.library,
+                            r0.device.library,
                             pinned.bytes.buffer(),
                             &[
                                 CopyPlane {
-                                    destination: r_dst.waves[wave_slot].engram_raw[slot].buffer,
+                                    destination: r0.waves[wave_slot].engram_raw[slot].buffer,
                                     offset: 0,
                                     bytes: raw_bytes,
                                 },
                                 CopyPlane {
-                                    destination: r_dst.waves[wave_slot].engram_masked[slot].buffer,
+                                    destination: r0.waves[wave_slot].engram_masked[slot].buffer,
                                     offset: raw_bytes,
                                     bytes: masked_bytes,
                                 },
                             ],
-                            r_dst.stream.raw,
+                            r0.stream.raw,
                         )
                     };
-                    // SAFETY: r_dst.stream contains all reads from this pinned source.
-                    let fenced = unsafe { pinned.bytes.copied_on(r_dst.stream.raw) };
+                    // SAFETY: r0.stream contains all reads from this pinned source.
+                    let fenced = unsafe { pinned.bytes.copied_on(r0.stream.raw) };
                     batch.engram_wave.retain_copy(lease);
                     if copied.is_err() || fenced.is_err() {
-                        if r_dst.stream.drain().is_err() {
-                            r_dst.device.library.quarantine_module_after_failed_drain();
+                        if r0.stream.drain().is_err() {
+                            r0.device.library.quarantine_module_after_failed_drain();
                         }
                     }
                     copied?;
@@ -3506,7 +3312,7 @@ impl<'a> Hy4Engine<'a> {
                 });
                 result?;
             }
-            if gpus == 2 && !layers_split {
+            if gpus == 2 {
                 let aligned_masked = masked_bytes.div_ceil(16) * 16;
                 self.peer_push_two_planes(
                     0,
@@ -3739,290 +3545,6 @@ impl<'a> Hy4Engine<'a> {
         };
         let routed_recv_offset = self.ffn_routed_recv_offset;
 
-        if layers_split {
-            let owner_prev = if layer == self.cut {
-                if let Some(prev) = prev_ffn {
-                    let r0 = &self.ranks[0];
-                    let ffn_recv0 = ffn_recv_ptrs[0];
-                    if batch.graphed {
-                        r0.graphs.run(
-                            GraphKey { layer: prev.layer, rows, section: GraphSection::FfnFinish },
-                            &r0.stream,
-                            || {
-                                r0.device.run(|| {
-                                    r0.finish_deferred_ffn_local(
-                                        0, gpus, true, prev, wave_slot, rows, prev_use_a,
-                                        skip_routed, ffn_recv0, routed_recv_offset,
-                                    )
-                                })
-                            },
-                        )?;
-                    } else {
-                        r0.device.run(|| {
-                            r0.finish_deferred_ffn_local(
-                                0, gpus, true, prev, wave_slot, rows, prev_use_a,
-                                skip_routed, ffn_recv0, routed_recv_offset,
-                            )
-                        })?;
-                    }
-                }
-                self.hop_to_rank1(wave_slot, rows, use_a)?;
-                None
-            } else {
-                prev_ffn
-            };
-
-            let r = &self.ranks[owner];
-            let kv_cache_buf = if is_sparse {
-                r.cache.dsa_kv_layer(self.dsa_index_of[&layer])?
-            } else {
-                r.cache.swa_layer_bank(self.swa_index_of[&layer])?
-            };
-            let ffn_recv = ffn_recv_ptrs[owner];
-            if batch.graphed {
-                if is_dense {
-                    if !is_sparse {
-                        if all_single_row {
-                            r.graphs.run(
-                                GraphKey { layer, rows, section: GraphSection::SwaLocal },
-                                &r.stream,
-                                || {
-                                    r.device.run(|| {
-                                        if let Some(prev) = owner_prev {
-                                            r.finish_deferred_ffn_local(
-                                                owner, gpus, true, prev, wave_slot, rows, prev_use_a,
-                                                skip_routed, ffn_recv, routed_recv_offset,
-                                            )?;
-                                        }
-                                        if let Some(slot) = engram_slot {
-                                            r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
-                                        }
-                                        r.attn_pre(&p, layer, false, local_heads, wave_slot, rows, use_a, kv_cache_buf)?;
-                                        r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention)?;
-                                        r.attn_out(&p, layer, false, 1, local_heads, rows)?;
-                                        r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
-                                        r.dense_ffn(&p, 1, wave_slot, rows)?;
-                                        r.ffn_combine_post(&p, true, wave_slot, rows, !use_a)
-                                    })
-                                },
-                            )?;
-                        } else {
-                            r.graphs.run(
-                                GraphKey { layer, rows, section: GraphSection::SwaExtendPre },
-                                &r.stream,
-                                || {
-                                    r.device.run(|| {
-                                        if let Some(prev) = owner_prev {
-                                            r.finish_deferred_ffn_local(
-                                                owner, gpus, true, prev, wave_slot, rows, prev_use_a,
-                                                skip_routed, ffn_recv, routed_recv_offset,
-                                            )?;
-                                        }
-                                        if let Some(slot) = engram_slot {
-                                            r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
-                                        }
-                                        r.attn_pre(&p, layer, false, local_heads, wave_slot, rows, use_a, kv_cache_buf)
-                                    })
-                                },
-                            )?;
-                            r.device.run(|| r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention))?;
-                            r.graphs.run(
-                                GraphKey { layer, rows, section: GraphSection::SwaExtendPost },
-                                &r.stream,
-                                || {
-                                    r.device.run(|| {
-                                        r.attn_out(&p, layer, false, 1, local_heads, rows)?;
-                                        r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
-                                        r.dense_ffn(&p, 1, wave_slot, rows)?;
-                                        r.ffn_combine_post(&p, true, wave_slot, rows, !use_a)
-                                    })
-                                },
-                            )?;
-                        }
-                    } else {
-                        let dsa_idx = self.dsa_index_of[&layer];
-                        r.graphs.run(
-                            GraphKey { layer, rows, section: GraphSection::DsaPre },
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    if let Some(prev) = owner_prev {
-                                        r.finish_deferred_ffn_local(
-                                            owner, gpus, true, prev, wave_slot, rows, prev_use_a,
-                                            skip_routed, ffn_recv, routed_recv_offset,
-                                        )?;
-                                    }
-                                    if let Some(slot) = engram_slot {
-                                        r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
-                                    }
-                                    r.attn_pre(&p, layer, true, local_heads, wave_slot, rows, use_a, kv_cache_buf)?;
-                                    r.dsa_index_wk(&p, wave_slot, rows)
-                                })
-                            },
-                        )?;
-                        run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, true)?;
-                        r.graphs.run(
-                            GraphKey { layer, rows, section: GraphSection::DsaLocalPost },
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    r.dsa_attn(kv_cache_buf, wave_slot, rows, decode_attention)?;
-                                    r.attn_out(&p, layer, true, 1, local_heads, rows)?;
-                                    r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
-                                    r.dense_ffn(&p, 1, wave_slot, rows)?;
-                                    r.ffn_combine_post(&p, true, wave_slot, rows, !use_a)
-                                })
-                            },
-                        )?;
-                    }
-                    batch.ffn_fused_layer = Some(layer);
-                    return Ok(());
-                }
-
-                if !is_sparse {
-                    if all_single_row {
-                        r.graphs.run(
-                            GraphKey { layer, rows, section: GraphSection::SwaAttn },
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    if let Some(prev) = owner_prev {
-                                        r.finish_deferred_ffn_local(
-                                            owner, gpus, true, prev, wave_slot, rows, prev_use_a,
-                                            skip_routed, ffn_recv, routed_recv_offset,
-                                        )?;
-                                    }
-                                    if let Some(slot) = engram_slot {
-                                        r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
-                                    }
-                                    r.attn_pre(&p, layer, false, local_heads, wave_slot, rows, use_a, kv_cache_buf)?;
-                                    r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention)?;
-                                    r.attn_out(&p, layer, false, 1, local_heads, rows)
-                                })
-                            },
-                        )?;
-                        if owner_prev.is_some_and(|prev| prev.owner == 1) {
-                            Self::record_order_event(self.r1_routed_consumed.as_ref(), &r.stream)?;
-                        }
-                    } else {
-                        r.graphs.run(
-                            GraphKey { layer, rows, section: GraphSection::SwaExtendPre },
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    if let Some(prev) = owner_prev {
-                                        r.finish_deferred_ffn_local(
-                                            owner, gpus, true, prev, wave_slot, rows, prev_use_a,
-                                            skip_routed, ffn_recv, routed_recv_offset,
-                                        )?;
-                                    }
-                                    if let Some(slot) = engram_slot {
-                                        r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
-                                    }
-                                    r.attn_pre(&p, layer, false, local_heads, wave_slot, rows, use_a, kv_cache_buf)
-                                })
-                            },
-                        )?;
-                        if owner_prev.is_some_and(|prev| prev.owner == 1) {
-                            Self::record_order_event(self.r1_routed_consumed.as_ref(), &r.stream)?;
-                        }
-                        r.device.run(|| r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention))?;
-                        r.graphs.run(
-                            GraphKey { layer, rows, section: GraphSection::SwaExtendPost },
-                            &r.stream,
-                            || r.device.run(|| r.attn_out(&p, layer, false, 1, local_heads, rows)),
-                        )?;
-                    }
-                } else {
-                    let dsa_idx = self.dsa_index_of[&layer];
-                    r.graphs.run(
-                        GraphKey { layer, rows, section: GraphSection::DsaPre },
-                        &r.stream,
-                        || {
-                            r.device.run(|| {
-                                if let Some(prev) = owner_prev {
-                                    r.finish_deferred_ffn_local(
-                                        owner, gpus, true, prev, wave_slot, rows, prev_use_a,
-                                        skip_routed, ffn_recv, routed_recv_offset,
-                                    )?;
-                                }
-                                if let Some(slot) = engram_slot {
-                                    r.engram_compute(&p, slot, wave_slot, rows, use_a)?;
-                                }
-                                r.attn_pre(&p, layer, true, local_heads, wave_slot, rows, use_a, kv_cache_buf)?;
-                                r.dsa_index_wk(&p, wave_slot, rows)
-                            })
-                        },
-                    )?;
-                    if owner_prev.is_some_and(|prev| prev.owner == 1) {
-                        Self::record_order_event(self.r1_routed_consumed.as_ref(), &r.stream)?;
-                    }
-                    run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, true)?;
-                    r.graphs.run(
-                        GraphKey { layer, rows, section: GraphSection::DsaAttnOut },
-                        &r.stream,
-                        || {
-                            r.device.run(|| {
-                                r.dsa_attn(kv_cache_buf, wave_slot, rows, decode_attention)?;
-                                r.attn_out(&p, layer, true, 1, local_heads, rows)
-                            })
-                        },
-                    )?;
-                }
-                batch.post_attn_deferred = true;
-                batch.reduce_attn_pending = false;
-                return Ok(());
-            }
-
-            if let Some(prev) = owner_prev {
-                r.device.run(|| {
-                    r.finish_deferred_ffn_local(
-                        owner, gpus, true, prev, wave_slot, rows, prev_use_a,
-                        skip_routed, ffn_recv, routed_recv_offset,
-                    )
-                })?;
-                if prev.owner == 1 {
-                    Self::record_order_event(self.r1_routed_consumed.as_ref(), &r.stream)?;
-                }
-            }
-            if let Some(slot) = engram_slot {
-                r.device.run(|| r.engram_compute(&p, slot, wave_slot, rows, use_a))?;
-                if batch.dump_rows > 0 && layer <= 3 {
-                    let w = &self.ranks[owner].waves[wave_slot];
-                    let r_cur = if use_a { w.r_a.buffer } else { w.r_b.buffer };
-                    self.dump_bf16(owner, &format!("l{layer:02}_after_engram"), r_cur, batch.dump_rows * HC * H)?;
-                }
-            }
-            let r = &self.ranks[owner];
-            r.device.run(|| r.attn_pre(&p, layer, is_sparse, local_heads, wave_slot, rows, use_a, kv_cache_buf))?;
-            if is_sparse {
-                let dsa_idx = self.dsa_index_of[&layer];
-                r.device.run(|| r.dsa_index_wk(&p, wave_slot, rows))?;
-                run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, false)?;
-                r.device.run(|| r.dsa_attn(kv_cache_buf, wave_slot, rows, decode_attention))?;
-            } else {
-                r.device.run(|| r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention))?;
-            }
-            r.device.run(|| r.attn_out(&p, layer, is_sparse, 1, local_heads, rows))?;
-            if batch.dump_rows > 0 && layer <= 3 {
-                let s = &self.ranks[owner].shared;
-                let w = &self.ranks[owner].waves[wave_slot];
-                let dump_rows = batch.dump_rows;
-                self.dump_bf16(owner, &format!("l{layer:02}_attn_y"), w.y.buffer, dump_rows * H)?;
-                self.dump_bf16(owner, &format!("l{layer:02}_attn_q_resid"), s.q_resid.buffer, dump_rows * Q_LORA)?;
-                self.dump_bf16(owner, &format!("l{layer:02}_attn_query"), s.query.buffer, dump_rows * local_heads * 576)?;
-                self.dump_bf16(owner, &format!("l{layer:02}_attn_out"), s.attn_out.buffer, dump_rows * local_heads * 512)?;
-                self.dump_f32(owner, &format!("l{layer:02}_attn_lse"), s.lse_out.buffer, dump_rows * local_heads)?;
-                self.dump_bf16(owner, &format!("l{layer:02}_attn_uv"), s.uv_out.buffer, dump_rows * local_heads * 256)?;
-                self.dump_bf16(owner, &format!("l{layer:02}_attn_delta"), s.delta.buffer, dump_rows * H)?;
-            }
-            self.ranks[owner]
-                .device
-                .run(|| self.ranks[owner].post_attn_ihc(&p, wave_slot, rows, use_a))?;
-            batch.use_a = !batch.use_a;
-            return Ok(());
-        }
-
         // Graphed decode fast-path:
         //   Case 1 (TP1 + local FFN): fuse entire SWA layer (1 graph) or DSA pre + post (2 graphs).
         //   Case 2 (TP2 or Spark-routed): fuse previous layer's deferred FFN finish into this layer's
@@ -4147,7 +3669,7 @@ impl<'a> Hy4Engine<'a> {
                                 r.device.run(|| {
                                     if let Some(prev) = prev_ffn {
                                         r.finish_deferred_ffn_local(
-                                            rank, gpus, false, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
+                                            rank, gpus, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
                                         )?;
                                     }
                                     if let Some(slot) = engram_slot {
@@ -4171,7 +3693,7 @@ impl<'a> Hy4Engine<'a> {
                                 r.device.run(|| {
                                     if let Some(prev) = prev_ffn {
                                         r.finish_deferred_ffn_local(
-                                            rank, gpus, false, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
+                                            rank, gpus, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
                                         )?;
                                     }
                                     if let Some(slot) = engram_slot {
@@ -4207,7 +3729,7 @@ impl<'a> Hy4Engine<'a> {
                             r.device.run(|| {
                                 if let Some(prev) = prev_ffn {
                                     r.finish_deferred_ffn_local(
-                                        rank, gpus, false, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
+                                        rank, gpus, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
                                     )?;
                                 }
                                 if let Some(slot) = engram_slot {
@@ -4253,7 +3775,7 @@ impl<'a> Hy4Engine<'a> {
                 let ffn_recv = ffn_recv_ptrs[rank];
                 r.device.run(|| {
                     r.finish_deferred_ffn_local(
-                        rank, gpus, false, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
+                        rank, gpus, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv, routed_recv_offset,
                     )
                 })?;
             }
@@ -4265,7 +3787,7 @@ impl<'a> Hy4Engine<'a> {
             if batch.dump_rows > 0 && layer <= 3 {
                 let w0 = &self.ranks[0].waves[wave_slot];
                 let r_cur = if use_a { w0.r_a.buffer } else { w0.r_b.buffer };
-                self.dump_bf16(0, &format!("l{layer:02}_after_engram"), r_cur, batch.dump_rows * HC * H)?;
+                self.dump_bf16(&format!("l{layer:02}_after_engram"), r_cur, batch.dump_rows * HC * H)?;
             }
         }
         if is_sparse && self.context_split {
@@ -4327,13 +3849,13 @@ impl<'a> Hy4Engine<'a> {
             let s0 = &self.ranks[0].shared;
             let w0 = &self.ranks[0].waves[wave_slot];
             let dump_rows = batch.dump_rows;
-            self.dump_bf16(0, &format!("l{layer:02}_attn_y"), w0.y.buffer, dump_rows * H)?;
-            self.dump_bf16(0, &format!("l{layer:02}_attn_q_resid"), s0.q_resid.buffer, dump_rows * Q_LORA)?;
-            self.dump_bf16(0, &format!("l{layer:02}_attn_query"), s0.query.buffer, dump_rows * local_heads * 576)?;
-            self.dump_bf16(0, &format!("l{layer:02}_attn_out"), s0.attn_out.buffer, dump_rows * local_heads * 512)?;
-            self.dump_f32(0, &format!("l{layer:02}_attn_lse"), s0.lse_out.buffer, dump_rows * local_heads)?;
-            self.dump_bf16(0, &format!("l{layer:02}_attn_uv"), s0.uv_out.buffer, dump_rows * local_heads * 256)?;
-            self.dump_bf16(0, &format!("l{layer:02}_attn_delta"), s0.delta.buffer, dump_rows * H)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_y"), w0.y.buffer, dump_rows * H)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_q_resid"), s0.q_resid.buffer, dump_rows * Q_LORA)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_query"), s0.query.buffer, dump_rows * local_heads * 576)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_out"), s0.attn_out.buffer, dump_rows * local_heads * 512)?;
+            self.dump_f32(&format!("l{layer:02}_attn_lse"), s0.lse_out.buffer, dump_rows * local_heads)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_uv"), s0.uv_out.buffer, dump_rows * local_heads * 256)?;
+            self.dump_bf16(&format!("l{layer:02}_attn_delta"), s0.delta.buffer, dump_rows * H)?;
         }
 
         // (C) post_proj_norm + fused attention iHC post + FFN iHC pre
@@ -4359,9 +3881,6 @@ impl<'a> Hy4Engine<'a> {
         let count_usage = self.count_expert_usage;
         let skip_routed = self.skip_routed_experts;
         let usage_phase = batch.usage_phase;
-        if self.layers_split {
-            return self.run_moe_frontend_layers(layer, batch, local_experts);
-        }
         let attn_recv = if reduce_attn {
             let ex = self.peer_exchange()?;
             [ex.recv(0, PEER_SLOT_ATTN)?, ex.recv(1, PEER_SLOT_ATTN)?]
@@ -4435,16 +3954,6 @@ impl<'a> Hy4Engine<'a> {
     fn run_spark_shared_ffn(&self, layer: usize, batch: &ActiveBatch) -> Result<()> {
         let p = format!("model.layers.{layer}");
         let rows = batch.rows;
-        if self.layers_split {
-            let r = &self.ranks[self.layer_owner(layer)];
-            let work = || r.device.run(|| r.shared_ffn(&p, 1, batch.wave_slot, rows));
-            if batch.graphed {
-                r.graphs.run(GraphKey { layer, rows, section: GraphSection::SparkShared }, &r.stream, work)?;
-            } else {
-                work()?;
-            }
-            return Ok(());
-        }
         let gpus = self.ranks.len();
         for r in &self.ranks {
             let work = || r.device.run(|| r.shared_ffn(&p, gpus, batch.wave_slot, rows));
@@ -4457,55 +3966,6 @@ impl<'a> Hy4Engine<'a> {
         Ok(())
     }
 
-    /// Owning-rank MoE frontend under `ATTENTION_PLACEMENT=layers`.
-    fn run_moe_frontend_layers(&mut self, layer: usize, batch: &mut ActiveBatch, local_experts: bool) -> Result<()> {
-        let p = format!("model.layers.{layer}");
-        let rows = batch.rows;
-        let wave_slot = batch.wave_slot;
-        let routed_scale = self.cfg.routed_scaling_factor as f32;
-        let deferred = batch.post_attn_deferred;
-        let use_a = batch.use_a;
-        let usage = self.expert_usage.as_ref();
-        let count_usage = self.count_expert_usage;
-        let skip_routed = self.skip_routed_experts;
-        let usage_phase = batch.usage_phase;
-        let owner = self.layer_owner(layer);
-        let r = &self.ranks[owner];
-        if batch.graphed {
-            let section = if local_experts { GraphSection::FfnFrontend } else { GraphSection::SparkRouter };
-            r.graphs.run(GraphKey { layer, rows, section }, &r.stream, || {
-                r.device.run(|| {
-                    if deferred {
-                        r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
-                    }
-                    if local_experts {
-                        r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale)?;
-                    } else {
-                        r.moe_router(&p, wave_slot, rows, routed_scale)?;
-                    }
-                    r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)
-                })
-            })?;
-        } else {
-            r.device.run(|| {
-                if deferred {
-                    r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
-                }
-                if local_experts {
-                    r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale)
-                } else {
-                    r.moe_router(&p, wave_slot, rows, routed_scale)
-                }
-            })?;
-        }
-        if deferred {
-            batch.post_attn_deferred = false;
-            batch.use_a = !batch.use_a;
-        }
-        batch.reduce_attn_pending = false;
-        Ok(())
-    }
-
     /// Finish post-FFN combine (`latent_up` + shared add + norm + iHC post) for dense or MoE layer.
     /// On TP2 graphed decode, exchanges FFN partials via `PeerExchange` and defers rank-local reduction
     /// + combine + iHC post into the next layer's attention section (or terminal `Tail` graph).
@@ -4514,58 +3974,6 @@ impl<'a> Hy4Engine<'a> {
         let rows = batch.rows;
         let is_dense = self.cfg.dense_layer[layer];
         let wave_slot = batch.wave_slot;
-        let owner = self.layer_owner(layer);
-
-        if self.layers_split {
-            let peer = 1 - owner;
-            if !is_dense && reduce_routed_tp2 {
-                let ex = self.peer_exchange()?;
-                let peer_in = routed_f32_input(&self.ranks[peer], rows, self.skip_routed_experts)?.ptr;
-                ex.push(peer, PEER_SLOT_FFN, peer_in, rows * LATENT_H * 4)?;
-                ex.wait(owner, PEER_SLOT_FFN)?;
-            }
-            let deferred_ffn = DeferredFfn { layer, owner, is_dense, reduce_routed_tp2 };
-            if batch.graphed {
-                batch.prev_ffn_deferred = Some(deferred_ffn);
-                return Ok(());
-            }
-            let use_a = batch.use_a;
-            let skip_routed = self.skip_routed_experts;
-            let recv_ptr = if !is_dense && reduce_routed_tp2 {
-                self.peer_exchange()?.recv(owner, PEER_SLOT_FFN)?
-            } else {
-                std::ptr::null_mut()
-            };
-            let routed_off = self.ffn_routed_recv_offset;
-            let r = &self.ranks[owner];
-            r.device.run(|| {
-                r.finish_deferred_ffn_local(
-                    owner, gpus, true, deferred_ffn, wave_slot, rows, use_a, skip_routed, recv_ptr, routed_off,
-                )
-            })?;
-            if owner == 1 {
-                Self::record_order_event(self.r1_routed_consumed.as_ref(), &r.stream)?;
-            }
-            batch.use_a = !batch.use_a;
-            if batch.dump_rows > 0 {
-                let dump_rows = batch.dump_rows;
-                let w = &self.ranks[owner].waves[wave_slot];
-                let r_cur = if batch.use_a { w.r_a.buffer } else { w.r_b.buffer };
-                self.dump_bf16(owner, &format!("l{layer:02}_out"), r_cur, dump_rows * HC * H)?;
-                if layer <= 3 {
-                    let s = &self.ranks[owner].shared;
-                    self.dump_bf16(owner, &format!("l{layer:02}_ffn_y"), w.y.buffer, dump_rows * H)?;
-                    self.dump_bf16(owner, &format!("l{layer:02}_ffn_delta"), s.delta.buffer, dump_rows * H)?;
-                    self.dump_bf16(owner, &format!("l{layer:02}_ffn_delta_norm"), s.delta_norm.buffer, dump_rows * H)?;
-                    if !is_dense {
-                        self.dump_bf16(owner, &format!("l{layer:02}_ffn_routed_latent"), s.routed_latent.buffer, dump_rows * LATENT_H)?;
-                        self.dump_bf16(owner, &format!("l{layer:02}_ffn_shared_out"), w.shared_out.buffer, dump_rows * H)?;
-                    }
-                }
-            }
-            return Ok(());
-        }
-
         let rank0_only = batch.rank0_only_tail && layer == batch.final_layer;
 
         let bf16_wire = gpus == 2 && batch.usage_phase == UsagePhase::Prefill;
@@ -4575,7 +3983,7 @@ impl<'a> Hy4Engine<'a> {
             self.exchange_ffn_tp2(wave_slot, rows, is_dense, reduce_routed_tp2, rank0_only)?;
         }
 
-        let deferred_ffn = DeferredFfn { layer, owner: 0, is_dense, reduce_routed_tp2 };
+        let deferred_ffn = DeferredFfn { layer, is_dense, reduce_routed_tp2 };
         if batch.graphed && gpus == 2 {
             batch.prev_ffn_deferred = Some(deferred_ffn);
             return Ok(());
@@ -4602,7 +4010,7 @@ impl<'a> Hy4Engine<'a> {
                     || {
                         r.device.run(|| {
                             r.finish_deferred_ffn_local(
-                                rank, gpus, false, deferred_ffn, wave_slot, rows, use_a, skip_routed, recv_ptr, routed_off,
+                                rank, gpus, deferred_ffn, wave_slot, rows, use_a, skip_routed, recv_ptr, routed_off,
                             )
                         })
                     },
@@ -4625,7 +4033,7 @@ impl<'a> Hy4Engine<'a> {
             } else {
                 r.device.run(|| {
                     r.finish_deferred_ffn_local(
-                        rank, gpus, false, deferred_ffn, wave_slot, rows, use_a, skip_routed, recv_ptr, routed_off,
+                        rank, gpus, deferred_ffn, wave_slot, rows, use_a, skip_routed, recv_ptr, routed_off,
                     )
                 })?;
             }
@@ -4636,16 +4044,16 @@ impl<'a> Hy4Engine<'a> {
             let dump_rows = batch.dump_rows;
             let w0 = &self.ranks[0].waves[wave_slot];
             let r_cur = if batch.use_a { w0.r_a.buffer } else { w0.r_b.buffer };
-            self.dump_bf16(0, &format!("l{layer:02}_out"), r_cur, dump_rows * HC * H)?;
+            self.dump_bf16(&format!("l{layer:02}_out"), r_cur, dump_rows * HC * H)?;
             if layer <= 3 {
                 let s0 = &self.ranks[0].shared;
                 let w0 = &self.ranks[0].waves[wave_slot];
-                self.dump_bf16(0, &format!("l{layer:02}_ffn_y"), w0.y.buffer, dump_rows * H)?;
-                self.dump_bf16(0, &format!("l{layer:02}_ffn_delta"), s0.delta.buffer, dump_rows * H)?;
-                self.dump_bf16(0, &format!("l{layer:02}_ffn_delta_norm"), s0.delta_norm.buffer, dump_rows * H)?;
+                self.dump_bf16(&format!("l{layer:02}_ffn_y"), w0.y.buffer, dump_rows * H)?;
+                self.dump_bf16(&format!("l{layer:02}_ffn_delta"), s0.delta.buffer, dump_rows * H)?;
+                self.dump_bf16(&format!("l{layer:02}_ffn_delta_norm"), s0.delta_norm.buffer, dump_rows * H)?;
                 if !is_dense {
-                    self.dump_bf16(0, &format!("l{layer:02}_ffn_routed_latent"), s0.routed_latent.buffer, dump_rows * LATENT_H)?;
-                    self.dump_bf16(0, &format!("l{layer:02}_ffn_shared_out"), w0.shared_out.buffer, dump_rows * H)?;
+                    self.dump_bf16(&format!("l{layer:02}_ffn_routed_latent"), s0.routed_latent.buffer, dump_rows * LATENT_H)?;
+                    self.dump_bf16(&format!("l{layer:02}_ffn_shared_out"), w0.shared_out.buffer, dump_rows * H)?;
                 }
             }
         }
@@ -4671,61 +4079,6 @@ impl<'a> Hy4Engine<'a> {
         let usage = self.expert_usage.as_ref();
         let count_usage = self.count_expert_usage;
         let usage_phase = batch.usage_phase;
-        if self.layers_split {
-            let owner = self.layer_owner(layer);
-            let peer = 1 - owner;
-            if self.cfg.dense_layer[layer] {
-                let r = &self.ranks[owner];
-                if batch.graphed {
-                    r.graphs.run(
-                        GraphKey { layer, rows, section: GraphSection::FfnFrontend },
-                        &r.stream,
-                        || {
-                            r.device.run(|| {
-                                if deferred {
-                                    r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
-                                }
-                                r.dense_ffn(&p, 1, wave_slot, rows)
-                            })
-                        },
-                    )?;
-                } else {
-                    r.device.run(|| {
-                        if deferred {
-                            r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
-                        }
-                        r.dense_ffn(&p, 1, wave_slot, rows)
-                    })?;
-                }
-                if deferred {
-                    batch.post_attn_deferred = false;
-                    batch.use_a = !batch.use_a;
-                }
-                batch.reduce_attn_pending = false;
-                return self.finish_ffn_combine_and_post(layer, batch, false);
-            }
-            self.run_moe_frontend(layer, batch, true)?;
-            Self::wait_order_event(self.tp2_routes_consumed[peer].as_ref(), &self.ranks[owner].stream)?;
-            if peer == 0 {
-                Self::wait_order_event(self.r0_spark_staged.as_ref(), &self.ranks[owner].stream)?;
-            }
-            self.peer_push_routes_and_wire(owner, peer, rows)?;
-            for rank in [owner, peer] {
-                let r = &self.ranks[rank];
-                if batch.graphed {
-                    r.graphs.run(
-                        GraphKey { layer, rows, section: GraphSection::Tp2Expert },
-                        &r.stream,
-                        || r.device.run(|| r.local_exl3(layer, gpus, rows, skip_routed)),
-                    )?;
-                } else {
-                    r.device.run(|| r.local_exl3(layer, gpus, rows, skip_routed))?;
-                }
-            }
-            Self::record_order_event(self.tp2_routes_consumed[peer].as_ref(), &self.ranks[peer].stream)?;
-            Self::record_order_event(self.r0_spark_staged.as_ref(), &self.ranks[0].stream)?;
-            return self.finish_ffn_combine_and_post(layer, batch, true);
-        }
         let attn_recv = if reduce_attn {
             let ex = self.peer_exchange()?;
             [ex.recv(0, PEER_SLOT_ATTN)?, ex.recv(1, PEER_SLOT_ATTN)?]
@@ -4821,28 +4174,22 @@ impl<'a> Hy4Engine<'a> {
     /// vocabulary head into `r0.shared.head_logits_f32 [count, vocab]` with zero host hop.
     fn project_head_tile(&self, wave_slot: usize, y_row_off: usize, count: usize) -> Result<DeviceLogits> {
         ensure!(count > 0 && count <= 64, "Hy4 head tile count {count} outside 1..=64");
-        let r_head = &self.ranks[self.head_rank];
-        let input = slice_buf(r_head.waves[wave_slot].y.buffer, y_row_off * H * 2, count * H * 2)?;
+        let r0 = &self.ranks[0];
+        let input = slice_buf(r0.waves[wave_slot].y.buffer, y_row_off * H * 2, count * H * 2)?;
         self.project_vocab_tile(wave_slot, input, count)
     }
 
     fn project_vocab_tile(&self, wave_slot: usize, x0_buf: CuteafdDeviceBuffer, count: usize) -> Result<DeviceLogits> {
         let vocab = self.cfg.vocab_size;
-        let r_head = &self.ranks[self.head_rank];
-        let head_out = r_head
-            .shared
-            .head_logits_f32
-            .as_ref()
-            .with_context(|| format!("rank {} missing head_logits_f32", self.head_rank))?
-            .buffer;
-        if self.ranks.len() == 1 || self.layers_split {
+        let r0 = &self.ranks[0];
+        let head_out = r0.shared.head_logits_f32.as_ref().context("rank 0 missing head_logits_f32")?.buffer;
+        if self.ranks.len() == 1 {
             let out_buf = CuteafdDeviceBuffer {
                 bytes: count * vocab * 4,
                 ..head_out
             };
-            r_head.device.run(|| launch_rank_lm_head(r_head, count, x0_buf, out_buf))?;
+            r0.device.run(|| launch_rank_lm_head(r0, count, x0_buf, out_buf))?;
         } else {
-            let r0 = &self.ranks[0];
             let r1 = &self.ranks[1];
             let w1 = &r1.waves[wave_slot];
             let handoff = self.head_handoff.as_ref().context("TP2 head handoff missing")?;
@@ -4893,7 +4240,7 @@ impl<'a> Hy4Engine<'a> {
             rows: count,
             vocab,
             stride: vocab,
-            stream: r_head.stream.raw,
+            stream: r0.stream.raw,
             greedy: None,
         })
     }
@@ -4926,65 +4273,54 @@ impl<'a> Hy4Engine<'a> {
     ) -> Result<()> {
         let wave_slot = batch.wave_slot;
         let gpus = self.ranks.len();
-        let head_rank = self.head_rank;
-        let r_head = &self.ranks[head_rank];
-        let w_head = &r_head.waves[wave_slot];
+        let r0 = &self.ranks[0];
+        let w0 = &r0.waves[wave_slot];
 
         // On TP2 graphed decode with full-batch Suffix(0), fuse the final layer's deferred FFN finish
-        // with terminal `hc_head` into one head-rank `Tail` graph.
+        // with terminal `hc_head` into one rank-0 `Tail` graph.
         if let Some(prev) = batch.prev_ffn_deferred.take() {
             let prev_use_a = batch.use_a;
             batch.use_a = !batch.use_a;
+            let ffn_recv0 = if gpus == 2 {
+                self.peer_exchange()?.recv(0, PEER_SLOT_FFN)?
+            } else {
+                std::ptr::null_mut()
+            };
             let skip_routed = self.skip_routed_experts;
             let routed_off = self.ffn_routed_recv_offset;
-            if batch.graphed
-                && gpus == 2
-                && mode == HeadMode::Suffix(0)
-                && batch.rows > 0
-                && (!self.layers_split || prev.owner == head_rank)
-            {
-                let ffn_recv_head = if !self.layers_split || (!prev.is_dense && prev.reduce_routed_tp2) {
-                    self.peer_exchange()?.recv(head_rank, PEER_SLOT_FFN)?
-                } else {
-                    std::ptr::null_mut()
-                };
+            if batch.graphed && gpus == 2 && mode == HeadMode::Suffix(0) && batch.rows > 0 {
                 let rows = batch.rows;
-                let r_cur = if batch.use_a { w_head.r_a.buffer } else { w_head.r_b.buffer };
-                let layers_split = self.layers_split;
-                r_head.graphs.run(
+                let r_cur = if batch.use_a { w0.r_a.buffer } else { w0.r_b.buffer };
+                r0.graphs.run(
                     GraphKey { layer: prev.layer, rows, section: GraphSection::Tail },
-                    &r_head.stream,
+                    &r0.stream,
                     || {
-                        r_head.device.run(|| {
-                            r_head.finish_deferred_ffn_local(
-                                head_rank, gpus, layers_split, prev, wave_slot, rows, prev_use_a,
-                                skip_routed, ffn_recv_head, routed_off,
+                        r0.device.run(|| {
+                            r0.finish_deferred_ffn_local(
+                                0, gpus, prev, wave_slot, rows, prev_use_a, skip_routed, ffn_recv0, routed_off,
                             )?;
                             // SAFETY: arena weights and scratch live through stream drain.
                             unsafe {
-                                r_head.programs.hc_head.launch(
+                                r0.programs.hc_head.launch(
                                     &[
                                         r_cur.ptr,
-                                        r_head.weights.buf("model.hc_head.hc_head_fn")?.ptr,
-                                        r_head.weights.buf("model.hc_head.hc_head_scale")?.ptr,
-                                        r_head.weights.buf("model.hc_head.hc_head_base")?.ptr,
-                                        r_head.weights.buf("model.norm.weight")?.ptr,
-                                        r_head.shared.delta_norm.buffer.ptr,
-                                        w_head.y.buffer.ptr,
+                                        r0.weights.buf("model.hc_head.hc_head_fn")?.ptr,
+                                        r0.weights.buf("model.hc_head.hc_head_scale")?.ptr,
+                                        r0.weights.buf("model.hc_head.hc_head_base")?.ptr,
+                                        r0.weights.buf("model.norm.weight")?.ptr,
+                                        r0.shared.delta_norm.buffer.ptr,
+                                        w0.y.buffer.ptr,
                                     ],
                                     &[Scalar::I32(rows as i32)],
-                                    r_head.stream.raw,
+                                    r0.stream.raw,
                                 )
                             }
                         })
                     },
                 )?;
-                if self.layers_split && prev.owner == 1 {
-                    Self::record_order_event(self.r1_routed_consumed.as_ref(), &r_head.stream)?;
-                }
                 self.capture_draft_hidden(batch, 0, false)?;
                 if batch.dump_rows > 0 {
-                    self.dump_bf16(head_rank, "hc_head_y", w_head.y.buffer, batch.dump_rows * H)?;
+                    self.dump_bf16("hc_head_y", w0.y.buffer, batch.dump_rows * H)?;
                 }
                 for tile_off in (0..rows).step_by(64) {
                     let count = (rows - tile_off).min(64);
@@ -4993,45 +4329,26 @@ impl<'a> Hy4Engine<'a> {
                 }
                 return Ok(());
             }
-            if self.layers_split {
-                let r_prev = &self.ranks[prev.owner];
-                let ffn_recv = if !prev.is_dense && prev.reduce_routed_tp2 {
-                    self.peer_exchange()?.recv(prev.owner, PEER_SLOT_FFN)?
-                } else {
-                    std::ptr::null_mut()
-                };
-                r_prev.device.run(|| {
-                    r_prev.finish_deferred_ffn_local(
-                        prev.owner, gpus, true, prev, wave_slot, batch.rows, prev_use_a,
-                        skip_routed, ffn_recv, routed_off,
+            let ffn_recv = if gpus == 2 {
+                let ex = self.peer_exchange()?;
+                [ex.recv(0, PEER_SLOT_FFN)?, ex.recv(1, PEER_SLOT_FFN)?]
+            } else {
+                [std::ptr::null_mut(); 2]
+            };
+            let rank0_only = batch.rank0_only_tail && prev.layer == batch.final_layer;
+            for (rank, r) in self.ranks.iter().enumerate() {
+                if rank0_only && rank == 1 {
+                    continue;
+                }
+                r.device.run(|| {
+                    r.finish_deferred_ffn_local(
+                        rank, gpus, prev, wave_slot, batch.rows, prev_use_a, skip_routed, ffn_recv[rank], routed_off,
                     )
                 })?;
-                if prev.owner == 1 {
-                    Self::record_order_event(self.r1_routed_consumed.as_ref(), &r_prev.stream)?;
-                }
-            } else {
-                let ffn_recv = if gpus == 2 {
-                    let ex = self.peer_exchange()?;
-                    [ex.recv(0, PEER_SLOT_FFN)?, ex.recv(1, PEER_SLOT_FFN)?]
-                } else {
-                    [std::ptr::null_mut(); 2]
-                };
-                let rank0_only = batch.rank0_only_tail && prev.layer == batch.final_layer;
-                for (rank, r) in self.ranks.iter().enumerate() {
-                    if rank0_only && rank == 1 {
-                        continue;
-                    }
-                    r.device.run(|| {
-                        r.finish_deferred_ffn_local(
-                            rank, gpus, false, prev, wave_slot, batch.rows, prev_use_a,
-                            skip_routed, ffn_recv[rank], routed_off,
-                        )
-                    })?;
-                }
             }
         }
 
-        let r_cur = if batch.use_a { w_head.r_a.buffer } else { w_head.r_b.buffer };
+        let r_cur = if batch.use_a { w0.r_a.buffer } else { w0.r_b.buffer };
         match mode {
             HeadMode::None => Ok(()),
             HeadMode::LastPerSeq => {
@@ -5042,7 +4359,7 @@ impl<'a> Hy4Engine<'a> {
                     r_cur.ptr.cast::<u8>().wrapping_add(last * HC * H * 2).cast()
                 } else {
                     let row_bytes = HC * H * 2;
-                    r_head.device.run(|| {
+                    r0.device.run(|| {
                         for (idx, m) in batch.members.iter().enumerate() {
                             let last = m.row_start + m.row_len - 1;
                             let src = CuteafdDeviceBuffer {
@@ -5051,30 +4368,30 @@ impl<'a> Hy4Engine<'a> {
                                 ..r_cur
                             };
                             let dst = CuteafdDeviceBuffer {
-                                ptr: r_head.shared.r_head_in.buffer.ptr.cast::<u8>().wrapping_add(idx * row_bytes).cast(),
+                                ptr: r0.shared.r_head_in.buffer.ptr.cast::<u8>().wrapping_add(idx * row_bytes).cast(),
                                 bytes: row_bytes,
-                                ..r_head.shared.r_head_in.buffer
+                                ..r0.shared.r_head_in.buffer
                             };
-                            // SAFETY: r_cur and r_head_in are disjoint admitted buffers on head rank.
-                            unsafe { r_head.device.library.copy_d2d_async(dst, src, row_bytes, r_head.stream.raw)?; }
+                            // SAFETY: r_cur and r_head_in are disjoint admitted buffers on rank 0.
+                            unsafe { r0.device.library.copy_d2d_async(dst, src, row_bytes, r0.stream.raw)?; }
                         }
                         Ok(())
                     })?;
-                    r_head.shared.r_head_in.buffer.ptr
+                    r0.shared.r_head_in.buffer.ptr
                 };
-                r_head.device.run(|| unsafe {
-                    r_head.programs.hc_head.launch(
+                r0.device.run(|| unsafe {
+                    r0.programs.hc_head.launch(
                         &[
                             hc_src_ptr,
-                            r_head.weights.buf("model.hc_head.hc_head_fn")?.ptr,
-                            r_head.weights.buf("model.hc_head.hc_head_scale")?.ptr,
-                            r_head.weights.buf("model.hc_head.hc_head_base")?.ptr,
-                            r_head.weights.buf("model.norm.weight")?.ptr,
-                            r_head.shared.delta_norm.buffer.ptr,
-                            w_head.y.buffer.ptr,
+                            r0.weights.buf("model.hc_head.hc_head_fn")?.ptr,
+                            r0.weights.buf("model.hc_head.hc_head_scale")?.ptr,
+                            r0.weights.buf("model.hc_head.hc_head_base")?.ptr,
+                            r0.weights.buf("model.norm.weight")?.ptr,
+                            r0.shared.delta_norm.buffer.ptr,
+                            w0.y.buffer.ptr,
                         ],
                         &[Scalar::I32(count as i32)],
-                        r_head.stream.raw,
+                        r0.stream.raw,
                     )
                 })?;
                 self.capture_draft_hidden(batch, 0, true)?;
@@ -5088,24 +4405,24 @@ impl<'a> Hy4Engine<'a> {
                     return Ok(());
                 }
                 let hc_src_ptr = r_cur.ptr.cast::<u8>().wrapping_add(first_row * HC * H * 2).cast();
-                r_head.device.run(|| unsafe {
-                    r_head.programs.hc_head.launch(
+                r0.device.run(|| unsafe {
+                    r0.programs.hc_head.launch(
                         &[
                             hc_src_ptr,
-                            r_head.weights.buf("model.hc_head.hc_head_fn")?.ptr,
-                            r_head.weights.buf("model.hc_head.hc_head_scale")?.ptr,
-                            r_head.weights.buf("model.hc_head.hc_head_base")?.ptr,
-                            r_head.weights.buf("model.norm.weight")?.ptr,
-                            r_head.shared.delta_norm.buffer.ptr,
-                            w_head.y.buffer.ptr,
+                            r0.weights.buf("model.hc_head.hc_head_fn")?.ptr,
+                            r0.weights.buf("model.hc_head.hc_head_scale")?.ptr,
+                            r0.weights.buf("model.hc_head.hc_head_base")?.ptr,
+                            r0.weights.buf("model.norm.weight")?.ptr,
+                            r0.shared.delta_norm.buffer.ptr,
+                            w0.y.buffer.ptr,
                         ],
                         &[Scalar::I32(total as i32)],
-                        r_head.stream.raw,
+                        r0.stream.raw,
                     )
                 })?;
                 self.capture_draft_hidden(batch, first_row, false)?;
                 if batch.dump_rows > 0 && first_row == 0 {
-                    self.dump_bf16(head_rank, "hc_head_y", w_head.y.buffer, batch.dump_rows * H)?;
+                    self.dump_bf16("hc_head_y", w0.y.buffer, batch.dump_rows * H)?;
                 }
                 for tile_off in (0..total).step_by(64) {
                     let count = (total - tile_off).min(64);
@@ -5222,22 +4539,14 @@ impl<'a> Hy4Engine<'a> {
                         .and_then(Option::as_mut)
                         .context("Hy4 send_experts without active unit")?;
                     self.engine.run_moe_frontend(layer, batch, false)?;
-                    let rows = batch.rows;
-                    if self.engine.layers_split {
-                        if self.engine.layer_owner(layer) == 1 {
-                            Hy4Engine::wait_order_event(
-                                self.engine.r0_spark_staged.as_ref(),
-                                &self.engine.ranks[1].stream,
-                            )?;
-                            self.engine.peer_push_routes_and_wire(1, 0, rows)?;
-                        }
-                    } else if self.engine.ranks.len() == 2 && self.engine.prefill_waves > 1 {
+                    if self.engine.ranks.len() == 2 && self.engine.prefill_waves > 1 {
                         // Protect rank 1's PEER_SLOT_ATTN read before another wave starts attention(layer).
                         let exchange = self.engine.peer_exchange()?;
                         exchange.signal(1, DIRECT)?;
                         exchange.wait(0, DIRECT)?;
                     }
                     let waves = self.waves.as_mut().context("Hy4 Spark route without active SparkLink")?;
+                    let rows = batch.rows;
                     let identity = self.engine.next_identity;
                     self.engine.next_identity = identity.checked_add(1).context("Hy4 Spark identity exhausted")?;
                     let version = self.engine.placement_version;
@@ -5290,12 +4599,6 @@ impl<'a> Hy4Engine<'a> {
                             )
                         }
                     })?;
-                    if self.engine.layers_split {
-                        Hy4Engine::record_order_event(
-                            self.engine.r0_spark_staged.as_ref(),
-                            &self.engine.ranks[0].stream,
-                        )?;
-                    }
                     // Waves::send copies route_ids, route_weights and wire_in to slot-owned staging
                     // in stream order, then publishes staged. The shared FFN reads wave.y and writes
                     // ffn_gate/up/act, native projection scratch and wave.shared_out/shared_f32 only.
@@ -5330,21 +4633,6 @@ impl<'a> Hy4Engine<'a> {
                             )
                         }
                     })?;
-                    if self.engine.layers_split && self.engine.layer_owner(layer) == 1 {
-                        Hy4Engine::wait_order_event(
-                            self.engine.r1_routed_consumed.as_ref(),
-                            &self.engine.ranks[0].stream,
-                        )?;
-                        let ex = self.engine.peer_exchange()?;
-                        ex.push_to(
-                            0,
-                            DIRECT,
-                            self.engine.ranks[0].shared.routed_latent.buffer.ptr,
-                            self.engine.ranks[1].shared.routed_latent.buffer.ptr,
-                            rows * LATENT_H * 2,
-                        )?;
-                        ex.wait(1, DIRECT)?;
-                    }
                     self.engine.finish_ffn_combine_and_post(layer, batch, false)
                 }
                 fn end_unit(&mut self, unit: &Unit) -> Result<()> {

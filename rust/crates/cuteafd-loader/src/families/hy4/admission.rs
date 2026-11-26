@@ -389,9 +389,15 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         )
     })?;
 
-    let layers_split = gpus == 2 && modes.iter().all(|m| matches!(m, LayerMode::Whole { .. }));
-    let layer_tp = if layers_split { 1 } else { gpus };
-    let links = hy4::spark_link(0, ranks, link_shape, request.replies).map_err(|error| {
+    let head_gpu = if modes
+        .iter()
+        .all(|m| matches!(m, LayerMode::HeadSplit | LayerMode::ContextSplit))
+    {
+        0u8
+    } else {
+        (gpus - 1) as u8
+    };
+    let links = hy4::spark_link(head_gpu, ranks, link_shape, request.replies).map_err(|error| {
         refused(
             format!("Hy4 Spark transport refused: {error}"),
             "Use supported Spark rank count and prefill shape.",
@@ -439,7 +445,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
 
     let index_topk = IndexTopkScratch::resolve(
         request.manifest_path,
-        layer_tp,
+        gpus,
         context_split,
         usize::try_from(context.maximum)
             .map_err(|_| refused("Hy4 context overflow", "Use a supported context length."))?,

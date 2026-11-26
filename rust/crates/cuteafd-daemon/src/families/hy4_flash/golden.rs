@@ -47,8 +47,8 @@ pub(crate) struct GoldenArgs {
     /// Optional second CUDA device for 2x RTX TP2 coordinator execution.
     #[arg(long)]
     pub(crate) split_device: Option<i32>,
-    /// Attention placement on 2 GPUs (`auto` -> `context`, or explicit `heads` / `layers` / `context`).
-    #[arg(long, default_value = "auto", value_parser = ["auto", "heads", "layers", "context"])]
+    /// Attention placement on 2 GPUs (`auto` -> `context`, or explicit `heads` / `context`).
+    #[arg(long, default_value = "auto", value_parser = ["auto", "heads", "context"])]
     pub(crate) attention_placement: String,
     /// Spark worker peer endpoints (`host:port,...`) for routed experts.
     #[arg(long, value_delimiter = ',')]
@@ -128,11 +128,10 @@ fn check_headers_only(args: &GoldenArgs) -> Result<()> {
     let cfg = Hy4FlashConfig::read(&args.snapshot)?;
     let model = hy4_plan::Model::open(&checkpoint)?;
     let gpus = if args.split_device.is_some() { 2 } else { 1 };
-    let (_, attention) = super::serve::resolve_attention_placement(gpus, args.attention_placement.as_str())?;
     let modes = cuteafd_loader::placement::families::hy4_flash::layer_modes(
         &cfg,
         gpus,
-        attention,
+        cuteafd_loader::placement::AttentionPlacement::Heads,
     );
     let arenas = cuteafd_loader::families::hy4_flash::weight_layout::target_arenas(
         &checkpoint,
@@ -329,10 +328,6 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         );
     }
     let (_, attention) = super::serve::resolve_attention_placement(devices.len(), args.attention_placement.as_str())?;
-    ensure!(
-        !(args.resume_dfly2 && attention == cuteafd_loader::placement::AttentionPlacement::Layers),
-        "hy4f-golden --resume-dfly2 is not supported with --attention-placement layers"
-    );
     let context_split = attention == cuteafd_loader::placement::AttentionPlacement::Context;
     let local_pages = if context_split { max_pages.div_ceil(2).max(16) } else { max_pages };
     let draft_tp = if args.resume_dfly2 && args.tp2_dflash { 2 } else { 1 };

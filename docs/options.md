@@ -368,9 +368,8 @@ FP8). `KV_CACHE=fp8|bf16` defaults to `fp8` for absorbed MLA KV and keeps the
 FP8 indexer key cache default. `ATTENTION_PLACEMENT=auto` selects whole layers
 on one RTX GPU and `context` (ContextSplit, parity-owned DSA KV/index pages with
 no DSA KV replication and head-split SWA-512) on two RTX GPUs; explicit
-`ATTENTION_PLACEMENT=heads` opts into replicated-KV head-split, and explicit
-`ATTENTION_PLACEMENT=layers` selects contiguous whole-layer halves (21/21, one
-boundary hop, zero KV replication, with `SPECULATOR=off`). `EMBEDDING=gpu` is required
+`ATTENTION_PLACEMENT=heads` opts into replicated-KV head-split (`layers`
+refuses in `serve-hy4f`). `EMBEDDING=gpu` is required
 (`host` refuses). `VISION=auto` (default) serves the checkpoint's bundled
 27-layer ViT (`vit.*`, 0.87 GiB packed BF16 arena plus admitted scratch) from
 the jointly admitted owner: an RTX GPU, or `spark[:rank]` replicas when every
@@ -1192,7 +1191,7 @@ family's planner and runtime policy):
 | `auto` (default) | ✓ layers¹ | ✓ context | ✓ context | ✓ context | ✓ heads | ✓ layers | ✓ layers² | ✓ context⁴ | ✓ layers | ✓ heads | ✓ heads | ✓ heads | ✓ context⁵ | ✓ heads |
 | `heads` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✗ | ✓⁴ | ✓ | ✓ | ✓ | ✓ | ✓⁵ | ✓ |
 | `context` | ✗ | ✓ | ✓ | ✓ | ✗ | ✗ | ✗ | ✓⁴ | ✗ | ✗ | ✗ | ✗ | ✓⁵ | ✗ |
-| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✓ (two RTX) | ✓ | ✗ | ✗ | ✗ | ✗ | ✓ (explicit; auto stays context)⁵ | ✓ (two RTX) |
+| `layers` | ✗ | ✗ | ✓ (explicit; auto stays context)³ | ✓ (explicit; auto stays context) | ✗ | ✓ | ✓ (two RTX) | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ (two RTX) |
 
 `✓` means the launch path accepts the value; `✗` means it stops with the
 family's attention-placement error.
@@ -1212,9 +1211,7 @@ on two GPUs and retains whole-owned layers on one. KDA stays head-split on
 two GPUs, independent of the MLA placement. ⁵ Hy4-flash `auto` selects
 `context` (ContextSplit, parity-owned KV/index) for MLA/DSA layers and
 head-split for SWA-512 layers on two GPUs, and retains whole-owned layers on
-one; explicit `heads` opts into replicated-KV head-split across all layers, and
-explicit `layers` places contiguous whole-layer halves (21/21, zero KV
-replication, with `SPECULATOR=off`).
+one; explicit `heads` opts into replicated-KV head-split across all layers.
 
 Token embedding placement (`EMBEDDING`; `cuteafd plan --embedding-placement`):
 

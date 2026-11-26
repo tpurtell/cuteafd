@@ -166,9 +166,8 @@ pub(super) fn resolve_attention_placement(gpus: usize, setting: &str) -> Result<
         ),
         (2, "auto" | "context") => Ok(("context", AttentionPlacement::Context)),
         (2, "heads") => Ok(("heads", AttentionPlacement::Heads)),
-        (2, "layers") => Ok(("layers", AttentionPlacement::Layers)),
         (2, other) => anyhow::bail!(
-            "Hy4-flash 2-GPU serving does not support ATTENTION_PLACEMENT={other}; use auto/context (ContextSplit default), layers, or explicit heads"
+            "Hy4-flash 2-GPU serving does not support ATTENTION_PLACEMENT={other}; use auto/context (ContextSplit default) or explicit heads"
         ),
         _ => anyhow::bail!("Hy4-flash supports 1 or 2 coordinator GPUs, got {gpus}"),
     }
@@ -311,7 +310,6 @@ fn reconcile_runtime_inventory(
             || id.starts_with("hy4_flash.head.")
             || id.starts_with("hy4_flash.target.")
             || id.starts_with("hy4_flash.peer.")
-            || id.starts_with("hy4_flash.hops.")
             || id.starts_with("hy4_flash.context_exchange.")
             || id.starts_with("expert-usage.gpu")
             || (id.starts_with("hy4_flash/dfly2/") && !id.starts_with("hy4_flash/dfly2/gpu"))
@@ -412,19 +410,11 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         resolve_attention_placement(gpus, args.attention_placement.as_str())?;
     // Resolve after the early decode-width and attention checks, but before admission.
     if args.dfly2.is_none() && args.peers.is_empty() {
-        if attention_placement == AttentionPlacement::Layers {
-            args.dfly2 = Some(false);
-        } else {
-            let view = args.attention.selected_view.clone().map(Ok)
-                .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
-            args.dfly2 = Some(cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(&view.config()?));
-            args.attention.selected_view = Some(view);
-        }
+        let view = args.attention.selected_view.clone().map(Ok)
+            .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+        args.dfly2 = Some(cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(&view.config()?));
+        args.attention.selected_view = Some(view);
     }
-    ensure!(
-        !(args.dfly2 == Some(true) && attention_placement == AttentionPlacement::Layers),
-        "Hy4-flash DFly2 speculative decoding is not supported with ATTENTION_PLACEMENT=layers; use ATTENTION_PLACEMENT=context or SPECULATOR=off"
-    );
     if !args.tp2_dflash_explicit {
         args.tp2_dflash = args.dfly2 == Some(true) && gpus == 2;
     }
@@ -528,11 +518,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             // Load coordinator AOT programs inside the pre-weight sample window so their
             // module bytes are measured once and never double-charged.
             let context_split = attention_placement == AttentionPlacement::Context;
-            let layers_split = gpus == 2 && attention_placement == AttentionPlacement::Layers;
-            let program_tp = if layers_split { 1 } else { gpus };
             let mut preloaded_programs: Vec<Hy4Programs<'_>> = Vec::with_capacity(gpus);
             let pre = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| {
-                preloaded_programs.push(Hy4Programs::load(&programs, program_tp, worker_args.kv_format, context_split)?);
+                preloaded_programs.push(Hy4Programs::load(&programs, gpus, worker_args.kv_format, context_split)?);
                 Ok(())
             })?;
 
@@ -865,8 +853,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 media.encoder,
                 worker_args.max_sequences,
             );
-            let head_device = if layers_split { device_ids[1] } else { device_ids[0] };
-            library.cuda_set_device(head_device)?;
+            library.cuda_set_device(worker_args.device)?;
             scheduler::schedule(
                 &backend,
                 &worker_args.snapshot,
@@ -1081,8 +1068,7 @@ mod tests {
         assert_eq!(super::resolve_attention_placement(2, "auto")?, ("context", AttentionPlacement::Context));
         assert_eq!(super::resolve_attention_placement(2, "context")?, ("context", AttentionPlacement::Context));
         assert_eq!(super::resolve_attention_placement(2, "heads")?, ("heads", AttentionPlacement::Heads));
-        assert_eq!(super::resolve_attention_placement(2, "layers")?, ("layers", AttentionPlacement::Layers));
-        assert!(super::resolve_attention_placement(1, "layers").is_err());
+        assert!(super::resolve_attention_placement(2, "layers").is_err());
         Ok(())
     }
 
@@ -1395,106 +1381,6 @@ mod tests {
         assert!(r_ctx.iter().any(|r| r.allocation.id == "hy4_flash.context_exchange.0"));
         assert!(r_ctx.iter().any(|r| r.allocation.id == "hy4_flash.context_exchange.1"));
         super::reconcile_runtime_inventory(&admitted_ctx.solved, &inputs_ctx, &w_ctx, &r_ctx)?;
-
-        // 2-GPU layers placement reconciliation: 21/21 whole-layer halves, single boundary hop,
-        // hy4_flash.hops.* transport owners, expert-usage on both GPUs, head on GPU 1, zero KV replication.
-        let modes_layers = hy4_place::layer_modes(&inputs_ctx.cfg, 2, AttentionPlacement::Layers);
-        let mut facts_layers = PoolFacts::new(context, None, 64);
-        facts_layers.memory = vec![
-            PoolMemory { available_bytes: 96u64 << 30, bytes_per_unit: 6 * 64 * 1024 },
-            PoolMemory { available_bytes: 96u64 << 30, bytes_per_unit: 6 * 64 * 1024 },
-        ];
-        let pool_layers = cuteafd_loader::placement::prepare_pool(facts_layers)?;
-        let targets_layers = vec![
-            CoordinatorWeights {
-                rank: 0,
-                layers: (0..21).collect(),
-                arena: WeightArenaLayout::new(
-                    "hy4_flash/target/gpu0",
-                    vec![("model.embed_tokens.weight".to_string(), 120_832 * 3072 * 2)],
-                )?,
-                core: BTreeMap::new(),
-                fp8: BTreeMap::new(),
-            },
-            CoordinatorWeights {
-                rank: 1,
-                layers: (21..42).collect(),
-                arena: WeightArenaLayout::new(
-                    "hy4_flash/target/gpu1",
-                    vec![("lm_head.weight".to_string(), 120_832 * 3072 * 2)],
-                )?,
-                core: BTreeMap::new(),
-                fp8: BTreeMap::new(),
-            },
-        ];
-        let inputs_layers = Hy4Inputs {
-            pool: pool_layers,
-            targets: targets_layers,
-            placement: AttentionPlacement::Layers,
-            modes: modes_layers,
-            expert_usage: Some(cuteafd_core::expert_usage::Geometry {
-                layers: inputs_ctx.cfg.layers,
-                experts: inputs_ctx.cfg.experts,
-                topk: inputs_ctx.cfg.topk,
-                routed_layers: inputs_ctx.routed.clone(),
-            }),
-            ..inputs_ctx
-        };
-        let req_layers = hy4_place::request(
-            inputs_layers.context,
-            None,
-            Onboard::Layers(0),
-            prefill,
-            Operation::Serving,
-            None,
-            replies,
-        );
-        let admitted_layers = inputs_layers.admit(req_layers)?;
-        assert_eq!(admitted_layers.placement.attention_placement, AttentionPlacement::Layers);
-        assert_eq!(admitted_layers.placement.hops.len(), 1);
-        let contract_layers = inputs_layers.prepare(&admitted_layers.solved.request)?;
-        let pages_layers = admitted_layers.solved.pool_tokens.div_ceil(admitted_layers.solved.pool_page_rows);
-        let mut w_layers = Vec::new();
-        let mut r_layers = Vec::new();
-        for alloc in admitted_layers.solved.facts.allocations.iter().filter(|a| a.view.is_none()) {
-            if alloc.id.starts_with("hy4_flash/target/gpu") {
-                w_layers.push(Receipt { allocation: alloc.clone(), address: addr });
-                addr += 0x1000;
-            } else if alloc.id.starts_with("hy4_flash.cache.")
-                || alloc.id.starts_with("hy4_flash.scratch.")
-                || alloc.id.starts_with("hy4_flash.wave.")
-                || alloc.id.starts_with("hy4_flash.head.")
-                || alloc.id.starts_with("hy4_flash.target.")
-                || alloc.id.starts_with("hy4_flash.peer.")
-                || alloc.id.starts_with("hy4_flash.hops.")
-                || alloc.id.starts_with("hy4_flash.context_exchange.")
-                || alloc.id.starts_with("expert-usage.gpu")
-            {
-                let curve = contract_layers
-                    .components
-                    .iter()
-                    .find_map(|c| match &c.kind {
-                        ComponentKind::Allocation { template, .. } if template.id == alloc.id => Some(&c.bytes),
-                        _ => None,
-                    })
-                    .expect("contract curve");
-                let piece = curve.0.iter().find(|p| (p.first..=p.last).contains(&pages_layers)).unwrap();
-                let payload = piece.bytes_at_first + piece.bytes_per_page * (pages_layers - piece.first);
-                let mut rec = alloc.clone();
-                rec.bytes = payload;
-                if rec.id.starts_with("hy4_flash.cache.") || rec.id.starts_with("hy4_flash.head.") {
-                    rec.id = format!("retained.{}", rec.id);
-                }
-                r_layers.push(Receipt { allocation: rec, address: addr });
-                addr += 0x1000;
-            }
-        }
-        assert!(r_layers.iter().any(|r| r.allocation.id.starts_with("hy4_flash.hops.")));
-        assert!(r_layers.iter().any(|r| r.allocation.id.starts_with("expert-usage.gpu0.")));
-        assert!(r_layers.iter().any(|r| r.allocation.id.starts_with("expert-usage.gpu1.")));
-        assert!(r_layers.iter().any(|r| r.allocation.id == "retained.hy4_flash.head.1.workspace"));
-        assert!(!r_layers.iter().any(|r| r.allocation.id == "retained.hy4_flash.head.0.workspace"));
-        super::reconcile_runtime_inventory(&admitted_layers.solved, &inputs_layers, &w_layers, &r_layers)?;
         Ok(())
     }
 
