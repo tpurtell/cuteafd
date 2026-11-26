@@ -6,6 +6,7 @@ pub mod config;
 pub mod draft;
 pub mod execution;
 pub mod graph_reserve;
+pub mod vision;
 pub mod weight_layout;
 
 pub use super::hy4_common::{Hy4DflyConfig, Hy4ExpertStorage, Hy4KvCache, Hy4VisionConfig};

@@ -168,6 +168,9 @@ pub enum ImageFamily {
     /// Hy4-flash: SGLang smart_resize (32-pixel cells, 4096..4194304 px),
     /// bicubic, mean/std 0.5, no temporal axis, a newline row per merged row.
     Hy4Flash,
+    /// Hy4 (`hy_v4_vl`): identical SGLang `HYV4VLImageProcessor` contract as
+    /// Hy4-flash, paired with Hy4's 40-layer 1536/6144 ViT tower.
+    Hy4,
 }
 
 impl ImageFamily {
@@ -177,7 +180,10 @@ impl ImageFamily {
     pub fn token_geometry(self) -> cuteafd_core::media::ImageTokenGeometry {
         cuteafd_core::media::ImageTokenGeometry {
             merge: ProcessorConfig::for_family(self).merge,
-            row_markers: u32::from(matches!(self, ImageFamily::Mistral | ImageFamily::Hy4Flash)),
+            row_markers: u32::from(matches!(
+                self,
+                ImageFamily::Mistral | ImageFamily::Hy4Flash | ImageFamily::Hy4
+            )),
         }
     }
 }
@@ -231,7 +237,8 @@ impl ProcessorConfig {
             ImageFamily::Mistral=>Some(self.max_image_tokens.min(MISTRAL_MAX_IMAGE_TOKENS)),
             ImageFamily::MiniMax=>Some(crate::families::minimax_m3::vision::MAX_IMAGE_TOKENS),
             ImageFamily::Kimi=>Some(crate::families::kimi_k3::vision::MAX_IMAGE_TOKENS as usize),
-            ImageFamily::Hy4Flash=>Some(crate::families::hy4_flash::vision::MAX_IMAGE_TOKENS),
+            ImageFamily::Hy4Flash => Some(crate::families::hy4_flash::vision::MAX_IMAGE_TOKENS),
+            ImageFamily::Hy4 => Some(crate::families::hy4::vision::MAX_IMAGE_TOKENS),
             _=>None,
         }
     }
@@ -239,6 +246,7 @@ impl ProcessorConfig {
         match self.family {
             ImageFamily::Kimi=>crate::families::kimi_k3::vision::MAX_IMAGE_TOKENS as usize,
             ImageFamily::Hy4Flash=>crate::families::hy4_flash::vision::MAX_IMAGE_TOKENS,
+            ImageFamily::Hy4=>crate::families::hy4::vision::MAX_IMAGE_TOKENS,
             _=>4096,
         }
     }
@@ -264,7 +272,7 @@ impl ProcessorConfig {
             ImageFamily::Step5 => (14, 1, 3024 * 3024, CLIP_MEAN, CLIP_STD),
             ImageFamily::Kimi => (14, 1, crate::families::kimi_k3::vision::MAX_IMAGE_CANVAS_PIXELS, [0.5;3], [0.5;3]),
             ImageFamily::MiniMax => (14, 28 * 28, 672 * 672, CLIP_MEAN, CLIP_STD),
-            ImageFamily::Hy4Flash => (16, crate::families::hy4_flash::vision::MIN_PIXELS,
+            ImageFamily::Hy4Flash | ImageFamily::Hy4 => (16, crate::families::hy4_flash::vision::MIN_PIXELS,
                 crate::families::hy4_flash::vision::MAX_PIXELS, [0.5; 3], [0.5; 3]),
         };
         Self {
@@ -272,7 +280,7 @@ impl ProcessorConfig {
             family,
             patch,
             merge: if family==ImageFamily::Step5 {4} else {2},
-            temporal: if matches!(family,ImageFamily::Kimi|ImageFamily::Hy4Flash) {1} else {2},
+            temporal: if matches!(family,ImageFamily::Kimi|ImageFamily::Hy4Flash|ImageFamily::Hy4) {1} else {2},
             mean,
             std,
             min_pixels,
@@ -283,6 +291,7 @@ impl ProcessorConfig {
                 ImageFamily::Kimi => crate::families::kimi_k3::vision::MAX_IMAGE_TOKENS as usize,
                 ImageFamily::MiniMax => crate::families::minimax_m3::vision::MAX_IMAGE_TOKENS,
                 ImageFamily::Hy4Flash => crate::families::hy4_flash::vision::MAX_IMAGE_TOKENS,
+                ImageFamily::Hy4 => crate::families::hy4::vision::MAX_IMAGE_TOKENS,
                 _ => 4096,
             },
             decode: DecodePolicy::default(),
@@ -303,8 +312,8 @@ impl ProcessorConfig {
         if family == ImageFamily::MiniMax {
             return minimax::processor_config(snapshot);
         }
-        if family == ImageFamily::Hy4Flash {
-            return hy4::processor_config(snapshot);
+        if matches!(family, ImageFamily::Hy4Flash | ImageFamily::Hy4) {
+            return hy4::processor_config(snapshot, family);
         }
         if matches!(family,ImageFamily::Inkling2|ImageFamily::Step5) {
             let cfg:serde_json::Value=crate::read_json_file(&snapshot.join("config.json"))
@@ -461,7 +470,7 @@ impl ProcessorConfig {
         }
         if self.patch == 0
             || self.merge == 0
-            || self.temporal != if matches!(self.family,ImageFamily::Kimi|ImageFamily::Hy4Flash) {1} else {2}
+            || self.temporal != if matches!(self.family,ImageFamily::Kimi|ImageFamily::Hy4Flash|ImageFamily::Hy4) {1} else {2}
             || self.max_image_tokens == 0
             || self.max_image_tokens > if self.family==ImageFamily::Kimi {crate::families::kimi_k3::vision::MAX_IMAGE_TOKENS as usize} else {16_384}
             || self.patch > 64
@@ -491,8 +500,8 @@ impl ProcessorConfig {
             }
             return Ok(());
         }
-        if self.family == ImageFamily::Hy4Flash {
-            let expected = Self::for_family(ImageFamily::Hy4Flash);
+        if matches!(self.family, ImageFamily::Hy4Flash | ImageFamily::Hy4) {
+            let expected = Self::for_family(self.family);
             if self.patch != expected.patch || self.merge != expected.merge || self.temporal != expected.temporal
                 || self.mean != expected.mean || self.std != expected.std || self.resample != expected.resample
                 || self.min_pixels != expected.min_pixels || self.max_pixels != expected.max_pixels
@@ -569,7 +578,7 @@ impl ProcessorConfig {
             ImageFamily::Inkling2=>Some("Inkling bundled vision.py sha256=34525c3b6afb44851de1f0341f60f6006760256c5e507b18cf5167a17497117c:processor-CLIP-bf16/encoder-CLIP-remap"),
             ImageFamily::Step5=>Some("Step bundled step3_processor.py sha256=ce0265261a6bffaf40b98911ef5b9babe30d20443af83a4c8ecf251ce6a861fa:Step3VisionProcessor/Step3VLImageProcessor:CLIP-bilinear-antialias728/504"),
             ImageFamily::MiniMax=>Some("sglang@a9bf8c76 MiniMaxM31ImageProcessor:RGB-before-Pillow-bicubic:ceil28-fit672:CLIP-f32:duplicate-still"),
-            ImageFamily::Hy4Flash=>Some("sglang@ccb8d9cc HYV4VLImageProcessor:Pillow-bicubic:smart_resize32-4096-4194304:mean-std0.5-f32:raster-p16"),
+            ImageFamily::Hy4Flash | ImageFamily::Hy4 => Some("sglang@ccb8d9cc HYV4VLImageProcessor:Pillow-bicubic:smart_resize32-4096-4194304:mean-std0.5-f32:raster-p16"),
             _=>None,
         }
     }
@@ -605,7 +614,7 @@ impl ProcessorConfig {
             Ok((canvas[1],canvas[0]))
         } else if self.family == ImageFamily::MiniMax {
             minimax::resize_shape(height, width)
-        } else if self.family == ImageFamily::Hy4Flash {
+        } else if matches!(self.family, ImageFamily::Hy4Flash | ImageFamily::Hy4) {
             crate::families::hy4_flash::vision::smart_resize(height, width).map_err(|e| invalid(e.to_string()))
         } else if self.family == ImageFamily::Muse {
             muse::resize_shape(height, width, factor, self.effective_max() as u32)

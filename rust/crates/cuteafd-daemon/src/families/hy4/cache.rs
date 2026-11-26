@@ -366,17 +366,30 @@ impl SnapshotOwner for Hy4CacheRank<'_> {
     }
 }
 
-/// Logical COW pages, active slot, and causal frontier for one Hy4 sequence.
+/// Logical COW pages, active slot, causal frontier, M-RoPE coordinates, and
+/// bound still-image feature spans for one Hy4 sequence.
 #[derive(Clone, Debug)]
 pub(crate) struct Hy4Placement {
     pub units: Vec<u32>,
     pub slot: usize,
     pub len: usize,
+    pub rope: std::sync::Arc<cuteafd_loader::families::hy4::vision::RopePositions>,
+    pub media: Option<std::sync::Arc<cuteafd_engine::media::RequestMedia>>,
 }
 
 impl Hy4Placement {
     pub(crate) fn new(units: Vec<u32>, slot: usize) -> Self {
-        Self { units, slot, len: 0 }
+        Self {
+            units,
+            slot,
+            len: 0,
+            rope: Default::default(),
+            media: None,
+        }
+    }
+
+    pub(crate) fn rope_at(&self, pos: usize) -> Result<[i64; 3]> {
+        self.rope.at(pos)
     }
 }
 
@@ -394,7 +407,7 @@ impl crate::shared::qwen::scheduler::Placement for Hy4Placement {
         self.slot as i32
     }
     fn spans(&self) -> &[cuteafd_core::MediaSpan] {
-        &[]
+        self.media.as_deref().map_or(&[], cuteafd_engine::media::RequestMedia::spans)
     }
 }
 

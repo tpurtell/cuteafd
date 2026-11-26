@@ -263,12 +263,29 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
         if self.publish_draft {
             if let Some(draft) = self.draft {
                 let taps = draft.taps(self.retained_rows, unit.slot)?;
-                for member in &members {
+                if let [member] = members.as_slice() {
                     let slot = *self
                         .slots
                         .get(member.sequence)
                         .context("Mini draft member slot missing")?;
                     draft.update(taps, slot, member.tokens.start, member.rows.start, member.rows.len())?;
+                } else {
+                    let spans: Vec<_> = members
+                        .iter()
+                        .map(|member| {
+                            let slot = *self
+                                .slots
+                                .get(member.sequence)
+                                .context("Mini draft member slot missing")?;
+                            Ok(crate::shared::speculation::recurrent_cache::ContextSpan {
+                                slot,
+                                start: member.tokens.start,
+                                first_row: member.rows.start,
+                                rows: member.rows.len(),
+                            })
+                        })
+                        .collect::<Result<_>>()?;
+                    draft.update_batch(taps, &spans)?;
                 }
             }
         }

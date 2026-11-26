@@ -2556,6 +2556,7 @@ impl<'a> Hy4Engine<'a> {
 
         let mut max_seq_end = 0usize;
         let mut members = Vec::with_capacity(unit.segments.len());
+        let mut media_rows: Vec<(usize, usize, usize)> = Vec::new();
         let mut row_cursor = 0usize;
 
         for seg in &unit.segments {
@@ -2598,15 +2599,18 @@ impl<'a> Hy4Engine<'a> {
             ensure!(p.slot < self.max_sequences, "Hy4 sequence slot {} out of range", p.slot);
             max_seq_end = max_seq_end.max(pos_end);
             flat_tokens.extend_from_slice(tok_slice);
+            if p.media.as_ref().is_some_and(|m| m.needed(pos_start, pos_end).next().is_some()) {
+                media_rows.push((seg.sequence, pos_start, row_cursor));
+            }
 
             for offset in 0..n {
                 let pos = pos_start + offset;
                 let logical_page = pos / PAGE_ROWS;
                 let local_row = pos % PAGE_ROWS;
                 let raw_page = p.units[logical_page] as usize;
-                // Text M-RoPE has equal (T, H, W) = (pos, pos, pos).
-                for _ in 0..3 {
-                    pos_i64.extend_from_slice(&(pos as i64).to_le_bytes());
+                let rope = p.rope_at(pos)?;
+                for axis in rope {
+                    pos_i64.extend_from_slice(&axis.to_le_bytes());
                 }
                 pos_i32.extend_from_slice(&(pos as i32).to_le_bytes());
                 if self.context_split {
@@ -2736,7 +2740,8 @@ impl<'a> Hy4Engine<'a> {
             }
         }
 
-        // Embed tokens on rank 0 into waves[wave_slot].r_a [rows, 4, H] BF16, replicate to rank 1 if TP2.
+        // Embed tokens on rank 0 into waves[wave_slot].r_a [rows, 4, H] BF16,
+        // splice any cached ViT image features across all 4 iHC streams, and replicate to rank 1 if TP2.
         {
             let r0 = &self.ranks[0];
             let emb = r0
@@ -2744,9 +2749,39 @@ impl<'a> Hy4Engine<'a> {
                 .embedding
                 .as_ref()
                 .context("Hy4 rank 0 missing TokenEmbedding")?;
+            let mut chunk = cuteafd_engine::media::MediaChunk::default();
+            for &(sequence, start, row) in &media_rows {
+                let p = &placements[sequence];
+                let media = p.media.as_ref().context("Hy4 media rows without request media")?;
+                let n = members
+                    .iter()
+                    .find(|m| m.row_start == row)
+                    .context("Hy4 media member")?
+                    .row_len;
+                let mut part = cuteafd_engine::media::MediaChunk::default();
+                media.write_chunk(start, start + n, &mut part)?;
+                chunk
+                    .indices
+                    .extend(part.indices.iter().map(|&index| index + row as u32));
+                chunk.features.extend(part.features);
+            }
             let wave = &r0.waves[wave_slot];
             r0.device.run(|| {
-                emb.embed(&flat_tokens, r0.shared.ids.buffer, HC, wave.r_a.buffer, r0.stream.raw)
+                emb.embed(&flat_tokens, r0.shared.ids.buffer, HC, wave.r_a.buffer, r0.stream.raw)?;
+                if !chunk.indices.is_empty() {
+                    r0.device.library.embedding_injection()?.inject_host(
+                        &chunk.features,
+                        &chunk.indices,
+                        wave.r_b.buffer,
+                        wave.y.buffer,
+                        wave.r_a.buffer,
+                        rows,
+                        H,
+                        HC,
+                        r0.stream.raw,
+                    )?;
+                }
+                Ok(())
             })?;
         }
         if self.ranks.len() == 2 {

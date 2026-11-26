@@ -280,6 +280,8 @@ impl TowerSpec {
             // `max_tokens` is the tower's merged capacity; newline rows are added per image.
             Some("hy_v4_flash") => Self::hy4_flash(snapshot,max_tokens.min(cuteafd_loader::families::hy4_flash::vision::MAX_MERGED_ROWS))
                 .map_err(|error| VisionError::Unsupported(error.to_string())),
+            Some("hy_v4_vl") => Self::hy4(snapshot,max_tokens.min(cuteafd_loader::families::hy4::vision::MAX_MERGED_ROWS))
+                .map_err(|error| VisionError::Unsupported(error.to_string())),
             // `max_tokens` counts the LM span; the tower's capacity is its merged [IMG] rows.
             Some("mistral_large4") => Self::mistral_large4(snapshot, mistral::merged_capacity(max_tokens)),
             kind => Err(VisionError::Unsupported(format!("tower model_type {kind:?}; add a tower exporter/kernel"))),
@@ -427,6 +429,7 @@ impl TowerSpec {
             cuteafd_loader::media::ImageFamily::Kimi => "kimi_k3",
             cuteafd_loader::media::ImageFamily::MiniMax => "minimax_m3",
             cuteafd_loader::media::ImageFamily::Hy4Flash => "hy4_flash",
+            cuteafd_loader::media::ImageFamily::Hy4 => "hy4",
         };
         let numerics = if self.image_family() == cuteafd_loader::media::ImageFamily::Muse {
             headers.insert("feature_norm_eps".into(), serde_json::json!(self.native.norm_eps.to_bits()));

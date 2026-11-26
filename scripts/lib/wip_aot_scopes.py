@@ -36,7 +36,7 @@ PROGRAM_SWITCHES = dict(deepseek_v4='DSV4', glm5='GLM', glm5_flash='GLMF', mimo_
 # (native/shared/cuda/vision_runtime.cu shared-runtime towers, including PE and
 # independent still towers). MiMo's ABI-1 tower and V4.1's own tower need none.
 VISION_ATTENTION_FAMILIES = {'qwen4', 'glm5_flash', 'muse_spark', 'mistral_large4',
-                             'minimax_m3', 'kimi_k3', 'inkling2', 'inkling2_mini', 'step5', 'hy4_flash'}
+                             'minimax_m3', 'kimi_k3', 'inkling2', 'inkling2_mini', 'step5', 'hy4_flash', 'hy4'}
 NATIVE_FAMILY_TOKENS = {'deepseek', 'glm', 'glmf', 'mimo', 'mimof', 'mimop', 'qwen', 'qwen4', 'step', 'step5'}
 NATIVE_FP8_SLUGS = {
     'deepseek-v4-flash', 'deepseek-v4-flash-0731', 'deepseek-v4-pro',

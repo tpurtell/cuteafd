@@ -1811,6 +1811,77 @@ impl<'a> DflashDrafter<'a> {
         self.update(&(0..rows).map(|tap_row| ContextRow { tap_row, slot, position: start + tap_row }).collect::<Vec<_>>())
     }
 
+    /// Ingest a multi-sequence batch of target feature spans in one `update` pass.
+    /// Packs only kept rows into `self.taps` via coalesced device copies so rejected
+    /// verify rows are never projected.
+    pub(crate) fn append_gqa_batch(&self, features: CuteafdDeviceBuffer,
+        spans: &[super::recurrent_cache::ContextSpan]) -> Result<()> {
+        if spans.is_empty() {
+            return Ok(());
+        }
+        let pitch = self.cfg.taps.len() * self.cfg.hidden * 2;
+        if let &[span] = spans {
+            let end_row = span.first_row.checked_add(span.rows).context("GQA feature span overflow")?;
+            ensure!(end_row.checked_mul(pitch).is_some_and(|end| end <= features.bytes),
+                "GQA feature span outside admitted extent");
+            let slice = CuteafdDeviceBuffer {
+                ptr: features.ptr.wrapping_byte_add(span.first_row * pitch),
+                bytes: span.rows * pitch,
+                ..features
+            };
+            return self.append_gqa_features(span.slot, span.start, slice, span.rows);
+        }
+        let mut total_rows = 0usize;
+        let mut seen_slots = std::collections::BTreeSet::new();
+        for span in spans {
+            ensure!(span.rows > 0, "GQA context append span is empty");
+            ensure!(span.slot < self.slots && seen_slots.insert(span.slot),
+                "GQA context append slot aliases or exceeds admission");
+            ensure!(span.rows <= RING, "batched GQA context span exceeds ring window");
+            let end_row = span.first_row.checked_add(span.rows).context("GQA context span overflow")?;
+            ensure!(end_row.checked_mul(pitch).is_some_and(|end| end <= features.bytes),
+                "GQA context feature span outside admitted owner");
+            total_rows = total_rows.checked_add(span.rows).context("GQA context batch row overflow")?;
+        }
+        ensure!(total_rows > 0 && total_rows <= TAP_ROWS, "GQA batched context exceeds TAP_ROWS");
+        let (a0, b0) = (features.ptr as usize, self.taps.buffer.ptr as usize);
+        let (a1, b1) = (a0.saturating_add(features.bytes), b0.saturating_add(self.taps.buffer.bytes));
+        ensure!(features.device_id != self.taps.buffer.device_id || a1 <= b0 || b1 <= a0,
+            "GQA batched feature source aliases self.taps");
+        let mut dst_row = 0usize;
+        let mut i = 0usize;
+        while i < spans.len() {
+            let src_first = spans[i].first_row;
+            let mut run_rows = spans[i].rows;
+            let mut j = i + 1;
+            while j < spans.len() && spans[j].first_row == src_first + run_rows {
+                run_rows += spans[j].rows;
+                j += 1;
+            }
+            let bytes = run_rows * pitch;
+            // SAFETY: validated disjoint source and retained self.taps on the shared stream.
+            unsafe {
+                self.library.copy_d2d_async(
+                    draft_view(self.taps.buffer, dst_row * pitch, bytes)?,
+                    draft_view(features, src_first * pitch, bytes)?,
+                    bytes,
+                    self.stream,
+                )?;
+            }
+            dst_row += run_rows;
+            i = j;
+        }
+        let mut rows = Vec::with_capacity(total_rows);
+        let mut tap_row = 0usize;
+        for span in spans {
+            for offset in 0..span.rows {
+                rows.push(ContextRow { tap_row, slot: span.slot, position: span.start + offset });
+                tap_row += 1;
+            }
+        }
+        self.update(&rows)
+    }
+
     /// Writes the context K/V of committed tapped rows (in tap-row order).
     pub fn update(&self, rows: &[ContextRow]) -> Result<()> {
         let Some(split) = &self.head_split else { return self.update_with(rows, || Ok(())); };

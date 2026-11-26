@@ -41,6 +41,23 @@ fn check_writable(placement: &Placement, rows: usize, context: usize, pool: &Ref
     Ok(())
 }
 
+fn compact_drafting_batches<T>(items: Vec<T>, batch_size: usize) -> Vec<Vec<T>> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let step = batch_size.max(1);
+    let mut batches = Vec::with_capacity(items.len().div_ceil(step));
+    let mut iter = items.into_iter();
+    loop {
+        let chunk: Vec<T> = iter.by_ref().take(step).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        batches.push(chunk);
+    }
+    batches
+}
+
 fn decode_spans(widths: impl IntoIterator<Item = usize>, capacity: usize) -> Result<Vec<std::ops::Range<usize>>> {
     let mut rows = 0usize;
     widths
@@ -701,34 +718,59 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
         };
         let start = std::time::Instant::now();
         let mut output = vec![vec![]; sequences.len()];
+        if let [s] = sequences {
+            if s.depth > 0 {
+                if let Some(anchor) = s.seq.anchor {
+                    let unembed = execution.target.operand("model.llm.unembed.weight")?.buffer;
+                    let embed = execution.target.operand("model.llm.embed.weight")?.buffer;
+                    let embed_norm = execution.target.operand("model.llm.embed_norm.weight")?.buffer;
+                    let row = [crate::shared::speculation::dflash::DraftSeq {
+                        slot: s.placement.slot,
+                        anchor,
+                        position: s.placement.len,
+                        valid_from: 0,
+                    }];
+                    let mut proposed = draft.propose(&row, embed, embed_norm, unembed)?;
+                    if let Some(tokens) = proposed.pop() {
+                        s.seq.confidence = tokens.confidence.into_iter().take(s.depth).collect();
+                        output[0] = tokens.tokens.into_iter().take(s.depth).collect();
+                    }
+                    timing.steps += 1;
+                    timing.seconds += start.elapsed().as_secs_f64();
+                }
+            }
+            return Ok(output);
+        }
+        let drafting: Vec<_> = sequences
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.depth > 0)
+            .filter_map(|(index, s)| {
+                s.seq
+                    .anchor
+                    .map(|anchor| (index, anchor, s.depth, s.placement.slot, s.placement.len))
+            })
+            .collect();
+        if drafting.is_empty() {
+            return Ok(output);
+        }
         let unembed = execution.target.operand("model.llm.unembed.weight")?.buffer;
         let embed = execution.target.operand("model.llm.embed.weight")?.buffer;
         let embed_norm = execution.target.operand("model.llm.embed_norm.weight")?.buffer;
-        for first in (0..sequences.len()).step_by(draft.sequences) {
-            let end = (first + draft.sequences).min(sequences.len());
-            let selected: Vec<_> = sequences[first..end]
+        for chunk in compact_drafting_batches(drafting, draft.sequences) {
+            let rows: Vec<_> = chunk
                 .iter()
-                .enumerate()
-                .filter(|(_, s)| s.depth > 0)
-                .filter_map(|(index, s)| s.seq.anchor.map(|anchor| (index, anchor, s)))
-                .collect();
-            if selected.is_empty() {
-                continue;
-            }
-            let rows: Vec<_> = selected
-                .iter()
-                .map(|(_, anchor, s)| crate::shared::speculation::dflash::DraftSeq {
-                    slot: s.placement.slot,
-                    anchor: *anchor,
-                    position: s.placement.len,
+                .map(|&(_, anchor, _, slot, position)| crate::shared::speculation::dflash::DraftSeq {
+                    slot,
+                    anchor,
+                    position,
                     valid_from: 0,
                 })
                 .collect();
             let proposed = draft.propose(&rows, embed, embed_norm, unembed)?;
-            let placed: Vec<_> = selected.into_iter().map(|(index, _, s)| (index, s.depth)).collect();
-            for ((index, depth), tokens) in placed.into_iter().zip(proposed) {
-                sequences[first + index].seq.confidence = tokens.confidence.into_iter().take(depth).collect();
-                output[first + index] = tokens.tokens.into_iter().take(depth).collect();
+            for ((index, _, depth, _, _), tokens) in chunk.into_iter().zip(proposed) {
+                sequences[index].seq.confidence = tokens.confidence.into_iter().take(depth).collect();
+                output[index] = tokens.tokens.into_iter().take(depth).collect();
             }
         }
         timing.steps += 1;
@@ -783,7 +825,7 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
             }
         }
         if let Some(draft) = draft {
-            for s in verified.iter_mut() {
+            if let [s] = verified {
                 let keep = if speculative {
                     s.kept.map_or(0, |(rows, _)| rows)
                 } else {
@@ -794,6 +836,29 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
                 }
                 if let Some((_, anchor)) = s.kept {
                     s.seq.anchor = Some(anchor);
+                }
+            } else {
+                let spans: Vec<_> = verified
+                    .iter()
+                    .filter_map(|s| {
+                        let keep = if speculative {
+                            s.kept.map_or(0, |(rows, _)| rows)
+                        } else {
+                            s.rows.len()
+                        };
+                        (keep > 0).then_some(crate::shared::speculation::recurrent_cache::ContextSpan {
+                            slot: s.placement.slot,
+                            start: s.start,
+                            first_row: s.first_row,
+                            rows: keep,
+                        })
+                    })
+                    .collect();
+                draft.update_batch(&draft.decode, &spans)?;
+                for s in verified.iter_mut() {
+                    if let Some((_, anchor)) = s.kept {
+                        s.seq.anchor = Some(anchor);
+                    }
                 }
             }
         }
@@ -807,5 +872,52 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
         }
         execution.requests.cache.drain()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_drafting_batches_packs_sparse_c48_into_single_group() {
+        // C48 with 11 sparse drafting requests across slots 0..48 (matching #2804 profile).
+        let active: Vec<(usize, usize, Option<u32>)> = (0..48)
+            .map(|i| {
+                let drafts = i % 4 == 0 && i < 44; // 11 sparse requests spread across all 6 old groups of 8
+                (i, usize::from(drafts), Some(100 + i as u32))
+            })
+            .collect();
+        let drafting: Vec<_> = active
+            .iter()
+            .filter(|(_, depth, anchor)| *depth > 0 && anchor.is_some())
+            .map(|&(idx, depth, anchor)| (idx, anchor.unwrap(), depth))
+            .collect();
+        assert_eq!(drafting.len(), 11);
+
+        // At admitted DECODE_ROWS = 64, all 11 sparse drafting requests fit in 1 batch.
+        let batches_64 = compact_drafting_batches(drafting.clone(), 64);
+        assert_eq!(batches_64.len(), 1);
+        assert_eq!(batches_64[0].len(), 11);
+        assert_eq!(
+            batches_64[0].iter().map(|&(idx, _, _)| idx).collect::<Vec<_>>(),
+            vec![0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40]
+        );
+
+        // Scored C48 plans up to 48 drafting requests; all 48 fit in 1 batch at DECODE_ROWS = 64.
+        let dense_c48: Vec<_> = (0..48).map(|i| (i, 100 + i as u32, 7usize)).collect();
+        let dense_batches = compact_drafting_batches(dense_c48, 64);
+        assert_eq!(dense_batches.len(), 1);
+        assert_eq!(dense_batches[0].len(), 48);
+
+        // Even with smaller batch_size = 8, 11 sparse requests pack into 2 batches (8 + 3), not 6.
+        let batches_8 = compact_drafting_batches(drafting, 8);
+        assert_eq!(batches_8.len(), 2);
+        assert_eq!(batches_8[0].len(), 8);
+        assert_eq!(batches_8[1].len(), 3);
+
+        // C64 with zero drafting requests runs zero batches.
+        let empty: Vec<(usize, u32, usize)> = Vec::new();
+        assert!(compact_drafting_batches(empty, 64).is_empty());
     }
 }

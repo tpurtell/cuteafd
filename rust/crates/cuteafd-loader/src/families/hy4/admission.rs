@@ -93,6 +93,10 @@ pub struct FactsRequest<'a> {
     pub replies: cuteafd_core::spark_reply::SparkReplyFormats,
     pub expert_usage: bool,
     pub resident_weight_limit: Option<ResidentWeights>,
+    /// Bundled 40-layer ViT placement policy (`VISION`), replicas and host feature cache.
+    pub vision: crate::plan::MediaMode,
+    pub vision_replicas: usize,
+    pub media_cache_bytes: Option<u64>,
 }
 
 /// Shared installed RTX onboarding owners from the real expert catalog and
@@ -546,6 +550,21 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         )
     })?;
 
+    let vision = crate::placement::still_encoder::StillEncoder::planned(
+        request.checkpoint,
+        request.vision,
+        request.vision_replicas,
+        &budgets,
+        request
+            .media_cache_bytes
+            .unwrap_or((8 << 30).min(host_total / 20)),
+    )
+    .map_err(|error| {
+        refused(
+            format!("Hy4 bundled vision inventory refused: {error:#}"),
+            "Supply the bundled vit.* tower tensors or use VISION=off.",
+        )
+    })?;
     if request.tp2_dflash && (!request.dfly2 || gpus != 2) {
         return Err(refused(
             "Hy4 TP2_DFLASH requires two coordinator GPUs and DFly2",
@@ -597,6 +616,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
 
     Ok(Hy4Inputs {
         cfg: cfg.clone(),
+        vision,
         kv_format: request.kv_format,
         gpus,
         spark_ranks: ranks,

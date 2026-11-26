@@ -42,7 +42,11 @@ impl Layout {
     pub fn new(snapshot: &Path, target: &Inkling2MiniConfig, slots: usize, prefill: usize,
         waves: usize, sms: usize, kv_cache: Qwen4KvCache, manifest: Option<&serde_json::Value>) -> Result<Self> {
         let config = config(snapshot, target)?;
-        let capacity = GlmDraftCapacity::new(slots, slots.min(8), config.block)?;
+        // Scored DFlash2 plans every eligible active sequence before head-score
+        // settling trims to the verify row budget; admit up to DECODE_ROWS / 2
+        // (32, the native GlmDraftCapacity arena cap) instead of 8 so C16/C32
+        // run in 1 compacted batch and C48 runs in 2 instead of 6.
+        let capacity = GlmDraftCapacity::new(slots, slots.min(super::execution::DECODE_ROWS / 2), config.block)?;
         let representation = GlmDraftRepresentation::Bf16Only;
         let physical = GlmDflashPhysicalLayout::read(snapshot, representation, capacity, sms, 2, kv_cache)?;
         let arena = WeightArenaLayout::new(ARENA, gqa_checkpoint_arena_requests(snapshot, representation, 0, 1)?)?;
