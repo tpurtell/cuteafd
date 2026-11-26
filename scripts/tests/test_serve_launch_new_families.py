@@ -143,6 +143,77 @@ def test_hy4_launcher_composes_1rtx_4spark_and_2rtx_6spark_argv(tmp_path: Path) 
     assert _flag(plan_heads, "--attention-placement") == "heads"
 
 
+@pytest.mark.parametrize("core_view", ["original", "k8-compact", "k6-compact", "fp8-compact"])
+def test_hy4_standard_options_wire_through_launcher(tmp_path: Path, core_view: str) -> None:
+    config = {
+        "model_type": "hy_v4_vl",
+        "text_config": {
+            "model_type": "hy_v4_vl_text",
+            "num_hidden_layers": 78,
+            "mlp_layer_types": ["dense"] + ["sparse"] * 77,
+        },
+        "vision_config": {"num_hidden_layers": 40},
+    }
+    trace_path = tmp_path / core_view / "spec-trace.jsonl"
+    four = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=192.0.2.{i + 1}\n" for i in range(4))
+    keys = (
+        f"SPARK_COUNT=4\nRTX_GPUS=1\nEXPERT_BACKEND=spark\nCORE_VIEW={core_view}\n"
+        "POOL_TOKENS=auto\nHOST_CACHE_BYTES=auto\nKV_CACHE=fp8\n"
+        "VISION=auto\nAUDIO=off\nVISION_REPLICAS=1\nMEDIA_CACHE_BYTES=256MiB\n"
+        "DECODE_ROWS=64\nRTX_EXPERT_LAYERS=auto\nEXPERT_USAGE=on\n"
+        f"PREFILL_PACKING=unrestricted\nGRAPH_PREWARM=on\nSPECULATION_TRACE={trace_path}\n"
+        + four
+    )
+    res = _family_launch_result(
+        tmp_path / core_view, config, "wrldsuksgo2mars/Hy4-EXL3-K4-MC", keys,
+        physical_gpus=(0,), extra_args=("--wip", "hy4"),
+        encoder_plan={**PLANNED, "spark_ranks": 4, "encoder": {"kind": {"kind": "rtx", "gpu": 0}, "replicas": []}},
+        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
+    )
+    serve = _line(res, "serve-hy4 --snapshot")
+    plan = _line(res, "cuteafd plan")
+    assert _flag(serve, "--core-view") == core_view
+    assert _flag(serve, "--kv-cache") == "fp8"
+    assert _flag(serve, "--vision") == "rtx:0"
+    assert _flag(serve, "--audio") == "off"
+    assert _flag(serve, "--vision-replicas") == "1"
+    assert _flag(serve, "--media-cache-bytes") == "256MiB"
+    assert _flag(plan, "--media-cache-bytes") == "256MiB"
+    assert _flag(serve, "--decode-rows") == "64"
+    assert _flag(serve, "--rtx-expert-layers") == "auto"
+    assert "--expert-usage" in shlex.split(serve)
+    assert "--pool-tokens" not in shlex.split(serve)
+    assert f"CUTEAFD_SPECULATION_TRACE={trace_path}" in serve
+    assert _flag(serve, "--peers") == ",".join(f"192.0.2.{i + 1}:19441" for i in range(4))
+
+
+@pytest.mark.parametrize("bad_key,needle", [
+    ("L2_PREFETCH=auto\n", "L2_PREFETCH is unsupported for Hy4"),
+    ("PREFIX_CACHE_MARK_MIB=64\n", "unused configuration key: PREFIX_CACHE_MARK_MIB"),
+    ("ATTENTION_PLACEMENT=layers\n", "layers is not implemented"),
+    ("EMBEDDING=host\n", "GPU token embeddings only"),
+])
+def test_hy4_launcher_refuses_unsupported_options(tmp_path: Path, bad_key: str, needle: str) -> None:
+    config = {
+        "model_type": "hy_v4_vl",
+        "text_config": {
+            "model_type": "hy_v4_vl_text",
+            "num_hidden_layers": 78,
+            "mlp_layer_types": ["dense"] + ["sparse"] * 77,
+        },
+    }
+    four = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(4))
+    keys = "SPARK_COUNT=4\nRTX_GPUS=1\nEXPERT_BACKEND=spark\nVISION=off\nAUDIO=off\n" + four + bad_key
+    res = _family_launch_result(
+        tmp_path, config, "wrldsuksgo2mars/Hy4-EXL3-K4-MC", keys,
+        physical_gpus=(0,), extra_args=("--wip", "hy4"),
+        encoder_plan={**PLANNED, "spark_ranks": 4},
+        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
+    )
+    assert res.returncode == 2
+    assert needle in res.stderr
+
+
 @pytest.mark.parametrize("mode,selected", [("off", "off"), ("dfly2", "dfly2"), ("auto", "dfly2"), ("", "dfly2")])
 def test_hy4_bundled_drafter_matches_plan_and_serve(tmp_path: Path, mode: str, selected: str) -> None:
     config = {"model_type": "hy_v4_flash", "num_hidden_layers": 42, "dfly_num_hidden_layers": 5,
