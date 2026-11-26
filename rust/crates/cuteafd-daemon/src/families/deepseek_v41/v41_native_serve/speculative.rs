@@ -26,6 +26,8 @@ pub(crate) struct LaneRequest {
 pub(crate) struct LaneDraft {
     /// Drafts planned per lane member, in lane order (empty: no draft pass).
     depths: Vec<usize>,
+    /// Indices actually submitted to the native chain, in lane order.
+    selected: Vec<usize>,
 }
 
 /// Layers whose experts run on the coordinator, for the console's layer classes.
@@ -47,10 +49,29 @@ type DraftSeed = (u64, u32, u64, usize);
 pub(crate) fn reset_lane_draft(lane: &mut LaneDraft, confidence_trace: &mut std::collections::BTreeMap<u64, Vec<f32>>,
     neural_lengths: &mut std::collections::BTreeMap<u64, usize>, inputs: &[DraftSeed]) {
     lane.depths.clear();
+    lane.selected.clear();
     for &(id, _, _, _) in inputs {
         confidence_trace.remove(&id);
         neural_lengths.remove(&id);
     }
+}
+
+/// Preserve the ordinary draft batch when it fits; under pressure select at
+/// most one full-width draft per available request slot, ranked by history.
+/// Every selected member needs at least one free target verify row.
+fn select_draft_members(seeds: &[DraftSeed], depths: &[usize], width: usize, verify_rows: usize,
+    probability: impl Fn(u64) -> f64) -> Vec<usize> {
+    let mut active: Vec<_> = seeds.iter().enumerate().filter_map(|(i, &(_, _, end, remaining))|
+        (end >= 2 && remaining > 1).then_some(i)).collect();
+    let capacity = cuteafd_core::v41_draft_members(seeds.len(), width);
+    if seeds.len() > capacity {
+        active.retain(|&i| depths[i] > 0);
+        active.sort_by(|&i, &j| probability(seeds[j].0).total_cmp(&probability(seeds[i].0))
+            .then_with(|| seeds[i].0.cmp(&seeds[j].0)));
+        active.truncate(capacity.min(verify_rows.saturating_sub(seeds.len())));
+        active.sort_unstable();
+    }
+    active
 }
 
 /// The anchor-only inputs a failed proposal verifies.
@@ -231,7 +252,10 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             Some(policy) => policy.plan(&requests, self.verify_rows),
             None => requests.iter().map(|&(_, room)| room.min(self.draft_limit)).collect(),
         };
+        let selected = select_draft_members(seeds, &depths, self.draft_width, self.verify_rows,
+            |id| self.policy.as_ref().map_or(0., |policy| policy.probability(id, 0)));
         self.lanes[lane].depths = depths.clone();
+        self.lanes[lane].selected = selected;
         depths
     }
     /// Fit the lane's proposals to their plan after the draft pass: keep the
@@ -565,8 +589,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
             };
             self.graph_lane_completed(lane)?;
             let (packed, values) = completed;
-            let active: Vec<_> = inputs.iter().enumerate()
-                .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
+            let active: Vec<_> = self.lanes[lane].selected.iter().map(|&i| (i, &inputs[i])).collect();
             let count = active.len();
             let width = self.chains[lane].width();
             ensure!(packed.len() == (width+1)*count && values.len() == width*count, "draft output extent differs");
@@ -589,17 +612,17 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         if let Some(round) = self.lanes.get_mut(lane) {
             reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, inputs);
         }
-        ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid draft batch size");
+        ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::v41_lane_members(self.lanes.len()), "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
             ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");
             ensure!(anchor < 129280 && remaining > 0, "invalid draft request input");
         }
-        let active: Vec<_> = inputs.iter().enumerate()
-            .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
-        let outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
+        let outputs = anchor_inputs(inputs);
         // No planned draft: the round verifies its anchors without a draft pass.
-        if active.is_empty() || self.plan(lane, inputs).iter().all(|&depth| depth == 0) {
+        let depths = self.plan(lane, inputs);
+        let active: Vec<_> = self.lanes[lane].selected.iter().map(|&i| (i, &inputs[i])).collect();
+        if active.is_empty() || depths.iter().all(|&depth| depth == 0) {
             return Ok(Some((outputs, started.elapsed().as_micros() as u64)));
         }
         let count = active.len();
@@ -677,19 +700,17 @@ impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
         // W64-1: reset before the guards so a proposal that fails them cannot
         // leave the previous round's width/counts/confidence behind.
         reset_lane_draft(&mut self.lanes[lane], &mut self.confidence_trace, &mut self.neural_lengths, inputs);
-        ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid draft batch size");
+        ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::v41_lane_members(self.lanes.len()), "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
             ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");
             ensure!(anchor < 129280 && remaining > 0, "invalid draft request input");
         }
-        let active: Vec<_> = inputs.iter().enumerate()
-            .filter(|(_, (_, _, end, remaining))| *end >= 2 && *remaining > 1).collect();
-        let mut outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
+        let mut outputs = anchor_inputs(inputs);
         // No planned draft: the round verifies its anchors without a draft pass.
-        if active.is_empty() { return Ok(outputs); }
         let depths = self.plan(lane, inputs);
-        if depths.iter().all(|&depth| depth == 0) { return Ok(outputs); }
+        let active: Vec<_> = self.lanes[lane].selected.iter().map(|&i| (i, &inputs[i])).collect();
+        if active.is_empty() || depths.iter().all(|&depth| depth == 0) { return Ok(outputs); }
         let width = self.chains[lane].width();
         let count = active.len();
         let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
@@ -767,6 +788,18 @@ impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
 #[cfg(test)]
 mod restored_prefix_tests {
     use super::*;
+
+    #[test]
+    fn wide_lane_draft_members_follow_history_and_verify_budget() {
+        let seeds: Vec<_> = (0..64).map(|i| (i, 1, 10, 8)).collect();
+        let depths = vec![7; 64];
+        for width in [5, 7] {
+            assert_eq!(select_draft_members(&seeds, &depths, width, 128, |id| id as f64), (32..64).collect::<Vec<_>>());
+            assert!(select_draft_members(&seeds, &depths, width, 64, |_| 1.).is_empty());
+            assert_eq!(select_draft_members(&seeds[..48], &depths[..48], width, 64, |id| id as f64), (32..48).collect::<Vec<_>>());
+            assert_eq!(select_draft_members(&seeds[..32], &depths[..32], width, 64, |_| 1.), (0..32).collect::<Vec<_>>());
+        }
+    }
 
     #[test]
     fn long_tail_stats_count_only_judged_positions() {

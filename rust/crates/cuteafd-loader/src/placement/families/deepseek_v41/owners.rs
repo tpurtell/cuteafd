@@ -253,7 +253,7 @@ pub fn blas_owners(ranks: usize, head: crate::placement::planner::serving::BlasH
 /// serving admission both select modules with it, so the predicted module set
 /// and the one the drafter loads are the same.
 pub fn draft_rows(concurrency: u64, lanes: u64) -> u64 {
-    let live = concurrency.div_ceil(lanes.max(1)) * cuteafd_core::MAX_DSPARK_PROPOSALS as u64;
+    let live = cuteafd_core::v41_draft_members(concurrency.div_ceil(lanes.max(1)) as usize, cuteafd_core::MAX_DSPARK_PROPOSALS) as u64 * cuteafd_core::MAX_DSPARK_PROPOSALS as u64;
     [16, 40, cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64,
         cuteafd_core::V41_DRAFT_WIDE_ROWS as u64].into_iter()
         .find(|&rows| rows >= live)
@@ -540,7 +540,7 @@ impl<'a> NativePrograms<'a> {
         ranks: usize, head_mode: Fp8Head) -> Result<Vec<Demand>> {
         ensure!((1..=4096).contains(&rows) && (1..=cuteafd_core::V41_VOCAB_ROWS as u64).contains(&decode_rows)
             && (1..=cuteafd_core::V41_MAX_REQUESTS as u64).contains(&requests)
-            && matches!(lanes, 1 | 2) && requests.div_ceil(lanes) <= cuteafd_core::V41_MAX_LANE_MEMBERS as u64
+            && matches!(lanes, 1 | 2)
             && matches!(width, 5 | 7) && matches!(ranks, 1 | 2), "invalid V4.1 draft owners");
         ensure!(experts["role"].as_str() == Some("coordinator"), "dSpark expert manifest role mismatch");
         ensure!(experts["input_format"].as_str() == Some("bf16"),
@@ -549,7 +549,7 @@ impl<'a> NativePrograms<'a> {
             ("kernel_intermediate", 2304), ("experts", 128), ("topk", 3)] {
             ensure!(experts["geometry"][key].as_u64() == Some(expected), "dSpark expert geometry mismatch: {key}");
         }
-        let members = requests.div_ceil(lanes);
+        let members = cuteafd_core::v41_draft_members(requests.div_ceil(lanes) as usize, width as usize) as u64;
         let live = members * width;
         let capacity = if live <= 16 { 16 } else if live <= 40 { 40 } else if live <= cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 { cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 } else { cuteafd_core::V41_DRAFT_WIDE_ROWS as u64 };
         let variants = experts["variants"].as_array().context("missing dSpark expert variants")?;
@@ -603,7 +603,7 @@ impl<'a> NativePrograms<'a> {
             ensure!(halves["geometry"][key].as_u64() == Some(expected),
                 "V4.1 TP2 draft expert geometry mismatch: {key}");
         }
-        let live = requests.div_ceil(lanes) * width;
+        let live = cuteafd_core::v41_draft_members(requests.div_ceil(lanes) as usize, width as usize) as u64 * width;
         let capacity = if live <= 16 { 16 } else if live <= 40 { 40 }
             else if live <= cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 { cuteafd_core::V41_DRAFT_LEGACY_ROWS as u64 }
             else { cuteafd_core::V41_DRAFT_WIDE_ROWS as u64 };
@@ -968,7 +968,7 @@ mod tests {
                 programs.main_context(DECODE_LANE_ROWS)?);
             assert_eq!(owner(&one, decoder, "dSpark windows"), owner(&two, decoder, "dSpark windows"));
             // A lane is capped at the member limit.
-            assert!(programs.dspark(&experts, 1024, DECODE_LANE_ROWS, cuteafd_core::V41_MAX_LANE_MEMBERS as u64 + 1, 1, 7, ranks,
+            assert!(programs.dspark(&experts, 1024, DECODE_LANE_ROWS, cuteafd_core::V41_MAX_REQUESTS as u64 + 1, 1, 7, ranks,
                 Fp8Head::Off).is_err());
             // Wider decode rows grow lane 1's main context and decode-lane owners.
             let wide_two = programs.dspark(&experts, 1024, 128, 16, 2, 7, ranks, Fp8Head::Off)?;
@@ -1054,7 +1054,7 @@ mod tests {
         for requests in [1u64, 2, 16, 32, 64] {
             for width in [5, 7] {
                 let lanes = if requests == 1 { 1 } else { 2 };
-                let live = requests.div_ceil(lanes) * width;
+                let live = cuteafd_core::v41_draft_members(requests.div_ceil(lanes) as usize, width as usize) as u64 * width;
                 let capacity = if live <= 16 { 16 } else if live <= 40 { 40 } else if live <= 80 { 80 } else { 256 };
                 let cover = if capacity <= 16 { 16 } else if capacity <= 80 { 80 } else { 256 };
                 let full = programs.dspark(&experts, 1024, DECODE_LANE_ROWS, requests, lanes, width, 2, Fp8Head::All)?;
