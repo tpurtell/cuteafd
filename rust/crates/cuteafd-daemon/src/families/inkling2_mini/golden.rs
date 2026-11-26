@@ -220,14 +220,6 @@ fn run(mut args: GoldenArgs) -> Result<()> {
         Ok(())
     })?;
     placement = placements[0].clone();
-    if let Some(dir) = std::env::var_os("CUTEAFD_DIAG_MINI_REAL_FEATURES") {
-        let dir = PathBuf::from(dir);
-        let binding = execution.draft.as_ref().ok_or_else(|| anyhow::anyhow!("Mini real-feature trace requires drafter"))?;
-        let embed = execution.target.operand("model.llm.embed.weight")?.buffer;
-        let norm = execution.target.operand("model.llm.embed_norm.weight")?.buffer;
-        let head = execution.target.operand("model.llm.unembed.weight")?.buffer;
-        binding.dump_real_proposals(&dir, rows, &[tokens[rows], tokens[rows-1], tokens[rows-2], tokens[rows-3]], embed, norm, head)?;
-    }
     ensure!(values.iter().all(|v| v.is_finite()), "Inkling 2 Mini golden nonfinite logits");
 
     // Optional N=1 vs N width invariance & graph vs eager byte-exact parity checks.
