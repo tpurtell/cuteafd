@@ -461,7 +461,10 @@ fn build_spec(
             routed_scaling: Some(cfg.routed_scaling_factor),
             groups: Some((cfg.n_group, cfg.topk_group)),
         }),
-        speculator: dfly.map(|d| SpeculatorSpec::BundledDspark { layers: d.layers }),
+        speculator: dfly.map(|d| SpeculatorSpec::Dfly2 {
+            layers: d.layers,
+            target_layers: d.target_kv_layers.clone(),
+        }),
         tables: Vec::new(),
         vision,
         notes,
@@ -486,7 +489,7 @@ impl Family for Hy4 {
     fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
         crate::plan::decode_rows::DecodeRowSupport::fixed(
             crate::placement::families::hy4::DECODE_ROWS,
-            0,
+            7,
             "Hy4 split-K decode exports cover at most 64 rows per step",
         )
     }
@@ -589,7 +592,7 @@ impl Family for Hy4 {
             Component::HyperConnection => "Export 4-stream iHC pre/post/post_pre and MhcHeadKernel at H=6144 (Hy4IhcGeometry(hidden=6144)) in hy4_ihc.py; see #2550.",
             Component::RoutedExpert => "Disambiguate ExpertGeometry::HY4 from GLM5 (same 6144/256/8/2048 shape, swiglu_limit=10.0 vs None) and export hy4:exl3-k45-mul1 for SM121 TP3..6 and SM120 RTX TP1/TP2; see #2550.",
             Component::Vision => "Optional 40-layer ViT vision tower is a follow-up item on #2550; text serving runs with --vision off.",
-            Component::Speculator => "Optional 5-layer DFly2 drafter (taps [61, 65, 69, 73, 77], dense I=18432) is a follow-up item on #2550; text serving runs without speculation first.",
+            Component::Speculator => "Bundled DFly2 requires validated Hy4 draft headers and matching coordinator programs; use SPECULATOR=off for target-only serving.",
             _ => "Wire Hy4 text forward, golden parity vs hy4-v1_20261122_own-text-bf16-f32, and serve-hy4 once wrldsuksgo2mars/Hy4-EXL3-K4-MC publishes; see #2550.",
         };
         Some(Hint {

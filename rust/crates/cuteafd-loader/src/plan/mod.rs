@@ -1442,7 +1442,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     if let Some(layout_options) = &options.layout {
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
-        if family.id() == "hy4_flash" {
+        if matches!(family.id(), "hy4" | "hy4_flash") {
             layout_options.hy4_dfly2 = ownership == spec::DraftOwnership::BundledDfly2;
         }
         layout_options.weight_budget_bytes = options.coordinator_budget_bytes;

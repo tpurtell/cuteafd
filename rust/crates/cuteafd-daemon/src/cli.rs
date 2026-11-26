@@ -5,7 +5,7 @@ use std::path::PathBuf;
 pub(crate) const DEFAULT_REAL_FULL_MAX_CONTEXT_TOKENS: usize = 128 * 1024;
 
 pub(crate) fn tp2_dflash_default(family: &str, split: bool, draft: bool) -> bool {
-    matches!(family, "glm5" | "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark" | "hy4_flash") && split && draft
+    matches!(family, "glm5" | "mimo_v2" | "kimi_k3" | "glm5_flash" | "muse_spark" | "hy4_flash" | "hy4") && split && draft
 }
 
 /// Resolve the topology-dependent bool once, without losing an explicit false.
@@ -42,6 +42,13 @@ pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatc
         }
         return Ok(());
     }
+    if let Commands::ServeHy4(args) = command {
+        args.tp2_dflash_explicit = explicit;
+        if !explicit {
+            args.tp2_dflash = tp2_dflash_default("hy4", args.split_device.is_some(), args.dfly2 == Some(true));
+        }
+        return Ok(());
+    }
     let (enabled, family, split, draft) = match command {
         Commands::ServeGlm(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some() || args.engine.dspark),
         Commands::GlmGolden(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some() || args.engine.dspark),
@@ -50,6 +57,7 @@ pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatc
         Commands::ServeKimi(args) => (&mut args.tp2_dflash, "kimi_k3", args.split_device.is_some(), args.draft.is_some()),
         Commands::ServeMuse(args) => (&mut args.tp2_dflash, "muse_spark", args.split_device.is_some(), args.draft.is_some()),
         Commands::Hy4fGolden(args) => (&mut args.tp2_dflash, "hy4_flash", args.split_device.is_some(), args.resume_dfly2),
+        Commands::Hy4Golden(args) => (&mut args.tp2_dflash, "hy4", args.split_device.is_some(), args.resume_dfly2),
         _ => return Ok(()),
     };
     let Some((_, sub)) = matches.subcommand() else { return Ok(()) };

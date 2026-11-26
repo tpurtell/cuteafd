@@ -514,7 +514,7 @@ fn tp2_dflash(args: &PlanArgs, family: &str,
     let applicable = if family == "mistral_large4" {
         args.layout && split && args.speculator == "dspark"
     } else {
-        let draft_compatible = if family == "hy4_flash" {
+        let draft_compatible = if matches!(family, "hy4" | "hy4_flash") {
             args.speculator == "dfly2"
         } else {
             args.speculator == "dflash2"
@@ -1117,6 +1117,10 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
             && cfg.get("SPECULATOR").is_none_or(|value| value == "auto")))
             && cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(
                 &cuteafd_loader::read_json_file::<serde_json::Value>(&snapshot.join("config.json"))?) => "dfly2",
+        "hy4" if (args.include_speculator || (args.speculator == "auto"
+            && cfg.get("SPECULATOR").is_none_or(|value| value == "auto")))
+            && cuteafd_loader::families::hy4::Hy4DflyConfig::bundled(
+                &cuteafd_loader::read_json_file::<serde_json::Value>(&snapshot.join("config.json"))?) => "dfly2",
         "glm5" | "glm5_flash" | "muse_spark" => "dflash2",
         "qwen3_5" if serde_json::from_slice::<serde_json::Value>(&std::fs::read(snapshot.join("config.json"))?)
             .is_ok_and(|config| config.get("text_config").unwrap_or(&config)["hidden_size"] == 5120) => "dspark",
@@ -1159,7 +1163,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
-        (_, "off") | ("hy4_flash", "dfly2") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2"|"dspark") | ("muse_spark" | "inkling2_mini", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
+        (_, "off") | ("hy4" | "hy4_flash", "dfly2") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2"|"dspark") | ("muse_spark" | "inkling2_mini", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "auto") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41" | "mistral_large4" | "minimax_m3" | "inkling2" | "inkling2_mini", "dspark") => true,
         _ => false,
@@ -2497,6 +2501,29 @@ mod tests {
                     let expected = if bundled && configured != Some("off") { "dfly2" } else { "off" };
                     assert_eq!(request.speculator, expected, "ranks={ranks:?}, config={configured:?}");
                     assert_eq!(DraftOwnership::selected("hy4_flash", &request.speculator),
+                        if expected == "dfly2" { DraftOwnership::BundledDfly2 } else { DraftOwnership::None });
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hy4_bundled_dfly2_auto_is_independent_of_spark_layout() {
+        use cuteafd_loader::plan::spec::DraftOwnership;
+        let target = tempfile::tempdir().unwrap();
+        for bundled in [true, false] {
+            let config = serde_json::json!({"dfly_num_hidden_layers": if bundled { 5 } else { 0 }});
+            std::fs::write(target.path().join("config.json"), config.to_string()).unwrap();
+            for ranks in [Some(0), Some(4), Some(6), None] {
+                for configured in [None, Some("auto"), Some("off")] {
+                    let mut request = args(target.path(), 0, false);
+                    request.spark_ranks = ranks;
+                    let cfg = configured.map(|value| std::collections::BTreeMap::from([
+                        ("SPECULATOR".into(), value.into())])).unwrap_or_default();
+                    resolve_speculator(&mut request, target.path(), "hy4", &cfg).unwrap();
+                    let expected = if bundled && configured != Some("off") { "dfly2" } else { "off" };
+                    assert_eq!(request.speculator, expected, "ranks={ranks:?}, config={configured:?}");
+                    assert_eq!(DraftOwnership::selected("hy4", &request.speculator),
                         if expected == "dfly2" { DraftOwnership::BundledDfly2 } else { DraftOwnership::None });
                 }
             }

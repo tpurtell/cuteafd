@@ -189,7 +189,6 @@ impl<'a> Hy4Backend<'a> {
         pool: &RefPagePool,
         allow_graphs: bool,
     ) -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative, "Hy4 DFly2 speculative verification lands in Piece 3");
         ensure!(
             !sequences.is_empty()
                 && sequences.len() <= self.concurrency
@@ -230,6 +229,7 @@ impl<'a> Hy4Backend<'a> {
         };
         let mut logits = None;
         let mut engine = self.engine.borrow_mut();
+        engine.set_provisional(speculative)?;
         let mut run = |engine: &mut Hy4Engine<'a>| {
             engine.run_units(
                 &mut placements,
@@ -243,11 +243,13 @@ impl<'a> Hy4Backend<'a> {
                 },
             )
         };
-        if allow_graphs {
-            run(&mut engine)?;
+        let result = if allow_graphs {
+            run(&mut engine)
         } else {
-            engine.without_graphs_mut(run)?;
-        }
+            engine.without_graphs_mut(run)
+        };
+        engine.set_provisional(false)?;
+        result?;
         for ((placement, _), next) in sequences.iter_mut().zip(placements) {
             **placement = next;
         }
@@ -386,7 +388,8 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
         Ok(())
     }
 
-    fn restore_draft(&self, _: &Hy4Placement, _: usize, _: &[u32], _: &mut Draft) -> Result<()> {
+    fn restore_draft(&self, placement: &Hy4Placement, _: usize, _: &[u32], _: &mut Draft) -> Result<()> {
+        self.engine.borrow().invalidate_draft(placement.slot);
         Ok(())
     }
 
@@ -656,10 +659,44 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
     fn draft(
         &self,
         sequences: &mut [scheduler::DraftSeq<'_, Hy4Placement, Draft>],
-        _: &mut scheduler::DraftTiming,
+        timing: &mut scheduler::DraftTiming,
         _: &mut TokenSelector<'_>,
     ) -> Result<Vec<Vec<u32>>> {
-        Ok(vec![Vec::new(); sequences.len()])
+        let start = std::time::Instant::now();
+        let engine = self.engine.borrow();
+        let selected = sequences
+            .iter()
+            .enumerate()
+            .filter_map(|(i, request)| {
+                let bonus = request.seq.anchor?;
+                let p = request.placement;
+                (request.depth > 0 && engine.draft_valid(p)).then_some((
+                    i,
+                    super::draft::Member {
+                        slot: p.slot,
+                        pos: p.len,
+                        bonus,
+                        depth: request.depth,
+                        rope_delta: 0,
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        let mut output = vec![Vec::new(); sequences.len()];
+        if !selected.is_empty() {
+            let members: Vec<_> = selected.iter().map(|(_, m)| *m).collect();
+            let proposals = engine.draft_batch(&members)?;
+            ensure!(
+                proposals.len() == selected.len(),
+                "Hy4 DFly2 batch returned the wrong member count"
+            );
+            for ((index, _), tokens) in selected.into_iter().zip(proposals) {
+                output[index] = tokens;
+            }
+            timing.steps += 1;
+        }
+        timing.seconds += start.elapsed().as_secs_f64();
+        Ok(output)
     }
 
     fn accept(
@@ -667,7 +704,6 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
         verified: &mut [scheduler::Verified<'_, Hy4Placement, Draft, usize>],
         speculative: bool,
     ) -> Result<()> {
-        ensure!(!speculative, "Hy4 DFly2 speculative acceptance lands in Piece 3");
         let sent = self
             .pending
             .borrow_mut()
@@ -683,11 +719,37 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
                 "Hy4 accept receipt differs"
             );
         }
+        let engine = self.engine.borrow();
+        for request in verified {
+            let Some((kept, after)) = request.kept else {
+                continue;
+            };
+            if speculative {
+                ensure!(
+                    kept > 0
+                        && kept <= request.rows.len()
+                        && request.placement.len == request.start + kept,
+                    "Hy4 provisional acceptance moved outside the committed prefix"
+                );
+            }
+            if request.neural {
+                if speculative {
+                    engine.accept_draft(
+                        request.history,
+                        request.first_row + kept - 1,
+                        request.placement.len,
+                    )?;
+                }
+                request.seq.anchor = Some(after);
+            }
+        }
         Ok(())
     }
 
-    fn cancel(&self, _placement: &Hy4Placement) -> Result<()> {
+    fn cancel(&self, placement: &Hy4Placement) -> Result<()> {
         let _ = self.pending.borrow_mut().take();
-        self.engine.borrow().drain()
+        let engine = self.engine.borrow();
+        engine.invalidate_draft(placement.slot);
+        engine.drain()
     }
 }

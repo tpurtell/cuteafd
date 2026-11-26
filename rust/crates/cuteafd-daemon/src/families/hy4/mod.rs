@@ -12,6 +12,7 @@
 //!   1x RTX and 2x RTX TP2 (`ContextSplit` default + `heads` opt-in).
 pub(crate) mod backend;
 pub(crate) mod cache;
+pub(crate) mod draft;
 pub(crate) mod execution;
 pub(crate) mod golden;
 pub(crate) mod graph_sites;

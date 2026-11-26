@@ -205,7 +205,7 @@ impl Hy4DflyConfig {
             .and_then(|s| s.get("num_speculative_tokens"))
             .and_then(Value::as_u64)
             .map(|n| n as usize)
-            .or(block_size)
+            .or_else(|| block_size.and_then(|b| b.checked_sub(1)))
             .unwrap_or(layers);
         Ok(Some(Self {
             layers,
@@ -221,6 +221,15 @@ impl Hy4DflyConfig {
             mtp_fusion,
             num_speculative_tokens,
         }))
+    }
+
+    pub fn bundled(root: &Value) -> bool {
+        root["dfly_num_hidden_layers"].as_u64() == Some(5)
+    }
+
+    /// Block rows processed by one DFly2 draft step: 1 anchor/bonus token + `num_speculative_tokens` masks.
+    pub fn block_rows(&self) -> usize {
+        self.num_speculative_tokens + 1
     }
 }
 
