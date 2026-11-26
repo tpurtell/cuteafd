@@ -400,13 +400,21 @@ def test_output_decode_recipe_uses_unsplit_m16_for_every_capacity() -> None:
                 if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
                 and node.test.id == "fixed_output")
     recipe = compile(ast.Module(body=body, type_ignores=[]), str(source), "exec")
-    for capacity in (1, 16, 80):
+    for capacity in (1, 16, 64, 80):
         namespace = {"capacity": capacity, "expected_m": capacity}
         exec(recipe, namespace)
         assert namespace["expected_m"] == 16
     text = source.read_text()
+    assert "v41_fp8_aot_expected_m(capacity=capacity, input_dim=k, output_dim=n," in text
+    assert "decode=decode_mode)" in text
     assert "if fixed_output and split_k != 1:" in text
-    assert "'all_rows': fixed_output or capacity == 1" in text
+    assert "if fixed_narrow and split_k != 4:" in text
+    assert "if name in (\"q_a\", \"kv\") and not decode_mode and split_k != 1:" in text
+    assert "if name in (\"q_a\", \"kv\") and capacity in (64, 256):" in text
+    assert "all_m = fixed_narrow" in text
+    assert "'plan_sms': 0" in text
+    assert "'decode_only': decode_only" in text
+    assert "'all_rows': fixed_output or fixed_narrow or capacity == 1" in text
 
 
 def test_native_manifest_records_inner_accumulation_and_outer_fold() -> None:

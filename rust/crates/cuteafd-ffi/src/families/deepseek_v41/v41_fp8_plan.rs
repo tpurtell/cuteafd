@@ -66,18 +66,21 @@ fn layout(infos: &[V41Fp8Info]) -> Result<(V41Fp8PlanInfo, Vec<usize>)> {
 }
 
 impl NativeLibrary {
-    fn validate_output_reduction(&self, capacity: u32, k: u32, n: u32)
+    fn validate_output_reduction(&self, capacity: u32, k: u32, n: u32, decode: bool)
         -> Result<Option<cuteafd_core::coordinator_programs::OutputReductionPlan>> {
-        if k != 8192 || !matches!(n, 5120 | 2560) { return Ok(None); }
-        let canonical = self.v41_output_reduction_info(16, k, n)?;
-        for rows in capacities(capacity)?.into_iter().filter(|&rows| rows <= 80) {
-            let recipe = self.v41_output_reduction_info(rows, k, n)?;
+        let fixed_output = k == 8192 && matches!(n, 5120 | 2560);
+        let fixed_narrow = decode && k == 5120 && matches!(n, 1280 | 512);
+        if !fixed_output && !fixed_narrow { return Ok(None); }
+        let limit = if fixed_narrow { cuteafd_core::V41_VOCAB_ROWS as u32 } else { 80 };
+        let canonical = self.v41_output_reduction_info(16, k, n, decode)?;
+        for rows in capacities(capacity)?.into_iter().filter(|&rows| rows <= limit) {
+            let recipe = self.v41_output_reduction_info(rows, k, n, decode)?;
             cuteafd_core::coordinator_programs::OutputReductionPlan::new(
                 rows as usize, canonical.expected_rows as usize, canonical.split_slices as usize)?.validate(rows as usize,
                     recipe.expected_rows as usize, recipe.split_slices as usize, recipe.all_rows == 1)?;
         }
         Ok(Some(cuteafd_core::coordinator_programs::OutputReductionPlan::new(
-            capacity.min(80) as usize, canonical.expected_rows as usize, canonical.split_slices as usize)?))
+            capacity.min(limit) as usize, canonical.expected_rows as usize, canonical.split_slices as usize)?))
     }
     pub fn v41_fp8_matrix_plan_info(
         &self,
@@ -85,20 +88,51 @@ impl NativeLibrary {
         k: u32,
         n: u32,
     ) -> Result<V41Fp8PlanInfo> {
-        self.validate_output_reduction(capacity, k, n)?;
+        self.v41_fp8_matrix_plan_info_with_mode(capacity, k, n, false)
+    }
+    pub fn v41_fp8_decode_matrix_plan_info(
+        &self,
+        capacity: u32,
+        k: u32,
+        n: u32,
+    ) -> Result<V41Fp8PlanInfo> {
+        self.v41_fp8_matrix_plan_info_with_mode(capacity, k, n, true)
+    }
+    fn v41_fp8_matrix_plan_info_with_mode(
+        &self,
+        capacity: u32,
+        k: u32,
+        n: u32,
+        decode: bool,
+    ) -> Result<V41Fp8PlanInfo> {
+        self.validate_output_reduction(capacity, k, n, decode)?;
         let infos = capacities(capacity)?
             .into_iter()
-            .map(|rows| self.v41_fp8_matrix_info(rows, k, n))
+            .map(|rows| if decode {
+                self.v41_fp8_decode_matrix_info(rows, k, n)
+            } else {
+                self.v41_fp8_matrix_info(rows, k, n)
+            })
             .collect::<Result<Vec<_>>>()?;
         let mut info = layout(&infos)?.0;
         info.capacity_rows = capacity;
         Ok(info)
     }
     pub fn v41_fp8_matrix_plan(&self, capacity: u32, k: u32, n: u32) -> Result<V41Fp8Plan<'_>> {
-        let output_reduction = self.validate_output_reduction(capacity, k, n)?;
+        self.v41_fp8_matrix_plan_with_mode(capacity, k, n, false)
+    }
+    pub fn v41_fp8_decode_matrix_plan(&self, capacity: u32, k: u32, n: u32) -> Result<V41Fp8Plan<'_>> {
+        self.v41_fp8_matrix_plan_with_mode(capacity, k, n, true)
+    }
+    fn v41_fp8_matrix_plan_with_mode(&self, capacity: u32, k: u32, n: u32, decode: bool) -> Result<V41Fp8Plan<'_>> {
+        let output_reduction = self.validate_output_reduction(capacity, k, n, decode)?;
         let kernels = capacities(capacity)?
             .into_iter()
-            .map(|rows| self.v41_fp8_matrix_kernel(rows, k, n))
+            .map(|rows| if decode {
+                self.v41_fp8_decode_matrix_kernel(rows, k, n)
+            } else {
+                self.v41_fp8_matrix_kernel(rows, k, n)
+            })
             .collect::<Result<Vec<_>>>()?;
         let infos: Vec<_> = kernels.iter().map(V41Fp8Kernel::info).collect();
         let (mut info, offsets) = layout(&infos)?;

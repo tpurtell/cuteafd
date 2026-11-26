@@ -1199,10 +1199,23 @@ pub fn write_v41_workspaces(dir: &Path) -> std::path::PathBuf {
     let matrices = [(5120,1152),(1152,5120),(5120,1280),(1280,32768),
         (32768,8192),(8192,5120),(5120,2304),(2304,5120),(5120,512),
         (1280,4096),(6144,25600),(15360,5120)];
-    let variants = matrices.into_iter().flat_map(|(k,n)|
-        [1,16,64,80,256,1024,4096].map(move |c| json!({"capacity":c,"input_dim":k,
-            "output_dim":n,"label":format!("matrix_{k}_{n}_m{c}"),"scratch_bytes":c+1,
-            "expected_m":if c<=80 {16}else{c},"split_k_slices":1,"all_rows":c<=80}))).collect::<Vec<_>>();
+    let mut variants = Vec::new();
+    for (k, n) in matrices {
+        let narrow = k == 5120 && matches!(n, 1280 | 512);
+        for c in [1,16,64,80,256,1024,4096] {
+            let single_decode = narrow && matches!(c, 1 | 16 | 80);
+            variants.push(json!({"capacity":c,"input_dim":k,
+                "output_dim":n,"label":format!("matrix_{k}_{n}_m{c}"),"scratch_bytes":c+1,
+                "expected_m":if single_decode || (!narrow && c<=80) {16} else {c},
+                "split_k_slices":if single_decode {4} else {1},
+                "all_rows":single_decode || (!narrow && c<=80), "decode_only":false}));
+            if narrow && matches!(c, 64 | 256) {
+                variants.push(json!({"capacity":c,"input_dim":k,
+                    "output_dim":n,"label":format!("matrix_{k}_{n}_m{c}_decode"),"scratch_bytes":c+257,
+                    "expected_m":16,"split_k_slices":4,"all_rows":true,"decode_only":true}));
+            }
+        }
+    }
     fs::write(share.join("V41_FP8_AOT.json"), serde_json::to_vec(&json!({"variants":variants})).unwrap()).unwrap();
     fs::write(share.join("V41_EXPERT_AOT.json"), serde_json::to_vec(&json!({
         "role":"coordinator","input_format":"bf16","geometry":{"hidden":5120,

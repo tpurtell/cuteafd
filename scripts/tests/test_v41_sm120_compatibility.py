@@ -48,7 +48,9 @@ static const uint32_t grids[] = {1000};
 #define CUTEAFD_V41_FP8_VARIANTS \
  {{1,1,32,32,64,0,16,32,16},{init,load,quant},{init,load,plan170},{init,load,noop},grids,0,1,1,0,170,1,1}, \
  {{1,1,32,32,128,0,16,32,16},{init,load,quant},{init,load,plan188},{init,load,noop},grids,64,4,1,0,188,1,1}, \
- {{1,1,256,32,64,0,16,32,16},{init,load,grouped_quant},{init,load,noop},{init,load,grouped_quant},grids,0,1,8,0,0,1,1}
+ {{1,1,256,32,64,0,16,32,16},{init,load,grouped_quant},{init,load,noop},{init,load,grouped_quant},grids,0,1,8,0,0,1,1}, \
+ {{1,64,64,32,64,0,16,32,16},{init,load,quant},{init,load,plan170},{init,load,noop},grids,0,1,1,0,0,64,0,0}, \
+ {{1,64,64,32,192,0,16,32,16},{init,load,quant},{init,load,plan188},{init,load,noop},grids,64,4,1,0,0,16,1,1}
 #define CUTEAFD_V41_HC_PROJECT_MODULE {init,load,noop}
 """
 
@@ -93,6 +95,14 @@ int main() {
    assert(recorded_grid==(dev==2 ? 680 : 880));
    if (k==32) assert(recorded_plan==(dev==2 ? 170 : 188));
   }
+  cuteafd_v41_fp8_info_t prefill_info{}, decode_info{};
+  assert(cuteafd_v41_fp8_matrix_info(64,64,32,&prefill_info)==0 && prefill_info.scratch_bytes==64);
+  assert(cuteafd_v41_fp8_decode_matrix_info(64,64,32,&decode_info)==0 && decode_info.scratch_bytes==192);
+  assert(cuteafd_v41_fp8_matrix_reduction_info(64,64,32,&recipe)==0 && recipe.split_slices==1 && recipe.expected_rows==64 && recipe.all_rows==0);
+  assert(cuteafd_v41_fp8_decode_matrix_reduction_info(64,64,32,&recipe)==0 && recipe.split_slices==4 && recipe.expected_rows==16 && recipe.all_rows==1);
+  void* dh=nullptr;
+  assert(cuteafd_v41_fp8_decode_matrix_initialize(64,64,32,&dh)==0 && handle(dh)->decode_only==1);
+  assert(cuteafd_v41_fp8_decode_matrix_reduction_info(1,256,32,&recipe)==0 && recipe.split_slices==1);
  }
  device=2;
  assert(cuteafd_v41_fp8_launch(h,reinterpret_cast<uint16_t*>(0x10000),

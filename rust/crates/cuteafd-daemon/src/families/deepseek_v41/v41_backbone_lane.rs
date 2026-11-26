@@ -729,7 +729,7 @@ impl<'a> LaneStorage<'a> {
         ensure!(unit > 0 && unit <= 4096 && unit <= rows
             && rows as usize <= crate::shared::memory::row_window::MAX_RESERVE_ROWS, "invalid lane storage geometry");
         Ok(Self::allocation_groups(rows,
-            AttentionQueryWave::device_bytes_with_split(library, unit, split_query)?,
+            AttentionQueryWave::storage_bytes_with_split(library, unit, split_query)?,
             AttentionOutputStorage::storage_bytes(library, rows, unit, split_output)?,
             if placed { 0 } else { BackboneSharedStorage::storage_bytes(library, rows, unit)? },
             SparseAttentionStorage::<'_, 64>::storage_bytes(unit as usize)?,

@@ -56,13 +56,17 @@ pub struct V41Fp8Kernel<'a> {
     launch: LaunchFn,
 }
 impl NativeLibrary {
-    pub(super) fn v41_output_reduction_info(&self, capacity: u32, k: u32, n: u32)
+    pub(super) fn v41_output_reduction_info(&self, capacity: u32, k: u32, n: u32, decode: bool)
         -> Result<OutputReductionInfo> {
         type ReductionFn = unsafe extern "C" fn(i32, i32, i32, *mut OutputReductionInfo) -> i32;
         let mut info = OutputReductionInfo::default();
         // SAFETY: the loaded library owns the symbol; out is a writable ABI value.
         let status = unsafe {
-            let function: ReductionFn = *self.lib.get(b"cuteafd_v41_fp8_matrix_reduction_info")?;
+            let function: ReductionFn = if decode {
+                *self.lib.get(b"cuteafd_v41_fp8_decode_matrix_reduction_info")?
+            } else {
+                *self.lib.get(b"cuteafd_v41_fp8_matrix_reduction_info")?
+            };
             function(i32::try_from(capacity)?, i32::try_from(k)?, i32::try_from(n)?, &mut info)
         };
         ensure!(status == 0 && info.abi_version == 1 && info.capacity_rows == capacity
@@ -77,6 +81,23 @@ impl NativeLibrary {
         capacity: u32,
         input_dim: u32,
         output_dim: u32,
+    ) -> Result<V41Fp8Info> {
+        self.v41_fp8_matrix_info_with_mode(capacity, input_dim, output_dim, false)
+    }
+    pub fn v41_fp8_decode_matrix_info(
+        &self,
+        capacity: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<V41Fp8Info> {
+        self.v41_fp8_matrix_info_with_mode(capacity, input_dim, output_dim, true)
+    }
+    fn v41_fp8_matrix_info_with_mode(
+        &self,
+        capacity: u32,
+        input_dim: u32,
+        output_dim: u32,
+        decode: bool,
     ) -> Result<V41Fp8Info> {
         ensure!(
             matches!(
@@ -99,7 +120,13 @@ impl NativeLibrary {
             "unsupported native FP8 matrix"
         );
         let capacity = i32::try_from(capacity)?;
-        let function: InfoFn = unsafe { *self.lib.get(b"cuteafd_v41_fp8_matrix_info")? };
+        let function: InfoFn = unsafe {
+            if decode {
+                *self.lib.get(b"cuteafd_v41_fp8_decode_matrix_info")?
+            } else {
+                *self.lib.get(b"cuteafd_v41_fp8_matrix_info")?
+            }
+        };
         let mut info = V41Fp8Info::default();
         let status = unsafe { function(capacity, input_dim as i32, output_dim as i32, &mut info) };
         ensure!(
@@ -132,9 +159,30 @@ impl NativeLibrary {
         input_dim: u32,
         output_dim: u32,
     ) -> Result<V41Fp8Kernel<'_>> {
-        let info = self.v41_fp8_matrix_info(capacity, input_dim, output_dim)?;
+        self.v41_fp8_matrix_kernel_with_mode(capacity, input_dim, output_dim, false)
+    }
+    pub fn v41_fp8_decode_matrix_kernel(
+        &self,
+        capacity: u32,
+        input_dim: u32,
+        output_dim: u32,
+    ) -> Result<V41Fp8Kernel<'_>> {
+        self.v41_fp8_matrix_kernel_with_mode(capacity, input_dim, output_dim, true)
+    }
+    fn v41_fp8_matrix_kernel_with_mode(
+        &self,
+        capacity: u32,
+        input_dim: u32,
+        output_dim: u32,
+        decode: bool,
+    ) -> Result<V41Fp8Kernel<'_>> {
+        let info = self.v41_fp8_matrix_info_with_mode(capacity, input_dim, output_dim, decode)?;
         unsafe {
-            let initialize: InitFn = *self.lib.get(b"cuteafd_v41_fp8_matrix_initialize")?;
+            let initialize: InitFn = if decode {
+                *self.lib.get(b"cuteafd_v41_fp8_decode_matrix_initialize")?
+            } else {
+                *self.lib.get(b"cuteafd_v41_fp8_matrix_initialize")?
+            };
             let scratch = *self.lib.get(b"cuteafd_v41_fp8_initialize_scratch")?;
             let pack = *self.lib.get(b"cuteafd_v41_fp8_matrix_pack_scales")?;
             let launch = *self.lib.get(b"cuteafd_v41_fp8_launch_rope")?;

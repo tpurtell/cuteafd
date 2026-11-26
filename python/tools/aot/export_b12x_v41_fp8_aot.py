@@ -92,7 +92,7 @@ def dispatch_header(output: Path, manifest: dict) -> None:
                                            variant[kind + '_abi']['symbol'])) + '}')
         if groups == 1:
             modules.append('{nullptr,nullptr,nullptr}')
-        variants.append('{{' + ','.join(map(str, info)) + '},' + ','.join(modules) + ',' + label + '_grids,' + str(variant['split_k_offset']) + ',' + str(variant['split_k_slices']) + ',' + str(groups) + ',' + str(variant.get('grouped_output_offset', 0)) + ',' + str(variant.get('plan_sms', 0)) + ',' + str(variant.get('expected_m', capacity)) + ',' + str(int(variant.get('all_rows', capacity == 1 or variant.get('split_k_all_m', False)))) + '}')
+        variants.append('{{' + ','.join(map(str, info)) + '},' + ','.join(modules) + ',' + label + '_grids,' + str(variant['split_k_offset']) + ',' + str(variant['split_k_slices']) + ',' + str(groups) + ',' + str(variant.get('grouped_output_offset', 0)) + ',' + str(variant.get('plan_sms', 0)) + ',' + str(variant.get('expected_m', capacity)) + ',' + str(int(variant.get('all_rows', capacity == 1 or variant.get('split_k_all_m', False)))) + ',' + str(int(variant.get('decode_only', False))) + '}')
     lines.append('#define CUTEAFD_V41_FP8_VARIANTS ' + ','.join(variants))
     (output / 'v41_fp8_variants.h').write_text('\n'.join(lines) + '\n')
 
@@ -125,22 +125,38 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                 'variants': []}
     for name, n, k in projections:
         for capacity in rows:
-            # Only these four shapes need different tactics on 5090/PRO.
-            # Common GEMMs query the persistent grid at launch.
-            dual = name in ('q_a', 'kv') and capacity in (1, 16)
-            for plan_sms in ((170, reference_sms) if dual else (reference_sms,)):
-                label = f'v41_{name}_fp8_m{capacity}' + (f'_sm{plan_sms}' if dual else '')
-                groups = 8 if name == 'o_a' else 1
+            # One unified SM120 variant serves both 170-SM RTX 5090 and 188-SM
+            # RTX PRO 6000. Common GEMMs query the persistent grid at launch.
+            # Narrow q_a/kv decode/verify capacities up to the admitted ceiling
+            # (256 rows) share one geometry-driven 4-way split-K all-M recipe
+            # across every SM120 card, while prefill buckets (64, 256, 1024,
+            # 4096) keep the untouched unsplit recipe via decode_only variants.
+            plan_sms = reference_sms
+            groups = 8 if name == 'o_a' else 1
+            if name in ("q_a", "kv") and capacity in (64, 256):
+                modes = (False, True)
+            elif name in ("q_a", "kv") and capacity in (1, 16, 80):
+                modes = (True,)
+            else:
+                modes = (False,)
+            for decode_mode in modes:
+                decode_only = decode_mode and len(modes) > 1
+                label = f'v41_{name}_fp8_m{capacity}_decode' if decode_only else f'v41_{name}_fp8_m{capacity}'
+                fixed_output = name in ("o_b", "o_b_tp2") and capacity <= 80
+                fixed_narrow = name in ("q_a", "kv") and decode_mode
                 expected_m = capacity
-                if os.environ.get('CUTEAFD_EXPORT_NARROW_AOT') == '1':
+                if name in ("q_a", "kv") or os.environ.get('CUTEAFD_EXPORT_NARROW_AOT') == '1':
                     from b12x._lib.dense_gemm import v41_fp8_aot_expected_m
                     expected_m = v41_fp8_aot_expected_m(capacity=capacity, input_dim=k, output_dim=n,
-                        sm_count=plan_sms, num_groups=groups)
-                fixed_output = name in ("o_b", "o_b_tp2") and capacity <= 80
+                        sm_count=plan_sms, num_groups=groups, decode=decode_mode)
                 if fixed_output:
                     # Decode and verify share the fast unsplit m16 arithmetic.
                     expected_m = 16
-                all_m = False
+                if fixed_narrow and expected_m != 16:
+                    raise ValueError(f'decode narrow {name} m{capacity} expected_m={expected_m}, expected 16')
+                if name in ("q_a", "kv") and not decode_mode and expected_m != capacity:
+                    raise ValueError(f'prefill narrow {name} m{capacity} expected_m={expected_m}, expected {capacity}')
+                all_m = fixed_narrow
                 quant = (compile_wo_grouped_quant_aot(groups=groups, group_width=k // groups)
                          if groups > 1 else compile_mxfp8_rows_quant_aot(
                              size_k=k, scale_block_size=32, expected_m=expected_m, amax_floor=1e-4))
@@ -154,6 +170,10 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                                                   **({"split_k_all_m": True} if all_m else {}))
                 if fixed_output and split_k != 1:
                     raise ValueError('decode output projection requires the unsplit m16 recipe')
+                if fixed_narrow and split_k != 4:
+                    raise ValueError('decode narrow q_a/kv projection requires the uniform 4-slice split-K recipe')
+                if name in ("q_a", "kv") and not decode_mode and split_k != 1:
+                    raise ValueError('prefill narrow q_a/kv projection must retain the unsplit recipe')
                 gemm.export_to_c(str(output), label + '_gemm', 'cuteafd_' + label + '_gemm')
                 layout = _block_fp8_linear_scratch_layout(tokens=capacity, in_features=k,
                                                         out_features=n, output_dtype=torch.bfloat16)
@@ -173,7 +193,7 @@ def export(output: Path, rows: tuple[int, ...], projections=PROJECTIONS) -> None
                                         activation_scratch_bytes=output_offset,
                                         scratch_bytes=output_offset + capacity * n * 2,
                                         activation_mma_scale_shape=[32, 4, (capacity + 127) // 128, 4, k // groups // 128, groups])
-                manifest['variants'].append({'capacity': capacity, 'plan_sms': plan_sms if dual else 0, 'expected_m': expected_m, 'split_k_all_m': all_m, 'all_rows': fixed_output or capacity == 1, 'label': label, 'input_dim': k, 'output_dim': n,
+                manifest['variants'].append({'capacity': capacity, 'plan_sms': 0, 'expected_m': expected_m, 'split_k_all_m': all_m, 'all_rows': fixed_output or fixed_narrow or capacity == 1, 'decode_only': decode_only, 'label': label, 'input_dim': k, 'output_dim': n,
                     'activation_scratch_bytes': layout.nbytes,
                     'scratch_bytes': split_offset + split_bytes if split_k > 1 else layout.nbytes,
                     'split_k_offset': split_offset, 'split_k_bytes': split_bytes,
