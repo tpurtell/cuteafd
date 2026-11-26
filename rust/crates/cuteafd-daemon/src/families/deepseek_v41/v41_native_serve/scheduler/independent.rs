@@ -250,7 +250,7 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
                     let mut draft = draft.borrow_mut();
                     // W64-1: a failed proposal verifies the anchors only while the
                     // draft is still live; a terminal draft fails the round.
-                    if let Some(draft) = draft.as_deref_mut() { match draft.poll_propose(lane, &drafting) {
+                    if let Some(draft) = draft.as_deref_mut() { match draft.poll_propose_with_cache(lane, &drafting, Some(requests.borrow().cache())) {
                         Ok(proposed) => proposed,
                         Err(error) => Some((draft.anchor_fallback(lane, &drafting, &error)?, 0)),
                     } }

@@ -448,6 +448,7 @@ if(CUTEAFD_ENABLE_CUDA)
     shared/cuda/l2_prefetch.cu
     families/deepseek_v41/cuda/v41_dspark_cache.cu
     families/deepseek_v41/cuda/v41_dspark_attention.cu
+    families/deepseek_v41/cuda/v41_dfly2.cu
     families/deepseek_v41/cuda/v41_compressor.cu
     families/deepseek_v41/cuda/v41_vision.cu
     shared/cuda/vision_runtime.cu
@@ -593,7 +594,8 @@ endif()
 if(CUTEAFD_ENABLE_V41_FP8_AOT)
   # Packed FP8->BF16 conversion requires the SM120 architecture-specific ISA.
   # Keep the normal target's portable image as a fallback in the same fatbin.
-  set_property(SOURCE families/deepseek_v41/cuda/v41_sparse_attention.cu APPEND PROPERTY
+  set_property(SOURCE families/deepseek_v41/cuda/v41_sparse_attention.cu
+    families/deepseek_v41/cuda/v41_dfly2.cu APPEND PROPERTY
     COMPILE_OPTIONS "--generate-code=arch=compute_120a,code=sm_120a")
   target_compile_definitions(cuteafd_native PRIVATE CUTEAFD_HAVE_V41_HC_AOT=1 CUTEAFD_HAVE_V41_ROUTER_AOT=1)
   add_dependencies(cuteafd_native cuteafd_v41_fp8_export cuteafd_v41_index_export cuteafd_v41_router_export)

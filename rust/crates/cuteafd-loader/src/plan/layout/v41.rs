@@ -37,7 +37,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     cuteafd_core::concurrency::validate("deepseek_v41", shape.concurrency)?;
     let rows = u64::from(cuteafd_core::coordinator_programs::v41_live_rows(
         u32::try_from(shape.prefill_rows)?).context("invalid V4.1 prefill rows")?);
-    let dspark = shape.native_layers > 0;
+    let dfly2_snapshot = options.v41_dfly2_snapshot.as_ref();
+    let dspark = shape.native_layers > 0 && dfly2_snapshot.is_none();
+    let has_draft = dspark || dfly2_snapshot.is_some();
     // The serving `MarkRule`: concurrency lanes, retained entries, `--prefix-cache-mark-mib`.
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(shape.concurrency,
         options.prefix_entries("deepseek_v41"), crate::placement::families::deepseek_v41::resident::prefix_mark_bytes(dspark),
@@ -46,12 +48,12 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // Immutable COW tails retain the configured conversations, independently of staging marks.
     let turns = if options.host_cache_bytes != Some(0) && marks > 0 { options.prefix_entries("deepseek_v41") }
         else { marks.saturating_sub(2) / 2 };
-    ensure!(!options.tp2_dspark_experts || (ranks == 2 && dspark),
-        "--tp2-dspark-experts requires two RTX GPUs and dSpark");
+    ensure!(!options.tp2_dspark_experts || (ranks == 2 && has_draft),
+        "--tp2-dspark-experts requires two RTX GPUs and dSpark or DFly2");
     ensure!(!dspark || shape.native_layers == 3, "V4.1 dSpark retains all three stages");
     // The TP2 draft pair forks its peer rank's expert kernels onto GPU0's
     // stream inside the chain's GPU1 capture (shared/experts/rtx/draft/pair.rs).
-    report.cross_device_graph_kernels = options.tp2_dspark_experts;
+    report.cross_device_graph_kernels = options.tp2_dspark_experts && dspark;
     let manifest = options.workspace_manifest.as_deref()
         .unwrap_or_else(|| std::path::Path::new("/opt/cuteafd/share/PROGRAMS.json"));
     let directory = manifest.parent().context("V4.1 manifest has no parent")?;
@@ -148,6 +150,60 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             draft.loader_peak = [draft.resident.max(resident + staging), resident + peer_staging];
         }
         Some(draft)
+    } else if let Some(dfly2_path) = dfly2_snapshot {
+        let dfly2_catalog = crate::read_v41_dfly2_catalog(dfly2_path, catalog.config())?;
+        let block_size = options.v41_dfly2_block_size.unwrap_or(dfly2_catalog.config().trained_block_size);
+        let dense = dfly2_catalog.dense_layout()?;
+        let dense_bytes = dense.bytes() as u64;
+        let expert_cat = dfly2_catalog.expert_catalog(catalog.config());
+        let (lane_count, lane_reqs) = {
+            let max_lanes = if shape.concurrency <= 1 { 1 } else { u64::from(lanes) };
+            let per_lane = shape.concurrency.div_ceil(max_lanes);
+            (max_lanes, per_lane.min(32))
+        };
+        let taps_bytes = (shape.concurrency * (5120 * 2 + 3 * 512 * 4) + 4096) as u64;
+        // Conservative workspace upper bound matching Dfly2Chain's home + peer arenas + expert workspaces.
+        let m = lane_reqs * block_size as u64;
+        let local_vocab = if ranks == 1 { 129_280u64 } else { 129_280 - 64_640 };
+        let home_ws = (m * (64 * 512 * 2 * 2 + 4 * 5120 * 2 * 2 + 8192 * 2 + 5120 * 6 + 8000)
+            + lane_reqs * (local_vocab * 4 + 64 * 512 * 2 + 5120 * 16)
+            + 96 * MIB) as u64;
+        let exp_ws = 128 * MIB;
+        let mut runtime = Vec::new();
+        let lead = u8::from(ranks == 2);
+        runtime.push(Demand::new(lead, Category::Workspace, "DFly2 request lanes",
+            lane_count * (home_ws + if options.tp2_dspark_experts { exp_ws / 2 } else { exp_ws }), Basis::Formula));
+        runtime.push(Demand::new(lead, Category::Workspace, "DFly2 target taps", taps_bytes, Basis::Exact));
+        let full_exp = 3 * native_expert_bytes(128, 5120, 2304);
+        let half_exp = 3 * native_expert_bytes(128, 5120, 1152);
+        let staging = expert_cat.expert_staging(crate::V41ExpertSelection::Dspark { stage: 0, expert: 0 })?.staging_bytes() as u64;
+        let mut draft = DraftInventory {
+            resident: dense_bytes + full_exp,
+            runtime,
+            marks: 0,
+            staging: [staging, 0],
+            loading_experts: [full_exp, 0],
+            loader_peak: [dense_bytes + full_exp + staging, 0],
+            dense: Some(dense),
+            ..Default::default()
+        };
+        if options.tp2_dspark_experts {
+            let peer_ws = (lane_reqs * (64_640 * 4 + 5120 * 2) + 8 * MIB) as u64;
+            draft.runtime.push(Demand::new(0, Category::Workspace, "DFly2 request lanes",
+                lane_count * (peer_ws + exp_ws / 2), Basis::Formula));
+            let peer_staging = expert_cat.expert_staging(crate::V41ExpertSelection::DsparkTp2 {
+                stage: 0, expert: 0, rank: 0 })?.staging_bytes() as u64;
+            draft.resident = dense_bytes + half_exp;
+            draft.peer_half = half_exp;
+            draft.staging = [staging, peer_staging];
+            draft.loading_experts = [half_exp; 2];
+            draft.loader_peak = [draft.resident + staging, half_exp + peer_staging];
+        } else if ranks == 2 {
+            let peer_ws = (lane_reqs * (64_640 * 4 + 5120 * 2) + 8 * MIB) as u64;
+            draft.runtime.push(Demand::new(0, Category::Workspace, "DFly2 request lanes",
+                lane_count * peer_ws, Basis::Formula));
+        }
+        Some(draft)
     } else { None };
     let mut facts = crate::placement::PoolFacts::new(crate::placement::planner::Context::resolve(shape.context_tokens,
             (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, 512);
@@ -168,7 +224,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     // and the routed-expert arenas are separate contract components.
     let mut physical = owners.fixed.iter().map(Owner::from_demand).collect::<Vec<_>>();
     let mut reserves = Vec::new();
-    let draft_rows = dspark.then(|| v41::owners::draft_rows(shape.concurrency, u64::from(lanes)));
+    let draft_rows = has_draft.then(|| v41::owners::draft_rows(shape.concurrency, u64::from(lanes)));
     let modules = programs.modules(decode_rows, rows, ranks, draft_rows)?;
     let mut cards = Vec::with_capacity(ranks);
     for (gpu, &total) in options.rtx_bytes.iter().enumerate() {
@@ -236,7 +292,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
     let mut prepared = ProductionInput {
         blas: v41::owners::blas_owners(ranks,
             if mode.target() { crate::placement::planner::serving::BlasHead::Native }
-            else { options.bf16_target_head }, dspark)?,
+            else { options.bf16_target_head }, has_draft)?,
         expert_usage: options.expert_usage,
         config: &checkpoint.config,
         gpus: ranks,

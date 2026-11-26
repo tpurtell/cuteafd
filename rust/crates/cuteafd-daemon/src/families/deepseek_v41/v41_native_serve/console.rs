@@ -118,11 +118,22 @@ pub(crate) fn layout(args: &crate::cli::NativeServeArgs) -> Layout {
     layout.lanes = 2;
     layout.concurrency = args.concurrency as usize;
     layout.eos = vec![1];
-    layout.speculator = args.dspark.then(|| Speculator {
-        name: "dSpark".into(),
-        positions: cuteafd_core::MAX_DSPARK_PROPOSALS,
-        policy: args.draft_length.label(7),
-    });
+    layout.speculator = if args.dfly2_enabled() {
+        let positions = args.native_draft_width();
+        Some(Speculator {
+            name: "DFly2".into(),
+            positions,
+            policy: args.draft_length.label(positions),
+        })
+    } else if args.dspark {
+        Some(Speculator {
+            name: "dSpark".into(),
+            positions: cuteafd_core::MAX_DSPARK_PROPOSALS,
+            policy: args.draft_length.label(7),
+        })
+    } else {
+        None
+    };
     layout.steps = vec![
         StepGroup::new("Lane round", "host clock", &[
             ("round.cycle0", "lane 0 cycle", Color::Target), ("round.cycle1", "lane 1 cycle", Color::Target),
@@ -153,8 +164,8 @@ pub(crate) fn layout(args: &crate::cli::NativeServeArgs) -> Layout {
         "prefix_cache_entries": args.resolved_prefix_entries(),
         "lane_capacity": super::scheduler::lane_capacity(args.concurrency as usize, usize::from(args.resolved_decode_lanes())),
     });
-    let dspark = args.dspark;
-    layout.dynamic = Some(Box::new(move || dynamic(&super::speculative::policy_snapshot(), dspark)));
+    let speculative = args.speculative_enabled();
+    layout.dynamic = Some(Box::new(move || dynamic(&super::speculative::policy_snapshot(), speculative)));
     layout
 }
 

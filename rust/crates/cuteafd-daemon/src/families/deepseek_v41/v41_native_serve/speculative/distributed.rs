@@ -6,11 +6,17 @@ use crate::families::deepseek_v41::v41_tensors::VocabularyShard;
 
 impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
     pub(crate) fn capture_startup(&mut self) -> Result<()> {
-        ensure!(self.requests.is_empty() && self.pending.iter().all(Option::is_none),
-            "draft startup requires no admitted requests");
-        let windows = self.windows.each_ref();
-        for chain in &mut self.chains { chain.capture_startup(windows)?; }
-        Ok(())
+        ensure!(self.pending.iter().all(Option::is_none),
+            "draft startup requires no pending proposals");
+        match &mut self.backend {
+            DraftBackend::Dspark { chains, windows, requests, .. } => {
+                ensure!(requests.is_empty(), "draft startup requires no admitted requests");
+                let windows = windows.each_ref();
+                for chain in chains { chain.capture_startup(windows)?; }
+                Ok(())
+            }
+            DraftBackend::Dfly2 { .. } => Ok(()),
+        }
     }
     /// The returned owner scopes destruction to GPU1. Synchronous runtime methods
     /// select their execution device internally and restore it before returning;
@@ -32,11 +38,72 @@ impl<'w, 'a> DraftRuntime<'w, 'a, DistributedDsparkChain<'w, 'a>> {
             tracing::info!(lanes=lane_count, lane_requests, draft_width=weights.draft_width(), gpu0_bytes_per_lane=lane_bytes[0],
                 gpu1_bytes_per_lane=lane_bytes[1], "distributed lane-local dSpark draft workspaces");
             Ok(Self {
-                mains, chains, windows: [window()?, window()?, window()?],
+                backend: DraftBackend::Dspark {
+                    mains,
+                    chains,
+                    windows: [window()?, window()?, window()?],
+                    requests: Default::default(),
+                },
                 pending_commit_ids: vec![Vec::new(); lane_count], pending_prefix_ids: [None, None],
-                requests: Default::default(), pending: vec![None; lane_count],
+                pending: vec![None; lane_count],
                 request_limit: requests as usize, verify_rows: decode_rows as usize, draft_limit: weights.draft_width(), draft_width: weights.draft_width(),
                 confidence_trace: Default::default(), neural_lengths: Default::default(), length: Default::default(), policy: None,
+                lanes: vec![LaneDraft::default(); lane_count],
+            })
+        })
+    }
+
+    pub fn with_dfly2_distributed(
+        devices: [Device<'a>; 2],
+        weights: &'w crate::families::deepseek_v41::v41_experts::dfly2::Dfly2Weights<'a>,
+        table: &'w NativeRtxTensors<'a>,
+        shards: [&'w VocabularyShard<'a>; 2],
+        decode_rows: u32,
+        requests: u32,
+        lanes: u8,
+    ) -> Result<DeviceOwner<'a, Self>> {
+        let (lane_count, lane_requests) = crate::families::deepseek_v41::v41_experts::dspark::draft_lanes(requests, lanes)?;
+        let lane_count = lane_count as usize;
+        devices[1].own(|| {
+            let chains = (0..lane_count)
+                .map(|_| crate::families::deepseek_v41::v41_experts::dfly2::Dfly2Chain::new(
+                    weights,
+                    table,
+                    crate::families::deepseek_v41::v41_experts::dfly2::Dfly2Vocab::Split(shards),
+                    lane_requests as usize,
+                ))
+                .collect::<Result<Vec<_>>>()?;
+            let taps = crate::families::deepseek_v41::v41_experts::dfly2::Dfly2TapStore::new(devices[1], requests as usize)?;
+            let commit_streams = (0..lane_count).map(|_| Stream::new(devices[1])).collect::<Result<Vec<_>>>()?;
+            let commit_done = (0..lane_count).map(|_| Event::new(devices[1])).collect::<Result<Vec<_>>>()?;
+            tracing::info!(
+                lanes = lane_count,
+                lane_requests,
+                block_size = weights.block_size(),
+                draft_width = weights.draft_width(),
+                tp2_experts = weights.is_tp2(),
+                "distributed lane-local V4.1 DFly2 draft workspaces"
+            );
+            Ok(Self {
+                backend: DraftBackend::Dfly2 {
+                    chains,
+                    taps,
+                    commit_streams,
+                    commit_done,
+                    pending_updates: vec![Vec::new(); lane_count],
+                    failure: crate::families::deepseek_v41::v41_experts::dspark::DraftFailure::default(),
+                },
+                pending_commit_ids: vec![Vec::new(); lane_count],
+                pending_prefix_ids: [None, None],
+                pending: vec![None; lane_count],
+                request_limit: requests as usize,
+                verify_rows: decode_rows as usize,
+                draft_limit: weights.draft_width(),
+                draft_width: weights.draft_width(),
+                confidence_trace: Default::default(),
+                neural_lengths: Default::default(),
+                length: Default::default(),
+                policy: None,
                 lanes: vec![LaneDraft::default(); lane_count],
             })
         })
@@ -48,6 +115,9 @@ mod tests {
     use super::*;
     use crate::families::deepseek_v41::v41_dspark_cache::WindowChunk;
     fn append<'a, C: DraftChain<'a>>(runtime: &mut DraftRuntime<'_, 'a, C>, lib: &NativeLibrary, cycle: usize) -> Result<u64> {
+        let DraftBackend::Dspark { windows, requests, .. } = &mut runtime.backend else {
+            anyhow::bail!("expected dSpark backend");
+        };
         let position = if cycle == 0 { 0 } else { 4 + cycle as u64 };
         let tokens = if cycle == 0 { 5 } else { 1 };
         for stage in 0..3 {
@@ -55,11 +125,11 @@ mod tests {
                 let v = ((i * 7 + stage * 11 + cycle * 13) % 63) as f32 / 64. - 0.5;
                 ((v.to_bits() >> 16) as u16).to_ne_bytes()
             }).collect();
-            lib.copy_h2d(runtime.windows[stage].source(), &values)?;
-            let chunks: Vec<_> = runtime.requests.values().map(|r| WindowChunk {
+            lib.copy_h2d(windows[stage].source(), &values)?;
+            let chunks: Vec<_> = requests.values().map(|r| WindowChunk {
                 lease: r.leases[stage], position, source_row: r.slot as u32 * tokens, tokens,
             }).collect();
-            unsafe { runtime.windows[stage].write(&chunks)?; }
+            unsafe { windows[stage].write(&chunks)?; }
         }
         Ok(position + u64::from(tokens))
     }
@@ -82,7 +152,7 @@ mod tests {
             [&shards[0], &shards[1]], 80, cuteafd_core::V41_VERIFY_ROWS as u32, 16, 2)?;
         let mut reference = devices[1].own(|| DraftRuntime::with_requests(&lib, &weights, &embedding, &full, 80, cuteafd_core::V41_VERIFY_ROWS as u32, 16, 2))?;
         devices[1].run(|| actual.get_mut().capture_startup())?;
-        assert!(actual.requests.is_empty());
+        assert!(matches!(&actual.backend, DraftBackend::Dspark { requests, .. } if requests.is_empty()));
         assert!(actual.pending.iter().all(Option::is_none));
         devices[1].run(|| {
             actual.bind_policy(0); reference.bind_policy(0);

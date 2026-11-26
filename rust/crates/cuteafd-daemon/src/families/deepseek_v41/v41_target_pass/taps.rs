@@ -9,6 +9,9 @@ use std::rc::Rc;
 use crate::shared::memory::row_window::{RowWindow, MAX_RESERVE_ROWS};
 use cuteafd_ffi::{CuteafdDeviceBuffer, NativeLibrary, V41AttentionOps};
 
+const DFLY2_RECALL_LAYERS: [usize; 3] = [28, 32, 36];
+const DFLY2_RECALL_ROW_BYTES: usize = 512 * 4;
+
 #[derive(Default)]
 struct Progress {
     batch: Option<u64>,
@@ -19,6 +22,13 @@ impl Progress {
         ensure!(
             self.batch == Some(batch) && self.next < 3 && layer == 37 + self.next,
             "target taps require this batch's layers 37, 38, 39 in order"
+        );
+        Ok(())
+    }
+    fn check_dfly2(&self, batch: u64, layer: usize) -> Result<()> {
+        ensure!(
+            self.batch == Some(batch) && self.next < 3 && layer == DFLY2_RECALL_LAYERS[self.next],
+            "DFly2 recall taps require this batch's layers 28, 32, 36 in order"
         );
         Ok(())
     }
@@ -55,6 +65,7 @@ pub(crate) struct TargetTapWave<'a> {
     capacity: usize,
     rows: Vec<ExpertRow>,
     progress: Progress,
+    dfly2_mode: bool,
 }
 /// Borrowed proposed main context. Consume it before committing or discarding
 /// the target pass; raw device views must not outlive this borrow.
@@ -99,7 +110,13 @@ impl<'a> TargetTapWave<'a> {
     pub(crate) fn on_storage(storage: Rc<TargetTapStorage<'a>>) -> Result<Self> {
         Ok(Self { ops: storage.stream.library.v41_attention_ops()?, capacity: storage.unit,
             rows: Vec::with_capacity(storage.unit), storage, window: RowWindow::NONE,
-            progress: Progress::default() })
+            progress: Progress::default(), dfly2_mode: false })
+    }
+    pub(crate) fn set_dfly2_mode(&mut self, enabled: bool) {
+        self.dfly2_mode = enabled;
+    }
+    pub(crate) fn is_dfly2_mode(&self) -> bool {
+        self.dfly2_mode
     }
     /// All readers of the old slot must drain before selecting its next unit.
     pub(crate) fn select_window(&mut self, window: RowWindow) -> Result<()> {
@@ -214,6 +231,96 @@ impl<'a> TargetTapWave<'a> {
             rows: &self.rows,
             batch: batch.identity(),
         })
+    }
+    fn dfly2_stage_buffer(&self, stage: usize) -> Result<CuteafdDeviceBuffer> {
+        let base = self.window.apply(self.storage.values.buffer, 30720);
+        let stage_bytes = self.rows.len() * DFLY2_RECALL_ROW_BYTES;
+        let offset = stage * stage_bytes;
+        ensure!(
+            offset + stage_bytes <= base.bytes,
+            "DFly2 recall tap stage {stage} exceeds target tap window"
+        );
+        Ok(CuteafdDeviceBuffer {
+            ptr: unsafe { base.ptr.cast::<u8>().add(offset).cast() },
+            bytes: stage_bytes,
+            ..base
+        })
+    }
+    unsafe fn enqueue_dfly2_recall(
+        &mut self,
+        batch: &CacheBatch,
+        layer: usize,
+        selected: CuteafdDeviceBuffer,
+    ) -> Result<()> {
+        let result = (|| -> Result<()> {
+            ensure!(self.dfly2_mode, "DFly2 recall capture requires dfly2_mode");
+            self.progress.check_dfly2(batch.identity(), layer)?;
+            let stage = self.progress.next;
+            let dst = self.dfly2_stage_buffer(stage)?;
+            ensure!(
+                selected.bytes >= dst.bytes && selected.device_id == dst.device_id,
+                "DFly2 recall selection buffer differs from target tap window ({} vs {}, dev {} vs {})",
+                selected.bytes, dst.bytes, selected.device_id, dst.device_id
+            );
+            unsafe {
+                crate::shared::memory::chain::join(self.storage.stream.library, self.storage.stream.raw)?;
+                self.storage.stream.library.copy_d2d_async(dst, selected, dst.bytes, self.storage.stream.raw)?;
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.reset();
+        }
+        result
+    }
+    /// # Safety
+    /// `selected` belongs to the current batch's completed decoder reindex for `layer ∈ {28, 32, 36}`.
+    pub(super) unsafe fn capture_dfly2_recall(
+        &mut self,
+        batch: &CacheBatch,
+        layer: usize,
+        selected: CuteafdDeviceBuffer,
+    ) -> Result<()> {
+        let queued = unsafe { self.enqueue_dfly2_recall(batch, layer, selected) };
+        let drained = if queued.is_err() {
+            unsafe { self.storage.stream.library.cuda_stream_synchronize(self.storage.stream.raw) }
+        } else {
+            unsafe { crate::shared::memory::chain::finish(self.storage.stream.library, self.storage.stream.raw) }
+        };
+        if let Err(error) = queued.and(drained) {
+            self.reset();
+            return Err(error);
+        }
+        self.progress.next += 1;
+        Ok(())
+    }
+    /// # Safety
+    /// Same ownership contract as [`Self::capture_dfly2_recall`].
+    pub(super) async unsafe fn capture_dfly2_recall_cooperative(
+        &mut self,
+        batch: &CacheBatch,
+        layer: usize,
+        selected: CuteafdDeviceBuffer,
+    ) -> Result<()> {
+        unsafe { self.enqueue_dfly2_recall(batch, layer, selected)?; }
+        if let Err(error) = unsafe { crate::shared::memory::chain::finish_cooperative(&self.storage.stream).await } {
+            self.reset();
+            return Err(error);
+        }
+        self.progress.next += 1;
+        Ok(())
+    }
+    pub(super) fn dfly2_recall_rows(&self, batch: &CacheBatch) -> Result<([CuteafdDeviceBuffer; 3], &[ExpertRow])> {
+        ensure!(self.dfly2_mode, "DFly2 recall rows require dfly2_mode");
+        self.progress.ready(batch.identity())?;
+        Ok((
+            [
+                self.dfly2_stage_buffer(0)?,
+                self.dfly2_stage_buffer(1)?,
+                self.dfly2_stage_buffer(2)?,
+            ],
+            &self.rows,
+        ))
     }
 }
 

@@ -9,6 +9,7 @@ pub(crate) mod engram_staging;
 pub(crate) mod engram_tokenizer;
 pub(crate) mod v41_catalog;
 pub(crate) mod v41_config;
+pub(crate) mod v41_dfly2;
 pub(crate) mod v41_exl3;
 pub(crate) mod v41_exl3_residency;
 pub(crate) mod v41_exl3_staging;

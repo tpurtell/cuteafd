@@ -35,7 +35,7 @@ use cuteafd_loader::OfficialV41Catalog;
 use std::rc::Rc;
 use cuteafd_core::memory_layout::ArenaTag;
 mod expert_backend;
-mod tp2;
+pub(super) mod tp2;
 use expert_backend::DraftExperts;
 
 #[derive(Debug, Clone, Copy)]

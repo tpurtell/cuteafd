@@ -473,6 +473,46 @@ impl<'a> BackboneCache<'a> {
     pub fn request_id(&self, lease: CacheLease) -> Result<u64> {
         Ok(self.request_identity(lease)?.id)
     }
+    /// Read-only target KV descriptor for one DFly2 draft stage (`0 => L28`, `1 => L32`, `2 => L36`),
+    /// referencing the request's committed window ring and source-20 paged FP4 KV pool.
+    pub fn dfly2_context_by_id(
+        &self,
+        request_id: u64,
+        stage: usize,
+        selected: cuteafd_ffi::CuteafdDeviceBuffer,
+    ) -> Result<cuteafd_ffi::V41Dfly2Request> {
+        const LAYERS: [usize; 3] = [28, 32, 36];
+        let layer = *LAYERS.get(stage).context("invalid DFly2 stage")?;
+        self.healthy()?;
+        let req = self
+            .requests
+            .iter()
+            .flatten()
+            .find(|r| r.id == request_id)
+            .with_context(|| format!("backbone cache has no live request {request_id}"))?;
+        let win = self.windows[layer].view(req.windows[layer])?;
+        let src = self.sources[3].kv_cache(req.sources[3])?;
+        ensure!(
+            selected.device_id == win.values.device_id && src.values.device_id == win.values.device_id,
+            "DFly2 context devices differ (selected={}, win={}, src={})",
+            selected.device_id,
+            win.values.device_id,
+            src.values.device_id
+        );
+        Ok(cuteafd_ffi::V41Dfly2Request {
+            window_values: win.values.ptr.cast(),
+            window_scales: win.scales.ptr.cast(),
+            source_values: src.values.ptr.cast(),
+            source_scales: src.scales.ptr.cast(),
+            source_pages: src.device_pages.ptr.cast(),
+            selected: selected.ptr.cast(),
+            window_begin: win.begin,
+            committed_end: win.end,
+            source_capacity: (src.values.bytes / 256) as u64,
+            page_stride: (src.device_pages.bytes / 4) as u32,
+            source_fp4: 1,
+        })
+    }
     pub fn committed_end(&self, lease: CacheLease) -> Result<u64> {
         let r = self.request(lease)?;
         for (layer, (state, &l)) in self.windows.iter().zip(&r.windows).enumerate() {

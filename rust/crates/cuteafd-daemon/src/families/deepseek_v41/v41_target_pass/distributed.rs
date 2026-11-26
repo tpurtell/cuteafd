@@ -397,6 +397,9 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     pub fn set_attention_decode(&mut self, decode: bool) {
         for lane in &mut self.resources.lanes { lane.get_mut().set_attention_decode(decode); }
     }
+    pub fn set_dfly2_mode(&mut self, enabled: bool) {
+        self.resources.taps.get_mut().set_dfly2_mode(enabled);
+    }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {
         for lane in &mut self.resources.lanes {
             let device = lane.device;
@@ -639,7 +642,7 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
                     }
                     unsafe { self.resources.engram.apply_staged(&mut self.resources.lanes[gpu], gate).await?; }
                 }
-                if layer >= 37 {
+                if layer >= 37 && !self.resources.taps.is_dfly2_mode() {
                     let input = self.resources.lanes[gpu].prepared_input()?;
                     device
                         .future(unsafe {
@@ -772,6 +775,21 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
             unsafe {
                 self.resources.execution
                     .complete_layer(guard.batch.cache()?, &mut self.resources.lanes[gpu], completed)
+                    .await?;
+            }
+            if self.resources.taps.is_dfly2_mode() && matches!(layer, 28 | 32 | 36) {
+                let selected = self.resources.indices[gpu]
+                    .as_ref()
+                    .context("DFly2 decoder index lane absent")?
+                    .current_selected()?;
+                device
+                    .future(unsafe {
+                        self.resources.taps.get_mut().capture_dfly2_recall_cooperative(
+                            guard.batch.cache()?,
+                            layer,
+                            selected,
+                        )
+                    })
                     .await?;
             }
             if self.resources.capture_routes {
@@ -1006,6 +1024,12 @@ impl<'w, 'a> DistributedTargetPass<'w, 'a> {
     pub fn taps(&self, batch: &RequestBatch) -> Result<TargetTaps<'_>> {
         self.state.ready(batch.cache()?.identity())?;
         self.resources.taps.output(batch.cache()?)
+    }
+    pub fn dfly2_commit_sources(&self, batch: &RequestBatch) -> Result<super::Dfly2CommitSources<'_>> {
+        self.state.ready(batch.cache()?.identity())?;
+        let (normalized, selected_rows) = self.resources.head.normalized_rows()?;
+        let (recall, rows) = self.resources.taps.dfly2_recall_rows(batch.cache()?)?;
+        Ok(super::Dfly2CommitSources { normalized, selected_rows, recall, rows })
     }
     pub fn enqueue_cache_commit(
         &mut self,

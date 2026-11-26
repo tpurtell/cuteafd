@@ -332,6 +332,20 @@ pub(super) fn admit_startup(
         draft.marks = slots * 3 * 128 * 528;
         startup.extend(target_owners.draft_load_phases(&draft)?);
         Some(draft)
+    } else if let Some(dfly2_path) = &args.dfly2_snapshot {
+        let dfly2_catalog = cuteafd_loader::read_v41_dfly2_catalog(dfly2_path, catalog.config())?;
+        let block_size = args.dfly2_block_size.map(usize::from).unwrap_or(dfly2_catalog.config().trained_block_size);
+        let draft = if ranks == 1 {
+            crate::families::deepseek_v41::v41_experts::dfly2::Dfly2Weights::single_inventory(
+                lib, catalog, &dfly2_catalog, block_size, args.concurrency, lanes)?
+        } else {
+            crate::shared::memory::device::Device { library: lib, id: 1 }.run(||
+                crate::families::deepseek_v41::v41_experts::dfly2::Dfly2Weights::distributed_inventory(
+                    lib, catalog, &dfly2_catalog, block_size, args.concurrency, lanes,
+                    args.tp2_dspark_experts, 64640))?
+        };
+        startup.extend(target_owners.draft_load_phases(&draft)?);
+        Some(draft)
     } else { None };
     let mut weight_arenas = target_layout.ranks.clone();
     if local_vision_owner(cuteafd_api::openai::vision_input_enabled(), args.vision_peers.is_some()) {
@@ -1241,7 +1255,7 @@ mod admission_tests {
             let moved = resolve(&args, &memory, no_experts(), 0, &vec![0; ranks], 0, Some(&draft))?;
             assert_eq!(draft::home(&moved.placement), Some(home));
             let ids = &[7, 3][..ranks];
-            let report = super::super::drafter_report(home, ids, &moved.solved)?;
+            let report = super::super::drafter_report(crate::shared::draft::report::Kind::Dspark, home, ids, &moved.solved)?;
             use crate::shared::draft::report::{Kind, Placement, Rank};
             assert_eq!((report.kind, report.placement, report.lead), (Kind::Dspark,
                 Some(if ranks == 1 { Placement::Whole } else { Placement::Split }), Some(Rank::CudaRank(ids[usize::from(home)]))));

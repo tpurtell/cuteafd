@@ -495,7 +495,8 @@ fn v41_layout(layout: &mut cuteafd_loader::plan::layout::LayoutOptions, args: &P
 
 fn tp2_dspark_experts(args: &PlanArgs, family: &str,
     cfg: &std::collections::BTreeMap<String, String>) -> Result<bool> {
-    let applicable = args.layout && matches!(family, "deepseek_v41" | "deepseek_v4") && args.rtx == 2 && args.speculator == "dspark";
+    let applicable = args.layout && matches!(family, "deepseek_v41" | "deepseek_v4") && args.rtx == 2
+        && (args.speculator == "dspark" || (family == "deepseek_v41" && args.speculator == "dfly2"));
     let enabled = args.tp2_dspark_experts || match cfg.get("TP2_DSPARK_EXPERTS").map(String::as_str) {
         None | Some("") => applicable,
         Some("off") => false,
@@ -503,7 +504,7 @@ fn tp2_dspark_experts(args: &PlanArgs, family: &str,
         Some(_) => anyhow::bail!("TP2_DSPARK_EXPERTS must be on or off"),
     };
     anyhow::ensure!(!enabled || applicable,
-        "--tp2-dspark-experts requires V4/V4.1, --layout, --rtx 2 and dSpark");
+        "--tp2-dspark-experts requires V4/V4.1, --layout, --rtx 2 and dSpark (or V4.1 DFly2)");
     Ok(enabled)
 }
 
@@ -780,7 +781,18 @@ fn run_plan_with_host(mut args: PlanArgs) -> Result<()> {
         let v41 = config.get("model_type").and_then(serde_json::Value::as_str) == Some("deepseek_v41")
             || config.get("architectures").and_then(serde_json::Value::as_array)
                 .is_some_and(|arches| arches.iter().any(|arch| arch == "DeepseekV41ForCausalLM"));
-        if v41 { v41_layout(layout, &args); }
+        if v41 {
+            if args.speculator == "dfly2" {
+                let resolved = file_args(args.clone(), &snapshot)?;
+                layout.v41_dfly2_snapshot = Some(resolved.drafter_snapshot
+                    .context("DeepSeek V4.1 DFly2 planning requires its checkpoint")?);
+                layout.v41_dfly2_block_size = cfg.get("DFLY2_BLOCK_SIZE")
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.parse::<usize>().context("DFLY2_BLOCK_SIZE"))
+                    .transpose()?;
+            }
+            v41_layout(layout, &args);
+        }
     }
     if args.files || args.fetch || args.role.is_some() {
         use cuteafd_loader::plan::files::{manifest_roles_view, ReadRole};
@@ -1159,7 +1171,7 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
         anyhow::ensure!(args.speculator != "off", "this family has no default speculator");
     }
     let enabled = match (family, args.speculator.as_str()) {
-        (_, "off") | ("hy4_flash", "dfly2") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2"|"dspark") | ("muse_spark" | "inkling2_mini", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
+        (_, "off") | ("hy4_flash" | "deepseek_v41", "dfly2") | ("qwen3_5", "dspark" | "mtp") | ("kimi_k3", "dflash2"|"dspark") | ("muse_spark" | "inkling2_mini", "dflash2") | ("glm5", "dflash2") | ("glm5_flash", "dflash2" | "dspark")
         | ("mimo_v2", "dflash2" | "mtp") | ("qwen4", "auto") | ("qwen4" | "step5", "mtp")
         | ("deepseek_v4" | "deepseek_v41" | "mistral_large4" | "minimax_m3" | "inkling2" | "inkling2_mini", "dspark") => true,
         _ => false,
@@ -1209,7 +1221,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
     } else {
         args.role.as_deref().is_none_or(|r| matches!(r, "coordinator" | "rtx0" | "rtx1" | "drafter"))
     };
-    if needs_drafter && args.drafter_snapshot.is_none() && matches!(args.speculator.as_str(), "dflash2" | "dspark") {
+    if needs_drafter && args.drafter_snapshot.is_none() && matches!(args.speculator.as_str(), "dflash2" | "dspark" | "dfly2") {
         let model = cfg.get("SPECULATOR_MODEL_ID").or_else(|| cfg.get("DRAFT_MODEL_ID"))
             .filter(|v| !v.is_empty()).map(String::as_str).or(match (family, args.speculator.as_str()) {
                 ("qwen3_5", "dspark") => Some("RadixArk/Qwen3.8-27B-DSpark"),
@@ -1219,6 +1231,7 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
                 ("inkling2_mini", "dflash2") => Some(cuteafd_loader::families::inkling2_mini::dflash::MODEL),
                 ("glm5_flash", "dflash2") => Some("incoai/GLM-5.3-Flash-DFlash2"),
                 ("glm5_flash", "dspark") => Some("RedHatAI/GLM-5.3-Flash-speculator.dspark-preview"),
+                ("deepseek_v41", "dfly2") => Some("AngelSlim/DS-V4.1-Flash-DFly2-B6"),
                 _ => None,
             });
         if let Some(model) = model {
@@ -1233,6 +1246,9 @@ fn file_args(mut args: PlanArgs, snapshot: &std::path::Path) -> Result<PlanArgs>
                     }
                     if family == "muse_spark" && model == "nvidia/Muse-Spark-Open-816B-A42B-DFlash2" {
                         return Some("22e2669e4c60689f9bff0749a34d9d8e59ce7cd6");
+                    }
+                    if family == "deepseek_v41" && model == "AngelSlim/DS-V4.1-Flash-DFly2-B6" {
+                        return Some("d08e55a6897b1974307ea9771038838de5986e66");
                     }
                     (family == "qwen3_5" && args.speculator == "dspark"
                         && model == "RadixArk/Qwen3.8-27B-DSpark")

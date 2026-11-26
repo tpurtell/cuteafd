@@ -5266,7 +5266,7 @@ def test_v41_uses_canonical_speculator(tmp_path: Path, value: str, enabled: bool
 
 
 @pytest.mark.parametrize("keys,error", [("DSPARK=on\n", "unknown configuration key: DSPARK"),
-    ("SPECULATOR=mtp\n", "SPECULATOR must be dspark or off for DeepSeek V4.1")])
+    ("SPECULATOR=mtp\n", "SPECULATOR must be dspark, dfly2 or off for DeepSeek V4.1")])
 def test_v41_rejects_noncanonical_speculator(tmp_path: Path, keys: str, error: str) -> None:
     result = _family_launch_result(tmp_path, {"model_type": "deepseek_v41"},
         "deepseek-ai/DeepSeek-V4.1-Flash", keys)

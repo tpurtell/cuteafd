@@ -23,6 +23,7 @@ pub use families::deepseek_v41::v41_kv::{V41Kv, V41KvStoreLayer, V41KvStoreLayer
 pub use families::deepseek_v41::v41_vision::V41VisionOps;
 pub use families::deepseek_v41::v41_compressor::V41Compressor;
 pub use families::deepseek_v41::v41_dspark_attention::{V41DsparkAttention,V41AttentionWindow};
+pub use families::deepseek_v41::v41_dfly2::{V41Dfly2Blas, V41Dfly2Ops, V41Dfly2Request};
 pub use families::deepseek_v41::v41_grouped_output::{V41GroupedOutput, V41_GROUPED_OUTPUT_WORKSPACE};
 pub use families::deepseek_v41::v41_attention_ops::V41AttentionOps;
 pub use families::deepseek_v41::v41_dspark_cache::{V41DsparkCache, V41KvWrite};

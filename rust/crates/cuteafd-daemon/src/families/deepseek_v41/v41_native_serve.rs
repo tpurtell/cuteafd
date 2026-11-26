@@ -38,7 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 
 
 pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
-    args.draft_length.report_inactive(args.dspark);
+    args.draft_length.report_inactive(args.speculative_enabled());
     // Identify the checkpoint before loading it: an unidentifiable directory fails in seconds.
     let mut profile = served_profile(args.model_id.clone(), &args.snapshot)?;
     let Started { send, readiness, worker_thread, stats, http } = start(args, true)?;
@@ -63,13 +63,13 @@ pub(crate) async fn run(args: crate::cli::NativeServeArgs) -> Result<()> {
     Ok(())
 }
 
-fn drafter_report(lead: u8, devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan)
+fn drafter_report(kind: crate::shared::draft::report::Kind, lead: u8, devices: &[i32], plan: &cuteafd_loader::placement::planner::ResolvedPlan)
     -> Result<crate::shared::draft::report::DrafterLayout> {
-    use crate::shared::draft::report::{self, Kind, Placement};
+    use crate::shared::draft::report::{self, Placement};
     // A distributed terminal uses both vocabulary shards even if the routed
     // draft experts are all on its lead.
     let placement = if devices.len() == 1 { Placement::Whole } else { Placement::Split };
-    report::from_plan(Kind::Dspark, placement, lead, devices, plan, |owner|
+    report::from_plan(kind, placement, lead, devices, plan, |owner|
         owner.id.starts_with("v41.draft.") && owner.category == cuteafd_core::memory_layout::Category::Workspace)
 }
 
@@ -176,7 +176,7 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
             concurrency: u64::from(args.concurrency),
             decode_lanes: lanes,
             rtx_gpus: args.rtx_gpus as usize,
-            draft_length: if args.dspark { args.draft_length.draft_length.map(|n| n as u32) } else { Some(0) },
+            draft_length: if args.speculative_enabled() { args.draft_length.draft_length.map(|n| n as u32) } else { Some(0) },
         },
     )?;
     let requested = args.decode_rows.as_option();
@@ -190,7 +190,8 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
 
 fn attention_plan(args: &crate::cli::NativeServeArgs) -> Result<cuteafd_core::coordinator_programs::AttentionReductionPlan> {
     let plan = cuteafd_core::coordinator_programs::AttentionReductionPlan::new(
-        args.resolved_decode_rows() as usize, args.dspark.then_some(args.draft_length.effective(cuteafd_core::MAX_DSPARK_PROPOSALS)),
+        args.resolved_decode_rows() as usize,
+        args.speculative_enabled().then_some(args.draft_length.effective(args.native_draft_width())),
         args.attention_plan_rows)?;
     cuteafd_bench::context::set_resolved("attention-plan-rows", &plan.rows().to_string());
     Ok(plan)
@@ -379,8 +380,9 @@ fn worker(
     stats: std::sync::Arc<std::sync::Mutex<serde_json::Value>>,
 ) -> Result<()> {
     cuteafd_bench::context::set_resolved("prefill-scoring", "streamed");
-    ensure!(!args.tp2_dspark_experts || (args.rtx_gpus==2 && args.dspark),
-        "--tp2-dspark-experts requires --rtx-gpus 2 and --dspark");
+    ensure!(!(args.dspark && args.dfly2_enabled()), "--dspark and --dfly2-snapshot are mutually exclusive");
+    ensure!(!args.tp2_dspark_experts || (args.rtx_gpus==2 && args.speculative_enabled()),
+        "--tp2-dspark-experts requires --rtx-gpus 2 and --dspark or --dfly2-snapshot");
     ensure!(!args.tp2_output_projection || args.rtx_gpus==2,"--tp2-output-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_query_projection || args.rtx_gpus==2,"--tp2-query-projection requires --rtx-gpus 2");
     ensure!(!args.tp2_attention || args.rtx_gpus==2,"--tp2-attention requires --rtx-gpus 2");
@@ -420,7 +422,7 @@ fn worker(
     )?;
     cuteafd_bench::context::set_family(catalog.config().family_id());
     catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v41",
-        if args.dspark { "dspark" } else { "off" }))?;
+        if args.dspark { "dspark" } else if args.dfly2_enabled() { "dfly2" } else { "off" }))?;
 
     // The resolved decode lanes (one or two) at decode width, and `slots`
     // prefill slots on one shared storage set (PLAN "Prefill contract").
@@ -608,6 +610,11 @@ fn worker(
     pass.install_attention_plan(attention_plan)?;
     if let Some(second) = &mut second { second.install_attention_plan(attention_plan)?; }
     for (slot, _) in &mut prefill_slots.slots { slot.install_attention_plan(attention_plan)?; }
+    if args.dfly2_enabled() {
+        pass.set_dfly2_mode(true);
+        if let Some(second) = &mut second { second.set_dfly2_mode(true); }
+        for (slot, _) in &mut prefill_slots.slots { slot.set_dfly2_mode(true); }
+    }
     // L2 prefetch serves decode/verify steps only: the decode lanes.
     if let Some(budget) = args.l2.budget(&lib, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
         pass.enable_l2_prefetch(budget)?;
@@ -628,11 +635,27 @@ fn worker(
     } else {
         None
     };
+    let dfly2_weights = if let Some(dfly2_path) = &args.dfly2_snapshot {
+        let dfly2_catalog = cuteafd_loader::read_v41_dfly2_catalog(dfly2_path, catalog.config())?;
+        let block_size = args.dfly2_block_size.map(usize::from).unwrap_or(dfly2_catalog.config().trained_block_size);
+        Some(crate::families::deepseek_v41::v41_experts::dfly2::Dfly2Weights::load_full(
+            &lib,
+            &catalog,
+            &dfly2_catalog,
+            block_size,
+            32 * 1024 * 1024 * 1024,
+        )?)
+    } else {
+        None
+    };
     if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
-    let mut draft = draft_weights
-        .as_ref()
-        .map(|weights| DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, decode_rows, args.concurrency, lanes))
-        .transpose()?;
+    let mut draft = if let Some(weights) = draft_weights.as_ref() {
+        Some(DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, decode_rows, args.concurrency, lanes)?)
+    } else if let Some(weights) = dfly2_weights.as_ref() {
+        Some(DraftRuntime::with_dfly2_single(weights, &table, &vocabulary, decode_rows, args.concurrency, lanes)?)
+    } else {
+        None
+    };
     if let Some(draft) = &mut draft {
         draft.set_length(args.draft_length)?;
     }
@@ -651,8 +674,8 @@ fn worker(
     let snapshot_slots = prefix::Arenas::slots_for(&args);
     let prefix_arenas = prefix::Arenas::new(
         crate::shared::memory::device::Device { library: &lib, id: lib.cuda_get_device()? },
-        draft.as_ref().map(|d| d.mark_device()), snapshot_slots)?;
-    let snapshot_bytes = prefix::Arenas::device_bytes(snapshot_slots, draft.is_some());
+        draft.as_ref().and_then(|d| d.mark_device()), snapshot_slots)?;
+    let snapshot_bytes = prefix::Arenas::device_bytes(snapshot_slots, draft.as_ref().is_some_and(|d| d.has_marks()));
     tracing::info!(snapshot_slots, snapshot_bytes, "snapshot arenas reserved before serving");
     admission::startup_phase(&lib, "v41/prefix-snapshots", device_total)?;
     // Verify native expert geometry against the pre-weight admission.
@@ -707,6 +730,7 @@ fn worker(
     vision_push.commit()?;
     drop(records);
     if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
+    if let Some(dfly2) = dfly2_weights.as_ref() { dfly2.release_raw_scales(); }
     // The solve priced the pool from the sample taken before any weight,
     // workspace or exchange owner existed. The device now holds them: charge
     // what it holds beyond the plan's owners and re-fit the pool to the
@@ -801,7 +825,7 @@ fn worker(
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some(), &pool)?;
+    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.as_ref().is_some_and(|d| d.has_marks()), &pool)?;
     scheduler::publish_capacity(&requests, &prefixes, pool.placement.max_pool_tokens_no_onboard);
     vision.connect()?;
     // Every other Ready owner is priced by now: weights, workspaces, KV,
@@ -815,8 +839,13 @@ fn worker(
             if let Some(draft) = &mut draft { draft.visit_graph_banks(f)?; }
             Ok(())
         }) }?;
-    if draft.is_some() {
-        crate::shared::draft::report::publish(drafter_report(0, &[inventory.gpus[0].device], &pool.solved)?);
+    if let Some(draft) = &draft {
+        let kind = if draft.is_dfly2() {
+            crate::shared::draft::report::Kind::Dfly2
+        } else {
+            crate::shared::draft::report::Kind::Dspark
+        };
+        crate::shared::draft::report::publish(drafter_report(kind, 0, &[inventory.gpus[0].device], &pool.solved)?);
     }
     admission::publish_provenance(&args, &inventory, &pool)?;
     admission::log_runtime_base(&lib, &pool)?;

@@ -32,6 +32,9 @@ pub use families::deepseek_v41::v41_config::{
     read_official_v41_config, OfficialV41Config, V41QuantizationConfig, V41RopeScaling,
     V41TextConfig, V41VisionConfig,
 };
+pub use families::deepseek_v41::v41_dfly2::{
+    read_v41_dfly2_catalog, V41Dfly2Catalog, V41Dfly2Config, V41Dfly2Tensor,
+};
 pub use families::deepseek_v41::engram_tokenizer::EngramTokenMap;
 pub use families::deepseek_v41::engram_prefetch::{EngramEncoding, EngramTable};
 pub use families::deepseek_v41::engram_lookahead::EngramLookahead;

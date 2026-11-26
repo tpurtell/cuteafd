@@ -221,7 +221,7 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
         }
         let (position, recent) = requests.engram_lookback(placement.lease).map_err(boxed)?;
         let draft_end = match (placement.draft, self.draft.borrow().as_ref()) {
-            (Some(id), Some(draft)) => Some(draft.committed_end(id).map_err(boxed)?),
+            (Some(id), Some(draft)) if draft.has_marks() => Some(draft.committed_end(id).map_err(boxed)?),
             _ => None,
         };
         Ok(V41Meta { request: RequestMark { backbone, engram_position: position, engram_recent: recent }, draft_end })
@@ -264,7 +264,8 @@ impl<'a, C: DraftChain<'a>> PrefixFamily<V41Meta> for V41Prefix<'_, 'a, '_, C> {
             if continuation.is_none() {
                 let mut draft = self.draft.borrow_mut();
                 match (placement.draft, draft.as_deref_mut(), saved.draft_end, self.arena.draft(*slot).map_err(boxed)?) {
-                    (Some(id), Some(draft), Some(end), Some(ring)) => draft.restore_mark(id, end, ring).map_err(boxed)?,
+                    (Some(id), Some(draft), Some(end), Some(ring)) if draft.has_marks() => draft.restore_mark(id, end, ring).map_err(boxed)?,
+                    (Some(id), Some(draft), None, None) if !draft.has_marks() => { draft.invalidate_prefix(id); }
                     (None, None, None, _) | (None, None, _, None) => {}
                     _ => return Err("retained execution mode differs".into()),
                 }

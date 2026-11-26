@@ -1,9 +1,13 @@
 use super::*;
+use crate::families::deepseek_v41::v41_backbone_cache::BackboneCache;
 use crate::families::deepseek_v41::v41_dspark_cache::{DsparkWindow, WindowLease};
+use crate::families::deepseek_v41::v41_experts::dfly2::{Dfly2Chain, Dfly2TapStore, Dfly2Vocab, Dfly2Weights};
+use crate::families::deepseek_v41::v41_experts::dspark::{DraftFailure, DsparkChain, DsparkMainContext, DsparkWeights};
+use crate::families::deepseek_v41::v41_target_pass::Dfly2CommitSources;
+use crate::shared::memory::device::{Device, Event, Stream};
 use cuteafd_ffi::CuteafdDeviceBuffer;
 /// Bytes of one request's retained rings in a draft mark: three windows' full slots.
 pub(crate) const DRAFT_MARK_BYTES: usize = 3 * cuteafd_ffi::V41DsparkCache::SLOT_BYTES;
-use crate::families::deepseek_v41::v41_experts::dspark::{DsparkChain, DsparkMainContext, DsparkWeights};
 use crate::families::deepseek_v41::v41_requests::RequestBatch;
 use crate::families::deepseek_v41::v41_backbone_lane::Capture;
 use crate::shared::draft::history::{self, Policy, Proposal};
@@ -116,21 +120,82 @@ pub(crate) fn require_peer_live() -> Result<()> {
     Ok(())
 }
 
+enum DraftBackend<'w, 'a, C> {
+    Dspark {
+        mains: Vec<DsparkMainContext<'w, 'a>>,
+        chains: Vec<C>,
+        windows: [DsparkWindow<'a>; 3],
+        requests: std::collections::BTreeMap<u64, DraftRequest>,
+    },
+    Dfly2 {
+        chains: Vec<Dfly2Chain<'w, 'a>>,
+        taps: Dfly2TapStore<'a>,
+        commit_streams: Vec<Stream<'a>>,
+        commit_done: Vec<Event<'a>>,
+        pending_updates: Vec<Vec<(u64, Option<u64>)>>,
+        failure: DraftFailure,
+    },
+}
+
+fn slice_dev_buf(buf: CuteafdDeviceBuffer, offset: usize, bytes: usize) -> Result<CuteafdDeviceBuffer> {
+    ensure!(offset <= buf.bytes && bytes <= buf.bytes - offset, "DFly2 commit slice out of range");
+    Ok(CuteafdDeviceBuffer {
+        ptr: unsafe { buf.ptr.cast::<u8>().add(offset).cast() },
+        bytes,
+        ..buf
+    })
+}
+
+#[allow(clippy::type_complexity)]
+fn prepare_dfly2_tap_updates(
+    sources: &Dfly2CommitSources<'_>,
+    batch: &RequestBatch,
+    accepted: &[u32],
+) -> Result<(Vec<(u64, u64, CuteafdDeviceBuffer, [CuteafdDeviceBuffer; 3])>, Vec<(u64, Option<u64>)>)> {
+    let ids = batch.cache()?.request_ids();
+    ensure!(ids.len() == accepted.len(), "DFly2 acceptance count differs");
+    let mut copies = Vec::with_capacity(ids.len());
+    let mut frontiers = Vec::with_capacity(ids.len());
+    let mut offset = 0usize;
+    for (&id, &acc) in ids.iter().zip(accepted) {
+        let start = offset;
+        while offset < sources.rows.len() && sources.rows[offset].request_id == id {
+            offset += 1;
+        }
+        let count = offset - start;
+        ensure!((acc as usize) <= count, "DFly2 accepted prefix exceeds batch rows");
+        if acc == 0 {
+            continue;
+        }
+        let last_row = start + acc as usize - 1;
+        let new_end = sources.rows[last_row].position + 1;
+        if let Some(sel_idx) = sources.selected_rows.iter().position(|&r| r == last_row) {
+            let h = slice_dev_buf(sources.normalized, sel_idx * 10240, 10240)?;
+            let r0 = slice_dev_buf(sources.recall[0], last_row * 2048, 2048)?;
+            let r1 = slice_dev_buf(sources.recall[1], last_row * 2048, 2048)?;
+            let r2 = slice_dev_buf(sources.recall[2], last_row * 2048, 2048)?;
+            copies.push((id, new_end, h, [r0, r1, r2]));
+            frontiers.push((id, Some(new_end)));
+        } else {
+            frontiers.push((id, None));
+        }
+    }
+    Ok((copies, frontiers))
+}
+
 /// Execution workspaces share a request-indexed bank of persistent draft state.
 pub(crate) struct DraftRuntime<'w, 'a, C = DsparkChain<'w, 'a>> {
-    mains: Vec<DsparkMainContext<'w, 'a>>,
+    backend: DraftBackend<'w, 'a, C>,
     pending_commit_ids: Vec<Vec<u64>>,
     pending_prefix_ids: [Option<u64>; 2],
-    chains: Vec<C>,
-    windows: [DsparkWindow<'a>; 3],
-    requests: std::collections::BTreeMap<u64, DraftRequest>,
     pending: Vec<Option<(Vec<(u64, u32, u64, usize)>, Instant)>>,
     request_limit: usize,
     verify_rows: usize,
     draft_limit: usize,
     draft_width: usize,
-    // The confidence head's raw logit per drafted position, downloaded whenever
-    // the draft policy is bound, or for diagnostics.
+    // The confidence head's raw score per drafted position (dSpark logit or
+    // DFly2 candidate probability), downloaded whenever the draft policy is
+    // bound, or for diagnostics.
     confidence_trace: std::collections::BTreeMap<u64, Vec<f32>>,
     neural_lengths: std::collections::BTreeMap<u64, usize>,
     /// `DRAFT_POLICY` and the `DRAFT_LENGTH` fixed-width override.
@@ -147,11 +212,17 @@ struct DraftRequest {
 }
 impl<'w, 'a> DraftRuntime<'w, 'a> {
     pub(crate) fn capture_startup(&mut self) -> Result<()> {
-        ensure!(self.requests.is_empty() && self.pending.iter().all(Option::is_none),
-            "draft startup requires no admitted requests");
-        let windows = self.windows.each_ref();
-        for chain in &mut self.chains { chain.capture_startup(windows)?; }
-        self.graph_completed()
+        ensure!(self.pending.iter().all(Option::is_none),
+            "draft startup requires no pending proposals");
+        match &mut self.backend {
+            DraftBackend::Dspark { chains, windows, requests, .. } => {
+                ensure!(requests.is_empty(), "draft startup requires no admitted requests");
+                let windows = windows.each_ref();
+                for chain in chains { chain.capture_startup(windows)?; }
+                self.graph_completed()
+            }
+            DraftBackend::Dfly2 { .. } => Ok(()),
+        }
     }
 
     pub fn with_requests(
@@ -174,12 +245,62 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
             additional_workspace_bytes=(lane_bytes*lane_count).saturating_sub(shared_bytes),
             "lane-local dSpark draft workspaces (weights shared)");
         Ok(Self {
-            mains,
+            backend: DraftBackend::Dspark {
+                mains,
+                chains,
+                windows: [window()?, window()?, window()?],
+                requests: Default::default(),
+            },
             pending_commit_ids: vec![Vec::new(); lane_count],
             pending_prefix_ids: [None, None],
-            chains,
-            windows: [window()?, window()?, window()?],
-            requests: Default::default(),
+            pending: vec![None; lane_count],
+            request_limit: requests as usize,
+            verify_rows: decode_rows as usize,
+            draft_limit: weights.draft_width(),
+            draft_width: weights.draft_width(),
+            confidence_trace: Default::default(),
+            neural_lengths: Default::default(),
+            length: Default::default(),
+            policy: None,
+            lanes: vec![LaneDraft::default(); lane_count],
+        })
+    }
+
+    pub fn with_dfly2_single(
+        weights: &'w Dfly2Weights<'a>,
+        table: &'w NativeRtxTensors<'a>,
+        head: &'w VocabularyHead<'a>,
+        decode_rows: u32,
+        requests: u32,
+        lanes: u8,
+    ) -> Result<Self> {
+        let (lane_count, lane_requests) = crate::families::deepseek_v41::v41_experts::dspark::draft_lanes(requests, lanes)?;
+        let lane_count = lane_count as usize;
+        let device = weights.device();
+        let chains = (0..lane_count)
+            .map(|_| Dfly2Chain::new(weights, table, Dfly2Vocab::Single(head), lane_requests as usize))
+            .collect::<Result<Vec<_>>>()?;
+        let taps = Dfly2TapStore::new(device, requests as usize)?;
+        let commit_streams = (0..lane_count).map(|_| Stream::new(device)).collect::<Result<Vec<_>>>()?;
+        let commit_done = (0..lane_count).map(|_| Event::new(device)).collect::<Result<Vec<_>>>()?;
+        tracing::info!(
+            lanes = lane_count,
+            lane_requests,
+            block_size = weights.block_size(),
+            draft_width = weights.draft_width(),
+            "lane-local V4.1 DFly2 draft workspaces (weights shared)"
+        );
+        Ok(Self {
+            backend: DraftBackend::Dfly2 {
+                chains,
+                taps,
+                commit_streams,
+                commit_done,
+                pending_updates: vec![Vec::new(); lane_count],
+                failure: DraftFailure::default(),
+            },
+            pending_commit_ids: vec![Vec::new(); lane_count],
+            pending_prefix_ids: [None, None],
             pending: vec![None; lane_count],
             request_limit: requests as usize,
             verify_rows: decode_rows as usize,
@@ -194,34 +315,64 @@ impl<'w, 'a> DraftRuntime<'w, 'a> {
     }
 }
 impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
+    fn execution_device(&self, lane: usize) -> Option<Device<'a>> {
+        match &self.backend {
+            DraftBackend::Dspark { chains, .. } => chains[lane].execution_device(),
+            DraftBackend::Dfly2 { chains, .. } => Some(chains[lane].device()),
+        }
+    }
+    pub fn is_dfly2(&self) -> bool {
+        matches!(self.backend, DraftBackend::Dfly2 { .. })
+    }
+    pub fn has_marks(&self) -> bool {
+        !self.is_dfly2()
+    }
+    pub fn invalidate_prefix(&mut self, id: u64) {
+        if let DraftBackend::Dfly2 { taps, .. } = &mut self.backend {
+            taps.invalidate(id);
+        }
+    }
     pub fn admit(&mut self, id: u64) -> Result<()> {
         if let Some(reason) = cuteafd_transport::health::failure_reason() {
             anyhow::bail!("draft runtime unavailable until restart: {reason}");
         }
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        ensure!(!self.requests.contains_key(&id), "draft request already admitted");
-        let slot = (0..self.request_limit).find(|slot| self.requests.values().all(|request| request.slot != *slot))
-            .context("draft request capacity exhausted")?;
-        let mut leases = Vec::new();
-        for stage in 0..3 {
-            match self.windows[stage].begin_request(slot, id) {
-                Ok(lease) => leases.push(lease),
-                Err(error) => {
-                    for (stage, lease) in leases.into_iter().enumerate() {
-                        let _ = self.windows[stage].release(lease);
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
+        match &mut self.backend {
+            DraftBackend::Dspark { windows, requests, .. } => {
+                ensure!(!requests.contains_key(&id), "draft request already admitted");
+                let slot = (0..self.request_limit).find(|slot| requests.values().all(|request| request.slot != *slot))
+                    .context("draft request capacity exhausted")?;
+                let mut leases = Vec::new();
+                for stage in 0..3 {
+                    match windows[stage].begin_request(slot, id) {
+                        Ok(lease) => leases.push(lease),
+                        Err(error) => {
+                            for (stage, lease) in leases.into_iter().enumerate() {
+                                let _ = windows[stage].release(lease);
+                            }
+                            return Err(error);
+                        }
                     }
-                    return Err(error);
                 }
+                requests.insert(id, DraftRequest {
+                    leases: leases.try_into().ok().context("draft admission incomplete")?,
+                    rng: cuteafd_core::DsparkRng::new(id),
+                    slot,
+                });
+                Ok(())
+            }
+            DraftBackend::Dfly2 { taps, .. } => {
+                taps.admit(id)?;
+                Ok(())
             }
         }
-        self.requests.insert(id, DraftRequest {
-            leases: leases.try_into().ok().context("draft admission incomplete")?,
-            rng: cuteafd_core::DsparkRng::new(id),
-            slot,
-        });
-        Ok(())
     }
-    pub(super) fn prefill_tap_capacity(&self) -> usize { self.mains[0].capacity() }
+    pub(super) fn prefill_tap_capacity(&self) -> Option<usize> {
+        match &self.backend {
+            DraftBackend::Dspark { mains, .. } => Some(mains[0].capacity()),
+            DraftBackend::Dfly2 { .. } => None,
+        }
+    }
     pub fn max_verify_rows(&self) -> usize { self.draft_width + crate::shared::draft::copy::COPY_EXTENSION + 1 }
     pub fn attention_drafts(&self) -> usize { self.draft_limit.min(self.draft_width) }
     pub fn set_length(&mut self, length: crate::shared::draft::length::DraftLength) -> Result<()> {
@@ -230,11 +381,16 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         Ok(())
     }
     /// Bind the shared history draft policy before serving. The drafter declares
-    /// its native block and its confidence head's raw logits; `local_layers` is
+    /// its native block and its confidence head score kind; `local_layers` is
     /// the installed placement's RTX layer count, for the console.
     pub(crate) fn bind_policy(&mut self, local_layers: usize) {
         LOCAL_LAYERS.store(local_layers as u64, std::sync::atomic::Ordering::Relaxed);
-        self.policy = Some(Policy::new(self.length, self.draft_width, cuteafd_core::HeadScore::Logit, true));
+        let head = if self.is_dfly2() {
+            cuteafd_core::HeadScore::CandidateProbability
+        } else {
+            cuteafd_core::HeadScore::Logit
+        };
+        self.policy = Some(Policy::new(self.length, self.draft_width, head, true));
     }
     /// What a verification round records besides its outputs: layer events under the timing profile.
     pub fn capture(&self) -> Capture {
@@ -246,14 +402,25 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     /// Plan the lane round's drafts before the draft pass. `seeds` are every
     /// lane member; a short history or an exhausted budget has no room.
     fn plan(&mut self, lane: usize, seeds: &[DraftSeed]) -> Vec<usize> {
-        let requests: Vec<_> = seeds.iter().map(|&(id, _, end, remaining)|
-            (id, if end >= 2 { remaining.saturating_sub(1) } else { 0 })).collect();
+        let requests: Vec<_> = seeds.iter().map(|&(id, _, end, remaining)| {
+            let ready = match &self.backend {
+                DraftBackend::Dspark { .. } => end >= 2,
+                DraftBackend::Dfly2 { taps, .. } => end >= 1 && taps.ready_at(id, end),
+            };
+            (id, if ready { remaining.saturating_sub(1) } else { 0 })
+        }).collect();
         let depths = match &mut self.policy {
             Some(policy) => policy.plan(&requests, self.verify_rows),
             None => requests.iter().map(|&(_, room)| room.min(self.draft_limit)).collect(),
         };
-        let selected = select_draft_members(seeds, &depths, self.draft_width, self.verify_rows,
+        let mut selected = select_draft_members(seeds, &depths, self.draft_width, self.verify_rows,
             |id| self.policy.as_ref().map_or(0., |policy| policy.probability(id, 0)));
+        if let DraftBackend::Dfly2 { taps, .. } = &self.backend {
+            selected.retain(|&i| {
+                let (id, _, end, _) = seeds[i];
+                taps.ready_at(id, end)
+            });
+        }
         self.lanes[lane].depths = depths.clone();
         self.lanes[lane].selected = selected;
         depths
@@ -294,7 +461,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         policy.observe_timed(&outcomes, timing);
     }
     pub fn release(&mut self, id: u64) -> Result<()> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
         ensure!(!self.pending_prefix_ids.contains(&Some(id)), "cannot release a request with pending snapshot copies");
         ensure!(!pending_draft_blocks(&self.pending, id),
             "cannot release a request with a pending draft");
@@ -304,28 +471,41 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         self.confidence_trace.remove(&id);
         self.neural_lengths.remove(&id);
         let mut failure = None;
-        if let Some(request) = self.requests.remove(&id) {
-            for (window, lease) in self.windows.iter_mut().zip(request.leases) {
-                if window.request_id(lease).is_ok() {
-                    if let Err(error) = window.release(lease) {
-                        failure = Some(error);
+        match &mut self.backend {
+            DraftBackend::Dspark { windows, requests, .. } => {
+                if let Some(request) = requests.remove(&id) {
+                    for (window, lease) in windows.iter_mut().zip(request.leases) {
+                        if window.request_id(lease).is_ok() {
+                            if let Err(error) = window.release(lease) {
+                                failure = Some(error);
+                            }
+                        }
                     }
                 }
+            }
+            DraftBackend::Dfly2 { taps, .. } => {
+                taps.release(id);
             }
         }
         failure.map_or(Ok(()), Err)
     }
-    /// The device every draft window (and so every draft mark) lives on.
-    pub fn mark_device(&self) -> crate::shared::memory::device::Device<'a> {
-        self.windows[0].device()
+    /// The device every draft window (and so every draft mark) lives on; `None` for self-stateless DFly2.
+    pub fn mark_device(&self) -> Option<crate::shared::memory::device::Device<'a>> {
+        match &self.backend {
+            DraftBackend::Dspark { windows, .. } => Some(windows[0].device()),
+            DraftBackend::Dfly2 { .. } => None,
+        }
     }
     fn ring_at(mark: CuteafdDeviceBuffer, stage: usize) -> CuteafdDeviceBuffer {
         let bytes = cuteafd_ffi::V41DsparkCache::SLOT_BYTES;
         CuteafdDeviceBuffer { ptr: unsafe { mark.ptr.cast::<u8>().add(stage * bytes).cast() }, bytes, ..mark }
     }
     fn check_frontier(&self, id: u64, end: u64) -> Result<[WindowLease; 3]> {
-        let request = self.requests.get(&id).context("draft request not admitted")?;
-        for (window, lease) in self.windows.iter().zip(request.leases) {
+        let DraftBackend::Dspark { windows, requests, .. } = &self.backend else {
+            anyhow::bail!("DFly2 does not store draft marks");
+        };
+        let request = requests.get(&id).context("draft request not admitted")?;
+        for (window, lease) in windows.iter().zip(request.leases) {
             ensure!(window.committed_end(lease)? == Some(end), "draft and target prefix frontiers differ");
         }
         Ok(request.leases)
@@ -333,12 +513,15 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     /// Copy request `id`'s three rings at frontier `end` into `mark` (`MARK_BYTES` on
     /// `mark_device`) synchronously.
     pub fn capture_mark(&mut self, id: u64, end: u64, mark: CuteafdDeviceBuffer) -> Result<()> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
         ensure!(mark.bytes == DRAFT_MARK_BYTES, "draft mark storage size differs");
         let leases = self.check_frontier(id, end)?;
-        let device = self.windows[0].device();
+        let DraftBackend::Dspark { windows, .. } = &mut self.backend else {
+            anyhow::bail!("DFly2 does not store draft marks");
+        };
+        let device = windows[0].device();
         device.run(|| {
-            for (stage, (window, lease)) in self.windows.iter_mut().zip(leases).enumerate() {
+            for (stage, (window, lease)) in windows.iter_mut().zip(leases).enumerate() {
                 window.capture_ring(lease, Self::ring_at(mark, stage))?;
             }
             Ok(())
@@ -346,20 +529,25 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     }
     /// [`DraftRuntime::capture_mark`] queued on capture lane `lane`.
     pub fn queue_mark(&mut self, lane: usize, id: u64, end: u64, mark: CuteafdDeviceBuffer) -> Result<()> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
         ensure!(self.pending_prefix_ids.get(lane).context("invalid draft snapshot lane")?.is_none(),
             "draft snapshot lane is occupied");
         ensure!(!self.pending_prefix_ids.contains(&Some(id)), "draft snapshot already pending");
         ensure!(mark.bytes == DRAFT_MARK_BYTES, "draft mark storage size differs");
         let leases = self.check_frontier(id, end)?;
         self.pending_prefix_ids[lane] = Some(id);
-        let device = self.windows[0].device();
-        let queued = device.run(|| {
-            for (stage, (window, lease)) in self.windows.iter_mut().zip(leases).enumerate() {
-                window.queue_ring(lane, lease, Self::ring_at(mark, stage))?;
+        let queued = match &mut self.backend {
+            DraftBackend::Dspark { windows, .. } => {
+                let device = windows[0].device();
+                device.run(|| {
+                    for (stage, (window, lease)) in windows.iter_mut().zip(leases).enumerate() {
+                        window.queue_ring(lane, lease, Self::ring_at(mark, stage))?;
+                    }
+                    Ok(())
+                })
             }
-            Ok(())
-        });
+            DraftBackend::Dfly2 { .. } => Err(anyhow::anyhow!("DFly2 does not store draft marks")),
+        };
         if let Err(error) = queued {
             if let Err(cleanup) = self.abort_mark(lane) {
                 tracing::error!(%cleanup, "draining failed draft snapshot enqueue");
@@ -374,62 +562,80 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     }
     /// The common frontier of request `id`'s three rings.
     pub fn committed_end(&self, id: u64) -> Result<u64> {
-        let request = self.requests.get(&id).context("draft request not admitted")?;
-        let mut end = None;
-        for (window, lease) in self.windows.iter().zip(request.leases) {
-            let current = window.committed_end(lease)?.context("draft window is not seeded")?;
-            ensure!(end.is_none_or(|e| e == current), "draft windows disagree on the frontier");
-            end = Some(current);
+        match &self.backend {
+            DraftBackend::Dspark { windows, requests, .. } => {
+                let request = requests.get(&id).context("draft request not admitted")?;
+                let mut end = None;
+                for (window, lease) in windows.iter().zip(request.leases) {
+                    let current = window.committed_end(lease)?.context("draft window is not seeded")?;
+                    ensure!(end.is_none_or(|e| e == current), "draft windows disagree on the frontier");
+                    end = Some(current);
+                }
+                end.context("no draft windows")
+            }
+            DraftBackend::Dfly2 { taps, .. } => {
+                taps.committed_end(id).context("DFly2 request taps not seeded")
+            }
         }
-        end.context("no draft windows")
     }
     /// Whether lane `lane`'s queued rings all landed; the lane frees once they have.
     pub fn mark_ready(&mut self, lane: usize) -> Result<bool> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
         ensure!(self.pending_prefix_ids.get(lane).is_some_and(Option::is_some), "no draft snapshot is pending");
         let mut ready = true;
-        for window in &mut self.windows {
-            // A window whose copy already landed freed its lane; poll only the rest.
-            if window.lane_pending(lane) { ready &= window.ring_ready(lane)?; }
+        if let DraftBackend::Dspark { windows, .. } = &mut self.backend {
+            for window in windows {
+                if window.lane_pending(lane) { ready &= window.ring_ready(lane)?; }
+            }
         }
         if ready { self.pending_prefix_ids[lane] = None; }
         Ok(ready)
     }
     pub fn abort_mark(&mut self, lane: usize) -> Result<()> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
         ensure!(lane < self.pending_prefix_ids.len(), "invalid draft snapshot lane");
         let mut failure = None;
-        for window in &mut self.windows {
-            if let Err(error) = window.abort_ring(lane) { failure.get_or_insert(error); }
+        if let DraftBackend::Dspark { windows, .. } = &mut self.backend {
+            for window in windows {
+                if let Err(error) = window.abort_ring(lane) { failure.get_or_insert(error); }
+            }
         }
         self.pending_prefix_ids[lane] = None;
         failure.map_or(Ok(()), Err)
     }
     /// Drain every restore stream before discard can recycle a draft slot.
     pub fn drain_prefix(&self) -> Result<()> {
-        for window in &self.windows { window.device().run(|| window.synchronize())?; }
+        if let DraftBackend::Dspark { windows, .. } = &self.backend {
+            for window in windows { window.device().run(|| window.synchronize())?; }
+        }
         Ok(())
     }
     /// Restore request `id`'s rings at frontier `end` from `mark`. The caller owns rollback;
     /// errors must not release or readmit a slot whose ring copies may still be queued.
     pub fn restore_mark(&mut self, id: u64, end: u64, mark: CuteafdDeviceBuffer) -> Result<()> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        ensure!(mark.bytes == DRAFT_MARK_BYTES && mark.device_id == self.windows[0].device().id,
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
+        let DraftBackend::Dspark { windows, requests, .. } = &mut self.backend else {
+            anyhow::bail!("DFly2 does not restore draft marks");
+        };
+        ensure!(mark.bytes == DRAFT_MARK_BYTES && mark.device_id == windows[0].device().id,
             "draft mark storage differs from the runtime's");
-        let leases = self.requests.get(&id).context("draft request not admitted")?.leases;
-        let device = self.windows[0].device();
-        let restored = device.run(|| {
+        let leases = requests.get(&id).context("draft request not admitted")?.leases;
+        let device = windows[0].device();
+        device.run(|| {
             for (stage, lease) in leases.into_iter().enumerate() {
-                self.windows[stage].restore_ring(lease, end, Self::ring_at(mark, stage))?;
+                windows[stage].restore_ring(lease, end, Self::ring_at(mark, stage))?;
             }
             Ok(())
-        });
-        restored
+        })
     }
     #[cfg(test)]
     pub(crate) fn validate_position(&self, id: u64, end: u64) -> Result<()> {
-        let request = self.requests.get(&id).context("draft request not admitted")?;
-        for (window, lease) in self.windows.iter().zip(request.leases) {
+        let DraftBackend::Dspark { windows, requests, .. } = &self.backend else {
+            ensure!(self.committed_end(id)? == end, "DFly2 draft position differs");
+            return Ok(());
+        };
+        let request = requests.get(&id).context("draft request not admitted")?;
+        for (window, lease) in windows.iter().zip(request.leases) {
             ensure!(window.request_id(lease)? == id, "draft request identity differs");
             ensure!(window.committed_end(lease)? == Some(end), "draft position differs");
         }
@@ -442,7 +648,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         batch: &mut RequestBatch,
         accepted: u32,
     ) -> Result<()> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
         self.commit_batch(pass, requests, batch, &[accepted])
     }
     pub fn commit_batch(
@@ -452,64 +658,118 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         batch: &mut RequestBatch,
         accepted: &[u32],
     ) -> Result<()> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        let ids = batch.cache()?.request_ids();
-        ensure!(ids.len() == accepted.len(), "draft acceptance count differs");
-        let leases = ids.iter().map(|id| self.requests.get(id)
-            .map(|request| request.leases).context("draft request not admitted"))
-            .collect::<Result<Vec<_>>>()?;
-        let stage_leases: [Vec<WindowLease>; 3] = std::array::from_fn(|stage|
-            leases.iter().map(|request| request[stage]).collect());
-        let taps = pass.taps(batch)?;
-        let mut proposal = unsafe {
-            self.mains[0]
-                .execute_rows(taps.values(), taps.batch_identity(), taps.rows())?
-        };
-        let [a, b, c] = self.windows.as_mut_slice() else {
-            anyhow::bail!("draft windows incomplete");
-        };
-        unsafe {
-            pass.commit_with_dspark(
-                requests,
-                batch,
-                &mut proposal,
-                &mut [a, b, c],
-                [&stage_leases[0], &stage_leases[1], &stage_leases[2]],
-                accepted,
-            )
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
+        match &mut self.backend {
+            DraftBackend::Dspark { mains, windows, requests: draft_requests, .. } => {
+                let ids = batch.cache()?.request_ids();
+                ensure!(ids.len() == accepted.len(), "draft acceptance count differs");
+                let leases = ids.iter().map(|id| draft_requests.get(id)
+                    .map(|request| request.leases).context("draft request not admitted"))
+                    .collect::<Result<Vec<_>>>()?;
+                let stage_leases: [Vec<WindowLease>; 3] = std::array::from_fn(|stage|
+                    leases.iter().map(|request| request[stage]).collect());
+                let taps = pass.taps(batch)?;
+                let mut proposal = unsafe {
+                    mains[0]
+                        .execute_rows(taps.values(), taps.batch_identity(), taps.rows())?
+                };
+                let [a, b, c] = windows.as_mut_slice() else {
+                    anyhow::bail!("draft windows incomplete");
+                };
+                unsafe {
+                    pass.commit_with_dspark(
+                        requests,
+                        batch,
+                        &mut proposal,
+                        &mut [a, b, c],
+                        [&stage_leases[0], &stage_leases[1], &stage_leases[2]],
+                        accepted,
+                    )
+                }
+            }
+            DraftBackend::Dfly2 { taps, commit_streams, .. } => {
+                let sources = pass.dfly2_commit_sources(batch)?;
+                let (copies, frontiers) = prepare_dfly2_tap_updates(&sources, batch, accepted)?;
+                let device = taps.device();
+                device.run(|| {
+                    if !copies.is_empty() {
+                        unsafe {
+                            taps.enqueue_commit_rows(device.library, &copies, commit_streams[0].raw)?;
+                        }
+                        commit_streams[0].drain()?;
+                    }
+                    taps.publish_frontiers(&frontiers)
+                })?;
+                pass.commit(requests, batch, accepted)
+            }
         }
     }
     /// Begin a completed decode batch's accepted-cache transaction on its own lane.
     pub fn begin_queued_commit(&mut self, lane: usize, pass: &impl crate::families::deepseek_v41::v41_target_pass::TargetCache<'a>,
         requests: &Requests<'a>, batch: &RequestBatch, accepted: &[u32]) -> Result<()> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        ensure!(lane < self.mains.len() && self.pending_commit_ids[lane].is_empty(), "commit lane busy or invalid");
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
+        ensure!(self.pending_commit_ids[lane].is_empty(), "commit lane busy or invalid");
         requests.validate_acceptance(batch, accepted)?;
         ensure!(accepted.iter().any(|&n| n > 0), "queued decode commit has no accepted rows");
         let ids = batch.cache()?.request_ids();
-        let leases = ids.iter().map(|id| self.requests.get(id)
-            .map(|request| request.leases).context("draft commit request not admitted"))
-            .collect::<Result<Vec<_>>>()?;
-        let stage_leases: [Vec<WindowLease>; 3] = std::array::from_fn(|stage|
-            leases.iter().map(|request| request[stage]).collect());
-        let taps = pass.taps(batch)?;
-        let chunks = crate::families::deepseek_v41::v41_experts::dspark::prepare_commit_rows(taps.rows(), self.windows.each_ref(),
-            stage_leases.each_ref().map(|leases| leases.as_slice()), accepted)?;
-        let writes = [self.windows[0].prepare_async_write(&chunks[0], taps.rows().len() as u32)?,
-            self.windows[1].prepare_async_write(&chunks[1], taps.rows().len() as u32)?,
-            self.windows[2].prepare_async_write(&chunks[2], taps.rows().len() as u32)?];
-        self.pending_commit_ids[lane] = ids.to_vec();
-        unsafe { self.mains[lane].enqueue_commit(taps.values(), &batch.cache()?.positions(),
-            self.windows.each_ref(), writes) }
+        match &mut self.backend {
+            DraftBackend::Dspark { mains, windows, requests: draft_requests, .. } => {
+                ensure!(lane < mains.len(), "commit lane invalid");
+                let leases = ids.iter().map(|id| draft_requests.get(id)
+                    .map(|request| request.leases).context("draft commit request not admitted"))
+                    .collect::<Result<Vec<_>>>()?;
+                let stage_leases: [Vec<WindowLease>; 3] = std::array::from_fn(|stage|
+                    leases.iter().map(|request| request[stage]).collect());
+                let taps = pass.taps(batch)?;
+                let chunks = crate::families::deepseek_v41::v41_experts::dspark::prepare_commit_rows(taps.rows(), windows.each_ref(),
+                    stage_leases.each_ref().map(|leases| leases.as_slice()), accepted)?;
+                let writes = [windows[0].prepare_async_write(&chunks[0], taps.rows().len() as u32)?,
+                    windows[1].prepare_async_write(&chunks[1], taps.rows().len() as u32)?,
+                    windows[2].prepare_async_write(&chunks[2], taps.rows().len() as u32)?];
+                self.pending_commit_ids[lane] = ids.to_vec();
+                unsafe { mains[lane].enqueue_commit(taps.values(), &batch.cache()?.positions(),
+                    windows.each_ref(), writes) }
+            }
+            DraftBackend::Dfly2 { taps, commit_streams, commit_done, pending_updates, .. } => {
+                ensure!(lane < commit_streams.len(), "DFly2 commit lane invalid");
+                let sources = pass.dfly2_commit_sources(batch)?;
+                let (copies, frontiers) = prepare_dfly2_tap_updates(&sources, batch, accepted)?;
+                let device = taps.device();
+                device.run(|| {
+                    if !copies.is_empty() {
+                        unsafe {
+                            taps.enqueue_commit_rows(device.library, &copies, commit_streams[lane].raw)?;
+                        }
+                    }
+                    commit_done[lane].record(&commit_streams[lane])
+                })?;
+                pending_updates[lane] = frontiers;
+                self.pending_commit_ids[lane] = ids.to_vec();
+                Ok(())
+            }
+        }
     }
     pub fn poll_queued_commit(&self, lane: usize) -> Result<bool> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        self.mains[lane].poll_commit()
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
+        match &self.backend {
+            DraftBackend::Dspark { mains, .. } => mains[lane].poll_commit(),
+            DraftBackend::Dfly2 { taps, commit_done, .. } => taps.device().run(|| unsafe {
+                taps.device().library.cuda_event_query(commit_done[lane].raw)
+            }),
+        }
     }
     pub fn finish_queued_commit(&mut self, lane: usize, pass: &mut impl crate::families::deepseek_v41::v41_target_pass::TargetCache<'a>,
         requests: &mut Requests<'a>, batch: &mut RequestBatch, accepted: &[u32]) -> Result<()> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
-        self.mains[lane].publish_commit(self.windows.as_mut_slice())?;
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
+        match &mut self.backend {
+            DraftBackend::Dspark { mains, windows, .. } => {
+                mains[lane].publish_commit(windows.as_mut_slice())?;
+            }
+            DraftBackend::Dfly2 { taps, pending_updates, .. } => {
+                let updates = std::mem::take(&mut pending_updates[lane]);
+                taps.publish_frontiers(&updates)?;
+            }
+        }
         pass.commit(requests, batch, accepted)?;
         self.pending_commit_ids[lane].clear();
         Ok(())
@@ -517,13 +777,19 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     /// Drain before revoking any target/cache storage, including partial enqueue.
     pub fn abort_queued_commit(&mut self, lane: usize, requests: &mut Requests<'a>,
         batch: &mut RequestBatch) -> Result<()> {
-        let _device = self.chains[0].execution_device().map(|device| device.enter()).transpose()?;
+        let _device = self.execution_device(0).map(|device| device.enter()).transpose()?;
         // Target publication may have cancelled the batch before returning an
         // error. Keep cleanup independent of its now-unavailable cache view.
         let ids = if self.pending_commit_ids[lane].is_empty() {
             batch.cache().map(|cache| cache.request_ids().to_vec()).unwrap_or_default()
         } else { self.pending_commit_ids[lane].clone() };
-        let mut result = self.mains[lane].abort_commit(self.windows.as_mut_slice());
+        let mut result = match &mut self.backend {
+            DraftBackend::Dspark { mains, windows, .. } => mains[lane].abort_commit(windows.as_mut_slice()),
+            DraftBackend::Dfly2 { commit_streams, pending_updates, .. } => {
+                pending_updates[lane].clear();
+                commit_streams[lane].drain()
+            }
+        };
         self.pending_commit_ids[lane].clear();
         requests.revoke_batch(batch);
         for id in ids { if let Err(error) = self.release(id) { result = Err(error); } }
@@ -533,27 +799,38 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     /// Each lane owns its draft scratch and stream; both can replay concurrently.
     /// Short RefCell borrows never survive a scheduler yield.
     pub(crate) fn visit_graph_banks(&mut self, f: &mut dyn FnMut(i32, &'static str, bool, &mut dyn crate::shared::decode_graph::CacheAttached) -> Result<()>) -> Result<()> {
-        for main in &mut self.mains { main.visit_graph_banks(f)?; }
-        for chain in &mut self.chains { chain.visit_graph_banks(f)?; }
+        if let DraftBackend::Dspark { mains, chains, .. } = &mut self.backend {
+            for main in mains { main.visit_graph_banks(f)?; }
+            for chain in chains { chain.visit_graph_banks(f)?; }
+        }
         Ok(())
     }
     pub(crate) fn visit_lane_graphs(&mut self, lane: usize,
         f: &mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()> {
-        if let Some(main) = self.mains.get_mut(lane) { main.visit_graph_banks(f)?; }
-        if let Some(chain) = self.chains.get_mut(lane) { chain.visit_graph_banks(f)?; }
+        if let DraftBackend::Dspark { mains, chains, .. } = &mut self.backend {
+            if let Some(main) = mains.get_mut(lane) { main.visit_graph_banks(f)?; }
+            if let Some(chain) = chains.get_mut(lane) { chain.visit_graph_banks(f)?; }
+        }
         Ok(())
     }
     fn graph_cycle(&mut self, lane: usize) -> Result<()> {
+        if self.is_dfly2() { return Ok(()); }
         crate::families::deepseek_v41::graph_policy::cycle(
             crate::shared::decode_graph::device::Cycle::Verify, |f| self.visit_lane_graphs(lane, f))
     }
     fn graph_completed(&mut self) -> Result<()> {
-        let library = self.windows[0].device().library;
+        let library = match &self.backend {
+            DraftBackend::Dspark { windows, .. } => windows[0].device().library,
+            DraftBackend::Dfly2 { .. } => return Ok(()),
+        };
         unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
             crate::shared::decode_graph::device::observe_completed(library, |f| self.visit_graph_banks(f)) }
     }
     fn graph_lane_completed(&mut self, lane: usize) -> Result<()> {
-        let library = self.windows[0].device().library;
+        let library = match &self.backend {
+            DraftBackend::Dspark { windows, .. } => windows[0].device().library,
+            DraftBackend::Dfly2 { .. } => return Ok(()),
+        };
         // SAFETY: this completed draft owns only persistent captured storage.
         unsafe { crate::shared::decode_graph::device::observe_completed(library,
             |f| self.visit_lane_graphs(lane, f)) }
@@ -561,94 +838,160 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     pub fn poll_propose(&mut self, lane: usize,
         inputs: &[(u64, u32, u64, usize)],
     ) -> Result<Option<(Vec<Vec<u32>>, u64)>> {
-        ensure!(lane < self.chains.len(), "invalid draft lane");
-        let _device = self.chains[lane].execution_device().map(|device| device.enter()).transpose()?;
+        self.poll_propose_with_cache(lane, inputs, None)
+    }
+    pub fn poll_propose_with_cache(&mut self, lane: usize,
+        inputs: &[(u64, u32, u64, usize)],
+        cache: Option<&BackboneCache<'a>>,
+    ) -> Result<Option<(Vec<Vec<u32>>, u64)>> {
+        let chain_count = match &self.backend {
+            DraftBackend::Dspark { chains, .. } => chains.len(),
+            DraftBackend::Dfly2 { chains, .. } => chains.len(),
+        };
+        ensure!(lane < chain_count, "invalid draft lane");
+        let _device = self.execution_device(lane).map(|device| device.enter()).transpose()?;
         if let Some((seeds, started)) = self.pending[lane].take() {
             if seeds != inputs {
-                // W64-1: the pending proposal no longer matches this round's
-                // inputs. Cancel it and drop the marker so `release()` can free
-                // the requests; the caller then verifies anchors only.
-                self.chains[lane].cancel_replay();
+                match &mut self.backend {
+                    DraftBackend::Dspark { chains, .. } => chains[lane].cancel_replay(),
+                    DraftBackend::Dfly2 { chains, .. } => chains[lane].cancel_pending(),
+                }
                 if let Some(round) = self.lanes.get_mut(lane) {
-                    // Clear the cancelled proposal's ids, not the new round's:
-                    // the new round resets its own state when it starts.
                     reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, &seeds);
                 }
                 anyhow::bail!("pending draft request inputs changed");
             }
-            let completed = match self.chains[lane].poll_replay() {
-                Ok(None) => { self.pending[lane] = Some((seeds, started)); return Ok(None); },
-                Ok(Some(value)) => value,
-                Err(error) => {
-                    self.chains[lane].note_failure(&error);
-                    if let Some(round) = self.lanes.get_mut(lane) {
-                        reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, inputs);
+            match &mut self.backend {
+                DraftBackend::Dspark { chains, .. } => {
+                    let completed = match chains[lane].poll_replay() {
+                        Ok(None) => { self.pending[lane] = Some((seeds, started)); return Ok(None); },
+                        Ok(Some(value)) => value,
+                        Err(error) => {
+                            chains[lane].note_failure(&error);
+                            if let Some(round) = self.lanes.get_mut(lane) {
+                                reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, inputs);
+                            }
+                            return Err(error);
+                        },
+                    };
+                    self.graph_lane_completed(lane)?;
+                    let (packed, values) = completed;
+                    let active: Vec<_> = self.lanes[lane].selected.iter().map(|&i| (i, &inputs[i])).collect();
+                    let count = active.len();
+                    let width = self.draft_width;
+                    ensure!(packed.len() == (width+1)*count && values.len() == width*count, "draft output extent differs");
+                    let mut outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
+                    for (row, &(output, &(id, anchor, _, remaining))) in active.iter().enumerate() {
+                        if self.wants_confidence() {
+                            self.confidence_trace.insert(id, (0..width).map(|step| values[step*count+row]).collect());
+                        }
+                        let tokens: Vec<_> = (0..=width).map(|step| packed[step*count+row]).collect();
+                        ensure!(tokens[0] == anchor && tokens.iter().all(|&t| t < 129280), "invalid draft tokens");
+                        let depth = self.lanes[lane].depths.get(output).copied().unwrap_or(0);
+                        outputs[output] = tokens[..remaining.min(depth.min(width)+1)].to_vec();
                     }
-                    return Err(error);
-                },
-            };
-            self.graph_lane_completed(lane)?;
-            let (packed, values) = completed;
-            let active: Vec<_> = self.lanes[lane].selected.iter().map(|&i| (i, &inputs[i])).collect();
-            let count = active.len();
-            let width = self.chains[lane].width();
-            ensure!(packed.len() == (width+1)*count && values.len() == width*count, "draft output extent differs");
-            let mut outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
-            for (row, &(output, &(id, anchor, _, remaining))) in active.iter().enumerate() {
-                if self.wants_confidence() {
-                    self.confidence_trace.insert(id, (0..width).map(|step| values[step*count+row]).collect());
+                    return Ok(Some((outputs, started.elapsed().as_micros() as u64)));
                 }
-                let tokens: Vec<_> = (0..=width).map(|step| packed[step*count+row]).collect();
-                ensure!(tokens[0] == anchor && tokens.iter().all(|&t| t < 129280), "invalid draft tokens");
-                let depth = self.lanes[lane].depths.get(output).copied().unwrap_or(0);
-                outputs[output] = tokens[..remaining.min(depth.min(width)+1)].to_vec();
+                DraftBackend::Dfly2 { chains, failure, .. } => {
+                    let completed = match chains[lane].poll() {
+                        Ok(None) => { self.pending[lane] = Some((seeds, started)); return Ok(None); }
+                        Ok(Some(value)) => value,
+                        Err(error) => {
+                            failure.record(&error);
+                            if let Some(round) = self.lanes.get_mut(lane) {
+                                reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, inputs);
+                            }
+                            return Err(error);
+                        }
+                    };
+                    let (tokens_rd, probs_rd) = completed;
+                    let active: Vec<_> = self.lanes[lane].selected.iter().map(|&i| (i, &inputs[i])).collect();
+                    let count = active.len();
+                    let width = self.draft_width;
+                    ensure!(tokens_rd.len() == width * count && probs_rd.len() == width * count, "DFly2 output extent differs");
+                    let mut outputs: Vec<_> = inputs.iter().map(|(_, anchor, _, _)| vec![*anchor]).collect();
+                    for (row, &(output, &(id, anchor, _, remaining))) in active.iter().enumerate() {
+                        let req_tokens = &tokens_rd[row * width..(row + 1) * width];
+                        let req_probs = &probs_rd[row * width..(row + 1) * width];
+                        ensure!(req_tokens.iter().all(|&t| t < 129280), "invalid DFly2 draft tokens");
+                        if self.wants_confidence() {
+                            self.confidence_trace.insert(id, req_probs.to_vec());
+                        }
+                        let depth = self.lanes[lane].depths.get(output).copied().unwrap_or(0);
+                        let take = remaining.saturating_sub(1).min(depth.min(width));
+                        let mut seq = Vec::with_capacity(1 + take);
+                        seq.push(anchor);
+                        seq.extend_from_slice(&req_tokens[..take]);
+                        outputs[output] = seq;
+                    }
+                    return Ok(Some((outputs, started.elapsed().as_micros() as u64)));
+                }
             }
-            return Ok(Some((outputs, started.elapsed().as_micros() as u64)));
         }
         let started = Instant::now();
         ensure!(self.pending[lane].is_none(), "shared draft proposal still pending");
-        // W64-1: reset before the guards so a proposal that fails them cannot
-        // leave the previous round's width/counts/confidence behind.
         if let Some(round) = self.lanes.get_mut(lane) {
             reset_lane_draft(round, &mut self.confidence_trace, &mut self.neural_lengths, inputs);
         }
         ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::v41_lane_members(self.lanes.len()), "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
-            ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");
+            let admitted = match &self.backend {
+                DraftBackend::Dspark { requests, .. } => requests.contains_key(&id),
+                DraftBackend::Dfly2 { taps, .. } => taps.contains(id),
+            };
+            ensure!(seen.insert(id) && admitted, "invalid draft request identity");
             ensure!(anchor < 129280 && remaining > 0, "invalid draft request input");
         }
         let outputs = anchor_inputs(inputs);
-        // No planned draft: the round verifies its anchors without a draft pass.
         let depths = self.plan(lane, inputs);
         let active: Vec<_> = self.lanes[lane].selected.iter().map(|&i| (i, &inputs[i])).collect();
         if active.is_empty() || depths.iter().all(|&depth| depth == 0) {
             return Ok(Some((outputs, started.elapsed().as_micros() as u64)));
         }
         let count = active.len();
-        let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
-        let bindings: [Vec<_>; 3] = std::array::from_fn(|stage| active.iter()
-            .map(|(_, (id, _, end, _))| (self.requests[id].leases[stage], *end)).collect());
-        if let Err(error) = self.chains[lane].stage_tokens(&tokens) {
-            self.chains[lane].note_failure(&error);
-            return Err(error);
-        }
-        let mut rngs: Vec<_> = self.requests.iter_mut().filter_map(|(id, request)|
-            active.iter().position(|(_, (active_id, _, _, _))| active_id == id)
-                .map(|index| (index, &mut request.rng))).collect();
-        rngs.sort_by_key(|(index, _)| *index);
-        if let Err(error) = self.chains[lane].stage_sampling(&mut rngs.into_iter().map(|(_, rng)| rng).collect::<Vec<_>>(),
-            &vec![0.0; count]) {
-            self.chains[lane].note_failure(&error);
-            return Err(error);
-        }
         self.graph_cycle(lane)?;
-        let windows = self.windows.each_ref();
-        let bindings = bindings.each_ref().map(|rows| rows.as_slice());
-        // SAFETY: admitted leases and windows stay owned by the runtime through completion/cancellation.
-        if let Err(error) = unsafe { self.chains[lane].begin_replay(windows, bindings) } {
-            self.chains[lane].note_failure(&error);
-            return Err(error);
+        match &mut self.backend {
+            DraftBackend::Dspark { chains, windows, requests, .. } => {
+                let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
+                let bindings: [Vec<_>; 3] = std::array::from_fn(|stage| active.iter()
+                    .map(|(_, (id, _, end, _))| (requests[id].leases[stage], *end)).collect());
+                if let Err(error) = chains[lane].stage_tokens(&tokens) {
+                    chains[lane].note_failure(&error);
+                    return Err(error);
+                }
+                let mut rngs: Vec<_> = requests.iter_mut().filter_map(|(id, request)|
+                    active.iter().position(|(_, (active_id, _, _, _))| active_id == id)
+                        .map(|index| (index, &mut request.rng))).collect();
+                rngs.sort_by_key(|(index, _)| *index);
+                if let Err(error) = chains[lane].stage_sampling(&mut rngs.into_iter().map(|(_, rng)| rng).collect::<Vec<_>>(),
+                    &vec![0.0; count]) {
+                    chains[lane].note_failure(&error);
+                    return Err(error);
+                }
+                let windows = windows.each_ref();
+                let bindings = bindings.each_ref().map(|rows| rows.as_slice());
+                if let Err(error) = unsafe { chains[lane].begin_replay(windows, bindings) } {
+                    chains[lane].note_failure(&error);
+                    return Err(error);
+                }
+            }
+            DraftBackend::Dfly2 { chains, taps, failure, .. } => {
+                let cache = cache.context("DFly2 draft requires live backbone cache")?;
+                let items: Vec<(u64, u32, u64)> = active.iter().map(|&(_, &(id, anchor, end, _))| (id, anchor, end)).collect();
+                let mut ctx = [Vec::with_capacity(count), Vec::with_capacity(count), Vec::with_capacity(count)];
+                for stage in 0..3 {
+                    for &(id, _, _) in &items {
+                        let recall = taps.recall_row(id, stage)?;
+                        ctx[stage].push(cache.dfly2_context_by_id(id, stage, recall)?);
+                    }
+                }
+                let refs = [ctx[0].as_slice(), ctx[1].as_slice(), ctx[2].as_slice()];
+                if let Err(error) = unsafe { chains[lane].begin(taps, &items, refs) } {
+                    failure.record(&error);
+                    return Err(error);
+                }
+            }
         }
         self.pending[lane] = Some((inputs.to_vec(), started));
         Ok(None)
@@ -660,13 +1003,17 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
 }
 
 impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
-    pub fn windows(&self) -> &[DsparkWindow<'a>] {
-        &self.windows
-    }
     /// Liveness gate for the anchor-only fallback: a terminal draft propagates
     /// its error instead of silently degrading every round to anchors.
     pub fn require_live(&self, lane: usize) -> Result<()> {
-        self.chains.get(lane).context("invalid draft lane")?.require_live()
+        match &self.backend {
+            DraftBackend::Dspark { chains, .. } => chains.get(lane).context("invalid draft lane")?.require_live(),
+            DraftBackend::Dfly2 { chains, failure, .. } => {
+                ensure!(lane < chains.len(), "invalid draft lane");
+                failure.check("V4.1 DFly2 draft chain")?;
+                require_peer_live()
+            }
+        }
     }
     /// A failed draft proposal: verify each member's anchor alone, but only
     /// while the draft is still live. A terminal draft propagates its error so
@@ -680,105 +1027,145 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
         }
         let total = DRAFT_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         tracing::warn!(lane, requests = seeds.len(), total, error = %format!("{error:#}"),
-            "dSpark draft proposal failed; this lane round verifies anchors only");
+            "draft proposal failed; this lane round verifies anchors only");
         Ok(anchor_inputs(seeds))
     }
 
 }
 impl<'w, 'a, C: ProposeChain<'a>> DraftRuntime<'w, 'a, C> {
-    /// Inputs are (request identity, anchor, committed end, remaining output budget).
-    /// Returned rows retain input order; short histories/budgets use the anchor only.
-    ///
-    /// The lane's own chain drafts and latches: `propose` and `require_live` must
-    /// agree on which chain a lane owns, or a terminal failure on one chain is
-    /// never seen by the lane that drafts on it.
     pub fn propose(&mut self, lane: usize,
         inputs: &[(u64, u32, u64, usize)],
     ) -> Result<Vec<Vec<u32>>> {
-        ensure!(lane < self.lanes.len() && lane < self.chains.len(), "invalid draft lane");
+        self.propose_with_cache(lane, inputs, None)
+    }
+    /// Inputs are (request identity, anchor, committed end, remaining output budget).
+    /// Returned rows retain input order; short histories/budgets use the anchor only.
+    pub fn propose_with_cache(&mut self, lane: usize,
+        inputs: &[(u64, u32, u64, usize)],
+        cache: Option<&BackboneCache<'a>>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let chain_count = match &self.backend {
+            DraftBackend::Dspark { chains, .. } => chains.len(),
+            DraftBackend::Dfly2 { chains, .. } => chains.len(),
+        };
+        ensure!(lane < self.lanes.len() && lane < chain_count, "invalid draft lane");
         ensure!(self.pending.iter().all(Option::is_none), "shared draft proposal still pending");
-        // W64-1: reset before the guards so a proposal that fails them cannot
-        // leave the previous round's width/counts/confidence behind.
         reset_lane_draft(&mut self.lanes[lane], &mut self.confidence_trace, &mut self.neural_lengths, inputs);
         ensure!(!inputs.is_empty() && inputs.len() <= cuteafd_core::v41_lane_members(self.lanes.len()), "invalid draft batch size");
         let mut seen = std::collections::BTreeSet::new();
         for &(id, anchor, _, remaining) in inputs {
-            ensure!(seen.insert(id) && self.requests.contains_key(&id), "invalid draft request identity");
+            let admitted = match &self.backend {
+                DraftBackend::Dspark { requests, .. } => requests.contains_key(&id),
+                DraftBackend::Dfly2 { taps, .. } => taps.contains(id),
+            };
+            ensure!(seen.insert(id) && admitted, "invalid draft request identity");
             ensure!(anchor < 129280 && remaining > 0, "invalid draft request input");
         }
         let mut outputs = anchor_inputs(inputs);
-        // No planned draft: the round verifies its anchors without a draft pass.
         let depths = self.plan(lane, inputs);
         let active: Vec<_> = self.lanes[lane].selected.iter().map(|&i| (i, &inputs[i])).collect();
         if active.is_empty() || depths.iter().all(|&depth| depth == 0) { return Ok(outputs); }
-        let width = self.chains[lane].width();
+        let width = self.draft_width;
         let count = active.len();
-        let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
-        let bindings: [Vec<_>; 3] = std::array::from_fn(|stage| active.iter()
-            .map(|(_, (id, _, end, _))| (self.requests[id].leases[stage], *end)).collect());
-        if let Err(error) = self.chains[lane].set_tokens(&tokens) {
-            self.chains[lane].note_failure(&error);
-            return Err(error);
-        }
-        let mut rngs: Vec<_> = self.requests.iter_mut().filter_map(|(id, request)|
-            active.iter().position(|(_, (active_id, _, _, _))| active_id == id)
-                .map(|index| (index, &mut request.rng))).collect();
-        rngs.sort_by_key(|(index, _)| *index);
-        if let Err(error) = self.chains[lane].prepare_sampling(
-            &mut rngs.into_iter().map(|(_, rng)| rng).collect::<Vec<_>>(), &vec![0.0; count]) {
-            self.chains[lane].note_failure(&error);
-            return Err(error);
-        }
         self.graph_cycle(lane)?;
-        let windows = self.windows.each_ref();
-        let bindings = bindings.each_ref().map(|rows| rows.as_slice());
-        if !self.chains[lane].has_graph(count) {
-            // SAFETY: admitted leases and windows remain owned until the synchronous operation drains.
-            if let Err(error) = unsafe { self.chains[lane].capture(windows, bindings) } {
-                self.chains[lane].note_failure(&error);
-                return Err(error);
+        let wants_conf = self.wants_confidence();
+        match &mut self.backend {
+            DraftBackend::Dspark { chains, windows, requests, .. } => {
+                let tokens: Vec<_> = active.iter().map(|(_, (_, anchor, _, _))| *anchor as i32).collect();
+                let bindings: [Vec<_>; 3] = std::array::from_fn(|stage| active.iter()
+                    .map(|(_, (id, _, end, _))| (requests[id].leases[stage], *end)).collect());
+                if let Err(error) = chains[lane].set_tokens(&tokens) {
+                    chains[lane].note_failure(&error);
+                    return Err(error);
+                }
+                let mut rngs: Vec<_> = requests.iter_mut().filter_map(|(id, request)|
+                    active.iter().position(|(_, (active_id, _, _, _))| active_id == id)
+                        .map(|index| (index, &mut request.rng))).collect();
+                rngs.sort_by_key(|(index, _)| *index);
+                if let Err(error) = chains[lane].prepare_sampling(
+                    &mut rngs.into_iter().map(|(_, rng)| rng).collect::<Vec<_>>(), &vec![0.0; count]) {
+                    chains[lane].note_failure(&error);
+                    return Err(error);
+                }
+                let windows = windows.each_ref();
+                let bindings = bindings.each_ref().map(|rows| rows.as_slice());
+                if !chains[lane].has_graph(count) {
+                    if let Err(error) = unsafe { chains[lane].capture(windows, bindings) } {
+                        chains[lane].note_failure(&error);
+                        return Err(error);
+                    }
+                }
+                if let Err(error) = unsafe { chains[lane].replay(windows, bindings) } {
+                    chains[lane].note_failure(&error);
+                    return Err(error);
+                }
+                let buffer = match chains[lane].draft_output() {
+                    Ok(output) => output[0],
+                    Err(error) => { chains[lane].note_failure(&error); return Err(error); }
+                };
+                let mut bytes = vec![0; buffer.bytes];
+                if let Err(error) = chains[lane].copy_d2h(&mut bytes, buffer) {
+                    chains[lane].note_failure(&error);
+                    return Err(error);
+                }
+                ensure!(bytes.len() == (width + 1) * count * 4, "draft token extent differs");
+                let packed: Vec<_> = bytes.chunks_exact(4)
+                    .map(|b| u32::from_ne_bytes(b.try_into().unwrap())).collect();
+                if wants_conf {
+                    let confidence = match chains[lane].draft_output() {
+                        Ok(output) => output[2],
+                        Err(error) => { chains[lane].note_failure(&error); return Err(error); }
+                    };
+                    ensure!(confidence.bytes == width * count * 4, "draft confidence extent differs");
+                    let mut bytes = vec![0; confidence.bytes];
+                    if let Err(error) = chains[lane].copy_d2h(&mut bytes, confidence) {
+                        chains[lane].note_failure(&error);
+                        return Err(error);
+                    }
+                    let values: Vec<_> = bytes.chunks_exact(4)
+                        .map(|b| f32::from_ne_bytes(b.try_into().unwrap())).collect();
+                    for (row, &(_, &(id, _, _, _))) in active.iter().enumerate() {
+                        self.confidence_trace.insert(id,
+                            (0..width).map(|step| values[step * count + row]).collect());
+                    }
+                }
+                self.graph_lane_completed(lane)?;
+                for (row, &(output, &(_, anchor, _, remaining))) in active.iter().enumerate() {
+                    let tokens: Vec<_> = (0..=width).map(|step| packed[step * count + row]).collect();
+                    ensure!(tokens[0] == anchor && tokens.iter().all(|&token| token < 129280), "invalid draft tokens");
+                    outputs[output] = tokens[..remaining.min(depths[output].min(width) + 1)].to_vec();
+                }
             }
-        }
-        // SAFETY: same stable window/binding lifetime as capture above.
-        if let Err(error) = unsafe { self.chains[lane].replay(windows, bindings) } {
-            self.chains[lane].note_failure(&error);
-            return Err(error);
-        }
-        self.graph_lane_completed(lane)?;
-        let buffer = match self.chains[lane].draft_output() {
-            Ok(output) => output[0],
-            Err(error) => { self.chains[lane].note_failure(&error); return Err(error); }
-        };
-        let mut bytes = vec![0; buffer.bytes];
-        if let Err(error) = self.chains[lane].copy_d2h(&mut bytes, buffer) {
-            self.chains[lane].note_failure(&error);
-            return Err(error);
-        }
-        ensure!(bytes.len() == (width + 1) * count * 4, "draft token extent differs");
-        let packed: Vec<_> = bytes.chunks_exact(4)
-            .map(|b| u32::from_ne_bytes(b.try_into().unwrap())).collect();
-        if self.wants_confidence() {
-            let confidence = match self.chains[lane].draft_output() {
-                Ok(output) => output[2],
-                Err(error) => { self.chains[lane].note_failure(&error); return Err(error); }
-            };
-            ensure!(confidence.bytes == width * count * 4, "draft confidence extent differs");
-            let mut bytes = vec![0; confidence.bytes];
-            if let Err(error) = self.chains[lane].copy_d2h(&mut bytes, confidence) {
-                self.chains[lane].note_failure(&error);
-                return Err(error);
+            DraftBackend::Dfly2 { chains, taps, failure, .. } => {
+                let cache = cache.context("DFly2 draft requires live backbone cache")?;
+                let items: Vec<(u64, u32, u64)> = active.iter().map(|&(_, &(id, anchor, end, _))| (id, anchor, end)).collect();
+                let mut ctx = [Vec::with_capacity(count), Vec::with_capacity(count), Vec::with_capacity(count)];
+                for stage in 0..3 {
+                    for &(id, _, _) in &items {
+                        let recall = taps.recall_row(id, stage)?;
+                        ctx[stage].push(cache.dfly2_context_by_id(id, stage, recall)?);
+                    }
+                }
+                let refs = [ctx[0].as_slice(), ctx[1].as_slice(), ctx[2].as_slice()];
+                let (tokens_rd, probs_rd) = match unsafe { chains[lane].propose_sync(taps, &items, refs) } {
+                    Ok(v) => v,
+                    Err(error) => { failure.record(&error); return Err(error); }
+                };
+                ensure!(tokens_rd.len() == width * count && probs_rd.len() == width * count, "DFly2 output extent differs");
+                for (row, &(output, &(id, anchor, _, remaining))) in active.iter().enumerate() {
+                    let req_tokens = &tokens_rd[row * width..(row + 1) * width];
+                    let req_probs = &probs_rd[row * width..(row + 1) * width];
+                    ensure!(req_tokens.iter().all(|&t| t < 129280), "invalid DFly2 draft tokens");
+                    if wants_conf {
+                        self.confidence_trace.insert(id, req_probs.to_vec());
+                    }
+                    let take = remaining.saturating_sub(1).min(depths[output].min(width));
+                    let mut seq = Vec::with_capacity(1 + take);
+                    seq.push(anchor);
+                    seq.extend_from_slice(&req_tokens[..take]);
+                    outputs[output] = seq;
+                }
             }
-            let values: Vec<_> = bytes.chunks_exact(4)
-                .map(|b| f32::from_ne_bytes(b.try_into().unwrap())).collect();
-            for (row, &(_, &(id, _, _, _))) in active.iter().enumerate() {
-                self.confidence_trace.insert(id,
-                    (0..width).map(|step| values[step * count + row]).collect());
-            }
-        }
-        for (row, &(output, &(_, anchor, _, remaining))) in active.iter().enumerate() {
-            let tokens: Vec<_> = (0..=width).map(|step| packed[step * count + row]).collect();
-            ensure!(tokens[0] == anchor && tokens.iter().all(|&token| token < 129280), "invalid draft tokens");
-            outputs[output] = tokens[..remaining.min(depths[output].min(width) + 1)].to_vec();
         }
         Ok(outputs)
     }
@@ -899,9 +1286,14 @@ mod anchor_fallback_tests {
     fn runtime<'a>(lib: &'a NativeLibrary, at: At, device_error: bool) -> Result<DraftRuntime<'a, 'a, FailingChain>> {
         let window = || DsparkWindow::new(lib, 4, 8, DsparkWindow::device_bytes(4, 8)?);
         let mut runtime = DraftRuntime {
-            mains: Vec::new(), chains: (0..2).map(|_| FailingChain::new(at, device_error)).collect(),
-            windows: [window()?, window()?, window()?], pending_commit_ids: vec![Vec::new(); 2],
-            pending_prefix_ids: [None, None], requests: Default::default(), pending: vec![None; 2],
+            backend: DraftBackend::Dspark {
+                mains: Vec::new(),
+                chains: (0..2).map(|_| FailingChain::new(at, device_error)).collect(),
+                windows: [window()?, window()?, window()?],
+                requests: Default::default(),
+            },
+            pending_commit_ids: vec![Vec::new(); 2],
+            pending_prefix_ids: [None, None], pending: vec![None; 2],
             request_limit: 4, verify_rows: cuteafd_core::V41_VERIFY_ROWS, draft_limit: 5, draft_width: 5, confidence_trace: Default::default(),
             neural_lengths: Default::default(), length: Default::default(), policy: None,
             lanes: vec![LaneDraft::default(); 2],
@@ -909,6 +1301,12 @@ mod anchor_fallback_tests {
         for id in 1..=4 { runtime.admit(id)?; }
         runtime.bind_policy(0);
         Ok(runtime)
+    }
+    fn dspark_parts<'r, 'w, 'a, C>(runtime: &'r mut DraftRuntime<'w, 'a, C>) -> (&'r mut Vec<C>, &'r mut [DsparkWindow<'a>; 3], &'r mut std::collections::BTreeMap<u64, DraftRequest>) {
+        match &mut runtime.backend {
+            DraftBackend::Dspark { chains, windows, requests, .. } => (chains, windows, requests),
+            DraftBackend::Dfly2 { .. } => unreachable!("expected dSpark backend in test"),
+        }
     }
     fn seeds(ids: &[u64]) -> Vec<DraftSeed> {
         ids.iter().enumerate().map(|(i, &id)| (id, 11 + i as u32, 5, 9)).collect()
@@ -929,7 +1327,7 @@ mod anchor_fallback_tests {
         let mut runtime = runtime(&lib, At::Never, false)?;
         let mark = crate::shared::memory::DeviceAllocation::new(&lib, DRAFT_MARK_BYTES,
             crate::shared::memory::TEST)?;
-        let lease = runtime.requests[&1].leases[0];
+        let lease = dspark_parts(&mut runtime).2[&1].leases[0];
         tokio::runtime::Runtime::new()?.block_on(async {
             use axum::{body::Body, http::{Request, StatusCode}};
             use tower::ServiceExt;
@@ -944,12 +1342,12 @@ mod anchor_fallback_tests {
             assert_eq!(app.clone().oneshot(get()).await?.status(), StatusCode::OK);
             fixture.configure_pack(&lib, 0, 1)?;
             assert!(runtime.restore_mark(1, 63, mark.buffer).is_err());
-            assert!(runtime.requests.contains_key(&1), "restore must retain failed request ownership");
+            assert!(dspark_parts(&mut runtime).2.contains_key(&1), "restore must retain failed request ownership");
             assert!(runtime.drain_prefix().is_err());
             runtime.release(1)?; // Poisoned component ownership remains held, not recycled.
             assert!(runtime.admit(1).is_err(), "failed ring slot must never be readmitted");
-            assert!(runtime.windows[0].begin_request(0, 99).is_err());
-            assert!(runtime.windows[0].request_id(lease).is_err(), "poisoned ring is unreadable");
+            assert!(dspark_parts(&mut runtime).1[0].begin_request(0, 99).is_err());
+            assert!(dspark_parts(&mut runtime).1[0].request_id(lease).is_err(), "poisoned ring is unreadable");
             assert_eq!(app.oneshot(get()).await?.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert!(receive.try_recv().is_err());
             fixture.configure_pack(&lib, 0, 0)?;
@@ -1018,7 +1416,7 @@ mod anchor_fallback_tests {
         runtime.confidence_trace.insert(1, vec![0.5; 5]);
         runtime.neural_lengths.insert(1, 3);
         assert!(runtime.poll_propose(1, &seeds(&[3, 4])).is_err());
-        assert!(runtime.chains[1].cancelled);
+        assert!(dspark_parts(&mut runtime).0[1].cancelled);
         assert!(runtime.lanes[1].depths.is_empty());
         assert!(runtime.confidence_trace(1).is_none() && !runtime.neural_lengths.contains_key(&1));
         runtime.release(1)?;
@@ -1041,20 +1439,20 @@ mod anchor_fallback_tests {
             bank.cache_commit(1, (), ticket, 1, 1, false);
             assert!(!bank.cache_needs_boundary(), "commit already sampled physical growth");
             let pending = bank.cache_ticket(&2, false, None).context("pending completion fixture")?;
-            runtime.chains[1].graph_bank = Some(bank);
+            dspark_parts(&mut runtime).0[1].graph_bank = Some(bank);
             let round = seeds(&[1, 2]);
             if independent {
                 assert!(runtime.poll_propose(1, &round)?.is_none());
-                assert!(runtime.chains[1].graph_bank.as_ref().unwrap().cache_needs_boundary());
+                assert!(dspark_parts(&mut runtime).0[1].graph_bank.as_ref().unwrap().cache_needs_boundary());
                 assert!(runtime.poll_propose(1, &round)?.is_none());
                 assert!(runtime.poll_propose(1, &round)?.is_some());
             } else {
                 runtime.propose(1, &round)?;
             }
-            assert!(!runtime.chains[1].graph_bank.as_ref().unwrap().cache_needs_boundary(),
+            assert!(!dspark_parts(&mut runtime).0[1].graph_bank.as_ref().unwrap().cache_needs_boundary(),
                 "completed proposal must feed measured_capture, independent={independent}");
             drop(pending);
-            runtime.chains[1].graph_bank.as_mut().unwrap().cache_clear_drained();
+            dspark_parts(&mut runtime).0[1].graph_bank.as_mut().unwrap().cache_clear_drained();
         }
         Ok(())
     }

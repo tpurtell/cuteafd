@@ -286,6 +286,13 @@ impl<'w, 'a> DistributedTargetHead<'w, 'a> {
     pub fn selected_rows(&self) -> Result<&[usize]> {
         ensure!(self.binding.is_some(), "distributed target head unpublished"); Ok(&self.selected)
     }
+    /// Normalized final target hidden states `[selected.len(), 5120]` BF16 on GPU1 and their
+    /// batch row indices, retained for DFly2 tap commits.
+    pub fn normalized_rows(&self) -> Result<(CuteafdDeviceBuffer, &[usize])> {
+        ensure!(self.binding.is_some(), "distributed target head unpublished");
+        let rows = self.selected.len();
+        Ok((part(self.normalize.buffers[3].buffer, 0, rows * 10240)?, &self.selected))
+    }
     pub fn token_positions(&self) -> Result<&[u64]> {
         ensure!(self.binding.is_some(), "distributed target head unpublished"); Ok(&self.tokens)
     }

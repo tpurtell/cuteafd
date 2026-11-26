@@ -1573,30 +1573,7 @@ struct BatchMeta {
     recall: Vec<usize>,
 }
 
-fn words<T, const N: usize>(input: &[T]) -> Vec<u8>
-where
-    T: LeBytes<N>,
-{
-    input.iter().flat_map(LeBytes::le_bytes).collect()
-}
-trait LeBytes<const N: usize> {
-    fn le_bytes(&self) -> [u8; N];
-}
-impl LeBytes<4> for i32 {
-    fn le_bytes(&self) -> [u8; 4] {
-        self.to_le_bytes()
-    }
-}
-impl LeBytes<4> for u32 {
-    fn le_bytes(&self) -> [u8; 4] {
-        self.to_le_bytes()
-    }
-}
-impl LeBytes<8> for i64 {
-    fn le_bytes(&self) -> [u8; 8] {
-        self.to_le_bytes()
-    }
-}
+use crate::shared::draft::dfly2::words;
 
 impl BatchMeta {
     fn new(members: &[Member], block: usize, mask: u32) -> Result<Self> {

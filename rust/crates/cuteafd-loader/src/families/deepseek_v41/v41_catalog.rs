@@ -164,6 +164,40 @@ impl V41CoordinatorTensorReader {
 }
 
 impl OfficialV41Catalog {
+    /// Construct an in-memory catalog adapter for an external V4.1 DFly2
+    /// checkpoint's 3×128 MXFP4 routed experts, aliased under `mtp.{0..3}.*`
+    /// so the shared V4.1 expert loader packs them without duplication.
+    pub(crate) fn from_dfly2_experts(
+        snapshot: &Path,
+        config: OfficialV41Config,
+        tensors: Vec<V41Tensor>,
+    ) -> Self {
+        let experts = RoutedExpertShape {
+            layers: 0,
+            first_layer: 0,
+            experts: 128,
+            topk: 3,
+            hidden: 5120,
+            intermediate: 2304,
+            draft_stages: 3,
+            draft_experts: 128,
+            activation: cuteafd_core::ExpertActivation::SiluClamp10,
+        };
+        Self {
+            source: CatalogSource::Legacy,
+            reader: Default::default(),
+            format: crate::plan::checkpoint::CheckpointFormat::HfSingle,
+            config: Some(config),
+            experts,
+            snapshot: snapshot.to_path_buf(),
+            tensors,
+            exl3: None,
+            exl3_arena_bytes: Default::default(),
+            nvfp4: None,
+            fp8: None,
+        }
+    }
+
     /// Transport tests use miniature payloads, never a serving admission contract.
     #[cfg(feature = "test-support")]
     #[doc(hidden)]

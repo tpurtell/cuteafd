@@ -1257,8 +1257,10 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         concurrency: resolved_concurrency,
         decode_lanes: report.decode_lanes,
         rtx_gpus,
-        draft_length: if family.id() == "deepseek_v41" && (options.draft_ownership == Some(spec::DraftOwnership::None)
-            || (options.draft_ownership.is_none() && options.layout.as_ref().is_some_and(|layout| layout.native_mtp_layers == 0))) {
+        draft_length: if family.id() == "deepseek_v41"
+            && !options.layout.as_ref().is_some_and(|layout| layout.v41_dfly2_snapshot.is_some())
+            && (options.draft_ownership == Some(spec::DraftOwnership::None)
+                || (options.draft_ownership.is_none() && options.layout.as_ref().is_some_and(|layout| layout.native_mtp_layers == 0))) {
             Some(0)
         } else { options.draft_length },
     })?;

@@ -552,6 +552,14 @@ impl<'a> TargetHeadWave<'a, '_> {
             _owner: PhantomData,
         })
     }
+    /// Normalized final target hidden states `[selected.len(), 5120]` BF16 and their
+    /// batch row indices, retained on the decoder GPU for DFly2 tap commits.
+    pub fn normalized_rows(&self) -> Result<(CuteafdDeviceBuffer, &[usize])> {
+        let rows = self.ready.context("target head normalized rows unpublished")?;
+        let mut normalized = self.b(3);
+        normalized.bytes = rows * STRIDES[3];
+        Ok((normalized, &self.selected))
+    }
     pub async fn download_rows(&mut self, rows: &[usize]) -> Result<Vec<u8>> {
         let logits = self.output()?.logits;
         // The head remains exclusively borrowed through transfer completion.

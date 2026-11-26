@@ -1,13 +1,13 @@
 //! Native TP2 draft expert ownership and graph integration.
 use crate::shared::experts::rtx::draft::{rank, pair, Layout};
-pub(super) const LAYOUT: Layout = Layout {
+pub(in crate::families::deepseek_v41::v41_experts) const LAYOUT: Layout = Layout {
     geometry: cuteafd_core::ExpertGeometry { hidden: 5120, experts: 128, topk: 3, intermediate: 2304, layers: 3, activation: cuteafd_core::ExpertActivation::SiluClamp10 },
     stages: 3, owner: 1,
 };
 #[cfg(test)]
 mod checkpoint_tests;
 
-pub(super) use crate::shared::experts::rtx::draft::rank::Weights;
+pub(in crate::families::deepseek_v41::v41_experts) use crate::shared::experts::rtx::draft::rank::Weights;
 use super::{DsparkRouter, DsparkSharedFfn, DsparkWeights};
 use crate::shared::memory::Tag;
 use crate::shared::memory::device::{Allocation, Device, Stream};

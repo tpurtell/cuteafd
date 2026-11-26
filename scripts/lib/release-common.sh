@@ -1095,7 +1095,7 @@ release_known_key() {
   case "$1" in
     FAMILY) return 0 ;; # Optional build family when checkpoint metadata is not local.
     EXLR8_MANIFEST|EXLR8_PREFILL_ACTIVATIONS) return 0 ;; # Published native EXLR8 selection and opt-in prefill numerics.
-    SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|DRAFT_LENGTH|SPECULATOR_FP8|SPECULATION_TRACE|TP2_DFLASH) return 0 ;;
+    SPECULATOR|SPECULATOR_MODEL_ID|SPECULATOR_MODEL_REVISION|SPECULATOR_DEPTH|DRAFT_LENGTH|DFLY2_BLOCK_SIZE|SPECULATOR_FP8|SPECULATION_TRACE|TP2_DFLASH) return 0 ;;
     DRAFT_POLICY) return 0 ;;
     CUDA_MODULE_LOADING) return 0 ;; # V4.1 and GLM Flash coordinator CUDA module loading (LAZY or EAGER).
     MAPPED_SCALE_PRELOAD_GIB|ENGRAM_WARM|PREFIX_CACHE_MARK_MIB|PREFIX_POINT_BOUNDARIES|API_KEY_FILE|ENABLE_BENCH|CONSOLE_ASSETS|USAGE|EXPERT_USAGE|GATEWAY) return 0 ;;
@@ -2208,14 +2208,18 @@ release_validate_tp2_options() {
 
 release_resolve_tp2_dspark_experts() {
   local family="$1" rtx_gpus="$2"
+  local eligible=0
+  if [[ "$rtx_gpus" == 2 && ( ( ( "$family" == deepseek_v41 || "$family" == deepseek_v4 ) && "$SPECULATOR" == dspark ) || ( "$family" == deepseek_v41 && "$SPECULATOR" == dfly2 ) ) ]]; then
+    eligible=1
+  fi
   if [[ -z "$TP2_DSPARK_EXPERTS" ]]; then
     TP2_DSPARK_EXPERTS=off
-    if [[ ( "$family" == deepseek_v41 || "$family" == deepseek_v4 ) && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ]]; then
+    if ((eligible)); then
       TP2_DSPARK_EXPERTS=on
     fi
   fi
-  [[ "$TP2_DSPARK_EXPERTS" != on || ( ( "$family" == deepseek_v41 || "$family" == deepseek_v4 ) && "$rtx_gpus" == 2 && "$SPECULATOR" == dspark ) ]] ||
-    release_die "TP2_DSPARK_EXPERTS requires V4/V4.1, two selected RTX GPUs and dSpark"
+  [[ "$TP2_DSPARK_EXPERTS" != on || "$eligible" == 1 ]] ||
+    release_die "TP2_DSPARK_EXPERTS requires V4/V4.1, two selected RTX GPUs and dSpark (or V4.1 DFly2)"
 }
 
 release_tp2_enabled() {

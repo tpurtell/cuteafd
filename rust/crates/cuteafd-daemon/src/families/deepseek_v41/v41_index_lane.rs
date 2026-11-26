@@ -325,6 +325,18 @@ impl<'w, 'a> IndexLane<'w, 'a> {
         output.validate_attention(layer, &bindings)?;
         Ok(output)
     }
+    /// Current decoder reindex selection buffer (`[rows, 512]` I32) for DFly2 recall taps.
+    pub fn current_selected(&self) -> Result<cuteafd_ffi::CuteafdDeviceBuffer> {
+        ensure!(!self.invalid, "index lane requires restart");
+        let producer = self.ready.context("index lane output unavailable")?;
+        ensure!(producer > 20, "DFly2 recall requires a decoder reindex layer");
+        Ok(self
+            .reindex
+            .as_ref()
+            .context("decoder reindex workspace absent")?
+            .output()?
+            .selected)
+    }
 }
 
 impl Drop for IndexLane<'_, '_> {

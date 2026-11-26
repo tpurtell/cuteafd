@@ -1768,6 +1768,12 @@ pub(crate) struct NativeServeArgs {
 
     /// Enable greedy RTX dSpark proposal generation and target verification.
     #[arg(long)] pub dspark: bool,
+    /// External AngelSlim DFly2 drafter snapshot directory (mutually exclusive with --dspark).
+    #[arg(long, conflicts_with = "dspark")]
+    pub dfly2_snapshot: Option<PathBuf>,
+    /// DFly2 draft block size including anchor (default: checkpoint's block_size, e.g. 6; 8 overdrives to 7 drafts).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(2..=16))]
+    pub dfly2_block_size: Option<u8>,
     #[command(flatten)]
     pub draft_length: crate::shared::draft::length::DraftLength,
     /// Compatibility spelling: decode lanes always advance independently.
@@ -1798,8 +1804,21 @@ pub(crate) struct NativeServeArgs {
 }
 
 impl NativeServeArgs {
+    pub fn dfly2_enabled(&self) -> bool {
+        self.dfly2_snapshot.is_some()
+    }
+    pub fn speculative_enabled(&self) -> bool {
+        self.dspark || self.dfly2_snapshot.is_some()
+    }
+    pub fn native_draft_width(&self) -> usize {
+        if self.dfly2_enabled() {
+            usize::from(self.dfly2_block_size.unwrap_or(6)).saturating_sub(1)
+        } else {
+            cuteafd_core::MAX_DSPARK_PROPOSALS
+        }
+    }
     pub fn adaptive_dspark(&self) -> bool {
-        self.dspark && self.draft_length.draft_length.is_none()
+        self.speculative_enabled() && self.draft_length.draft_length.is_none()
     }
     /// Resolved decode lanes: explicit `--decode-lanes`, else 1 on 1× RTX and 2 on 2× RTX (1 at C1).
     pub(crate) fn resolved_decode_lanes(&self) -> u8 {

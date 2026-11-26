@@ -112,6 +112,10 @@ pub struct LayoutOptions {
     pub inkling_dspark: bool,
     pub inkling_mini_dflash: Option<std::path::PathBuf>,
     pub hy4_dfly2: bool,
+    /// DeepSeek V4.1 external DFly2 drafter snapshot (AngelSlim/DS-V4.1-Flash-DFly2-B6).
+    pub v41_dfly2_snapshot: Option<std::path::PathBuf>,
+    /// DeepSeek V4.1 DFly2 block size override (default checkpoint's 6; 8 overdrives to 7 drafts).
+    pub v41_dfly2_block_size: Option<usize>,
     /// Explicitly disable GLM Flash external speculation and its arenas.
     pub glmf_drafter_disabled: bool,
     /// GLM Flash external draft checkpoint; absent resolves the launcher default from HF_HOME.
@@ -330,6 +334,8 @@ impl Default for LayoutOptions {
             inkling_dspark: false,
             inkling_mini_dflash: None,
             hy4_dfly2: false,
+            v41_dfly2_snapshot: None,
+            v41_dfly2_block_size: None,
             glmf_drafter_disabled: false,
             glmf_drafter_snapshot: None,
             glmf_dense_manifest: None,

@@ -7,6 +7,7 @@ pub(crate) mod coordinator;
 pub(crate) mod local;
 pub(crate) mod tp2;
 pub(crate) mod tp2_ffn;
+pub(crate) mod dfly2;
 pub(crate) mod dspark;
 pub(crate) use crate::shared::experts::exl3;
 pub(crate) use crate::shared::experts::execution::ExpertExecution;

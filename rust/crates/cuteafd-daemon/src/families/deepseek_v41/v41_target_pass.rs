@@ -36,20 +36,35 @@ pub(crate) use verification::VerificationTarget;
 mod encoder_units;
 pub(crate) use taps::{TargetTapStorage, TargetTapWave, TargetTaps};
 
-/// Target cache publication used by the independent scheduler's queued dSpark
+/// Target-side sources committed into [`Dfly2TapStore`] for each accepted request.
+pub(crate) struct Dfly2CommitSources<'a> {
+    pub normalized: cuteafd_ffi::CuteafdDeviceBuffer,
+    pub selected_rows: &'a [usize],
+    pub recall: [cuteafd_ffi::CuteafdDeviceBuffer; 3],
+    pub rows: &'a [crate::families::deepseek_v41::v41_backbone_router::ExpertRow],
+}
+
+/// Target cache publication used by the independent scheduler's queued draft
 /// transaction. Static dispatch keeps ordinary serving on its existing path.
 pub(crate) trait TargetCache<'a> {
     fn taps(&self, batch: &RequestBatch) -> Result<TargetTaps<'_>>;
+    fn dfly2_commit_sources(&self, batch: &RequestBatch) -> Result<Dfly2CommitSources<'_>>;
     fn commit(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         accepted: &[u32]) -> Result<()>;
 }
 impl<'a> TargetCache<'a> for TargetPass<'_, 'a> {
     fn taps(&self, batch: &RequestBatch) -> Result<TargetTaps<'_>> { TargetPass::taps(self, batch) }
+    fn dfly2_commit_sources(&self, batch: &RequestBatch) -> Result<Dfly2CommitSources<'_>> {
+        TargetPass::dfly2_commit_sources(self, batch)
+    }
     fn commit(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         accepted: &[u32]) -> Result<()> { TargetPass::commit(self, requests, batch, accepted) }
 }
 impl<'a> TargetCache<'a> for DistributedTargetPass<'_, 'a> {
     fn taps(&self, batch: &RequestBatch) -> Result<TargetTaps<'_>> { DistributedTargetPass::taps(self, batch) }
+    fn dfly2_commit_sources(&self, batch: &RequestBatch) -> Result<Dfly2CommitSources<'_>> {
+        DistributedTargetPass::dfly2_commit_sources(self, batch)
+    }
     fn commit(&mut self, requests: &mut Requests<'a>, batch: &mut RequestBatch,
         accepted: &[u32]) -> Result<()> { DistributedTargetPass::commit(self, requests, batch, accepted) }
 }
@@ -259,6 +274,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
         self.resources.lane.install_expert_usage(usage);
     }
     pub fn set_attention_decode(&mut self, decode: bool) { self.resources.lane.set_attention_decode(decode); }
+    pub fn set_dfly2_mode(&mut self, enabled: bool) { self.resources.taps.set_dfly2_mode(enabled); }
     pub fn reserve_sparse_decode_rows(&mut self, rows: usize) -> Result<()> {
         self.resources.lane.reserve_sparse_decode_rows(rows)
     }
@@ -618,7 +634,7 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                     }
                 }
                 let engram_us = prepare_timing.elapsed().as_micros() as u64 - advance_us;
-                if layer >= 37 {
+                if layer >= 37 && !self.resources.taps.is_dfly2_mode() {
                     unsafe {
                         if requests.cooperative_completion() {
                             self.resources.taps.capture_cooperative(guard.batch.cache()?, &self.resources.lane.prepared_input()?).await?;
@@ -655,6 +671,14 @@ impl<'w, 'a> TargetPass<'w, 'a> {
                 if cooperative {
                     self.resources.execution.complete_layer_cooperative(guard.batch.cache()?, &mut self.resources.lane, completed).await?;
                 } else { self.resources.execution.complete_layer(guard.batch.cache()?, &mut self.resources.lane, completed)?; }
+                if self.resources.taps.is_dfly2_mode() && matches!(layer, 28 | 32 | 36) {
+                    let selected = self.resources.index.current_selected()?;
+                    if cooperative {
+                        self.resources.taps.capture_dfly2_recall_cooperative(guard.batch.cache()?, layer, selected).await?;
+                    } else {
+                        self.resources.taps.capture_dfly2_recall(guard.batch.cache()?, layer, selected)?;
+                    }
+                }
             }
             if let Some(directory) = &activation_trace {
                 self.resources.lane.trace_output(directory)?;
@@ -718,6 +742,12 @@ impl<'w, 'a> TargetPass<'w, 'a> {
     pub fn taps(&self, batch: &RequestBatch) -> Result<TargetTaps<'_>> {
         self.state.ready(batch.cache()?.identity())?;
         self.resources.taps.output(batch.cache()?)
+    }
+    pub fn dfly2_commit_sources(&self, batch: &RequestBatch) -> Result<Dfly2CommitSources<'_>> {
+        self.state.ready(batch.cache()?.identity())?;
+        let (normalized, selected_rows) = self.resources.head.normalized_rows()?;
+        let (recall, rows) = self.resources.taps.dfly2_recall_rows(batch.cache()?)?;
+        Ok(Dfly2CommitSources { normalized, selected_rows, recall, rows })
     }
     /// The scheduler samples/validates logits before publishing accepted input
     /// prefixes. A failed commit consumes this pass; discard before reuse.

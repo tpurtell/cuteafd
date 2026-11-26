@@ -499,7 +499,7 @@ fn prefill_packed_admissions<'w, 'a, P: ServingTarget<'w, 'a>>(
     use crate::shared::prefill_packing;
     let mut out = std::collections::BTreeMap::new();
     let limits = packing_limits(args.prefill_packing, args.prefill_batch_tokens as usize,
-        args.max_context_tokens as usize, draft.as_ref().map(|d| d.prefill_tap_capacity()), NATIVE_COORDINATOR_EXACT_CAP);
+        args.max_context_tokens as usize, draft.as_ref().and_then(|d| d.prefill_tap_capacity()), NATIVE_COORDINATOR_EXACT_CAP);
     let eligible: Vec<_> = admitted.iter().enumerate().filter_map(|(i, &(prepared, lease, hit))| {
         (!hit && prepared.images.is_empty() && !prepared.prompt.is_empty()
             && prepared.prompt.len() <= limits.chunk_rows
@@ -2212,7 +2212,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
     // The anchors' rows are known since the last commit: fetch them across the draft phase.
     prefetch_drafts(lane, requests, active, members, &seeds.iter().map(|seed| vec![seed.1]).collect::<Vec<_>>());
     let mut inputs = if let Some(draft) = draft.as_deref_mut() {
-        match draft.propose(lane, &seeds) {
+        match draft.propose_with_cache(lane, &seeds, Some(requests.cache())) {
             Ok(inputs) => inputs,
             // W64-1: a failed proposal verifies the anchors only while the draft
             // is still live; a terminal draft fails the round.

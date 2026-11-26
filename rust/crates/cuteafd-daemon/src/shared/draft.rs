@@ -9,6 +9,7 @@
 //! policy reads no device signal.
 pub(crate) mod clock;
 pub(crate) mod copy;
+pub(crate) mod dfly2;
 pub(crate) mod history;
 pub(crate) mod length;
 pub(crate) mod remote;

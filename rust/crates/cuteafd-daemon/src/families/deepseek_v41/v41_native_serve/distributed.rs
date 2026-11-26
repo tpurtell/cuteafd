@@ -40,7 +40,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         Ok(())
     };
     memory_checkpoint("CUDA contexts and peer access")?;
-    let catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot)?;
+    let mut catalog = cuteafd_loader::read_official_v41_catalog(&args.snapshot)?;
+    catalog.select_draft(cuteafd_loader::plan::spec::DraftOwnership::selected("deepseek_v41",
+        if args.dspark { "dspark" } else if args.dfly2_enabled() { "dfly2" } else { "off" }))?;
     cuteafd_bench::context::set_family(catalog.config().family_id());
 
     let map = CachePlacement::encoder_decoder();
@@ -335,6 +337,11 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     pass.install_attention_plan(attention_plan)?;
     if let Some(second) = &mut second { second.install_attention_plan(attention_plan)?; }
     for slot in &mut slot_passes { slot.install_attention_plan(attention_plan)?; }
+    if args.dfly2_enabled() {
+        pass.set_dfly2_mode(true);
+        if let Some(second) = &mut second { second.set_dfly2_mode(true); }
+        for slot in &mut slot_passes { slot.set_dfly2_mode(true); }
+    }
     // L2 prefetch serves decode/verify steps only: the decode lanes.
     if let Some(budget) = args.l2.budget(&lib, crate::shared::l2_prefetch::OTHER_DEFAULT)? {
         pass.enable_l2_prefetch(budget)?;
@@ -384,8 +391,8 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // peak is part of it); retained owners are the Movable's exact bytes.
     let draft_budgets = |gpu: usize| -> usize { draft_load.iter().filter(|d| usize::from(d.gpu) == gpu)
         .map(|d| d.bytes as usize).sum::<usize>() };
-    if args.dspark {
-        ensure!(cuteafd_loader::placement::draft::home(&pool.placement) == Some(1), "V4.1 dSpark must be placed beside the decoder head");
+    if args.speculative_enabled() {
+        ensure!(cuteafd_loader::placement::draft::home(&pool.placement) == Some(1), "V4.1 drafter must be placed beside the decoder head");
     }
     let recorder = crate::shared::experts::rtx::dense::Recorder::start(records.is_some())?;
     let prepared_draft = if args.dspark && args.tp2_dspark_experts && records.is_some() {
@@ -399,6 +406,17 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
                 capacity,args.concurrency,lanes,[draft_budgets(0),draft_budgets(1)],16<<20,draft_width))?
         } else {devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(&lib, &catalog,
             capacity, args.concurrency, lanes, draft_budgets(1), 16 << 20, draft_width))?})
+    } else { None };
+    let dfly2_weights = if let Some(dfly2_path) = &args.dfly2_snapshot {
+        let dfly2_catalog = cuteafd_loader::read_v41_dfly2_catalog(dfly2_path, catalog.config())?;
+        let block_size = args.dfly2_block_size.map(usize::from).unwrap_or(dfly2_catalog.config().trained_block_size);
+        Some(if args.tp2_dspark_experts {
+            devices[1].own(|| crate::families::deepseek_v41::v41_experts::dfly2::Dfly2Weights::load_tp2(
+                &lib, &catalog, &dfly2_catalog, block_size, [32 << 30, 32 << 30]))?
+        } else {
+            devices[1].own(|| crate::families::deepseek_v41::v41_experts::dfly2::Dfly2Weights::load_full(
+                &lib, &catalog, &dfly2_catalog, block_size, 32 << 30))?
+        })
     } else { None };
     if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     memory_checkpoint("draft weights")?;
@@ -456,6 +474,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     // Every recorded scale pack ran (Done or mount fill): release raw scales.
     for weights in shared_owned.iter_mut().flatten() { weights.release_raw_scales(); }
     if let Some(draft) = draft_weights.as_ref() { draft.release_raw_scales(); }
+    if let Some(dfly2) = dfly2_weights.as_ref() { dfly2.release_raw_scales(); }
     if let (Some(weights), Some(inventory)) = (&draft_weights, &dspark_inventory) {
         // The loaded weights size their lane chains through the same shape the
         // pre-load inventory used; any divergence is an accounting defect.
@@ -470,15 +489,25 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
                 bytes * draft_lanes);
         }
     }
-    let mut draft = draft_weights.as_ref().map(|weights| DraftRuntime::with_distributed_requests(
-        devices, weights, &table, [&vocab[0], &vocab[1]], capacity, decode_rows, args.concurrency, lanes)).transpose()?;
+    let mut draft = if let Some(weights) = draft_weights.as_ref() {
+        Some(DraftRuntime::with_distributed_requests(
+            devices, weights, &table, [&vocab[0], &vocab[1]], capacity, decode_rows, args.concurrency, lanes)?)
+    } else if let Some(weights) = dfly2_weights.as_ref() {
+        Some(DraftRuntime::with_dfly2_distributed(
+            devices, weights, &table, [&vocab[0], &vocab[1]], decode_rows, args.concurrency, lanes)?)
+    } else {
+        None
+    };
     if let Some(draft) = &mut draft {
         draft.set_length(args.draft_length)?;
     }
     attention_plan.validate_loaded(draft.as_ref().map(|draft| draft.attention_drafts()))?;
     tracing::info!(plan_rows=attention_plan.rows(), capacity=attention_plan.capacity_rows(),
         "V4.1 fixed BF16 AOT compressed/native FP32 window attention plan");
-    let prefix_arenas = match &draft { Some(draft) => prefix_arenas.with_draft(draft.mark_device())?, None => prefix_arenas };
+    let prefix_arenas = match draft.as_ref().and_then(|d| d.mark_device()) {
+        Some(dev) => prefix_arenas.with_draft(dev)?,
+        None => prefix_arenas,
+    };
     memory_checkpoint("draft runtime and marks")?;
     let shared: [Rc<Vec<SharedWeights<'_>>>; 2] = shared_owned.map(Rc::new);
     if let Some(pending) = spark_admission { pending.wait()?; }
@@ -615,7 +644,7 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     }) }?;
     crate::shared::memory_report::release_load_staging(&lib)?;
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.is_some(), &pool)?;
+    let prefixes = scheduler::prepare_prefix_cache(&lib, &args, &requests, prefix_arenas, draft.as_ref().is_some_and(|d| d.has_marks()), &pool)?;
     scheduler::publish_capacity(&requests, &prefixes, pool.placement.max_pool_tokens_no_onboard);
     tracing::info!(elapsed_ms=started.elapsed().as_millis(), "dual RTX serving owners ready");
     vision.connect()?;
@@ -624,7 +653,12 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
     if let Some(draft) = &draft {
         let physical = devices.map(|device| device.id);
         let lead = cuteafd_loader::placement::planner::CoordinatorDevices::new(&physical)?.logical_rank(draft.device.id)?;
-        crate::shared::draft::report::publish(super::drafter_report(lead, &physical, &pool.solved)?);
+        let kind = if draft.is_dfly2() {
+            crate::shared::draft::report::Kind::Dfly2
+        } else {
+            crate::shared::draft::report::Kind::Dspark
+        };
+        crate::shared::draft::report::publish(super::drafter_report(kind, lead, &physical, &pool.solved)?);
     }
     admission::publish_provenance(&args, &inventory, &pool)?;
     admission::log_runtime_base(&lib, &pool)?;

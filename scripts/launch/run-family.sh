@@ -644,7 +644,12 @@ release_validate_tp2_options
 [[ -z "$HTTP_QUEUE_DEPTH" || ( "$HTTP_QUEUE_DEPTH" =~ ^[1-9][0-9]*$ && "$HTTP_QUEUE_DEPTH" -le 4096 ) ]] || release_die "HTTP_QUEUE_DEPTH must be in 1..4096"
 [[ "$HTTP_QUEUE_WAIT_MS" =~ ^[0-9]+$ ]] || release_die "HTTP_QUEUE_WAIT_MS must be non-negative"
 [[ "$HOST_CACHE_BYTES" == auto || "$HOST_CACHE_BYTES" =~ ^[0-9]+([.][0-9]{1,6})?(B|MB|GB|MiB|GiB)?$ ]] || release_die "HOST_CACHE_BYTES must be auto, 0, or a byte size"
-case "$SPECULATOR" in dspark|off) ;; *) release_die "SPECULATOR must be dspark or off for DeepSeek V4.1" ;; esac
+case "$SPECULATOR" in dspark|dfly2|off) ;; *) release_die "SPECULATOR must be dspark, dfly2 or off for DeepSeek V4.1" ;; esac
+v41_dfly2_block_size="$(get DFLY2_BLOCK_SIZE)"
+[[ -z "$v41_dfly2_block_size" || ( "$v41_dfly2_block_size" =~ ^[0-9]+$ && "$v41_dfly2_block_size" -ge 2 && "$v41_dfly2_block_size" -le 16 ) ]] ||
+  release_die "DFLY2_BLOCK_SIZE must be an integer in 2..16"
+[[ -z "$v41_dfly2_block_size" || "$SPECULATOR" == dfly2 ]] ||
+  release_die "DFLY2_BLOCK_SIZE requires SPECULATOR=dfly2"
 # Unset follows DRAFT_POLICY over the drafter's native seven-token block.
 draft_length="$DRAFT_LENGTH"
 [[ -z "$draft_length" || "$draft_length" =~ ^[1-9][0-9]*$ ]] ||
@@ -738,7 +743,22 @@ namespace_mount_args=("${RELEASE_HUB_MOUNTS[@]}")
   release_die "unsupported: EXL3 for DeepSeek V4/V4.1 Flash"
 coordinator="$RELEASE_COORDINATOR_CONTAINER_NAME"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
-[[ "$TP2_DSPARK_EXPERTS" != on || "$SPECULATOR" == dspark ]] || release_die "TP2_DSPARK_EXPERTS requires dSpark"
+[[ "$TP2_DSPARK_EXPERTS" != on || "$SPECULATOR" == dspark || "$SPECULATOR" == dfly2 ]] || release_die "TP2_DSPARK_EXPERTS requires dSpark or DFly2"
+v41_dfly2_snapshot=""
+if [[ "$SPECULATOR" == dfly2 ]]; then
+  v41_dfly2_model="$(get SPECULATOR_MODEL_ID AngelSlim/DS-V4.1-Flash-DFly2-B6)"
+  v41_dfly2_rev="$(get SPECULATOR_MODEL_REVISION)"
+  if [[ -z "$v41_dfly2_rev" && "$v41_dfly2_model" == AngelSlim/DS-V4.1-Flash-DFly2-B6 ]]; then
+    v41_dfly2_rev=d08e55a6897b1974307ea9771038838de5986e66
+  fi
+  if [[ -z "$v41_dfly2_rev" ]]; then
+    v41_dfly2_rev="$(tr -d '[:space:]' < "$hf_home/hub/models--${v41_dfly2_model//\//--}/refs/main" 2>/dev/null || true)"
+  fi
+  [[ -n "$v41_dfly2_rev" ]] || release_die "DFly2 drafter $v41_dfly2_model revision not found in $hf_home; set SPECULATOR_MODEL_REVISION"
+  v41_dfly2_rel="hub/models--${v41_dfly2_model//\//--}/snapshots/$v41_dfly2_rev"
+  [[ -d "$hf_home/$v41_dfly2_rel" ]] || release_die "DFly2 drafter snapshot missing: $hf_home/$v41_dfly2_rel"
+  v41_dfly2_snapshot="$(readlink -f "$hf_home/$v41_dfly2_rel")"
+fi
 
 RELEASE_RECLAIM_ARGS=()
 ((restart == 0)) || release_coordinator_reclaim_args "$coordinator"
@@ -806,6 +826,7 @@ count_args=(--available-sparks "$RELEASE_AVAILABLE_SPARKS" --mapped-scale-preloa
 # Pass loader-resolved values: the planner's plain config parser does not parse
 # shell quoting/comments or supply the loader's default Spark inventory.
 count_config_text="$(printf '%s=%s\n' TP2_DSPARK_EXPERTS "$TP2_DSPARK_EXPERTS" SPECULATOR "$SPECULATOR" EXPERT_USAGE "$(get EXPERT_USAGE on)"
+  [[ -z "${v41_dfly2_block_size:-}" ]] || printf 'DFLY2_BLOCK_SIZE=%s\n' "$v41_dfly2_block_size"
   for ((rank = 0; rank < SPARK_COUNT; rank++)); do
     host_key="SPARK_${rank}_HOST"
     printf '%s=%s\n' "$host_key" "${!host_key}"
@@ -845,6 +866,7 @@ v41_prefill_waves="$(get PREFILL_WAVES)"
 [[ "$SPECULATOR" != off ]] || count_args+=(--native-mtp-layers 0)
 [[ -z "$KV_POOL_SIZE" ]] || count_args+=(--kv-pool-size "$KV_POOL_SIZE")
 count_args+=(--speculator "$SPECULATOR")
+[[ -z "${v41_dfly2_snapshot:-}" ]] || count_args+=(--drafter-snapshot "$v41_dfly2_snapshot")
 deployment_peers=()
 for ((rank = 0; rank < RELEASE_AVAILABLE_SPARKS; rank++)); do
   lane_key="SPARK_${rank}_LANE_A"
@@ -1055,7 +1077,7 @@ assert hashlib.sha256((root / "lib/libcuteafd_native.so").read_bytes()).hexdiges
 fi
 
 peers="$(jq -er '.peers | join(",")' <<<"$count_plan")"
-fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "decode-rows=${resolved_decode_rows}" "$SPECULATOR" "draft-policy=$(get DRAFT_POLICY history)" "${draft_length:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
+fingerprint="$(printf '%s\n' "$engine_commit" "$RELEASE_MODEL_ID" "$RELEASE_MODEL_REVISION" "$ADDR" "$RELEASE_RTX_GPUS" "$gpu_uuid_csv" "$gpu_pci_csv" "$CONCURRENCY" "${HTTP_QUEUE_DEPTH:-$CONCURRENCY}" "$HTTP_QUEUE_WAIT_MS" "$HOST_CACHE_BYTES" "$RTX_EXPERT_LAYERS" "${KV_POOL_SIZE}${POOL_TOKENS:+:planner=$POOL_TOKENS}" "$EMBEDDING" "$VISION" "$AUDIO" "memory=${memory_policy_args[*]}" "$PREFIX_CACHE_ENTRIES" "$MAX_CONTEXT_TOKENS" "$MAX_OUTPUT_TOKENS" "$PREFILL_BATCH_TOKENS" "prefill-waves=${V41_PREFILL_WAVES:-}" "prefill-reserve=${V41_PREFILL_RESERVE_ROWS:-}" "decode-rows=${resolved_decode_rows}" "$SPECULATOR" "dfly2=${v41_dfly2_snapshot}:${v41_dfly2_block_size:-6}" "draft-policy=$(get DRAFT_POLICY history)" "${draft_length:-auto}" "$TP2_ATTENTION" "$TP2_QUERY_PROJECTION" "$TP2_OUTPUT_PROJECTION" "$TP2_DSPARK_EXPERTS" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_DEVICE_MAP:-}" "${CUTEAFD_PROTOCOL_V2_VERBS_HOST_EXECUTION_LANES:-}" "${v41_worker_budget:-}" "$SPARK_COUNT" "$(release_hosts_csv)" "$peers" "spark-tp=${spark_tp}" "v41-spark-tp-roles=${spark_tp_roles_required}" | sha256sum | awk '{print $1}')"
 spark_prefix="$RELEASE_SPARK_CONTAINER_PREFIX"
 # Launch features shared with every family, validated before a dry run returns
 # and before any service is stopped.
@@ -1219,6 +1241,10 @@ if [[ -n "${POOL_TOKENS:-}" ]]; then
   args+=(--pool-tokens "$planner_tokens")
 fi
 [[ "$SPECULATOR" != dspark ]] || args+=(--dspark)
+if [[ "$SPECULATOR" == dfly2 ]]; then
+  args+=(--dfly2-snapshot "$v41_dfly2_snapshot")
+  [[ -z "$v41_dfly2_block_size" ]] || args+=(--dfly2-block-size "$v41_dfly2_block_size")
+fi
 [[ -z "$draft_length" ]] || args+=(--draft-length "$draft_length")
 args+=("${draft_policy_args[@]}")
 [[ "$TP2_ATTENTION" != on ]] || args+=(--tp2-attention)

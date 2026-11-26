@@ -3,6 +3,7 @@
 pub(crate) mod v41_attention_ops;
 pub(crate) mod v41_candidate_blocks;
 pub(crate) mod v41_compressor;
+pub(crate) mod v41_dfly2;
 pub(crate) mod v41_dspark;
 pub(crate) mod v41_dspark_attention;
 pub(crate) mod v41_dspark_cache;
