@@ -2574,7 +2574,8 @@ def test_mistral_large4_defaults_to_its_bundled_drafter_and_honors_explicit_off(
     assert plan[plan.index("--attention-placement") + 1] == "auto"
     serve = next(shlex.split(line) for line in result.stderr.splitlines()
                  if "docker run -d" in line and "serve-glm" in line)
-    assert "--dspark" in serve and "--draft" not in serve and "dflash2" not in " ".join(serve)
+    assert "--dspark" in serve and "--draft" not in serve
+    assert not any(arg.startswith("--draft=") for arg in serve)
     assert plan[plan.index("--speculator") + 1] == "dspark"
     assert "--draft-block" not in serve  # The bundled checkpoint supplies its native depth.
     assert ("--split-device" in serve) == (gpus == 2)
