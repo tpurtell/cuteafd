@@ -168,11 +168,13 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
         let home_ws = (m * (64 * 512 * 2 * 2 + 4 * 5120 * 2 * 2 + 8192 * 2 + 5120 * 6 + 8000)
             + lane_reqs * (local_vocab * 4 + 64 * 512 * 2 + 5120 * 16)
             + 96 * MIB) as u64;
-        let exp_ws = 128 * MIB;
+        let cap = if m <= 16 { 16u64 } else if m <= 80 { 80 } else { 256 };
+        let tp2_rank_ws = match cap { 16 => 2 * MIB, 80 => 7 * MIB, _ => 20 * MIB };
+        let full_exp_ws = match cap { 16 => 24 * MIB, 80 => 64 * MIB, _ => 128 * MIB };
         let mut runtime = Vec::new();
         let lead = u8::from(ranks == 2);
         runtime.push(Demand::new(lead, Category::Workspace, "DFly2 request lanes",
-            lane_count * (home_ws + if options.tp2_dspark_experts { exp_ws / 2 } else { exp_ws }), Basis::Formula));
+            lane_count * (home_ws + if options.tp2_dspark_experts { tp2_rank_ws + cap * 20_504 } else { full_exp_ws }), Basis::Formula));
         runtime.push(Demand::new(lead, Category::Workspace, "DFly2 target taps", taps_bytes, Basis::Exact));
         let full_exp = 3 * native_expert_bytes(128, 5120, 2304);
         let half_exp = 3 * native_expert_bytes(128, 5120, 1152);
@@ -188,9 +190,9 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             ..Default::default()
         };
         if options.tp2_dspark_experts {
-            let peer_ws = (lane_reqs * (64_640 * 4 + 5120 * 2) + 8 * MIB) as u64;
+            let peer_ws = (32 * MIB + lane_reqs * (64_640 * 4 + 5120 * 2 + 32 * 1024) + MIB) as u64;
             draft.runtime.push(Demand::new(0, Category::Workspace, "DFly2 request lanes",
-                lane_count * (peer_ws + exp_ws / 2), Basis::Formula));
+                lane_count * (peer_ws + tp2_rank_ws), Basis::Formula));
             let peer_staging = expert_cat.expert_staging(crate::V41ExpertSelection::DsparkTp2 {
                 stage: 0, expert: 0, rank: 0 })?.staging_bytes() as u64;
             draft.resident = dense_bytes + half_exp;
@@ -199,7 +201,7 @@ pub(crate) fn layout(report: &mut PlanReport, model: &dyn crate::plan::FamilyMod
             draft.loading_experts = [half_exp; 2];
             draft.loader_peak = [draft.resident + staging, half_exp + peer_staging];
         } else if ranks == 2 {
-            let peer_ws = (lane_reqs * (64_640 * 4 + 5120 * 2) + 8 * MIB) as u64;
+            let peer_ws = (32 * MIB + lane_reqs * (64_640 * 4 + 5120 * 2 + 32 * 1024) + MIB) as u64;
             draft.runtime.push(Demand::new(0, Category::Workspace, "DFly2 request lanes",
                 lane_count * peer_ws, Basis::Formula));
         }

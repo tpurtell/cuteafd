@@ -984,8 +984,10 @@ impl AdmittedPrefill {
         let shape = Self { unit_cap: usize::try_from(plan.unit_rows)?, waves: usize::try_from(plan.waves)? };
         ensure!(shape.reserve_rows() <= crate::shared::memory::row_window::MAX_RESERVE_ROWS,
             "V4.1 prefill reserve {} exceeds the row planes", shape.reserve_rows());
+        let speculator = if args.dfly2_enabled() { "dfly2" } else if args.dspark { "dspark" } else { "off" };
         cuteafd_bench::context::ResolvedSettings::default().value("prefill-batch-tokens", shape.unit_cap)
-            .value("prefill-waves", shape.waves).value("prefill-reserve-rows", shape.reserve_rows()).publish();
+            .value("prefill-waves", shape.waves).value("prefill-reserve-rows", shape.reserve_rows())
+            .value("speculator", speculator).publish();
         Ok(shape)
     }
     /// Rows every shared row plane spans: the slots' units.
