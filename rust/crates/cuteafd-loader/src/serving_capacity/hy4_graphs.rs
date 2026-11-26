@@ -32,60 +32,42 @@ impl Hy4GraphLayout {
 /// are intentionally not defaults: both graph reserves slowed matched decode
 /// versus eager. TP1 retains its C1-derived cap; the wider 1340 MiB working
 /// set also regressed throughput despite eliminating donor churn.
+const CENSUS: &[(Hy4GraphLayout, usize, WorkingSet)] = &[
+    (Hy4GraphLayout::Exl3Min, 0, WorkingSet { w1: 88 << 20, step_growth: 18 << 20, capture_growth: 4 << 20 }),
+    (Hy4GraphLayout::Exl3Max, 0, WorkingSet { w1: 100 << 20, step_growth: 20 << 20, capture_growth: 4 << 20 }),
+    (Hy4GraphLayout::Exl3Max, 1, WorkingSet { w1: 98 << 20, step_growth: 18 << 20, capture_growth: 4 << 20 }),
+    (Hy4GraphLayout::Exl3MinSpark, 0, WorkingSet { w1: 130 << 20, step_growth: 26 << 20, capture_growth: 4 << 20 }),
+];
+
+#[cfg(test)]
 fn working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<WorkingSet> {
-    let (w1, step_growth, capture_growth) = match (layout, rank) {
-        (Some(Hy4GraphLayout::Exl3Min), 0) => (88, 18, 4),
-        (Some(Hy4GraphLayout::Exl3Max), 0) => (100, 20, 4),
-        (Some(Hy4GraphLayout::Exl3Max), 1) => (98, 18, 4),
-        (Some(Hy4GraphLayout::Exl3MinSpark), 0) => (130, 26, 4),
-        _ => return None,
-    };
-    Some(WorkingSet {
-        w1: w1 << 20,
-        step_growth: step_growth << 20,
-        capture_growth: capture_growth << 20,
-    })
+    graph_reserve::census_working_set(rank, layout, CENSUS)
 }
 
 /// Use identical inputs for admission, provenance, and runtime. Layouts
 /// without a qualified census default to eager; explicit reserves still work.
 pub fn reserve_policy(layout: Option<Hy4GraphLayout>, rank: usize) -> Result<Resolved, Error> {
-    match working_set(layout, rank) {
-        Some(measured) => graph_reserve::current_working_set(rank, measured),
-        None => graph_reserve::current(rank, false, 0, 0),
-    }
+    graph_reserve::current_census(rank, layout, CENSUS)
 }
 
 /// Short and 32K C1 physical graph-arena census for split DFly2 on `Exl3Max`
 /// (2x RTX, 0 Sparks, shipping `CORE_VIEW=original`, default `TP2_DFLASH=on`):
 /// measured `100 MiB` on GPU0 and `98 MiB` on GPU1 (zero captures/misses/eager
 /// runs on both timed C1 bands).
-pub fn split_dfly2_working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<WorkingSet> {
-    let (w1, step_growth, capture_growth) = match (layout, rank) {
-        (Some(Hy4GraphLayout::Exl3Max), 0) => (100, 20, 4),
-        (Some(Hy4GraphLayout::Exl3Max), 1) => (98, 18, 4),
-        _ => return None,
-    };
-    Some(WorkingSet {
-        w1: w1 << 20,
-        step_growth: step_growth << 20,
-        capture_growth: capture_growth << 20,
-    })
+// The split-census rows are identical to the current base table's local TP2
+// rows; this predicate preserves the split-only query used by the tests.
+#[cfg(test)]
+fn split_dfly2_working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<WorkingSet> {
+    working_set(layout.filter(|key| *key == Hy4GraphLayout::Exl3Max), rank)
 }
 
-/// Resolve the per-rank graph reserve policy, routing split-DFly2 layouts through
-/// the shared `graph_reserve::current_working_set` policy (`soft = W1 + margin`)
-/// with no local margin total.
+/// Split DFly2 and the ordinary policy currently have the same measured
+/// local TP2 rows. Preserve all layout fallbacks through the common table.
 pub fn reserve_policy_for(
     layout: Option<Hy4GraphLayout>,
     rank: usize,
-    tp2_dfly2: bool,
+    _tp2_dfly2: bool,
 ) -> Result<Resolved, Error> {
-    if tp2_dfly2 {
-        if let Some(measured) = split_dfly2_working_set(layout, rank) {
-            return graph_reserve::current_working_set(rank, measured);
-        }
-    }
     reserve_policy(layout, rank)
 }
 #[cfg(test)]
