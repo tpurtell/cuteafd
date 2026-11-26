@@ -169,10 +169,12 @@ impl std::ops::Deref for VisionSpecView {
 }
 
 impl VisionSpec {
-    /// Mirrors cuteafd_vision_encode_pixels dispatch: both PE and generic
-    /// tower paths consume source/content geometry, legacy paths do not.
+    /// Mirrors cuteafd_vision_encode_pixels dispatch: PE and non-Hy4 generic
+    /// tower paths consume source/content geometry; legacy and Hy4 (`absolute_kind == 2`)
+    /// full-canvas towers take `cuteafd_vision_encode`.
     pub fn supports_source_pixels(&self) -> bool {
-        self.perception.is_some() || self.tower.is_some()
+        self.perception.is_some()
+            || self.tower.as_ref().is_some_and(|tower| tower.absolute_kind != 2)
     }
     /// Layer storage is owned and follows the checkpoint depth, never an ABI cap.
     pub fn with_depth(mut self, depth: usize) -> Self {
@@ -989,6 +991,11 @@ mod tests {
         assert!(validate_pixel_geometry([34,48],pixels,14,spec.supports_source_pixels()).is_ok());
         let minimax=ImagePixels::full(672,476);
         assert!(validate_pixel_geometry([34,48],minimax,14,spec.supports_source_pixels()).is_ok());
+        // Hy4 / Hy4-flash (`absolute_kind == 2`) uses full-canvas encode_hy4_batch, not encode_pixels.
+        spec.tower = Some(TowerExtension { absolute_kind: 2, projection_order: 3, ..Default::default() });
+        assert!(!spec.supports_source_pixels());
+        assert!(validate_pixel_geometry([16, 16], ImagePixels::full(256, 256), 16, spec.supports_source_pixels()).is_ok());
+        assert!(validate_pixel_geometry([16, 16], pixels, 16, spec.supports_source_pixels()).is_err());
         spec.tower=None;spec.perception=Some(PerceptionSpec::default());
         assert!(spec.supports_source_pixels());
         assert!(validate_pixel_geometry([34,48],pixels,14,spec.supports_source_pixels()).is_ok());

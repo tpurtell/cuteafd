@@ -206,6 +206,8 @@ pub struct Hy4Inputs {
     pub graph_reserve: Vec<u64>,
     pub host_prefix: serving::HostPrefixOwners,
     pub resident_weight_limit: Option<ResidentWeights>,
+    /// Bundled 40-layer ViT owner candidates; None when VISION=off or no vision_config.
+    pub vision: Option<crate::placement::still_encoder::StillEncoder>,
 }
 
 #[derive(Debug, Clone)]
@@ -989,6 +991,11 @@ impl Recipe for Hy4Inputs {
             }
         }
 
+        // Independent bundled 40-layer ViT shares the target/KV/expert joint solve.
+        if let Some(vision) = &self.vision {
+            vision.extend(&mut contract_variables, &mut components, maximum)?;
+            vision.require_spark_worker(&contract_variables, &mut requires);
+        }
         fixed_request_tails(&mut components, maximum, &[])?;
         let mut contract = Contract {
             phase_order: PhaseOrder::TARGET_THEN_DRAFT,

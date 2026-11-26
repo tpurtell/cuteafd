@@ -7,7 +7,7 @@ use anyhow::{ensure, Context, Result};
 pub const fn vision_weight_arena_label() -> &'static str { "vision packed weight arena" }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StillTowerKind { Kimi, MiniMax, Inkling2, Step5, Hy4Flash }
+pub enum StillTowerKind { Kimi, MiniMax, Inkling2, Step5, Hy4Flash, Hy4 }
 
 #[derive(Clone, Debug)]
 pub struct StillTowerInventory {
@@ -63,9 +63,22 @@ impl StillTowerInventory {
                 let limit=crate::families::hy4_flash::vision::MAX_MERGED_ROWS;
                 ensure!((1..=limit).contains(&max_output_rows),"still tower output rows outside 1..={limit}");
                 let arena=WeightArenaLayout::new("hy4_flash/vision",regions)?;
-                ensure!(arena.bytes() as u64==packed.arena_bytes,"Hy4 packed vision arena differs from header pack");
+                ensure!(arena.bytes() as u64==packed.arena_bytes,"Hy4-flash packed vision arena differs from header pack");
                 let scratch=scratch_bytes(StillTowerKind::Hy4Flash,max_output_rows)?;
                 return Ok(Self {kind:StillTowerKind::Hy4Flash,arena,scratch,max_output_rows});
+            },
+            Some("hy_v4_vl")=>{
+                let contract=crate::families::hy4::vision::vision_contract(&checkpoint.config)?;
+                let packed=crate::families::hy4::vision::pack(&contract,tensors)?;
+                let regions=packed.tensors.into_iter().map(|tensor| {
+                    Ok((tensor.metadata.name,usize::try_from(tensor.metadata.byte_length)?))
+                }).collect::<Result<Vec<_>>>()?;
+                let limit=crate::families::hy4::vision::MAX_MERGED_ROWS;
+                ensure!((1..=limit).contains(&max_output_rows),"still tower output rows outside 1..={limit}");
+                let arena=WeightArenaLayout::new("hy4/vision",regions)?;
+                ensure!(arena.bytes() as u64==packed.arena_bytes,"Hy4 packed vision arena differs from header pack");
+                let scratch=scratch_bytes(StillTowerKind::Hy4,max_output_rows)?;
+                return Ok(Self {kind:StillTowerKind::Hy4,arena,scratch,max_output_rows});
             },
             other=>anyhow::bail!("no independent still tower for {other:?}"),
         };
@@ -82,7 +95,9 @@ impl StillTowerInventory {
 pub fn scratch_bytes(kind: StillTowerKind, rows: usize) -> Result<u64> {
     ensure!(!matches!(kind, StillTowerKind::Inkling2 | StillTowerKind::Step5),
         "PE scratch requires checkpoint-native PerceptionGeometry");
-    if kind==StillTowerKind::Hy4Flash { return hy4_scratch_bytes(rows); }
+    if matches!(kind, StillTowerKind::Hy4Flash | StillTowerKind::Hy4) {
+        return hy4_scratch_bytes(kind, rows);
+    }
     let limit=match kind {StillTowerKind::Kimi=>16698,StillTowerKind::MiniMax=>576,_=>unreachable!()};
     ensure!((1..=limit).contains(&rows),"still tower scratch capacity outside native range");
     let (hidden,attention,heads,intermediate,rotated,temporal,output,projector_hidden)=match kind {
@@ -118,10 +133,14 @@ pub fn scratch_bytes(kind: StillTowerKind, rows: usize) -> Result<u64> {
 
 /// Mirror of native `scratch_hy4_tower`: persistent residual/next/segment table,
 /// then the largest phase (patch input, positions, attention, MLP, merger).
-fn hy4_scratch_bytes(rows: usize) -> Result<u64> {
+fn hy4_scratch_bytes(kind: StillTowerKind, rows: usize) -> Result<u64> {
     ensure!((1..=crate::families::hy4_flash::vision::MAX_MERGED_ROWS).contains(&rows),
         "Hy4 tower scratch capacity outside native range");
-    let (h,i,o,m,heads)=(1152u64,4304u64,3072u64,4608u64,16u64);
+    let (h,i,o,m,heads)=match kind {
+        StillTowerKind::Hy4Flash=>(1152u64,4304u64,3072u64,4608u64,16u64),
+        StillTowerKind::Hy4=>(1536u64,6144u64,6144u64,6144u64,16u64),
+        _=>unreachable!(),
+    };
     let units=u64::try_from(rows)?;
     let n=units*4;
     let align=|bytes:u64|->Result<u64>{Ok(bytes.checked_add(255).context("tower scratch alignment overflow")?/256*256)};
@@ -172,10 +191,18 @@ mod tests {
     fn hy4_scratch_is_bounded_and_monotone() {
         let full=scratch_bytes(StillTowerKind::Hy4Flash,4096).unwrap();
         assert!(full>scratch_bytes(StillTowerKind::Hy4Flash,1024).unwrap());
-        // Attention phase (6 x n x 1152 BF16 + LSE) dominates at full capacity.
+        // Attention phase (5 x n x 1152 BF16 + LSE) dominates at full capacity.
         assert_eq!(full,(2*16384*1152*2+256)+(5*16384*1152*2+16384*16*4));
         assert!(scratch_bytes(StillTowerKind::Hy4Flash,4097).is_err());
         assert!(scratch_bytes(StillTowerKind::Hy4Flash,0).is_err());
+
+        let hy4_full=scratch_bytes(StillTowerKind::Hy4,4096).unwrap();
+        assert!(hy4_full>full);
+        assert!(hy4_full>scratch_bytes(StillTowerKind::Hy4,1024).unwrap());
+        // Attention phase (5 x n x 1536 BF16 + LSE) dominates at full capacity.
+        assert_eq!(hy4_full,(2*16384*1536*2+256)+(5*16384*1536*2+16384*16*4));
+        assert!(scratch_bytes(StillTowerKind::Hy4,4097).is_err());
+        assert!(scratch_bytes(StillTowerKind::Hy4,0).is_err());
     }
 
     #[test]
