@@ -787,6 +787,9 @@ gpu_selection="$(python3 "$repo_root/scripts/lib/coordinator-gpus.py" select \
   --expert-format "$expert_format" \
   "${compact_selection_args[@]}" ${RELEASE_RECLAIM_ARGS[@]+"${RELEASE_RECLAIM_ARGS[@]}"})" || exit 2
 RELEASE_RTX_GPUS="$(jq -r '.count' <<<"$gpu_selection")"
+if [[ "$SPECULATOR" == dfly2 && "$RELEASE_RTX_GPUS" == 2 && "$attention_placement" == heads ]]; then
+  release_die "SPECULATOR=dfly2 does not support explicit ATTENTION_PLACEMENT=heads on two RTX GPUs (cannot serve without copying KV; use default auto for V4.1's 20/20 layers split)"
+fi
 release_resolve_tp2_dspark_experts deepseek_v41 "$RELEASE_RTX_GPUS"
 if release_tp2_enabled; then
   ((RELEASE_RTX_GPUS == 2)) || release_die "TP2 options require two selected RTX GPUs; use --rtx-gpus 2"

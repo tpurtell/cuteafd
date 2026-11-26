@@ -5275,6 +5275,22 @@ def test_v41_rejects_noncanonical_speculator(tmp_path: Path, keys: str, error: s
     assert "docker run -d" not in result.stderr
 
 
+def test_v41_dfly2_refuses_explicit_heads_on_two_rtx(tmp_path: Path) -> None:
+    dfly_rev = "d08e55a6897b1974307ea9771038838de5986e66"
+    dfly_snap = tmp_path / "hf" / "hub" / "models--AngelSlim--DS-V4.1-Flash-DFly2-B6" / "snapshots" / dfly_rev
+    dfly_snap.mkdir(parents=True)
+    result = _family_launch_result(
+        tmp_path,
+        {"model_type": "deepseek_v41"},
+        "deepseek-ai/DeepSeek-V4.1-Flash",
+        "MODEL_REVISION=\nSPECULATOR=dfly2\nATTENTION_PLACEMENT=heads\nVISION=off\nRTX_GPUS=2\nRTX_EXPERT_LAYERS=1\nSPARK_COUNT=2\nSPARK_1_HOST=h1\nSPARK_1_LANE_A=10.0.0.2\n",
+        physical_gpus=(0, 1),
+    )
+    assert result.returncode == 2, result.stderr
+    assert "SPECULATOR=dfly2 does not support explicit ATTENTION_PLACEMENT=heads on two RTX GPUs" in result.stderr
+    assert "docker run -d" not in result.stderr
+
+
 @pytest.mark.parametrize("value,expected", [("48", "48"), ("60", "60"), ("all", "all")])
 def test_expert_onboarding_forwards_exact_pins_above_forty(tmp_path, value, expected):
     result = _family_launch_result(tmp_path, {
