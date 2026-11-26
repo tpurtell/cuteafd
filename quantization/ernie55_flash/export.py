@@ -7,6 +7,7 @@ import mc_package as mc
 from core_export import packed_specs
 from inkling2.export import DirectMCWriter as BaseWriter, VIEWS
 from inkling2.publish import LFS_ATTRIBUTES
+from .hca_format import HCA_OUTPUT, group_modules, original_selection
 from .source import BASE_REPO, BASE_REVISION
 
 
@@ -32,11 +33,17 @@ def projection_inventory(source):
         outputs, inputs = shape
         routed = role == "routed_expert"
         group = "routed" if routed else ("mtp" if module.startswith("model.mtp.") else "core")
+        modules = (module,)
+        if module.endswith(HCA_OUTPUT):
+            modules = group_modules(module, source.document)
+            outputs, remainder = divmod(outputs, len(modules))
+            if remainder or outputs != source.document["o_lora_rank"]:
+                raise ValueError(f"HCA source rows disagree with group geometry: {module}")
         geometry = dict(in_features=inputs, out_features=outputs,
                         stored_out_features=((outputs + 127) // 128) * 128,
                         bits=4 if routed else 8, group=group, codebook="mul1")
         packed_specs(module, geometry)
-        (experts if routed else core)[module] = geometry
+        (experts if routed else core).update(dict.fromkeys(modules, geometry))
     return native, core, experts
 
 
@@ -55,7 +62,7 @@ def view_metadata(source, native, core, experts, identity):
             modules.update({name: dict(g, bits=bits) for name, g in core.items()})
             patterns.extend("^" + re.escape(name) + "$" for name in sorted(core))
         else:
-            for name in core:
+            for name in original_selection(core, source.document):
                 key = mc.original_tensor_name("ernie55_flash", name)
                 retained[key] = source.specs[key]
         config = deepcopy(source.document)
@@ -125,6 +132,10 @@ parity checks. Calibration uses all 64 DSA indexer heads with flash filtering of
 | Calibration | {components['agentic']['tokens']:,} agentic tokens followed by {components['exl3_standard']['tokens']:,} standard tokens |
 | Recovery | All natural top-10 routes, then ranks 11–20 with learnable expert scales and renormalized gamma, then raw-XTX identity observations to reach 1,024 |
 | Combine | Ascending expert order in FP32, then latent normalization and fc2 |
+
+HCA output group `g` uses the standard EXL3 bundle `linear_o_group_proj.groups.g` in
+each compact index. Apply group `g` to its own input channels and concatenate the
+eight outputs in ascending group order. The original index stores the native matrix.
 
 ## Running it
 
@@ -198,8 +209,9 @@ class DirectMCWriter(BaseWriter):
             if role == "core":
                 original.append(name)
             module = name.removesuffix(".weight")
+            modules = group_modules(module, self.header.document) if module.endswith(HCA_OUTPUT) else (module,)
             for bits in ((4,) if role == "routed_expert" else (8, 6)):
-                expected[bits].update(module + "." + s for s in ("trellis", "suh", "svh", "mul1"))
+                expected[bits].update(m + "." + s for m in modules for s in ("trellis", "suh", "svh", "mul1"))
         if any(expected[bits] != entries.keys() for bits, entries in ((4, k4), (8, k8), (6, k6))):
             raise ValueError(f"incomplete ERNIE packed block: {label}")
         return self.write_group(label, original=self.header.source_entries(original),

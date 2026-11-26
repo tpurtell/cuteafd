@@ -38,6 +38,14 @@ def check_source_shard(family, shard):
         raise ValueError("unsafe original source shard")
 
 
+def native_direct_selection(family, compact, config):
+    """Resolve the native row layout corresponding to the compact module inventory."""
+    if family == "ernie55_flash":
+        from ernie55_flash.hca_format import original_selection
+        return original_selection(compact, config)
+    return compact
+
+
 def original_tensor_name(family, module):
     if family == "ernie55_flash" and module.endswith(".self_attn.linear_o_group_proj"):
         return module
@@ -894,6 +902,7 @@ def validate(output, *, verification='full'):
     if reviewed_selection is None:
         recipe, compact_selection = family_recipe(family)
         reviewed_selection = original_core_selection(family, recipe, compact_selection)
+    reviewed_selection = native_direct_selection(family, reviewed_selection, load_json(output / 'config.json'))
     original_quant = load_json(output / 'quantize_config.json')
     for module, geometry in reviewed_selection.items():
         if module in original_quant['tensor_storage']:

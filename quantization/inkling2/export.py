@@ -265,8 +265,9 @@ class DirectMCWriter:
                 raise ValueError('K6 drafter fallback must reference the existing K8 encode')
             for rows in (mappings, sizes, specs):
                 rows['k6-compact'][name] = rows['k8-compact'][name]
+        native_selection = package.native_direct_selection(self.family, core_selection, configs['original'])
         expected = {'original': {package.original_tensor_name(self.family, module): ['BF16', [g['out_features'], g['in_features']]]
-                                  for module, g in core_selection.items()}}
+                                  for module, g in native_selection.items()}}
         for view, bits in (('k8-compact', 8), ('k6-compact', 6)):
             expected[view] = {n: [dtype, shape] for m, g in core_selection.items()
                               for n, (dtype, shape) in packed_specs(m, dict(g, bits=k6_bit_overrides.get(m, bits) if bits == 6 else bits)).items()}

@@ -6,11 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from core_export import packed_specs
-from ernie55_flash import export
+from ernie55_flash import export, hca_format
 from ernie55_flash.source import FLASHINDEXER_FILE, HeaderSource
 import mc_package as mc
 
@@ -24,6 +24,7 @@ def fixture(path):
     roles = {fp: "flashindexer", bare: "core", draft: "core", expert: "routed_expert", "lm_head.weight": "native"}
     names = {n: FLASHINDEXER_FILE if n == fp else "model.safetensors" for n in roles}
     tensors = {n: torch.full((128, 128), i, dtype=torch.bfloat16) for i, n in enumerate(roles)}
+    tensors[bare] = torch.arange(8, dtype=torch.bfloat16).repeat_interleave(128)[:, None].expand(-1, 128).contiguous()
     (path / "flashindexer").mkdir()
     for shard in set(names.values()):
         save_file({n: t for n, t in tensors.items() if names[n] == shard}, path / shard)
@@ -31,7 +32,8 @@ def fixture(path):
         (path / asset).write_text("fixture")
     src = SimpleNamespace(snapshot=path, roles=roles, specs={n: ("BF16", list(t.shape)) for n, t in tensors.items()},
                           weight_map=names, locations={n: dict(shard=s, source_name=n) for n, s in names.items()},
-                          sizes={n: t.nbytes for n, t in tensors.items()}, document={"model_type": "ernie5_5_moe"})
+                          sizes={n: t.nbytes for n, t in tensors.items()}, document=dict(model_type="ernie5_5_moe", o_groups=8,
+                              o_lora_rank=128, num_attention_heads=8, head_dim=128))
     src.payload_bytes = sum(src.sizes.values())
     src.tensor_count = len(roles)
     src.index = {"metadata": {"total_size": src.payload_bytes - src.sizes[fp]}}
@@ -45,6 +47,9 @@ def encode_fixture(path, selection, bits):
     for module, geometry in selection.items():
         for name, (dtype, shape) in packed_specs(module, dict(geometry, bits=bits)).items():
             value = mc.MUL1 - 2**32 if dtype == "I32" else 0
+            if ".groups." in module and dtype != "I32":
+                group = int(module.rsplit(".", 1)[1])
+                value = bits * (group + 1)
             tensors[name] = torch.full(shape, value, dtype=getattr(torch, mc.DTYPES[dtype]))
     save_file(tensors, path)
     return {n: (path, n) for n in tensors}
@@ -60,7 +65,7 @@ def test_direct_package_with_bare_parameter_and_auxiliary_source(tmp_path):
         export.DirectMCWriter(out, src, {"status": "candidate", "inputs": identity["inputs"]})
     writer = export.DirectMCWriter(out, src, identity)
     native, core, experts = export.projection_inventory(src)
-    core_names = [mc.original_tensor_name(writer.family, m) for m in core]
+    core_names = [n for n, role in src.roles.items() if role == "core"]
     packed = {8: encode_fixture(tmp_path/"eight", core, 8), 6: encode_fixture(tmp_path/"six", core, 6),
               4: encode_fixture(tmp_path/"experts", experts, 4)}
     with pytest.raises(ValueError, match="incomplete"):
@@ -87,6 +92,22 @@ def test_direct_package_with_bare_parameter_and_auxiliary_source(tmp_path):
         assert set(q["tensor_storage"]) == (experts.keys() if bits == 16 else experts.keys() | core.keys())
         assert q["meta"]["upstream_activations"] == "k8-compact"
         assert set(core_names).issubset(mapping) == (bits == 16)
+        parent = "model.layers.0.self_attn.linear_o_group_proj"
+        if bits == 16:
+            assert not any(name.startswith(parent + ".groups.") for name in mapping)
+        else:
+            expected = load_file(str(tmp_path / ("eight" if bits == 8 else "six")))
+            for i, bundle in enumerate(hca_format.read_group_bundles(out, mapping, parent, src.document, bits)):
+                assert bundle["suh"][0] == bits * (i + 1)
+                for suffix, tensor in bundle.items():
+                    assert torch.equal(tensor, expected[f"{parent}.groups.{i}.{suffix}"])
+            missing = dict(mapping)
+            del missing[parent + ".groups.7.suh"]
+            with pytest.raises(ValueError, match="incomplete"):
+                list(hca_format.read_group_bundles(out, missing, parent, src.document, bits))
+            with pytest.raises(ValueError, match="incomplete"):
+                list(hca_format.read_group_bundles(out, mapping | {parent: "native.safetensors"},
+                                                   parent, src.document, bits))
     assert "Apache License 2.0" in (out / "README.md").read_text()
     assert (out / "encoding_ernie.py").read_bytes() == (src.snapshot / "encoding_ernie.py").read_bytes()
 
