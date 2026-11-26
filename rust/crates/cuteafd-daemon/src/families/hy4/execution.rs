@@ -1576,6 +1576,7 @@ impl<'a> Hy4Engine<'a> {
             devices,
             programs,
             None,
+            None,
             manifest_path,
             checkpoint,
             cfg,
@@ -1601,6 +1602,7 @@ impl<'a> Hy4Engine<'a> {
         devices: &[Device<'a>],
         programs: &'a Programs<'a>,
         mut preloaded_programs: Option<Vec<Hy4Programs<'a>>>,
+        preloaded_weights: Option<Vec<Hy4RankWeights<'a>>>,
         manifest_path: Option<&Path>,
         checkpoint: &Checkpoint,
         cfg: Hy4Config,
@@ -1640,6 +1642,9 @@ impl<'a> Hy4Engine<'a> {
         if let Some(pre) = &preloaded_programs {
             ensure!(pre.len() == gpus, "preloaded Hy4Programs rank count mismatch");
         }
+        if let Some(pre) = &preloaded_weights {
+            ensure!(pre.len() == gpus, "preloaded Hy4RankWeights rank count mismatch");
+        }
         if gpus == 2 {
             let probed = crate::shared::peer_split::probed_device(
                 devices[0].library,
@@ -1657,8 +1662,10 @@ impl<'a> Hy4Engine<'a> {
         let prefill_waves = prefill_waves.max(1);
         let head_rows = max_rows.min(DECODE_ROWS as usize);
         let index_topk = IndexTopkScratch::resolve(manifest_path, gpus, context_split, admitted_context)?;
-        let weights_all =
-            Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, head_rows, media)?;
+        let weights_all = match preloaded_weights {
+            Some(pre) => pre,
+            None => Hy4RankWeights::load_all(devices, programs, checkpoint, &cfg, max_rows, head_rows, media)?,
+        };
         let max_seq_pages = admitted_context.div_ceil(PAGE_ROWS).max(16);
 
         let metadata_uploads = if context_split {

@@ -179,6 +179,10 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
             draft_length: if args.dspark { args.draft_length.draft_length.map(|n| n as u32) } else { Some(0) },
         },
     )?;
+    let requested = args.decode_rows.as_option();
+    let auto_target = cuteafd_loader::plan::decode_rows::auto_target("deepseek_v41", lanes, args.rtx_gpus as usize);
+    tracing::info!(lanes, decode_rows, auto_target, capped_by_boot_demand = requested.is_none() && decode_rows < auto_target,
+        requested = ?requested, "V4.1 resolved decode geometry");
     args.decode_rows = cuteafd_loader::plan::decode_rows::DecodeRowsSetting::explicit(decode_rows);
     cuteafd_bench::context::set_resolved("decode-rows", &decode_rows.to_string());
     Ok(lanes)

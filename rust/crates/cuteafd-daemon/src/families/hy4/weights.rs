@@ -54,14 +54,15 @@ pub(crate) struct Hy4RankWeights<'a> {
 }
 
 impl<'a> Hy4RankWeights<'a> {
-    pub(crate) fn load_all(
+    /// Allocate each rank's packed target weight arena and record (or mount) all
+    /// non-dequantized target tensors into the active dense loader.
+    pub(crate) fn record_all(
         devices: &[Device<'a>],
         programs: &'a Programs<'a>,
         checkpoint: &Checkpoint,
         cfg: &Hy4Config,
         max_rows: usize,
         max_head_rows: usize,
-        media: crate::shared::vision::push::Contribution,
     ) -> Result<Vec<Self>> {
         let gpus = devices.len();
         ensure!(matches!(gpus, 1 | 2), "Hy4 supports 1 or 2 coordinator GPUs, not {gpus}");
@@ -80,202 +81,205 @@ impl<'a> Hy4RankWeights<'a> {
         ];
         admit_host_memory(0, &mount_owners, 0, 0)?;
         dense.admit_mount(mount)?;
-        let ranks = crate::shared::experts::rtx::push::load_alone_with_media(
-            &checkpoint.snapshot,
-            devices,
-            media,
-            || {
-                let mut ranks = Vec::with_capacity(gpus);
-                for (rank, layout) in layouts.into_iter().enumerate() {
-                    let device = devices[rank];
-                    let arena = DeviceWeightArena::new(
-                        device,
-                        layout.arena.clone(),
-                        ArenaTag::weights("hy4/target"),
-                    )?;
 
-                    let native = Hy4NativeCore::load_with(
-                        device,
-                        programs,
-                        checkpoint,
-                        &layout.core,
-                        &layout.fp8,
-                        fp8_role,
-                        HY4_NATIVE_TAGS,
-                        max_rows,
-                        &arena,
-                    )?;
-                    let claimed_by_native = |name: &str| -> bool {
-                        for suffix in [".trellis", ".suh", ".svh"] {
-                            if let Some(stem) = name.strip_suffix(suffix) {
-                                if layout.core.contains_key(stem) {
-                                    return true;
-                                }
-                            }
-                        }
-                        for suffix in [".payload", ".scales"] {
-                            if let Some(stem) = name.strip_suffix(suffix) {
-                                if layout.fp8.contains_key(stem) {
-                                    return true;
-                                }
-                            }
-                        }
-                        false
-                    };
+        let mut ranks = Vec::with_capacity(gpus);
+        for (rank, layout) in layouts.into_iter().enumerate() {
+            let device = devices[rank];
+            let arena = DeviceWeightArena::new(
+                device,
+                layout.arena.clone(),
+                ArenaTag::weights("hy4/target"),
+            )?;
 
-                    let mut views = BTreeMap::new();
-                    let mut embedding = None;
-                    let mut inv_freq = None;
-
-                    for (name, view_meta) in layout.arena.views() {
-                        if claimed_by_native(name) {
-                            continue;
+            let native = Hy4NativeCore::load_with(
+                device,
+                programs,
+                checkpoint,
+                &layout.core,
+                &layout.fp8,
+                fp8_role,
+                HY4_NATIVE_TAGS,
+                max_rows,
+                &arena,
+            )?;
+            let claimed_by_native = |name: &str| -> bool {
+                for suffix in [".trellis", ".suh", ".svh"] {
+                    if let Some(stem) = name.strip_suffix(suffix) {
+                        if layout.core.contains_key(stem) {
+                            return true;
                         }
-                        if name == ROPE_INV_FREQ {
-                            let bytes = inv_freq_bytes(cfg.qk_rope_dim, cfg.rope_theta);
-                            let alloc = arena.view(name, bytes.len())?;
-                            device.run(|| device.library.copy_h2d(alloc.buffer, &bytes))?;
-                            inv_freq = Some(alloc);
-                            continue;
-                        }
-                        if name == "model.embed_tokens.weight" {
-                            let entry = checkpoint
-                                .tensors
-                                .iter()
-                                .find(|t| t.meta.name == *name)
-                                .context("Hy4 missing model.embed_tokens.weight")?;
-                            let source = EmbedSource::new(
-                                &checkpoint.snapshot,
-                                &entry.shard,
-                                &entry.meta,
-                                cfg.hidden,
-                            )?;
-                            let (emb, ()) = device.run(|| {
-                                TokenEmbedding::load_with(
-                                    device.library,
-                                    source,
-                                    EmbedPlacement::Gpu,
-                                    || Ok(()),
-                                    |_, bytes| arena.view("model.embed_tokens.weight", bytes),
-                                )
-                            })?;
-                            embedding = Some(emb);
-                            continue;
-                        }
-
-                        let alloc = arena.view(name, view_meta.bytes())?;
-                        let stem = name.strip_suffix(".weight").unwrap_or(name);
-                        if stem.ends_with(".self_attn.kv_b_proj") {
-                            if !model.core.contains_key(stem) {
-                                let header = checkpoint
-                                    .header(name)
-                                    .context("Hy4 BF16 KV-B header missing")?;
-                                ensure!(
-                                    header.dtype == DType::Bf16 && header.shape.len() == 2,
-                                    "bad BF16 KV-B shape for {name}"
-                                );
-                                let nope = cfg.qk_nope_dim;
-                                let v = cfg.v_head_dim;
-                                let lat = cfg.kv_lora_rank;
-                                let rect = dense_rect(checkpoint, name, rank, gpus, core_split)?;
-                                let heads = rect.rows.len() / (nope + v);
-                                let uk_bytes = heads * lat * nope * 2;
-                                let uv_bytes = heads * v * lat * 2;
-                                ensure!(
-                                    rect.rows.len() == heads * (nope + v)
-                                        && rect.width() == lat * 2
-                                        && rect.bytes() == uk_bytes + uv_bytes
-                                        && alloc.buffer.bytes == uk_bytes + uv_bytes,
-                                    "Hy4 KV-B source or destination extent differs for {name}"
-                                );
-                                dense.step(
-                                    Step {
-                                        device: device.id,
-                                        rects: vec![rect],
-                                        jobs: vec![Job::Absorb {
-                                            heads,
-                                            nope,
-                                            v,
-                                            lat,
-                                            uk: CuteafdDeviceBuffer {
-                                                bytes: uk_bytes,
-                                                ..alloc.buffer
-                                            },
-                                            uv: CuteafdDeviceBuffer {
-                                                ptr: alloc.buffer.ptr.wrapping_byte_add(uk_bytes),
-                                                bytes: uv_bytes,
-                                                ..alloc.buffer
-                                            },
-                                        }],
-                                    },
-                                    std::ptr::null_mut(),
-                                )?;
-                            }
-                        } else {
-                            let rect = dense_rect(checkpoint, name, rank, gpus, core_split)?;
-                            let bytes = rect.bytes();
-                            ensure!(
-                                bytes == alloc.buffer.bytes,
-                                "Hy4 {name}: source {bytes} and arena {} sizes differ",
-                                alloc.buffer.bytes
-                            );
-                            dense.operand(Operand {
-                                device: device.id,
-                                buffer: alloc.buffer,
-                                lands: vec![(rect, 0)],
-                                bytes,
-                            })?;
-                        }
-                        views.insert(name.clone(), alloc);
                     }
-
-                    let inv_freq = inv_freq.context("Hy4 target arena missing inv_freq view")?;
-                    let local_vocab = cfg.vocab_size / gpus;
-                    let (head_ws, head) = if views.contains_key("lm_head.weight") {
-                        let ws = Allocation::new(
-                            device,
-                            HEAD_WS_BYTES,
-                            Tag::workspace("hy4/head-cublas-ws"),
-                        )?;
-                        let h = device.run(|| {
-                            // SAFETY: `ws` stays alive in `Hy4RankWeights` for the full lifetime of `head`.
-                            unsafe {
-                                device.library.vocabulary_head_rows(
-                                    ws.buffer.ptr,
-                                    cfg.hidden as u32,
-                                    max_head_rows.min(64) as u32,
-                                    local_vocab as u32,
-                                    TargetHead::configured().native_mode(),
-                                )
-                            }
-                        })?;
-                        (Some(ws), Some(h))
-                    } else {
-                        (None, None)
-                    };
-
-                    ranks.push(Self {
-                        device,
-                        rank,
-                        gpus,
-                        layout,
-                        arena,
-                        views,
-                        native,
-                        embedding,
-                        inv_freq,
-                        head_ws,
-                        head,
-                        local_vocab,
-                    });
                 }
-                Ok(ranks)
-            },
-        )?;
-        dense.release();
+                for suffix in [".payload", ".scales"] {
+                    if let Some(stem) = name.strip_suffix(suffix) {
+                        if layout.fp8.contains_key(stem) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            };
 
-        // Convert compact EXL3 `kv_b_proj` projections serially into their absorbed BF16 views.
-        for r in &ranks {
+            let mut views = BTreeMap::new();
+            let mut embedding = None;
+            let mut inv_freq = None;
+
+            for (name, view_meta) in layout.arena.views() {
+                if claimed_by_native(name) {
+                    continue;
+                }
+                if name == ROPE_INV_FREQ {
+                    let bytes = inv_freq_bytes(cfg.qk_rope_dim, cfg.rope_theta);
+                    let alloc = arena.view(name, bytes.len())?;
+                    device.run(|| device.library.copy_h2d(alloc.buffer, &bytes))?;
+                    inv_freq = Some(alloc);
+                    continue;
+                }
+                if name == "model.embed_tokens.weight" {
+                    let entry = checkpoint
+                        .tensors
+                        .iter()
+                        .find(|t| t.meta.name == *name)
+                        .context("Hy4 missing model.embed_tokens.weight")?;
+                    let source = EmbedSource::new(
+                        &checkpoint.snapshot,
+                        &entry.shard,
+                        &entry.meta,
+                        cfg.hidden,
+                    )?;
+                    let (emb, ()) = device.run(|| {
+                        TokenEmbedding::load_with(
+                            device.library,
+                            source,
+                            EmbedPlacement::Gpu,
+                            || Ok(()),
+                            |_, bytes| arena.view("model.embed_tokens.weight", bytes),
+                        )
+                    })?;
+                    embedding = Some(emb);
+                    continue;
+                }
+
+                let alloc = arena.view(name, view_meta.bytes())?;
+                let stem = name.strip_suffix(".weight").unwrap_or(name);
+                if stem.ends_with(".self_attn.kv_b_proj") {
+                    if !model.core.contains_key(stem) {
+                        let header = checkpoint
+                            .header(name)
+                            .context("Hy4 BF16 KV-B header missing")?;
+                        ensure!(
+                            header.dtype == DType::Bf16 && header.shape.len() == 2,
+                            "bad BF16 KV-B shape for {name}"
+                        );
+                        let nope = cfg.qk_nope_dim;
+                        let v = cfg.v_head_dim;
+                        let lat = cfg.kv_lora_rank;
+                        let rect = dense_rect(checkpoint, name, rank, gpus, core_split)?;
+                        let heads = rect.rows.len() / (nope + v);
+                        let uk_bytes = heads * lat * nope * 2;
+                        let uv_bytes = heads * v * lat * 2;
+                        ensure!(
+                            rect.rows.len() == heads * (nope + v)
+                                && rect.width() == lat * 2
+                                && rect.bytes() == uk_bytes + uv_bytes
+                                && alloc.buffer.bytes == uk_bytes + uv_bytes,
+                            "Hy4 KV-B source or destination extent differs for {name}"
+                        );
+                        dense.step(
+                            Step {
+                                device: device.id,
+                                rects: vec![rect],
+                                jobs: vec![Job::Absorb {
+                                    heads,
+                                    nope,
+                                    v,
+                                    lat,
+                                    uk: CuteafdDeviceBuffer {
+                                        bytes: uk_bytes,
+                                        ..alloc.buffer
+                                    },
+                                    uv: CuteafdDeviceBuffer {
+                                        ptr: alloc.buffer.ptr.wrapping_byte_add(uk_bytes),
+                                        bytes: uv_bytes,
+                                        ..alloc.buffer
+                                    },
+                                }],
+                            },
+                            std::ptr::null_mut(),
+                        )?;
+                    }
+                } else {
+                    let rect = dense_rect(checkpoint, name, rank, gpus, core_split)?;
+                    let bytes = rect.bytes();
+                    ensure!(
+                        bytes == alloc.buffer.bytes,
+                        "Hy4 {name}: source {bytes} and arena {} sizes differ",
+                        alloc.buffer.bytes
+                    );
+                    dense.operand(Operand {
+                        device: device.id,
+                        buffer: alloc.buffer,
+                        lands: vec![(rect, 0)],
+                        bytes,
+                    })?;
+                }
+                views.insert(name.clone(), alloc);
+            }
+
+            let inv_freq = inv_freq.context("Hy4 target arena missing inv_freq view")?;
+            let local_vocab = cfg.vocab_size / gpus;
+            let (head_ws, head) = if views.contains_key("lm_head.weight") {
+                let ws = Allocation::new(
+                    device,
+                    HEAD_WS_BYTES,
+                    Tag::workspace("hy4/head-cublas-ws"),
+                )?;
+                let h = device.run(|| {
+                    // SAFETY: `ws` stays alive in `Hy4RankWeights` for the full lifetime of `head`.
+                    unsafe {
+                        device.library.vocabulary_head_rows(
+                            ws.buffer.ptr,
+                            cfg.hidden as u32,
+                            max_head_rows.min(64) as u32,
+                            local_vocab as u32,
+                            TargetHead::configured().native_mode(),
+                        )
+                    }
+                })?;
+                (Some(ws), Some(h))
+            } else {
+                (None, None)
+            };
+
+            ranks.push(Self {
+                device,
+                rank,
+                gpus,
+                layout,
+                arena,
+                views,
+                native,
+                embedding,
+                inv_freq,
+                head_ws,
+                head,
+                local_vocab,
+            });
+        }
+        dense.release();
+        Ok(ranks)
+    }
+
+    /// Convert compact EXL3 `kv_b_proj` projections serially into their absorbed BF16 views.
+    pub(crate) fn finish_kv_b(
+        ranks: &[Self],
+        programs: &'a Programs<'a>,
+        checkpoint: &Checkpoint,
+        cfg: &Hy4Config,
+    ) -> Result<()> {
+        let model = hy4_plan::Model::open(checkpoint)?;
+        let gpus = ranks.len();
+        for r in ranks {
             for (name, dst) in &r.views {
                 let Some(stem) = name
                     .strip_suffix(".weight")
@@ -303,6 +307,25 @@ impl<'a> Hy4RankWeights<'a> {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    pub(crate) fn load_all(
+        devices: &[Device<'a>],
+        programs: &'a Programs<'a>,
+        checkpoint: &Checkpoint,
+        cfg: &Hy4Config,
+        max_rows: usize,
+        max_head_rows: usize,
+        media: crate::shared::vision::push::Contribution,
+    ) -> Result<Vec<Self>> {
+        let ranks = crate::shared::experts::rtx::push::load_alone_with_media(
+            &checkpoint.snapshot,
+            devices,
+            media,
+            || Self::record_all(devices, programs, checkpoint, cfg, max_rows, max_head_rows),
+        )?;
+        Self::finish_kv_b(&ranks, programs, checkpoint, cfg)?;
         Ok(ranks)
     }
 

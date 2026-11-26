@@ -2127,9 +2127,9 @@ fn admission_loads<T>(active: &mut [T], lanes: u8, queued: impl IntoIterator<Ite
 }
 
 /// Members one decode lane holds: the request slots split across `lanes`
-/// lanes, capped by the per-lane member limit (`V41_MAX_LANE_MEMBERS`).
+/// lanes, capped by the per-lane member limit (64 total).
 pub(super) fn lane_capacity(slots: usize, lanes: usize) -> usize {
-    slots.div_ceil(lanes.max(1)).min(cuteafd_core::V41_MAX_LANE_MEMBERS)
+    slots.div_ceil(lanes.max(1)).min(cuteafd_core::v41_lane_members(lanes.max(1)))
 }
 
 fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<'a>>],
@@ -2199,7 +2199,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
 ) -> Result<()> {
     let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
     let started = Instant::now();
-    ensure!(!members.is_empty() && members.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid single decode lane");
+    ensure!(!members.is_empty() && members.len() <= cuteafd_core::V41_MAX_REQUESTS, "invalid single decode lane");
     let speculative = draft.is_some();
     let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
     // Speculative rows vary every round: keep each decode shape's graphs,

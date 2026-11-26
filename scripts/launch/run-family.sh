@@ -817,7 +817,7 @@ v41_decode_rows="$(get DECODE_ROWS)"
 [[ -z "$v41_decode_rows" || "$v41_decode_rows" == auto || "$v41_decode_rows" =~ ^[1-9][0-9]*$ ]] ||
   release_die "DECODE_ROWS must be auto or a positive integer"
 [[ -z "$v41_decode_rows" ]] || count_args+=(--decode-rows "$v41_decode_rows")
-[[ -z "$v41_decode_rows" || "$v41_decode_rows" == auto || -z "$draft_length" ]] || count_args+=(--draft-length "$draft_length")
+[[ -z "$draft_length" ]] || count_args+=(--draft-length "$draft_length")
 count_args+=("${attention_precision_args[@]}")
 ((RELEASE_SPARK_COUNT_EXPLICIT == 0)) || count_args+=(--spark-ranks "$SPARK_COUNT")
 # Keep checkpoint paths unchanged inside the full namespace mount.
@@ -880,6 +880,11 @@ resolved_decode_lanes="$(jq -er '.decode_lanes | select(. == 1 or . == 2)' <<<"$
   release_die "DeepSeek V4.1 deployment does not name one or two decode lanes"
 resolved_decode_rows="$(jq -er '.decode_rows | select(type == "number" and . >= 1)' <<<"$count_plan")" ||
   release_die "DeepSeek V4.1 deployment does not name a supported verify-row budget"
+if [[ -z "$v41_decode_rows" || "$v41_decode_rows" == auto ]]; then
+  if [[ "$RELEASE_RTX_GPUS" == 1 && "$resolved_decode_lanes" == 1 && "$resolved_decode_rows" -lt 128 ]]; then
+    echo "V4.1 auto DECODE_ROWS capped by boot demand: 128 -> $resolved_decode_rows"
+  fi
+fi
 selected_count="$(jq -er '.spark_ranks' <<<"$count_plan")"
 if ((RELEASE_SPARK_COUNT_EXPLICIT)); then
   ((selected_count <= SPARK_COUNT)) || release_die "planner requested more Spark ranks than configured: $selected_count > $SPARK_COUNT"
