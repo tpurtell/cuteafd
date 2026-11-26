@@ -40,7 +40,13 @@ def bootstrap_key(inputs):
 def qualify(inputs, vendor, local):
     measured = measured_inputs(inputs)
     checked = identity.verified_identity(measured, vendor, local)
-    return dict(checked, inputs=inputs,
+    # Publication and reporting run outside the numerical worker.
+    family = "quantization/ernie55_flash/"
+    operational = {family + name for name in ("publish.py", "handoff.py", "progress.py",
+                   "postprocess.py", "finish.py", "after_production.py", "after-production.sh")}
+    numerical = {path:sha for path,sha in inputs["code"].items()
+                 if path not in operational and not path.startswith(family + "systemd/")}
+    return dict(checked, inputs=dict(inputs, code=numerical),
                 measured_parity_input_sha256=identity.parity_input_digest(measured),
                 shared_production_files=identity.committed_files(identity.REPO, *DEPENDENCIES))
 
