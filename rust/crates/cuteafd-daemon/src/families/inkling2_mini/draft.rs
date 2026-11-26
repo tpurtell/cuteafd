@@ -272,10 +272,11 @@ impl<'a> Binding<'a> {
         let mut first_matches = 0;
         let mut blocks = 0;
         let mut max_rel_l2 = 0.0f64;
-        // Measured independent BF16 attention paths differ by ~0.17% from FP64;
-        // this checkpoint amplifies it to 4.25% head relL2. Allow 8% per row,
-        // and first disagreements up to 2 nats (observed maximum 1.75) only.
-        const MAX_ROW_REL_L2: f64 = 0.08;
+        // Independent BF16 attention paths differ by 0.17% from FP64. For
+        // anchor 101 the head relL2 was 4.25% overall, 5.55% worst row;
+        // the gate allows 6% per row. Across the four anchors the first
+        // disagreement margin was at most 1.75 and position 1 agreed 4/4.
+        const MAX_ROW_REL_L2: f64 = 0.06;
         const MAX_DIVERGENCE_MARGIN: f32 = 2.0;
         for test in fixture.results {
             let actual = self.propose(&[DraftSeq { slot: 0, anchor: test.anchor, position: fixture.rows, valid_from: 0 }], embed, norm, head)?;
