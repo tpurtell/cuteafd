@@ -418,17 +418,23 @@ fn vision_on_two_rtx_is_charged_by_the_joint_solve() {
                     && phase.phase == crate::placement::planner::Phase::Ready).unwrap().owned;
             let host_total = report.phase_ledger.as_ref().unwrap().budgets.iter()
                 .find(|budget| budget.id == "coordinator host RAM").unwrap().physical_bytes;
-            let off_baseline = if memory.pool_tokens == off.memory_layout.as_ref().unwrap().pool_tokens {
-                off.clone()
-            } else {
-                // Match the smaller RTX-vision pool so pinned upload page-table sizing is identical.
+            let baseline_host = if on_rtx && (report.onboard_layers != off.onboard_layers
+                || memory.pool_tokens != off.memory_layout.as_ref().unwrap().pool_tokens)
+            {
+                // An RTX-hosted tower can shrink the admitted KV pool or displace onboarded
+                // TP2 layers (changing pinned page-table staging or route checks); compare
+                // host Ready at matching pool and onboard count to isolate the media cache.
                 let mut matched = layout_options(ranks, 2);
                 matched.vision = MediaMode::Off;
-                matched.layout.as_mut().unwrap().workspace_manifest = Some(manifest.clone());
-                matched.layout.as_mut().unwrap().pool_tokens = Some(memory.pool_tokens);
-                input.plan(&matched).unwrap()
+                let layout = matched.layout.as_mut().unwrap();
+                layout.onboard = report.onboard_layers.map(crate::placement::OnboardSetting::Layers);
+                layout.pool_tokens = Some(memory.pool_tokens);
+                layout.workspace_manifest = Some(manifest.clone());
+                host_ready(&input.plan(&matched).unwrap())
+            } else {
+                host_ready(&off)
             };
-            assert_eq!(host_ready(&report) - host_ready(&off_baseline), (8u64 << 30).min(host_total / 20),
+            assert_eq!(host_ready(&report) - baseline_host, (8u64 << 30).min(host_total / 20),
                 "both local and remote towers charge their coordinator embedding cache");
             println!("ml4 n={ranks} 2 RTX {vision:?}: encoder {:?}, pool {} (off {})", encoder.kind,
                 memory.pool_tokens, off.memory_layout.as_ref().unwrap().pool_tokens);

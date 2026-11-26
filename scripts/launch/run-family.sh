@@ -113,6 +113,11 @@ while IFS='=' read -r key value; do
 done < <(grep -E '^[A-Z_0-9]+=' "$config")
 [[ -z "${SPARK_COUNT:-}" ]] || { cfg[SPARK_COUNT]="$SPARK_COUNT"; cfg_file[SPARK_COUNT]=1; }
 [[ -z "${SPARK_HOSTS:-}" ]] || { cfg[SPARK_HOSTS]="$SPARK_HOSTS"; cfg_file[SPARK_HOSTS]=1; }
+for key in "${!cfg[@]}"; do
+  if [[ "$key" == *_HOST || "$key" == *_HOSTS || "$key" == WIP_BUILD_SEED ]]; then
+    release_validate_host_value "$key" "${cfg[$key]}"
+  fi
+done
 get() { printf '%s' "${cfg[$1]:-${2:-}}"; }
 # Attention compute never inherits a weight or cache format.
 attention_precision="$(get ATTENTION_PRECISION)"
@@ -1653,7 +1658,8 @@ fi
 speculator="$(get SPECULATOR)"
 if [[ "$family" == kimi_k3 ]]; then kimi_requested_speculator="$speculator"; speculator=off; fi
 # MiniMax uses its bundled native drafter on whole, Layers and Heads placements.
-if [[ ( "$family" == minimax_m3 || "$family" == inkling2 || "$family" == inkling2_mini ) && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
+if [[ ( "$family" == minimax_m3 || "$family" == inkling2 ) && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
+if [[ "$family" == inkling2_mini && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dflash2; fi
 # Qwen resolves auto only after expert admission, not from configured inventory.
 if [[ "$family" == qwen4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=auto; fi
 if [[ "$family" == hy4_flash && ( -z "$speculator" || "$speculator" == auto ) ]]; then
@@ -1664,6 +1670,7 @@ if [[ "$family" == hy4_flash && ( -z "$speculator" || "$speculator" == auto ) ]]
 fi
 default_drafter=""
 [[ "$family" != muse_spark ]] || default_drafter=nvidia/Muse-Spark-Open-816B-A42B-DFlash2
+[[ "$family" != inkling2_mini ]] || default_drafter=incoai/Inkling-2-Mini-DFlash2
 
 if [[ -z "$speculator" ]]; then
   speculator=off
@@ -1706,7 +1713,7 @@ if [[ -z "$speculator" ]]; then
 
 fi
 case "$family:$speculator" in
-  minimax_m3:dspark|inkling2:dspark|inkling2_mini:dspark|hy4_flash:dfly2) ;;
+  minimax_m3:dspark|inkling2:dspark|inkling2_mini:dspark|inkling2_mini:dflash2|hy4_flash:dfly2) ;;
   qwen4:mtp|qwen4:auto) ;;
   glm5:dspark) [[ "$checkpoint_family" == mistral_large4 ]] ||
     { echo "SPECULATOR=dspark does not apply to $family" >&2; exit 2; } ;; # The MTP layer's experts stay local even with Spark backbone experts.
@@ -1881,6 +1888,9 @@ case "$speculator" in
       draft_revision="$(get SPECULATOR_MODEL_REVISION)"
       if [[ -z "$draft_revision" && "$family:$speculator" == kimi_k3:dspark && "$drafter" == "$default_drafter" ]]; then
         draft_revision="$(jq -er '.default_drafter_revision' <<<"$kimi_defaults")"
+      fi
+      if [[ -z "$draft_revision" && $family == inkling2_mini && $drafter == incoai/Inkling-2-Mini-DFlash2 ]]; then
+        draft_revision=4f9088ea66c21f2b99ed657d1941c306b03e84d2
       fi
       if [[ -z "$draft_revision" && $family == muse_spark && $drafter == nvidia/Muse-Spark-Open-816B-A42B-DFlash2 ]]; then
         draft_revision=22e2669e4c60689f9bff0749a34d9d8e59ce7cd6
@@ -2116,6 +2126,8 @@ if [[ $family == inkling2_mini ]]; then
   case "$inkling_draft_kv" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
   if [[ "$speculator" == dspark ]]; then
     family_args+=(--dspark --draft-kv-cache "$inkling_draft_kv")
+  elif [[ "$speculator" == dflash2 ]]; then
+    family_args+=(--dspark=false --draft-kv-cache "$inkling_draft_kv")
   else
     family_args+=(--dspark=false)
   fi
@@ -2498,7 +2510,7 @@ audio_encoder_hash=""
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
     plan_draft_args+=(--draft-kv-cache "$(get DRAFT_KV_CACHE "${kimi_draft_kv_default:-fp8}")")
   fi
-  if [[ "$family:$speculator" == muse_spark:dflash2 ]]; then
+  if [[ "$family:$speculator" == muse_spark:dflash2 || "$family:$speculator" == inkling2_mini:dflash2 ]]; then
     plan_draft_args+=(--drafter-snapshot "$draft_snapshot")
   fi
   # Read the effective serve argv, including family modes that enable auto.
@@ -2564,7 +2576,7 @@ audio_encoder_hash=""
   [[ -z "$(get SPARK_DECODE_REPLY_FORMAT)" ]] || plan_draft_args+=(--spark-decode-reply-format "$(get SPARK_DECODE_REPLY_FORMAT)")
   if [[ "$family" == inkling2 || "$family" == inkling2_mini ]]; then
     plan_draft_args+=(--kv-cache "$inkling_kv")
-    if [[ "$speculator" == dspark ]]; then plan_draft_args+=(--draft-kv-cache "$inkling_draft_kv"); fi
+    if [[ "$speculator" == dspark || "$speculator" == dflash2 ]]; then plan_draft_args+=(--draft-kv-cache "$inkling_draft_kv"); fi
   fi
   if [[ "$family" == hy4_flash || "$family" == hy4 ]]; then
     plan_draft_args+=(--kv-cache "$hy4_kv")

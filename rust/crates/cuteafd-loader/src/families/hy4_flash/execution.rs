@@ -49,9 +49,23 @@ pub fn hy4_dsa_partial_scratch_bytes(rows: usize) -> usize {
     part + lse
 }
 
+/// Maximum rows of the installed ContextSplit partial programs (internally
+/// tiled at 64 rows). The index score workspace is independently sub-tiled.
+pub const CONTEXT_PREFILL_ROWS: usize = 4096;
+
+/// Physical exchange and scratch width, shared by admission and execution.
+pub fn context_exchange_rows(max_rows: usize, decode_rows: usize) -> usize {
+    max_rows.min(CONTEXT_PREFILL_ROWS).max(decode_rows)
+}
+
+/// Decode and verify must remain a single exchange (and one graph shape).
+pub fn context_chunk_rows(max_rows: usize, decode_rows: usize, decode: bool) -> usize {
+    if decode { decode_rows } else { context_exchange_rows(max_rows, decode_rows) }
+}
+
 /// Shared `ContextExchange` buffer specification for Hy4-flash 2-GPU ContextSplit DSA layers
 /// (16 heads/GPU, 576-dim absorbed query, 512 scored group candidates, 2 alternating slots).
-pub fn hy4_context_buffers(cfg: &Hy4FlashConfig, decode_rows: usize) -> crate::placement::ContextBuffers {
+pub fn hy4_context_buffers(cfg: &Hy4FlashConfig, max_rows: usize, decode_rows: usize) -> crate::placement::ContextBuffers {
     let half_heads = (cfg.sparse_heads / 2) as u64;
     let kv_a_dim = (cfg.kv_lora_rank + cfg.qk_rope_dim) as u64;
     let group_topk = cfg.indexer_group_topk as u64;
@@ -62,7 +76,7 @@ pub fn hy4_context_buffers(cfg: &Hy4FlashConfig, decode_rows: usize) -> crate::p
         partial_row_bytes: half_heads * (cfg.kv_lora_rank as u64 * 2 + 4),
         candidate_row_bytes: group_topk * 8,
         compiled_extent: 0,
-        decode_rows: decode_rows as u64,
+        decode_rows: context_exchange_rows(max_rows, decode_rows) as u64,
         lanes: 1,
         workspace_bytes: 0,
     }
@@ -360,7 +374,7 @@ impl SharedScratchLayout {
             (
                 "attn_scratch".into(),
                 mla_split_scratch_bytes(decode_rows, tp)
-                    .max(if context_split { hy4_dsa_partial_scratch_bytes(decode_rows) } else { 0 })
+                    .max(if context_split { hy4_dsa_partial_scratch_bytes(context_exchange_rows(max_rows, decode_rows)) } else { 0 })
                     .max(ATTN_SCRATCH_BYTES)
                     .max(256),
             ),
@@ -392,13 +406,14 @@ impl SharedScratchLayout {
         ];
         if context_split {
             let half_dsa_heads = cfg.sparse_heads / 2;
-            views.push(("ctx_cand_scores".into(), (decode_rows * cfg.indexer_group_topk * 4).max(256)));
-            views.push(("ctx_cand_indices".into(), (decode_rows * cfg.indexer_group_topk * 4).max(256)));
-            views.push(("ctx_partial_own".into(), (decode_rows * half_dsa_heads * cfg.kv_lora_rank * 2).max(256)));
-            views.push(("ctx_lse_own".into(), (decode_rows * half_dsa_heads * 4).max(256)));
-            views.push(("ctx_partial_peer".into(), (decode_rows * half_dsa_heads * cfg.kv_lora_rank * 2).max(256)));
-            views.push(("ctx_lse_peer".into(), (decode_rows * half_dsa_heads * 4).max(256)));
-            views.push(("ctx_draft_slots".into(), (decode_rows * cfg.indexer_candidate_topk * 4).max(256)));
+            let ctx_rows = context_exchange_rows(max_rows, decode_rows);
+            views.push(("ctx_cand_scores".into(), (ctx_rows * cfg.indexer_group_topk * 4).max(256)));
+            views.push(("ctx_cand_indices".into(), (ctx_rows * cfg.indexer_group_topk * 4).max(256)));
+            views.push(("ctx_partial_own".into(), (ctx_rows * half_dsa_heads * cfg.kv_lora_rank * 2).max(256)));
+            views.push(("ctx_lse_own".into(), (ctx_rows * half_dsa_heads * 4).max(256)));
+            views.push(("ctx_partial_peer".into(), (ctx_rows * half_dsa_heads * cfg.kv_lora_rank * 2).max(256)));
+            views.push(("ctx_lse_peer".into(), (ctx_rows * half_dsa_heads * 4).max(256)));
+            views.push(("ctx_draft_slots".into(), (ctx_rows * cfg.indexer_candidate_topk * 4).max(256)));
         }
         if rank == 0 {
             views.push(("head_logits_f32".into(), (HEAD_TILE_ROWS * cfg.vocab_size * 4).max(256)));
@@ -644,12 +659,24 @@ mod tests {
             );
         }
 
-        let ex = hy4_context_buffers(&cfg, decode_rows);
+        let ex = hy4_context_buffers(&cfg, 2752, decode_rows);
         let ex_bytes = crate::placement::ContextExchangeLayout::new(&ex)
             .bytes()
             .expect("ContextExchangeLayout bytes");
-        // Chunked at decode_rows=64: ~7.5 MiB per GPU (well under 16 MiB).
-        assert!(ex_bytes > 4 << 20 && ex_bytes < 16 << 20, "unexpected ex_bytes={ex_bytes}");
+        let old = crate::placement::ContextExchangeLayout::new(&hy4_context_buffers(&cfg, decode_rows, decode_rows));
+        let wide = crate::placement::ContextExchangeLayout::new(&ex);
+        assert_eq!(wide.rows, 2752);
+        assert_eq!(ex_bytes - old.bytes().unwrap(), (2752 - 64) * 123_008);
+        for live in [1, 64, 128, 2752, 4096, 8192] {
+            assert_eq!(context_chunk_rows(live.max(decode_rows), decode_rows, true), decode_rows);
+            assert_eq!(context_chunk_rows(live.max(decode_rows), decode_rows, false), live.clamp(decode_rows, 4096));
+        }
+        let narrow = SharedScratchLayout::new_with_context(&cfg, 0, 2, 64, 64, 64, 16, cfg.vocab_size / 2, true)?;
+        let wide_scratch = SharedScratchLayout::new_with_context(&cfg, 0, 2, 2752, 64, 64, 16, cfg.vocab_size / 2, true)?;
+        let ctx_bytes = |layout: &SharedScratchLayout| layout.arena.views().iter()
+            .filter(|(name, _)| name.starts_with("ctx_")).map(|(_, v)| v.bytes()).sum::<usize>();
+        assert_eq!(ctx_bytes(&wide_scratch) - ctx_bytes(&narrow), (2752 - 64) * 45_184);
+        assert_eq!(wide_scratch.arena.view("attn_scratch").unwrap().bytes(), narrow.arena.view("attn_scratch").unwrap().bytes());
         Ok(())
     }
 }

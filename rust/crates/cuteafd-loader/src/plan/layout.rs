@@ -110,6 +110,7 @@ pub struct LayoutOptions {
     pub dense_qwen_mtp: bool,
     pub minimax_dspark: bool,
     pub inkling_dspark: bool,
+    pub inkling_mini_dflash: Option<std::path::PathBuf>,
     pub hy4_dfly2: bool,
     /// Explicitly disable GLM Flash external speculation and its arenas.
     pub glmf_drafter_disabled: bool,
@@ -327,6 +328,7 @@ impl Default for LayoutOptions {
             dense_qwen_mtp: false,
             minimax_dspark: false,
             inkling_dspark: false,
+            inkling_mini_dflash: None,
             hy4_dfly2: false,
             glmf_drafter_disabled: false,
             glmf_drafter_snapshot: None,

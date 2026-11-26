@@ -1503,7 +1503,7 @@ pub(crate) struct Fp8Prefill {
     pub kda_bits: i32,
 }
 
-use cuteafd_loader::serving_capacity::glmf_graphs::{GraphGeometry, decode_strides};
+use crate::shared::decode_graph::{GraphGeometry, decode_strides};
 
 fn check_decode_slots(sequences: impl IntoIterator<Item = i32>) -> Result<()> {
     let mut slots = std::collections::HashSet::new();
@@ -1547,12 +1547,12 @@ impl GraphKey {
     fn normalized(mut self, attention: Option<GlmNextAttention>) -> Self {
         self.head = attention.is_none();
         if self.head { self.spec = false; }
-        if attention != Some(GlmNextAttention::Mla) {
-            self.long = false;
-            self.pool_width = 0;
-            self.page_stride = 0;
-            self.pool_stride = 0;
-        }
+        let geometry = GraphGeometry::keyed(self.pool_width, self.page_stride, self.pool_stride, self.long)
+            .for_table(attention == Some(GlmNextAttention::Mla));
+        self.long = geometry.long;
+        self.pool_width = geometry.pool_width;
+        self.page_stride = geometry.page_stride;
+        self.pool_stride = geometry.pool_stride;
         self
     }
 }

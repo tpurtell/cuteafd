@@ -71,6 +71,7 @@ mod exl3_workspace;
 pub(crate) use exl3_workspace::exl3_workspace_bytes_from_refs;
 pub use exl3_workspace::{exl3_rtx_output_bytes, exl3_workspace_bytes, Exl3Epilogue, Exl3WorkspaceBinding, Exl3WorkspaceLayout, Exl3WorkspaceOwner};
 pub mod glm_graphs;
+pub mod decode_graph_key;
 pub mod v41_graphs;
 pub mod v41_workspace;
 pub mod mimo_graphs;
@@ -407,25 +408,11 @@ fn selected(
     Ok(())
 }
 
-/// Preserve the qualified short-context shapes; only long tables use geometric rows.
-pub const GLM_SHORT_ROW_BUCKETS: [usize; 24] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
-    20, 24, 28, 32, 40, 48, 56, 64];
-pub const GLM_LONG_ROW_BUCKETS: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
 pub const GLM_PAGE_ROWS: usize = 64;
 
-pub fn glm_decode_row_buckets(table_width: usize) -> &'static [usize] {
-    if table_width > 131_072 / GLM_PAGE_ROWS { &GLM_LONG_ROW_BUCKETS } else { &GLM_SHORT_ROW_BUCKETS }
-}
-
-pub fn glm_decode_row_bucket(rows: usize, table_width: usize) -> Result<usize, CacheGeometryError> {
-    if !(1..=64).contains(&rows) { return Err(CacheGeometryError::InvalidGlmDecodeRows(rows)); }
-    glm_decode_row_buckets(table_width).iter().copied().find(|&bucket| bucket >= rows)
-        .ok_or(CacheGeometryError::InvalidGlmDecodeRows(rows))
-}
-
 pub fn glm_decode_table_width(pages: usize, context: usize, pool_pages: usize) -> usize {
-    let cap = context.div_ceil(GLM_PAGE_ROWS).min(pool_pages).max(1);
-    pages.max(16).next_power_of_two().min(cap)
+    let table_pages = context.div_ceil(GLM_PAGE_ROWS).max(1);
+    decode_graph_key::decode_page_stride(pages, pool_pages.max(1), table_pages)
 }
 
 pub fn glm_decode_table_widths(context: usize, pool_pages: usize) -> Vec<usize> {
@@ -991,27 +978,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn glm_long_graphs_cover_every_row_and_keep_short_keys() {
+    fn glm_decode_table_widths_are_powers_of_two_capped_by_pool_and_context() {
         let short = glm_decode_table_widths(131_072, 32_768);
-        assert_eq!(short, vec![16, 32, 64, 128, 256, 512, 1024, 2048]);
+        assert_eq!(short, vec![64, 128, 256, 512, 1024, 2048]);
         let long = glm_decode_table_widths(1_048_576, 32_768);
         assert_eq!(&long[..short.len()], short.as_slice());
-        let shapes: usize = long.iter().map(|&w| glm_decode_row_buckets(w).len()).sum();
-        assert_eq!(shapes, 8 * 24 + 3 * 7);
-        for width in long {
-            for rows in 1..=64 {
-                let bucket = glm_decode_row_bucket(rows, width).unwrap();
-                assert!(bucket >= rows && bucket <= 64);
-                if width <= 2048 {
-                    assert_eq!(bucket, *GLM_SHORT_ROW_BUCKETS.iter().find(|&&b| b >= rows).unwrap());
-                } else {
-                    assert_eq!(bucket, rows.next_power_of_two());
-                }
-            }
-        }
-        assert!(glm_decode_row_bucket(0, 16384).is_err());
-        assert!(glm_decode_row_bucket(65, 16384).is_err());
-        assert_eq!(glm_decode_table_widths(1_048_576, 3000), vec![16, 32, 64, 128, 256, 512, 1024, 2048, 3000]);
+        assert_eq!(long, vec![64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]);
+        assert_eq!(glm_decode_table_widths(1_048_576, 3000), vec![64, 128, 256, 512, 1024, 2048, 3000]);
+        assert_eq!(glm_decode_table_width(1, 131_072, 32_768), decode_graph_key::MIN_PAGE_STRIDE);
+        assert_eq!(glm_decode_table_width(17, 131_072, 32_768), decode_graph_key::MIN_PAGE_STRIDE);
+        assert_eq!(glm_decode_table_width(65, 131_072, 32_768), 128);
+        assert_eq!(glm_decode_table_width(1, 131_072, 32), 32);
     }
 
     #[test]

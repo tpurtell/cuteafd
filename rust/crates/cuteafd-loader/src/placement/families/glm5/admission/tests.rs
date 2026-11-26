@@ -189,7 +189,7 @@ fn gqa_layout(representation: crate::families::glm5::draft_representation::GlmDr
     let cfg = GlmDflashConfig { hidden: 256, intermediate: 512, layers: 2, heads: 4,
         kv_heads: 2, head_dim: 64, eps: 1e-5, theta: 10000., block: 4, group: 2,
         mask_token: 0, rank: 256, taps: vec![0, 1], vocab: 64, window: 2048,
-        row_window: false, sample_from_anchor: false };
+        row_window: false, sample_from_anchor: false, post_selector_softcap: None };
     GlmDflashPhysicalLayout::new(&cfg, representation, GlmDraftCapacity::new(20, 16, cfg.block).unwrap(),
         188, 0, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap()
 }
@@ -201,7 +201,7 @@ fn packed_draft_is_charged_once_during_push_target_load() {
     let draft = GlmDflashConfig { hidden: 256, intermediate: 512, layers: 2, heads: 4,
         kv_heads: 2, head_dim: 64, eps: 1e-5, theta: 10000., block: 4, group: 2,
         mask_token: 0, rank: 256, taps: vec![0, 1], vocab: 64, window: 2048,
-        row_window: false, sample_from_anchor: false };
+        row_window: false, sample_from_anchor: false, post_selector_softcap: None };
     for representation in [GlmDraftRepresentation::Bf16Only, GlmDraftRepresentation::Fp8Only] {
         let layout = GlmDflashPhysicalLayout::new(&draft, representation,
             GlmDraftCapacity::new(20, 16, draft.block).unwrap(), 188, 0,
@@ -430,7 +430,7 @@ fn tp2_gqa_draft_splits_arenas_charges_standalone_tails_and_balances_embedding()
     let draft_cfg = GlmDflashConfig { hidden: 256, intermediate: 512, layers: 2, heads: 4,
         kv_heads: 2, head_dim: 64, eps: 1e-5, theta: 10000., block: 4, group: 2,
         mask_token: 0, rank: 256, taps: vec![0, 1], vocab: 64, window: 2048,
-        row_window: false, sample_from_anchor: false };
+        row_window: false, sample_from_anchor: false, post_selector_softcap: None };
     std::fs::write(draft_dir.path().join("config.json"), serde_json::to_vec(&serde_json::json!({
         "hidden_size": draft_cfg.hidden, "intermediate_size": draft_cfg.intermediate,
         "num_hidden_layers": draft_cfg.layers, "num_attention_heads": draft_cfg.heads,
@@ -1518,8 +1518,7 @@ fn graph_layers(owners: &[u8], tp2: &[bool]) -> Vec<GlmGraphLayer> {
 }
 
 #[test]
-fn graph_figures_are_keyed_by_the_measured_fingerprint_and_estimate_other_layouts() {
-    disallow_synthetic_graphs();
+fn graph_figures_use_w1_working_set_reserves_for_every_layout() {
     let min_layers: Vec<_> = (0..78).map(|layer| GlmGraphLayer {
         dense: layer < 3, local: false, attention_owner: None,
     }).collect();
@@ -1527,71 +1526,39 @@ fn graph_figures_are_keyed_by_the_measured_fingerprint_and_estimate_other_layout
     for layer in &mut max_layers[3..9] { layer.local = true; }
     let min = StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 4).unwrap();
     let max = StartupGraphs::new(1 << 20, AttentionPlacement::Context, 2, &max_layers, 6).unwrap();
-    assert_eq!(min.declared()[0].fingerprint(0).unwrap(), MIN_GRAPHS);
-    assert_eq!(max.declared()[0].fingerprint(0).unwrap(), MAX_GRAPHS[0]);
-    assert_eq!(max.declared()[1].fingerprint(1).unwrap(), MAX_GRAPHS[1]);
-    assert_eq!(min.ranks()[0].bytes, 2_984_247_296);
-    assert_eq!(max.ranks().iter().map(|rank| rank.bytes).collect::<Vec<_>>(),
-        [3_042_967_552, 2_971_664_384]);
-    for (rank, graph) in min.ranks().iter().enumerate() {
-        assert_eq!(graph.margin, 0);
-        assert_eq!(graph.basis, Basis::Calibrated);
-        assert_eq!(graph.executables as usize, min.declared()[rank].len());
+    for graphs in [&min, &max] {
+        for (rank, component) in graphs.components(32768).unwrap().iter().enumerate() {
+            let ComponentKind::Allowance(allowance) = &component.kind else {
+                panic!("graphs are opaque, not physical allocations")
+            };
+            assert_eq!(allowance.location, Location::coordinator(rank as u8));
+            assert_eq!(allowance.lifetime, Lifetime { first: Phase::Warmup, last: Phase::Growth });
+            let measured = graphs.default_reserve(rank);
+            let expected = crate::placement::graph_reserve::resolve_working_set(None, None, None, rank, measured).unwrap().bytes;
+            assert_eq!(allowance.bytes, expected);
+            assert_eq!(allowance.bytes, graphs.reserves().unwrap()[rank]);
+            assert!(!allowance.assumed, "the configured budget is not a census estimate");
+            assert!(allowance.source.starts_with("graph reserve: "));
+        }
     }
-    assert_eq!(min.figures()[0].attribution, FigureAttribution::Measured);
-    assert_eq!(min.figures()[0].identity.declared_graphs, MIN_GRAPHS);
-    for (rank, component) in max.components(32768).unwrap().iter().enumerate() {
-        let ComponentKind::Allowance(allowance) = &component.kind else {
-            panic!("graphs are opaque, not physical allocations")
-        };
-        assert_eq!(allowance.location, Location::coordinator(rank as u8));
-        assert_eq!(allowance.lifetime, Lifetime { first: Phase::Warmup, last: Phase::Growth });
-        assert_eq!(allowance.bytes, max.reserves().unwrap()[rank]);
-        assert!(!allowance.assumed, "the configured budget is not a census estimate");
-        assert!(allowance.source.starts_with("graph reserve: "));
-    }
-    // The declared key set, not the context alone, is the identity. Each of
-    // these produces a fingerprint with no measured row; #1605 serves it on the
-    // best measured row for its rank (the default-context row upper-bounds a
-    // lower context), labelled Estimated with one warning, and never scales or
-    // refuses.
     let mut owned = max_layers.clone();
     for (layer, spec) in owned.iter_mut().enumerate() { spec.attention_owner = Some((layer % 2) as u8); }
-    let estimated = [
+    for graphs in [
         StartupGraphs::new(1 << 19, AttentionPlacement::Heads, 1, &min_layers, 4),
         StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 2, &max_layers, 6),
         StartupGraphs::new(1 << 20, AttentionPlacement::Layers, 2, &owned, 6),
         StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 8),
         StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers[..77], 4),
-    ];
-    for graphs in estimated {
-        let graphs = graphs.expect("an unmeasured declared graph set is served, not refused");
-        for (rank, graph) in graphs.ranks().iter().enumerate() {
-            assert_eq!(graph.basis, Basis::Estimated);
-            assert_eq!(graph.margin, 0);
-            // Same rank first, identically-keyed first within it.
-            let same_rank = super::MEASURED_GLM_GRAPHS.iter().filter(|row| row.rank == rank as u8);
-            let expected = same_rank.clone().filter(|row| row.keys == graph.executables as usize)
-                .map(|row| row.bytes).max()
-                .or_else(|| same_rank.map(|row| row.bytes).max())
-                .expect("the family has a measured row for every rank");
-            assert_eq!(graph.bytes, expected);
-            let figure = &graphs.figures()[rank];
-            assert!(matches!(figure.attribution, FigureAttribution::Estimated { .. }));
-            // The figure keeps the provenance of the row it borrowed.
-            assert!(!figure.identity.declared_graphs.is_empty());
-            assert_eq!(figure.bytes, expected);
-        }
-        for component in graphs.components(32768).unwrap() {
+    ] {
+        let graphs = graphs.expect("every valid layout resolves a W1 working-set reserve");
+        for (rank, component) in graphs.components(32768).unwrap().iter().enumerate() {
             let ComponentKind::Allowance(allowance) = &component.kind else {
                 panic!("graphs are opaque, not physical allocations")
             };
-            let (base, extra) = graphs.default_reserve();
-            assert_eq!(allowance.bytes, crate::placement::graph_reserve::resolve(None, 0, false, base, extra).unwrap().bytes);
-            let list = crate::serving_capacity::glm_graphs::glm_prewarm_list(graphs.ranks().len());
-            let expected_base = list.reserve_base_bytes + list.reserve_extra_bytes;
-            assert_eq!(allowance.bytes, expected_base + 500_000_000u64.min(expected_base));
-            assert!(!allowance.assumed, "an estimated census does not change the configured budget");
+            let measured = graphs.default_reserve(rank);
+            let expected = crate::placement::graph_reserve::resolve_working_set(None, None, None, rank, measured).unwrap().bytes;
+            assert_eq!(allowance.bytes, expected);
+            assert!(!allowance.assumed);
             assert!(allowance.source.starts_with("graph reserve: "));
         }
     }
@@ -1601,21 +1568,15 @@ fn graph_figures_are_keyed_by_the_measured_fingerprint_and_estimate_other_layout
 }
 
 #[test]
-fn a_live_capture_replaces_the_row_only_at_the_row_fingerprint() {
+fn startup_graph_set_reports_working_set_ranks() {
     let min_layers: Vec<_> = (0..78).map(|layer| GlmGraphLayer {
         dense: layer < 3, local: false, attention_owner: None,
     }).collect();
     let min = StartupGraphs::new(1 << 20, AttentionPlacement::Heads, 1, &min_layers, 4).unwrap();
     let set = min.set();
     assert_eq!(set.lifetime, crate::placement::Lifetime::Startup);
-    assert_eq!(set.shapes, glm_graph_shapes(1 << 20, (1 << 20) / PAGE_ROWS as usize).len() as u64);
+    assert_eq!(set.shapes, 0);
     assert_eq!(set.ranks, min.ranks());
-    assert_eq!(min.capture_note(&set), None);
-    let mut moved = set.clone();
-    moved.ranks[0].bytes += 2 << 20;
-    let note = min.capture_note(&moved).unwrap();
-    assert!(note.contains("update MEASURED_GLM_GRAPHS"), "{note}");
-    assert!(note.contains(&format!("rank 0: row {} -> captured {}", set.ranks[0].bytes, moved.ranks[0].bytes)));
 }
 
 #[test]
@@ -2142,11 +2103,9 @@ fn full_context_graph_boundary_keeps_original_pool_domain_and_exact_pins() {
     assert_eq!(plan.pool_tokens, wanted);
     assert_eq!(plan.request.context.maximum, context);
     assert_eq!(contract.maximum_pages, 32768);
-    // A smaller context changes the declaration; it cannot make the full request fit.
-    let smaller = StartupGraphs::new(context - 64, AttentionPlacement::Layers, 2,
+    // A smaller context still resolves a valid working-set reserve; it cannot make the full request fit.
+    let _smaller = StartupGraphs::new(context - 64, AttentionPlacement::Layers, 2,
         &graph_layers(&[0, 1], &[false, false]), 4).unwrap();
-    assert_ne!(smaller.declared()[0].fingerprint(0).unwrap(),
-        recipe.graphs[0].value.declared()[0].fingerprint(0).unwrap());
     request.pool = Pin::Exact(wanted);
     assert_eq!(
         planner::solve(request.clone(), limits.clone(), &recipe)

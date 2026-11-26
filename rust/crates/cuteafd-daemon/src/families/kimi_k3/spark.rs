@@ -163,7 +163,8 @@ impl<'a> RoutedLane<'a> {
     /// Route copies queue into the exchange slot's staging ahead of the
     /// shared FFN on this stream; the link's worker builds and posts the
     /// request once they complete. This thread never waits for the GPU.
-    pub(crate) fn begin(&mut self, local: &mut LocalLane<'a>, layer: usize, rows: usize,
+    /// The caller owns the shared FFN launches, one per local rank.
+    pub(crate) fn begin(&mut self, local: &LocalLane<'a>, layer: usize, rows: usize,
         kind: ExpertV2SourceKind, routes: cuteafd_ffi::KimiRoutes,
         wire: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<Ticket> {
         self.check(local, rows)?;
@@ -182,7 +183,6 @@ impl<'a> RoutedLane<'a> {
                 Box::new(move |routes, wire| request_parts(layer, rows, sequence, kind, routes, wire))) }
         })?;
         self.sequence.set(sequence);
-        local.ffn(layer, rows)?;
         let ticket = Ticket { layer, rows, sequence };
         let output = local.buffer("expert combined")?;
         self.outstanding.push_back(Outstanding { ticket, wave, output });

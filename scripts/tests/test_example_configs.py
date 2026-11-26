@@ -100,6 +100,7 @@ CHECKPOINTS = {
     "wrldsuksgo2mars/Mistral-Large-4-EXL3-K4": {"model_type": "mistral_large4", "text_config": {
         "model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}},
     # Drafters the starting configs name.
+    "incoai/Inkling-2-Mini-DFlash2": {"architectures": ["DFlash2DraftModel"]},
     "incoai/GLM-5.3-DFlash2": {"architectures": ["DFlash2DraftModel"]},
     "incoai/GLM-5.3-Flash-DFlash2": {"architectures": ["DFlash2DraftModel"]},
 }
@@ -143,6 +144,8 @@ def _hub(tmp_path: Path) -> Path:
         (root / "snapshots" / "abc" / "config.json").write_text(json.dumps(config))
     draft = hf / "hub/models--RadixArk--Qwen3.8-27B-DSpark/snapshots"
     (draft / "85ef153be924f17ce4bf62726954eeaa4a73e854").symlink_to(draft / "abc")
+    mini = hf / "hub/models--incoai--Inkling-2-Mini-DFlash2/snapshots"
+    (mini / "4f9088ea66c21f2b99ed657d1941c306b03e84d2").symlink_to(mini / "abc")
     return hf
 
 
@@ -177,8 +180,19 @@ def _stubs(tmp_path: Path) -> Path:
     return bin_dir
 
 
+def _with_real_hosts(config: Path, tmp_path: Path) -> Path:
+    """Substitute template REPLACE-ME-spark-N hostnames with real-looking test hosts
+    before invoking release_load_config / run.sh (which refuse placeholder hosts)."""
+    text = config.read_text().replace("REPLACE-ME-spark-", "spark-")
+    staged = tmp_path / f"real-{config.name}"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_text(text)
+    return staged
+
+
 def _family_launch(tmp_path: Path, config: Path) -> subprocess.CompletedProcess[str]:
     """run.sh --config CONFIG for a non-V4.1 family: dispatch to the real run-family.sh."""
+    config = _with_real_hosts(config, tmp_path)
     hf = _hub(tmp_path)
     _pin_snapshots(hf, keys(config))
     bin_dir = _stubs(tmp_path)
@@ -239,7 +253,7 @@ print(json.dumps(dict(report, resolved_settings=fake_resolved_settings(args, fam
 
 def _strip(config: Path, tmp_path: Path, drop: tuple[str, ...]) -> Path:
     """The example without the named keys: what a user gets from the launcher's bare defaults."""
-    lines = [line for line in config.read_text().splitlines()
+    lines = [line.replace("REPLACE-ME-spark-", "spark-") for line in config.read_text().splitlines()
              if not any(line.startswith(f"{key}=") for key in drop)]
     bare = tmp_path / f"bare-{config.name}"
     bare.write_text("\n".join(lines) + "\n")
@@ -654,7 +668,7 @@ GATE_SPECULATOR_DEFAULTS = {"deepseek_v41": "dspark", "deepseek_v4": "dspark",
                             "glm5": "dflash2", "glm5_flash": "dflash2",
                             "mimo_v2": "dflash2", "qwen4": "mtp", "step5": "mtp",
                             "muse_spark": "dflash2", "minimax_m3": "dspark", "hy4_flash": "dfly2",
-                            "inkling2_mini": "dspark"}
+                            "inkling2_mini": "dflash2"}
 def _default_speculator(family: str, model: str) -> str:
     if family == "kimi_k3":
         return "dspark" if "K3.1" in model else "dflash2"
@@ -927,7 +941,7 @@ def test_release_smoke_entry_passes_config_validation(entry: dict, tmp_path: Pat
     for key in ("BENCH_SIMULATED", "BENCH_HARDWARE_CLASS"):
         values.pop(key, None)
     path = tmp_path / "entry.config"
-    path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+    path.write_text("".join(f"{key}={str(value).replace('REPLACE-ME-spark-', 'spark-')}\n" for key, value in values.items()))
     hf = _hub(tmp_path)
     snapshot = hf / "hub" / f"models--{values['MODEL_ID'].replace('/', '--')}" / "snapshots/abc/config.json"
     checkpoint = json.loads(snapshot.read_text())
@@ -950,10 +964,11 @@ def test_v41_starting_config_passes_the_native_config_validation(path: Path, tmp
     topology and the rails before any image or host is touched."""
     hf = _hub(tmp_path)
     _pin_snapshots(hf, keys(path))
+    staged = _with_real_hosts(path, tmp_path)
     result = subprocess.run(
         ["bash", "-euc", 'source scripts/lib/release-common.sh; [[ "$(release_config_family "$1")" == deepseek_v41 ]]; '
          'release_load_config "$1"; printf "%s\\n" "$SPARK_COUNT" "$RTX_GPUS" "$POOL_TOKENS" "$SPECULATOR"',
-         "test", str(path)], cwd=ROOT, env={**os.environ, "HF_HOME": str(hf)}, capture_output=True, text=True)
+         "test", str(staged)], cwd=ROOT, env={**os.environ, "HF_HOME": str(hf)}, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     count, gpus, pool, dspark = result.stdout.split()
     assert (count, gpus, pool, dspark) == (keys(path)["SPARK_COUNT"], keys(path)["RTX_GPUS"], "auto", "dspark")
@@ -1045,7 +1060,7 @@ def test_ml4_qualification_config_preserves_native_draft_defaults(name: str, tmp
         "model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}}
     launches = []
     for label, drop in (("example", ()), ("bare", SPECULATOR_KEYS + POOL_KEYS)):
-        config = "".join(f"{k}={v}\n" for k, v in values.items()
+        config = "".join(f"{k}={v.replace('REPLACE-ME-spark-', 'spark-')}\n" for k, v in values.items()
                          if k not in ("MODEL_ID", "MODEL_REVISION", *drop))
         result = _family_launch_result(tmp_path / label, checkpoint, values["MODEL_ID"], config,
                                       extra_args=("--wip", "ml4-test"))

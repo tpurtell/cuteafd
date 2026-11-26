@@ -310,6 +310,23 @@ def test_prelaunch_foreign_container_refused(entry, tmp_path, monkeypatch):
         cards.assert_absent(job)
 
 
+def test_prelaunch_bound_addr_port_refused(entry, tmp_path, monkeypatch):
+    job = make(entry, tmp_path)
+    port = int(cards.resolve_container_keys(job['entry'])['addr'].rpartition(':')[2])
+    listening = f'LISTEN 0 128 0.0.0.0:{port} 0.0.0.0:*\n'
+    monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout=listening if cmd[0] == 'ss' else ''))
+    with pytest.raises(ValueError, match=f'ADDR port {port} is already bound'):
+        cards.assert_port_free(job)
+
+
+def test_prelaunch_free_addr_port_passes(entry, tmp_path, monkeypatch):
+    job = make(entry, tmp_path)
+    port = int(cards.resolve_container_keys(job['entry'])['addr'].rpartition(':')[2])
+    other = f'LISTEN 0 128 0.0.0.0:{port + 1} 0.0.0.0:*\nLISTEN 0 128 [::]:22 [::]:*\n'
+    monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout=other if cmd[0] == 'ss' else ''))
+    cards.assert_port_free(job)
+
+
 def test_container_absence_is_checked_at_grant_not_before_queuing(entry, tmp_path, monkeypatch):
     # A job may queue behind a running task that still holds a container of the same
     # name; refusing it up front wastes the queue slot. Absence is rechecked once
@@ -3303,7 +3320,8 @@ def test_omitted_expert_port_uses_launcher_default_in_preflight_and_assert_absen
     seen = []
     monkeypatch.setattr(cards, 'run', lambda cmd: seen.append(cmd) or SimpleNamespace(stdout=''))
     cards.preflight_at_grant(job, {'instance': 'b', 'slot': 's'})
-    assert len(seen) == 1 + len(omitted['sparks'])
+    # One container listing per host, then one listen-port check on raptor.
+    assert len(seen) == 1 + len(omitted['sparks']) + 1 and seen[-1] == ['ss', '-Hltn']
     monkeypatch.setattr(cards, 'run', lambda cmd: SimpleNamespace(stdout='cuteafd-spark-expert-ostrich-19441\n'))
     with pytest.raises(ValueError, match='cuteafd-spark-expert-ostrich-19441'):
         cards.assert_absent(job)

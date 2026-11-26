@@ -3,11 +3,11 @@
 use super::{PAGE_ROWS, weights::WeightInventory};
 use super::{buffers::{FLOOR, TargetBuffers}, exchanges::ExchangeBuffers, hooks::HookBuffers};
 use crate::families::glm5::GlmDsaConfig;
-use crate::placement::inventory::{DeclaredGraphSet, FigureAttribution, FigureIdentity, MemoryFigure};
+use crate::placement::inventory::{FigureAttribution, FigureIdentity, MemoryFigure};
 use crate::placement::{AttentionPlacement, GraphRank, GraphSet, LayerMode, planner::*};
 use cuteafd_core::memory_layout::Basis;
-use crate::serving_capacity::glm_graphs::{GlmGraphKey, GlmGraphLayer, GlmPrewarmFamily,
-    glm_declared_graphs, glm_graph_shapes};
+use crate::serving_capacity::glm_graphs::{GlmGraphLayer, GlmPrewarmFamily,
+    glm_bootstrap_bytes, glm_working_set};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -990,20 +990,16 @@ impl AdmittedGlm {
             identity.layout, self.placement.attention_placement, self.solved.pool_tokens,
             self.solved.decisions.onboard_layers, self.spark.spark_ranks,
             self.solved.decisions.prefill, self.solved.decisions.embedding);
-        let graphs = self.graphs.declared().iter().enumerate().map(|(rank, set)|
-            set.fingerprint(rank as u8).map_err(Refusal::InvalidFact)).collect::<Result<Vec<_>, _>>()?;
-        let host_graphs = graphs.join(",");
         let identity = FigureIdentity { layout: &layout, ..identity };
         let mut uses = Vec::new();
-        for (rank, graph) in graphs.iter().enumerate() {
-            let current = FigureIdentity { declared_graphs: graph, ..identity };
-            uses.push(FigureUse { name: "graph instantiate", figure: self.graphs.figures()[rank], current });
+        for rank in 0..self.graphs.ranks().len() {
+            let current = FigureIdentity { declared_graphs: "", ..identity };
             uses.push(FigureUse { name: "context/modules", figure: self.runtime.context()[rank], current });
             for (index, row) in self.runtime.stages().iter().enumerate().filter(|(_, row)| row.rank == rank) {
                 uses.push(FigureUse { name: row.label, figure: self.runtime.stage_figure(index), current });
             }
         }
-        let current = FigureIdentity { declared_graphs: &host_graphs, ..identity };
+        let current = FigureIdentity { declared_graphs: "", ..identity };
         uses.extend([FigureUse { name: "host load", figure: self.host.load(), current },
             FigureUse { name: "host steady", figure: self.host.steady(), current }]);
         Ok(census_recommendation(uses))
@@ -1418,189 +1414,9 @@ pub const GLM_MAX_CONTEXT: [MemoryFigure; 2] = [
         "#1242 glm53-exl3-max-census-r1/preweight/rank1"),
 ];
 
-/// One measured startup-graph residency: the summed
-/// `CUTEAFD_GRAPH_CENSUS {"event":"capture"}` `instantiate_bytes` records of one
-/// census device, over exactly the declared key set that produced `fingerprint`.
-/// Graph instantiate storage is 2 MiB-quantized driver memory whose size follows
-/// the captured kernels, not the key count: one fingerprint measured on two
-/// builds differs (16,827 keys needed 3.73 GB at 9567fdf6 and 3.04 GB at
-/// 5d180b5c8), so a row is never scaled to another key set or another build.
-/// A declared set with no row is served on the best measured estimate for its
-/// rank (#1605); a census replaces the estimate with the real row.
-/// `commit` is the cuteafd SHA that produced the census and `sparkinfer` the
-/// SparkInfer revision that build pinned; the bytes follow the fork, so a row
-/// measured under another pin is reported loudly at plan time.
-///
-/// Measure a new row with the family census card, then sum that device's
-/// `profile/graph-census-captures-*.jsonl` `instantiate_bytes` values:
-///
-/// ```text
-/// scripts/bench/wip-cards.py --build --cards glm53-exl3-min \
-///     --set glm53-exl3-min:PROFILE=census --set glm53-exl3-min:MEMORY_PADDING=2GiB \
-///     --probe glm53-exl3-min:memory,console --panels none
-/// ```
-#[derive(Debug, Clone, Copy)]
-struct MeasuredGraphSet {
-    keys: usize,
-    /// Logical rank whose census device produced these bytes.
-    rank: u8,
-    fingerprint: &'static str,
-    bytes: u64,
-    layout: &'static str,
-    census: &'static str,
-    commit: &'static str,
-    sparkinfer: &'static str,
-}
-
-/// GLM 5.3 K6-HQA (#1242 census, revision 47af23347db743b4666d952e2eb48f2b01c3fede),
-/// GLM 5.3 K6 at cuteafd 29212c52, and Mistral Large 4 at cuteafd 3baa1a4a and
-/// 29212c52. Each byte figure is one device's capture sum; count and fingerprint
-/// identify the set. Every row records both the cuteafd commit and the
-/// SparkInfer revision of the build that measured it.
-const MEASURED_GLM_GRAPHS: [MeasuredGraphSet; 8] = [
-    MeasuredGraphSet { rank: 0, keys: 16_827, fingerprint: MIN_GRAPHS, bytes: 2_984_247_296, layout: HQA_MIN_LAYOUT,
-        census: "glm53-hqa-min-glm5-r1 device 0: 16827 capture instantiate records; free 8245936128->5261688832",
-        commit: "a5aa27a3f8968b6c25821f6baf6a10559b4ef5a6",
-        sparkinfer: "851c42833da26711c68868014cad2fc043916416" },
-    MeasuredGraphSet { rank: 0, keys: 16_827, fingerprint: MAX_GRAPHS[0], bytes: 3_042_967_552, layout: MAX_LAYOUT,
-        census: "glm53-exl3-max-census-r1 device 0: 16827 capture instantiate records",
-        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226",
-        sparkinfer: "78cfee4e04e8d8055853945711e5f28ea27216e0" },
-    MeasuredGraphSet { rank: 1, keys: 16_614, fingerprint: MAX_GRAPHS[1], bytes: 2_971_664_384, layout: MAX_LAYOUT,
-        census: "glm53-exl3-max-census-r1 device 1: 16614 capture instantiate records",
-        commit: "5d180b5c8d76636d5937336638dfd71c15a8d226",
-        sparkinfer: "78cfee4e04e8d8055853945711e5f28ea27216e0" },
-    MeasuredGraphSet { rank: 0, keys: 16_827, fingerprint: "743e61e45b39ba6bdb04043401a1b5f9330863bda205bbb35615ff9512aea6dc",
-        bytes: 3_732_930_560, layout: "glm53-exl3-k4/core-k6; attention/Context; sparks/6",
-        census: "typed-tags-phase-c glm53-exl3-max-fixed-r1 device 0: 16827 capture instantiate records",
-        commit: "29212c52f262afcda61c940f6c007e837d231057",
-        sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
-    MeasuredGraphSet { rank: 1, keys: 16_614, fingerprint: "b6f823f3b9defca4fcd752fab3567a19d8056921c5277355e8a5be925bae1d54",
-        bytes: 3_986_685_952, layout: "glm53-exl3-k4/core-k6; attention/Context; sparks/6",
-        census: "typed-tags-phase-c glm53-exl3-max-fixed-r1 device 1: 16614 capture instantiate records",
-        commit: "29212c52f262afcda61c940f6c007e837d231057",
-        sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
-    MeasuredGraphSet { rank: 0, keys: 15_549, fingerprint: "5a2e6d744e3c72d4b192e3e8732ac7681eb2f4f9d44acfa8216420f9df693f70",
-        bytes: 2_740_977_664, layout: "ml4-exl3; attention/Heads; 1 rank",
-        census: "ml4 1x census memory-census-20261108T172510Z-raptor-coordinator-57-0",
-        commit: "3baa1a4ab72f8e378c07abd0d22ac473db53a840",
-        sparkinfer: "851c42833da26711c68868014cad2fc043916416" },
-    MeasuredGraphSet { rank: 0, keys: 15_549, fingerprint: "bc9d9f1d011860a37be849433d80b8b4c728751d7a5bbd8e483d4e147d80c031",
-        bytes: 3_445_620_736, layout: "ml4-exl3; attention/Context; 2 ranks",
-        census: "typed-tags-phase-c ml4-exl3-max-fixed-r1 device 0: 15549 capture instantiate records",
-        commit: "29212c52f262afcda61c940f6c007e837d231057",
-        sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
-    MeasuredGraphSet { rank: 1, keys: 15_336, fingerprint: "4ca4be3bc0b20179dc457a8eff3ec0d9425bb6a4ef1a6851955a9f6a9d4073aa",
-        bytes: 3_720_347_648, layout: "ml4-exl3; attention/Context; 2 ranks",
-        census: "typed-tags-phase-c ml4-exl3-max-fixed-r1 device 1: 15336 capture instantiate records",
-        commit: "29212c52f262afcda61c940f6c007e837d231057",
-        sparkinfer: "9567fdf609b135968d6fb5ed647a6e0d1bcd8b9f" },
-];
-
-/// The SparkInfer revision this build pins. Graph instantiate storage is the
-/// fork's kernels, so a row measured under another pin is stale evidence.
-fn pinned_sparkinfer_revision() -> &'static str {
-    static REVISION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    REVISION.get_or_init(|| {
-        let lock: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"), "/../../../third_party/sparkinfer.lock.json")))
-            .expect("embedded SparkInfer lock");
-        lock["revision"].as_str().expect("SparkInfer lock revision").to_owned()
-    })
-}
-
-fn measured_graph_row(fingerprint: &str) -> Option<&'static MeasuredGraphSet> {
-    MEASURED_GLM_GRAPHS.iter().find(|row| row.fingerprint == fingerprint)
-}
-
-/// One resolved graph row: the charge, its attribution and the warning the
-/// caller reports (a stale pin, or an unmeasured fingerprint served from an
-/// estimate). Admission never refuses for a missing row (#1605).
-struct GraphRow {
-    bytes: u64,
-    basis: Basis,
-    figure: MemoryFigure,
-    warning: Option<String>,
-}
-
-/// The measured row for one declared set. A fingerprint with no row is served
-/// with the family's best measured estimate for that rank (#1605), never
-/// refused: the default-context row upper-bounds a lower context because
-/// context can only go down from the checkpoint maximum, and a layout with no
-/// comparable row charges the largest measured row.
-fn graph_row(fingerprint: &str, keys: usize, rank: usize) -> GraphRow {
-    if let Some(row) = measured_graph_row(fingerprint).filter(|row| row.keys == keys) {
-        let pinned = pinned_sparkinfer_revision();
-        let warning = (row.sparkinfer != pinned).then(|| format!(
-            "GLM startup graph row {fingerprint} ({n} keys, rank-set {}) was measured at cuteafd {} \
-             with SparkInfer {} but this build pins {pinned}; instantiate storage follows the fork, \
-             so re-run this layout's memory census and update MEASURED_GLM_GRAPHS",
-            row.layout, row.commit, row.sparkinfer, n = row.keys));
-        return GraphRow { bytes: row.bytes, basis: Basis::Calibrated, warning,
-            figure: measured(row.bytes, row.fingerprint, row.layout, row.commit, row.census) };
-    }
-    {
-        // Unit fixtures build plans on synthetic geometries no census covers.
-        // Production startup never enables this; see `allow_synthetic_graphs`.
-        if SYNTHETIC_GRAPHS.with(std::cell::Cell::get) {
-            // Size a synthetic geometry the way a census of it would: the
-            // largest measured per-key rate above (3,720,347,648 B over 15,336
-            // keys, the ML4 two-rank census), rounded up to 256 KiB per key. A
-            // flat 2 MiB per declared graph overstated a 15.5k-key ML4 plan by
-            // 26.6 GiB and turned its witness plan into a capacity refusal.
-            let bytes = keys as u64 * (256 << 10);
-            return GraphRow { bytes, basis: Basis::Estimated, warning: None,
-                figure: MemoryFigure { bytes,
-                    attribution: FigureAttribution::Estimated { derivation: "256 KiB per declared graph (largest measured per-key rate)" },
-                    evidence: "synthetic unit fixture", producing_commit: "test",
-                    identity: FigureIdentity { declared_graphs: "", programs_sha256: CENSUS_PROGRAMS,
-                        native_sha256: CENSUS_NATIVE, toolchain: CENSUS_TOOLCHAIN,
-                        gpu_class: "synthetic/sm_120", driver: "test", layout: "synthetic unit fixture" } } };
-        }
-    }
-    // #1605: an unmeasured fingerprint is served, never refused. Charge the
-    // best measured row for this logical rank, identically-keyed first: the
-    // default-context census row is an upper bound for a lower context because
-    // context cannot exceed the checkpoint maximum. A layout the family has no
-    // comparable row for (e.g. ML4's layer placement) charges the largest
-    // measured row. A runtime OOM on an unusual layout is the user's to fix
-    // through GPU_MEMORY_CAP or GPU_RESERVE.
-    let same_rank = || MEASURED_GLM_GRAPHS.iter().filter(|row| row.rank == rank as u8);
-    let source = same_rank().filter(|row| row.keys == keys).max_by_key(|row| row.bytes)
-        .or_else(|| same_rank().max_by_key(|row| row.bytes))
-        .or_else(|| MEASURED_GLM_GRAPHS.iter().max_by_key(|row| row.bytes))
-        .expect("measured graph rows are non-empty");
-    GraphRow { bytes: source.bytes, basis: Basis::Estimated,
-        warning: Some(format!(
-            "GLM startup graph fingerprint {fingerprint} ({keys} keys, rank {rank}) has no measured row; \
-             serving with the measured rank-{} row {} ({} bytes, {}) as an estimated upper bound; \
-             run a memory census of this layout to measure it",
-            source.rank, source.fingerprint, source.bytes, source.layout)),
-        figure: MemoryFigure { bytes: source.bytes,
-            attribution: FigureAttribution::Estimated { derivation: "unmeasured declared fingerprint; charged the measured row of the same rank as an upper bound (#1605)" },
-            evidence: source.census, producing_commit: source.commit,
-            identity: FigureIdentity { declared_graphs: source.fingerprint,
-                programs_sha256: CENSUS_PROGRAMS, native_sha256: CENSUS_NATIVE,
-                toolchain: CENSUS_TOOLCHAIN, gpu_class: "RTX PRO 6000 Blackwell/sm_120/188",
-                driver: "13.2", layout: source.layout } } }
-}
-
-thread_local! {
-    /// Unit fixtures plan synthetic geometries that no census covers. On by
-    /// default in this crate's tests; another crate's fixture must opt in, and
-    /// production startup never does, so an unmeasured fingerprint is charged a
-    /// synthetic size. Production charges the best measured estimate instead.
-    static SYNTHETIC_GRAPHS: std::cell::Cell<bool> = const { std::cell::Cell::new(cfg!(test)) };
-}
-
-/// Test fixtures in another crate whose planner geometry no census covers.
-/// Never call this from serving code.
-#[doc(hidden)]
-pub fn allow_synthetic_graphs() { SYNTHETIC_GRAPHS.with(|flag| flag.set(true)); }
-
-#[cfg(test)]
-pub(crate) fn disallow_synthetic_graphs() { SYNTHETIC_GRAPHS.with(|flag| flag.set(false)); }
-
+/// One measured startup-graph residency note removed: exact-row rank-local decode
+/// graphs use the working-set reserve policy (`StartupGraphs`) rather than a
+/// prewarmed declared-fingerprint inventory.
 const MIN_CENSUS: &str = "builds/shared-planner-glm-census-min-4a56925e7/glm53-exl3-min-census-r1";
 const MAX_CENSUS: &str = "builds/shared-planner-glm-census-max-5d180b5c8/glm53-exl3-max-census-r1";
 
@@ -1902,78 +1718,75 @@ fn ordinary_heap_subset(component: &Component) -> bool {
     }
 }
 
-/// Independently declared full-context keys plus one measured instantiate row
-/// per rank. The row is keyed by that rank's declared fingerprint; an
-/// undeclared fingerprint charges the best measured estimate for that rank,
-/// warns once and serves (#1605), never refuses. No scaling, margin or invented
-/// post-Ready reserve.
+/// Exact-row rank-local decode graph admission for GLM 5.3 / Mistral Large 4.
+/// Reserves use the shared working-set reserve policy (`S + max(20% S, 100 MB)`
+/// rounded up to 2 MiB, retaining the 96 MiB floor), with zero rank-local startup prewarm.
 #[derive(Debug, Clone)]
 pub struct StartupGraphs {
     enabled: bool,
     family: GlmPrewarmFamily,
     context: u64,
-    shapes: u64,
     attention: AttentionPlacement,
     layers: Vec<GlmGraphLayer>,
-    declared: Vec<DeclaredGraphSet<GlmGraphKey>>,
-    fingerprints: Vec<String>,
     ranks: Vec<GraphRank>,
-    figures: Vec<MemoryFigure>,
+    bootstraps: Vec<u64>,
+    soft_caps: Vec<u64>,
 }
 
 impl StartupGraphs {
-    /// GLM 5.3's own declared set and checked-in prewarm list.
+    /// GLM 5.3's exact-row W1 working-set reserve.
     pub fn new(context: u64, attention: AttentionPlacement, gpus: usize,
         layers: &[GlmGraphLayer], return_ranks: usize) -> Result<Self, Refusal> {
         Self::with_family(GlmPrewarmFamily::Glm5, context, attention, gpus, layers, return_ranks)
     }
 
-    /// A glm5-engine family's declared set; its reserve comes from that
-    /// family's list for this layout.
+    /// A glm5-engine family's exact-row W1 working-set reserve for this layout.
     pub fn with_family(family: GlmPrewarmFamily, context: u64, attention: AttentionPlacement,
-        gpus: usize, layers: &[GlmGraphLayer], return_ranks: usize) -> Result<Self, Refusal> {
+        gpus: usize, layers: &[GlmGraphLayer], _return_ranks: usize) -> Result<Self, Refusal> {
         if context == 0 { return Err(invalid("zero graph context")); }
-        let extent = usize::try_from(context).map_err(|_| Refusal::Overflow("GLM graph context"))?;
-        let shapes = glm_graph_shapes(extent, extent.div_ceil(PAGE_ROWS as usize));
-        let declared = glm_declared_graphs(&shapes, attention, gpus, layers, return_ranks)
-            .map_err(Refusal::InvalidFact)?;
-        let (mut fingerprints, mut ranks, mut figures) = (Vec::new(), Vec::new(), Vec::new());
-        let mut estimated = Vec::new();
-        for (rank, keys) in declared.iter().enumerate() {
-            let fingerprint = keys.fingerprint(rank as u8).map_err(Refusal::InvalidFact)?;
-            let row = graph_row(&fingerprint, keys.len(), rank);
-            match (row.basis, row.warning) {
-                // One warning for the whole plan, not one per rank (#1605).
-                (Basis::Estimated, Some(warning)) => estimated.push(warning),
-                (_, Some(warning)) => tracing::warn!("{warning}"),
-                _ => {}
-            }
-            figures.push(row.figure);
-            ranks.push(GraphRank { executables: keys.len() as u64, bytes: row.bytes, margin: 0, basis: row.basis, node_charge: None });
-            fingerprints.push(fingerprint);
+        if !(1..=2).contains(&gpus) || layers.is_empty()
+            || (attention != AttentionPlacement::Heads && gpus != 2)
+            || layers.iter().any(|layer| (layer.local && layer.dense)
+                || match attention {
+                    AttentionPlacement::Layers => layer.attention_owner.is_none_or(|owner| owner >= 2),
+                    _ => layer.attention_owner.is_some(),
+                }) {
+            return Err(invalid("invalid GLM graph layout"));
         }
-        if !estimated.is_empty() {
-            warn_once(&fingerprints.join(","), || format!(
-                "GLM startup graphs are admitted on estimated rows (#1605); no census covers this declared set: {}",
-                estimated.join("; ")));
+        let mut ranks = Vec::with_capacity(gpus);
+        let mut bootstraps = Vec::with_capacity(gpus);
+        let mut soft_caps = Vec::with_capacity(gpus);
+        for rank in 0..gpus {
+            let measured = glm_working_set(family, gpus, rank);
+            let bootstrap = glm_bootstrap_bytes(family, gpus, rank);
+            let policy = crate::placement::graph_reserve::current_working_set(rank, measured)
+                .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
+            ranks.push(GraphRank {
+                executables: policy.base_bytes.div_ceil(bootstrap),
+                bytes: policy.bytes,
+                margin: 0,
+                basis: Basis::Calibrated,
+                node_charge: None,
+            });
+            bootstraps.push(bootstrap);
+            soft_caps.push(policy.base_bytes);
         }
-        Ok(Self { enabled: true, family, context, shapes: shapes.len() as u64, attention, layers: layers.to_vec(),
-            declared, fingerprints, ranks, figures })
+        Ok(Self { enabled: true, family, context, attention, layers: layers.to_vec(), ranks, bootstraps, soft_caps })
     }
 
-    pub fn declared(&self) -> &[DeclaredGraphSet<GlmGraphKey>] { &self.declared }
-    pub fn fingerprints(&self) -> &[String] { &self.fingerprints }
+    pub fn family(&self) -> GlmPrewarmFamily { self.family }
     pub fn ranks(&self) -> &[GraphRank] { &self.ranks }
-    pub fn figures(&self) -> &[MemoryFigure] { &self.figures }
+    pub fn bootstraps(&self) -> &[u64] { &self.bootstraps }
+    pub fn soft_caps(&self) -> &[u64] { &self.soft_caps }
 
-    /// The same inventory the daemon reconciles its live capture against.
+    /// The same inventory the daemon reconciles its live cache against.
     pub fn set(&self) -> GraphSet {
-        GraphSet { ranks: self.ranks.clone(), lifetime: crate::placement::Lifetime::Startup, shapes: self.shapes }
+        GraphSet { ranks: self.ranks.clone(), lifetime: crate::placement::Lifetime::Startup, shapes: 0 }
     }
 
-    /// This layout's checked-in reserve before user overrides.
-    pub fn default_reserve(&self) -> (u64, u64) {
-        crate::placement::graph_reserve::glm_default(self.family, self.ranks.len())
+    /// This layout's checked-in C1 working-set inputs before user overrides.
+    pub fn default_reserve(&self, rank: usize) -> crate::placement::graph_reserve::WorkingSet {
+        crate::placement::graph_reserve::glm_default(self.family, self.ranks.len(), rank)
     }
 
     fn with_decode_graphs(mut self, enabled: bool) -> Self {
@@ -1983,9 +1796,9 @@ impl StartupGraphs {
 
     pub fn reserve_policy(&self, rank: usize) -> Result<crate::placement::graph_reserve::Resolved, Refusal> {
         use crate::placement::graph_reserve;
-        let (base, tail) = self.default_reserve();
-        (if self.enabled { graph_reserve::current(rank, false, base, tail) } else {
-            graph_reserve::resolve(Some("0"), rank, false, base, tail).map(|mut policy| {
+        let measured = self.default_reserve(rank);
+        (if self.enabled { graph_reserve::current_working_set(rank, measured) } else {
+            graph_reserve::resolve_working_set(Some("0"), None, None, rank, measured).map(|mut policy| {
                 policy.source = "DECODE_GRAPHS=off";
                 policy.base_source = policy.source;
                 policy
@@ -2006,32 +1819,11 @@ impl StartupGraphs {
                 GraphRank { bytes: reserves[rank], ..*graph }, maximum_pages)?;
             if let ComponentKind::Allowance(owner) = &mut component.kind {
                 owner.source = crate::placement::graph_reserve::source(&format!("glm.graphs.{rank}"));
-                // This owner is the configured budget, not the census estimate.
                 owner.assumed = false;
             }
             Ok(component)
         }).collect()
     }
-
-    /// The measured rows beside the live capture, so a build whose captured
-    /// executable residency moved away from its row is reported, not absorbed.
-    pub fn capture_note(&self, measured: &GraphSet) -> Option<String> {
-        let drift: Vec<_> = self.ranks.iter().zip(&measured.ranks).enumerate()
-            .filter_map(|(rank, (row, live))| (row.bytes != live.bytes)
-                .then(|| format!("rank {rank}: row {} -> captured {}", row.bytes, live.bytes)))
-            .collect();
-        (!drift.is_empty()).then(|| format!(
-            "GLM startup graph capture differs from the measured row ({}); update MEASURED_GLM_GRAPHS for this build",
-            drift.join(", ")))
-    }
-}
-/// One warning per declared set per process: a recipe prepares a case per
-/// onboarding count, and an estimate is a report, not a fault (#1605).
-fn warn_once(key: &str, message: impl FnOnce() -> String) {
-    static SEEN: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> = std::sync::OnceLock::new();
-    let mut seen = SEEN.get_or_init(Default::default).lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    if seen.insert(key.to_owned()) { tracing::warn!("{}", message()); }
 }
 
 struct Domains<'a> {
@@ -2515,7 +2307,7 @@ impl Recipe for GlmRecipe<'_> {
         }
         for case in &self.graphs {
             let graph = &case.value;
-            if graph.declared.len() != self.gpus
+            if graph.ranks.len() != self.gpus
                 || graph.context != self.context
                 || graph.layers.len() != self.attention.len()
                 || self.attention.iter().zip(&graph.layers).enumerate().any(|(index, (mode, layer))| {

@@ -57,9 +57,20 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
     if role is not None and manifest['role'] != ('spark' if role == 'expert' else role):
         raise ValueError('EXL3 package/serving role mismatch')
     expected = manifest['files']
+    expected_set = set(expected) | {'manifest.json'}
     actual = {str(p.relative_to(package)) for p in package.rglob('*') if p.is_file()}
-    if actual != set(expected) | {'manifest.json'}:
-        raise ValueError('EXL3 package contains missing or unlisted files')
+    if actual != expected_set:
+        def _fmt(items: list[str], limit: int = 20) -> str:
+            shown = ', '.join(items[:limit])
+            return f'{shown} (+{len(items) - limit} more)' if len(items) > limit else shown
+        missing = sorted(expected_set - actual)
+        unlisted = sorted(actual - expected_set)
+        parts = []
+        if missing:
+            parts.append(f'missing ({len(missing)}): {_fmt(missing)}')
+        if unlisted:
+            parts.append(f'unlisted ({len(unlisted)}): {_fmt(unlisted)}')
+        raise ValueError(f'EXL3 package contains missing or unlisted files: {"; ".join(parts)}')
     for name, spec in expected.items():
         path = package / name
         if Path(name).is_absolute() or '..' in Path(name).parts or path.is_symlink():

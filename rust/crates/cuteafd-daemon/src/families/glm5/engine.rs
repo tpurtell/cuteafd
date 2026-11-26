@@ -28,8 +28,7 @@ use cuteafd_loader::families::glm5::GlmDsaConfig;
 use crate::shared::peer_split::{PeerExchange, RankDevice, DIRECT};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use cuteafd_loader::serving_capacity::{glm_decode_row_bucket,
-    glm_decode_table_width, glm_decode_table_widths, GLM_SHORT_ROW_BUCKETS};
+use cuteafd_loader::serving_capacity::glm_decode_table_width;
 use cuteafd_loader::serving_capacity::glm_graphs::{GlmGraphKey as GraphKey, GlmGraphPrevious as Previous};
 use std::ffi::c_void;
 use crate::shared::experts::rtx::{pair::Pair, ExpertInput, Routes, ExchangeDtype, RtxExpertLayer};
@@ -43,6 +42,7 @@ fn decode_peer_bytes(rows: usize, hidden: usize, exchange: ExchangeDtype) -> usi
 mod tp2;
 mod packing;
 mod layers;
+mod local_graph;
 mod allocation;
 
 /// Expert weights are loaded before KV; execution, pair and check owners bind later.
@@ -105,13 +105,6 @@ pub(crate) use cuteafd_loader::placement::families::glm5::GlmContext;
 type Dev<'a> = DeviceAllocation<'a>;
 
 pub(crate) const PAGE_ROWS: usize = 64;
-/// Decode/verify steps run padded to one of these row counts, and their page
-/// tables to a power-of-two width of at least 16 pages (or the
-/// whole context). Startup prewarms selected shapes; the shared cache captures
-/// or runs unlisted serving shapes eagerly within the per-device reserve.
-/// Exact up to 16 rows (one sequence's verify step: no padding at C1), then
-/// in steps of 4 / 8 (padding a batched step costs ~1% per row on the GPU).
-pub(crate) const ROW_BUCKETS: [usize; 24] = GLM_SHORT_ROW_BUCKETS;
 
 /// Statuses follow the ids in a decode workspace's `select` buffer at a fixed offset.
 const SELECT_STATUS_OFFSET: usize = DECODE_ROWS * 4;
@@ -127,14 +120,7 @@ pub(crate) const DECODE_ROWS: usize = 64;
 /// Fewest rows per lane worth another exchange per layer.
 const MIN_LANE_ROWS: usize = 256;
 
-struct GraphExec<'a>(*mut c_void, &'a NativeLibrary);
-
-impl Drop for GraphExec<'_> {
-    fn drop(&mut self) {
-        // SAFETY: the exec came from end_capture and is destroyed once.
-        let _ = unsafe { self.1.cuda_graph_exec_destroy(self.0) };
-    }
-}
+type GraphExec<'a> = crate::shared::decode_graph::GraphOwner<'a, ()>;
 
 
 /// Host tables of one step.
@@ -159,6 +145,7 @@ struct StepTables {
 }
 
 impl StepTables {
+    #[cfg(test)]
     fn pad_rows(&mut self, pool_pages: usize, bucket: usize) {
         let scratch = pool_pages as i32;
         while self.positions.len() < bucket {
@@ -617,9 +604,7 @@ pub(crate) struct GlmEngine<'a> {
     usage_lookup: Option<HostAllocation<'a>>,
     pub(super) usage_active: Cell<bool>,
     graph_cycles: RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
-    graphs_warmed: Cell<bool>,
-    graphs_warming: Cell<bool>,
-    graph_basis: Cell<Option<crate::shared::decode_graph::device::Basis>>,
+    graphs_ready: Cell<bool>,
     /// The DFlash2 drafter; every step taps its target layers.
     pub drafter: Option<super::drafter::GlmDrafter<'a>>,
     /// Prefix marks admission charged for a window-ring drafter's draft windows (0: none).
@@ -792,7 +777,7 @@ impl<'a> GlmEngine<'a> {
             terminal: Cell::new(crate::shared::peer_split::TerminalState::Active), spark_bf16: false, prefill_span_rows: prefill_lanes * prefill_rows, skip: None, l2: None, profile: RefCell::new([0.0; 3]),
             pending_media: RefCell::new(None),
             exchange_host: RefCell::new([0.0; 4]), width_taps: RefCell::new(None),
-            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graph_cycles: RefCell::new(None), graphs_warmed: Cell::new(false), graphs_warming: Cell::new(false), graph_basis: Cell::new(None), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, fp8_prefill: Default::default(), selection_dump: None })
+            graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()), expert_usage: None, usage_lookup: None, usage_active: Cell::new(false), graph_cycles: RefCell::new(None), graphs_ready: Cell::new(false), drafter: None, draft_window_marks: 0, draft_core_head: None, target_core_head: None, embedding, fp8_prefill: Default::default(), selection_dump: None })
     }
 
     pub(super) fn initialize_usage(&mut self, geometry: Option<cuteafd_core::expert_usage::Geometry>,
@@ -812,7 +797,7 @@ impl<'a> GlmEngine<'a> {
 
     fn put_usage_rows(&self, w: &Workspace<'_>, tables: &StepTables) -> Result<()> {
         let (Some(destination), Some(source)) = (&w.usage_rows, &self.usage_lookup) else { return Ok(()); };
-        let rows = if self.usage_active.get() && !self.graphs_warming.get() { tables.exchange_rows } else { 0 };
+        let rows = if self.usage_active.get() { tables.exchange_rows } else { 0 };
         let offset = usage_lookup_offset(tables.decode, rows)?;
         let source = cuteafd_ffi::CuteafdHostBuffer { ptr: source.buffer.ptr.cast::<u8>().wrapping_add(offset).cast(),
             bytes: 8, ..source.buffer };
@@ -1571,184 +1556,43 @@ impl<'a> GlmEngine<'a> {
                 tables.page_table.extend(std::iter::repeat_n(0, width - pages));
             }
         }
-        let buckets = crate::shared::probe::verify_timing::checked_bucket(rows, forced,
-            |rows| Ok(glm_decode_row_bucket(rows, width)?))?;
-        let bucket = buckets.ran;
-        self.pad_rows(&mut tables, bucket);
-        let mut padded = tokens.to_vec();
-        padded.resize(bucket, 0);
-        // Padded rows' logits follow the real rows'; only those are returned.
-        let logits = self.step(&tables, &padded, bucket, experts, on_layer)?
-            .map(|logits| DeviceLogits { rows, ..logits });
+        let buckets = crate::shared::probe::verify_timing::checked_bucket(rows, forced, Ok)?;
+        let logits = self.step(&tables, tokens, rows, experts, on_layer)?;
         for (placement, count) in sequences.iter_mut() {
             placement.len += *count;
         }
         Ok((logits, buckets))
     }
 
-    pub(crate) fn verify_explore_bucket(&self, rows: usize, min_end: usize, max_end: usize) -> usize {
-        let width = |end: usize| self.table_width_bucket(end.div_ceil(PAGE_ROWS));
-        // A possible table-width boundary gives no attested padding slack.
-        if width(min_end) != width(max_end) { return rows; }
-        glm_decode_row_bucket(rows, width(min_end)).unwrap_or(rows)
+    pub(crate) fn verify_explore_bucket(&self, rows: usize, _min_end: usize, _max_end: usize) -> usize {
+        rows
     }
 
     /// The page-table width a decode step whose longest row needs `pages`
-    /// pages runs with: a power of two from 16, capped at the
-    /// context's pages.
+    /// pages runs with: a power of two from the shared `MIN_PAGE_STRIDE` (64
+    /// pages = 4,096 tokens), capped at the pool and context's pages.
     fn table_width_bucket(&self, pages: usize) -> usize {
         glm_decode_table_width(pages, self.max_context, self.pages)
     }
 
-    /// Every table width [`Self::table_width_bucket`] returns.
-    fn table_width_buckets(&self) -> Vec<usize> {
-        glm_decode_table_widths(self.max_context, self.pages)
-    }
-
-    /// The checked-in prewarm and reserve identity of this checkpoint.
+    /// The checked-in working-set reserve identity of this checkpoint.
     fn prewarm_family(&self) -> cuteafd_loader::serving_capacity::glm_graphs::GlmPrewarmFamily {
         cuteafd_loader::serving_capacity::glm_graphs::GlmPrewarmFamily::of(&self.cfg.variant)
     }
 
-    /// Whether the resolved layout's list pins this key's geometry. Entries
-    /// hold the width a step is built with; under the context placement each
-    /// rank's captured key is its half table.
-    fn prewarm_pins(&self, key: &GraphKey) -> bool {
-        use cuteafd_loader::serving_capacity::glm_graphs::{glm_prewarm, prewarm_key_width};
-        glm_prewarm(self.prewarm_family(), self.ranks()).entries.iter().any(|entry| entry.pin
-            && entry.shape.rows == key.rows
-            && prewarm_key_width(entry.shape.table_width, self.context_kv()) == key.table_width)
-    }
-
-    /// Pads a decode step's tables to `bucket` rows: position 0 of the scratch
-    /// page past the pool (its own records and index keys; no sequence reads them).
-    fn pad_rows(&self, tables: &mut StepTables, bucket: usize) {
-        // Under context the slot id is a logical page id (`rank_tables` sends padded rows
-        // to each GPU's scratch row); the pages past the pool are never a real row's.
-        tables.pad_rows(self.pages, bucket);
-    }
-
-    /// Best-effort prewarm of the family's selected geometries within the graph
-    /// reserve. Unlisted or uncaptured request shapes may capture or run eager.
-    /// One eager pass first puts module, workspace and BLAS first touch outside
-    /// executable residency. Returns resident keys and per-rank capture samples.
-    pub fn warm_decode_graphs(&self, mut experts: Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>,
-        inventory: &cuteafd_loader::placement::families::glm5::admission::StartupGraphs, bootstraps: &[u64])
-        -> Result<Vec<StartupGraphCapture>> {
-        use cuteafd_loader::placement::inventory::GraphMemorySample;
-        let started = std::time::Instant::now();
-        use cuteafd_loader::serving_capacity::glm_graphs::glm_prewarm_shapes;
-        ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0
-            && self.peer.as_ref().is_none_or(|peer| peer.graphs.borrow().len() == 0),
-            "GLM startup graph inventory already captured");
-        // `GRAPH_PREWARM=off` skips an all-local layout; segments capture on first
-        // use. A spanning layout always prewarms (#2303).
-        let Some(_startup) = crate::shared::decode_graph::sites::startup(
-            super::graph_sites::spans("glm5.segment", self.ranks() > 1)) else {
-            self.graphs_warmed.set(true);
-            return Ok(Vec::new());
-        };
-        let all_shapes = glm_prewarm_shapes(self.prewarm_family(), self.ranks(), self.max_context, self.pages);
-        let policies = (0..self.ranks()).map(|rank| inventory.reserve_policy(rank))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let bases: Vec<_> = policies.iter().map(|policy| policy.base_bytes).collect();
-        let costs = |selected: &[usize]| -> Vec<u64> {
-            inventory.declared().iter().enumerate().map(|(rank, declared)| {
-                let keys: Vec<_> = declared.iter().filter(|key| selected.iter().any(|index| {
-                    let shape = all_shapes[*index].shape;
-                    key.rows == shape.rows && key.table_width == if self.context_kv() {
-                        shape.table_width.div_ceil(2)
-                    } else { shape.table_width }
-                })).collect();
-                match self.graph_basis() {
-                    crate::shared::decode_graph::device::Basis::Nodes { node_rate, graph_rate } => {
-                        let nodes: u64 = keys.iter().filter_map(|key| self.graph_estimate(key).and_then(|estimate| estimate.nodes)).sum();
-                        let pack = |bytes: u64| bytes.div_ceil(2 << 20).saturating_mul(2 << 20);
-                        pack(nodes.saturating_mul(node_rate)).saturating_add(pack((keys.len() as u64).saturating_mul(graph_rate)))
-                    }
-                    _ => (keys.len() as u64).saturating_mul(bootstraps[rank]),
-                }
-            }).collect()
-        };
-        let pins: Vec<_> = all_shapes.iter().map(|entry| entry.pin).collect();
-        let selected = cuteafd_loader::placement::graph_reserve::prewarm_selection(&pins, &bases,
-            |selected, bases| costs(selected).iter().zip(bases).all(|(bytes, base)| bytes <= base));
-        if selected.len() < all_shapes.len() {
-            let full = costs(&(0..all_shapes.len()).collect::<Vec<_>>());
-            let kept = costs(&selected);
-            tracing::warn!(skipped_entries = all_shapes.len() - selected.len(),
-                skipped_bytes = ?full.iter().zip(&kept).map(|(full, kept)| full.saturating_sub(*kept)).collect::<Vec<_>>(),
-                base_bytes = ?bases, "GLM prewarm exceeds base; skipped entries remain runtime misses (pinned set is indivisible)");
-        }
-        let estimated_arena_bytes = costs(&selected);
-        let shapes: Vec<_> = selected.into_iter().map(|index| all_shapes[index].clone()).collect();
-        use crate::shared::decode_graph::device::Cycle;
-        self.graphs.borrow_mut().cache_cycle(Cycle::Other);
-        if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_cycle(Cycle::Other); }
-        // Eager pass: each shape's first module, workspace and BLAS touch lands
-        // outside executable residency, before the before-sample.
-        let mut run = |warming: bool| -> Result<()> {
-            self.graphs_warming.set(warming);
-            for shape in &shapes {
-                let (width, bucket) = (shape.shape.table_width, shape.shape.rows);
-                let mut tables = StepTables { segments: Vec::new(), decode: true, positions: Vec::new(), slots: Vec::new(),
-                    page_table: Vec::new(), table_width: width, table_stride: width, cache_lengths: Vec::new(),
-                    lengths: Vec::new(), exchange_rows: 1 };
-                self.pad_rows(&mut tables, bucket);
-                let experts = experts.as_mut().map(|(link, runtime)| (&mut **link, *runtime));
-                self.step(&tables, &vec![0; bucket], bucket, experts, None)?;
-                if warming {
-                    // Startup must measure each admitted shape before the next:
-                    // a spanning prewarm miss cannot be captured during serving.
-                    // This is not on the serving step path.
-                    let started = std::time::Instant::now();
-                    self.synchronize()?;
-                    if let Some(cycles) = self.graph_cycles.borrow().as_ref() { cycles.record_drain(started.elapsed()); }
-                    self.graph_boundary()?;
-                }
-            }
-            Ok(())
-        };
-        run(false)?;
-        let before = self.graph_memory_samples()?;
-        let captured = run(true);
-        self.graphs_warming.set(false);
-        captured?;
-        // Prewarm is best effort within the reserve, not a sealed inventory.
-        let after = self.graph_memory_samples()?;
-        // The startup inventory sample already drained both ranks. Settle
-        // the final prewarm capture through its event, not submission.
-        self.graph_boundary()?;
-        self.graphs_warmed.set(true);
-        let captures = (0..self.ranks()).map(|rank| {
-            let graphs = if rank == 0 { self.graphs.borrow() } else { self.peer()?.graphs.borrow() };
-            Ok(StartupGraphCapture { rank, keys: graphs.keys(),
-                before: before[rank], after: after[rank] })
-        }).collect::<Result<Vec<_>>>()?;
-        tracing::info!(graphs = captures.iter().map(|capture| capture.keys.len()).sum::<usize>(),
-            free = ?captures.iter().map(|capture| (capture.before.free, capture.after.free)).collect::<Vec<_>>(),
-            prewarm_shapes = shapes.len(),
-            estimated_arena_bytes = ?estimated_arena_bytes,
-            measured_arena_bytes = ?before.iter().zip(&after).map(|(before, after)| before.free.saturating_sub(after.free)).collect::<Vec<_>>(),
-            prewarm_geometries = ?shapes.iter().map(|entry| entry.shape).collect::<Vec<_>>(),
-            elapsed_ms = started.elapsed().as_millis() as u64, "GLM decode graphs captured at startup");
-        Ok(captures)
-    }
-
     pub fn configure_graph_cache(&self, inventory: &cuteafd_loader::placement::families::glm5::admission::StartupGraphs,
         reserves: &[u64], bootstraps: &[u64]) -> Result<()> {
-        use crate::shared::decode_graph::device::{Cycle, Preference, Site};
-        if self.graph_basis() == crate::shared::decode_graph::device::Basis::Bytes {
-            tracing::warn!("GLM graph cache uses per-site byte estimates: local/TP2 or non-HQA node counts uncalibrated");
-        }
+        use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+        ensure!(self.selection_dump.is_none(), "{} refuses CUDA graph capture",
+            crate::shared::selection_dump::ENV_DIR);
         for rank in 0..self.ranks() {
             let graphs = if rank == 0 { &self.graphs } else { &self.peer()?.graphs };
             let device = self.on(rank, || self.library.cuda_get_device())?;
             graphs.borrow_mut().attach_device(self.library, device, reserves[rank], Site {
-                name: "glm5.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,
+                name: "glm5.decode_local", cycle: Cycle::Decode, preference: Preference::Adaptive,
                 bootstrap: bootstraps[rank],
-                basis: self.graph_basis(),
-                spans_devices: super::graph_sites::spans("glm5.segment", self.ranks() > 1),
+                basis: Basis::Bytes,
+                spans_devices: super::graph_sites::spans("glm5.decode_local", false),
             })?;
             let policy = inventory.reserve_policy(rank)?;
             crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
@@ -1760,39 +1604,12 @@ impl<'a> GlmEngine<'a> {
         if reserves.iter().any(|&bytes| bytes > 0) {
             *self.graph_cycles.borrow_mut() = Some(crate::shared::decode_graph::device::EventCycles::new(self.library, &streams)?);
         }
+        if self.decode_workspace.borrow().is_none() {
+            *self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true)?);
+        }
+        drop(self.peer_workspaces(true, 1)?);
+        self.graphs_ready.set(true);
         Ok(())
-    }
-
-    fn graph_basis(&self) -> crate::shared::decode_graph::device::Basis {
-        use crate::shared::decode_graph::device::Basis;
-        if let Some(basis) = self.graph_basis.get() { return basis; }
-        // #1612 rates cover this route only. Resolve once before serving;
-        // device-info probes must not appear on request misses.
-        let sm120 = self.library.cuda_get_device().and_then(|device| self.library.cuda_device_info(device))
-            .is_ok_and(|info| info.compute_capability_major == 12 && info.compute_capability_minor == 0);
-        let basis = if sm120 && self.ranks() == 1 && !self.has_local()
-            && matches!(self.cfg.variant, cuteafd_loader::families::glm5::GlmVariant::Glm)
-            && self.weights.layers.iter().all(|layer| !layer.attention_native.is_empty()) {
-            let rate = cuteafd_loader::serving_capacity::glm_graph_nodes::GLM_SM120_NODE_RATES[0];
-            Basis::Nodes { node_rate: rate.bytes_per_node, graph_rate: rate.bytes_per_executable }
-        } else { Basis::Bytes };
-        self.graph_basis.set(Some(basis));
-        basis
-    }
-
-    fn graph_estimate(&self, key: &GraphKey) -> Option<crate::shared::decode_graph::device::Estimate> {
-        use crate::shared::decode_graph::device::{Basis, Estimate};
-        use cuteafd_loader::serving_capacity::glm_graph_nodes::{glm_remote_hqa_nodes, GlmRemoteHqaNodeClass};
-        let Basis::Nodes { node_rate, graph_rate } = self.graph_basis() else { return None };
-        let layer = self.weights.layers.get(key.layer);
-        let nodes = glm_remote_hqa_nodes(key, GlmRemoteHqaNodeClass {
-            dense: layer.is_some_and(|layer| layer.dense),
-            paged_dsa: layer.is_some_and(|layer| layer.full_indexer),
-            speculator_tap: key.layer.checked_sub(1).is_some_and(|previous|
-                self.drafter.as_ref().is_some_and(|draft| draft.tap_index(previous).is_some())),
-        }).ok()?;
-        Some(Estimate { bytes: nodes.saturating_mul(node_rate).saturating_add(graph_rate),
-            nodes: Some(nodes), node_rate, graph_rate, parallel_width: 1 })
     }
 
     /// Drains both ranks' streams (the benchmark's verify-timing boundary).
@@ -1806,8 +1623,8 @@ impl<'a> GlmEngine<'a> {
         Ok(())
     }
 
-    /// Serving replays captured decode graphs: startup warm-up finished.
-    pub(crate) fn production_replay_ready(&self) -> bool { self.graphs_warmed.get() }
+    /// Serving replays captured decode graphs: graph cache is configured and ready.
+    pub(crate) fn production_replay_ready(&self) -> bool { self.graphs_ready.get() }
 
     fn graph_boundary(&self) -> Result<()> {
         let mut cycles = self.graph_cycles.borrow_mut();
@@ -1823,30 +1640,6 @@ impl<'a> GlmEngine<'a> {
             })?;
         }
         Ok(())
-    }
-
-    /// Physical free/total and the ledger's tracked bytes on both ranks, with
-    /// the streams drained so no queued work lands inside the window.
-    fn graph_memory_samples(&self) -> Result<Vec<cuteafd_loader::placement::inventory::GraphMemorySample>> {
-        use cuteafd_loader::placement::inventory::GraphMemorySample;
-        // SAFETY: both ranks' streams are live; nothing else is queued.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
-        if self.peer.is_some() {
-            let stream = self.stream_of(1);
-            self.on(1, || unsafe { self.library.cuda_stream_synchronize(stream) })?;
-        }
-        let ledger = cuteafd_ffi::memory_ledger::snapshot();
-        use cuteafd_ffi::memory_ledger::Space;
-        (0..self.ranks()).map(|rank| self.on(rank, || {
-            let device = self.library.cuda_get_device()?;
-            let (free, total) = self.library.cuda_physical_memory_info()?;
-            Ok(GraphMemorySample { free: free as u64, total: total as u64,
-                tracked_device: ledger.total(Space::Device, device) as u64,
-                tracked_pinned: ledger.rows.iter().filter(|row| row.key.space == Space::Pinned)
-                    .map(|row| row.bytes as u64).sum(),
-                tracked_managed: ledger.rows.iter().filter(|row| row.key.space == Space::Managed)
-                    .map(|row| row.bytes as u64).sum() })
-        })).collect()
     }
 
     fn step(&self, tables: &StepTables, tokens: &[u32], logit_rows: usize,
@@ -1917,7 +1710,7 @@ impl<'a> GlmEngine<'a> {
                 self.embedding.embed(tokens, w.ids.buffer, 1, w.h.buffer, self.stream)?;
             }
             let head = logit_rows == t;
-            self.decode_layers(w, w1, &ranked[0], t, &mut experts, gather, head)?;
+            self.decode_layers_local(w, w1, &ranked[0], t, &mut experts, gather, head)?;
             if !head {
                 self.launch_head(w, t, logit_rows)?;
             }
@@ -2192,239 +1985,14 @@ impl<'a> GlmEngine<'a> {
                 .cast_const())) }
     }
 
-    /// Decode layers as captured graph segments: each replays the previous
-    /// layer's reduce + residual norm, this layer's attention and
-    /// post-attention norm, and the dense FFN or the MoE front (router,
-    /// select, wire rows); the Spark exchange runs between segments.
-    ///
-    /// Under a head split each segment exchanges with rank 1's segment of the
-    /// same layer (captured on rank 1's stream); rank 1's next segment is
-    /// queued before the host waits in this layer's Spark exchange, except when
-    /// its current shared-core meet still needs rank 0's publication.
-    #[allow(clippy::too_many_arguments)]
-    fn decode_layers(&self, w: &Workspace<'_>, w1: Option<&Workspace<'_>>, ranked: &[StepTables; 2], t: usize,
-        experts: &mut Option<(&mut SparkLink<'_>, &tokio::runtime::Runtime)>, gather: bool, head: bool) -> Result<()> {
-        let tables = &ranked[0];
-        let rows = Scalar::I32(t as i32);
-        let layers = &self.weights.layers;
-        let bytes = t * self.cfg.hidden * 2;
-        // The decode transport's intake planes (or the skip intake's); the
-        // replayed graphs bake them in.
-        let reduction = match (experts.as_mut(), &self.skip) {
-            (_, Some(_)) => None,
-            // One decode slot: the replayed graphs bake slot 0's planes.
-            (Some((transport, _)), None) => {
-                let waves = transport.exchange()?;
-                ensure!(waves.waves() == 1, "GLM decode graphs bake one return slot's planes");
-                Some(waves.reduction(0))
-            }
-            (None, None) => None,
-        };
-        // Previous layer's FFN output: none (first layer), in `delta`, or Spark planes.
-        let mut previous = Previous::First;
-        for index in 0..=layers.len() {
-            let layer = layers.get(index);
-            let segment = || -> Result<()> {
-                if index == 0 && gather {
-                    // SAFETY: the step's ids are in `ids` before the replay; `h` holds its rows.
-                    unsafe { self.embedding.gather(w.ids.buffer.ptr, std::ptr::null(), t, 1, std::ptr::null(),
-                        w.h.buffer.ptr, None, crate::shared::peer_split::RankDevice { device: self.device, stream: self.stream })? };
-                }
-                if let (0, Some(w1)) = (index, w1) {
-                    self.exchange()?.push_to(0, DIRECT, w.h.buffer.ptr, w1.h.buffer.ptr, bytes)?;
-                }
-                if let Previous::Planes(ranks) = previous {
-                    if let Some(reduction) = &reduction {
-                        // SAFETY: the landed decode slot and workspace outlive graph replay.
-                        unsafe { reduction.launch(self.library, w.shared.buffer.ptr.cast(),
-                            w.delta.buffer.ptr.cast(), t, self.stream)?; }
-                    } else {
-                        self.reduce(self.skip.as_ref().context("skip intake")?.pointers(), w, ranks, t)?;
-                    }
-                }
-                let weight = match layer {
-                    Some(layer) => layer.ptr("input_norm")?,
-                    None => self.weights.norm.buffer.ptr,
-                };
-                match (w1, previous, index.checked_sub(1)) {
-                    // Rank 1's partial (dense) or shared-expert half in; this GPU's routed +
-                    // shared sum out first (rank 1 needs it; not after the last layer).
-                    (Some(_), Previous::Delta | Previous::Planes(_), Some(before)) => {
-                        let ffn = slot(before, true, 0);
-                        if matches!(previous, Previous::Planes(_))
-                            && (layer.is_some() || Self::core_split(&layers[before], "down")) {
-                            self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
-                        }
-                        if !self.shared_zero_elided(before, &layers[before]) { self.exchange()?.wait(0, ffn)?; }
-                        if self.tp2_layer(before) { self.tp2_norm(0, w, weight, before, 0, rows)?; }
-                        else { self.ffn_norm(0, before, 0, w, &layers[before], weight, rows,
-                            w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
-                    }
-                    _ => {
-                        let deltas = if matches!(previous, Previous::First) { 0 } else { 1 };
-                        self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
-                            ("delta1", w.delta.buffer.ptr), ("weight", weight), ("out", w.x.buffer.ptr)],
-                            &[rows, Scalar::I32(deltas)])?;
-                    }
-                }
-                // `h` now holds the previous layer's output.
-                if let (Some(drafter), Some(previous)) = (&self.drafter, index.checked_sub(1)) {
-                    drafter.tap(previous, w.h.buffer.ptr, 0, t)?;
-                }
-                let Some(layer) = layer else {
-                    if head {
-                        self.launch_head(w, t, t)?;
-                        self.select_greedy(w, t)?;
-                    }
-                    return Ok(());
-                };
-                self.attention_unit(0, w, index, layer, rows, "m64", ranked, 0)?;
-                if w1.is_some() {
-                    let attended = slot(index, false, 0);
-                    self.publish_projection(0, index, 0, w, layer, "o", t)?;
-                    self.exchange()?.wait(0, attended)?;
-                    self.projection_norm(0, index, 0, w, layer, "o", layer.ptr("post_norm")?, rows,
-                        w.delta.buffer.ptr, self.recv(0, attended)?)?;
-                } else {
-                    self.run(&self.family_program("norm"), &[("residual", w.h.buffer.ptr), ("delta0", w.delta.buffer.ptr),
-                        ("delta1", w.delta.buffer.ptr), ("weight", layer.ptr("post_norm")?), ("out", w.x.buffer.ptr)],
-                        &[rows, Scalar::I32(1)])?;
-                }
-                if layer.dense {
-                    self.ffn(w, layer, self.cfg.dense_intermediate, "m64", w.delta.buffer.ptr, rows)?;
-                    if w1.is_some() {
-                        self.publish_projection(0, index, 0, w, layer, "down", t)?;
-                    }
-                    Ok(())
-                } else {
-                    self.moe_front(index, w, layer, t)
-                }
-            };
-            let key = GraphKey { layer: index, rows: t, table_width: tables.table_width,
-                table_stride: tables.table_stride, previous, head: head && layer.is_none() };
-            {
-                let _range = crate::shared::probe::verify_timing::range(Some(self.library), || match layer {
-                    Some(layer) if layer.dense => format!("L{index} attention+dense"),
-                    Some(_) => format!("L{index} attention+router"),
-                    None => "head".into(),
-                });
-                self.replay_on(0, key, segment)?;
-            }
-            if let (Previous::Planes(_), None, Some((transport, _))) = (previous, &self.skip, experts.as_mut()) {
-                // The segment just queued reduced the previous layer's planes.
-                transport.exchange()?.consumed(0, self.stream)?;
-            }
-            let defer_peer = layer.is_some_and(|layer| !layer.dense && !self.tp2_layer(index)
-                && Self::core_split(layer, "down"));
-            let peer_next = || -> Result<()> {
-                if let (Some(w1), Some(layer)) = (w1, layer.filter(|_| index + 1 < layers.len())) {
-                    let kind = if layer.dense || self.tp2_layer(index) { Previous::Delta }
-                        else { Previous::Planes(0) };
-                    if let (false, Some(l2)) = (layer.dense, self.peer()?.l2.as_ref()) {
-                        self.on(1, || l2.issue(self.library, index, self.stream_of(1)))?;
-                    }
-                    self.peer_segment(index + 1, kind, w1, t, ranked, bytes)?;
-                }
-                Ok(())
-            };
-            if let Some(w1) = w1 {
-                // Rank 1's segments: layer 0 with rank 0's first, then each next one before
-                // this layer's exchange unless a native shared-core meet is still pending.
-                if index == 0 {
-                    self.peer_segment(0, Previous::First, w1, t, ranked, bytes)?;
-                }
-                if layer.is_some() && self.local_layer(index) {
-                    self.local_ffn(index, 0, w, Some(w1), t, "m64")?;
-                }
-                if !defer_peer { peer_next()?; }
-            } else if layer.is_some() && self.local_layer(index) {
-                self.local_ffn(index, 0, w, None, t, "m64")?;
-            }
-            previous = match layer {
-                None => break,
-                Some(layer) if layer.dense || self.local_layer(index) => Previous::Delta,
-                // Only the step's real rows go to the Sparks; padded rows reduce stale
-                // planes into their own (scratch) rows.
-                Some(layer) if self.skip.is_some() => Previous::Planes(self.moe_skip(w, index, layer,
-                    tables.exchange_rows, "m64")?),
-                Some(layer) => {
-                    let _range = crate::shared::probe::verify_timing::range(Some(self.library),
-                        || format!("L{index} experts exchange {}/{t}", tables.exchange_rows));
-                    let (transport, _) = experts.as_mut()
-                        .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
-                    let waves = transport.exchange()?;
-                    self.moe_exchange(w, index, layer, tables.exchange_rows, "m64", true, waves)?;
-                    Previous::Planes(waves.ranks())
-                }
-            };
-            // Instantiating the next peer graph can wait for that device to drain.
-            // Queue rank 0's current shared meet first so rank 1 can reach its end.
-            if defer_peer { peer_next()?; }
-            crate::shared::console::layer_mark(index);
-        }
-        Ok(())
-    }
-
-    /// Rank 1's decode segment of layer `index` (see [`Self::decode_layers`]):
-    /// the previous layer's FFN exchange (rank 0's dense partial or routed +
-    /// shared sum in) and this layer's input norm, its heads' attention and the
-    /// attention all-reduce, then its dense partial or shared-expert half out.
-    fn peer_segment(&self, index: usize, previous: Previous, w1: &Workspace<'_>, t: usize, ranked: &[StepTables; 2],
-        bytes: usize) -> Result<()> {
-        let tables = &ranked[1];
-        let peer = self.peer()?;
-        let rows = Scalar::I32(t as i32);
-        let segment = || -> Result<()> {
-            let exchange = self.exchange()?;
-            let layer = &peer.layers[index];
-            match (previous, index.checked_sub(1)) {
-                (Previous::Delta | Previous::Planes(_), Some(before)) => {
-                    let ffn = slot(before, true, 0);
-                    exchange.wait(1, ffn)?;
-                    let received = self.recv(1, ffn)?;
-                    let (first, second) = if matches!(previous, Previous::Delta) { (w1.delta.buffer.ptr, received) }
-                        else { (received, w1.shared.buffer.ptr) };
-                    if self.tp2_layer(before) { self.tp2_norm(1, w1, layer.ptr("input_norm")?, before, 0, rows)?; }
-                    else { self.ffn_norm(1, before, 0, w1, &peer.layers[before], layer.ptr("input_norm")?, rows, first, second)?; }
-                }
-                _ => {
-                    exchange.wait(1, DIRECT)?;
-                    self.norm_full(1, w1, layer.ptr("input_norm")?, 0, rows, w1.delta.buffer.ptr, w1.delta.buffer.ptr)?;
-                }
-            }
-            self.attention_unit(1, w1, index, layer, rows, "m64", ranked, 0)?;
-            let (attended, ffn) = (slot(index, false, 0), slot(index, true, 0));
-            self.publish_projection(1, index, 0, w1, layer, "o", t)?;
-            exchange.wait(1, attended)?;
-            self.projection_norm(1, index, 0, w1, layer, "o", layer.ptr("post_norm")?, rows,
-                w1.delta.buffer.ptr, self.recv(1, attended)?)?;
-            let out = if layer.dense { w1.delta.buffer.ptr } else { w1.shared.buffer.ptr };
-            let intermediate = if layer.dense { self.cfg.dense_intermediate } else { self.cfg.moe_intermediate };
-            if layer.dense { self.ffn_on(1, w1, layer, intermediate, "m64", out, rows)?; }
-            else { self.shared_on(1, index, w1, layer, rows, "m64")?; }
-            if self.tp2_layer(index) { Ok(()) }
-            else if layer.dense { self.publish_projection(1, index, 0, w1, layer, "down", t) }
-            else {
-                if !self.shared_zero_elided(index, layer) { exchange.push(1, ffn, out, bytes)?; }
-                if index + 1 == peer.layers.len() && Self::core_split(layer, "down") {
-                    exchange.wait(1, ffn)?;
-                }
-                Ok(())
-            }
-        };
-        let key = GraphKey { layer: index, rows: t, table_width: tables.table_width, table_stride: tables.table_stride,
-            previous, head: false };
-        self.replay_on(1, key, segment)
-    }
-
-    /// Launches `segment` through a graph captured the first time `key` is seen.
-    fn replay(&self, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
-        self.replay_on(0, key, segment)
-    }
-
-    /// [`Self::replay`] on rank `rank`'s stream (its own graphs).
+    /// [`Self::replay`] on rank `rank`'s stream (its own graphs): a hit launches the
+    /// captured segment, a miss captures (or updates a cold donor at the soft cap via
+    /// `GraphBank::cache_miss` / `replay_on`), and every failed capture cancels its ticket.
     fn replay_on(&self, rank: usize, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.require_live()?;
+        if self.force_route_check.get() || self.tp2.as_ref().is_some_and(|pair| pair.checking()) {
+            return segment();
+        }
         let graphs = match (rank, &self.peer) {
             (1, Some(peer)) => &peer.graphs,
             _ => &self.graphs,
@@ -2432,13 +2000,14 @@ impl<'a> GlmEngine<'a> {
         let stream = self.stream_of(rank);
         if let Some(graph) = graphs.borrow_mut().cached_launch(&key) {
             // SAFETY: the graph's pointers are persistent engine buffers of that rank.
-            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) });
+            return self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.raw, stream) });
         }
-        if !self.graphs_warmed.get() && !self.graphs_warming.get() { return segment(); }
+        if !self.graphs_ready.get() { return segment(); }
         ensure!(self.selection_dump.is_none(), "{} refuses CUDA graph capture",
             crate::shared::selection_dump::ENV_DIR);
-        let pinned = self.prewarm_pins(&key);
-        let Some(mut ticket) = graphs.borrow_mut().cache_ticket(&key, pinned, self.graph_estimate(&key)) else { return segment() };
+        let Some(mut ticket) = graphs.borrow_mut().cache_ticket(&key, false, None) else {
+            return segment();
+        };
         // No synchronization here: peer segments may not yet have been queued.
         // SAFETY: capture records launches on this rank's persistent stream.
         if let Err(error) = self.on(rank, || unsafe { crate::shared::decode_graph::begin_capture(&self.library, stream, &ticket) }) {
@@ -2451,7 +2020,10 @@ impl<'a> GlmEngine<'a> {
         let exec = self.on(rank, || unsafe { crate::shared::decode_graph::end_capture(&self.library, stream, &mut ticket) });
         if let Err(error) = captured {
             graphs.borrow_mut().cache_ticket_failed(ticket, exec.as_ref().err().unwrap_or(&error));
-            if let Ok((raw, _, _, _, _)) = exec { drop(GraphExec(raw, self.library)); }
+            if let Ok((raw, _, _, _, _)) = exec {
+                // SAFETY: the capture failed; this executable owns no live launch.
+                let _ = self.on(rank, || unsafe { self.library.cuda_graph_exec_destroy(raw) });
+            }
             return Err(error);
         }
         let (raw, nodes, width, spans_devices, inspection_error) = match exec {
@@ -2465,18 +2037,20 @@ impl<'a> GlmEngine<'a> {
         };
         if let Some(error) = inspection_error {
             static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| tracing::warn!(site = "glm5.decode", %error,
+            WARNED.call_once(|| tracing::warn!(site = "glm5.decode_local", %error,
                 "graph topology unknown; retaining executable without chain reuse"));
         }
-        let graph = GraphExec(raw, self.library);
-        crate::shared::decode_graph::census::capture_key("glm5", "decode",
-            graphs.as_ptr() as usize, rank as i32, Some(0), &key, graph.0);
+        let device = if rank == 1 { self.peer()?.device } else { self.device };
+        // SAFETY: persistent engine storage outlives the executable, which teardown drains first.
+        let graph = unsafe { GraphExec::new(self.library, device, raw, ())? };
+        crate::shared::decode_graph::census::capture_key("glm5", "decode_local",
+            graphs.as_ptr() as usize, rank as i32, Some(0), &key, graph.raw);
         // Own the executable and ticket before launch: a launch error is drained
         // by the submission guard before either its pointers or owner can retire.
         graphs.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
         let bank = graphs.borrow();
         let graph = bank.get(&key).context("inserted graph")?;
-        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.0, stream) })?;
+        self.on(rank, || unsafe { crate::shared::decode_graph::launch(&self.library, graph.raw, stream) })?;
         Ok(())
     }
 
@@ -2594,6 +2168,18 @@ impl<'a> GlmEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     fn moe_exchange(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
         transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<usize> {
+        self.moe_exchange_with_shared(w, index, layer, t, cap, decode, transport, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn moe_exchange_one_way(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize,
+        cap: &str, decode: bool, transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<usize> {
+        self.moe_exchange_with_shared(w, index, layer, t, cap, decode, transport, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_exchange_with_shared(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
+        transport: &mut crate::shared::spark_waves::Waves<'_>, one_way_shared: bool) -> Result<usize> {
         ensure!(transport.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", transport.ranks());
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
@@ -2608,7 +2194,11 @@ impl<'a> GlmEngine<'a> {
         };
         self.exchange_host.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         // The shared expert runs on the GPU while the worker posts and the Sparks compute.
-        self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
+        if one_way_shared {
+            self.shared_on_rank0_one_way(index, w.lane, w, layer, Scalar::I32(t as i32), cap)?;
+        } else {
+            self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
+        }
         if decode {
             self.prefetch(index)?;
         }
@@ -2623,8 +2213,17 @@ impl<'a> GlmEngine<'a> {
     /// With CUTEAFD_EMULATE_EXCHANGE_US a decode step waits that long after
     /// the shared expert (and the L2 prefetch) as a Spark exchange would.
     fn moe_skip(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<usize> {
+        self.moe_skip_with_shared(w, index, layer, t, cap, false)
+    }
+
+    pub(super) fn moe_skip_one_way(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<usize> {
+        self.moe_skip_with_shared(w, index, layer, t, cap, true)
+    }
+
+    fn moe_skip_with_shared(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str,
+        one_way_shared: bool) -> Result<usize> {
         let skip = self.skip.as_ref().context("routed experts are not skipped")?;
-        self.moe_stage(w, index, layer, t, cap)?;
+        self.moe_stage_with_shared(w, index, layer, t, cap, one_way_shared)?;
         if cap == "m64" {
             let mark = crate::shared::l2_prefetch::exchange_mark(self.library, self.stream)?;
             self.prefetch(index)?;
@@ -2662,6 +2261,11 @@ impl<'a> GlmEngine<'a> {
     /// skip benchmark (a host-mode exchange's cost) and the EXLR8 wire
     /// golden use it; serving goes through [`Self::moe_exchange`].
     pub(super) fn moe_stage(&self, w: &Workspace<'_>, layer_index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<()> {
+        self.moe_stage_with_shared(w, layer_index, layer, t, cap, false)
+    }
+
+    fn moe_stage_with_shared(&self, w: &Workspace<'_>, layer_index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str,
+        one_way_shared: bool) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
             if self.spark_bf16 { h * 2 } else { h + h / 32 })?;
@@ -2709,7 +2313,11 @@ impl<'a> GlmEngine<'a> {
             });
         }
         // The shared expert runs on the GPU while the host sends and the Sparks compute.
-        self.shared_on(0, layer_index, w, layer, Scalar::I32(t as i32), cap)
+        if one_way_shared {
+            self.shared_on_rank0_one_way(layer_index, w.lane, w, layer, Scalar::I32(t as i32), cap)
+        } else {
+            self.shared_on(0, layer_index, w, layer, Scalar::I32(t as i32), cap)
+        }
     }
 
     /// A prefill unit's wave on the link's transport worker: the routes and
@@ -3265,7 +2873,7 @@ impl<'a> GlmEngine<'a> {
             crate::shared::selection_dump::ENV_DIR);
         ensure!(!self.weights.layers.iter().any(|l| l.attention_owner.is_some_and(|gpu| gpu != 0)),
             "{} refuses layers placement on GLM 5.3", crate::shared::selection_dump::ENV_DIR);
-        ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0,
+        ensure!(!self.graphs_ready.get() && self.graphs.borrow().len() == 0,
             "{} refuses attached CUDA graphs: use --decode-graphs off (DECODE_GRAPHS=off in the launcher)",
             crate::shared::selection_dump::ENV_DIR);
         self.selection_dump = Some(dump);
@@ -3694,36 +3302,18 @@ mod long_graph_tests {
 
 
     #[test]
-    fn long_padding_resolves_only_to_sized_scratch_records() {
+    fn scratch_page_records_stay_within_allocated_pool_tail() {
         let pages = 22_018;
-        for real in 1..=64 {
-            let width = 1_048_576 / PAGE_ROWS;
-            let bucket = glm_decode_row_bucket(real, width).unwrap();
-            let mut tables = StepTables { segments: Vec::new(), decode: true, positions: vec![200_000; real],
-                slots: vec![123 * PAGE_ROWS as i64; real], page_table: vec![123; real * width],
-                table_width: width, table_stride: width, cache_lengths: vec![200_001; real],
-                lengths: vec![2048; real], exchange_rows: real };
-            tables.pad_rows(pages, bucket);
-            assert_eq!(tables.exchange_rows, real);
-            assert_eq!(&tables.page_table[..real * width], vec![123; real * width]);
-            assert_eq!(&tables.positions[..real], vec![200_000; real]);
-            assert_eq!(tables.page_table.len(), bucket * width);
-            assert!(bucket * width * 4 <= DECODE_ROWS * pages * 4);
-            assert!(bucket <= DECODE_ROWS);
-            for row in real..bucket {
-                assert_eq!(tables.positions[row], 0);
-                assert_eq!(tables.cache_lengths[row], 1);
-                assert_eq!(tables.lengths[row], 1);
-                let slot = tables.slots[row] as usize;
-                assert_eq!(slot, pages * PAGE_ROWS);
-                assert!(tables.page_table[row * width..(row + 1) * width].iter()
-                    .all(|&page| page as usize == pages));
-                assert!((slot + 1) * RECORD_BYTES <= (pages + 1) * RECORD_PAGE_BYTES);
-                // 128-byte index key plus its 4-byte scale; only position zero is live.
-                assert!((slot + 1) * 132 <= (pages + 1) * INDEX_PAGE_BYTES);
-            }
-        }
-        assert_eq!(glm_decode_row_bucket(33, 16384).unwrap(), DECODE_ROWS);
+        let width = 1_048_576 / PAGE_ROWS;
+        let mut tables = StepTables { segments: Vec::new(), decode: true, positions: vec![200_000; 3],
+            slots: vec![123 * PAGE_ROWS as i64; 3], page_table: vec![123; 3 * width],
+            table_width: width, table_stride: width, cache_lengths: vec![200_001; 3],
+            lengths: vec![2048; 3], exchange_rows: 3 };
+        tables.pad_rows(pages, 4);
+        let slot = tables.slots[3] as usize;
+        assert_eq!(slot, pages * PAGE_ROWS);
+        assert!((slot + 1) * RECORD_BYTES <= (pages + 1) * RECORD_PAGE_BYTES);
+        assert!((slot + 1) * 132 <= (pages + 1) * INDEX_PAGE_BYTES);
         assert_eq!(INDEX_PAGE_BYTES, PAGE_ROWS * 132);
     }
 }
@@ -3736,7 +3326,7 @@ impl Drop for GlmEngine<'_> {
             crate::shared::decode_graph::fatal_drain(self.retire_tp2(), "GLM peer engine retirement");
         }
         if self.graphs.borrow().len() > 0 || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().len() > 0) {
-            crate::shared::decode_graph::fatal_drain(self.graph_memory_samples().map(|_| ()), "GLM graph retirement");
+            crate::shared::decode_graph::fatal_drain(self.synchronize(), "GLM graph retirement");
         }
         if !self.native_experts.is_empty() || self.expert_usage.is_some() {
             // SAFETY: native shared execution and workspace owners remain live until this drain.
@@ -3827,15 +3417,13 @@ mod native_decode_order_tests {
                 check_host(&repeated).unwrap();
             }
         }
-        // Bind the modeled seam to decode_layers, not just a balanced toy schedule.
-        let source = include_str!("engine.rs");
-        let decode = source.split("fn decode_layers(").nth(1).unwrap().split("fn peer_segment(").next().unwrap();
-        assert!(decode.contains("!layer.dense && !self.tp2_layer(index)\n                && Self::core_split(layer, \"down\")"));
-        let before = decode.find("if !defer_peer { peer_next()?; }").unwrap();
-        let exchange = decode.find("self.moe_exchange(").unwrap();
-        let skip = decode.find("self.moe_skip(").unwrap();
-        let after = decode.find("if defer_peer { peer_next()?; }").unwrap();
-        assert!(before < exchange && exchange < after && before < skip && skip < after);
+        // Bind the modeled seam to local_graph.rs: Rank 1's next-layer staging always runs
+        // after Rank 0's Spark exchange / shared-core completion so no peer wait is unmatched.
+        let local = include_str!("engine/local_graph.rs");
+        let exchange = local.find("self.moe_exchange_one_way(").unwrap();
+        let skip = local.find("self.moe_skip_one_way(").unwrap();
+        let stage_next = local.find("self.local_stage_rank1_attention(index + 1,").unwrap();
+        assert!(skip < stage_next && exchange < stage_next);
     }
 }
 

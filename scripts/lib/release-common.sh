@@ -1319,6 +1319,14 @@ release_onboard() {
   python3 "$(dirname "${BASH_SOURCE[0]}")/checkpoint-family.py" "${args[@]}"
 }
 
+release_validate_host_value() {
+  local key="$1" value="$2"
+  [[ -n "$value" ]] || return 0
+  if [[ "${value,,}" == *replace-me* ]]; then
+    release_die "$key contains placeholder host '$value'; replace REPLACE-ME values with real hostnames"
+  fi
+}
+
 release_load_config() {
   local config="$1"
   local mode="${2:-launch}"
@@ -1446,6 +1454,12 @@ release_load_config() {
   [[ -z "$count_env" ]] || SPARK_COUNT="$count_env"
   [[ -z "$hosts_env" ]] || SPARK_HOSTS="$hosts_env"
   [[ -z "$SPARK_COUNT$SPARK_HOSTS" ]] || RELEASE_SPARK_COUNT_EXPLICIT=1
+  release_validate_host_value WIP_BUILD_SEED "$WIP_BUILD_SEED"
+  release_validate_host_value SPARK_HOSTS "$SPARK_HOSTS"
+  for release_i in {0..7}; do
+    local host_key="SPARK_${release_i}_HOST"
+    release_validate_host_value "$host_key" "${!host_key:-}"
+  done
   RELEASE_AVAILABLE_SPARKS=0
   for release_i in {0..7}; do
     local host_key="SPARK_${release_i}_HOST"

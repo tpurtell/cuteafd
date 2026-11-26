@@ -592,8 +592,8 @@ spec = importlib.util.spec_from_file_location('hwlock', {str(hw / 'hwlock_real.p
 hwlock = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hwlock)
 take = hwlock._take_ticket
-def recorded(queue, locks, max_run=None):
-    seq, path, handle = take(queue, locks, max_run)
+def recorded(queue, locks, max_run=None, gate=False):
+    seq, path, handle = take(queue, locks, max_run, gate)
     trace.write('ticket ' + path.read_text() + '\\n'); trace.flush()
     return seq, path, handle
 hwlock._take_ticket = recorded

@@ -89,20 +89,8 @@ impl DraftLayout {
                 work.buffers.push(("projection.fp8".into(), weight.fp8_scratch(manifest, rows)?));
             }
         }
-        let h=config.transformer.hidden;let taps=config.taps.len();
-        let extent=|values:&[usize]|values.iter().try_fold(1usize,|n,value|n.checked_mul(*value)).context("draft target owner overflow");
-        let mut target=Vec::new();
-        for wave in 0..waves{
-            target.push((format!("unit.{wave}.taps"),extent(&[prefill,taps,h,2])?));
-            target.push((format!("unit.{wave}.narrow"),extent(&[prefill,h,2])?));
-        }
-        let replay_rows = super::execution::replay_capacity(decode_rows);
-        target.push(("decode.taps".into(),extent(&[decode_rows,taps,h,2])?));
-        target.push(("decode.narrow".into(),extent(&[decode_rows,h,2])?));
-        let conv=super::conv::ConvLayout::new(slots,48,h,1024/ranks)?;
-        let verify = vec![("verify.checkpoint".into(),conv.bytes()?),
-            ("verify.replay".into(),extent(&[48,replay_rows,conv.width,4])?), ("verify.table".into(),replay_rows*12)];
-        target.extend(verify.iter().cloned());
+        let (target, verify) = target_owners(config.transformer.hidden, config.taps.len(), slots,
+            prefill, waves, decode_rows, ranks)?;
         let (peer,exchange)=if ranks==2 {
             let bytes=runtime[0].buffers.iter().find(|(name,_)|name=="step.partial").context("draft partial owner missing")?.1;
             let slot = runtime[0].buffers.iter().find(|(name,_)|name=="step.partial_f32").map_or(bytes, |(_, bytes)| *bytes);
@@ -113,4 +101,23 @@ impl DraftLayout {
         } else {(Vec::new(),Vec::new())};
         Ok(Self{config,weights,runtime,target,peer,exchange})
     }
+}
+
+/// Shared target tap staging and FIR verification owners, independent of the drafter body.
+pub fn target_owners(h: usize, taps: usize, slots: usize, prefill: usize, waves: usize,
+    decode_rows: usize, ranks: usize) -> Result<(Vec<(String, usize)>, Vec<(String, usize)>)> {
+    let extent=|values:&[usize]|values.iter().try_fold(1usize,|n,value|n.checked_mul(*value)).context("draft target owner overflow");
+    let mut target=Vec::new();
+    for wave in 0..waves{
+        target.push((format!("unit.{wave}.taps"),extent(&[prefill,taps,h,2])?));
+        target.push((format!("unit.{wave}.narrow"),extent(&[prefill,h,2])?));
+    }
+    let replay_rows = super::execution::replay_capacity(decode_rows);
+    target.push(("decode.taps".into(),extent(&[decode_rows,taps,h,2])?));
+    target.push(("decode.narrow".into(),extent(&[decode_rows,h,2])?));
+    let conv=super::conv::ConvLayout::new(slots,48,h,1024/ranks)?;
+    let verify = vec![("verify.checkpoint".into(),conv.bytes()?),
+        ("verify.replay".into(),extent(&[48,replay_rows,conv.width,4])?), ("verify.table".into(),replay_rows*12)];
+    target.extend(verify.iter().cloned());
+    Ok((target, verify))
 }

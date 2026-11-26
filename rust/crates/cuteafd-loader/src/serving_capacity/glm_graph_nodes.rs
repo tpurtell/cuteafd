@@ -73,39 +73,20 @@ pub fn glm_remote_hqa_nodes(key: &GlmGraphKey, class: GlmRemoteHqaNodeClass)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::placement::{attention::AttentionPlacement, graph_nodes::{charge, GraphNodeCounts}};
-    use crate::serving_capacity::glm_graphs::{glm_declared_graphs, glm_graph_shapes, GlmGraphLayer};
 
     #[test]
-    fn declared_keys_reproduce_archived_node_totals_and_context_subsets() {
-        let layers: Vec<_> = (0..78).map(|layer| GlmGraphLayer { dense: layer < 3,
-            local: false, attention_owner: None }).collect();
-        for (context, executables, nodes) in [
-            (131072, 15168, 404160),
-            (262144, 15721, 420754),
-            (1048576, 16827, 463350),
-        ] {
-            let shapes = glm_graph_shapes(context, 1048576 / 64);
-            let declared = glm_declared_graphs(&shapes, AttentionPlacement::Heads, 1, &layers, 4).unwrap();
-            assert_eq!(declared[0].len(), executables);
-            let counts = GraphNodeCounts::declared(&declared[0], |key| glm_remote_hqa_nodes(key,
-                GlmRemoteHqaNodeClass { dense: key.layer < 3,
-                    paged_dsa: key.layer < 3 || (key.layer >= 6 && (key.layer - 6) % 4 == 0),
-                    speculator_tap: [6, 20, 34, 48, 62, 76].contains(&key.layer) })).unwrap();
-            assert_eq!(counts.nodes, nodes);
-            assert_eq!(counts.executables, executables as u64);
-            if context == 1048576 {
-                assert_eq!(charge("glm5", "sm_120", &counts, &GLM_SM120_NODE_RATES,
-                    "0".parse().unwrap()).unwrap().packed_bytes, 2984247296);
-            }
-        }
-    }
-
-    #[test]
-    fn unknown_residual_route_is_not_silently_treated_as_remote() {
-        let key = GlmGraphKey { layer: 4, rows: 1, table_width: 16, table_stride: 16,
+    fn remote_hqa_node_counts_and_unknown_residual_route() {
+        let key = GlmGraphKey { layer: 0, sub: 0, rows: 1, table_width: 16, table_stride: 16,
+            previous: GlmGraphPrevious::First, head: false };
+        assert_eq!(glm_remote_hqa_nodes(&key, GlmRemoteHqaNodeClass { dense: true,
+            paged_dsa: true, speculator_tap: false }).unwrap(), 38);
+        let head = GlmGraphKey { layer: 78, sub: 0, rows: 1, table_width: 16, table_stride: 16,
+            previous: GlmGraphPrevious::Planes(4), head: true };
+        assert_eq!(glm_remote_hqa_nodes(&head, GlmRemoteHqaNodeClass { dense: false,
+            paged_dsa: false, speculator_tap: false }).unwrap(), 7);
+        let unknown = GlmGraphKey { layer: 4, sub: 0, rows: 1, table_width: 16, table_stride: 16,
             previous: GlmGraphPrevious::Planes(0), head: false };
-        assert!(glm_remote_hqa_nodes(&key, GlmRemoteHqaNodeClass { dense: false,
+        assert!(glm_remote_hqa_nodes(&unknown, GlmRemoteHqaNodeClass { dense: false,
             paged_dsa: false, speculator_tap: false }).is_err());
     }
 }
