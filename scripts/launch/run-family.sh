@@ -1660,7 +1660,7 @@ if [[ "$family" == inkling2_mini && ( -z "$speculator" || "$speculator" == auto 
 if [[ "$family" == qwen4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=auto; fi
 if [[ "$family" == hy4_flash && ( -z "$speculator" || "$speculator" == auto ) ]]; then
   speculator=off
-  if [[ "$attention_placement" != layers ]] && python3 -c 'import json,sys; n=json.load(open(sys.argv[1])).get("dfly_num_hidden_layers"); sys.exit(type(n) is not int or n != 5)' "$snapshot/$selected_config"; then
+  if python3 -c 'import json,sys; n=json.load(open(sys.argv[1])).get("dfly_num_hidden_layers"); sys.exit(type(n) is not int or n != 5)' "$snapshot/$selected_config"; then
     speculator=dfly2
   fi
 fi

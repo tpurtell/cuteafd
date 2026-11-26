@@ -351,47 +351,18 @@ impl SharedScratchLayout {
         context_split: bool,
         index_topk: IndexTopkScratch,
     ) -> Result<Self> {
-        Self::new_for_layers(
-            cfg,
-            rank,
-            tp,
-            false,
-            max_rows,
-            decode_rows,
-            local_vocab,
-            context_split,
-            index_topk,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_for_layers(
-        cfg: &Hy4Config,
-        rank: usize,
-        tp: usize,
-        layers_split: bool,
-        max_rows: usize,
-        decode_rows: usize,
-        local_vocab: usize,
-        context_split: bool,
-        index_topk: IndexTopkScratch,
-    ) -> Result<Self> {
         ensure!(
             matches!(tp, 1 | 2)
                 && rank < tp
                 && max_rows > 0
                 && decode_rows > 0
-                && (!context_split || (tp == 2 && !layers_split))
-                && (!layers_split || tp == 2),
+                && (!context_split || tp == 2),
             "invalid Hy4 SharedScratchLayout shape"
         );
         let h = cfg.hidden;
         let hc = cfg.hc_mult;
-        let layer_tp = if layers_split { 1 } else { tp };
-        let head_rank = if layers_split { tp - 1 } else { 0 };
-        let split_head = tp == 2 && !layers_split;
-        let local_heads = cfg.heads / layer_tp;
-        let max_inter = cfg.intermediate / layer_tp;
+        let local_heads = cfg.heads / tp;
+        let max_inter = cfg.intermediate / tp;
         let wire_row = h + h / 32;
         let tp2_f32_bytes = if tp == 2 { max_rows * h * 4 } else { 256 };
         let kv_a_dim = cfg.kv_lora_rank + cfg.qk_rope_dim;
@@ -418,7 +389,7 @@ impl SharedScratchLayout {
             ("uv_out".into(), (max_rows * local_heads * cfg.v_head_dim * 2).max(256)),
             (
                 "attn_scratch".into(),
-                mla_split_scratch_bytes(decode_rows, layer_tp)
+                mla_split_scratch_bytes(decode_rows, tp)
                     .max(if context_split { hy4_dsa_partial_scratch_bytes(decode_rows) } else { 0 })
                     .max(ATTN_SCRATCH_BYTES)
                     .max(256),
@@ -442,7 +413,7 @@ impl SharedScratchLayout {
             ("routed_out".into(), (max_rows * h * 2).max(256)),
             (
                 "logits_tile".into(),
-                if split_head { (HEAD_TILE_ROWS * local_vocab * 4).max(256) } else { 256 },
+                if tp == 2 { (HEAD_TILE_ROWS * local_vocab * 4).max(256) } else { 256 },
             ),
         ];
         if context_split {
@@ -456,7 +427,7 @@ impl SharedScratchLayout {
             views.push(("ctx_partial_peer".into(), (decode_rows * half_heads * cfg.kv_lora_rank * 2).max(256)));
             views.push(("ctx_lse_peer".into(), (decode_rows * half_heads * 4).max(256)));
         }
-        if rank == head_rank {
+        if rank == 0 {
             views.push(("head_logits_f32".into(), (HEAD_TILE_ROWS * cfg.vocab_size * 4).max(256)));
         }
         let arena = WeightArenaLayout::new(Self::arena_id(rank), views)?;
