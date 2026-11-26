@@ -227,7 +227,9 @@ extern "C" int32_t cuteafd_v41_router(const uint16_t* hidden,const uint16_t* wei
   auto status=cuteafd_v41_router_scores_aot(hidden,weight,scores,rows,experts,stream);
   if(status)return status;
   // Skinny writes activated scores; the wider MMA route still writes logits.
-  if(rows<=64)
+  // Must match V41_ROUTER_SKINNY_MAX_ROWS in third_party/sparkinfer/b12x/moe/_shared/v41_router.py
+  // (guarded by scripts/tests/test_expert_router.py::test_v41_router_skinny_cap_matches_fork_constant).
+  if(rows<=256)
     select_fast_kernel<false><<<rows,512,0,s>>>(scores,bias,bias_vl,image_mask,ids,routing,experts,topk);
   else
     select_fast_kernel<true><<<rows,512,0,s>>>(scores,bias,bias_vl,image_mask,ids,routing,experts,topk);
