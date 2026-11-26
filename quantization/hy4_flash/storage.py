@@ -230,6 +230,9 @@ class HostExpertStaging:
 class Routes:
     """Stable expert-major view of immutable token-major route records."""
 
+    candidate_gamma_contract = CANDIDATE_GAMMA_CONTRACT
+    signed_scaling_factors = False
+
     def __init__(self, batches, experts, tokens, *, device="cpu", recover=False):
         self.latent = None
         self.recovery = None
@@ -247,7 +250,8 @@ class Routes:
                 if (near.dtype != torch.int32 or near_gamma.dtype != torch.float32 or near.ndim != 2
                         or near.shape != near_gamma.shape or len(near) != len(ids)
                         or near.shape[1] > ids.shape[1] or bool((near < 0).any())
-                        or bool((near >= experts).any()) or bool((near_gamma < 0).any())
+                        or bool((near >= experts).any())
+                        or (not self.signed_scaling_factors and bool((near_gamma < 0).any()))
                         or not bool(torch.isfinite(near_gamma).all())):
                     raise ValueError("invalid Hy4 candidate route record")
                 all_ids = torch.cat((ids, near), dim=1).sort(dim=1).values
@@ -321,7 +325,7 @@ class Routes:
                         augmented_rank_counts=rank_counts[self.top_k + 1:].tolist(),
                         augmented_corpus_rows=near.tolist(),
                         selection_xxh3_128=digest.hexdigest(), selection_policy="rank-major-then-corpus-row",
-                        candidate_gamma_contract=CANDIDATE_GAMMA_CONTRACT,
+                        candidate_gamma_contract=self.candidate_gamma_contract,
                         identity_contract=IDENTITY_CONTRACT)
         if addition is None:
             return natural, native_gamma, evidence
