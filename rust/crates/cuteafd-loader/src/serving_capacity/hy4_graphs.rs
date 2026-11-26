@@ -24,14 +24,20 @@ impl Hy4GraphLayout {
 }
 
 /// Short and 32K C1 physical graph-arena censuses on the reference cards.
-/// Local cards use DFly2; the 1-Spark census uses the stock Spark setting
-/// (DFly2 off) and supplies the single-GPU Spark layouts.
+/// All measured cards use DFly2. The single-GPU Spark C1 census is the maximum
+/// across 1/4 Sparks with zero and auto expert onboarding (K8 compact):
+/// zero-onboard W1 130 MiB on both, auto W1 90/78 MiB; target verify
+/// width growth <= 24 MiB, draft growth <= 2 MiB, single capture <= 4 MiB.
+/// The TP2 Spark C1 census (116/108 MiB) and wider census (1130/1058 MiB)
+/// are intentionally not defaults: both graph reserves slowed matched decode
+/// versus eager. TP1 retains its C1-derived cap; the wider 1340 MiB working
+/// set also regressed throughput despite eliminating donor churn.
 fn working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<WorkingSet> {
     let (w1, step_growth, capture_growth) = match (layout, rank) {
         (Some(Hy4GraphLayout::Exl3Min), 0) => (88, 18, 4),
         (Some(Hy4GraphLayout::Exl3Max), 0) => (100, 20, 4),
         (Some(Hy4GraphLayout::Exl3Max), 1) => (98, 18, 4),
-        (Some(Hy4GraphLayout::Exl3MinSpark), 0) => (12, 12, 2),
+        (Some(Hy4GraphLayout::Exl3MinSpark), 0) => (130, 26, 4),
         _ => return None,
     };
     Some(WorkingSet {
@@ -41,8 +47,8 @@ fn working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<WorkingSet
     })
 }
 
-/// Use identical inputs for admission, provenance, and runtime. Unmeasured
-/// layouts do not borrow a census; explicit reserves still work there.
+/// Use identical inputs for admission, provenance, and runtime. Layouts
+/// without a qualified census default to eager; explicit reserves still work.
 pub fn reserve_policy(layout: Option<Hy4GraphLayout>, rank: usize) -> Result<Resolved, Error> {
     match working_set(layout, rank) {
         Some(measured) => graph_reserve::current_working_set(rank, measured),
@@ -89,17 +95,20 @@ mod tests {
     #[test]
     fn c1_census_sets_rank_local_soft_and_hard_caps() {
         use Hy4GraphLayout::*;
-        for (layout, rank, w1, soft, hard) in [
-            (Exl3Min, 0, 88, 184, 192),
-            (Exl3Max, 0, 100, 196, 204),
-            (Exl3Max, 1, 98, 194, 202),
-            (Exl3MinSpark, 0, 12, 108, 112),
+        for (layout, rank, w1, step, capture, soft, hard) in [
+            (Exl3Min, 0, 88, 18, 4, 184, 192),
+            (Exl3Max, 0, 100, 20, 4, 196, 204),
+            (Exl3Max, 1, 98, 18, 4, 194, 202),
+            (Exl3MinSpark, 0, 130, 26, 4, 226, 234),
         ] {
             let census = working_set(Some(layout), rank).unwrap();
             assert_eq!(census.w1, w1 << 20);
+            assert_eq!(census.step_growth, step << 20);
+            assert_eq!(census.capture_growth, capture << 20);
             let policy = graph_reserve::resolve_working_set(None, None, None, rank, census).unwrap();
             assert_eq!(policy.base_bytes, soft << 20);
             assert_eq!(policy.bytes, hard << 20);
+            assert_eq!(policy.growth_headroom, Some((2 * capture) << 20));
         }
     }
 
@@ -107,7 +116,12 @@ mod tests {
     fn unmeasured_ranks_do_not_borrow_graph_working_sets() {
         assert_eq!(working_set(Hy4GraphLayout::resolve(1, 0), 1), None);
         assert_eq!(working_set(Hy4GraphLayout::resolve(2, 0), 2), None);
-        assert_eq!(working_set(Hy4GraphLayout::resolve(2, 6), 1), None);
+        assert_eq!(working_set(Hy4GraphLayout::resolve(2, 6), 2), None);
+        for sparks in [1, 4, 6] {
+            for rank in [0, 1] {
+                assert_eq!(working_set(Hy4GraphLayout::resolve(2, sparks), rank), None);
+            }
+        }
         assert_eq!(working_set(Hy4GraphLayout::resolve(3, 0), 0), None);
         assert_eq!(working_set(Hy4GraphLayout::resolve(1, 1), 0),
                    working_set(Hy4GraphLayout::resolve(1, 4), 0));
