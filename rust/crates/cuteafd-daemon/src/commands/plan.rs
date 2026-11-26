@@ -1108,7 +1108,8 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     }
     let default = match family {
         "minimax_m3" | "inkling2" | "inkling2_mini" => "dspark",
-        "hy4_flash" if (args.speculator == "auto" || args.include_speculator)
+        "hy4_flash" if (args.include_speculator || (args.speculator == "auto"
+            && cfg.get("SPECULATOR").is_none_or(|value| value == "auto")))
             && cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(
                 &cuteafd_loader::read_json_file::<serde_json::Value>(&snapshot.join("config.json"))?) => "dfly2",
         "glm5" | "glm5_flash" | "muse_spark" => "dflash2",
