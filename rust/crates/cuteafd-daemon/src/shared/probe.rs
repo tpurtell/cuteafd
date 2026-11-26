@@ -458,6 +458,12 @@ pub(crate) fn token(probe: &ProbeRef, token: u32) {
     }
 }
 
+pub(crate) fn prefill_units(probe: &ProbeRef, units: usize) {
+    if let Some(probe) = probe {
+        probe.prefill_units(units);
+    }
+}
+
 /// Records a host row predicting token `position`.
 pub(crate) fn host_row(probe: &ProbeRef, position: usize, logits: &[f32]) {
     if let Some(probe) = probe {

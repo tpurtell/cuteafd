@@ -726,6 +726,52 @@ mod readiness_tests {
         assert_eq!(result, 17);
         Ok(())
     }
+
+    #[test]
+    fn scheduler_reports_last_prefill_units_from_pipeline_and_single_unit_paths() -> Result<()> {
+        use crate::shared::prefill_pipeline::{FfnRoute, PrefillHooks, Unit, run_prefill_units, sequence_units};
+        use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+
+        struct NoopHooks;
+        impl PrefillHooks for NoopHooks {
+            type Ticket = ();
+            fn route(&self, _: usize) -> FfnRoute { FfnRoute::Spark }
+            fn begin_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+            fn attention(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn local_ffn(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn send_experts(&mut self, _: usize, _: &Unit) -> Result<()> { Ok(()) }
+            fn land_experts(&mut self, _: usize, _: &Unit, _: ()) -> Result<()> { Ok(()) }
+            fn end_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+            fn commit_unit(&mut self, _: &Unit) -> Result<()> { Ok(()) }
+        }
+
+        let seed_probe = Some(Probe::new(ProbeSpec { record_rows: 1, ..ProbeSpec::default() }));
+        let ((), seed_units) = observe_prefill(|| {
+            let units = sequence_units(3 * 2752, 2752, 3, 2)?;
+            run_prefill_units(&mut NoopHooks, &units, 3)
+        })?;
+        probe::prefill_units(&seed_probe, seed_units);
+        assert_eq!(seed_probe.as_ref().unwrap().record().last_prefill_units, Some(3));
+
+        let warm_probe = Some(Probe::new(ProbeSpec { record_rows: 1, ..ProbeSpec::default() }));
+        let ((), warm_units) = observe_prefill(|| Ok(()))?;
+        probe::prefill_units(&warm_probe, warm_units);
+        assert_eq!(warm_probe.as_ref().unwrap().record().last_prefill_units, Some(1));
+
+        let failed_probe = Some(Probe::new(ProbeSpec { record_rows: 1, ..ProbeSpec::default() }));
+        let failed: Result<((), usize)> = observe_prefill(|| anyhow::bail!("injected prefill failure"));
+        assert!(failed.is_err());
+        assert_eq!(failed_probe.as_ref().unwrap().record().last_prefill_units, None);
+
+        let source = include_str!("scheduler.rs");
+        let group = source.split_once("\nfn prefill_group").unwrap().1.split_once("\n#[allow(clippy::too_many_arguments)]\npub(crate) fn schedule").unwrap().0;
+        let schedule = source.split_once("\npub(crate) fn schedule").unwrap().1.split_once("\n/// Lane-owned decode state").unwrap().0;
+        assert!(group.contains("observe_prefill(|| engine.prefill_packed("));
+        assert!(group.contains("probe::prefill_units(&p.job.probe, units)"));
+        assert!(schedule.contains("PrefillUnitObserver::begin()"));
+        assert!(schedule.contains("probe::prefill_units(&p.job.probe, units)"));
+        Ok(())
+    }
 }
 
 fn packed_chunk<P: Placement, D>(p: &Prefill<'_, P, D>) -> Option<(usize, usize)> {
@@ -775,6 +821,11 @@ fn scheduler_splits_for_metadata_capacity_before_submission() {
     assert!(queue.is_empty());
 }
 
+pub(crate) fn observe_prefill<T>(body: impl FnOnce() -> Result<T>) -> Result<(T, usize)> {
+    let (result, units) = crate::shared::prefill_pipeline::observe_prefill_units(body);
+    Ok((result?, units.unwrap_or(1)))
+}
+
 fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
     cache: &mut PrefixCache<CudaCopyEngine<'a>, B::Meta>, selector: &mut TokenSelector<'a>,
     group: &mut [Prefill<'_, B::Placement, B::Draft>], neural: bool) -> Vec<Result<Chunk>> {
@@ -796,7 +847,7 @@ fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
                 next: tokens.get(end).copied(), draft: seq, neural: effective_neural(neural, &job.probe) });
             outputs.push((&*job, constraint, first, prompt_row, tokens.len(), end, *resume));
         }
-        engine.prefill_packed(&mut sequences, cache.pool(), &mut |i, logits| {
+        observe_prefill(|| engine.prefill_packed(&mut sequences, cache.pool(), &mut |i, logits| {
             let (job, constraint, first, retained, len, end, resume) = &mut outputs[i];
             // Even a departed member's state advanced; only its local completion fails.
             if job.events.is_closed() { return Ok(Err(anyhow::anyhow!("client went away"))); }
@@ -817,9 +868,13 @@ fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
                 Ok(token) => { **first = Some(token); Ok(Ok(())) }
                 Err(error) => Ok(Err(error)),
             }
-        })
+        }))
     });
     let elapsed = timer.elapsed().as_secs_f64();
+    let (result, units) = match result {
+        Ok((outcomes, units)) => (Ok(outcomes), Some(units)),
+        Err(error) => (Err(error), None),
+    };
     let outcomes = member_outcomes(group.len(), result);
     group.iter_mut().zip(&ends).zip(&counts).zip(row_shares(&counts)).zip(outcomes)
         .map(|((((p, &end), &count), share), outcome)| {
@@ -830,6 +885,9 @@ fn prefill_group<'a, B: Backend<'a>>(engine: &B, family: &B::Prefix,
             p.busy += elapsed * share;
             p.ticket.prefill(count, p.chunks, p.plan.chunks.len(), timer);
             outcome?;
+            if let Some(units) = units.filter(|_| end == p.tokens.len()) {
+                probe::prefill_units(&p.job.probe, units);
+            }
             for &(_, point) in p.plan.points.iter().filter(|&&(chunk, _)| chunk == p.chunks && !probe::cold(&p.job.probe)) {
                 cache.capture_session(p.ticket.session());
                 if let Err(error) = cache.capture_media(family, SnapshotKind::Prompt, &p.keys.tokens()[..point],
@@ -1166,10 +1224,12 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     let start = p.placement.len();
                     let decode = p.job.probe.as_ref().and_then(|probe| probe.spec.cold_steps.get(p.chunks))
                         .is_some_and(|step| step.decode);
+                    let units = crate::shared::prefill_pipeline::PrefillUnitObserver::begin();
                     let logits = if decode {
                         engine.verify_device_ungraphed(&mut [(&mut p.placement, chunk)], false,
                             UngraphedKind::Scoring, cache.pool())?
                     } else { engine.prefill_device(&mut p.placement, chunk, 1, cache.pool())? };
+                    let units = (!decode).then(|| units.finish().unwrap_or(1));
                     if end == p.tokens.len() {
                         // The first token, while this prompt's logits are the workspace's.
                         let mut logits = logits.context("prefill produced no logits")?;
@@ -1182,6 +1242,9 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         }
                         if caching && !probe::cold(&p.job.probe) && p.resume < p.tokens.len() {
                             p.prompt_row = Some(logits.row_host(engine.library(), 0)?);
+                        }
+                        if let Some(units) = units {
+                            probe::prefill_units(&p.job.probe, units);
                         }
                         if probe::wants_first(&p.job.probe) {
                             probe::device_rows(engine.library(), &p.job.probe, &logits, 0, 1, p.tokens.len())?;
