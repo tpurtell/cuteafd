@@ -110,6 +110,8 @@ class Drafter:
         self.inkling = target_cfg.get("model_type") == "inkling2_loop"
         if self.inkling:
             self.embed = target_tensor("model.llm.embed.weight")
+            self.embed_norm = target_tensor("model.llm.embed_norm.weight").to(device)
+            self.embed_eps = target_cfg["text_config"]["rms_norm_eps"]
             self.lm_head = target_tensor("model.llm.unembed.weight").to(device)
             self.valid_vocab = target_cfg["text_config"]["unpadded_vocab_size"]
         else:
@@ -128,6 +130,16 @@ class Drafter:
             out.append((rope(rms(k, self.w[p + "k_norm.weight"], self.eps), positions, self.theta), v))
         return out
 
+    def block_embeddings(self, anchor: int) -> torch.Tensor:
+        tokens = torch.tensor([anchor] + [self.mask] * (self.block - 1))
+        h = self.embed[tokens].to(self.device)
+        if self.inkling:
+            # SGLang TP1 calls Inkling's get_input_embeddings callable, not .weight.
+            xf = h.float()
+            h = (xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.embed_eps)
+                 * self.embed_norm.float()).to(h.dtype)
+        return h
+
     def body(self, anchor: int, position: int, ctx: list[tuple[torch.Tensor, torch.Tensor]],
              row_window: bool = False) -> torch.Tensor:
         """Final-norm output [block, hidden] of one block at `position` (the
@@ -139,8 +151,7 @@ class Drafter:
             k = torch.cat([torch.arange(position - n, position, device=self.device),
                            torch.arange(position, position + self.block, device=self.device)])[None]
             mask = (q - k).abs() < self.window
-        tokens = torch.tensor([anchor] + [self.mask] * (self.block - 1))
-        h = self.embed[tokens].to(self.device)
+        h = self.block_embeddings(anchor)
         positions = torch.arange(position, position + self.block, device=self.device)
         n = rms(h, self.w["layers.0.input_layernorm.weight"], self.eps)
         for l in range(self.layers):

@@ -823,7 +823,7 @@ enum DraftInput<'r, 'e> {
     Rows(&'r [u8]),
     /// Gathered on the device from the target's embedding table by token id.
     Table(&'r TokenEmbedding<'e>),
-    RawTable(CuteafdDeviceBuffer),
+    NormalizedTable { table: CuteafdDeviceBuffer, norm: CuteafdDeviceBuffer, eps: f32 },
     /// A device-ordered gather/transport bridge owned by the target.
     Launch(&'r InputLaunch<'r>),
 }
@@ -2787,10 +2787,10 @@ impl<'a> DflashDrafter<'a> {
         self.draft_from(sequences, DraftInput::Table(embedding), self.head_call(&head)?, true)
     }
 
-    /// Borrow a native BF16 target embedding without constructing a second table owner.
-    pub(crate) fn draft_raw_table(&self, sequences: &[DraftSeq], table: CuteafdDeviceBuffer, head: TargetHead<'_>) -> Result<Vec<Draft>> {
+    /// Borrow the target BF16 embedding and apply its RMSNorm to the full block.
+    pub(crate) fn draft_normalized_table(&self, sequences: &[DraftSeq], table: CuteafdDeviceBuffer, norm: CuteafdDeviceBuffer, eps: f32, head: TargetHead<'_>) -> Result<Vec<Draft>> {
         ensure!(table.bytes == self.cfg.vocab * self.cfg.hidden * 2 && table.device_id == self.library.cuda_get_device()?, "DFlash raw target table geometry");
-        self.draft_from(sequences, DraftInput::RawTable(table), self.head_call(&head)?, true)
+        self.draft_from(sequences, DraftInput::NormalizedTable { table, norm, eps }, self.head_call(&head)?, true)
     }
 
     /// Diagnostic device-input replay retains the explicit head arithmetic selection.
@@ -2845,7 +2845,7 @@ impl<'a> DflashDrafter<'a> {
             "MLA draft borrows the target device embedding; host mask-row fallback is not admitted");
         let rows_ok = match input {
             DraftInput::Rows(r) => r.len() == s_count * h * 2,
-            DraftInput::Table(_) | DraftInput::RawTable(_) | DraftInput::Launch(_) => true,
+            DraftInput::Table(_) | DraftInput::NormalizedTable { .. } | DraftInput::Launch(_) => true,
         };
         ensure!(s_count > 0 && s_count <= self.max_sequences && rows_ok, "draft step of {s_count} sequences");
         let rows = s_count * block;
@@ -2936,12 +2936,17 @@ impl<'a> DflashDrafter<'a> {
                 let ids = draft_input_ids(sequences, c.mask_token, block);
                 embedding.embed(&ids, w.head()?.ids.buffer, 1, w.h.buffer, self.stream)?;
             }
-            DraftInput::RawTable(table) => {
+            DraftInput::NormalizedTable { table, norm, eps } => {
                 let ids = draft_input_ids(sequences, c.mask_token, block);
                 self.put(&w.head()?.ids, bytes_of(&ids))?;
-                // SAFETY: the target table, admitted ID and hidden owners share this stream.
-                unsafe { self.library.cuda_embedding_lookup_bf16_async(table, w.head()?.ids.buffer,
-                    w.h.buffer, rows, c.vocab, h, self.stream)?; }
+                // Inkling get_input_embeddings normalizes every token, including masks.
+                // SAFETY: disjoint admitted scratch and residual owners share the stream.
+                unsafe {
+                    self.library.cuda_embedding_lookup_bf16_async(table, w.head()?.ids.buffer,
+                        w.n.buffer, rows, c.vocab, h, self.stream)?;
+                    self.library.cuda_ds4_rmsnorm_bf16_rne_async(w.n.buffer, norm, w.h.buffer,
+                        i32::try_from(rows)?, i32::try_from(h)?, eps, self.stream)?;
+                }
             }
             DraftInput::Launch(input) => {
                 let ids = draft_input_ids(sequences, c.mask_token, block);

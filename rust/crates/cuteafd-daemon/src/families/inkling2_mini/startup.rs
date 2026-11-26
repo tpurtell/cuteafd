@@ -311,7 +311,7 @@ pub(crate) fn whole<'a>(
     if let Some(layout) = &inputs.dflash {
         let embed = execution.target.operand("model.llm.embed.weight")?.buffer;
         execution.draft = Some(std::rc::Rc::new(super::draft::Binding::new_dflash(
-            programs, stream.clone(), layout, &admitted.solved, embed, cfg.text.unpadded_vocab_size,
+            programs, stream.clone(), layout, &admitted.solved, embed, cfg.text.unpadded_vocab_size, cfg.text.rms_norm_eps as f32,
             usize::try_from(inputs.prefill.rows)?, usize::try_from(inputs.prefill.waves)?, inputs.prefix_mark_slots)?));
         let report = crate::shared::draft::report::admitted(crate::shared::draft::report::Kind::Dflash2,
             crate::shared::draft::report::Placement::Whole, 0, &physical, &admitted.solved)?;

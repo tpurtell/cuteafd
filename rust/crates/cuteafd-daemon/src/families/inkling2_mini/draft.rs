@@ -35,6 +35,7 @@ struct Gqa<'a> {
     body: crate::shared::memory::device::DeviceOwner<'a, DflashDrafter<'a>>,
     marks: Option<WindowSnapshots<'a>>,
     frontier: RefCell<Vec<usize>>,
+    embed_eps: f32,
     stream: Rc<Stream<'a>>,
 }
 
@@ -153,7 +154,7 @@ impl<'a> Binding<'a> {
 
     pub fn new_dflash(programs: &'a Programs<'a>, stream: Rc<Stream<'a>>,
         layout: &cuteafd_loader::families::inkling2_mini::dflash::Layout, admitted: &ResolvedPlan,
-        embed: Buffer, valid_vocab: usize, prefill_rows: usize, waves: usize, mark_slots: usize) -> Result<Self> {
+        embed: Buffer, valid_vocab: usize, embed_eps: f32, prefill_rows: usize, waves: usize, mark_slots: usize) -> Result<Self> {
         use crate::shared::{memory::weight_arena::DeviceWeightArena, fp8_linear::{Fp8Rows, Fp8Scales}};
         use cuteafd_core::memory_layout::ArenaTag;
         use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
@@ -217,7 +218,7 @@ impl<'a> Binding<'a> {
         let prefill = (0..waves).map(|_| TapBuffer::new(stream.clone(), cfg.hidden, &sites, prefill_rows)).collect::<Result<Vec<_>>>()?;
         let decode = TapBuffer::new(stream.clone(), cfg.hidden, &sites, 64)?;
         stream.drain()?;
-        Ok(Self { drafter: None, dflash: Some(Gqa { body, marks, frontier: RefCell::new(vec![0;slots]), stream }), marks: Vec::new(), verify, prefill, decode, sites,
+        Ok(Self { drafter: None, dflash: Some(Gqa { body, marks, frontier: RefCell::new(vec![0;slots]), embed_eps, stream }), marks: Vec::new(), verify, prefill, decode, sites,
             sequences, block: cfg.block, hidden: cfg.hidden, context_rows: 2048 })
     }
 
@@ -247,7 +248,7 @@ impl<'a> Binding<'a> {
         if let Some(d) = &self.drafter { return d.draft(rows, embed, norm, |n,a| self.select(n,a,head)); }
         let gqa = self.dflash.as_ref().context("Mini GQA drafter missing")?;
         for row in rows { ensure!(self.frontier(row.slot)?.1 == row.position, "Mini DFlash proposal frontier differs"); }
-        gqa.stream.device.run(|| gqa.body.draft_raw_table(rows, embed, TargetHead::Bf16Buffer(&head)))
+        gqa.stream.device.run(|| gqa.body.draft_normalized_table(rows, embed, norm, gqa.embed_eps, TargetHead::Bf16Buffer(&head)))
     }
     /// Compare real-weight block proposals with the independent reference generator.
     pub fn check_oracle(&self, path: &std::path::Path, embed: Buffer, norm: Buffer, head: Buffer) -> Result<()> {

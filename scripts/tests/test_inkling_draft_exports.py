@@ -88,3 +88,13 @@ def test_mini_exports_cover_gqa_dflash2():
     bf16, _ = namespace["inkling2_mini_projection_shapes"]()
     assert {(2304, 13824), (6912, 2304), (9216, 2304), (2304, 576), (2304, 256),
             (2304, 6144), (2304, 2048), (4096, 2304)} <= bf16
+
+
+def test_mini_external_draft_uses_target_embedding_norm():
+    binding = (ROOT / "rust/crates/cuteafd-daemon/src/families/inkling2_mini/draft.rs").read_text()
+    shared = (ROOT / "rust/crates/cuteafd-daemon/src/shared/speculation/dflash.rs").read_text()
+    assert "draft_normalized_table(rows, embed, norm, gqa.embed_eps" in binding
+    branch = shared.split("DraftInput::NormalizedTable { table, norm, eps } => {", 1)[1].split("DraftInput::Launch", 1)[0]
+    assert "draft_input_ids(sequences, c.mask_token, block)" in branch
+    assert "cuda_embedding_lookup_bf16_async" in branch
+    assert "cuda_ds4_rmsnorm_bf16_rne_async(w.n.buffer, norm, w.h.buffer" in branch
