@@ -685,6 +685,22 @@ def test_the_gate_child_path_is_unchanged(lockdir):
             del os.environ[hwlock.GATE_ENV]
 
 
+@pytest.mark.parametrize('nested_gate', [False, True])
+def test_gate_child_cannot_take_undeclared_locks(lockdir, nested_gate):
+    env = {**os.environ, 'CUTEAFD_LOCK_DIR': str(lockdir)}
+    inner = [sys.executable, str(SCRIPT), '--locks', 'gpu0,gpu1', '--wait', '5',
+             *(['--gate'] if nested_gate else []), '--', 'true']
+    with hwlock.hold(['gpu0'], wait=5, gate=True):
+        env[hwlock.GATE_ENV] = str(hwlock.GATE_SEQ[0])
+        result = subprocess.run(inner, env=env, capture_output=True, text=True, timeout=10)
+        assert result.returncode == hwlock.NESTED_EXIT
+        assert 'undeclared locks gpu1' in result.stderr
+        assert len(list((lockdir / 'hwq').glob('*.ticket'))) == 1
+        with pytest.raises(hwlock.NestedAcquisition, match='undeclared locks gpu1'):
+            with hwlock.hold(['gpu0', 'gpu1'], wait=5, gate=nested_gate):
+                pytest.fail('undeclared hold granted')
+
+
 # 2026-11-23: wip-cards held ticket 13742 (sparks,gpu0,gpu1,moa) as a plain
 # holder; a nested launch under it asked hwlock for the same locks, queued a new
 # ticket behind its own parent and waited on flocks the parent held. Both GPUs

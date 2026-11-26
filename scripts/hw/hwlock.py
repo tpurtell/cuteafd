@@ -73,7 +73,8 @@ lock in the one outer hwlock call. Inside a backfilled job the refusal names
 the ticket the backfill went ahead of. Backfill never applies inside a live
 gate: such a request queues as before. The --gate child path is unchanged: a
 gate's holder record is exempt, and inside a live gate a hold takes the flocks
-without a ticket.
+without a ticket. A nested hold must request only locks declared by each of
+its live enclosing gates; undeclared locks are refused (exit 77).
 """
 from __future__ import annotations
 
@@ -338,18 +339,13 @@ def gate_ancestors() -> set[int]:
     return {int(s) for s in os.environ.get(GATE_ENV, '').split(':') if s.isdigit()}
 
 
-def inside_live_gate(queue: Path) -> bool:
-    """Whether a `--gate` ancestor's ticket is still live (it holds our turn)."""
-    for seq in gate_ancestors():
-        for path in queue.glob(f'{seq:012d}.*.ticket'):
-            try:
-                with open(path) as handle:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            except FileNotFoundError:
-                continue
-    return False
+def live_gate_tickets(queue: Path) -> dict[int, set[str]]:
+    """The declared locks of live `--gate` ancestors holding our turn."""
+    ancestors = gate_ancestors()
+    if not ancestors:
+        return {}
+    return {seq: set(data.get('locks', [])) for seq, _, data in _live_entries(queue, 'ticket')
+            if seq in ancestors}
 
 
 def older_conflicts(queue: Path, locks: list[str], before: int | None) -> list[str]:
@@ -458,12 +454,24 @@ def hold(names, wait: float, label: str = '', gate: bool = False, preflight: str
             f'refusing {",".join(locks)} inside ancestor ticket {tickets} (holding {",".join(held_here)}): '
             'an inner ticket would wait on its own ancestor; request every lock in the one outer hwlock call '
             f'(--locks {",".join(canonical(set(held_here) | set(locks)))})')
+    # A gate child bypasses the queue only for locks its gate reserved. This
+    # also applies to nested --gate requests and in-process gate holders.
+    gates = live_gate_tickets(lock_dir() / 'hwq')
+    for data in enclosing:
+        if data.get('gate'):
+            gates[data['seq']] = set(data.get('locks', []))
+    for ancestor, declared in gates.items():
+        missing = canonical(set(locks) - declared)
+        if missing:
+            raise NestedAcquisition(
+                f'refusing {",".join(locks)} inside gate ticket {ancestor}: '
+                f'undeclared locks {",".join(missing)}; declare every lock on the outer gate')
     # A check on state the queue itself changes (free memory on shared hosts) is
     # meaningful only once our turn comes; such checks run at grant alone.
     if not preflight_at_grant_only:
         check_preflight(preflight, preflight_timeout)
     queue = _queue()
-    if not gate and inside_live_gate(queue):
+    if not gate and gates:
         # The --gate ancestor already won this job's turn; a new, younger
         # ticket would wait behind jobs that themselves wait on the gate.
         held = None
