@@ -20,8 +20,15 @@ impl Layout {
     }
 }
 
-// Populate only from a physical C1 census of this family.
-const CENSUS: &[(Layout, usize, WorkingSet)] = &[];
+// Short and 32K C1, K8 MC, FP8 KV, no drafter (hy4-gr-base, dev
+// 43a4f41f1b, 2026-11-26). The first event-completed capture batch
+// grew the arena by the entire W1; use that physical batch for both
+// step and capture headroom rather than dividing by executable count.
+const CENSUS: &[(Layout, usize, WorkingSet)] = &[
+    (Layout::SingleSpark, 0, WorkingSet { w1: 32 << 20, step_growth: 32 << 20, capture_growth: 32 << 20 }),
+    (Layout::DualContextSpark, 0, WorkingSet { w1: 40 << 20, step_growth: 40 << 20, capture_growth: 40 << 20 }),
+    (Layout::DualContextSpark, 1, WorkingSet { w1: 40 << 20, step_growth: 40 << 20, capture_growth: 40 << 20 }),
+];
 
 pub fn reserve_policy(layout: Option<Layout>, rank: usize) -> Result<Resolved, Error> {
     graph_reserve::current_census(rank, layout, CENSUS)
@@ -30,6 +37,21 @@ pub fn reserve_policy(layout: Option<Layout>, rank: usize) -> Result<Resolved, E
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_c1_census_resolves_soft_and_hard_caps() {
+        for (layout, rank, w1, soft, hard) in [
+            (Layout::SingleSpark, 0, 32, 128, 192),
+            (Layout::DualContextSpark, 0, 40, 136, 216),
+            (Layout::DualContextSpark, 1, 40, 136, 216),
+        ] {
+            let measured = graph_reserve::census_working_set(rank, Some(layout), CENSUS).unwrap();
+            assert_eq!(measured.w1, w1 << 20);
+            let policy = graph_reserve::resolve_working_set(None, None, None, rank, measured).unwrap();
+            assert_eq!(policy.base_bytes, soft << 20);
+            assert_eq!(policy.bytes, hard << 20);
+        }
+    }
 
     #[test]
     fn unsupported_shapes_do_not_borrow_a_census() {
@@ -42,5 +64,7 @@ mod tests {
             assert_eq!(Layout::resolve(gpus, sparks, attention), None);
         }
         assert_eq!(graph_reserve::census_working_set(0, None, CENSUS), None);
+        assert_eq!(graph_reserve::census_working_set(1, Some(Layout::SingleSpark), CENSUS), None);
+        assert_eq!(graph_reserve::census_working_set(2, Some(Layout::DualContextSpark), CENSUS), None);
     }
 }
