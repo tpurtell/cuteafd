@@ -167,7 +167,7 @@ fn quant(snapshot: &Path, spark_ranks: usize) -> Vec<QuantGroup> {
 
 /// The speculator the options select.
 pub(crate) fn speculator(family: Option<&str>, settings: &[Setting]) -> Option<String> {
-    if family == Some("hy4_flash") && setting(settings, &["speculator"]) == Some("dfly2") {
+    if matches!(family, Some("hy4_flash" | "deepseek_v41")) && setting(settings, &["speculator"]) == Some("dfly2") {
         return Some("DFly2".into());
     }
     let truthy = |names: &[&str]| setting(settings, names).is_some_and(|v| v == "true");
@@ -396,6 +396,7 @@ mod tests {
         assert_eq!(speculator(Some("mimo_v2"), &[]), None);
         assert_eq!(speculator(Some("hy4_flash"), &[s("speculator", "dfly2", None, "resolved")]).as_deref(), Some("DFly2"));
         assert_eq!(speculator(Some("hy4_flash"), &[s("speculator", "off", None, "resolved")]), None);
+        assert_eq!(speculator(Some("deepseek_v41"), &[s("speculator", "dfly2", None, "resolved")]).as_deref(), Some("DFly2"));
     }
 
     #[test]
