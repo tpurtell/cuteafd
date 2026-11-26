@@ -274,7 +274,8 @@ impl<'a> Binding<'a> {
             ensure!(actual[0].tokens.len() == test.tokens.len(), "Mini oracle block length differs");
             matched += actual[0].tokens.iter().zip(&test.tokens).filter(|(a,b)| a == b).count();
             total += test.tokens.len();
-            println!("Mini draft anchor {}: actual {:?}, expected {:?}", test.anchor, actual[0].tokens, test.tokens);
+            println!("Mini draft anchor {}: actual {:?}, expected {:?}, features {:?}", test.anchor, actual[0].tokens, test.tokens, actual[0].features);
+            if std::env::var_os("CUTEAFD_DIAG_DFLASH_TENSORS").is_some() { break; }
         }
         ensure!(total > 0 && matched == total, "Mini DFlash2 block oracle {matched}/{total}");
         println!("Mini DFlash2 real-weight oracle {matched}/{total}");

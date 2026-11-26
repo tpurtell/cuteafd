@@ -117,14 +117,22 @@ class Drafter:
             self.lm_head = target_tensor("lm_head.weight").to(device)
             self.valid_vocab = self.cfg["vocab_size"]
 
+    def dump(self, name, value):
+        if getattr(self, "dump_dir", None) is not None:
+            value = value.detach().contiguous().cpu()
+            if value.dtype == torch.bfloat16: value = value.view(torch.int16)
+            value.numpy().tofile(self.dump_dir / (name + ".bin"))
+
     def context(self, taps: torch.Tensor, positions: torch.Tensor) -> list[tuple[torch.Tensor, torch.Tensor]]:
         """Per-layer context K (roped) and V for tap rows [n, 6 * hidden]."""
         fused = rms(F.linear(taps, self.w["fc.weight"]), self.w["hidden_norm.weight"], self.eps)
+        self.dump("context-norm", fused)
         out = []
         for l in range(self.layers):
             p = f"layers.{l}.self_attn."
             k = F.linear(fused, self.w[p + "k_proj.weight"]).view(-1, self.kv_heads, self.head_dim)
             v = F.linear(fused, self.w[p + "v_proj.weight"]).view(-1, self.kv_heads, self.head_dim)
+            self.dump(f"context-{l}-kv", torch.cat([k.flatten(1), v.flatten(1)], dim=-1))
             out.append((rope(rms(k, self.w[p + "k_norm.weight"], self.eps), positions, self.theta), v))
         return out
 
@@ -142,7 +150,9 @@ class Drafter:
         tokens = torch.tensor([anchor] + [self.mask] * (self.block - 1))
         h = self.embed[tokens].to(self.device)
         positions = torch.arange(position, position + self.block, device=self.device)
+        self.dump("input", h)
         n = rms(h, self.w["layers.0.input_layernorm.weight"], self.eps)
+        self.dump("input-norm", n)
         for l in range(self.layers):
             p = f"layers.{l}."
             dyn = F.linear(n, self.w[p + "attention_conv.kernel_projection.weight"])
@@ -172,14 +182,20 @@ class Drafter:
             h = h + conv(d, dyn, base, 1, self.group)
             last = l + 1 == self.layers
             n = rms(h, self.w["norm.weight" if last else f"layers.{l + 1}.input_layernorm.weight"], self.eps)
+            self.dump(f"layer-{l}", h)
+            self.dump(f"layer-{l}-norm", n)
         return n
 
     def select(self, anchor: int, hidden: torch.Tensor) -> tuple[list[int], list[list[float]]]:
         """Greedy candidate path over rows 1.. of the block."""
         rows = hidden[1:]
         logits = F.linear(rows, self.lm_head[:self.valid_vocab])
+        self.dump("logits", F.linear(hidden, self.lm_head).float())
         unary, candidates = torch.topk(logits, self.topk, dim=-1)
         projected = F.linear(rows, self.w["candidate_selector.hidden_projection.weight"])
+        self.dump("unary", unary.float())
+        self.dump("candidates", candidates.int())
+        self.dump("projected", F.linear(hidden, self.w["candidate_selector.hidden_projection.weight"]))
         pred_cb = self.w["candidate_selector.predecessor_codebook"]
         succ_cb = self.w["candidate_selector.successor_codebook"]
         previous, tokens, features = anchor, [], []
@@ -215,12 +231,16 @@ def mini_fixture(draft: Path, target: Path, out: Path, device: str):
         width = len(model.taps) * model.cfg["hidden_size"]
         taps = ((torch.arange(rows * width, device=device, dtype=torch.int64) * 17 % 251).float() / 128 - 1).reshape(rows, width).bfloat16()
         taps.cpu().view(torch.int16).numpy().tofile(out / "taps.bin")
+        model.dump_dir = out / "ref"
+        model.dump_dir.mkdir(exist_ok=True)
         ctx = model.context(taps, torch.arange(rows, device=device))
         result = []
         for anchor in (101, 501, 1013, 200006):
             h = model.body(anchor, rows, ctx, True)
             tokens, features = model.select(anchor, h)
             result.append(dict(anchor=anchor, tokens=tokens, features=features))
+            model.dump("features", torch.tensor(features))
+            model.dump_dir = None
         (out / "meta.json").write_text(json.dumps(dict(rows=rows, results=result)))
 
 
