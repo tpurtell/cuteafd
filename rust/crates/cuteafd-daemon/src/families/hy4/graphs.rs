@@ -64,9 +64,8 @@ impl<'a> Hy4Graphs<'a> {
         &mut self,
         library: &'a cuteafd_ffi::NativeLibrary,
         device: i32,
-        rank: usize,
+        policy: cuteafd_loader::placement::graph_reserve::Resolved,
     ) -> Result<()> {
-        let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, 0, 0)?;
         self.bank.get_mut().attach_device(
             library,
             device,

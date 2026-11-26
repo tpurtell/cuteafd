@@ -18,7 +18,7 @@ use cuteafd_engine::prefix::PrefixFamily;
 use cuteafd_loader::{
     families::hy4::{
         admission::{self, Coordinator, FactsRequest},
-        Hy4Config, Hy4KvCache,
+        graph_reserve, Hy4Config, Hy4KvCache,
     },
     placement::{
         families::hy4::{self as hy4_place, AdmittedHy4, Hy4Inputs},
@@ -212,6 +212,7 @@ fn publish_provenance(
     runtime: &RuntimeInventory,
     admitted: &AdmittedHy4,
     attention: &str,
+    graph_policies: &[cuteafd_loader::placement::graph_reserve::Resolved],
 ) -> Result<()> {
     use sha2::{Digest, Sha256};
     let hash = |path: &Path| -> Result<String> {
@@ -220,9 +221,6 @@ fn publish_provenance(
         std::io::copy(&mut file, &mut digest)?;
         Ok(format!("{:x}", digest.finalize()))
     };
-    let graph_policies: Vec<_> = (0..runtime.gpus.len())
-        .map(|gpu| cuteafd_loader::placement::graph_reserve::current(gpu, false, 0, 0))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
     cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
         "memory_reconciliation_provenance": {
             "schema_version": 1,
@@ -578,7 +576,17 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             })?;
 
             cuteafd_loader::placement::reserve::log_plan(&admitted.solved, "hy4");
-            publish_provenance(&worker_args, &pre, &admitted, resolved_attention)?;
+            let graph_layout = graph_reserve::Layout::resolve(
+                gpus, worker_args.peers.len(), attention_placement,
+            );
+            let graph_policies: Vec<_> = (0..gpus)
+                .map(|rank| graph_reserve::reserve_policy(graph_layout, rank))
+                .collect::<std::result::Result<_, _>>()?;
+            ensure!(
+                graph_policies.iter().map(|policy| policy.bytes).eq(inputs.graph_reserve.iter().copied()),
+                "Hy4 graph reserve policies disagreed with admission"
+            );
+            publish_provenance(&worker_args, &pre, &admitted, resolved_attention, &graph_policies)?;
             let sampled_free: Vec<u64> = pre.gpus.iter().map(|g| g.free_bytes).collect();
             pre.record("hy4", &sampled_free);
             cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
@@ -739,7 +747,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 inputs.expert_usage.as_ref(),
                 worker_args.expert_usage_reader.clone(),
             )?;
-            engine.configure_graphs()?;
+            engine.configure_graphs(&graph_policies)?;
 
             let coord_devices = CoordinatorDevices::new(&device_ids)?;
             let mut weights_inv = Inventory::new(

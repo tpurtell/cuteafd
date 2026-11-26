@@ -456,6 +456,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
     let mut budgets: Vec<Budget> = Vec::with_capacity(gpus + ranks + 1);
     let mut code = Vec::with_capacity(gpus);
     let mut graph_reserve = Vec::with_capacity(gpus);
+    let graph_layout = super::graph_reserve::Layout::resolve(gpus, ranks, request.attention);
     match &request.coordinator {
         Coordinator::Planned { rtx_bytes } => {
             for (gpu, &cap) in rtx_bytes.iter().enumerate() {
@@ -472,7 +473,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
                     )
                     .bytes,
                 );
-                let gr = crate::placement::graph_reserve::current(gpu, false, 0, 0)
+                let gr = super::graph_reserve::reserve_policy(graph_layout, gpu)
                     .map_err(|error| {
                         refused(
                             format!("Hy4 graph reserve refused: {error}"),
@@ -493,7 +494,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
             for (gpu, &(total, logical, free)) in samples.iter().enumerate() {
                 budgets.push(hy4::measured_budget(gpu as u8, total, logical, free));
                 code.push(loaded_code[gpu]);
-                let gr = crate::placement::graph_reserve::current(gpu, false, 0, 0)
+                let gr = super::graph_reserve::reserve_policy(graph_layout, gpu)
                     .map_err(|error| {
                         refused(
                             format!("Hy4 graph reserve refused: {error}"),
