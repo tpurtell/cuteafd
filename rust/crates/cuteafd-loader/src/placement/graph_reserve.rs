@@ -23,22 +23,33 @@ pub fn glm_default(family: GlmPrewarmFamily, ranks: usize) -> (u64, u64) {
 /// - 2x RTX GPU 1: `W1_lane = 594 MiB` (592 MiB prewarm/lane + 2 MiB 32K index),
 ///   `shared = 14 MiB` (incl. 6 MiB spanning `dspark_chain`), `step_growth = 11 MiB/lane`.
 /// An unknown layout returns `None` so it never borrows another layout's inventory.
-pub fn v41_working_set(ranks: usize, rank: usize, lanes: u8) -> Option<WorkingSet> {
+/// For 128 verify rows, the Nov 25 no-churn StridedPLE census (#2460,
+/// `v41-r128-nochurn-traces`) measured one-lane charged high-water of
+/// 3286 / 1348 / 1356 MiB (TP1 / TP2 GPU0 / GPU1). Use that retained
+/// working set, not the C1-only boundary, to prevent churn at C8/C16.
+/// Remove the existing shared allowance before scaling per-lane storage;
+/// scale the step estimate by the same measured ratio. Interpolate between
+/// the two measured row bands, extrapolate above 128 (not a measured band).
+/// Single-capture high-water is still 4 MiB on all three devices.
+pub fn v41_working_set(ranks: usize, rank: usize, lanes: u8, decode_rows: u32) -> Option<WorkingSet> {
     const MIB: u64 = 1 << 20;
     let lanes = u64::from(lanes.max(1));
-    let (w1, step_growth) = match (ranks, rank) {
-        (1, 0) => ((lanes * 984 + 80) * MIB, lanes * 27 * MIB),
-        (2, 0) => ((lanes * 592 + 12) * MIB, lanes * 11 * MIB),
-        (2, 1) => ((lanes * 594 + 14) * MIB, lanes * 11 * MIB),
+    let (lane64, shared, step64, total128) = match (ranks, rank) {
+        (1, 0) => (984u64, 80, 27, 3286),
+        (2, 0) => (592, 12, 11, 1348),
+        (2, 1) => (594, 14, 11, 1356),
         _ => return None,
     };
-    Some(WorkingSet { w1, step_growth, capture_growth: 4 * MIB })
+    let additional = (total128 - shared - lane64) * u64::from(decode_rows.saturating_sub(64));
+    let lane = lane64 * MIB + (additional * MIB).div_ceil(64);
+    let step = (step64 * lane).div_ceil(lane64);
+    Some(WorkingSet { w1: lanes * lane + shared * MIB, step_growth: lanes * step, capture_growth: 4 * MIB })
 }
 
 /// Resolve V4.1's reserve through the shared `current_working_set` rule for
 /// measured layouts, or `current(rank, false, 0, 0)` for unknown layouts.
-pub fn v41_current(ranks: usize, rank: usize, lanes: u8) -> Result<Resolved, Error> {
-    match v41_working_set(ranks, rank, lanes) {
+pub fn v41_current(ranks: usize, rank: usize, lanes: u8, decode_rows: u32) -> Result<Resolved, Error> {
+    match v41_working_set(ranks, rank, lanes, decode_rows) {
         Some(measured) => current_working_set(rank, measured),
         None => current(rank, false, 0, 0),
     }
@@ -438,13 +449,33 @@ mod tests {
             (2, 1, 1, 608, 730, 738),
             (2, 1, 2, 1_202, 1_444, 1_452),
         ] {
-            let measured = v41_working_set(ranks, rank, lanes).unwrap();
+            let measured = v41_working_set(ranks, rank, lanes, 64).unwrap();
             assert_eq!(measured.w1, w1_mib * MIB, "ranks={ranks} rank={rank} lanes={lanes}");
             let policy = resolve_working_set(None, None, None, rank, measured).unwrap();
             assert_eq!(policy.base_bytes, soft_mib * MIB);
             assert_eq!(policy.growth_headroom, Some(8 * MIB));
             assert_eq!(policy.bytes, hard_mib * MIB);
         }
-        assert!(v41_working_set(3, 0, 1).is_none());
+        assert!(v41_working_set(3, 0, 1, 64).is_none());
     }
+    #[test]
+    fn v41_wide_rows_cover_no_churn_census_and_scale_only_lane_bytes() {
+        const MIB: u64 = 1 << 20;
+        for (ranks, rank, shared, w128) in [(1, 0, 80, 3286), (2, 0, 12, 1348), (2, 1, 14, 1356)] {
+            let base = v41_working_set(ranks, rank, 1, 64).unwrap();
+            let wide = v41_working_set(ranks, rank, 1, 128).unwrap();
+            let two = v41_working_set(ranks, rank, 2, 128).unwrap();
+            assert_eq!(wide.w1, w128 * MIB);
+            assert_eq!(two.w1, 2 * wide.w1 - shared * MIB);
+            assert_eq!(two.step_growth, 2 * wide.step_growth);
+            assert!(wide.step_growth > base.step_growth);
+            assert_eq!(wide.capture_growth, base.capture_growth);
+            assert!(v41_working_set(ranks, rank, 1, 256).unwrap().w1 > wide.w1);
+            let resolved = resolve_working_set(None, None, None, rank, wide).unwrap();
+            assert!(resolved.base_bytes > wide.w1);
+            let override_ = resolve_working_set(Some("6GiB"), None, None, rank, wide).unwrap();
+            assert_eq!(override_.bytes, 6 << 30);
+        }
+    }
+
 }

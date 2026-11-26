@@ -132,8 +132,8 @@ pub struct Opaque {
 /// x `lanes` + shared, plus shared step and single-capture headroom).
 /// `GPU_GRAPH_RESERVE` overrides it per device and never splits across ranks.
 /// Nothing here is live at Ready, so it prices only the post-ready phases.
-pub fn graph_allowance(ranks: usize, rank: usize, lanes: u8) -> Result<Opaque, Refusal> {
-    let resolved = crate::placement::graph_reserve::v41_current(ranks, rank, lanes)
+pub fn graph_allowance(ranks: usize, rank: usize, lanes: u8, decode_rows: u32) -> Result<Opaque, Refusal> {
+    let resolved = crate::placement::graph_reserve::v41_current(ranks, rank, lanes, decode_rows)
         .map_err(|error| Refusal::InvalidFact(error.to_string()))?;
     Ok(Opaque {
         location: Location::coordinator(rank as u8),
@@ -1812,14 +1812,14 @@ mod explicit_budget_tests {
     #[test]
     fn graph_reserve_prices_only_the_named_arena() {
         for lanes in [1u8, 2] {
-            let owner = super::graph_allowance(1, 0, lanes).unwrap();
-            let measured = crate::placement::graph_reserve::v41_working_set(1, 0, lanes).unwrap();
+            let owner = super::graph_allowance(1, 0, lanes, 64).unwrap();
+            let measured = crate::placement::graph_reserve::v41_working_set(1, 0, lanes, 64).unwrap();
             assert_eq!(owner.bytes, crate::placement::graph_reserve::resolve_working_set(None, None, None, 0, measured).unwrap().bytes);
             assert_eq!(owner.source, "graph reserve: v41.graphs.0");
             // The old lazy envelope and runtime growth owner are gone, not renamed.
             assert!(!owner.source.contains("runtime"));
         }
-        assert!(super::graph_allowance(1, 0, 2).unwrap().bytes > super::graph_allowance(1, 0, 1).unwrap().bytes);
+        assert!(super::graph_allowance(1, 0, 2, 64).unwrap().bytes > super::graph_allowance(1, 0, 1, 64).unwrap().bytes);
     }
 }
 
