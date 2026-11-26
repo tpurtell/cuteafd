@@ -3000,6 +3000,8 @@ impl<'a> DflashDrafter<'a> {
                             rows, h, c.conv_width())?;
                         l.glm_dflash_conv(w.n.buffer.ptr, w.dflash()?.dynamic.buffer.ptr, attn_base.buffer.ptr, w.dflash()?.conv.buffer.ptr,
                             rows, block, h, group, s)?;
+                        self.oracle_dump(&format!("layer-{index}-attn-dyn"), w.dflash()?.dynamic.buffer, rows*c.conv_width()*2)?;
+                        self.oracle_dump(&format!("layer-{index}-attn-conv"), w.dflash()?.conv.buffer, rows*h*2)?;
                         w.dflash()?.conv.buffer
                     }
                     LayerBody::Plain => w.n.buffer,
@@ -3007,14 +3009,18 @@ impl<'a> DflashDrafter<'a> {
                 match (&layer.attention, &w.attention, &self.context) {
                     (DraftAttention::Gqa(a), AttentionWorkspace::Gqa(attention), DraftContext::Gqa(_)) => {
                         self.linear(w.dflash()?.conv.buffer.ptr, &a.qkv, 0, attention.qkv.buffer.ptr, rows, h, c.qkv_width())?;
+                        self.oracle_dump(&format!("layer-{index}-qkv"), attention.qkv.buffer, rows*c.qkv_width()*2)?;
                         l.glm_dflash_qk_rope(attention.qkv.buffer.ptr, a.q_norm.buffer.ptr, a.k_norm.buffer.ptr,
                             w.positions.buffer.ptr, std::ptr::null(), attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
                             rows, c.heads, c.kv_heads, c.theta, eps, false, c.head_dim, s)?;
+                        self.oracle_dump(&format!("layer-{index}-q-rope"), attention.q.buffer, rows*attention_width*2)?;
+                        self.oracle_dump(&format!("layer-{index}-k-rope"), attention.k.buffer, rows*c.kv_width()*2)?;
                         l.glm_dflash_attention(attention.q.buffer.ptr, attention.k.buffer.ptr, attention.v.buffer.ptr,
                             a.k_ring.buffer.ptr, a.v_ring.buffer.ptr, attention.tables.buffer.ptr,
                             at(&attention.tables, s_count * 4), at(&attention.tables, 2 * s_count * 4),
                             attention.attn.buffer.ptr, attention.scratch.buffer.ptr, s_count, block, c.heads, c.kv_heads, RING,
                             max_keys, if c.row_window { c.window } else { 0 }, 1.0 / (c.head_dim as f32).sqrt(), self.kv_cache == cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8, c.head_dim, s)?;
+                        self.oracle_dump(&format!("layer-{index}-attn"), attention.attn.buffer, rows*attention_width*2)?;
                         self.linear(attention.attn.buffer.ptr, &a.o, 0, w.delta.buffer.ptr, rows, attention_width, h)?;
                     }
                     (DraftAttention::Mla(a), AttentionWorkspace::Mla(attention), DraftContext::Mla(context)) => {
@@ -3049,15 +3055,20 @@ impl<'a> DflashDrafter<'a> {
                 let next = self.layers.get(index + 1).map_or(self.norm.buffer.ptr, |n| n.input_norm.buffer.ptr);
                 match &layer.body {
                     LayerBody::Dflash { attn_base, mlp_conv, mlp_base, .. } => {
+                        self.oracle_dump(&format!("layer-{index}-attn-out"), w.delta.buffer, rows*h*2)?;
                         l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dflash()?.dynamic.buffer.ptr, attn_base.buffer.ptr,
                             w.h.buffer.ptr, layer.post_norm.buffer.ptr, w.h.buffer.ptr, w.n.buffer.ptr, rows, block, h, group, eps, s)?;
+                        self.oracle_dump(&format!("layer-{index}-post-attn"), w.h.buffer, rows*h*2)?;
+                        self.oracle_dump(&format!("layer-{index}-post-attn-norm"), w.n.buffer, rows*h*2)?;
                         self.linear(w.n.buffer.ptr, mlp_conv, 0, w.dflash()?.dynamic.buffer.ptr,
                             rows, h, c.conv_width())?;
                         l.glm_dflash_conv(w.n.buffer.ptr, w.dflash()?.dynamic.buffer.ptr, mlp_base.buffer.ptr, w.dflash()?.conv.buffer.ptr,
                             rows, block, h, group, s)?;
                         self.linear(w.dflash()?.conv.buffer.ptr, &layer.gate_up, 0, w.gate_up.buffer.ptr,
                             rows, h, 2 * inter)?;
+                        self.oracle_dump(&format!("layer-{index}-gate-up"), w.gate_up.buffer, rows*2*inter*2)?;
                         l.glm_dflash_silu_mul(w.gate_up.buffer.ptr, w.act.buffer.ptr, rows, inter, s)?;
+                        self.oracle_dump(&format!("layer-{index}-act"), w.act.buffer, rows*inter*2)?;
                         self.linear(w.act.buffer.ptr, &layer.down, 0, w.delta.buffer.ptr, rows,
                             inter, h)?;
                         l.glm_dflash_conv_residual_norm(w.delta.buffer.ptr, w.dflash()?.dynamic.buffer.ptr, mlp_base.buffer.ptr,
