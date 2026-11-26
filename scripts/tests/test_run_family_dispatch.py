@@ -890,14 +890,15 @@ def test_family_table_matches_the_rust_launch_fixtures(tmp_path: Path) -> None:
         assert got == case["line"], (case["name"], out.stderr)
 
 
-def _real_planner_keys(raw: str) -> str:
+def _real_planner_keys(raw: str, drop: tuple[str, ...] = ()) -> str:
     """A shipped example's keys for a real-planner launch: the snapshot supplies the model.
 
     The launcher refuses template REPLACE-ME hosts (#2736), so the copy it reads gets
-    real-looking ones; host names never reach the planner.
+    real-looking ones; host names never reach the planner. `drop` removes further keys.
     """
+    dropped = ("MODEL_ID=", "MODEL_REVISION=", *(f"{key}=" for key in drop))
     return "\n".join(line.replace("REPLACE-ME-spark-", "spark-") for line in raw.splitlines()
-                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION="))) + "\nMODEL_REVISION=\n"
+                     if not line.startswith(dropped)) + "\nMODEL_REVISION=\n"
 
 
 def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys: str,
@@ -1607,8 +1608,7 @@ def capture_kimi_real_planner_launch(snapshot: Path, example: Path, binary: Path
     config = dict(line.split("=", 1) for line in raw.splitlines()
                   if line and not line.startswith("#") and "=" in line)
     gpus = int(config["RTX_GPUS"])
-    keys = "\n".join(line for line in raw.splitlines()
-                     if not line.startswith(("MODEL_ID=", "MODEL_REVISION=", "ATTENTION_PLACEMENT="))) + "\nMODEL_REVISION=\n"
+    keys = _real_planner_keys(raw, drop=("ATTENTION_PLACEMENT",))
     # Keep actual drafter headers for speculating examples in the isolated HF root.
     if drafter_id := config.get("SPECULATOR_MODEL_ID"):
         drafter = "models--" + drafter_id.replace("/", "--")
