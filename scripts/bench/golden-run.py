@@ -76,7 +76,9 @@ exits fails the run at once), runs with host networking and /dev/infiniband, and
 CUTEAFD_GOLDEN_PEERS (lane-A IP:PORT by rank, from --config), CUTEAFD_GOLDEN_SPARK_WORLD,
 CUTEAFD_GOLDEN_EXPERT_LAYERS (expanded --expert-layers) and CUTEAFD_GOLDEN_SPARK_PACKAGES
 (the workers' package manifest.json files, identical on every host, read-only under
-/opt/cuteafd/spark). A golden subcommand must take them as `--peers {peers}`. Workers are
+/opt/cuteafd/spark). A golden subcommand must take them as `--peers {peers}`. Its
+explicit --core-view (or CUTEAFD_CORE_VIEW in an arm's environment) also selects the
+workers' core view; conflicting worker overrides are refused before enqueue. Workers are
 removed (logs kept) after every run, on failure, timeout and SIGTERM/SIGINT too, before
 the locks are released. The LAN-only build seeds are refused.
 
@@ -87,7 +89,8 @@ pairs share conditions. Slots, images, Spark hosts and container names are check
 before enqueue and again at grant; --preflight adds a shell check at both points, like
 hwlock's. Each container (golden-TASK-ARM) first checks it sees its GPUs (exit 86 when
 not), is removed on any exit before the locks are released, and runs under a per-arm
-timeout. --dry-run runs the checks and reports the lock set without taking locks or printing argv.
+timeout. --dry-run runs the checks and reports the lock set and workers' core-view
+arguments (if any), without taking locks or printing the full argv.
 
 Output, under ~/.cache/cuteafd/builds/TASK/golden/: ARM/rN/{log,exit,argv.json,
 workers/HOST.log} and whatever the run wrote to {out}; argv.json holds the exact docker
@@ -278,6 +281,40 @@ def golden_args(family, args, sparks=False):
         if sep and flag in WRITERS and not value.startswith('{out}'):
             raise ValueError(f'{arg}: write outputs under the arm directory ({flag}={{out}}/NAME)')
     return [SUBCOMMANDS[family], *args]
+
+
+def core_view_arg(args):
+    view = None
+    for i, arg in enumerate(args):
+        flag, sep, value = arg.partition('=')
+        if flag != '--core-view':
+            continue
+        if view is not None:
+            raise ValueError('--core-view supplied more than once')
+        view = value if sep else (args[i + 1] if i + 1 < len(args) else '')
+        if not view or view.startswith('--'):
+            raise ValueError('--core-view requires a value')
+    return view
+
+
+def worker_core_view_args(state, name, arm):
+    """Match the coordinator's Clap precedence: CLI, environment, then original."""
+    sparks = state['sparks']
+    key = 'CUTEAFD_CORE_VIEW'
+    view = core_view_arg(run_args(state, arm)) if state['mode'] == 'golden' else None
+    if view is None and key in arm['env']:
+        view = substitute([arm['env'][key]], state['snapshot_container'], **placeholder_values(state))[0]
+    worker_arg = core_view_arg(sparks['args'])
+    # Arbitrary commands/tests may select their view internally; without an
+    # explicit coordinator selection, leave their worker settings alone.
+    if view is None and state['mode'] != 'golden':
+        return []
+    expected = view if view is not None else 'original'
+    worker_env = {**sparks['env'], **sparks['arm_env'][name]}.get(key)
+    for source, actual in (('--worker-arg --core-view', worker_arg), ('worker ' + key, worker_env)):
+        if actual is not None and actual != expected:
+            raise ValueError(f'arm {name}: {source}={actual!r} disagrees with coordinator core view {expected!r}')
+    return ['--core-view', view] if view is not None and worker_arg is None else []
 
 
 PLACEHOLDERS = ('snapshot', 'hub', 'out', 'fixtures', 'peers', 'expert_layers')
@@ -600,7 +637,7 @@ def worker_command(state, arm, rank, record):
     cmd += ['--entrypoint', 'timeout', record['image_id'], '--kill-after=30', str(lifetime), ENTRYPOINT,
             'cuteafd', 'expertd-native', '--snapshot', snapshot, '--native-lib', f'{SLOT_LIB}/libcuteafd_native.so',
             '--rank', str(rank), '--world', str(len(sparks['hosts'])), '--device-budget-bytes', str(sparks['budget']),
-            '--listen', f"0.0.0.0:{sparks['port']}", *sparks['args']]
+            '--listen', f"0.0.0.0:{sparks['port']}", *sparks['args'], *sparks['core_view_args'][arm]]
     return cmd
 
 
@@ -1920,6 +1957,8 @@ def build_state(args, arms):
     for arm in arms.values():
         for value in arm['env'].values():
             substitute([value], container_path, **placeholder_values(state))
+    if sparks:
+        sparks['core_view_args'] = {name: worker_core_view_args(state, name, arm) for name, arm in arms.items()}
     return state
 
 
@@ -2024,7 +2063,7 @@ def main(argv=None):
                         help='exit 1 unless every --compare-logits pair is byte-identical (comparisons are otherwise report-only)')
     parser.add_argument('--vocab', type=int, help='logits row width (default: the checkpoint config.json vocab_size)')
     parser.add_argument('--overwrite', action='store_true', help='replace an earlier golden/ of this task')
-    parser.add_argument('--dry-run', action='store_true', help='run the checks, print the commands, take no locks')
+    parser.add_argument('--dry-run', action='store_true', help='run the checks, report locks and worker core-view args, take no locks')
     parser.add_argument('--preflight-only', action='store_true', help='run the CPU checks and exit (0 = pass)')
     parser.add_argument('golden', nargs=argparse.REMAINDER, help='-- GOLDEN ARGS (verbatim, after the subcommand)')
     args = parser.parse_args(argv)
@@ -2065,6 +2104,12 @@ def main(argv=None):
         if args.dry_run:
             print(f"# locks (fair queue, in order): {','.join(state['locks'])}; "
                   f"--max-run {turn_max_run(state, len(order), args):.0f}")
+            if state.get('sparks'):
+                for name in arms:
+                    record = next(iter(state['slots'][name]['sparks'].values()))
+                    view = core_view_arg(worker_command(state, name, 0, record))
+                    if view is not None:
+                        print(f'# arm {name} worker argv: {shlex.join(["--core-view", view])}')
         print('golden-run: preflight pass')
         return 0
     root = Path(state['root'])
