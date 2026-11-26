@@ -107,15 +107,17 @@ pub(crate) fn prepare<'a>(
     let selected_weights = SelectedWeights::new(checkpoint, cfg, options.drafter.is_some())?;
     let mut kernels = None;
     let mut module_pins = Vec::new();
-    let replay_cap = cuteafd_loader::families::inkling2_mini::execution::replay_capacity(options.decode_rows as usize);
-    let fir_commit = if replay_cap == 64 { "fir_history_commit" } else { "fir_history_commit_m128" };
+    let load_128 = cuteafd_loader::families::inkling2_mini::execution::replay_capacity(options.decode_rows as usize) == 128;
     let devices = [options.device];
     let runtime = RuntimeInventory::measure(library, &devices, InventoryPhase::PreWeight, |_| {
         programs.program("inkling2_padded_transpose_bf16_r16_c1024_p64", &["source", "output"])?;
         kernels = Some(MiniKernels::bind_rows(programs, options.kv_format, options.decode_rows as usize)?);
         if options.drafter.is_some() || options.dflash.is_some() {
             programs.load_matching(|name| {
-                name.starts_with("inkling_draft_") || name.starts_with("draft_bf16_") || name == fir_commit
+                name.starts_with("inkling_draft_")
+                    || name.starts_with("draft_bf16_")
+                    || name == "fir_history_commit"
+                    || (load_128 && name == "fir_history_commit_m128")
             })?;
         }
         if let Some(tensors) = catalog.fp8() {

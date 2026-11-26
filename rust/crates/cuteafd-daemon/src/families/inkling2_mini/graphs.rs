@@ -28,6 +28,16 @@ struct Key {
     taps: bool,
 }
 
+impl Key {
+    /// Export capacity (`64` for `rows <= 64`, `128` for `rows > 64`) is a pure
+    /// deterministic function of `self.rows` across both `Decode` and `Verify`,
+    /// so no `(rows, mode, taps)` graph key can alias two different kernel capacities.
+    #[cfg(test)]
+    fn export_capacity(self) -> usize {
+        super::layers::select_decode_capacity(self.rows)
+    }
+}
+
 pub(super) struct DecodeGraphs<'a> {
     bank: GraphBank<Key, GraphOwner<'a, ()>>,
     first_touched: HashSet<Key>,
@@ -388,5 +398,18 @@ mod tests {
         let off128 = shipping_prewarm_keys(64, 128, false);
         assert_eq!(off128.len(), 64);
         assert!(off128.iter().all(|&(_, mode)| mode == Mode::Decode));
+
+        // Graph key capacity is a deterministic function of rows across both modes:
+        // <= 64 selects m64 and > 64 selects m128 (never aliases).
+        for mode in [Mode::Decode, Mode::Verify] {
+            for taps in [false, true] {
+                assert_eq!(Key { rows: 1, mode, taps }.export_capacity(), 64);
+                assert_eq!(Key { rows: 8, mode, taps }.export_capacity(), 64);
+                assert_eq!(Key { rows: 64, mode, taps }.export_capacity(), 64);
+                assert_eq!(Key { rows: 65, mode, taps }.export_capacity(), 128);
+                assert_eq!(Key { rows: 80, mode, taps }.export_capacity(), 128);
+                assert_eq!(Key { rows: 128, mode, taps }.export_capacity(), 128);
+            }
+        }
     }
 }

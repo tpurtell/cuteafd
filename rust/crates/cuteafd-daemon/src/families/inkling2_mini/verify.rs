@@ -45,6 +45,7 @@ pub(crate) struct Verify<'a> {
     pub replay: Allocation<'a>,
     table: Allocation<'a>,
     commit: Commit<'a>,
+    commit_128: Option<Commit<'a>>,
     layout: Layout,
     mark_layout: MarkLayout,
     stream: Rc<Stream<'a>>,
@@ -52,6 +53,10 @@ pub(crate) struct Verify<'a> {
     owner: u64,
     generation: Cell<u64>,
     pending: RefCell<Option<Vec<Submitted>>>,
+}
+
+pub(crate) fn select_commit_capacity(total_rows: usize) -> usize {
+    cuteafd_loader::families::inkling2_mini::execution::replay_capacity(total_rows)
 }
 
 impl<'a> Verify<'a> {
@@ -64,7 +69,12 @@ impl<'a> Verify<'a> {
     ) -> Result<Self> {
         let replay_rows = cuteafd_loader::families::inkling2_mini::execution::replay_capacity(decode_rows);
         let layout = Layout::contiguous_rows(slots, width, replay_rows)?;
-        let commit = Commit::load(programs, layout)?;
+        let commit = Commit::load_capacity(programs, layout, 64)?;
+        let commit_128 = if replay_rows == 128 {
+            Some(Commit::load_capacity(programs, layout, 128)?)
+        } else {
+            None
+        };
         let mark_layout = MarkLayout::new(&[(stream.device.id, layout.history_bytes()?)])?;
         let checkpoint = Rc::new(Allocation::new(
             stream.device,
@@ -89,6 +99,7 @@ impl<'a> Verify<'a> {
             replay,
             table,
             commit,
+            commit_128,
             layout,
             mark_layout,
             stream,
@@ -189,7 +200,13 @@ impl<'a> Verify<'a> {
             available.push((row.first, row.rows));
             frontiers.push((row.slot, row.start + keep));
         }
-        let table = self.commit.table(&entries, &available)?;
+        let total_rows = submitted.iter().map(|r| r.first + r.rows).max().unwrap_or(0);
+        let commit = if select_commit_capacity(total_rows) == 128 {
+            self.commit_128.as_ref().context("Mini 128-row FIR commit not bound")?
+        } else {
+            &self.commit
+        };
+        let table = commit.table(&entries, &available)?;
         let bytes = table.iter().flat_map(|word| word.to_le_bytes()).collect::<Vec<_>>();
         // SAFETY: one table upload + single FIR gather across all 48 slots.
         unsafe {
@@ -197,7 +214,7 @@ impl<'a> Verify<'a> {
                 .device
                 .library
                 .copy_h2d_ordered(self.table.buffer, &bytes, self.stream.raw)?;
-            self.commit.launch(
+            commit.launch(
                 self.checkpoint.buffer,
                 self.replay.buffer,
                 self.table.buffer,
@@ -233,5 +250,20 @@ impl<'a> Verify<'a> {
 impl Drop for Verify<'_> {
     fn drop(&mut self) {
         self.stream.drain_or_abort("Inkling 2 Mini FIR verify retirement");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_commit_capacity_selects_64_at_8_rows_and_128_at_80_rows() {
+        assert_eq!(select_commit_capacity(1), 64);
+        assert_eq!(select_commit_capacity(8), 64);
+        assert_eq!(select_commit_capacity(64), 64);
+        assert_eq!(select_commit_capacity(65), 128);
+        assert_eq!(select_commit_capacity(80), 128);
+        assert_eq!(select_commit_capacity(128), 128);
     }
 }
