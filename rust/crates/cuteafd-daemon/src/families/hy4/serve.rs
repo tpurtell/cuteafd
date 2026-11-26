@@ -174,9 +174,10 @@ pub(super) fn resolve_attention_placement(
             "Hy4 single-GPU serving does not support ATTENTION_PLACEMENT={other}; use auto or heads"
         ),
         (2, "auto" | "context") => Ok(("context", AttentionPlacement::Context)),
+        (2, "layers") => Ok(("layers", AttentionPlacement::Layers)),
         (2, "heads") => Ok(("heads", AttentionPlacement::Heads)),
         (2, other) => anyhow::bail!(
-            "Hy4 2-GPU serving does not support ATTENTION_PLACEMENT={other}; use auto/context (ContextSplit default) or explicit heads"
+            "Hy4 2-GPU serving does not support ATTENTION_PLACEMENT={other}; use auto/context (ContextSplit default), layers, or explicit heads"
         ),
         _ => anyhow::bail!("Hy4 supports 1 or 2 coordinator GPUs, got {gpus}"),
     }
@@ -295,6 +296,7 @@ fn reconcile_runtime_inventory(
             || id.starts_with("hy4.head.")
             || id.starts_with("hy4.target.")
             || id.starts_with("hy4.peer.")
+            || id.starts_with("hy4.hops.")
             || id.starts_with("hy4.context_exchange.")
             || id.starts_with("expert-usage.gpu")
     };
@@ -498,11 +500,14 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let prefill_waves = usize::try_from(prefill.waves)?;
 
             let context_split = attention_placement == AttentionPlacement::Context;
+            let layers_split = gpus == 2 && attention_placement == AttentionPlacement::Layers;
+            let program_tp = if layers_split { 1 } else { gpus };
+            let head_device = if layers_split { device_ids[1] } else { device_ids[0] };
             let mut preloaded_programs: Vec<Hy4Programs<'_>> = Vec::with_capacity(gpus);
             let pre = RuntimeInventory::measure(&library, &device_ids, InventoryPhase::PreWeight, |_| {
                 preloaded_programs.push(Hy4Programs::load(
                     &programs,
-                    gpus,
+                    program_tp,
                     worker_args.kv_format,
                     context_split,
                 )?);
@@ -752,6 +757,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                                 &programs,
                                 &checkpoint,
                                 &cfg,
+                                attention_placement,
                                 capacity_rows,
                                 head_rows,
                             )
@@ -829,6 +835,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                             &programs,
                             &checkpoint,
                             &cfg,
+                            attention_placement,
                             capacity_rows,
                             head_rows,
                             media_push,
@@ -947,6 +954,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     &programs,
                     &checkpoint,
                     &cfg,
+                    attention_placement,
                     capacity_rows,
                     head_rows,
                     media_push,
@@ -1073,7 +1081,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 media.encoder,
                 worker_args.max_sequences,
             );
-            library.cuda_set_device(worker_args.device)?;
+            library.cuda_set_device(head_device)?;
             scheduler::schedule(
                 &backend,
                 &worker_args.snapshot,
@@ -1248,7 +1256,11 @@ mod tests {
             super::resolve_attention_placement(2, "heads")?,
             ("heads", AttentionPlacement::Heads)
         );
-        assert!(super::resolve_attention_placement(2, "layers").is_err());
+        assert_eq!(
+            super::resolve_attention_placement(2, "layers")?,
+            ("layers", AttentionPlacement::Layers)
+        );
+        assert!(super::resolve_attention_placement(1, "layers").is_err());
         Ok(())
     }
 
@@ -1490,6 +1502,168 @@ mod tests {
             address: addr,
         });
         assert!(super::reconcile_runtime_inventory(&admitted.solved, &inputs, &weights_receipts, &extra).is_err());
+
+        // 2-GPU layers placement reconciliation: 39/39 whole-layer halves, single boundary hop,
+        // hy4.hops.* transport owners, expert-usage on both GPUs, head on GPU 1, zero KV replication.
+        let modes_layers = hy4_place::layer_modes(&inputs.cfg, 2, AttentionPlacement::Layers);
+        let mut facts_layers = PoolFacts::new(context, None, 64);
+        facts_layers.memory = vec![
+            PoolMemory { available_bytes: 96u64 << 30, bytes_per_unit: 39 * 64 * 1024 },
+            PoolMemory { available_bytes: 96u64 << 30, bytes_per_unit: 39 * 64 * 1024 },
+        ];
+        let pool_layers = cuteafd_loader::placement::prepare_pool(facts_layers)?;
+        let targets_layers = vec![
+            CoordinatorWeights {
+                rank: 0,
+                layers: (0..39).collect(),
+                arena: WeightArenaLayout::new(
+                    "hy4/target/gpu0",
+                    vec![("model.embed_tokens.weight".to_string(), 120_832 * 6144 * 2)],
+                )?,
+                core: BTreeMap::new(),
+                fp8: BTreeMap::new(),
+            },
+            CoordinatorWeights {
+                rank: 1,
+                layers: (39..78).collect(),
+                arena: WeightArenaLayout::new(
+                    "hy4/target/gpu1",
+                    vec![("lm_head.weight".to_string(), 120_832 * 6144 * 2)],
+                )?,
+                core: BTreeMap::new(),
+                fp8: BTreeMap::new(),
+            },
+        ];
+        let mut budgets_layers = vec![
+            hy4_place::planned_budget(0, 96u64 << 30, 96u64 << 30, 1u64 << 30),
+            hy4_place::planned_budget(1, 96u64 << 30, 96u64 << 30, 1u64 << 30),
+        ];
+        budgets_layers.extend(inputs.budgets[1..].iter().cloned());
+        let inputs_layers = Hy4Inputs {
+            gpus: 2,
+            pool: pool_layers,
+            targets: targets_layers,
+            placement: AttentionPlacement::Layers,
+            modes: modes_layers,
+            expert_usage: Some(cuteafd_core::expert_usage::Geometry {
+                layers: inputs.cfg.layers,
+                experts: inputs.cfg.experts,
+                topk: inputs.cfg.topk,
+                routed_layers: inputs.routed.clone(),
+            }),
+            budgets: budgets_layers,
+            code: vec![256u64 << 20, 256u64 << 20],
+            graph_reserve: vec![0, 0],
+            ..inputs
+        };
+        let req_layers = hy4_place::request(
+            inputs_layers.context,
+            None,
+            Onboard::Layers(0),
+            prefill,
+            Operation::Serving,
+            None,
+            replies,
+        );
+        let admitted_layers = inputs_layers.admit(req_layers)?;
+        assert_eq!(admitted_layers.placement.attention_placement, AttentionPlacement::Layers);
+        assert_eq!(admitted_layers.placement.hops.len(), 1);
+        assert_eq!(admitted_layers.placement.hops[0].from, 0);
+        assert_eq!(admitted_layers.placement.hops[0].to, 1);
+        let contract_layers = inputs_layers.prepare(&admitted_layers.solved.request)?;
+        let pages_layers = admitted_layers.solved.pool_tokens.div_ceil(admitted_layers.solved.pool_page_rows);
+        let mut w_layers = Vec::new();
+        let mut r_layers = Vec::new();
+        for alloc in admitted_layers.solved.facts.allocations.iter().filter(|a| a.view.is_none()) {
+            if alloc.id.starts_with("hy4/target/gpu") {
+                w_layers.push(Receipt { allocation: alloc.clone(), address: addr });
+                addr += 0x1000;
+            } else if alloc.id.starts_with("hy4.cache.")
+                || alloc.id.starts_with("hy4.scratch.")
+                || alloc.id.starts_with("hy4.wave.")
+                || alloc.id.starts_with("hy4.head.")
+                || alloc.id.starts_with("hy4.target.")
+                || alloc.id.starts_with("hy4.peer.")
+                || alloc.id.starts_with("hy4.hops.")
+                || alloc.id.starts_with("hy4.context_exchange.")
+                || alloc.id.starts_with("expert-usage.gpu")
+            {
+                let curve = contract_layers
+                    .components
+                    .iter()
+                    .find_map(|c| match &c.kind {
+                        ComponentKind::Allocation { template, .. } if template.id == alloc.id => Some(&c.bytes),
+                        _ => None,
+                    })
+                    .expect("contract curve");
+                let piece = curve.0.iter().find(|p| (p.first..=p.last).contains(&pages_layers)).unwrap();
+                let payload = piece.bytes_at_first + piece.bytes_per_page * (pages_layers - piece.first);
+                let mut rec = alloc.clone();
+                rec.bytes = payload;
+                if rec.id.starts_with("hy4.cache.") || rec.id.starts_with("hy4.head.") {
+                    rec.id = format!("retained.{}", rec.id);
+                }
+                r_layers.push(Receipt { allocation: rec, address: addr });
+                addr += 0x1000;
+            }
+        }
+        assert!(r_layers.iter().any(|r| r.allocation.id.starts_with("hy4.hops.")));
+        assert!(r_layers.iter().any(|r| r.allocation.id.starts_with("expert-usage.gpu0.")));
+        assert!(r_layers.iter().any(|r| r.allocation.id.starts_with("expert-usage.gpu1.")));
+        assert!(r_layers.iter().any(|r| r.allocation.id == "retained.hy4.head.1.workspace"));
+        assert!(!r_layers.iter().any(|r| r.allocation.id == "retained.hy4.head.0.workspace"));
+        super::reconcile_runtime_inventory(&admitted_layers.solved, &inputs_layers, &w_layers, &r_layers)?;
+
+        // 2-GPU ContextSplit reconciliation must NOT admit hy4.hops.* (entry broadcast uses PeerExchange DIRECT).
+        let modes_ctx = hy4_place::layer_modes(&inputs_layers.cfg, 2, AttentionPlacement::Context);
+        let mut facts_ctx = PoolFacts::new(context, None, 128);
+        facts_ctx.memory = vec![
+            PoolMemory { available_bytes: 96u64 << 30, bytes_per_unit: 78 * 64 * 1024 },
+            PoolMemory { available_bytes: 96u64 << 30, bytes_per_unit: 78 * 64 * 1024 },
+        ];
+        let pool_ctx = cuteafd_loader::placement::prepare_pool(facts_ctx)?;
+        let targets_ctx = (0..2)
+            .map(|gpu| {
+                Ok(CoordinatorWeights {
+                    rank: gpu,
+                    layers: (0..78).collect(),
+                    arena: WeightArenaLayout::new(
+                        format!("hy4/target/gpu{gpu}"),
+                        vec![("lm_head.weight".to_string(), (120_832 / 2) * 6144 * 2)],
+                    )?,
+                    core: BTreeMap::new(),
+                    fp8: BTreeMap::new(),
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let inputs_ctx = Hy4Inputs {
+            pool: pool_ctx,
+            targets: targets_ctx,
+            index_topk: IndexTopkScratch::from_manifest_value(None, 2, true, 262_144)?,
+            placement: AttentionPlacement::Context,
+            modes: modes_ctx,
+            expert_usage: None,
+            ..inputs_layers
+        };
+        let req_ctx = hy4_place::request(
+            inputs_ctx.context,
+            None,
+            Onboard::Layers(0),
+            prefill,
+            Operation::Serving,
+            None,
+            replies,
+        );
+        let admitted_ctx = inputs_ctx.admit(req_ctx)?;
+        assert!(
+            !admitted_ctx
+                .solved
+                .facts
+                .allocations
+                .iter()
+                .any(|a| a.id.starts_with("hy4.hops.")),
+            "ContextSplit must not admit hy4.hops.* backings"
+        );
         Ok(())
     }
 }

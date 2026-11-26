@@ -68,6 +68,31 @@ impl<'a> Hy4CacheRank<'a> {
         max_chunk_rows: usize,
         mark_slots: usize,
     ) -> Result<Self> {
+        Self::new_owned(
+            readers,
+            cfg,
+            kv_format,
+            cfg.sparse_layers().len(),
+            cfg.swa_layers().len(),
+            pages,
+            sequences,
+            max_chunk_rows,
+            mark_slots,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_owned(
+        readers: Vec<Rc<Stream<'a>>>,
+        cfg: &Hy4FlashConfig,
+        kv_format: Hy4KvCache,
+        dsa_layers: usize,
+        swa_layers: usize,
+        pages: usize,
+        sequences: usize,
+        max_chunk_rows: usize,
+        mark_slots: usize,
+    ) -> Result<Self> {
         let first = readers.first().context("Hy4-flash cache requires at least one reader stream")?;
         let device = first.device;
         ensure!(
@@ -75,8 +100,6 @@ impl<'a> Hy4CacheRank<'a> {
             "Hy4-flash cache reader devices differ"
         );
         ensure!(pages > 0 && sequences > 0, "Hy4-flash cache requires positive pages and sequences");
-        let dsa_layers = cfg.sparse_layers().len();
-        let swa_layers = cfg.swa_layers().len();
         let layout = CacheLayout::for_unit(cfg, kv_format, sequences, dsa_layers, swa_layers, max_chunk_rows)?;
         let swa_ring_pages = layout.swa_ring_pages;
         let swa_ring_rows = layout.swa_ring_rows;

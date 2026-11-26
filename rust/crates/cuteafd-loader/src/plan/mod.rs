@@ -1443,7 +1443,10 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         let mut layout_options = layout_options.clone();
         if !ownership.uses_checkpoint() { layout_options.native_mtp_layers = 0; }
         if family.id() == "hy4_flash" {
-            layout_options.hy4_dfly2 = ownership == spec::DraftOwnership::BundledDfly2;
+            let layers = layout_options.rtx_bytes.len() == 2
+                && report.requested_attention == Some(crate::placement::AttentionPlacement::Layers);
+            layout_options.hy4_dfly2 = ownership == spec::DraftOwnership::BundledDfly2
+                && !(layers && options.draft_ownership.is_none());
         }
         layout_options.weight_budget_bytes = options.coordinator_budget_bytes;
         let mut memory = family_layout(model, input, &mut report, &mut layout_options, options.placement)?;

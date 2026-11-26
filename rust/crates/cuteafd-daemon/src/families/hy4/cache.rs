@@ -49,6 +49,24 @@ impl<'a> Hy4CacheRank<'a> {
         pages: usize,
         sequences: usize,
     ) -> Result<Self> {
+        Self::new_owned(
+            readers,
+            kv_format,
+            cfg.layers,
+            cfg.index_cache.full_count(),
+            pages,
+            sequences,
+        )
+    }
+
+    pub(crate) fn new_owned(
+        readers: Vec<Rc<Stream<'a>>>,
+        kv_format: Hy4KvCache,
+        kv_layers: usize,
+        full_index_layers: usize,
+        pages: usize,
+        sequences: usize,
+    ) -> Result<Self> {
         let first = readers
             .first()
             .context("Hy4 cache requires at least one reader stream")?;
@@ -60,11 +78,9 @@ impl<'a> Hy4CacheRank<'a> {
             "Hy4 cache reader devices differ"
         );
         ensure!(
-            pages > 0 && sequences > 0,
-            "Hy4 cache requires positive pages and sequences"
+            pages > 0 && sequences > 0 && kv_layers > 0 && full_index_layers > 0,
+            "Hy4 cache requires positive layers, pages and sequences"
         );
-        let kv_layers = cfg.layers;
-        let full_index_layers = cfg.index_cache.full_count();
         let layout = CacheLayout::new(kv_format, kv_layers, full_index_layers)?;
 
         let dsa_kv_bytes = kv_layers

@@ -481,19 +481,22 @@ fn pack_kv_b_absorbed_from_transposed(
 }
 
 impl<'a> Hy4RankWeights<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_all(
         devices: &[Device<'a>],
         programs: &'a Programs<'a>,
         checkpoint: &Checkpoint,
         cfg: &Hy4FlashConfig,
+        attention: AttentionPlacement,
         max_rows: usize,
         max_head_rows: usize,
         media: crate::shared::vision::push::Contribution,
     ) -> Result<Vec<Self>> {
         let gpus = devices.len();
         ensure!(matches!(gpus, 1 | 2), "Hy4-flash supports 1 or 2 coordinator GPUs, not {gpus}");
+        let layers_split = gpus == 2 && attention == AttentionPlacement::Layers;
         let model = hy4_plan::Model::open(checkpoint)?;
-        let modes = hy4_placement::layer_modes(cfg, gpus, AttentionPlacement::Heads);
+        let modes = hy4_placement::layer_modes(cfg, gpus, attention);
         let layouts = target_arenas(checkpoint, cfg, &model.core, &modes, gpus)?;
         ensure!(layouts.len() == gpus, "target_arenas rank count mismatch");
 
@@ -511,6 +514,7 @@ impl<'a> Hy4RankWeights<'a> {
             let mut ranks = Vec::with_capacity(gpus);
             for (rank, layout) in layouts.into_iter().enumerate() {
                 let device = devices[rank];
+                let (split_rank, split_ranks) = if layers_split { (0, 1) } else { (rank, gpus) };
                 let arena = DeviceWeightArena::new(
                     device,
                     layout.arena.clone(),
@@ -593,7 +597,7 @@ impl<'a> Hy4RankWeights<'a> {
                             let nope = cfg.qk_nope_dim;
                             let v = cfg.v_head_dim;
                             let lat = cfg.kv_lora_rank;
-                            let rect = dense_rect(checkpoint, name, rank, gpus)?;
+                            let rect = dense_rect(checkpoint, name, split_rank, split_ranks)?;
                             let heads = rect.rows.len() / (nope + v);
                             let uk_bytes = heads * lat * nope * 2;
                             let uv_bytes = heads * v * lat * 2;
@@ -609,7 +613,7 @@ impl<'a> Hy4RankWeights<'a> {
                     } else {
                         let rects = match packed_engram_rects(checkpoint, cfg, name)? {
                             Some(rects) => rects,
-                            None => vec![dense_rect(checkpoint, name, rank, gpus)?],
+                            None => vec![dense_rect(checkpoint, name, split_rank, split_ranks)?],
                         };
                         let mut bytes = 0;
                         let lands = rects.into_iter().map(|rect| {
@@ -626,7 +630,7 @@ impl<'a> Hy4RankWeights<'a> {
                 let inv_freq_dsa = inv_freq_dsa.context("Hy4-flash target arena missing inv_freq_dsa view")?;
                 let inv_freq_swa = inv_freq_swa.context("Hy4-flash target arena missing inv_freq_swa view")?;
 
-                let local_vocab = cfg.vocab_size / gpus;
+                let local_vocab = cfg.vocab_size / split_ranks;
                 let (head_ws, head) = if views.contains_key("lm_head.weight") {
                     let ws = Allocation::new(device, HEAD_WS_BYTES, Tag::workspace("hy4_flash/head-cublas-ws"))?;
                     let h = device.run(|| {
@@ -670,13 +674,14 @@ impl<'a> Hy4RankWeights<'a> {
         // the uninitialized absorbed view to execution. Only target arena
         // views are eligible: the compact inventory includes the drafter.
         for r in &ranks {
+            let (split_rank, split_ranks) = if layers_split { (0, 1) } else { (r.rank, gpus) };
             for (name, dst) in &r.views {
                 let Some(stem) = name.strip_suffix(".weight").filter(|stem| stem.ends_with(".self_attn.kv_b_proj")) else {
                     continue;
                 };
                 let Some(proj) = model.core.get(stem) else { continue };
-                let local_heads = proj.shape[0] / gpus / (cfg.qk_nope_dim + cfg.v_head_dim);
-                dequant_kv_b_trellis_absorbed(r.device, programs, checkpoint, proj, r.rank, gpus, local_heads,
+                let local_heads = proj.shape[0] / split_ranks / (cfg.qk_nope_dim + cfg.v_head_dim);
+                dequant_kv_b_trellis_absorbed(r.device, programs, checkpoint, proj, split_rank, split_ranks, local_heads,
                     cfg.qk_nope_dim, cfg.v_head_dim, cfg.kv_lora_rank, dst.buffer)?;
             }
         }
