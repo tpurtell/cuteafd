@@ -13,6 +13,8 @@ from pathlib import Path
 import sys
 
 import torch
+import torch.nn.functional as F
+from torch.overrides import TorchFunctionMode
 
 from .routing import rank_routes
 
@@ -25,6 +27,40 @@ from families.ernie55_flash import model as reference
 
 
 _MOE = "block_sparse_moe."
+
+
+class _HcaGroupInputs(TorchFunctionMode):
+    """Observe native grouped GEMMs without changing the independent reference.
+
+    The reference's shape-invariant linear pads its last tile to 128. Weight
+    views identify the group, and sequence length identifies genuine rows.
+    The observer receives a borrowed tile before GEMM, in native token order.
+    """
+
+    def __init__(self, weights, config, tokens, observe):
+        super().__init__()
+        slices = weights["self_attn.linear_o_group_proj"].view(config.o_groups, config.o_lora_rank, -1)
+        self.shape = slices.shape[1:]
+        self.groups = {weight.data_ptr(): group for group, weight in enumerate(slices)}
+        self.offsets = [0] * config.o_groups
+        self.tokens = tokens
+        self.observe = observe
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if func is F.linear and args[1].shape == self.shape:
+            group = self.groups.get(args[1].data_ptr())
+            if group is not None:
+                start = self.offsets[group]
+                count = min(len(args[0]), self.tokens - start)
+                if count <= 0:
+                    raise ValueError("unexpected repeated HCA grouped output tile")
+                self.observe(group, start, args[0][:count])
+                self.offsets[group] += count
+        return func(*args, **(kwargs or {}))
+
+    def check_complete(self):
+        if any(offset != self.tokens for offset in self.offsets):
+            raise ValueError("reference did not expose every ERNIE HCA grouped output input")
 
 
 @dataclass
@@ -69,18 +105,25 @@ class ErnieForward:
         return reference.layer_forward(hidden, weights, self.config, index, positions,
                                        enable_flashindexer=False)
 
-    def mlp_input(self, hidden, weights, index, positions, *, draft_context_kv=None):
+    def mlp_input(self, hidden, weights, index, positions, *, draft_context_kv=None, observe_hca_group=None):
         """Enter the dense or latent MLP after native/K8 attention and reference mHC."""
         c = self.config
         post, comb, inputs = reference.mhc_pre(
             hidden, weights, "self_attention_hyper_connection", weights["input_layernorm.weight"], c)
-        if draft_context_kv is not None:
-            attended = reference.hca_attention(
-                inputs, weights, c, positions, context_kv=draft_context_kv, non_causal=True, rope_mode="plain")
-        elif c.is_dsa_layer(index):
+        if draft_context_kv is None and c.is_dsa_layer(index):
+            if observe_hca_group is not None:
+                raise ValueError("HCA group observer requested for an MLA-DSA layer")
             attended = reference.mla_dsa_attention(inputs, weights, c, positions, enable_flashindexer=False)
         else:
-            attended = reference.hca_attention(inputs, weights, c, positions, rope_mode="yarn")
+            draft = draft_context_kv is not None
+            options = dict(context_kv=draft_context_kv, non_causal=draft, rope_mode="plain" if draft else "yarn")
+            if observe_hca_group is None:
+                attended = reference.hca_attention(inputs, weights, c, positions, **options)
+            else:
+                observer = _HcaGroupInputs(weights, c, len(inputs), observe_hca_group)
+                with observer:
+                    attended = reference.hca_attention(inputs, weights, c, positions, **options)
+                observer.check_complete()
         residual = reference.mhc_post(attended, hidden, post, comb)
         post, comb, x = reference.mhc_pre(
             residual, weights, "mlp_hyper_connection", weights["post_attention_layernorm.weight"], c)

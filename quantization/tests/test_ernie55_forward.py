@@ -103,3 +103,44 @@ def test_draft_context_rope_stage_head_and_markov_order(tiny):
     expected = reference.dspark_propose(taps, 2, aux, stages, outer, c, draft_rope_mode="plain",
                                         multimax_after_markov=True, eps_outside_sqrt=False)
     assert all(torch.equal(a, b) for a, b in zip(block, expected, strict=True))
+
+
+def test_hca_observer_exposes_distinct_real_inputs_for_all_eight_groups(tiny):
+    # The second tile contains exactly three real rows. Padding them to 128
+    # for shape-invariant GEMM must not increase the calibration sample count.
+    length, c = 131, tiny.config
+    hidden = torch.randn(length, c.hc_mult, c.hidden_size, generator=torch.Generator().manual_seed(3))
+    weights = tiny.load_layer(0)
+    positions = torch.arange(length)
+    captures = [[] for _ in range(c.o_groups)]
+
+    def record(group, start, tile):
+        captures[group].append((start, tile.clone()))
+
+    observed = tiny.mlp_input(hidden, weights, 0, positions, observe_hca_group=record)
+    baseline = tiny.mlp_input(hidden, weights, 0, positions)
+    assert torch.equal(observed.x, baseline.x)
+    for group in captures:
+        assert [(start, len(tile)) for start, tile in group] == [(0, 128), (128, 3)]
+    inputs = [torch.cat([tile for _, tile in chunks]) for chunks in captures]
+    assert all(rows.shape == (length, c.head_dim) for rows in inputs)
+    assert not torch.equal(inputs[0], inputs[1])
+
+    # Prove the tile actually feeds its named slice: perturb a single group's
+    # matrix and use the recorded rows to predict the delta in attention.
+    group = 3
+    name = "self_attn.linear_o_group_proj"
+    delta = torch.zeros_like(weights[name])
+    group_delta = delta.view(c.o_groups, c.o_lora_rank, -1)[group]
+    group_delta.fill_(.125)
+    _, _, x = reference.mhc_pre(hidden, weights, "self_attention_hyper_connection",
+                                weights["input_layernorm.weight"], c)
+    gate = reference.norm(reference.linear(x, weights["self_attn.linear_q_down_proj.weight"]),
+                          weights["self_attn.q_layernorm.weight"], c.rms_norm_eps)
+    gate = reference.linear(gate, weights["self_attn.gate_proj.weight"]).sigmoid()
+    # Zeroing the other groups isolates this slice without subtractive cancellation.
+    isolated = torch.zeros_like(gate)
+    isolated[:, group*c.o_lora_rank:(group+1)*c.o_lora_rank] = reference.linear(inputs[group], group_delta)
+    expected = reference.linear(isolated * gate, weights["self_attn.o_proj.weight"])
+    actual = reference.hca_attention(x, weights | {name: delta}, c, positions)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
