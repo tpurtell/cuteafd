@@ -47,6 +47,8 @@ pub(crate) enum Section {
     SparkRouter,
     /// Shared expert FFN launched after staging, ahead of the landed wait.
     SparkShared,
+    /// Onboarded TP2 EXL3 routed experts under `layers` placement (runs in parallel on both ranks).
+    Tp2Expert,
     /// Post-FFN combine + norm + iHC post (TP2 or Spark-routed).
     FfnFinish,
     /// Rank-0 final layer post-FFN combine + norm + iHC post + terminal `hc_head`.
@@ -288,6 +290,7 @@ mod tests {
                     Section::FfnFrontend,
                     Section::SparkRouter,
                     Section::SparkShared,
+                    Section::Tp2Expert,
                     Section::FfnFinish,
                 ] {
                     for rows in [1, 4, 16, 64] {

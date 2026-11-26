@@ -39,6 +39,9 @@ pub(crate) struct Hy4RankWeights<'a> {
     pub(crate) device: Device<'a>,
     pub(crate) rank: usize,
     pub(crate) gpus: usize,
+    /// Per-layer tensor shard rank/world (1/0 for TP1 or 2-GPU `layers`; rank/2 for `heads`/`context`).
+    pub(crate) layer_split_rank: usize,
+    pub(crate) layer_split_ranks: usize,
     pub(crate) layout: CoordinatorWeights,
     /// Single packed backing for all target weights & globals on this GPU.
     pub(crate) arena: DeviceWeightArena<'a>,
@@ -56,20 +59,23 @@ pub(crate) struct Hy4RankWeights<'a> {
 impl<'a> Hy4RankWeights<'a> {
     /// Allocate each rank's packed target weight arena and record (or mount) all
     /// non-dequantized target tensors into the active dense loader.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_all(
         devices: &[Device<'a>],
         programs: &'a Programs<'a>,
         checkpoint: &Checkpoint,
         cfg: &Hy4Config,
+        attention: AttentionPlacement,
         max_rows: usize,
         max_head_rows: usize,
     ) -> Result<Vec<Self>> {
         let gpus = devices.len();
         ensure!(matches!(gpus, 1 | 2), "Hy4 supports 1 or 2 coordinator GPUs, not {gpus}");
         let model = hy4_plan::Model::open(checkpoint)?;
-        let modes = hy4_placement::layer_modes(cfg, gpus, AttentionPlacement::Heads);
+        let modes = hy4_placement::layer_modes(cfg, gpus, attention);
         let layouts = target_arenas(checkpoint, cfg, &model.core, &modes, gpus)?;
         ensure!(layouts.len() == gpus, "Hy4 target_arenas rank count mismatch");
+        let whole_layers = gpus == 1 || attention == AttentionPlacement::Layers;
 
         let library = devices[0].library;
         let dense = DenseLoad::mount(library);
@@ -85,6 +91,8 @@ impl<'a> Hy4RankWeights<'a> {
         let mut ranks = Vec::with_capacity(gpus);
         for (rank, layout) in layouts.into_iter().enumerate() {
             let device = devices[rank];
+            let layer_split_ranks = if whole_layers { 1 } else { gpus };
+            let layer_split_rank = if whole_layers { 0 } else { rank };
             let arena = DeviceWeightArena::new(
                 device,
                 layout.arena.clone(),
@@ -174,7 +182,13 @@ impl<'a> Hy4RankWeights<'a> {
                         let nope = cfg.qk_nope_dim;
                         let v = cfg.v_head_dim;
                         let lat = cfg.kv_lora_rank;
-                        let rect = dense_rect(checkpoint, name, rank, gpus, core_split)?;
+                        let rect = dense_rect(
+                            checkpoint,
+                            name,
+                            layer_split_rank,
+                            layer_split_ranks,
+                            core_split,
+                        )?;
                         let heads = rect.rows.len() / (nope + v);
                         let uk_bytes = heads * lat * nope * 2;
                         let uv_bytes = heads * v * lat * 2;
@@ -209,7 +223,13 @@ impl<'a> Hy4RankWeights<'a> {
                         )?;
                     }
                 } else {
-                    let rect = dense_rect(checkpoint, name, rank, gpus, core_split)?;
+                    let rect = dense_rect(
+                        checkpoint,
+                        name,
+                        layer_split_rank,
+                        layer_split_ranks,
+                        core_split,
+                    )?;
                     let bytes = rect.bytes();
                     ensure!(
                         bytes == alloc.buffer.bytes,
@@ -227,7 +247,7 @@ impl<'a> Hy4RankWeights<'a> {
             }
 
             let inv_freq = inv_freq.context("Hy4 target arena missing inv_freq view")?;
-            let local_vocab = cfg.vocab_size / gpus;
+            let local_vocab = cfg.vocab_size / layer_split_ranks;
             let (head_ws, head) = if views.contains_key("lm_head.weight") {
                 let ws = Allocation::new(
                     device,
@@ -255,6 +275,8 @@ impl<'a> Hy4RankWeights<'a> {
                 device,
                 rank,
                 gpus,
+                layer_split_rank,
+                layer_split_ranks,
                 layout,
                 arena,
                 views,
@@ -278,7 +300,6 @@ impl<'a> Hy4RankWeights<'a> {
         cfg: &Hy4Config,
     ) -> Result<()> {
         let model = hy4_plan::Model::open(checkpoint)?;
-        let gpus = ranks.len();
         for r in ranks {
             for (name, dst) in &r.views {
                 let Some(stem) = name
@@ -290,14 +311,15 @@ impl<'a> Hy4RankWeights<'a> {
                 let Some(proj) = model.core.get(stem) else {
                     continue;
                 };
-                let local_heads = proj.shape[0] / gpus / (cfg.qk_nope_dim + cfg.v_head_dim);
+                let local_heads =
+                    proj.shape[0] / r.layer_split_ranks / (cfg.qk_nope_dim + cfg.v_head_dim);
                 dequant_kv_b_trellis_absorbed_with(
                     r.device,
                     programs,
                     checkpoint,
                     proj,
-                    r.rank,
-                    gpus,
+                    r.layer_split_rank,
+                    r.layer_split_ranks,
                     local_heads,
                     cfg.qk_nope_dim,
                     cfg.v_head_dim,
@@ -310,11 +332,13 @@ impl<'a> Hy4RankWeights<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn load_all(
         devices: &[Device<'a>],
         programs: &'a Programs<'a>,
         checkpoint: &Checkpoint,
         cfg: &Hy4Config,
+        attention: AttentionPlacement,
         max_rows: usize,
         max_head_rows: usize,
         media: crate::shared::vision::push::Contribution,
@@ -323,7 +347,7 @@ impl<'a> Hy4RankWeights<'a> {
             &checkpoint.snapshot,
             devices,
             media,
-            || Self::record_all(devices, programs, checkpoint, cfg, max_rows, max_head_rows),
+            || Self::record_all(devices, programs, checkpoint, cfg, attention, max_rows, max_head_rows),
         )?;
         Self::finish_kv_b(&ranks, programs, checkpoint, cfg)?;
         Ok(ranks)

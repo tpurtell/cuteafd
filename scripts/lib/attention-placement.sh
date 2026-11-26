@@ -32,12 +32,10 @@ release_check_attention_placement() {
     *:muse_spark) release_die "Muse has no context/layers attention executor: native attention splits heads" ;;
     *:inkling2) release_die "inkling2 supports heads attention only; context and layers are not implemented" ;;
     *:inkling2_mini) release_die "inkling2_mini attention placement is TP1-only (heads); context and layers are not implemented" ;;
-    layers:hy4_flash) release_die "hy4_flash supports context (2-GPU default) or explicit heads attention; layers is not implemented" ;;
-    layers:hy4) release_die "hy4 supports context (2-GPU default) or explicit heads attention; layers is not implemented" ;;
     auto:*|heads:*|context:glm5|context:glm5_flash|context:deepseek_v4|context:hy4_flash|context:hy4|layers:qwen4|layers:qwen3_5) ;;
     # K4/P7 qualified explicit layers; context remains the recorded auto default.
     # The planner still requires the selected image's executor and native programs.
-    layers:glm5|layers:glm5_flash)
+    layers:glm5|layers:glm5_flash|layers:hy4_flash|layers:hy4)
       echo "note: $family attention placement layers explicitly selected; auto remains context on two GPUs" >&2 ;;
     context:*|layers:*) release_die "$family cannot run attention placement $attention_placement: executor not implemented; only heads is qualified" ;;
     *) release_die "ATTENTION_PLACEMENT must be auto, context, layers or heads" ;;

@@ -628,15 +628,23 @@ impl Hy4Inputs {
 
         // Packed rank scratch arena + packed per-wave scratch arenas (with per-wave IndexCache selection).
         let context_split = self.modes.iter().any(|m| *m == LayerMode::ContextSplit);
+        let layers_split =
+            self.gpus == 2 && self.modes.iter().all(|m| matches!(m, LayerMode::Whole { .. }));
+        let layer_tp = if layers_split { 1 } else { self.gpus };
         let max_seq_pages = usize::try_from(self.context.maximum)
             .map_err(|_| Refusal::Overflow("Hy4 context pages"))?
             .div_ceil(PAGE_ROWS)
             .max(16);
-        let local_vocab = cfg.vocab_size / self.gpus;
-        let shared = SharedScratchLayout::new(
+        let local_vocab = if self.gpus == 2 && !layers_split {
+            cfg.vocab_size / self.gpus
+        } else {
+            cfg.vocab_size
+        };
+        let shared = SharedScratchLayout::new_for_layers(
             cfg,
             gpu,
             self.gpus,
+            layers_split,
             capacity_rows,
             self.decode_rows as usize,
             local_vocab,
@@ -660,7 +668,7 @@ impl Hy4Inputs {
                 cfg,
                 gpu,
                 slot,
-                self.gpus,
+                layer_tp,
                 capacity_rows,
                 max_seq_pages,
                 self.sequences as usize,
@@ -794,10 +802,12 @@ impl Recipe for Hy4Inputs {
         for gpu in 0..self.gpus {
             components.extend(self.rank_owners(gpu, maximum)?);
         }
+        let layers_split = pair && self.modes.iter().all(|m| matches!(m, LayerMode::Whole { .. }));
         if let Some(geometry) = &self.expert_usage {
+            let usage_gpus: &[u8] = if layers_split { &[0, 1] } else { &[0] };
             components.extend(crate::placement::expert_usage::components(
                 geometry,
-                &[0],
+                usage_gpus,
                 maximum,
             )?);
         }
@@ -844,18 +854,11 @@ impl Recipe for Hy4Inputs {
 
         let spec = self.hop_spec();
         let hops = plan_hops(&self.modes, &spec).map_err(invalid)?;
-        let hop_bytes = crate::placement::hop_buffer_bytes(&hops, &spec, self.gpus)
-            .ok_or(Refusal::Overflow("Hy4 residual hop buffers"))?;
-        for (gpu, &bytes) in hop_bytes.iter().enumerate() {
-            components.extend(buffer(
-                format!("hy4.hops.{gpu}"),
-                Location::coordinator(gpu as u8),
-                bytes,
-                Lifetime::TARGET,
-                Category::Transport,
-                "iHC residual hops",
-                maximum,
-            ));
+        if self.gpus == 2 && self.placement == AttentionPlacement::Layers && !hops.is_empty() {
+            let layout = crate::placement::HopLinkLayout::new(&hops, &spec)
+                .ok_or(Refusal::Overflow("Hy4 residual hop buffers"))?;
+            components.extend(layout.receive_components("hy4.hops", Lifetime::TARGET, maximum));
+            components.extend(layout.control_components("hy4.hops", Lifetime::TARGET, maximum));
         }
 
         let counts = self.counts();
