@@ -404,7 +404,12 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
 
     engine.dump_dir = args.dump_dir.clone();
     if args.decode_graphs {
-        engine.configure_graphs()?;
+        use cuteafd_loader::families::hy4::graph_reserve;
+        let layout = graph_reserve::Layout::resolve(devices.len(), args.peers.len(), attention);
+        let policies: Vec<_> = (0..devices.len())
+            .map(|rank| graph_reserve::reserve_policy(layout, rank))
+            .collect::<std::result::Result<_, _>>()?;
+        engine.configure_graphs(&policies)?;
     }
 
     if !args.resume_at.is_empty() {

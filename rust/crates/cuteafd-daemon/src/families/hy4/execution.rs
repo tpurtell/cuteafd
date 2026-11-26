@@ -1936,9 +1936,13 @@ impl<'a> Hy4Engine<'a> {
         self.count_expert_usage = self.expert_usage.is_some();
     }
 
-    pub(crate) fn configure_graphs(&mut self) -> Result<()> {
-        for (rank, r) in self.ranks.iter_mut().enumerate() {
-            r.graphs.attach(r.device.library, r.device.id, rank)?;
+    pub(crate) fn configure_graphs(
+        &mut self,
+        policies: &[cuteafd_loader::placement::graph_reserve::Resolved],
+    ) -> Result<()> {
+        ensure!(policies.len() == self.ranks.len(), "Hy4 graph policy rank count mismatch");
+        for (r, &policy) in self.ranks.iter_mut().zip(policies) {
+            r.graphs.attach(r.device.library, r.device.id, policy)?;
         }
         let streams: Vec<(i32, *mut std::ffi::c_void)> = self
             .ranks
