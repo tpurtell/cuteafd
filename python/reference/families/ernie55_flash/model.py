@@ -23,8 +23,6 @@ from families.hy4_common import (
     configure_f32,
     inverse_rms,
     norm,
-    phase,
-    phase_split_half,
     rotate,
     rotate_split_half,
     rotate_tail,
@@ -492,6 +490,30 @@ class Checkpoint(_BaseCheckpoint):
         else:
             result["experts"] = LazyExpertStore(self, prefix)
         return result
+
+
+def _inv_freq(width: int, base: float, device: torch.device) -> torch.Tensor:
+    # Compute 1 / base**(2k/d) in float64 before casting to float32 so CUDA powf
+    # does not drift by 1 ULP from glibc pow at base=8e6 and pos=131072.
+    return (1.0 / (base ** (torch.arange(0, width, 2, dtype=torch.float64) / width))).to(
+        device=device, dtype=torch.float32
+    )
+
+
+def phase(positions: torch.Tensor, width: int, base: float) -> tuple[torch.Tensor, torch.Tensor]:
+    freq = positions.float().unsqueeze(-1) * _inv_freq(width, base, positions.device)
+    return (
+        torch.cos(freq).repeat_interleave(2, dim=-1).unsqueeze(1),
+        torch.sin(freq).repeat_interleave(2, dim=-1).unsqueeze(1),
+    )
+
+
+def phase_split_half(positions: torch.Tensor, width: int, base: float) -> tuple[torch.Tensor, torch.Tensor]:
+    freq = positions.float().unsqueeze(-1) * _inv_freq(width, base, positions.device)
+    return (
+        torch.cos(freq).repeat(1, 2).unsqueeze(1),
+        torch.sin(freq).repeat(1, 2).unsqueeze(1),
+    )
 
 
 def yarn_phase(

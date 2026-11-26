@@ -116,11 +116,18 @@ SEMANTICS = {
         "union full 7-token draft block) -> mtp.mhc_contract (head_hidden) -> mtp.norm -> target lm_head -> "
         "sequential Markov walk (markov_w1.T embedding -> markov_w2 linear bias) and confidence_head "
         "(sigmoid(proj(cat([head_hidden, markov_embed])))). "
-        "Disagreements under 2x2 empirical measurement on real weights: "
-        "(1) Draft RoPE: vLLM-ERNIE (nvidia/dspark.py:128-135) uses plain RoPE theta=8e6 vs SGLang "
-        "(models/ernie55_dspark.py:88-95) uses YaRN compress_rope_theta=160000; "
-        "(2) Multimax order: vLLM-ERNIE (nvidia/dspark.py:266-274, test_dspark_draft_multimax.py) applies multimax "
-        "AFTER adding Markov bias vs SGLang (models/ernie55_dspark.py:350-361) applies multimax BEFORE Markov bias."
+        "Disagreements resolved by 2x2 empirical draft-acceptance measurement on real weights (20 held-out prompts, "
+        "lengths 128..1024, teacher-forced against the 43-layer IEEE-F32 target's greedy tokens): "
+        "(1) Multimax order: vLLM-ERNIE (nvidia/dspark.py:266-274, multimax AFTER Markov bias) decisively beats "
+        "SGLang (models/ernie55_dspark.py:350-361, multimax BEFORE Markov bias) on both RoPE modes: "
+        "plain+after mean_acc=2.200 (1+acc=3.200, pos=[0.65,0.55,0.30,0.25,0.20,0.15,0.10], raw_match_mean=0.593) "
+        "vs plain+before 1.350 (+0.850 +/- 0.443 SE), and yarn+after 2.300 vs yarn+before 1.700 (+0.600 +/- 0.438 SE). "
+        "(2) Draft RoPE at multimax-after: vLLM-ERNIE plain RoPE theta=8e6 (nvidia/dspark.py:128-135, mean_acc=2.200, "
+        "raw_match=[0.65,0.80,0.50,0.65,0.50,0.60,0.45], mean_conf=0.6126) vs SGLang YaRN compress theta=160000 "
+        "(models/ernie55_dspark.py:88-95, mean_acc=2.300, raw_match=[0.65,0.80,0.50,0.55,0.50,0.35,0.35], "
+        "mean_conf=0.5724) are within noise on prefix acceptance (paired diff -0.100 +/- 0.250 SE, 3W-3L-14T), with "
+        "plain RoPE stronger on unconditional per-position match (+6.4%) and confidence (16/20 prompts). Per main "
+        "ruling, defaults follow vLLM-ERNIE (authority #1): draft_rope_mode='plain' and multimax_after_markov=True."
     ),
 }
 
