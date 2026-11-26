@@ -112,6 +112,13 @@ fn scoring_replay(
     Ok(logits)
 }
 
+/// Rows the scheduler hands one prefill call: the full multi-wave span, so
+/// `sequence_units` cuts it into `waves` units that overlap on the Spark
+/// exchange. One unit per call serialized the waves (#2550).
+fn prefill_span(unit_rows: usize, waves: usize) -> usize {
+    unit_rows * waves.max(1)
+}
+
 pub(crate) struct Hy4Backend<'a> {
     engine: RefCell<Hy4Engine<'a>>,
     family: Hy4Prefix<'a>,
@@ -301,7 +308,7 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
             vocab_size: self.vocab,
             max_context: self.context,
             slots: self.concurrency,
-            prefill_rows: self.unit_rows,
+            prefill_rows: prefill_span(self.unit_rows, self.prefill_waves),
             decode_rows: self.decode_rows,
         }
     }
@@ -797,6 +804,37 @@ mod tests {
         }
         assert_eq!(first.len, 17);
         assert!(scoring_replay(&mut [(&mut first, &[1])], true, &mut decode, &mut accept).is_err());
+        Ok(())
+    }
+
+    /// The scheduler chunks a prompt at `geometry().prefill_rows`; `prefill_device`
+    /// then cuts each chunk into wave units. At the shipping 1x RTX + 4 Spark shape
+    /// (3 x 2752) an 8K prompt must run as one call of three overlapped units, not
+    /// three serial calls of [1408, 1344], [1408, 1344], [2688] (#2550).
+    #[test]
+    fn scheduler_geometry_hands_prefill_the_full_wave_span() -> Result<()> {
+        use cuteafd_loader::serving_capacity::prefill_waves::{prefill_shape, PrefillOverrides, PrefillPlan};
+        let shape = prefill_shape(4, cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::hy4_flash::HY4_FLASH),
+            PrefillOverrides::default())?;
+        assert_eq!(shape, PrefillPlan { unit_rows: 2752, waves: 3, span_rows: 8256 });
+        let (unit_rows, waves) = (shape.unit_rows as usize, shape.waves as usize);
+        let rows = prefill_span(unit_rows, waves);
+        assert_eq!(rows as u64, shape.span_rows);
+        let policy = cuteafd_engine::prefix::PointPolicy { gap: 0, boundaries: 0, per_request: 0 };
+        let calls = cuteafd_engine::prefix::plan_points(0, 8192, rows, &[], 0, 0, policy).chunks;
+        assert_eq!(calls, vec![8192]);
+        let units = sequence_units(8192, unit_rows, waves, 1)?;
+        assert_eq!(units.iter().map(|u| (u.rows.clone(), u.slot)).collect::<Vec<_>>(),
+            vec![(0..2752, 0), (2752..5504, 1), (5504..8192, 2)]);
+        // The old one-unit geometry: three serial calls, five units, two in flight at most.
+        let old = cuteafd_engine::prefix::plan_points(0, 8192, unit_rows, &[], 0, 0, policy).chunks;
+        assert_eq!(old, vec![2752, 5504, 8192]);
+        assert_eq!(sequence_units(2752, unit_rows, waves, 1)?.iter().map(|u| u.rows.len()).collect::<Vec<_>>(),
+            vec![1408, 1344]);
+        // `geometry()` composes exactly this span.
+        let backend = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(backend.contains("prefill_rows: prefill_span(self.unit_rows, self.prefill_waves),"));
+        assert_eq!(prefill_span(4096, 1), 4096);
         Ok(())
     }
 

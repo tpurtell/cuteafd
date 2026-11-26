@@ -230,7 +230,12 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         .bytes,
         Coordinator::Measured { loaded_code, .. } => *loaded_code,
     };
-    let graph_reserve = crate::serving_capacity::inkling2_mini_graphs::policy(0)
+    let graph_keys = crate::serving_capacity::inkling2_mini_graphs::KeySpace::for_config(
+        request.sequences,
+        DECODE_ROWS,
+        request.drafter.is_some() || request.dflash.is_some(),
+    );
+    let graph_reserve = crate::serving_capacity::inkling2_mini_graphs::policy(0, graph_keys)
         .map_err(|error| refused(format!("Inkling 2 Mini graph reserve refused: {error}"), "Fix GPU_GRAPH_RESERVE."))?
         .bytes;
 
