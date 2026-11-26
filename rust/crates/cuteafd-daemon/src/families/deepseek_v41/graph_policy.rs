@@ -119,7 +119,7 @@ pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize, lanes: 
     tracing::warn!("V4.1 graph cache uses byte estimates: SM120 node rates are not calibrated");
     set_layout(ranks);
     visit(&mut |device, name, spans, bank| {
-        let policy = cuteafd_loader::placement::graph_reserve::v41_current(ranks, device as usize, lanes)
+        let policy = cuteafd_loader::placement::graph_reserve::v41_current(ranks, device as usize, lanes, max_decode_rows())
             .map_err(anyhow::Error::msg)?;
         bank.attach(library, device, policy.bytes, Site { name: site_name(name), cycle: Cycle::Other,
             preference: Preference::Adaptive, bootstrap: 2 << 20, basis: Basis::Bytes,
