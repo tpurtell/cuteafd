@@ -173,11 +173,12 @@ impl<'a> Hy4Graphs<'a> {
             self.first_touch_pending.set(true);
             return work();
         }
-        if let Some(raw) = self.bank.borrow_mut().cached_launch(&key).map(|graph| graph.raw) {
+        let cached = self.bank.borrow_mut().cached_launch(&key).map(|graph| graph.raw);
+        if let Some(raw) = cached {
             return stream.device.run(|| {
                 // SAFETY: containing Hy4Engine retains weights, cache, scratch, and EXL3 owners;
                 // all rank streams drain before terminal clear or storage drop.
-                unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw) }
+                unsafe { crate::shared::decode_graph::launch(&stream.device.library, raw, stream.raw, self.bank.borrow().launch_tally()) }
             });
         }
         let Some(mut ticket) = self
@@ -233,7 +234,7 @@ impl<'a> Hy4Graphs<'a> {
                 .borrow_mut()
                 .cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
             // SAFETY: committed executable retains the same persistent pointer contract.
-            unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw) }
+            unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw, self.bank.borrow().launch_tally()) }
         })
     }
 }

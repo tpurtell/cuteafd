@@ -65,18 +65,21 @@ struct DeviceBinding {
     pinned_hits: u64,
     pinned_counts: Vec<(u64, u64)>,
     touched: Vec<usize>,
+    launches: std::sync::Arc<super::device::BankLaunches>,
     clocks: std::sync::Arc<[super::device::EpochClock; 2]>,
     lane: usize,
 }
 
 impl DeviceBinding {
     fn flush(&mut self, cache: &mut super::device::DeviceCache) {
-        if std::mem::take(&mut self.pinned_hits) == 0 { return }
-        cache.sample_clock();
-        for slot in self.touched.drain(..) {
-            let (id, count) = &mut self.pinned_counts[slot];
-            cache.batched_hits(*id, self.site.cycle, std::mem::take(count));
+        if std::mem::take(&mut self.pinned_hits) > 0 {
+            cache.sample_clock();
+            for slot in self.touched.drain(..) {
+                let (id, count) = &mut self.pinned_counts[slot];
+                cache.batched_hits(*id, self.site.cycle, std::mem::take(count));
+            }
         }
+        cache.fold_bank_launches(&self.launches);
     }
 }
 
@@ -216,9 +219,14 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub fn attach_device(&mut self, library: &cuteafd_ffi::NativeLibrary, device: i32, reserve: u64, site: super::device::Site) -> anyhow::Result<()> {
         anyhow::ensure!(self.entries.is_empty() && self.device.is_none(), "graph bank already attached or populated");
         let cache = super::device::device_cache(library, device, reserve, site.basis)?;
-        let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
-        let (clocks, lane) = cache.lock().unwrap_or_else(|p| p.into_inner()).bank_clock(bank);
-        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new(), touched: Vec::new(), clocks, lane });
+        let (bank, launches, clocks, lane) = {
+            let mut controller = cache.lock().unwrap_or_else(|p| p.into_inner());
+            let bank = controller.bank();
+            let launches = controller.register_bank_launches(bank, site.name, site.cycle);
+            let (clocks, lane) = controller.bank_clock(bank);
+            (bank, launches, clocks, lane)
+        };
+        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new(), touched: Vec::new(), launches, clocks, lane });
         Ok(())
     }
 
@@ -228,10 +236,23 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         anyhow::ensure!(device < 0, "policy fixtures require a synthetic device");
         anyhow::ensure!(self.entries.is_empty() && self.device.is_none(), "graph bank already attached or populated");
         let cache = super::device::device_cache_sampled(device, reserve, site.basis, || Ok((0, 0, 0, 0, 0)))?;
-        let bank = cache.lock().unwrap_or_else(|p| p.into_inner()).bank();
-        let (clocks, lane) = cache.lock().unwrap_or_else(|p| p.into_inner()).bank_clock(bank);
-        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new(), touched: Vec::new(), clocks, lane });
+        let (bank, launches, clocks, lane) = {
+            let mut controller = cache.lock().unwrap_or_else(|p| p.into_inner());
+            let bank = controller.bank();
+            let launches = controller.register_bank_launches(bank, site.name, site.cycle);
+            let (clocks, lane) = controller.bank_clock(bank);
+            (bank, launches, clocks, lane)
+        };
+        self.device = Some(DeviceBinding { cache, bank, site, pinned_hits: 0, pinned_counts: Vec::new(), touched: Vec::new(), launches, clocks, lane });
         Ok(())
+    }
+
+    pub fn launch_tally(&self) -> Option<&super::device::BankLaunches> {
+        self.device.as_ref().map(|binding| binding.launches.as_ref())
+    }
+
+    pub fn record_launch(&self) {
+        if let Some(tally) = self.launch_tally() { tally.record(); }
     }
 
     /// Change attribution at a whole-cycle boundary, retaining the pinned-hit
@@ -239,14 +260,14 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub fn cache_cycle(&mut self, cycle: super::device::Cycle) {
         if let Some(binding) = &mut self.device {
             if binding.site.cycle == cycle { return }
-            let shared = binding.cache.clone();
-            let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
-            cache.sample_clock();
-            if binding.site.cycle != cycle {
+            if binding.pinned_hits > 0 || binding.launches.has_pending() {
+                let shared = binding.cache.clone();
+                let mut cache = shared.lock().unwrap_or_else(|p| p.into_inner());
+                cache.sample_clock();
                 binding.flush(&mut cache);
-                cache.bank_cycle(binding.bank, cycle);
-                binding.site.cycle = cycle;
             }
+            binding.site.cycle = cycle;
+            binding.launches.set_cycle(cycle);
         }
     }
 
@@ -358,7 +379,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub fn cache_clear_drained(&mut self) {
         if let Some(binding) = &self.device {
             let ids: Vec<_> = self.entries.values().filter_map(|entry| entry.cached.map(|(id, _)| id)).collect();
-            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(&ids);
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native(&ids);
         }
         self.entries.clear();
         self.cache_keys.clear();
@@ -371,6 +392,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             let lane = cache.bank_lane(binding.bank);
             cache.remove_bank(binding.bank);
             cache.assign_bank_lane(binding.bank, lane);
+            cache.reattach_bank_launches(binding.bank, std::sync::Arc::clone(&binding.launches));
         }
     }
 
@@ -379,7 +401,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         let keys: Vec<_> = self.entries.keys().filter(|key| matches(key)).cloned().collect();
         let ids: Vec<_> = keys.iter().filter_map(|key| self.entries.get(key)?.cached.map(|(id, _)| id)).collect();
         if let Some(binding) = &self.device {
-            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(&ids);
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native(&ids);
         }
         for key in keys { self.entries.remove(&key); }
         if let Some(binding) = &self.device {
@@ -446,7 +468,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
             self.entries.iter().filter_map(|(key, entry)| entry.cached
                 .filter(|(id, _)| cache.persistent_victim_ready(*id)).map(|(id, _)| (key.clone(), id))).collect()
         };
-        binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(
+        binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native(
             &victims.iter().map(|(_, id)| *id).collect::<Vec<_>>());
         for (key, _) in &victims { self.entries.remove(key); }
         if !victims.is_empty() {
@@ -470,7 +492,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
         };
         if !victims.is_empty() {
             drain()?;
-            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native_counts(
+            binding.cache.lock().unwrap_or_else(|p| p.into_inner()).retire_native(
                 &victims.iter().map(|(_, id)| *id).collect::<Vec<_>>());
             for (key, _) in &victims { if let Some(entry) = self.entries.remove(key) { self.retired.push(entry.exec); } }
             // drain_retired's ordering, with the already completed drain proof.
@@ -1163,6 +1185,248 @@ mod device_tests {
         assert_eq!(bank.cache_keys.len(), 1);
         bank.cache_tick();
         assert!(bank.cache_keys.is_empty());
+    }
+
+    #[test]
+    fn launch_time_segments_launched_matches_full_scan_oracle_over_n_cycles() -> anyhow::Result<()> {
+        use super::super::GraphOwner;
+        use std::collections::BTreeMap;
+
+        // Test-only oracle implementing the old per-exec native counter + full-scan bank_cycle algorithm.
+        struct RefExec {
+            bank: usize,
+            site: &'static str,
+            launch_cycle: Cycle,
+            counted: u64,
+        }
+        #[derive(Default)]
+        struct FullScanOracle {
+            native_launches: HashMap<usize, u64>,
+            live: HashMap<usize, RefExec>,
+            cycles: HashMap<Cycle, u64>,
+            sites: BTreeMap<&'static str, HashMap<Cycle, u64>>,
+        }
+        impl FullScanOracle {
+            fn register(&mut self, bank: usize, site: &'static str, cycle: Cycle, exec: usize) {
+                self.native_launches.insert(exec, 0);
+                self.live.insert(exec, RefExec { bank, site, launch_cycle: cycle, counted: 0 });
+            }
+            fn launched(&mut self, exec: usize) {
+                *self.native_launches.entry(exec).or_default() += 1;
+            }
+            fn sample(&self, exec: usize) -> u64 {
+                self.native_launches.get(&exec).copied().unwrap_or(0)
+            }
+            fn flip(&mut self, bank: usize, next: Cycle) {
+                for (&exec, entry) in &mut self.live {
+                    if entry.bank != bank || entry.launch_cycle == next { continue }
+                    let total = self.native_launches.get(&exec).copied().unwrap_or(0);
+                    let delta = total.saturating_sub(entry.counted);
+                    if delta > 0 {
+                        *self.cycles.entry(entry.launch_cycle).or_default() += delta;
+                        *self.sites.entry(entry.site).or_default().entry(entry.launch_cycle).or_default() += delta;
+                        entry.counted = total;
+                    }
+                    entry.launch_cycle = next;
+                }
+            }
+            fn retire(&mut self, exec: usize) {
+                if let Some(entry) = self.live.remove(&exec) {
+                    let delta = self.sample(exec).saturating_sub(entry.counted);
+                    if delta > 0 {
+                        *self.cycles.entry(entry.launch_cycle).or_default() += delta;
+                        *self.sites.entry(entry.site).or_default().entry(entry.launch_cycle).or_default() += delta;
+                    }
+                }
+            }
+            fn snapshot(&self) -> (HashMap<Cycle, u64>, BTreeMap<&'static str, HashMap<Cycle, u64>>) {
+                let mut cycles = self.cycles.clone();
+                let mut sites = self.sites.clone();
+                for (&exec, entry) in &self.live {
+                    let delta = self.sample(exec).saturating_sub(entry.counted);
+                    if delta > 0 {
+                        *cycles.entry(entry.launch_cycle).or_default() += delta;
+                        *sites.entry(entry.site).or_default().entry(entry.launch_cycle).or_default() += delta;
+                    }
+                }
+                (cycles, sites)
+            }
+        }
+
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.quiet_events(&library, true)?;
+        fixture.configure_memory_usage(&library, 0, 256 << 20, 0)?;
+        let device = -164_501;
+
+        let mut bank_a: GraphBank<u32, GraphOwner<'_, ()>> = GraphBank::new();
+        let mut bank_b: GraphBank<u32, GraphOwner<'_, ()>> = GraphBank::new();
+        bank_a.attach_device_for_test(device, 1 << 30, Site { name: "site-a", ..site() })?;
+        bank_b.attach_device_for_test(device, 1 << 30, Site { name: "site-b", ..site() })?;
+        let mut oracle = FullScanOracle::default();
+
+        let assert_parity = |oracle: &FullScanOracle, label: &str| {
+            let (ref_cycles, ref_sites) = oracle.snapshot();
+            let snap = super::super::device::snapshots().into_iter()
+                .find(|row| row.device == device).expect("device snapshot");
+            for cycle in [Cycle::Decode, Cycle::Verify, Cycle::Prefill, Cycle::Wave, Cycle::Other] {
+                let got = snap.cycles.get(&cycle).map_or(0, |c| c.segments_launched);
+                let want = ref_cycles.get(&cycle).copied().unwrap_or(0);
+                assert_eq!(got, want, "{label}: cycle {cycle:?} segments_launched mismatch");
+                for site_name in ["site-a", "site-b"] {
+                    let got_site = snap.update_sites.get(site_name)
+                        .and_then(|m| m.get(&cycle)).map_or(0, |c| c.segments_launched);
+                    let want_site = ref_sites.get(site_name)
+                        .and_then(|m| m.get(&cycle)).copied().unwrap_or(0);
+                    assert_eq!(got_site, want_site, "{label}: site {site_name} cycle {cycle:?} mismatch");
+                }
+            }
+        };
+
+        fn capture_and_launch<'a>(
+            library: &'a cuteafd_ffi::NativeLibrary,
+            bank: &mut GraphBank<u32, GraphOwner<'a, ()>>,
+            bank_idx: usize,
+            site_name: &'static str,
+            cycle: Cycle,
+            key: u32,
+            launches: usize,
+            oracle: &mut FullScanOracle,
+        ) -> anyhow::Result<usize> {
+            let mut ticket = bank.cache_ticket(&key, false, None).expect("ticket");
+            // SAFETY: CPU fixture records no device work.
+            let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+            let (raw, nodes, width, spans, _) = ticket.complete_source(library, source, std::ptr::null_mut())?;
+            // SAFETY: fixture graph owns no device allocations.
+            let owner = unsafe { GraphOwner::new(library, 0, raw, ())? };
+            bank.cache_commit(key, owner, ticket, nodes as u64, width, spans);
+            bank.cache_measured(10);
+            oracle.register(bank_idx, site_name, cycle, raw as usize);
+            for _ in 0..launches {
+                // SAFETY: fixture submits no device work.
+                unsafe { super::super::launch(library, raw, std::ptr::null_mut(), bank.launch_tally())?; }
+                oracle.launched(raw as usize);
+            }
+            Ok(raw as usize)
+        }
+
+        // Populate both banks with initial captures and immediate first-launch counts.
+        let mut cycle_a = Cycle::Decode;
+        let mut cycle_b = Cycle::Decode;
+        for key in 0..12u32 {
+            capture_and_launch(&library, &mut bank_a, 0, "site-a", cycle_a, key, usize::from(key % 3 != 0), &mut oracle)?;
+        }
+        for key in 0..6u32 {
+            capture_and_launch(&library, &mut bank_b, 1, "site-b", cycle_b, key, 1, &mut oracle)?;
+        }
+        // Unflushed mid-cycle snapshot must already match the oracle.
+        assert_parity(&oracle, "after initial captures (unflushed)");
+
+        // Run 40 cycles mixing flips, replays, mid-cycle ticks, idle cycles, new captures, and retirements.
+        let schedule = [Cycle::Verify, Cycle::Decode, Cycle::Verify, Cycle::Prefill, Cycle::Decode, Cycle::Other];
+        let mut next_key = 100u32;
+        for step in 0..40usize {
+            let next_a = schedule[step % schedule.len()];
+            bank_a.cache_cycle(next_a);
+            oracle.flip(0, next_a);
+            cycle_a = next_a;
+
+            // Leave every 5th cycle idle on bank_a to exercise zero-launch flips.
+            if step % 5 != 0 {
+                let replays = 1 + (step % 4);
+                for k in 0..replays {
+                    let key = ((step * 3 + k) % 12) as u32;
+                    if let Some(raw) = bank_a.cached_launch(&key).map(|owner| owner.raw) {
+                        for _ in 0..(1 + (k % 2)) {
+                            // SAFETY: fixture submits no device work.
+                            unsafe { super::super::launch(&library, raw, std::ptr::null_mut(), bank_a.launch_tally())?; }
+                            oracle.launched(raw as usize);
+                        }
+                    }
+                }
+            }
+            // Check unflushed snapshot BEFORE cache_tick to prove launch_counts folds pending tallies.
+            assert_parity(&oracle, &format!("step {step} before tick"));
+
+            // Flush via cache_tick mid-cycle on odd steps.
+            if step % 2 == 1 {
+                bank_a.cache_tick();
+            }
+
+            // Flip bank_b on a different cadence to prove bank isolation.
+            if step % 3 == 0 {
+                let next_b = if cycle_b == Cycle::Decode { Cycle::Verify } else { Cycle::Decode };
+                bank_b.cache_cycle(next_b);
+                oracle.flip(1, next_b);
+                cycle_b = next_b;
+                let key = (step % 6) as u32;
+                if let Some(raw) = bank_b.cached_launch(&key).map(|owner| owner.raw) {
+                    // SAFETY: fixture submits no device work.
+                    unsafe {
+                        if super::super::census::dispatch(&library, std::ptr::null_mut(), c"layer_row", 1,
+                            Some(raw), || Ok(()))? {
+                            bank_b.record_launch();
+                            oracle.launched(raw as usize);
+                        }
+                    }
+                }
+            }
+
+            // Capture a new graph and launch it immediately, then retire an older one later.
+            if step % 7 == 2 {
+                let key = next_key;
+                next_key += 1;
+                let exec = capture_and_launch(&library, &mut bank_a, 0, "site-a", cycle_a, key, 2, &mut oracle)?;
+                if step > 10 {
+                    bank_a.cache_remove_drained(|&k| k == key);
+                    oracle.retire(exec);
+                }
+            }
+
+            assert_parity(&oracle, &format!("step {step}"));
+        }
+
+        // Exercise a donor transfer on bank_a followed by launch and cycle flip.
+        let cache = bank_a.device.as_ref().unwrap().cache.clone();
+        let live_before: HashMap<u32, usize> = bank_a.keys().into_iter()
+            .filter_map(|k| bank_a.get(&k).map(|o| (k, o.raw as usize))).collect();
+        cache.lock().unwrap().advance_for_update_fixture(0, 5);
+        let charged = super::super::device::snapshots().into_iter()
+            .find(|row| row.device == device).unwrap().charged;
+        cache.lock().unwrap().set_soft_limit_for_fixture(charged);
+        let donor_key = next_key + 50;
+        let mut ticket = bank_a.cache_ticket(&donor_key, false, None).expect("soft update ticket");
+        // SAFETY: CPU fixture records no device work.
+        let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+        let (new_raw, nodes, width, spans, _) = ticket.complete_source(&library, source, std::ptr::null_mut())?;
+        for (&k, &old_exec) in &live_before {
+            if bank_a.get(&k).is_none() {
+                oracle.retire(old_exec);
+            }
+        }
+        // SAFETY: fixture graph owns no device allocations.
+        let owner = unsafe { GraphOwner::new(&library, 0, new_raw, ())? };
+        bank_a.cache_commit(donor_key, owner, ticket, nodes as u64, width, spans);
+        oracle.register(0, "site-a", cycle_a, new_raw as usize);
+        // SAFETY: fixture submits no device work.
+        unsafe { super::super::launch(&library, new_raw, std::ptr::null_mut(), bank_a.launch_tally())?; }
+        oracle.launched(new_raw as usize);
+        assert_parity(&oracle, "after donor transfer before flip");
+        let final_cycle = if cycle_a == Cycle::Decode { Cycle::Verify } else { Cycle::Decode };
+        bank_a.cache_cycle(final_cycle);
+        oracle.flip(0, final_cycle);
+        assert_parity(&oracle, "after donor transfer and flip");
+
+        // Exercise clear_drained + reuse to verify bank_launches reattaches cleanly.
+        for (_, exec) in live_before { oracle.retire(exec); }
+        oracle.retire(new_raw as usize);
+        bank_a.cache_clear_drained();
+        capture_and_launch(&library, &mut bank_a, 0, "site-a", final_cycle, 999, 3, &mut oracle)?;
+        assert_parity(&oracle, "after clear_drained and reuse");
+
+        drop(bank_a);
+        drop(bank_b);
+        Ok(())
     }
 
     #[test]

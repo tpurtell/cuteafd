@@ -134,7 +134,7 @@ impl DsparkAttentionOutput<'_, '_> {
             return unsafe { self.execute(rows) };
         };
         let launched = unsafe {
-            crate::shared::decode_graph::launch(&self.standalone.device.library, graph, self.standalone.get()?.raw)
+            crate::shared::decode_graph::launch(&self.standalone.device.library, graph, self.standalone.get()?.raw, self.graph.launch_tally())
         };
         let drained = self.synchronize();
         launched.and(drained)?;

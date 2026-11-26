@@ -561,7 +561,7 @@ static int hc_is_recording(void *stream) {
 }
 static int capture_status;
 void fixture_configure_capture(int status) { capture_status = status; }
-struct graph_exec { int device; size_t bytes; int invalid; uint64_t launches; int uploaded; void *uploaded_stream; };
+struct graph_exec { int device; size_t bytes; int invalid; int uploaded; void *uploaded_stream; };
 int cuteafd_cuda_graph_end_capture(void *stream, void **out) {
     if (hc_is_recording(stream)) hc_recording = 0;
     if (capture_status) return capture_status;
@@ -569,7 +569,6 @@ int cuteafd_cuda_graph_end_capture(void *stream, void **out) {
     if (!graph) return 1;
     graph->device = current_device;
     graph->invalid = 0;
-    graph->launches = 0;
     graph->uploaded = 0;
     graph->uploaded_stream = NULL;
     graph->bytes = graph_bytes;
@@ -632,7 +631,6 @@ int cuteafd_cuda_graph_source_transfer(void *source, void *donor, void **out) {
     struct graph_exec *next = malloc(sizeof(*next));
     if (!next) return 1;
     *next = *old;
-    next->launches = 0;
     next->uploaded = 0;
     next->uploaded_stream = NULL;
     old->invalid = 1;
@@ -661,12 +659,8 @@ int cuteafd_cuda_graph_launch(void *handle, void *stream) {
     (void)stream;
     struct graph_exec *graph = handle;
     if (!graph || graph->invalid || graph->device != current_device) return 1;
-    ++graph->launches;
     event('L');
     return 0;
-}
-int cuteafd_cuda_graph_launch_count(void *handle, uint64_t *out) {
-    *out = ((struct graph_exec *)handle)->launches; return 0;
 }
 int cuteafd_cuda_graph_exec_destroy(void *handle) {
     struct graph_exec *graph = handle;

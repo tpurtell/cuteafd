@@ -257,7 +257,7 @@ impl DsparkMainContext<'_, '_> {
             return unsafe { self.execute(rows) };
         };
         let launched = unsafe {
-            crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw)
+            crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw, self.graph.launch_tally())
         };
         let drained = self.synchronize();
         launched.and(drained)?;

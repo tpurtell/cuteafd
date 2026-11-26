@@ -702,7 +702,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
         };
         ensure!(count == rows, "backbone router captured rows differ");
         let launched = unsafe {
-            crate::shared::decode_graph::launch(&self.stream().library, graph, self.stream().raw)
+            crate::shared::decode_graph::launch(&self.stream().library, graph, self.stream().raw, self.graphs.launch_tally())
         };
         // Device-read routes ([`Self::device_read`]): later stages join the
         // chain; the remote layer's collect is its host wait.
@@ -860,8 +860,8 @@ impl<'a> BackboneRouterWave<'_, 'a> {
             self.stage_inputs(input.values, image_mask)?;
             let graph = if self.window.is_windowed() { None } else { self.graphs.cached_launch(self.layer, self.weights, rows).map(|(raw, _)| raw) };
             let library = self.stream().library; let stream = self.stream().raw;
-            crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
-                graph, || self.enqueue(rows))?;
+            if crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+                graph, || self.enqueue(rows))? { self.graphs.record_launch(); }
             self.record_routes(rows, Some(phase))
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }

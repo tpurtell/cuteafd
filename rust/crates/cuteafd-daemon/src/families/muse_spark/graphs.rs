@@ -41,9 +41,10 @@ impl<'a> Graphs<'a> {
     pub(crate) fn cycle(&self, cycle: Cycle) { self.bank.borrow_mut().cache_cycle(cycle); }
 
     pub(crate) fn run(&self, key: Key, stream: *mut c_void, mut segment: impl FnMut() -> Result<()>) -> Result<()> {
-        if let Some(raw) = self.bank.borrow_mut().cached_launch(&key).map(|graph| graph.raw) {
+        let cached = self.bank.borrow_mut().cached_launch(&key).map(|graph| graph.raw);
+        if let Some(raw) = cached {
             // SAFETY: the backend retains rank storage and drains before dropping the banks.
-            return unsafe { crate::shared::decode_graph::launch(&self.device.library, raw, stream) };
+            return unsafe { crate::shared::decode_graph::launch(&self.device.library, raw, stream, self.bank.borrow().launch_tally()) };
         }
         if self.singleton.borrow().contains(&key) { return segment(); }
         let Some(mut ticket) = self.bank.borrow_mut().cache_ticket(&key, self.pins.borrow().contains(&key.rows), None) else { return segment() };
@@ -89,7 +90,7 @@ impl<'a> Graphs<'a> {
         let graph = unsafe { GraphOwner::new(self.device.library, self.device.id, raw, ())? };
         self.bank.borrow_mut().cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
         // SAFETY: newly captured executable, with the same persistent operands.
-        unsafe { crate::shared::decode_graph::launch(&self.device.library, raw, stream) }
+        unsafe { crate::shared::decode_graph::launch(&self.device.library, raw, stream, self.bank.borrow().launch_tally()) }
     }
 
     pub(crate) fn retains_rows(&self, rows: usize) -> bool {

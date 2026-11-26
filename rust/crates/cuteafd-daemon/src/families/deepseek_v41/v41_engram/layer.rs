@@ -433,7 +433,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         };
         let launched = unsafe {
             self.stage_inputs(residual, gathered)?;
-            crate::shared::decode_graph::launch(&self.weights.library, graph, self.storage.stream.raw)
+            crate::shared::decode_graph::launch(&self.weights.library, graph, self.storage.stream.raw, self.graphs.launch_tally())
         };
         launched.and(self.synchronize())?;
         self.ready_rows = Some(rows);
@@ -451,8 +451,9 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
             crate::shared::memory::chain::join(self.weights.library, self.storage.stream.raw)?;
             self.acquire_scratch()?;
             self.enqueue_inputs(residual, gathered)?;
-            crate::shared::decode_graph::census::dispatch(self.weights.library, self.storage.stream.raw, c"layer_row",
-                gathered.rows, graph, || self.enqueue(gathered.rows))
+            if crate::shared::decode_graph::census::dispatch(self.weights.library, self.storage.stream.raw, c"layer_row",
+                gathered.rows, graph, || self.enqueue(gathered.rows))? { self.graphs.record_launch(); }
+            Ok(())
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         if cold && !self.window.is_windowed() && crate::families::deepseek_v41::graph_policy::captures_shape(gathered.rows as u32)

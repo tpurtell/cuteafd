@@ -345,7 +345,7 @@ impl<'a> BackboneSharedWave<'_, 'a> {
         };
         ensure!(count == rows, "shared FFN captured rows differ");
         let launched = unsafe {
-            crate::shared::decode_graph::launch(&self.stream().library, graph, self.stream().raw)
+            crate::shared::decode_graph::launch(&self.stream().library, graph, self.stream().raw, self.graphs.launch_tally())
         };
         launched.and(unsafe { crate::shared::memory::chain::finish(self.stream().library, self.stream().raw) })?;
         self.ready = Some(rows);
@@ -414,8 +414,9 @@ impl<'a> BackboneSharedWave<'_, 'a> {
             self.stream().library.copy_d2d_async(self.input(), input.values, input.values.bytes, self.stream().raw)?;
             let graph = if self.window.is_windowed() { None } else { self.graphs.cached_launch(self.layer, self.weights, rows).map(|(raw, _)| raw) };
             let library = self.stream().library; let stream = self.stream().raw;
-            crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
-                graph, || self.enqueue(rows))
+            if crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+                graph, || self.enqueue(rows))? { self.graphs.record_launch(); }
+            Ok(())
         })();
         if let Err(error) = launched { self.synchronize()?; return Err(error); }
         unsafe { crate::shared::memory::chain::finish_cooperative(&self.stream()).await?; }

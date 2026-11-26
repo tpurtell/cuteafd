@@ -42,7 +42,7 @@ pub use shared::rtx_combine::{RtxPartialDtype, RtxTp2Combine};
 pub use shared::expert_usage;
 mod cuda_runtime;
 mod graph_source;
-pub use graph_source::{GraphLaunchQuery, GraphSource, GraphUpdateResult};
+pub use graph_source::{GraphSource, GraphUpdateResult};
 pub mod host_isa;
 pub mod memory_ledger;
 pub mod load_timing;

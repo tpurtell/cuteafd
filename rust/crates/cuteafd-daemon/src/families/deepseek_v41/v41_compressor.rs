@@ -1042,9 +1042,10 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
                 query.hidden.bytes, self.stream().raw)?; }
             self.upload_queued(&prepared)?;
             unsafe {
-                crate::shared::decode_graph::census::dispatch(self.stream().library, self.stream().raw, c"layer_row",
+                if crate::shared::decode_graph::census::dispatch(self.stream().library, self.stream().raw, c"layer_row",
                     prepared.rows, if capture || forced_eager { None } else { self.selected_graph().map(|(raw, _, _)| raw) },
-                    || self.enqueue(state, prepared.rows))
+                    || self.enqueue(state, prepared.rows))? { self.retained_graphs.record_launch(); }
+                Ok(())
             }
         })();
         self.pending_query = Some((prepared, capture));
@@ -1129,8 +1130,8 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
                 self.stream().library.copy_d2d_async(self.storage.input.buffer, query.hidden,
                     query.hidden.bytes, self.stream().raw)?;
                 self.upload_queued(&prepared)?;
-                crate::shared::decode_graph::census::dispatch(self.stream().library, self.stream().raw, c"layer_row",
-                    prepared.rows, graph, || self.enqueue(state, prepared.rows))?;
+                if crate::shared::decode_graph::census::dispatch(self.stream().library, self.stream().raw, c"layer_row",
+                    prepared.rows, graph, || self.enqueue(state, prepared.rows))? { self.retained_graphs.record_launch(); }
                 crate::shared::memory::chain::finish(self.stream().library, self.stream().raw)
             } })();
             if let Err(error) = queued { self.synchronize()?; return Err(error); }
@@ -1226,6 +1227,7 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         let launched = unsafe {
             crate::shared::decode_graph::census::dispatch(self.stream().library, self.stream().raw, c"layer_row",
                 rows, Some(graph), || self.enqueue(state, rows))
+                .map(|replayed| if replayed { self.retained_graphs.record_launch(); })
         };
         let drained = self.synchronize();
         launched.and(drained)?;

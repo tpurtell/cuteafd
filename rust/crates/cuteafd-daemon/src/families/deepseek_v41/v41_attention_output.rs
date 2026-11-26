@@ -456,7 +456,7 @@ impl AttentionOutputWave<'_, '_> {
         };
         ensure!(count == rows, "attention output capture row count differs");
         let launched = unsafe {
-            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw)
+            crate::shared::decode_graph::launch(&self.storage.stream.library, graph, self.storage.stream.raw, self.graphs.launch_tally())
         };
         launched.and(self.synchronize())?;
         self.ready = Some(rows);
@@ -537,7 +537,7 @@ impl AttentionOutputWave<'_, '_> {
         let rows = attention.rows as u32;
         if !self.graphed(rows) || crate::shared::decode_graph::census::eager("layer_row") {
             let library = self.storage.stream.library;
-            unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+            unsafe { let _ = crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
                 None, || self.enqueue_on(rows, stream))?; }
             let mut output = self.b(2);
             output.bytes = attention.rows * ROW_BYTES[2];
@@ -550,8 +550,8 @@ impl AttentionOutputWave<'_, '_> {
         }
         let graph = self.graphs.cached_launch(self.weights.layer, self.weights, rows).map(|(raw, _)| raw);
         let library = self.storage.stream.library;
-        unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
-            graph, || self.enqueue_on(rows, stream))?; }
+        unsafe { if crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+            graph, || self.enqueue_on(rows, stream))? { self.graphs.record_launch(); } }
         let mut output = self.b(2);
         output.bytes = attention.rows * ROW_BYTES[2];
         Ok(output)
@@ -585,8 +585,8 @@ impl AttentionOutputWave<'_, '_> {
         }
         let graph = self.graphs.cached_launch(self.weights.layer, self.weights, rows).map(|(raw, _)| raw);
         let library = self.storage.stream.library;
-        unsafe { crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
-            graph, || self.enqueue_on(rows, stream))?; }
+        unsafe { if crate::shared::decode_graph::census::dispatch(library, stream, c"layer_row", rows as usize,
+            graph, || self.enqueue_on(rows, stream))? { self.graphs.record_launch(); } }
         if graph.is_none() && super::graph_policy::captures_shape(rows)
             && !crate::shared::decode_graph::census::eager("layer_row") {
             return Ok(None);

@@ -535,7 +535,7 @@ impl DsparkChain<'_, '_> {
         );
         self.upload(&reads, bindings)?;
         let launched = unsafe {
-            crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw)
+            crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw, self.graphs.launch_tally())
         };
         let drained = self.synchronize();
         settle(launched, drained)?;
@@ -579,7 +579,7 @@ impl DsparkChain<'_, '_> {
         unsafe {
             let span = self.timing.begin("graph_forward_terminal", None, count * self.width, self.stream.raw)?;
             if let Some(graph) = graph {
-                crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw)?;
+                crate::shared::decode_graph::launch(&self.stream.library, graph, self.stream.raw, self.graphs.launch_tally())?;
             }
             self.timing.end(span, self.stream.raw)?;
             let bytes = self.download.bytes_mut();

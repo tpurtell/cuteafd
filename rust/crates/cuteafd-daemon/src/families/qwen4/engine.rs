@@ -3185,9 +3185,10 @@ impl<'a> Qwen4Engine<'a> {
     fn replay(&self, key: GraphKey, segment: impl Fn() -> Result<()>) -> Result<()> {
         self.require_live()?;
         let owner = self.active_owner.get();
-        if let Some(graph) = self.graphs.borrow_mut()[owner].cached_launch(&key).map(|graph| graph.0) {
+        let cached = self.graphs.borrow_mut()[owner].cached_launch(&key).map(|graph| graph.0);
+        if let Some(graph) = cached {
             // SAFETY: the graph's pointers are persistent engine buffers.
-            unsafe { crate::shared::decode_graph::launch(&self.library, graph, self.execution_stream())?; }
+            unsafe { crate::shared::decode_graph::launch(&self.library, graph, self.execution_stream(), self.graphs.borrow()[owner].launch_tally())?; }
             return self.ple_consumed(&key);
         }
         // Graphs unconfigured, or a step before initialization: run the segment
@@ -3243,9 +3244,10 @@ impl<'a> Qwen4Engine<'a> {
             self.graphs.as_ptr() as usize, owner as i32, Some(0), &key, raw);
         let graph = GraphExec(raw, Device { library: self.library, id: self.library.cuda_get_device()? });
         self.graphs.borrow_mut()[owner].cache_commit(key, graph, ticket, nodes as u64, width, spans_devices);
-        let graph = self.graphs.borrow()[owner].get(&key).context("inserted Qwen graph")?.0;
+        let banks = self.graphs.borrow();
+        let graph = banks[owner].get(&key).context("inserted Qwen graph")?.0;
         // SAFETY: the new graph reads and writes persistent engine buffers.
-        unsafe { crate::shared::decode_graph::launch(&self.library, graph, self.execution_stream())?; }
+        unsafe { crate::shared::decode_graph::launch(&self.library, graph, self.execution_stream(), banks[owner].launch_tally())?; }
         self.ple_consumed(&key)
     }
 

@@ -390,7 +390,6 @@ cuteafd_status_t cuteafd_cuda_graph_source_update(void* source, void* exec,
 cuteafd_status_t cuteafd_cuda_graph_source_destroy(void* source);
 cuteafd_status_t cuteafd_cuda_graph_source_transfer(void* source, void* donor, void** out);
 cuteafd_status_t cuteafd_cuda_graph_exec_invalidate(void* donor);
-cuteafd_status_t cuteafd_cuda_graph_launch_count(void* exec, uint64_t* out);
 cuteafd_status_t cuteafd_cuda_graph_end_capture_retained(
     void* cuda_stream, cuteafd_cuda_graph_capture_info_t* out);
 cuteafd_status_t cuteafd_cuda_graph_upload(void* cuda_graph_exec, void* cuda_stream);

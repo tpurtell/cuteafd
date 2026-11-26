@@ -763,7 +763,7 @@ impl<'a> IndexSelectionWave<'a> {
         let dispatch = || unsafe {
             if capture {
                 let g = self.graph.as_ref().context("selection graph missing")?.0;
-                crate::shared::decode_graph::launch(&self.storage.stream.library, g, self.storage.stream.raw)
+                crate::shared::decode_graph::launch(&self.storage.stream.library, g, self.storage.stream.raw, self.graphs.launch_tally())
             } else { self.enqueue(&geometry, &sources, &groups, shared_blocks, rows, tiles, width, use_candidates) }
         };
         let launched = if crate::shared::decode_graph::census::enabled() {

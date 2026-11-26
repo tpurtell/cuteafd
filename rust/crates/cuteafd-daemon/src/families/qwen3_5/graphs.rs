@@ -127,9 +127,10 @@ impl DenseEngine<'_> {
         let graphs = if rank == 0 { &self.graphs } else { &self.peer.as_ref().expect("admitted graph owner").graphs };
         let key = Key { segment: index, rows: step.rows, table_stride: step.table_stride, spec: step.speculative };
         let library = stream.device.library;
-        if let Some(raw) = graphs.bank.borrow_mut().cached_launch(&key).map(|exec| exec.raw) {
+        let cached = graphs.bank.borrow_mut().cached_launch(&key).map(|exec| exec.raw);
+        if let Some(raw) = cached {
             // SAFETY: all captured pointers retain the same engine-owned backing.
-            return unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw) };
+            return unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw, graphs.bank.borrow().launch_tally()) };
         }
         let pinned = qwen35_graphs::layout(&graphs.variant).is_some_and(|layout|
             layout.traced && layout.entries.iter().any(|entry|
@@ -174,7 +175,7 @@ impl DenseEngine<'_> {
         }
         graphs.bank.borrow_mut().cache_commit(key, exec, ticket, nodes as u64, width, spans);
         // SAFETY: successful insertion retains the executable until a drained boundary.
-        unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw) }
+        unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw, graphs.bank.borrow().launch_tally()) }
     }
 
     pub(super) fn graph_completed(&self) -> Result<()> {

@@ -55,3 +55,55 @@ fn cache_hot_paths_nanoseconds() {
         });
     }
 }
+
+#[test]
+#[ignore = "optimized CPU bank_cycle microbenchmark; run explicitly with --nocapture"]
+fn bank_cycle_flip_microseconds_600_vs_15000() -> anyhow::Result<()> {
+    use super::super::GraphOwner;
+    let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+    let library = fixture.load()?;
+    fixture.quiet_events(&library, true)?;
+    fixture.configure_memory_usage(&library, 0, 256 << 20, 0)?;
+
+    for (idx, live_execs) in [600u32, 15_000u32].into_iter().enumerate() {
+        let device = -39_100 - idx as i32;
+        let mut bank: GraphBank<u32, GraphOwner<'_, ()>> = GraphBank::new();
+        bank.attach_device_for_test(device, 1 << 40, Site {
+            name: "flip-bench", cycle: Cycle::Decode, preference: Preference::Capture,
+            bootstrap: 4096, basis: Basis::Bytes, spans_devices: false,
+        })?;
+        for key in 0..live_execs {
+            let mut ticket = bank.cache_ticket(&key, false, None).unwrap();
+            // SAFETY: CPU fixture records no device work.
+            let source = unsafe { library.cuda_graph_capture_source(std::ptr::null_mut())? };
+            let (raw, nodes, width, spans, _) = ticket.complete_source(&library, source, std::ptr::null_mut())?;
+            // SAFETY: fixture graph owns no device allocations.
+            let owner = unsafe { GraphOwner::new(&library, 0, raw, ())? };
+            bank.cache_commit(key, owner, ticket, nodes as u64, width, spans);
+        }
+        bank.cache_measured(10);
+        bank.cache_cycle(Cycle::Verify);
+        bank.cache_cycle(Cycle::Decode);
+
+        for launched in [0u32, 12u32, 166u32] {
+            let iterations = 2_000usize;
+            let mut total_flip_ns = 0u128;
+            for step in 0..iterations {
+                for k in 0..launched {
+                    let key = (k + (step as u32 % 4)) % live_execs;
+                    let raw = bank.cached_launch(&key).unwrap().raw;
+                    // SAFETY: fixture submits no device work.
+                    unsafe { super::super::launch(&library, raw, std::ptr::null_mut(), bank.launch_tally())?; }
+                }
+                let next = if step % 2 == 0 { Cycle::Verify } else { Cycle::Decode };
+                let started = Instant::now();
+                bank.cache_cycle(black_box(next));
+                total_flip_ns += started.elapsed().as_nanos();
+            }
+            let us = (total_flip_ns as f64 / iterations as f64) / 1_000.0;
+            println!("bank_cycle_flip live_execs={live_execs} launched={launched} us_per_flip={us:.3}");
+        }
+        drop(bank);
+    }
+    Ok(())
+}

@@ -373,9 +373,10 @@ impl<'w,'a> Wave<'w,'a> {
                     rank.storage.stream.device.library.cuda_stream_wait_event(rank.storage.stream.raw,wave.storage.input_ready[input_rank].raw)?;
                 }
                 rank.storage.copy.launch_rows(rank.storage.input.buffer,input,k*2,rows as usize,k*2,k*2,rank.storage.stream.raw)?;
-                crate::shared::decode_graph::census::dispatch(rank.storage.stream.device.library, rank.storage.stream.raw,
+                if crate::shared::decode_graph::census::dispatch(rank.storage.stream.device.library, rank.storage.stream.raw,
                     c"layer_row", rows as usize, graph,
-                    || rank.enqueue(weights,rows))
+                    || rank.enqueue(weights,rows))? { rank.graphs.record_launch(); }
+                Ok(())
             })?;
         }
         let owner=&wave.ranks[wave.owner];let peer=&wave.ranks[1-wave.owner];
@@ -386,9 +387,10 @@ impl<'w,'a> Wave<'w,'a> {
         owner.storage.stream.device.run(||unsafe {
             acquire(&wave.storage.guard, owner.storage.stream.raw)?;
             owner.storage.stream.device.library.cuda_stream_wait_event(owner.storage.stream.raw,wave.storage.peer_done.raw)?;
-            crate::shared::decode_graph::census::dispatch(owner.storage.stream.device.library, owner.storage.stream.raw,
+            if crate::shared::decode_graph::census::dispatch(owner.storage.stream.device.library, owner.storage.stream.raw,
                 c"layer_row", rows as usize, gather_graph,
-                || wave.enqueue_gather(rows))
+                || wave.enqueue_gather(rows))? { wave.gather_graphs.record_launch(); }
+            Ok(())
         })?;
         let output=CuteafdDeviceBuffer { bytes:rows as usize*n*2,..wave.storage.output.buffer };
         let result=owner.storage.stream.device.run(||consume(output,owner.storage.stream.raw))?;
