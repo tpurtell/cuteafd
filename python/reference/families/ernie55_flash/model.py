@@ -711,12 +711,16 @@ def hca_attention(
             dist = q_id[:, None] - k_id[None, :]
             swa_allowed = (dist >= 0) & (dist < window) & (k_id[None, :] < stop)
 
-            n_comp_tile = (stop) // COMPRESS_RATIO_HCA
-            if n_comp_tile > 0 and comp_kv is not None:
-                c_k = comp_kv[:n_comp_tile]
-                c_id = torch.arange(n_comp_tile, device=device)
+            n_comp_max = (start + ROWS) // COMPRESS_RATIO_HCA
+            if n_comp_max > 0:
+                n_comp_have = min(n_chunks, n_comp_max)
+                if n_comp_have > 0 and comp_kv is not None:
+                    c_k = F.pad(comp_kv[:n_comp_have], (0, 0, 0, n_comp_max - n_comp_have))
+                else:
+                    c_k = torch.zeros((n_comp_max, hd), dtype=kv.dtype, device=device)
+                c_id = torch.arange(n_comp_max, device=device)
                 # Chunk c (covering [128c .. 128c+127]) is visible for pos >= 128c + 127, i.e. c < (pos+1)//128.
-                comp_allowed = c_id[None, :] < ((q_id[:, None] + 1) // COMPRESS_RATIO_HCA)
+                comp_allowed = (c_id[None, :] < ((q_id[:, None] + 1) // COMPRESS_RATIO_HCA)) & (c_id[None, :] < n_comp_have)
                 all_k = torch.cat((c_k, swa_k), dim=0)
                 allowed = torch.cat((comp_allowed, swa_allowed), dim=1)
             else:
@@ -791,16 +795,18 @@ def dsa_select_topk(
     first_pruned = window + topk
     for start in range(first_pruned, seq_len, ROWS):
         stop = min(start + ROWS, seq_len)
-        max_k = stop - window
-        k_tile = ik[:max_k]  # [max_k, ihd]
-        q_tile = iq[start:stop]  # [B, H, ihd]
-        w_tile = iw[start:stop]  # [B, H]
+        max_k_full = start + ROWS - window
+        max_k_have = stop - window
+        k_tile = F.pad(ik[:max_k_have], (0, 0, 0, max_k_full - max_k_have))  # [max_k_full, ihd]
+        pad_q = ROWS - (stop - start)
+        q_tile = F.pad(iq[start:stop], (0, 0, 0, 0, 0, pad_q))  # [ROWS, H, ihd]
+        w_tile = F.pad(iw[start:stop], (0, 0, 0, pad_q))  # [ROWS, H]
         # scores[b, j] = sum_h w[b, h] * relu(dot(q[b, h], k[j]))
         raw = torch.einsum("bhd,kd->bhk", q_tile, k_tile).relu()
-        agg = torch.einsum("bh,bhk->bk", w_tile, raw)
+        agg = torch.einsum("bh,bhk->bk", w_tile, raw)[: stop - start]
         q_pos = torch.arange(start, stop, device=device)
-        k_pos = torch.arange(max_k, device=device)
-        valid = k_pos[None, :] < (q_pos[:, None] + 1 - window)
+        k_pos = torch.arange(max_k_full, device=device)
+        valid = (k_pos[None, :] < (q_pos[:, None] + 1 - window)) & (k_pos[None, :] < max_k_have)
         agg = agg.masked_fill(~valid, -float("inf"))
         indices[start:stop] = agg.topk(topk, dim=-1, sorted=False).indices
     return indices
