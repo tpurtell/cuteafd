@@ -35,7 +35,7 @@ use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, CuteafdHostBuffer, F32Add};
 use cuteafd_loader::families::hy4_flash::engram::advance_tail;
 use cuteafd_loader::families::hy4_flash::execution::{
-    hy4_context_buffers, hy4_dsa_partial_scratch_bytes, hy4_peer_ffn_routed_offset,
+    context_chunk_rows, context_exchange_rows, hy4_context_buffers, hy4_dsa_partial_scratch_bytes, hy4_peer_ffn_routed_offset,
     hy4_peer_slot_sizes, mla_split_scratch_bytes, wave_metadata_layout_for_rank,
     SharedScratchLayout, WaveScratchLayout, PAGE_ROWS, WAVE_METADATA,
 };
@@ -1701,9 +1701,17 @@ impl<'a> Hy4Engine<'a> {
             };
             let sms = device.run(|| device.library.sm_count())?;
             let mla_splits = MlaSplitPlan::new(&progs, max_context, decode_rows, sms)?;
+            if let Some(ctx) = &progs.context {
+                let width = context_exchange_rows(max_rows, decode_rows);
+                for program in [&ctx.dsa_partial_h0, &ctx.dsa_partial_h16, &ctx.lse_combine2,
+                    &ctx.indexer_scored_topk, &ctx.indexer_merge_expand_owned] {
+                    ensure!(width <= program.spec().capacity_rows as usize,
+                        "{} cannot cover admitted {width}-row context exchange", program.spec().name);
+                }
+            }
             // Split-capable launches never exceed the admitted decode/verify rows.
             let attn_scratch = mla_split_scratch_bytes(decode_rows, gpus)
-                .max(if context_split { hy4_dsa_partial_scratch_bytes(decode_rows) } else { 0 });
+                .max(if context_split { hy4_dsa_partial_scratch_bytes(context_exchange_rows(max_rows, decode_rows)) } else { 0 });
             let cache = Rc::new(Hy4CacheRank::new(
                 vec![stream.clone()],
                 &cfg,
@@ -1790,7 +1798,7 @@ impl<'a> Hy4Engine<'a> {
                 peer.abort_word(0)?.context("Hy4 rank 0 exchange not abortable")?,
                 peer.abort_word(1)?.context("Hy4 rank 1 exchange not abortable")?,
             ];
-            let buffers = hy4_context_buffers(&cfg, decode_rows);
+            let buffers = hy4_context_buffers(&cfg, max_rows, decode_rows);
             Some(ContextExchange::new(
                 devices[0].library,
                 [
@@ -2966,10 +2974,10 @@ impl<'a> Hy4Engine<'a> {
 
         let write_draft = i32::from(self.draft.as_ref().is_some_and(|d| d.captures_layer(layer)));
         let query_half_bytes = 16 * KV_A_DIM * 2;
-        let ctx_chunk = self.decode_rows;
+        let ctx_chunk = context_chunk_rows(self.max_rows, self.decode_rows, batch.decode_attention);
 
         // 3. Chunked ContextSplit exchange + dual partials + combine (1 pass on decode/verify,
-        // `ceil(rows / decode_rows)` passes on prefill using 7.5 MiB ContextExchange).
+        // otherwise one pass per admitted prefill tile; MLA internally uses 64-row scratch).
         for chunk_start in (0..rows).step_by(ctx_chunk) {
             let c_rows = (rows - chunk_start).min(ctx_chunk);
             let slot = if batch.graphed {
