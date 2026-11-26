@@ -292,6 +292,11 @@ def hy4_full_root():
     return ROOT_ARITHMETIC
 
 
+def ernie55_flash_root():
+    from families.ernie55_flash.sources import ROOT_ARITHMETIC
+    return ROOT_ARITHMETIC
+
+
 def inkling2_mini_root():
     from families.inkling2_mini.golden import ROOT_ARITHMETIC
     return ROOT_ARITHMETIC
@@ -304,6 +309,7 @@ ROOT_PRECISIONS = [
     (lambda: golden_root('muse_spark'), 'BF16 checkpoint (F32 computation)'),
     (hy4_root, 'BF16 checkpoint (F32 computation; native Engram FP8 round-trip)'),
     (hy4_full_root, 'BF16 checkpoint (F32 computation)'),
+    (ernie55_flash_root, 'BF16 checkpoint (F32 computation)'),
     (lambda: golden_root('mistral_large4'), 'official FP8 block-128 (no vendor BF16 master), computed in F32'),
 ]
 

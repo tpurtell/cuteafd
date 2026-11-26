@@ -253,9 +253,7 @@ impl<'a> MiniBackend<'a> {
                 .draft
                 .as_ref()
                 .context("Mini speculative verify without admitted drafter")?
-                .layout
-                .config
-                .taps
+                .sites
                 .clone();
             let ids: Vec<usize> = placements.iter().map(|p| p.slot).collect();
             let rows: Vec<VerifyRow> = receipt
@@ -668,9 +666,9 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
             cuteafd_core::HeadScore::None
         }
     }
-    fn configure_draft_scores(&self, _traced: bool, scored: bool) {
+    fn configure_draft_scores(&self, traced: bool, scored: bool) {
         if let Some(draft) = &self.execution.borrow().draft {
-            draft.drafter.set_score_readback(scored);
+            draft.set_scores(traced, scored);
         }
     }
     fn draft_head<'d>(&self, draft: &'d Draft) -> Option<&'d [f32]> {
@@ -683,7 +681,7 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
     fn prefill_draft(&self, p: &Placement, _: usize, _: &[u32], next: Option<u32>, state: &mut Draft) -> Result<()> {
         if let Some(draft) = &self.execution.borrow().draft {
             ensure!(
-                draft.drafter.frontier(p.slot)?.1 == p.len,
+                draft.frontier(p.slot)?.1 == p.len,
                 "Mini draft prefill frontier differs"
             );
         }
@@ -706,8 +704,8 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
         let unembed = execution.target.operand("model.llm.unembed.weight")?.buffer;
         let embed = execution.target.operand("model.llm.embed.weight")?.buffer;
         let embed_norm = execution.target.operand("model.llm.embed_norm.weight")?.buffer;
-        for first in (0..sequences.len()).step_by(draft.layout.runtime[0].sequences) {
-            let end = (first + draft.layout.runtime[0].sequences).min(sequences.len());
+        for first in (0..sequences.len()).step_by(draft.sequences) {
+            let end = (first + draft.sequences).min(sequences.len());
             let selected: Vec<_> = sequences[first..end]
                 .iter()
                 .enumerate()
@@ -726,9 +724,7 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
                     valid_from: 0,
                 })
                 .collect();
-            let proposed = draft
-                .drafter
-                .draft(&rows, embed, embed_norm, |seqs, anchors| draft.select(seqs, anchors, unembed))?;
+            let proposed = draft.propose(&rows, embed, embed_norm, unembed)?;
             let placed: Vec<_> = selected.into_iter().map(|(index, _, s)| (index, s.depth)).collect();
             for ((index, depth), tokens) in placed.into_iter().zip(proposed) {
                 sequences[first + index].seq.confidence = tokens.confidence.into_iter().take(depth).collect();

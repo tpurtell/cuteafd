@@ -55,7 +55,7 @@ mod tests {
         let cfg = DflashConfig { hidden: 128, intermediate: 128, layers: 2,
             heads: 1, kv_heads: 1, head_dim: 128, eps: 1e-6, theta: 10000., block: 8,
             group: 16, mask_token: 0, rank: 256, taps: vec![0], vocab: 16,
-            window: 2048, row_window: false, sample_from_anchor: false };
+            window: 2048, row_window: false, sample_from_anchor: false, post_selector_softcap: None };
         let shapes = cfg.tensor_shapes();
         write_safetensors(&draft.join("model.safetensors"), &shapes.iter()
             .map(|(name, shape)| t(name.clone(), "BF16", shape)).collect::<Vec<_>>());

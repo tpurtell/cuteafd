@@ -124,6 +124,10 @@ pub(super) fn layout(
         cfg,
         kv_format: opts.inkling_kv,
         drafter,
+        dflash: opts.inkling_mini_dflash.as_deref().map(|snapshot| (snapshot, Selection {
+            kv_cache: opts.draft_kv_cache,
+            sms: opts.physical_sms.unwrap_or(ArchContext::for_device("sm_120", card.physical_bytes).sms) as usize,
+        })),
         manifest_path: manifest_path.as_deref(),
         manifest,
         coordinator: Coordinator::Planned { card },

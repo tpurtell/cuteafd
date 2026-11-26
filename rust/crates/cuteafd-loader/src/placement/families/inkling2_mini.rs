@@ -83,6 +83,7 @@ pub struct MiniInputs {
     pub experts: Vec<MiniLayerExperts>,
     pub local: LocalPackage,
     pub drafter: Option<Drafter>,
+    pub dflash: Option<crate::families::inkling2_mini::dflash::Layout>,
     pub vision: Option<Vision>,
     pub budgets: Vec<Budget>,
     pub code: u64,
@@ -618,6 +619,26 @@ impl Recipe for MiniInputs {
                     "target tap and accepted-prefix FIR owner",
                     maximum,
                 ));
+            }
+        }
+
+        if let Some(draft) = &self.dflash {
+            contract_variables.push(Variable::DraftHome(vec![0]));
+            let lifetime = Lifetime { first: Phase::DraftLoad, last: Phase::Growth };
+            let location = Location::coordinator(0);
+            components.extend(weight_arena_components(&draft.arena, location, lifetime, maximum,
+                MemoryKind::DrafterWeights)?);
+            let weights = draft.physical.weight_owners().map(|a| &a.id).collect::<std::collections::BTreeSet<_>>();
+            for owner in draft.physical.owners().iter().filter(|a| !weights.contains(&a.id)) {
+                components.extend(buffer(format!("inkling2_mini.dflash.{}", owner.id), owner.location,
+                    owner.bytes, lifetime, owner.category, "DFlash2 fixed owner", maximum));
+            }
+            components.extend(buffer("inkling2_mini.dflash.marks", location,
+                (draft.mark_bytes * self.prefix_mark_slots) as u64, lifetime, Category::Drafter,
+                "exact DFlash2 ring marks", maximum));
+            for (name, bytes) in &draft.target {
+                components.extend(buffer(format!("inkling2_mini.draft.target.{name}"), location,
+                    *bytes as u64, lifetime, Category::Drafter, "target taps and FIR", maximum));
             }
         }
 
