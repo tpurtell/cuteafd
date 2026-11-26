@@ -378,9 +378,8 @@ becomes `h/2 * (w/2 + 1)` image rows, the checkpoint's `image_newline` closing
 each merged row, with interleaved 3D M-RoPE positions. Up to eight images
 encode in one batched tower pass. `AUDIO` accepts `auto` or `off` and starts
 none. `SPECULATOR=auto` (default) uses the checkpoint's bundled five-stage
-DFly2 on Spark-free layouts, including two-RTX `context` (default) and explicit
-`heads`; Spark layouts retain their drafter-off default. `SPECULATOR=dfly2`
-explicitly enables it. It reuses committed target MLA KV
+DFly2 on every layout, with or without Sparks, including two-RTX `context`
+(default) and explicit `heads`. `SPECULATOR=dfly2` names it explicitly. It reuses committed target MLA KV
 and compressed-indexer recall; a fully restored prefix takes one target-only
 round before proposing. Proposals batch across requests; rank-local draft and
 verify sections graph exact live rows. Recall gathering, metadata uploads and
