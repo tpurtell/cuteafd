@@ -26,7 +26,10 @@ def tiny(tmp_path_factory):
                routed_scaling_factor_learnable=True, routed_scaling_factor=3.,
                n_routed_experts=24, num_experts_per_tok=10, hidden_act="situ",
                activation_situ_beta=4., activation_situ_linear_beta=25., n_shared_experts=1,
-               moe_latent_size=8, moe_intermediate_size=8, intermediate_size=16,
+               # Each SiTU row fills whole SIMD vectors, as at production width
+               # 2048. A scalar sigmoid tail at width 8 can give a different
+               # last bit when the same expert rows are grouped across prompts.
+               moe_latent_size=8, moe_intermediate_size=64, intermediate_size=16,
                vocab_size=64, multimax="lm_head", dspark_markov_rank=8, dspark_target_layer_ids=[0, 1, 2],
                dspark_block_size=3, dspark_noise_token_id=11)
     config = reference.Config.parse(raw)
