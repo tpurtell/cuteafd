@@ -119,6 +119,15 @@ def candidate(snapshot, corpus, reference_repo):
                 reference_revision=git(ref, "log", "-1", "--format=%H", "--", *REFERENCE_FILES), recipe=RECIPE)
 
 
+def parity_input_digest(inputs):
+    """Bind the measured forward and its dependencies independently of later pilot/export code."""
+    forward_files = {"forward.py", "forward_preflight.py", "routing.py", "storage.py",
+                     "source.py", "prepare_corpus.py", "identity.py"}
+    keys = {path: checksum for path, checksum in inputs["code"].items()
+            if not path.startswith("quantization/ernie55_flash/") or Path(path).name in forward_files}
+    return digest(dict(inputs, code=keys))
+
+
 def verified_identity(inputs, vendor, local):
     """Verify preflights after the production worktree has rebased onto the merged reference."""
     from .forward import reference
@@ -144,7 +153,7 @@ def verified_identity(inputs, vendor, local):
             value, bound = row["error"], row["bound"]
             if not all(type(x) in (int, float) and math.isfinite(x) for x in (value, bound)) or not 0 <= value <= bound:
                 raise ValueError(f"parity bound failed: {name}")
-    if (local.get("host") != "maxq" or local.get("input_identity_sha256") != digest(inputs)
+    if (local.get("host") != "maxq" or local.get("input_identity_sha256") != parity_input_digest(inputs)
             or local.get("vendor_receipt_sha256") != digest(vendor)):
         raise ValueError("maxq forward parity must bind the measured vendor gate and quant inputs")
     return dict(schema="ernie55-causal-mc-v1", inputs=inputs,

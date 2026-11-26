@@ -37,7 +37,7 @@ def parity_inputs(monkeypatch):
                   source_revision=ids.BASE_REVISION, reference_files_sha256=ids.digest(current),
                   measurements={p: dict(error=.001, bound=.002) for p in
                                 ("hca", "mla_dsa", "mhc", "dense", "latent_moe", "situ", "lm_head", "dspark")})
-    inputs = dict(reference_files=current)
+    inputs = dict(reference_files=current, code={})
     local = dict(vendor, schema="ernie55-quant-forward-parity-v1", host="maxq",
                  input_identity_sha256=ids.digest(inputs), vendor_receipt_sha256=ids.digest(vendor))
     monkeypatch.setitem(sys.modules, "ernie55_flash.forward", SimpleNamespace(
