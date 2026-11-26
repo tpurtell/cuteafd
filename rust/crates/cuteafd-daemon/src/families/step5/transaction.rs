@@ -990,6 +990,13 @@ impl<'e, 'a, E: CopyEngine> Step<'e, 'a, E> {
                             )
                         }
                     })?;
+                    // The dense kernel table is append-only; only the just-produced
+                    // complete regions need copying to their private physical pages.
+                    let start = (whole.base / 8 + plan.regions.start) as u64;
+                    for (dense, retained) in cache.summary_runs(layer, sequence.sequence,
+                        &sequence.pages, start, start + completed as u64)? {
+                        copy(&stage.stream, retained, dense)?;
+                    }
                 }
             }
         }
