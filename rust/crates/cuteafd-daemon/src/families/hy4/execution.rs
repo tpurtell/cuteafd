@@ -701,8 +701,9 @@ struct RankRuntime<'a> {
 }
 
 impl<'a> RankRuntime<'a> {
-    /// Attention iHC pre + MLA Q/KV projections + rank_norm_pack + q_b + q_absorb + linear_gate.
-    /// When `full_indexer` is true, also runs `indexer.{wq_b, wk, weights_proj}` + `index_post`.
+    /// Attention iHC pre (or fused previous-FFN iHC post + attention iHC pre when `fused_prev_post` is `Some`)
+    /// + MLA Q/KV projections + rank_norm_pack + q_b + q_absorb + linear_gate.
+    /// When `full_idx` is `Some`, also runs `indexer.{wq_b, wk, weights_proj}` + `index_post`.
     #[allow(clippy::too_many_arguments)]
     fn attn_pre(
         &self,
@@ -713,6 +714,7 @@ impl<'a> RankRuntime<'a> {
         wave_slot: usize,
         rows: usize,
         use_a: bool,
+        fused_prev_post: Option<bool>,
         kv_cache_buf: CuteafdDeviceBuffer,
     ) -> Result<()> {
         let w = &self.waves[wave_slot];
@@ -723,19 +725,39 @@ impl<'a> RankRuntime<'a> {
 
         // SAFETY: arena weights, cache, and scratch live through stream drain.
         unsafe {
-            self.programs.ihc_pre.launch(
-                &[
-                    r_cur.ptr,
-                    self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_fn"))?.ptr,
-                    self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_scale"))?.ptr,
-                    self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_base"))?.ptr,
-                    self.weights.buf(&format!("{p}.input_layernorm.weight"))?.ptr,
-                    self.shared.post.buffer.ptr,
-                    w.y.buffer.ptr,
-                ],
-                &s_rows,
-                self.stream.raw,
-            )?;
+            if let Some(prev_use_a) = fused_prev_post {
+                let r_in = if prev_use_a { w.r_a.buffer } else { w.r_b.buffer };
+                self.programs.ihc_post_pre.launch(
+                    &[
+                        self.shared.delta.buffer.ptr,
+                        r_in.ptr,
+                        w.post_ffn.buffer.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_fn"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_scale"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_base"))?.ptr,
+                        self.weights.buf(&format!("{p}.input_layernorm.weight"))?.ptr,
+                        r_cur.ptr,
+                        self.shared.post.buffer.ptr,
+                        w.y.buffer.ptr,
+                    ],
+                    &s_rows,
+                    self.stream.raw,
+                )?;
+            } else {
+                self.programs.ihc_pre.launch(
+                    &[
+                        r_cur.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_fn"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_scale"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_base"))?.ptr,
+                        self.weights.buf(&format!("{p}.input_layernorm.weight"))?.ptr,
+                        self.shared.post.buffer.ptr,
+                        w.y.buffer.ptr,
+                    ],
+                    &s_rows,
+                    self.stream.raw,
+                )?;
+            }
             launch_proj_out(
                 self,
                 &format!("{p}.self_attn.q_a_proj"),
@@ -1326,47 +1348,6 @@ impl<'a> RankRuntime<'a> {
         Ok(())
     }
 
-    /// Combine routed + shared (if sparse) and apply `ihc_post` directly (Hy4 has NO sandwich norms).
-    fn ffn_combine_post(
-        &self,
-        is_dense: bool,
-        wave_slot: usize,
-        rows: usize,
-        use_a: bool,
-    ) -> Result<()> {
-        let w = &self.waves[wave_slot];
-        if !is_dense {
-            // SAFETY: routed_out and shared_out finished in stream order into disjoint delta.
-            unsafe {
-                self.bf16_add.launch(
-                    self.shared.routed_out.buffer,
-                    w.shared_out.buffer,
-                    self.shared.delta.buffer,
-                    rows * H,
-                    self.stream.raw,
-                )?;
-            }
-        }
-        let (r_in, r_out) = if use_a {
-            (w.r_a.buffer, w.r_b.buffer)
-        } else {
-            (w.r_b.buffer, w.r_a.buffer)
-        };
-        // SAFETY: scratch buffers live through stream drain.
-        unsafe {
-            self.programs.ihc_post.launch(
-                &[
-                    self.shared.delta.buffer.ptr,
-                    r_in.ptr,
-                    w.post_ffn.buffer.ptr,
-                    r_out.ptr,
-                ],
-                &[Scalar::I32(rows as i32)],
-                self.stream.raw,
-            )
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn reduce_f32_to_bf16_local(
         &self,
@@ -1412,15 +1393,17 @@ impl<'a> RankRuntime<'a> {
         }
     }
 
+    /// Materialize the deferred previous layer's FFN delta into `self.shared.delta` without
+    /// applying `ihc_post`, so the next layer's attention can fuse `ihc_post` + `ihc_pre` into
+    /// one `ihc_post_pre` launch.
     #[allow(clippy::too_many_arguments)]
-    fn finish_deferred_ffn_local(
+    fn prepare_deferred_ffn_delta(
         &self,
         rank: usize,
         gpus: usize,
         prev: DeferredFfn,
         wave_slot: usize,
         rows: usize,
-        use_a: bool,
         skip_routed: bool,
         ffn_recv_ptr: *mut std::ffi::c_void,
         routed_recv_offset: usize,
@@ -1461,7 +1444,63 @@ impl<'a> RankRuntime<'a> {
                 )?;
             }
         }
-        self.ffn_combine_post(prev.is_dense, wave_slot, rows, use_a)
+        if !prev.is_dense {
+            // SAFETY: routed_out and shared_out finished in stream order into disjoint delta.
+            unsafe {
+                self.bf16_add.launch(
+                    self.shared.routed_out.buffer,
+                    self.waves[wave_slot].shared_out.buffer,
+                    self.shared.delta.buffer,
+                    rows * H,
+                    self.stream.raw,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_deferred_ffn_local(
+        &self,
+        rank: usize,
+        gpus: usize,
+        prev: DeferredFfn,
+        wave_slot: usize,
+        rows: usize,
+        use_a: bool,
+        skip_routed: bool,
+        ffn_recv_ptr: *mut std::ffi::c_void,
+        routed_recv_offset: usize,
+    ) -> Result<()> {
+        self.prepare_deferred_ffn_delta(
+            rank,
+            gpus,
+            prev,
+            wave_slot,
+            rows,
+            skip_routed,
+            ffn_recv_ptr,
+            routed_recv_offset,
+        )?;
+        let w = &self.waves[wave_slot];
+        let (r_in, r_out) = if use_a {
+            (w.r_a.buffer, w.r_b.buffer)
+        } else {
+            (w.r_b.buffer, w.r_a.buffer)
+        };
+        // SAFETY: scratch buffers live through stream drain.
+        unsafe {
+            self.programs.ihc_post.launch(
+                &[
+                    self.shared.delta.buffer.ptr,
+                    r_in.ptr,
+                    w.post_ffn.buffer.ptr,
+                    r_out.ptr,
+                ],
+                &[Scalar::I32(rows as i32)],
+                self.stream.raw,
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1517,6 +1556,7 @@ struct ActiveBatch {
     ctx_pt_stride: usize,
     ctx_slot_counter: usize,
     graphed: bool,
+    can_defer_ffn: bool,
     ffn_fused_layer: Option<usize>,
     post_attn_deferred: bool,
     reduce_attn_pending: bool,
@@ -2343,6 +2383,7 @@ impl<'a> Hy4Engine<'a> {
         unit: &Unit,
         priority: ReadPriority,
         head_mode: HeadMode,
+        single_wave: bool,
     ) -> Result<ActiveBatch> {
         let wave_slot = unit.slot;
         let rows = unit.rows.len();
@@ -2589,6 +2630,7 @@ impl<'a> Hy4Engine<'a> {
         let graphed = priority == ReadPriority::Decode
             && wave_slot == 0
             && rows <= self.decode_rows
+            && single_wave
             && self.graphs_active()
             && !self.skip_routed_experts
             && self.dump_dir.is_none();
@@ -2621,6 +2663,7 @@ impl<'a> Hy4Engine<'a> {
             && unit.layers.end == self.cfg.layers
             && head_mode != HeadMode::None
             && dump_rows == 0;
+        let can_defer_ffn = single_wave && dump_rows == 0;
 
         Ok(ActiveBatch {
             wave_slot,
@@ -2629,6 +2672,7 @@ impl<'a> Hy4Engine<'a> {
             ctx_pt_stride,
             ctx_slot_counter: 0,
             graphed,
+            can_defer_ffn,
             ffn_fused_layer: None,
             post_attn_deferred: false,
             reduce_attn_pending: false,
@@ -3060,6 +3104,8 @@ impl<'a> Hy4Engine<'a> {
             [std::ptr::null_mut(); 2]
         };
 
+        let fused_prev_post = prev_ffn.map(|_| prev_use_a);
+
         if batch.graphed {
             let pre_section = if full_idx.is_some() {
                 GraphSection::DsaFullPre
@@ -3077,12 +3123,15 @@ impl<'a> Hy4Engine<'a> {
                         || {
                             r.device.run(|| {
                                 if let Some(prev) = prev_ffn {
-                                    r.finish_deferred_ffn_local(
-                                        0, 1, prev, wave_slot, rows, prev_use_a, skip_routed,
+                                    r.prepare_deferred_ffn_delta(
+                                        0, 1, prev, wave_slot, rows, skip_routed,
                                         std::ptr::null_mut(), routed_recv_offset,
                                     )?;
                                 }
-                                r.attn_pre(&p, layer, Some(fidx), local_heads, wave_slot, rows, use_a, kv_cache_buf)
+                                r.attn_pre(
+                                    &p, layer, Some(fidx), local_heads, wave_slot, rows, use_a,
+                                    fused_prev_post, kv_cache_buf,
+                                )
                             })
                         },
                     )?;
@@ -3104,7 +3153,7 @@ impl<'a> Hy4Engine<'a> {
                                         usage, count_usage, skip_routed, false, layer, usage_phase, rows,
                                     )?;
                                 }
-                                r.ffn_combine_post(is_dense, wave_slot, rows, !use_a)
+                                Ok(())
                             })
                         },
                     )?;
@@ -3116,12 +3165,15 @@ impl<'a> Hy4Engine<'a> {
                         || {
                             r.device.run(|| {
                                 if let Some(prev) = prev_ffn {
-                                    r.finish_deferred_ffn_local(
-                                        0, 1, prev, wave_slot, rows, prev_use_a, skip_routed,
+                                    r.prepare_deferred_ffn_delta(
+                                        0, 1, prev, wave_slot, rows, skip_routed,
                                         std::ptr::null_mut(), routed_recv_offset,
                                     )?;
                                 }
-                                r.attn_pre(&p, layer, None, local_heads, wave_slot, rows, use_a, kv_cache_buf)?;
+                                r.attn_pre(
+                                    &p, layer, None, local_heads, wave_slot, rows, use_a,
+                                    fused_prev_post, kv_cache_buf,
+                                )?;
                                 r.dsa_attn(kv_cache_buf, wave_slot, rows, decode_attention)?;
                                 r.attn_out(&p, layer, 1, local_heads, rows)?;
                                 r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
@@ -3134,11 +3186,17 @@ impl<'a> Hy4Engine<'a> {
                                         usage, count_usage, skip_routed, false, layer, usage_phase, rows,
                                     )?;
                                 }
-                                r.ffn_combine_post(is_dense, wave_slot, rows, !use_a)
+                                Ok(())
                             })
                         },
                     )?;
                 }
+                batch.use_a = !use_a;
+                batch.prev_ffn_deferred = Some(DeferredFfn {
+                    layer,
+                    is_dense,
+                    reduce_routed_tp2: false,
+                });
                 batch.ffn_fused_layer = Some(layer);
                 return Ok(());
             }
@@ -3153,12 +3211,15 @@ impl<'a> Hy4Engine<'a> {
                     || {
                         r.device.run(|| {
                             if let Some(prev) = prev_ffn {
-                                r.finish_deferred_ffn_local(
-                                    rank, gpus, prev, wave_slot, rows, prev_use_a, skip_routed,
+                                r.prepare_deferred_ffn_delta(
+                                    rank, gpus, prev, wave_slot, rows, skip_routed,
                                     ffn_recv, routed_recv_offset,
                                 )?;
                             }
-                            r.attn_pre(&p, layer, full_idx, local_heads, wave_slot, rows, use_a, kv_cache_buf)
+                            r.attn_pre(
+                                &p, layer, full_idx, local_heads, wave_slot, rows, use_a,
+                                fused_prev_post, kv_cache_buf,
+                            )
                         })
                     },
                 )?;
@@ -3196,8 +3257,8 @@ impl<'a> Hy4Engine<'a> {
             for (rank, r) in self.ranks.iter().enumerate() {
                 let ffn_recv = ffn_recv_ptrs[rank];
                 r.device.run(|| {
-                    r.finish_deferred_ffn_local(
-                        rank, gpus, prev, wave_slot, rows, prev_use_a, skip_routed,
+                    r.prepare_deferred_ffn_delta(
+                        rank, gpus, prev, wave_slot, rows, skip_routed,
                         ffn_recv, routed_recv_offset,
                     )
                 })?;
@@ -3207,7 +3268,10 @@ impl<'a> Hy4Engine<'a> {
             for r in &self.ranks {
                 let kv_cache_buf = r.cache.dsa_kv_layer(layer)?;
                 r.device.run(|| {
-                    r.attn_pre(&p, layer, full_idx, local_heads, wave_slot, rows, use_a, kv_cache_buf)
+                    r.attn_pre(
+                        &p, layer, full_idx, local_heads, wave_slot, rows, use_a,
+                        fused_prev_post, kv_cache_buf,
+                    )
                 })?;
             }
             self.run_dsa_context_split_body(layer, full_idx, &p, batch)?;
@@ -3215,7 +3279,10 @@ impl<'a> Hy4Engine<'a> {
             for r in &self.ranks {
                 let kv_cache_buf = r.cache.dsa_kv_layer(layer)?;
                 r.device.run(|| {
-                    r.attn_pre(&p, layer, full_idx, local_heads, wave_slot, rows, use_a, kv_cache_buf)
+                    r.attn_pre(
+                        &p, layer, full_idx, local_heads, wave_slot, rows, use_a,
+                        fused_prev_post, kv_cache_buf,
+                    )
                 })?;
                 if let Some(fidx) = full_idx {
                     Self::run_full_indexer_topk(r, fidx, batch)?;
@@ -3396,7 +3463,7 @@ impl<'a> Hy4Engine<'a> {
             is_dense,
             reduce_routed_tp2,
         };
-        if batch.graphed && gpus == 2 {
+        if batch.can_defer_ffn {
             batch.prev_ffn_deferred = Some(deferred_ffn);
             return Ok(());
         }
@@ -3686,7 +3753,7 @@ impl<'a> Hy4Engine<'a> {
             };
             let skip_routed = self.skip_routed_experts;
             let routed_off = self.ffn_routed_recv_offset;
-            if batch.graphed && gpus == 2 && mode == HeadMode::Suffix(0) && batch.rows > 0 {
+            if batch.graphed && mode == HeadMode::Suffix(0) && batch.rows > 0 {
                 let rows = batch.rows;
                 let r_cur = if batch.use_a { w0.r_a.buffer } else { w0.r_b.buffer };
                 r0.graphs.run(
@@ -3857,6 +3924,7 @@ impl<'a> Hy4Engine<'a> {
         let initial_starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
         let staged_frontiers = initial_starts.clone();
         let run_waves = self.prefill_waves;
+        let single_wave = units.len() <= 1 || run_waves <= 1;
         let kind = match priority {
             ReadPriority::Decode | ReadPriority::DecodeFirst => ExpertV2SourceKind::Decode,
             _ => ExpertV2SourceKind::Prefill,
@@ -3873,6 +3941,7 @@ impl<'a> Hy4Engine<'a> {
                 sources: &'p [&'p [u32]],
                 priority: ReadPriority,
                 kind: ExpertV2SourceKind,
+                single_wave: bool,
                 head_mode: F,
                 on_tile: &'p mut dyn FnMut(&Unit, usize, DeviceLogits) -> Result<()>,
                 active: Vec<Option<ActiveBatch>>,
@@ -3908,6 +3977,7 @@ impl<'a> Hy4Engine<'a> {
                         unit,
                         self.priority,
                         mode,
+                        self.single_wave,
                     )?;
                     self.active[slot] = Some(batch);
                     Ok(())
@@ -4096,6 +4166,7 @@ impl<'a> Hy4Engine<'a> {
                 sources,
                 priority,
                 kind,
+                single_wave,
                 head_mode,
                 on_tile,
                 active: (0..run_waves).map(|_| None).collect(),
