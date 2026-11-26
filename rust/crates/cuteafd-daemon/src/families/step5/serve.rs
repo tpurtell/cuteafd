@@ -1062,6 +1062,8 @@ mod tests {
         let mut args = live_mtp_args();
         // The text-only oracle starts routed experts, not remote vision workers.
         args.vision.vision = cuteafd_loader::plan::MediaMode::Off;
+        // Golden-run starts every routed layer on the Spark ranks.
+        args.rtx_expert_layers = cuteafd_loader::placement::OnboardSetting::Layers(0);
         args.kv_cache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
             .unwrap_or_else(|_| "bf16".into()).parse()?;
         args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
