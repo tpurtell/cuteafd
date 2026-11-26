@@ -20,6 +20,7 @@ use cuteafd_loader::formats::mapped_table::ReadPriority;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 fn check_writable(
     placement: &Hy4Placement,
@@ -134,6 +135,9 @@ pub(crate) struct Hy4Backend<'a> {
     host: Option<cuteafd_hostcache::config::Config>,
     profile: RefCell<[f64; 2]>,
     pending: RefCell<Option<Vec<(usize, usize, Vec<u32>)>>>,
+    /// Bundled 40-layer ViT contract when vision is enabled (None: VISION=off).
+    vision: Option<cuteafd_loader::families::hy4_flash::vision::VisionContract>,
+    config: serde_json::Value,
 }
 
 impl<'a> Hy4Backend<'a> {
@@ -142,7 +146,13 @@ impl<'a> Hy4Backend<'a> {
         context: usize,
         unit_rows: usize,
         host: Option<cuteafd_hostcache::config::Config>,
+        snapshot: &Path,
+        vision: bool,
     ) -> Result<Self> {
+        let config: serde_json::Value = cuteafd_loader::read_json_file(&snapshot.join("config.json"))?;
+        let vision = vision
+            .then(|| cuteafd_loader::families::hy4::vision::vision_contract(&config))
+            .transpose()?;
         let library = engine.library();
         let family = engine.prefix()?;
         let concurrency = engine.max_sequences;
@@ -172,6 +182,8 @@ impl<'a> Hy4Backend<'a> {
             host,
             profile: RefCell::new([0.0; 2]),
             pending: RefCell::new(None),
+            vision,
+            config,
         })
     }
 
@@ -267,7 +279,7 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
     type Placement = Hy4Placement;
     type Draft = Draft;
     type History = usize;
-    type Coordinates = ();
+    type Coordinates = Arc<cuteafd_loader::families::hy4::vision::RopePositions>;
     type Encoder = crate::shared::qwen::Encoder;
     type Meta = ();
     type Prefix = Hy4Prefix<'a>;
@@ -343,35 +355,51 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
         job: NativeRequest,
         tokens: Vec<u32>,
     ) -> Result<(scheduler::Prompt, RequestMedia, Vec<EncodeJob>)> {
-        ensure!(job.audio.is_empty(), "Hy4 has no bundled audio tower");
-        ensure!(
-            job.media.is_empty() && job.image_groups.is_empty(),
-            "Hy4 bundled 40-layer ViT lands in Piece 3; text-only requests are supported now"
-        );
-        let vocab = u32::try_from(self.vocab)?;
         let hidden = self.engine.borrow().cfg.hidden;
-        let keys = cuteafd_engine::media::MediaKeys::new(&tokens, vocab, &[])?;
-        let media = RequestMedia::new(Vec::new(), hidden, tokens.len())?;
-        Ok((scheduler::Prompt { job, tokens, keys }, media, Vec::new()))
+        super::media::prepare(
+            job,
+            tokens,
+            &self.config,
+            self.vision.as_ref(),
+            self.vocab,
+            hidden,
+            self.context,
+        )
     }
 
     fn probe_features(
         &self,
-        _prompt: &scheduler::Prompt,
-        _media: &mut RequestMedia,
-        _cache: &mut EmbeddingCache,
-        _snapshot: &Path,
+        prompt: &scheduler::Prompt,
+        media: &mut RequestMedia,
+        cache: &mut EmbeddingCache,
+        snapshot: &Path,
     ) -> Result<()> {
+        if prompt
+            .job
+            .probe
+            .as_ref()
+            .is_some_and(|p| p.spec.feature_scoring())
+            && !media.spans().is_empty()
+            && std::env::var_os("CUTEAFD_MEDIA_FEATURES_DIR").is_some()
+        {
+            crate::shared::probe::still::features(
+                prompt,
+                media,
+                cache,
+                snapshot,
+                cuteafd_loader::media::ImageFamily::Hy4,
+            )?;
+        }
         Ok(())
     }
 
     fn coordinates(
         &self,
-        _tokens: &[u32],
-        _job: &NativeRequest,
-        _media: &RequestMedia,
+        tokens: &[u32],
+        job: &NativeRequest,
+        media: &RequestMedia,
     ) -> Result<Self::Coordinates> {
-        Ok(())
+        super::media::rope_positions(tokens, job, media, self.vision.as_ref())
     }
 
     fn placement(&self, units: Vec<u32>, slot: i32) -> Hy4Placement {
@@ -381,8 +409,8 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
     fn bind_request(
         &self,
         placement: &mut Hy4Placement,
-        _rope: Self::Coordinates,
-        _media: RequestMedia,
+        rope: Self::Coordinates,
+        media: RequestMedia,
         tokens: &[u32],
         resume: usize,
     ) -> Result<()> {
@@ -390,6 +418,8 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
             placement.len == resume && resume <= tokens.len(),
             "Hy4 restored request frontier differs"
         );
+        placement.rope = rope;
+        placement.media = (!media.spans().is_empty()).then(|| Arc::new(media));
         Ok(())
     }
 

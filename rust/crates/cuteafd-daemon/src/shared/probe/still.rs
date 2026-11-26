@@ -86,7 +86,7 @@ pub(crate) fn prepare(job: NativeRequest, tokens: Vec<u32>, vocabulary: u32, hid
 
 /// The pinned serving reference whose tower produced fidelity features.
 fn source_revision(family: ImageFamily) -> &'static str {
-    if family == ImageFamily::Hy4Flash { "sglang@ccb8d9cc" } else { "sglang@a9bf8c76" }
+    if matches!(family, ImageFamily::Hy4Flash | ImageFamily::Hy4) { "sglang@ccb8d9cc" } else { "sglang@a9bf8c76" }
 }
 
 pub(crate) fn snapshot_identity(snapshot: &Path, family: ImageFamily) -> Result<serde_json::Value> {

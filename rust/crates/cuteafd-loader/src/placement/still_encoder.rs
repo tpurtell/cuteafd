@@ -20,6 +20,7 @@ impl StillEncoder {
             Some("minimax_m3_vl") => crate::families::minimax_m3::vision::MAX_IMAGE_TOKENS,
             Some("inkling2" | "inkling2_loop" | "step5_vl") => 4096,
             Some("hy_v4_flash") => crate::families::hy4_flash::vision::MAX_MERGED_ROWS,
+            Some("hy_v4_vl") => crate::families::hy4::vision::MAX_MERGED_ROWS,
             _ => anyhow::bail!("unsupported independent still tower"),
         };
         let inventory = StillTowerInventory::from_checkpoint(checkpoint, rows)?;

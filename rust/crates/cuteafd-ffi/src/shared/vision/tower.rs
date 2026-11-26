@@ -171,7 +171,7 @@ impl TowerExtension {
         let hy4 = self.absolute_kind == 2;
         if hy4 != (self.projection_order == 3)
             || (hy4
-                && (base.head_dim != 72
+                && (!matches!(base.head_dim, 72 | 96)
                     || base.patch_size != 16
                     || self.rotary_kind != 0
                     || self.pixel_layout != 1

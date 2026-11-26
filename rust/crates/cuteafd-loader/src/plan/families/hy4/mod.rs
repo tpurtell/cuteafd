@@ -583,12 +583,14 @@ impl Family for Hy4 {
         Some(TensorRole::layer(component, layer))
     }
     fn component_hint(&self, component: Component) -> Option<Hint> {
+        if component == Component::Vision {
+            return None;
+        }
         let how = match component {
             Component::Attention => "Export Hy4 absorbed gated MLA (64H TP1 / 32H TP2, q_lora=2048, qa_kva_eps=1e-6, kv_lora=512, F32 sinks + sigmoid linear_gate, interleaved tail-64 RoPE) via hy4_mla.py; see #2550.",
             Component::Indexer => "Export Hy4IndexPost (32H x 128, LayerNorm eps=1e-5, tail-64 interleaved RoPE -> 8448 B/page) and reuse compile_glm_index_topk_aot with IndexCache reuse across the 57 shared layers; see #2550.",
             Component::HyperConnection => "Export 4-stream iHC pre/post/post_pre and MhcHeadKernel at H=6144 (Hy4IhcGeometry(hidden=6144)) in hy4_ihc.py; see #2550.",
             Component::RoutedExpert => "Disambiguate ExpertGeometry::HY4 from GLM5 (same 6144/256/8/2048 shape, swiglu_limit=10.0 vs None) and export hy4:exl3-k45-mul1 for SM121 TP3..6 and SM120 RTX TP1/TP2; see #2550.",
-            Component::Vision => "Optional 40-layer ViT vision tower is a follow-up item on #2550; text serving runs with --vision off.",
             Component::Speculator => "Optional 5-layer DFly2 drafter (taps [61, 65, 69, 73, 77], dense I=18432) is a follow-up item on #2550; text serving runs without speculation first.",
             _ => "Wire Hy4 text forward, golden parity vs hy4-v1_20261122_own-text-bf16-f32, and serve-hy4 once wrldsuksgo2mars/Hy4-EXL3-K4-MC publishes; see #2550.",
         };

@@ -86,6 +86,8 @@ pub(crate) struct ServeArgs {
     #[arg(long)]
     pub expert_package: Option<PathBuf>,
     #[command(flatten)]
+    pub media: crate::shared::vision::still::Options,
+    #[command(flatten)]
     pub prefix: PrefixArgs,
     #[command(flatten)]
     pub draft_length: crate::shared::draft::length::DraftLength,
@@ -423,7 +425,11 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     );
     let stats = Arc::new(Mutex::new(serde_json::Value::Null));
     let worker_stats = stats.clone();
-    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
+    type Vision = (
+        Option<Arc<cuteafd_api::openai::media::MediaPreparer>>,
+        Option<Arc<std::sync::atomic::AtomicBool>>,
+    );
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(usize, Vision)>>();
     let worker_args = args.clone();
 
     let worker = tokio::task::spawn_blocking(move || -> Result<()> {
@@ -556,6 +562,9 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 replies,
                 expert_usage,
                 resident_weight_limit,
+                vision: worker_args.media.vision,
+                vision_replicas: worker_args.media.vision_replicas,
+                media_cache_bytes: worker_args.media.media_cache_bytes.map(|bytes| bytes.0 as u64),
             };
             let inputs = admission::gather(&facts_req)
                 .map_err(|refused| anyhow::anyhow!("{}: {}", refused.what, refused.how))?;
@@ -599,6 +608,25 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             let served_context = usize::try_from(admitted.solved.served_context())?;
             let admitted_context = usize::try_from(inputs.context.maximum)?;
             let host_quota = inputs.host_prefix.quota_bytes;
+
+            // Start the bundled 40-layer ViT owner on its admitted device before the
+            // target/Spark push group so its deferred arena lands in the same group.
+            let vision_placement = inputs
+                .vision
+                .as_ref()
+                .and_then(|vision| vision.admitted(&admitted.solved));
+            let mut media = crate::shared::vision::still::Ready::load(
+                &worker_args.media,
+                &worker_args.snapshot,
+                &worker_args.native_lib,
+                &library,
+                &device_ids,
+                vision_placement,
+                cuteafd_loader::media::ImageFamily::Hy4,
+                inputs.vision.as_ref().map_or(0, |vision| vision.media_cache),
+            )?;
+            let media_push = std::mem::take(&mut media.push);
+            library.cuda_set_device(worker_args.device)?;
 
             let rtx_plan = if onboarded_layers.is_empty() {
                 None
@@ -713,11 +741,12 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 )?;
 
                 // Unified SparkNest push group: Spark workers + coordinator dense target
-                // weights + onboarded RTX EXL3 experts in one group (mount fallback outside SparkNest).
+                // weights + bundled ViT arena + onboarded RTX EXL3 experts in one group.
                 let policy = PushPolicy::for_snapshot(&checkpoint.snapshot)?;
+                let media_records = media_push.records();
                 let planned = if spark_adm.coordinator_pushes() {
                     policy.plan(|| -> Result<_> {
-                        let (weights, records) = dense::recording(|| {
+                        let (weights, mut records) = dense::recording(|| {
                             super::weights::Hy4RankWeights::record_all(
                                 &devices,
                                 &programs,
@@ -727,6 +756,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                                 head_rows,
                             )
                         })?;
+                        records.extend(media_records);
                         let (operands, steps) = (records.operands.len(), records.steps.len());
                         let dense = dense::plan_records(
                             &checkpoint.snapshot,
@@ -790,6 +820,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                             elapsed_ms = started.elapsed().as_millis() as u64,
                             "Hy4 unified SparkNest push group committed"
                         );
+                        media_push.commit()?;
                         (weights, pushed)
                     }
                     None => {
@@ -800,7 +831,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                             &cfg,
                             capacity_rows,
                             head_rows,
-                            Default::default(),
+                            media_push,
                         )?;
                         (weights, None)
                     }
@@ -918,7 +949,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     &cfg,
                     capacity_rows,
                     head_rows,
-                    Default::default(),
+                    media_push,
                 )?;
                 let onboarded = match &rtx_plan {
                     None => (0..gpus).map(|_| None).collect(),
@@ -1026,11 +1057,20 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 .value("prefill-waves", prefill.waves)
                 .publish();
 
-            let backend = Hy4Backend::new(engine, served_context, unit_rows, host)?;
+            let backend = Hy4Backend::new(
+                engine,
+                served_context,
+                unit_rows,
+                host,
+                &worker_args.snapshot,
+                media.preparer.is_some(),
+            )?;
+            let mut image = media.preparer.clone();
+            let mut health = media.encoder.health_handle();
             backend.enable_expert_usage();
             let mut media_admission = cuteafd_engine::media::MediaAdmission::new(
-                cuteafd_engine::media::EmbeddingCache::new(0),
-                crate::shared::qwen::Encoder::Off,
+                cuteafd_engine::media::EmbeddingCache::new(media.cache_bytes),
+                media.encoder,
                 worker_args.max_sequences,
             );
             library.cuda_set_device(worker_args.device)?;
@@ -1057,7 +1097,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     })?
                     .record("hy4-serving-loaded", &[]);
                     if let Some(ready) = ready.take() {
-                        let _ = ready.send(Ok(served_context));
+                        let _ = ready.send(Ok((served_context, (image.take(), health.take()))));
                     }
                     Ok(())
                 },
@@ -1080,9 +1120,18 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         )
     });
 
-    let context = ready_rx
+    let (context, (image, health)) = ready_rx
         .await
         .context("Hy4 worker exited before readiness")??;
+    // Vision is advertised only once the tower owner reported ready.
+    let profile = match image {
+        Some(image) => {
+            let mut profile = profile.with_grouped_vision(image);
+            profile.vision_health = health;
+            profile
+        }
+        None => profile,
+    };
     let limits = args.prefix.reserve.limits(context)?;
     let snapshot = args.snapshot.clone();
     let hub = crate::shared::console::hub(args.console.console_text, || {
@@ -1302,6 +1351,7 @@ mod tests {
             fp8: BTreeMap::new(),
         };
         let inputs = Hy4Inputs {
+            vision: None,
             cfg,
             kv_format: Hy4KvCache::Fp8,
             gpus: 1,

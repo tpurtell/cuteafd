@@ -136,6 +136,9 @@ pub(super) fn layout(
         replies: opts.spark_reply_formats,
         expert_usage: opts.expert_usage,
         resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)),
+        vision: report.vision,
+        vision_replicas: opts.vision_replicas,
+        media_cache_bytes: opts.media_cache_bytes,
     };
     let inputs = match admission::gather(&facts_req) {
         Ok(inputs) => inputs,
@@ -176,6 +179,19 @@ pub(super) fn layout(
         }
     };
 
+    report.encoder = inputs
+        .vision
+        .as_ref()
+        .and_then(|vision| vision.admitted(&admitted.solved));
+    if let Some(vision) = &inputs.vision {
+        notes.push(format!(
+            "Hy4 bundled ViT: packed arena {:.2} GiB + scratch {:.2} GiB ({} merged rows), owner {:?}",
+            vision.inventory.arena.bytes() as f64 / GIB,
+            vision.inventory.scratch as f64 / GIB,
+            vision.inventory.max_output_rows,
+            report.encoder.as_ref().map(|e| &e.kind)
+        ));
+    }
     let host_quota = inputs.host_prefix.quota_bytes;
     report.phase_ledger = Some(crate::plan::SolvedPhaseLedger::from(&admitted.solved));
     report.host_budget_bytes = host_quota;

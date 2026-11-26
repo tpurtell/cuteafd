@@ -4,14 +4,24 @@
 use super::{ImageFamily, MediaError, ProcessorConfig, Result};
 use std::path::Path;
 
-pub(super) fn processor_config(snapshot: &Path) -> Result<ProcessorConfig> {
+pub(super) fn processor_config(snapshot: &Path, family: ImageFamily) -> Result<ProcessorConfig> {
     let error = |e: String| MediaError::Config(e);
     let config = crate::read_json_file(&snapshot.join("config.json")).map_err(|e| error(e.to_string()))?;
-    crate::families::hy4_flash::vision::VisionContract::from_config(&config).map_err(|e| error(e.to_string()))?;
+    match family {
+        ImageFamily::Hy4Flash => {
+            crate::families::hy4_flash::vision::VisionContract::from_config(&config)
+                .map_err(|e| error(e.to_string()))?;
+        }
+        ImageFamily::Hy4 => {
+            crate::families::hy4::vision::vision_contract(&config)
+                .map_err(|e| error(e.to_string()))?;
+        }
+        _ => return Err(error(format!("unexpected Hy4 image family {family:?}"))),
+    }
     let document: serde_json::Value = crate::read_json_file(&snapshot.join("processor_config.json"))
         .map_err(|e| error(e.to_string()))?;
     let raw = &document["image_processor"];
-    let expected = ProcessorConfig::for_family(ImageFamily::Hy4Flash);
+    let expected = ProcessorConfig::for_family(family);
     let ok = raw["image_processor_type"] == "HYV4VLImageProcessor"
         && raw["patch_size"] == 16 && raw["merge_size"] == 2 && raw["temporal_patch_size"] == 1
         && raw["spatial_patch_size"] == 1

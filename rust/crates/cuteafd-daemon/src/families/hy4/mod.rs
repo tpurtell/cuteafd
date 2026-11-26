@@ -16,6 +16,7 @@ pub(crate) mod execution;
 pub(crate) mod golden;
 pub(crate) mod graph_sites;
 pub(crate) mod graphs;
+pub(crate) mod media;
 pub(crate) mod programs;
 pub(crate) mod serve;
 pub(crate) mod weights;
