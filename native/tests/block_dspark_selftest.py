@@ -368,6 +368,99 @@ def markov_check(lib, baseline=None, rank=256):
         assert lib.cuteafd_glmf_dspark_markov_norms(None, None, vocab, invalid_rank, stream) != 0
 
 
+def batch_composition_invariance_check(lib):
+    """A sequence's WMMA attention output must be bitwise identical across batch
+    sizes, companion context lengths, and batch positions (both ring and paged, BF16 and FP8)."""
+    from draft_kv_selftest import pack
+    stream = torch.cuda.current_stream().cuda_stream
+    for dim, heads, kvh, block in ((128, 24, 8, 8), (128, 48, 8, 8)):
+        max_seqs = 32
+        lengths_list = [0, 17, 33, 64, 127, 192, 256, 583, 1024, 1500, 2048,
+                        31, 95, 311, 777, 1024, 0, 5, 193, 600, 1024, 1200,
+                        48, 128, 512, 999, 1024, 1800, 63, 255, 1023, 2048]
+        assert len(lengths_list) == max_seqs
+        capacity = max(lengths_list) + 64
+        width = (capacity + 63) // 64
+        q_all = torch.randn(max_seqs, block, heads, dim, device="cuda").bfloat16()
+        k_all = torch.randn(max_seqs, block, kvh, dim, device="cuda").bfloat16()
+        v_all = torch.randn_like(k_all)
+        kc = torch.randn(max_seqs, capacity, kvh, dim, device="cuda").bfloat16()
+        vc = torch.randn_like(kc)
+        compact_k = pack(kc.reshape(-1, kvh, dim))
+        compact_v = pack(vc.reshape(-1, kvh, dim))
+        page_ids = torch.randperm(max_seqs * width, device="cuda", dtype=torch.int32)
+        kp = torch.zeros(max_seqs * width, 64, kvh, dim, device="cuda", dtype=torch.bfloat16)
+        vp = torch.zeros_like(kp)
+        compact_kp = torch.zeros(max_seqs * width, 64, compact_k.shape[-1], device="cuda", dtype=torch.uint8)
+        compact_vp = torch.zeros_like(compact_kp)
+        for slot in range(max_seqs):
+            padded_k = torch.nn.functional.pad(kc[slot], (0, 0, 0, 0, 0, width * 64 - capacity))
+            padded_v = torch.nn.functional.pad(vc[slot], (0, 0, 0, 0, 0, width * 64 - capacity))
+            kp[page_ids.reshape(max_seqs, width)[slot].long()] = padded_k.reshape(width, 64, kvh, dim)
+            vp[page_ids.reshape(max_seqs, width)[slot].long()] = padded_v.reshape(width, 64, kvh, dim)
+            for logical in range(width):
+                first, end = logical * 64, min((logical + 1) * 64, capacity)
+                physical = page_ids.reshape(max_seqs, width)[slot, logical].long()
+                compact_kp[physical, :end - first] = compact_k[slot * capacity + first:slot * capacity + end]
+                compact_vp[physical, :end - first] = compact_v[slot * capacity + first:slot * capacity + end]
+        size = lib.cuteafd_block_dspark_attention_workspace(max_seqs, heads, kvh, block, capacity + block, dim)
+        scratch = torch.full((size + 256,), 173, device="cuda", dtype=torch.uint8)
+
+        def run(subset, fp8, paged):
+            idx = torch.tensor(subset, device="cuda", dtype=torch.long)
+            n = len(subset)
+            q = q_all[idx].contiguous()
+            k = k_all[idx].contiguous()
+            v = v_all[idx].contiguous()
+            slots = idx.to(torch.int32).contiguous()
+            lens = torch.tensor([lengths_list[s] for s in subset], device="cuda", dtype=torch.int32)
+            ends = lens.clone()
+            max_keys = max(lengths_list[s] for s in subset) + block
+            out = torch.full_like(q, float("nan"))
+            if paged:
+                pt = page_ids.reshape(max_seqs, width)[idx].contiguous()
+                fn = lib.cuteafd_block_dspark_attention_paged_fp8 if fp8 else lib.cuteafd_block_dspark_attention_paged
+                k_src, v_src = (compact_kp, compact_vp) if fp8 else (kp, vp)
+                assert fn(q.data_ptr(), k.data_ptr(), v.data_ptr(), k_src.data_ptr(), v_src.data_ptr(),
+                          slots.data_ptr(), lens.data_ptr(), ends.data_ptr(), pt.data_ptr(),
+                          out.data_ptr(), scratch.data_ptr(), n, block, heads, kvh, max_seqs * width * 64,
+                          max_keys, 0, 0, dim, width, dim ** -0.5, stream) == 0
+            else:
+                fn = lib.cuteafd_block_dspark_attention_fp8 if fp8 else lib.cuteafd_block_dspark_attention
+                k_src, v_src = (compact_k, compact_v) if fp8 else (kc, vc)
+                assert fn(q.data_ptr(), k.data_ptr(), v.data_ptr(), k_src.data_ptr(), v_src.data_ptr(),
+                          slots.data_ptr(), lens.data_ptr(), ends.data_ptr(),
+                          out.data_ptr(), scratch.data_ptr(), n, block, heads, kvh, capacity,
+                          max_keys, 0, 0, dim, dim ** -0.5, stream) == 0
+            torch.cuda.synchronize()
+            assert torch.all(scratch[size:] == 173), "batch invariance workspace overrun"
+            return out
+
+        probes = [0, 2, 5, 7, 8, 10]  # lengths: 0, 33, 192, 583, 1024, 2048
+        compositions = [
+            [7, 10],
+            [10, 7],
+            [0, 2, 5, 7, 8, 10, 1, 3],
+            [10, 8, 7, 5, 2, 0, 15, 20, 11, 14, 25],
+            list(range(16)),
+            list(range(32)),
+            list(reversed(range(32))),
+        ]
+        for fp8 in (False, True):
+            for paged in (False, True):
+                solo = {s: run([s], fp8, paged)[0] for s in probes}
+                for comp in compositions:
+                    batched = run(comp, fp8, paged)
+                    for pos, s in enumerate(comp):
+                        if s in solo:
+                            assert torch.equal(batched[pos], solo[s]), (
+                                f"WMMA attention batch-invariance mismatch: heads={heads}/{kvh} "
+                                f"fp8={fp8} paged={paged} slot={s} len={lengths_list[s]} "
+                                f"batch_size={len(comp)} pos={pos}"
+                            )
+        print(f"batch-composition invariance heads={heads}/{kvh} block={block} batches=1,2,8,11,16,32: exact")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("library")
@@ -383,6 +476,7 @@ def main():
         rotary_check(lib, bind(args.baseline) if args.baseline else None)
         attention_check(lib)
         sliding_attention_check(lib)
+        batch_composition_invariance_check(lib)
     print("block dSpark kernels: all checks passed")
 
 
