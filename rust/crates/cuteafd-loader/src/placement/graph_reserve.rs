@@ -248,6 +248,21 @@ pub fn current_working_set(rank: usize, measured: WorkingSet) -> Result<Resolved
     resolve_working_set(text.as_deref(), extra.as_deref(), cap.as_deref(), rank, measured)
 }
 
+/// Look up a coordinator census by its exact family-defined layout and rank.
+/// Unknown rows retain the unmeasured zero-base policy and explicit overrides.
+pub fn current_census<K: PartialEq>(rank: usize, layout: Option<K>, table: &[(K, usize, WorkingSet)]) -> Result<Resolved, Error> {
+    match census_working_set(rank, layout, table) {
+        Some(measured) => current_working_set(rank, measured),
+        None => current(rank, false, 0, 0),
+    }
+}
+
+pub fn census_working_set<K: PartialEq>(rank: usize, layout: Option<K>, table: &[(K, usize, WorkingSet)]) -> Option<WorkingSet> {
+    let layout = layout?;
+    table.iter().find_map(|(key, gpu, measured)|
+        (*gpu == rank && key == &layout).then_some(*measured))
+}
+
 pub fn resolve(text: Option<&str>, rank: usize, spark: bool, base: u64, tail: u64) -> Result<Resolved, Error> {
     resolve_with_extra(text, None, None, rank, spark, base, tail)
 }
@@ -291,6 +306,17 @@ pub fn prewarm_selection(pinned: &[bool], bases: &[u64],
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn census_lookup_never_borrows_another_layout_or_rank() {
+        let measured = WorkingSet { w1: 12 << 20, step_growth: 12 << 20, capture_growth: 2 << 20 };
+        let table = [("dual", 1, measured)];
+        assert_eq!(census_working_set(1, Some("dual"), &table), Some(measured));
+        assert_eq!(census_working_set(0, Some("dual"), &table), None);
+        assert_eq!(census_working_set(1, Some("single"), &table), None);
+        assert_eq!(census_working_set(1, None, &table), None);
+    }
+
     #[test]
     fn physical_floor_defaults_selectors_and_disable() {
         assert_eq!(physical_floor(None, 0, 100 << 20).unwrap(), 50 << 20);

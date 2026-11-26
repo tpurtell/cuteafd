@@ -20,16 +20,11 @@ impl Layout {
     }
 }
 
-fn working_set(_layout: Option<Layout>, _rank: usize) -> Option<WorkingSet> {
-    // Populate only from a physical C1 census of this family.
-    None
-}
+// Populate only from a physical C1 census of this family.
+const CENSUS: &[(Layout, usize, WorkingSet)] = &[];
 
 pub fn reserve_policy(layout: Option<Layout>, rank: usize) -> Result<Resolved, Error> {
-    match working_set(layout, rank) {
-        Some(measured) => graph_reserve::current_working_set(rank, measured),
-        None => graph_reserve::current(rank, false, 0, 0),
-    }
+    graph_reserve::current_census(rank, layout, CENSUS)
 }
 
 #[cfg(test)]
@@ -46,6 +41,6 @@ mod tests {
         ] {
             assert_eq!(Layout::resolve(gpus, sparks, attention), None);
         }
-        assert_eq!(working_set(None, 0), None);
+        assert_eq!(graph_reserve::census_working_set(0, None, CENSUS), None);
     }
 }
