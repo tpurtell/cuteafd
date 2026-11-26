@@ -4,11 +4,12 @@ set -euo pipefail
 repo="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 run="$HOME/Developer/quantization-runs/ernie55-flash-k4-mc"
 build="$HOME/.cache/cuteafd/builds/ernie55-flash-k4-mc"
-phase="${1:?usage: launch.sh build|preflight|pilot PYTHON-ARGUMENT...}"
+phase="${1:?usage: launch.sh build|preflight|pilot|production PYTHON-ARGUMENT...}"
 shift
 case "$phase" in
     build|preflight) deadline=2h ;;
     pilot) deadline=30m ;;
+    production) deadline=45d ;;
     *) echo "Unknown phase $phase" >&2; exit 2 ;;
 esac
 (( $# )) || { echo "Missing Python arguments" >&2; exit 2; }
