@@ -243,6 +243,8 @@ def test_deployment_preserves_release_container_commands(
             # The reserve the units cut.
             reserve = command[command.index("--prefill-reserve-rows") + 1]
             before["command"][position:position] = ["--prefill-waves", waves, "--prefill-reserve-rows", reserve]
+            if before["command"][before["command"].index("--rtx-gpus") + 1] == "1" and "--dspark" in before["command"]:
+                before["command"][position:position] = ["--decode-rows", "128"]
             # Serve's unit is the planner's: a third of the reserve with Sparks.
             if waves == "3":
                 before["command"][before["command"].index("--prefill-batch-tokens") + 1] = "2752"

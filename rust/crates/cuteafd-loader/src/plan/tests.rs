@@ -2311,7 +2311,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                             &catalog, &dir.path().join("share/PROGRAMS.json"),
                             report.prefill_unit_rows.unwrap(), gpus, 188, report.prefill_waves.unwrap() as usize,
                             report.prefill_waves.unwrap() * report.prefill_unit_rows.unwrap(),
-                            crate::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS, report.decode_lanes).unwrap();
+                            u64::from(report.decode_rows), report.decode_lanes).unwrap();
                         let cost = if gpus == 1 { costs[0].whole } else { costs[0].half[device.index as usize] };
                         assert_eq!(cost.resident, packed(gpus as u64));
                         assert_eq!(local.bytes, cost.resident + cost.staging + workspace);
