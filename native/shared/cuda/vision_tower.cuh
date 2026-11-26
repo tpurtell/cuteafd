@@ -28,14 +28,14 @@ bool valid_generic_tower(const cuteafd_vision_spec& s) {
   // channel-major conv grouping and checkpoint newline rows. Others stay patch 14.
   const bool hy4=t.absolute_kind==2;
   if(hy4!=(t.projection_order==3) || s.patch_size!=(hy4?16u:14u))return false;
-  if(hy4 && (s.head_dim!=72 || t.rotary_kind || t.pixel_layout!=1 || t.temporal_patch!=1 || t.pre_norm.kind ||
+  if(hy4 && ((s.head_dim!=72 && s.head_dim!=96) || t.rotary_kind || t.pixel_layout!=1 || t.temporal_patch!=1 || t.pre_norm.kind ||
      t.block_norm_kind!=1 || t.activation!=1 || t.final_norm.kind!=2 || t.projectors[0].activation!=1 ||
      t.post_norm.kind || s.max_tokens>4096 || !generic_extent(s,s.merger_extra[0],size_t(s.output_width)*2)))return false;
   if(!hy4 && s.merger_extra[0]!=UINT64_MAX && s.merger_extra[0]!=0)return false;
   if(t.version!=1 || t.size!=sizeof(t) || (t.block_norm_kind!=1 && t.block_norm_kind!=2) ||
      (t.activation!=1 && t.activation!=2) || !isfinite(t.block_norm_epsilon) || t.block_norm_epsilon<=0.f ||
      !s.hidden || s.hidden>8192 || !s.intermediate || s.intermediate>32768 || !s.depth || s.depth>128 ||
-     !s.heads || s.heads>32 || s.kv_heads!=s.heads || (s.head_dim!=72 && s.head_dim!=80 && s.head_dim!=128) ||
+     !s.heads || s.heads>32 || s.kv_heads!=s.heads || (s.head_dim!=72 && s.head_dim!=80 && s.head_dim!=96 && s.head_dim!=128) ||
      uint64_t(s.heads)*s.head_dim!=t.attention_width || t.spatial_merge!=2 ||
      (t.pixel_layout!=1 && t.pixel_layout!=2) ||
      !((t.temporal_patch==1 && t.temporal_input==0) || (t.temporal_patch==2 && t.temporal_input==1)))return false;

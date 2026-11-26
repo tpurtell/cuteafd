@@ -96,6 +96,53 @@ def test_hy4_flash_launcher_composes_0spark_and_spark_argv(tmp_path: Path) -> No
     assert "--split-device" not in shlex.split(serve_s4)
 
 
+def test_hy4_launcher_composes_1rtx_4spark_and_2rtx_6spark_argv(tmp_path: Path) -> None:
+    config = {
+        "model_type": "hy_v4_vl",
+        "text_config": {
+            "model_type": "hy_v4_vl_text",
+            "num_hidden_layers": 78,
+            "mlp_layer_types": ["dense"] + ["sparse"] * 77,
+        },
+    }
+    four = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(4))
+    keys_min = "SPARK_COUNT=4\nRTX_GPUS=1\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\nCORE_VIEW=k8-compact\n" + four
+    res_min = _family_launch_result(
+        tmp_path / "hy4-min", config, "wrldsuksgo2mars/Hy4-EXL3-K4-MC", keys_min,
+        physical_gpus=(0,), extra_args=("--wip", "hy4"), encoder_plan={**PLANNED, "spark_ranks": 4},
+        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
+    )
+    serve_min = _line(res_min, "serve-hy4 --snapshot")
+    assert _flag(serve_min, "--core-view") == "k8-compact"
+    assert _flag(serve_min, "--kv-cache") == "fp8"
+    assert _flag(serve_min, "--peers") == ",".join(f"10.0.0.{i + 1}:19441" for i in range(4))
+    assert "--split-device" not in shlex.split(serve_min)
+
+    six = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(6))
+    keys_max = "SPARK_COUNT=6\nRTX_GPUS=2\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\nCORE_VIEW=k8-compact\n" + six
+    res_max = _family_launch_result(
+        tmp_path / "hy4-max", config, "wrldsuksgo2mars/Hy4-EXL3-K4-MC", keys_max,
+        physical_gpus=(0, 1), extra_args=("--wip", "hy4"), encoder_plan={**PLANNED, "spark_ranks": 6},
+        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
+    )
+    serve_max = _line(res_max, "serve-hy4 --snapshot")
+    assert (_flag(serve_max, "--device"), _flag(serve_max, "--split-device")) == ("0", "1")
+    assert _flag(serve_max, "--core-view") == "k8-compact"
+    assert _flag(serve_max, "--attention-placement") is None
+    assert _flag(serve_max, "--peers") == ",".join(f"10.0.0.{i + 1}:19441" for i in range(6))
+
+    res_heads = _family_launch_result(
+        tmp_path / "hy4-heads", config, "wrldsuksgo2mars/Hy4-EXL3-K4-MC",
+        keys_max + "ATTENTION_PLACEMENT=heads\n",
+        physical_gpus=(0, 1), extra_args=("--wip", "hy4"), encoder_plan={**PLANNED, "spark_ranks": 6},
+        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
+    )
+    serve_heads = _line(res_heads, "serve-hy4 --snapshot")
+    plan_heads = _line(res_heads, "cuteafd plan")
+    assert "CUTEAFD_ATTENTION_PLACEMENT=heads" in serve_heads
+    assert _flag(plan_heads, "--attention-placement") == "heads"
+
+
 @pytest.mark.parametrize("mode,selected", [("off", "off"), ("dfly2", "dfly2"), ("auto", "dfly2"), ("", "dfly2")])
 def test_hy4_bundled_drafter_matches_plan_and_serve(tmp_path: Path, mode: str, selected: str) -> None:
     config = {"model_type": "hy_v4_flash", "num_hidden_layers": 42, "dfly_num_hidden_layers": 5,

@@ -401,7 +401,7 @@ mod tests {
                     assert!(row.cap_bytes > 0);
                 }
             }
-            let mark_bytes = live.cache.ranks.iter().map(|r| r.bytes).sum::<u64>();
+            let mark_bytes = live.cache.ranks.iter().map(|r| r.mark_bytes).sum::<u64>();
             let expected_slots = if entries == 0 { 0 } else if host != Some(0) { 2 } else {
                 cuteafd_core::prefix::mark_slots_for(16, entries, mark_bytes, opts.mimo_prefix_mark_bytes) as usize
             };
@@ -429,7 +429,7 @@ mod tests {
                 assert_eq!(reservation.active as u64, live.cache.ranks[rank].bytes * 16);
                 assert_eq!(
                     reservation.marks as u64,
-                    live.cache.ranks[rank].bytes * live.marks as u64
+                    live.cache.ranks[rank].mark_bytes * live.marks as u64
                 );
             }
             inputs.inventory.gpus[0].baseline = Baseline::Planned {

@@ -1060,6 +1060,10 @@ mod tests {
         use super::super::prefix::Placement;
         let _ = tracing_subscriber::fmt().with_env_filter("info").try_init();
         let mut args = live_mtp_args();
+        // The text-only oracle starts routed experts, not remote vision workers.
+        args.vision.vision = cuteafd_loader::plan::MediaMode::Off;
+        // Golden-run starts every routed layer on the Spark ranks.
+        args.rtx_expert_layers = cuteafd_loader::placement::OnboardSetting::Layers(0);
         args.kv_cache = std::env::var("CUTEAFD_STEP5_KV_CACHE")
             .unwrap_or_else(|_| "bf16".into()).parse()?;
         args.snapshot = std::env::var("CUTEAFD_GOLDEN_SNAPSHOT")?.into();
@@ -1069,10 +1073,16 @@ mod tests {
             .map(str::parse).collect::<std::result::Result<Vec<_>, _>>()?;
         let windows: serde_json::Value = serde_json::from_slice(&std::fs::read(
             std::path::Path::new(&std::env::var("CUTEAFD_GOLDEN_FIXTURES")?).join("windows.json"))?)?;
-        let tokens = windows["windows"][0]["tokens"].as_array().context("live exactness tokens")?
+        let window = windows["windows"].as_array().context("live exactness windows")?.iter()
+            .find(|w| w["tokens"].as_array().is_some_and(|t| t.len() > 577)
+                && w["roles"].as_array().is_some_and(|roles| roles.iter().any(|r| r == "gen")))
+            .context("live exactness requires a published generated-row window")?;
+        let tokens = window["tokens"].as_array().context("live exactness tokens")?
             .iter().map(|v| v.as_u64().context("live token id").and_then(|n| Ok(u32::try_from(n)?)))
             .collect::<Result<Vec<_>>>()?;
-        ensure!(tokens.len() > 577, "live exactness needs at least 578 real tokens");
+        let generated = window["roles"].as_array().context("live exactness roles")?.iter()
+            .enumerate().find(|(at, role)| *at > 577 && *at + 1 < tokens.len() && *role == "gen")
+            .map(|(at, _)| at - 1).context("live exactness generated continuation")?;
         with_backend(&args, |backend, _, _| {
             let (family, mut pool) = backend.prefix_cache(&args.prefix, 3)?;
             let prefill = |placement: &mut Placement, state: &mut super::super::mtp::DraftState,
@@ -1084,7 +1094,7 @@ mod tests {
                 }
                 Ok(())
             };
-            for frontier in [63usize, 64, 65, 575, 576] {
+            for frontier in [63usize, 64, 65, 575, 576, generated] {
                 let mut source = pool.admit_cold(&family, frontier, frontier + 4,
                     |pages| Placement { media: None, pages, sequence: 0, committed: 0 })?.placement;
                 let mut source_draft = super::super::mtp::DraftState::default();
@@ -1130,12 +1140,17 @@ mod tests {
                 ensure!(backend.verify_device(&mut [(&mut source, &rows)], true, pool.pool()).is_err(),
                     "live abort injection did not fire");
                 ensure!(expected == backend.diagnostic_state(&source)?, "aborted target changed mark at {frontier}");
-                backend.verify_device(&mut [(&mut source, &rows)], true, pool.pool())?;
+                let source_logits = backend.verify_device(&mut [(&mut source, &rows)], true, pool.pool())?
+                    .context("live continuation logits")?.to_host(backend.library())?;
                 backend.accept(&mut [scheduler::Verified { placement: &mut source, seq: &mut source_draft,
                     start: frontier, history: (), rows: &rows, first_row: 0,
                     kept: Some((1, tokens[frontier + 1])), finished: true, neural: true }], true)?;
                 for (placement, draft) in [(&mut cold, &mut cold_draft), (&mut restored, &mut restored_draft)] {
-                    backend.verify_device(&mut [(placement, &rows)], true, pool.pool())?;
+                    let logits = backend.verify_device(&mut [(placement, &rows)], true, pool.pool())?
+                        .context("live restored continuation logits")?.to_host(backend.library())?;
+                    ensure!(source_logits.len() == logits.len() && source_logits.iter().zip(&logits)
+                        .all(|(a,b)| a.is_finite() && a.to_bits() == b.to_bits()),
+                        "live target continuation logits differ at {frontier}");
                     backend.accept(&mut [scheduler::Verified { placement, seq: draft, start: frontier,
                         history: (), rows: &rows, first_row: 0, kept: Some((1, tokens[frontier + 1])),
                         finished: true, neural: true }], true)?;
@@ -1163,7 +1178,7 @@ mod tests {
                 prefill(&mut fresh, &mut fresh_draft, frontier, frontier + 1, pool.pool())?;
                 ensure!(continued == backend.diagnostic_state(&fresh)?, "live prior-turn hit differs from cold prefill");
                 backend.require_live()?;
-                println!("Step-5 live exactness frontier={frontier} target_kv_csa=real predictor_stages=3 abort_replay=true restore=true fresh_marks=true turn_hit=true byte_exact=true");
+                println!("Step-5 live exactness frontier={frontier} target_kv_csa=real predictor_stages=3 abort_replay=true restore=true fresh_marks=true turn_hit=true continuation_logits_byte_exact=true byte_exact=true");
                 for placement in [&next, &fresh] { pool.release(&family, &placement.pages)?; }
                 pool.clear(&family)?;
             }

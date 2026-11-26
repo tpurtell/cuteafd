@@ -2015,7 +2015,9 @@ impl<'a> Engine<'a> {
         }
         // A sample is only a completed-step boundary once every rank's queued
         // work landed; this runs only while a capture or retirement is due.
+        let wait = std::time::Instant::now();
         self.drain_state()?;
+        crate::shared::decode_graph::device::record_boundary_drain(std::iter::once(self.device).chain(self.peer.iter().map(|p| p.device)), wait.elapsed());
         let spans = self.ranks() > 1;
         // SAFETY: see above; every V4 owner pins `()` and only borrowed
         // persistent storage, never a per-capture allocation.

@@ -20,7 +20,18 @@ IDENTITY = {
 }
 # Git's own defaults must not decide whether a submodule clone is allowed, or the
 # fallback would pass with the script's conditional file-transport flag removed.
-HERMETIC = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+HERMETIC = {
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_SYSTEM": os.devnull,
+    # Reject non-file transports even if a regression selects an unexpected URL.
+    # Keep file's default 'user' policy so nested clones still need the script's
+    # explicit protocol.file.allow=always flag.
+    "GIT_CONFIG_COUNT": "2",
+    "GIT_CONFIG_KEY_0": "protocol.allow",
+    "GIT_CONFIG_VALUE_0": "never",
+    "GIT_CONFIG_KEY_1": "protocol.file.allow",
+    "GIT_CONFIG_VALUE_1": "user",
+}
 FILE_ALLOWED = ("-c", "protocol.file.allow=always")
 
 
@@ -122,16 +133,24 @@ class SubmoduleInitLocalTest(unittest.TestCase):
                          fixture.inner_url)
         self.assertIn("at pins", result.stdout)
 
-    def test_default_worktree_is_the_current_repo_root(self):
+    def test_default_worktree_is_the_checkout_containing_the_script(self):
         fixture = self.fixture()
+        script = fixture.super_repo / "scripts/dev/submodule-init-local"
+        script.parent.mkdir(parents=True)
+        shutil.copy2(SCRIPT, script)
+        sub = fixture.super_repo / "modules/sub"
+        git(fixture.super_repo, "submodule", "deinit", "-f", "modules/sub")
+        self.assertFalse((sub / ".git").exists())
 
         env = {**os.environ, **HERMETIC, "CUTEAFD_GIT_MIRRORS": str(fixture.mirrors)}
-        result = subprocess.run([str(SCRIPT)], cwd=fixture.super_repo, text=True,
+        result = subprocess.run([str(script)], cwd=fixture.root, text=True,
                                 capture_output=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(
-            git(fixture.super_repo / "modules/sub", "rev-parse", "HEAD").stdout.strip(),
-            fixture.middle_pin)
+        self.assertEqual(git(sub, "rev-parse", "HEAD").stdout.strip(), fixture.middle_pin)
+        self.assertEqual(git(sub / "inner", "rev-parse", "HEAD").stdout.strip(),
+                         fixture.inner_pin)
+        self.assertTrue((fixture.mirrors / "modules-sub.git").is_dir())
+        self.assertTrue((fixture.mirrors / "modules-sub-inner.git").is_dir())
 
     def test_initialized_submodule_fetches_the_pin_from_the_mirror(self):
         """A submodule left behind by an older clone must switch to the mirror.

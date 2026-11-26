@@ -88,15 +88,17 @@ def export_jobs():
     # Inkling 2 has no live example config yet; its MXFP8 W8A8, native dynamic-amax
     # NVFP4 W4A4 and K4 MC EXL3 expert packages are registered here.
     experts.update(("inkling2:mxfp8", "inkling2:nvfp4a4", "inkling2:exl3-k45",
-                    "inkling2_mini:mxfp8", "inkling2_mini:nvfp4a4", "hy4f:exl3-k45-mul1"))
+                    "inkling2_mini:mxfp8", "inkling2_mini:nvfp4a4", "hy4f:exl3-k45-mul1",
+                    "hy4:exl3-k45-mul1"))
     geometries = [*compare.GEOMETRIES, "kimik3", "kimik31", "muse", "muse2", "ml4", "hy4f", "hy4f2",
+                  "hy4", "hy42",
                   "dense_trellis_k6", "kimi_split", "expert_partial", "expert_reply",
                   "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "exlr8", "exlr8_dense",
                   "minimax", "inkling2", "inkling2_mini", "native_experts"]
     jobs = [("programs", "export_b12x_dsv4_aot.py", [
         "--geometry", ",".join(geometries), "--max-context", "1048576",
         "--decode-rows", "64", "--prefill-rows", "4096", "--context-split", "on",
-        "--dense-trellis-families", "kimik3,glm,glmf,step5,muse,ml4,inkling2,hy4f",
+        "--dense-trellis-families", "kimik3,glm,glmf,step5,muse,ml4,inkling2,hy4f,hy4",
         "--exlr8-family", "glm,glmf", "--exlr8-role", "coordinator"])]
     for expert in sorted(experts):
         family, kind = expert.split(":")

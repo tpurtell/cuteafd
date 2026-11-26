@@ -301,6 +301,7 @@ def seed_checkpoint_metadata(hf):
         "wrldsuksgo2mars/DeepSeek-V4-Pro-EXL3-K2-Core-K6": {**DSV4, "quantization_config": {"quant_method": "exl3"}},
         "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC": GLM5,
         "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC": GLMF,
+        "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1": GLMF,
         "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC": GLMF,
         "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC": {"model_type": "step5_vl", "text_config": {
             "model_type": "step5", "num_hidden_layers": 92, "moe_layer_list": list(range(3, 91))}},
@@ -347,7 +348,7 @@ def seed_checkpoint_metadata(hf):
         (root / "refs").mkdir(exist_ok=True)
         (root / "refs/main").write_text("fixture")
         if "EXL3" in name or (config.get("quantization_config") or {}).get("quant_method") == "exl3":
-            codebook = "mul1" if config.get("model_type") == "hy_v4_flash" else "mcg"
+            codebook = "mul1" if (config.get("model_type") == "hy_v4_flash" or "MUL1" in name) else "mcg"
             seed_exl3_index(hf, name, revision="fixture", codebook=codebook)
     repo = Path(__file__).resolve().parents[2]
     for path in (repo / "examples/configs").glob("*.config"):

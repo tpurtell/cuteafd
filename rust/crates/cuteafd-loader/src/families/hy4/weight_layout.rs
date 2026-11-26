@@ -17,6 +17,24 @@ use crate::serving_capacity::WeightArenaLayout;
 
 use super::Hy4Config;
 
+pub const ROPE_INV_FREQ: &str = "hy4.rope.inv_freq";
+
+/// Both the original and compact target recipes use the shared windowed
+/// mount reader. Expert shards have separate owners.
+pub fn target_mount_load(
+    checkpoint: &Checkpoint,
+    gpus: usize,
+) -> Result<crate::shared::dense_read::MountLoad> {
+    crate::shared::dense_read::MountLoad::from_headers(
+        checkpoint
+            .tensors
+            .iter()
+            .map(|t| &t.meta)
+            .filter(|h| !h.name.contains(".mlp.experts.")),
+        gpus,
+    )
+}
+
 /// Core projections eligible for K8/K6 EXL3 MUL1 compact views in Hy4
 /// (`origin/quant/hy4-k4-mc:quantization/hy4/recipe.py::reviewed_core_modules`).
 pub fn core_contract(stem: &str) -> Option<CoreContract> {
@@ -122,6 +140,61 @@ impl CoordinatorWeights {
             maximum,
             cuteafd_core::memory_layout::MemoryKind::Weights,
         )
+    }
+
+    pub fn has_bf16_head(&self) -> bool {
+        self.arena.views().contains_key(crate::families::hy4_common::HEAD_WEIGHT)
+    }
+
+    pub fn native_core_scratch(
+        &self,
+        rows: usize,
+    ) -> Result<Option<crate::formats::trellis_core::ProjectionScratchLayout>> {
+        let mut combined: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
+        for (stem, layout) in &self.core {
+            if stem == HEAD_STEM {
+                continue;
+            }
+            let [n, k] = layout.shape;
+            let one = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, rows)?;
+            match &mut combined {
+                Some(acc) => acc.merge(&one)?,
+                None => combined = Some(one),
+            }
+        }
+        for stem in self.fp8.keys() {
+            if stem == HEAD_STEM {
+                continue;
+            }
+            let one = crate::formats::trellis_core::ProjectionScratchLayout {
+                rows,
+                extents: BTreeMap::from([("fp8", 256)]),
+            };
+            match &mut combined {
+                Some(acc) => acc.merge(&one)?,
+                None => combined = Some(one),
+            }
+        }
+        Ok(combined)
+    }
+
+    pub fn native_head_scratch(
+        &self,
+        head_rows: usize,
+    ) -> Result<Option<crate::formats::trellis_core::ProjectionScratchLayout>> {
+        if let Some(layout) = self.core.get(HEAD_STEM) {
+            let [n, k] = layout.shape;
+            return Ok(Some(crate::formats::trellis_core::ProjectionScratchLayout::new(
+                k, n, head_rows,
+            )?));
+        }
+        if self.fp8.contains_key(HEAD_STEM) {
+            return Ok(Some(crate::formats::trellis_core::ProjectionScratchLayout {
+                rows: head_rows,
+                extents: BTreeMap::from([("fp8", 256)]),
+            }));
+        }
+        Ok(None)
     }
 
     pub fn trellis_scratch(
@@ -309,6 +382,9 @@ pub fn target_arenas(
                 views.push((format!("{p}.mlp.gate.e_score_correction_bias"), cfg.experts * 4));
             }
         }
+
+        // RoPE inverse frequency constants live inside the target arena (never standalone allocations).
+        views.push((ROPE_INV_FREQ.into(), (cfg.qk_rope_dim / 2) * 4));
 
         let arena = WeightArenaLayout::new(format!("hy4/target/gpu{rank}"), views)?;
         out.push(CoordinatorWeights {

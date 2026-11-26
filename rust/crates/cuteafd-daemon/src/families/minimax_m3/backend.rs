@@ -285,7 +285,9 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         if !paired && (observe || draft.is_none()) {
             // No drafter: canonical state publishes before selection. Graph
             // maintenance likewise needs a completed sample.
+            let wait = std::time::Instant::now();
             self.completed(Ok(()))?;
+            if observe && draft.is_some() { crate::shared::decode_graph::device::record_boundary_drain(self.owners.storage.ranks.iter().map(|r| r.decode.borrow().stream.device.id), wait.elapsed()); }
         }
         if observe {
             // SAFETY: paired execution or the publication/maintenance fence

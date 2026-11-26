@@ -79,6 +79,12 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
   admission decides fit; the packed qualification covers RTX PRO 6000 MXFP4
   min/max, not 5090/32 GB, NVFP4 or StridedPLE performance. Packed does not
   bypass independent expert/projection or StridedPLE+NVFP4 restrictions.
+- Decode lanes: unset `DECODE_LANES` resolves by coordinator RTX count at
+  `DECODE_ROWS=64` — **1 lane on 1× RTX** (wins C4–C16 and 32K C8 with +20.4%
+  KV pool in [#2460](https://github.com/tpurtell/cuteafd/issues/2460#issuecomment-7165698474))
+  and **2 lanes on 2× RTX** (keeps the C16 win and 2.28× larger KV pool).
+  Explicit `DECODE_LANES=1|2` overrides either layout; `CONCURRENCY=1` always
+  resolves to one lane.
 - Bundled vision tower (MoonViT-style) when the checkpoint carries
   `vision_config`. `VISION=auto` admits it whenever the KV pool still meets
   `KV_MIN_TOKENS`.
@@ -87,6 +93,7 @@ There is no separate scale-only preload. `ENGRAM_WARM` warms the whole mapped ta
 
 | Setting | Default | Scope |
 | --- | --- | --- |
+| `DECODE_LANES` | `1` on 1× RTX; `2` on 2× RTX (`1` at `CONCURRENCY=1`) | Independent decode lanes at `DECODE_ROWS=64`. Explicit `1` or `2` overrides the layout default; plan, admission and lane-scaled graph reserve follow the resolved count ([#2460](https://github.com/tpurtell/cuteafd/issues/2460#issuecomment-7165698474)). |
 | `TP2_DSPARK_EXPERTS` | `on` with two RTX GPUs and dSpark; otherwise `off` | Splits dSpark routed experts across the RTX pair. `off` keeps them on the draft GPU. Explicit `on` requires V4.1, two RTX GPUs and dSpark. |
 
 ## Known limits

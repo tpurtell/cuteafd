@@ -164,9 +164,10 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
         "V4.1 uses built-in bounded replay for partial matches; --prefix-partial is MiMo-only");
     args.prefix.resolve_entries(args.concurrency as usize);
     cuteafd_bench::context::set_resolved("max-context-tokens", &args.max_context_tokens.to_string());
-    let lanes = cuteafd_loader::plan::resolve_decode_lanes("deepseek_v41", Some(args.decode_lanes), u64::from(args.concurrency))?;
+    let lanes = cuteafd_loader::plan::resolve_decode_lanes(
+        "deepseek_v41", args.decode_lanes, u64::from(args.concurrency), args.rtx_gpus as usize)?;
     // Every later owner, admission and scheduler reads the resolved count.
-    args.decode_lanes = lanes;
+    args.decode_lanes = Some(lanes);
     cuteafd_bench::context::set_resolved("decode-lanes", &lanes.to_string());
     let decode_rows = cuteafd_loader::plan::resolve_decode_rows(
         "deepseek_v41",
@@ -178,6 +179,10 @@ fn normalize_serving(args: &mut crate::cli::NativeServeArgs) -> Result<u8> {
             draft_length: if args.dspark { args.draft_length.draft_length.map(|n| n as u32) } else { Some(0) },
         },
     )?;
+    let requested = args.decode_rows.as_option();
+    let auto_target = cuteafd_loader::plan::decode_rows::auto_target("deepseek_v41", lanes, args.rtx_gpus as usize);
+    tracing::info!(lanes, decode_rows, auto_target, capped_by_boot_demand = requested.is_none() && decode_rows < auto_target,
+        requested = ?requested, "V4.1 resolved decode geometry");
     args.decode_rows = cuteafd_loader::plan::decode_rows::DecodeRowsSetting::explicit(decode_rows);
     cuteafd_bench::context::set_resolved("decode-rows", &decode_rows.to_string());
     Ok(lanes)
@@ -419,7 +424,7 @@ fn worker(
 
     // The resolved decode lanes (one or two) at decode width, and `slots`
     // prefill slots on one shared storage set (PLAN "Prefill contract").
-    let lanes = args.decode_lanes;
+    let lanes = args.resolved_decode_lanes();
     let admitted = AdmittedPrefill::resolve(&args)?;
     ensure!(admitted.unit_cap == capacity as usize, "V4.1 prefill unit cap {} differs from the live rows {capacity}",
         admitted.unit_cap);
@@ -1217,17 +1222,20 @@ mod spark_lane_tests {
     fn decode_shaped_rows_never_ride_the_prefill_link() {
         use cuteafd_transport::{worker_selection::{execution_owner, ExecutionOwner}, ExpertV2SourceKind::*};
         for (slots, unit) in [(2u64, 4096u64), (3, 2752), (4, 2048)] {
-            let executions = cuteafd_loader::plan::spark_executions::admit_family("deepseek_v41",
-                &cuteafd_core::EXL3_CAPACITIES, None, unit, slots).unwrap();
-            for lane in 0..2 {
-                for (kind, rows) in [(Decode, 1), (MtpVerify, 8)] {
-                    assert_eq!(execution_owner(&executions, kind, lane, rows).unwrap(), ExecutionOwner::Decode(lane as usize));
+            for lanes in [1u8, 2] {
+                let executions = cuteafd_loader::plan::spark_executions::admit_family_lanes("deepseek_v41",
+                    &cuteafd_core::EXL3_CAPACITIES, None, unit, slots, lanes).unwrap();
+                for lane in 0..u32::from(lanes) {
+                    for (kind, rows) in [(Decode, 1), (MtpVerify, 8)] {
+                        assert_eq!(execution_owner(&executions, kind, lane, rows).unwrap(), ExecutionOwner::Decode(lane as usize));
+                    }
                 }
+                let prefill_link = u32::from(lanes);
+                for kind in [Decode, MtpVerify] {
+                    assert!(execution_owner(&executions, kind, prefill_link, 8).is_err(), "k={slots} lanes={lanes}: decode rows on the prefill link");
+                }
+                assert_eq!(execution_owner(&executions, Prefill, prefill_link, unit as u32).unwrap(), ExecutionOwner::Prefill);
             }
-            for kind in [Decode, MtpVerify] {
-                assert!(execution_owner(&executions, kind, 2, 8).is_err(), "k={slots}: decode rows on the prefill link");
-            }
-            assert_eq!(execution_owner(&executions, Prefill, 2, unit as u32).unwrap(), ExecutionOwner::Prefill);
         }
         // Every decode-shaped call site takes its pass from a decode lane.
         let source = include_str!("v41_native_serve.rs");

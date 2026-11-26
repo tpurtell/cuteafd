@@ -41,8 +41,8 @@
       "family": "kimi_k3",
       "checkpoint": "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC",
       "1rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact)"
+        "status": "current",
+        "report": "benchmarks/kimi_k3/2026-11-25-smoke-kimi-k3-1-pro-exl3-k2-mc-1rtx-6spark-kimi-k31-mc-k8-compact-min"
       },
       "2rtx": {
         "status": "current",
@@ -53,20 +53,20 @@
       "family": "glm5",
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
       "1rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact)"
+        "status": "current",
+        "report": "benchmarks/glm5/2026-11-25-smoke-glm-5-3-exl3-k4-mc-1rtx-4spark-glm53-mc-k8-compact-min"
       },
       "2rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact)"
+        "status": "current",
+        "report": "benchmarks/glm5/2026-11-25-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-k8-compact-max"
       }
     },
     {
       "family": "glm5_flash",
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
       "1rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact)"
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-1rtx-2spark-glmf-mc-k8-compact-min"
       },
       "2rtx": {
         "status": "current",
@@ -75,10 +75,22 @@
     },
     {
       "family": "glm5_flash",
+      "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1",
+      "1rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-1rtx-2spark-glmf-mc-mul1-original-min"
+      },
+      "2rtx": {
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-2rtx-glmf-mc-mul1-original-max"
+      }
+    },
+    {
+      "family": "glm5_flash",
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC",
       "1rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact)"
+        "status": "current",
+        "report": "benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k3-25-mc-1rtx-2spark-glm53f-k325-mc-min"
       },
       "2rtx": {
         "status": "current",
@@ -137,8 +149,8 @@
       "family": "muse_spark",
       "checkpoint": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
       "1rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact)"
+        "status": "current",
+        "report": "benchmarks/muse_spark/2026-11-25-smoke-muse-spark-open-exl3-k4-mc-1rtx-4spark-muse-spark-exl3-k4-mc-min"
       },
       "2rtx": {
         "status": "current",
@@ -173,8 +185,8 @@
       "family": "inkling2",
       "checkpoint": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
       "1rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact)"
+        "status": "current",
+        "report": "benchmarks/inkling2/2026-11-25-smoke-inkling-2-small-exl3-k4-mc-1rtx-4spark-inkling2-exl3-min"
       },
       "2rtx": {
         "status": "current",
@@ -197,12 +209,12 @@
       "family": "hy4_flash",
       "checkpoint": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
       "1rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact, 0 Sparks)"
+        "status": "current",
+        "report": "benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-1rtx-hy4-flash-exl3-min"
       },
       "2rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact, 0 Sparks)"
+        "status": "current",
+        "report": "benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-2rtx-hy4-flash-exl3-max"
       }
     }
   ],
@@ -221,7 +233,7 @@
       "family": "glm5",
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
       "views": {
-        "k8-compact": null,
+        "k8-compact": "benchmarks/glm5/2026-11-25-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-k8-compact-max",
         "original": "benchmarks/glm5/2026-11-19-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-original-max",
         "k6-compact": null,
         "fp8-compact": null
@@ -281,7 +293,7 @@
       "family": "hy4_flash",
       "checkpoint": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
       "views": {
-        "k8-compact": null,
+        "k8-compact": "benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-2rtx-hy4-flash-exl3-max",
         "original": null,
         "k6-compact": null,
         "fp8-compact": null
@@ -667,8 +679,8 @@
       "checkpoint": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
       "spark_ranks": 1,
       "1rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact)"
+        "status": "current",
+        "report": "benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-1rtx-1spark-hy4-flash-1rtx-1spark"
       }
     },
     {
@@ -676,8 +688,8 @@
       "checkpoint": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
       "spark_ranks": 4,
       "1rtx": {
-        "status": "pending",
-        "reason": "Pending v7 Release smoke (K8 compact)"
+        "status": "current",
+        "report": "benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-1rtx-4spark-hy4-flash-1rtx-4spark"
       }
     }
   ]

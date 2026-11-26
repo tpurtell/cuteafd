@@ -141,6 +141,26 @@ def test_hy4f_exl3_spark_range_and_profiles_cover_tp1_to_tp6():
         assert len(widths) == world and sum(widths.values()) == 1536
 
 
+def test_hy4_exl3_spark_range_and_profiles_cover_tp3_to_tp8():
+    packages = module('hy4_spark_package_coverage', ROOT / 'python/tools/lib/spark_packages.py')
+    assert pack.GEOMETRIES['hy4'] == (6144, 2048, 256, 8)
+    assert pack.activation('hy4') == 'silu'
+    assert pack.swiglu_limit('hy4') == 10.0
+    assert packages.package_worlds('hy4', 'exl3') == [3, 4, 5, 6, 7, 8]
+    entry = packages.package_entry('hy4', 'exl3')
+    assert entry['basis'] == 'lower_bound'
+    assert entry['checkpoints'][0] == {
+        'model': 'wrldsuksgo2mars/Hy4-EXL3-K4-MC',
+        'revision': '67346c4bdee2d8694606b4b4db9a96442e8667b7',
+        'routed_expert_bytes': 77 * 256 * 3 * (384 * 128 * 64 * 2 + (6144 + 2048) * 2 + 4),
+    }
+    profiles = pack.build_profiles('spark', 'hy4')
+    for world in range(3, 9):
+        widths = {destination: width for _, width, _, _, _, destinations in profiles
+                  for destination in destinations if destination.startswith(f'tp{world}-rank')}
+        assert len(widths) == world and sum(widths.values()) == 2048
+
+
 def count_objects(geometry, worlds, intermediate, unit=128):
     """Today's tp-keyed jobs versus proposed compact width-class jobs.
 

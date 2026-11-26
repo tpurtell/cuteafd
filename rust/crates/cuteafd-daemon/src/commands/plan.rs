@@ -349,6 +349,9 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
     configured!(concurrency, "CONCURRENCY");
     configured!(draft_context_window, "DRAFT_CONTEXT_WINDOW");
     configured!(prefill_waves, "PREFILL_WAVES");
+    if args.decode_lanes.is_none() {
+        args.decode_lanes = get("DECODE_LANES").map(|v| v.parse().context("DECODE_LANES")).transpose()?;
+    }
     if !args.explicit_settings.contains("decode_rows") {
         if let Some(value) = get("DECODE_ROWS") {
             args.decode_rows = value.parse()
@@ -1105,8 +1108,8 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
     }
     let default = match family {
         "minimax_m3" | "inkling2" | "inkling2_mini" => "dspark",
-        "hy4_flash" if args.spark_ranks.unwrap_or(args.available_sparks) == 0
-            && (args.speculator == "auto" || args.include_speculator)
+        "hy4_flash" if (args.include_speculator || (args.speculator == "auto"
+            && cfg.get("SPECULATOR").is_none_or(|value| value == "auto")))
             && cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(
                 &cuteafd_loader::read_json_file::<serde_json::Value>(&snapshot.join("config.json"))?) => "dfly2",
         "glm5" | "glm5_flash" | "muse_spark" => "dflash2",
@@ -2454,6 +2457,29 @@ mod tests {
         let mut off = args(target.path(), 2, false);
         off.speculator = "off".into();
         assert_eq!(file_args(off, target.path()).unwrap().speculator, "off");
+    }
+
+    #[test]
+    fn hy4_flash_bundled_dfly2_auto_is_independent_of_spark_layout() {
+        use cuteafd_loader::plan::spec::DraftOwnership;
+        let target = tempfile::tempdir().unwrap();
+        for bundled in [true, false] {
+            let config = serde_json::json!({"dfly_num_hidden_layers": if bundled { 5 } else { 0 }});
+            std::fs::write(target.path().join("config.json"), config.to_string()).unwrap();
+            for ranks in [Some(0), Some(1), Some(4), None] {
+                for configured in [None, Some("auto"), Some("off")] {
+                    let mut request = args(target.path(), 0, false);
+                    request.spark_ranks = ranks;
+                    let cfg = configured.map(|value| std::collections::BTreeMap::from([
+                        ("SPECULATOR".into(), value.into())])).unwrap_or_default();
+                    resolve_speculator(&mut request, target.path(), "hy4_flash", &cfg).unwrap();
+                    let expected = if bundled && configured != Some("off") { "dfly2" } else { "off" };
+                    assert_eq!(request.speculator, expected, "ranks={ranks:?}, config={configured:?}");
+                    assert_eq!(DraftOwnership::selected("hy4_flash", &request.speculator),
+                        if expected == "dfly2" { DraftOwnership::BundledDfly2 } else { DraftOwnership::None });
+                }
+            }
+        }
     }
 
     #[test]

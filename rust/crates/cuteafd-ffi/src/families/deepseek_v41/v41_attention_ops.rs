@@ -120,7 +120,7 @@ impl V41AttentionOps<'_> {
         stream: *mut c_void,
     ) -> Result<()> {
         ensure!(
-            (1..=cuteafd_core::V41_MAX_LANE_MEMBERS as u32).contains(&requests),
+            (1..=cuteafd_core::V41_MAX_DRAFT_MEMBERS as u32).contains(&requests),
             "invalid terminal layout request count"
         );
         for b in [residual, output] {
@@ -162,7 +162,7 @@ impl V41AttentionOps<'_> {
         stream: *mut c_void,
     ) -> Result<()> {
         ensure!(
-            (1..=cuteafd_core::V41_MAX_LANE_MEMBERS as u32).contains(&requests),
+            (1..=cuteafd_core::V41_MAX_DRAFT_MEMBERS as u32).contains(&requests),
             "invalid embedding request count"
         );
         buffer(table, 129280 * 5120 * 2)?;

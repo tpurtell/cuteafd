@@ -1002,7 +1002,9 @@ impl<'e, 'a> Execution<'e, 'a> {
         }
         // First touch and cache maintenance need a quiescent sample; ordinary
         // replays only tick above and leave the head ordered on its lane stream.
+        let wait = std::time::Instant::now();
         collect_lane_results(self.main.stages.iter().map(|stage| stage.stream.drain()))?;
+        crate::shared::decode_graph::device::record_boundary_drain(self.main.stages.iter().map(|stage| stage.stream.device.id), wait.elapsed());
         self.main.require_live()?;
         // SAFETY: graph owners hold no allocations; native, cache and staging storage
         // stays live in this execution and its borrowed owners until terminal drainage.

@@ -499,8 +499,11 @@ impl<'a> Projection<'a> {
         accumulator:Buffer,stream:*mut c_void)->Result<()> {
         ensure!(rows>0 && rows<=scratch.rows,"trellis scratch live-row ceiling");
         let policy=self.program.policy();
-        ensure!(weights.shape==[policy.output,policy.input] && weights.bits==policy.bits
-            && accumulator.bytes>=rows*policy.output*4,"trellis F32 core destination geometry");
+        let side=match weights.side {cuteafd_loader::formats::dense_trellis::TrellisSide::Output=>1,
+            cuteafd_loader::formats::dense_trellis::TrellisSide::Input=>2};
+        ensure!(weights.shape==[policy.output,policy.input] && side==policy.side
+            && codebook(weights)==policy.codebook && weights.bits==policy.bits
+            && accumulator.bytes>=rows*policy.output*4,"trellis F32 core destination geometry/width/codebook");
         let b=DenseTrellisBuffers{accumulator,..scratch.buffers(input,weights)};
         self.program.core(rows,b,stream)?;Ok(())
     }

@@ -184,7 +184,9 @@ impl DenseEngine<'_> {
             for (_, graphs) in banks { graphs.bank.borrow_mut().cache_tick(); }
             return Ok(());
         }
+        let wait = std::time::Instant::now();
         self.drain()?;
+        device::record_boundary_drain(banks.iter().map(|(device, _)| *device), wait.elapsed());
         // SAFETY: both streams are drained; all banks retain rank-local resources.
         unsafe { device::observe_completed(self.stream.device.library, |visit| {
             for (device, graphs) in &banks {

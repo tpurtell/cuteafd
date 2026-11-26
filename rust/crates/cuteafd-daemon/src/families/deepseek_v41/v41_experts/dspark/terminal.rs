@@ -124,8 +124,8 @@ impl DsparkTerminal<'_, '_> {
     pub fn additional_bytes_with_width(capacity: usize, width: usize) -> Result<usize> {
         ensure!(matches!(width, 5 | 7), "draft width must be five or seven");
         ensure!(
-            (1..=cuteafd_core::V41_MAX_LANE_MEMBERS).contains(&capacity),
-            "terminal request capacity must be 1 through {}", cuteafd_core::V41_MAX_LANE_MEMBERS
+            (1..=cuteafd_core::V41_MAX_DRAFT_MEMBERS).contains(&capacity),
+            "terminal request capacity must be 1 through {}", cuteafd_core::V41_MAX_DRAFT_MEMBERS
         );
         Ok(
             capacity * (width * 129280 * 4 * 2 + (width + 2) * 4 + 16 + width * 10240 + width * (40960 + 16))

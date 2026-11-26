@@ -80,10 +80,9 @@ pub const STEP5: ExecutorModes = ExecutorModes { family: "step5", modes: &[WHOLE
     hops: true, attention: AttentionPlacement::Layers };
 
 /// Every serving family's executor set, for lookups by family name.
-/// (`hy4::HY4` joins this table when `serve-hy4` lands in `cuteafd-daemon`.)
-pub const EXECUTORS: [ExecutorModes; 14] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4,
+pub const EXECUTORS: [ExecutorModes; 15] = [DEEPSEEK_V4, DEEPSEEK_V41, GLM5, GLM5_FLASH, MIMO_V2, QWEN4,
     qwen3_5::EXECUTOR, KIMI_K3, STEP5, muse_spark::MUSE_SPARK, minimax_m3::MINIMAX_M3, inkling2::INKLING2,
-    inkling2_mini::INKLING2_MINI, hy4_flash::HY4_FLASH];
+    inkling2_mini::INKLING2_MINI, hy4_flash::HY4_FLASH, hy4::HY4];
 
 pub fn executor(family: &str) -> Option<ExecutorModes> {
     EXECUTORS.into_iter().find(|e| e.family == family)

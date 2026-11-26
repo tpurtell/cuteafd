@@ -428,7 +428,8 @@ fn installed_local_physical_equals_serving(native: bool, manifest: PathBuf,
     ensure!(count > 0, "max card selected no local experts");
     let rows = report.prefill_unit_rows.context("max card unit rows missing")? as usize;
     let lanes = plan::resolve_decode_lanes("glm5", options.decode_lanes,
-        options.layout.as_ref().unwrap().resolved_concurrency("glm5"))? as usize;
+        options.layout.as_ref().unwrap().resolved_concurrency("glm5"),
+        options.layout.as_ref().unwrap().rtx_bytes.len())? as usize;
     let catalog = input.expert_catalog()?;
     let exlr8 = if native { Some(MetadataInput::open(&snapshot, "up1")?) } else { None };
     let local = if native { glm5::exlr8_inventory(&snapshot, "up1", &manifest, cfg.first_moe_layer + count,

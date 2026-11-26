@@ -2,7 +2,7 @@
 //!
 //! `DECODE_ROWS` (`--decode-rows`) bounds the total target rows (anchors plus
 //! drafts) verified by one decode lane in a single step. `auto` resolves to
-//! [`DEFAULT_DECODE_ROWS`] (64, today's behaviour). Plan, serve and golden all
+//! [`DEFAULT_DECODE_ROWS`] (64), except one-lane V4.1 on 1 RTX. Plan, serve and golden all
 //! resolve it once at boot beside `CONCURRENCY` and `DECODE_LANES`.
 use super::PlanError;
 
@@ -58,7 +58,7 @@ pub const DRAFTER_SUPPORT: DecodeRowSupport = DecodeRowSupport::fixed(
 /// Boot inputs for [`resolve`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodeRowsRequest {
-    /// Explicit `--decode-rows` / `DECODE_ROWS` value; `None` means `auto` (64).
+    /// Explicit `--decode-rows` / `DECODE_ROWS` value; `None` means `auto`.
     pub requested: Option<u32>,
     /// Resolved boot concurrency (`CONCURRENCY`).
     pub concurrency: u64,
@@ -119,19 +119,27 @@ pub fn parse_setting(value: &str) -> Result<Option<u32>, String> {
     }
 }
 
-/// Resolve the per-lane verify-row budget once at boot before layout or CUDA
-/// allocation. `None` (`auto`) resolves to [`DEFAULT_DECODE_ROWS`] (64).
+/// Automatic target before bounding by boot demand.
+pub fn auto_target(family: &str, lanes: u8, rtx_gpus: usize) -> u32 {
+    if family == "deepseek_v41" && lanes == 1 && rtx_gpus == 1 { 128 } else { DEFAULT_DECODE_ROWS }
+}
+
+/// Resolve the per-lane verify-row budget once before layout or CUDA allocation.
 pub fn resolve(family: &dyn super::Family, request: DecodeRowsRequest) -> Result<u32, PlanError> {
-    let Some(rows) = request.requested else {
-        return Ok(DEFAULT_DECODE_ROWS);
-    };
+    let auto = auto_target(family.id(), request.decode_lanes, request.rtx_gpus);
+    if request.requested.is_none() && auto == DEFAULT_DECODE_ROWS { return Ok(DEFAULT_DECODE_ROWS); }
+    let support = family.decode_rows();
+    let effective_draft = request.draft_length.unwrap_or(support.native_draft_block).min(support.native_draft_block);
+    let demand = request.concurrency.max(1).saturating_mul(u64::from(effective_draft) + 1);
+    let ceiling = u64::from(DEFAULT_DECODE_ROWS).max(demand);
+    let rows = request.requested.unwrap_or_else(||
+        u64::from(auto).min(ceiling) as u32);
     if rows == 0 {
         return Err(PlanError::InvalidOption {
             option: "--decode-rows",
             reason: "must be positive".into(),
         });
     }
-    let support = family.decode_rows();
     let capacity = support.max_for_gpus(request.rtx_gpus);
     if rows > capacity {
         return Err(PlanError::UnsupportedDecodeRows {
@@ -154,12 +162,6 @@ pub fn resolve(family: &dyn super::Family, request: DecodeRowsRequest) -> Result
             ),
         });
     }
-    let effective_draft = match request.draft_length {
-        Some(length) => length.min(support.native_draft_block),
-        None => support.native_draft_block,
-    };
-    let demand = request.concurrency.max(1).saturating_mul(u64::from(effective_draft) + 1);
-    let ceiling = u64::from(DEFAULT_DECODE_ROWS).max(demand);
     if u64::from(rows) > ceiling {
         return Err(PlanError::InvalidOption {
             option: "--decode-rows",
@@ -193,9 +195,9 @@ mod tests {
     }
 
     #[test]
-    fn every_family_resolves_auto_to_64_and_refuses_above_program_capacity() {
+    fn every_family_resolves_auto_and_refuses_above_program_capacity() {
         for family in super::super::family::registry() {
-            assert_eq!(resolve(*family, req(None, 16, 1, 1, None)).unwrap(), DEFAULT_DECODE_ROWS, "{}", family.id());
+            assert_eq!(resolve(*family, req(None, 16, 1, 1, None)).unwrap(), auto_target(family.id(), 1, 1), "{}", family.id());
             assert_eq!(resolve(*family, req(Some(64), 1, 1, 1, None)).unwrap(), 64, "{}", family.id());
             for gpus in [1, 2] {
                 let cap = family.decode_rows().max_for_gpus(gpus);
@@ -205,6 +207,21 @@ mod tests {
                     if value == over && capacity == cap), "{} gpus={gpus}: {err}", family.id());
             }
         }
+    }
+
+    #[test]
+    fn v41_one_rtx_resolves_one_lane_and_wide_rows_at_concurrency_16_through_64() {
+        let family = &crate::plan::families::deepseek::DEEPSEEK_V41;
+        for c in 16..=64 {
+            let lanes = crate::plan::decode_lanes::resolve(family, None, c, 1).unwrap();
+            assert_eq!(lanes, 1);
+            assert_eq!(resolve(family, req(None, c, lanes, 1, None)).unwrap(), 128);
+            assert_eq!(resolve(family, req(Some(64), c, lanes, 1, None)).unwrap(), 64);
+        }
+        assert_eq!(resolve(family, req(None, 1, 1, 1, None)).unwrap(), 64);
+        assert_eq!(resolve(family, req(None, 16, 1, 1, Some(3))).unwrap(), 64);
+        assert_eq!(resolve(family, req(None, 16, 1, 1, Some(5))).unwrap(), 96);
+        assert_eq!(resolve(family, req(None, 64, 2, 1, None)).unwrap(), 64);
     }
 
     #[test]

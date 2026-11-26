@@ -1056,7 +1056,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 }
 
 fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
-    cuteafd_loader::plan::resolve_decode_lanes("mimo_v2", Some(args.decode_lanes), args.rings as u64)?;
+    cuteafd_loader::plan::resolve_decode_lanes("mimo_v2", Some(args.decode_lanes), args.rings as u64, 1)?;
     // Validate immutable representation, capacity and kernel alignment before
     // the native module or any device allocation is admitted.
     args.draft_storage()?;
@@ -1927,11 +1927,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
     let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
     let report = |label: &str, metrics: &crate::shared::golden_scores::RowMetrics| {
         if reference.is_none() || metrics.rows == 0 { return; }
-        let (rows, scored) = (metrics.rows, metrics.scored.max(1) as f64);
-        println!("{label} logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
-            golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * metrics.agree as f64 / rows as f64,
-            100.0 * metrics.next_ok as f64 / scored, 100.0 * metrics.reference_next as f64 / scored,
-            metrics.nll / scored, metrics.kl / rows as f64);
+        println!("{}", metrics.context_only_line(label));
     };
     if let Some(writer) = &mut saved {
         ensure!(prefill_metrics.rows == prefill && decode_logits.len() == (tokens.len() - prefill) * cfg.vocab_size,

@@ -198,6 +198,25 @@ impl RowMetrics {
     }
 }
 
+/// Printed once after any legacy-fixture score line.
+pub(crate) const CONTEXT_ONLY_NOTE: &str =
+    "context-only fixture: no quality verdict (use the published fidelity set)";
+
+impl RowMetrics {
+    /// The score line for a legacy `tokens.bin` + `logits.bin` fixture, which has no
+    /// generated-row roles: every row is prompt context. Teacher-forced NLL of the
+    /// actual next tokens (engine vs reference, same tokens) is a sanity bound; the
+    /// reference KL and top-1 are deliberately not reported, since a headline from
+    /// context rows reads as a quality score (the verdict gates generated rows only).
+    pub(crate) fn context_only_line(&self, label: &str) -> String {
+        let scored = self.scored.max(1) as f64;
+        let (engine, reference) = (self.nll / scored, self.reference_nll / scored);
+        format!("{label} logits (context-only, {} rows, {} scored): NLL sanity bound engine {engine:.4} \
+            reference {reference:.4} delta {:+.4} (not a verdict)\n{CONTEXT_ONLY_NOTE}",
+            self.rows, self.scored, engine - reference)
+    }
+}
+
 /// Dense qualification keeps its historical lower-index tie rule and nonnegative row KL.
 #[derive(Default)]
 pub(crate) struct DenseRowMetrics {
@@ -271,6 +290,20 @@ pub(crate) fn scored_kl(reference: &[f32], logits: &[f32], vocab: usize) -> Resu
 #[cfg(test)]
 mod bounded_rows_tests {
     use super::*;
+
+    #[test]
+    fn context_only_line_reports_nll_bound_without_kl_or_top1() -> Result<()> {
+        let mut metrics = RowMetrics::default();
+        metrics.push(&[2.0, 0.0, -1.0], Some(&[1.0, 0.5, -1.0]), Some(0))?;
+        metrics.push(&[0.0, 1.0, 3.0], Some(&[0.0, 2.0, 1.0]), Some(2))?;
+        let line = metrics.context_only_line("prefill");
+        assert!(line.contains("2 rows, 2 scored") && line.contains("NLL sanity bound engine"), "{line}");
+        assert!(line.contains("delta ") && line.contains("not a verdict"), "{line}");
+        assert!(line.ends_with("context-only fixture: no quality verdict (use the published fidelity set)"), "{line}");
+        let lower = line.to_lowercase();
+        assert!(!lower.contains("kl") && !lower.contains("top-1") && !lower.contains("agreement"), "{line}");
+        Ok(())
+    }
 
     #[test]
     fn streamed_metrics_preserve_legacy_nll_kl_and_top1_bits() -> Result<()> {

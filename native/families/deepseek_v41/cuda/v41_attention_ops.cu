@@ -263,7 +263,7 @@ __global__ void embed_kernel(const __nv_bfloat16* table, const int32_t* tokens,
 template<int Width>
 static int32_t launch_dspark_embed(const uint16_t* table, const int32_t* tokens,
     uint16_t* residual, float* pre, int32_t requests, void* stream) {
-  if(requests<1 || requests>CUTEAFD_V41_MAX_LANE_MEMBERS)return cudaErrorInvalidValue;
+  if(requests<1 || requests>CUTEAFD_V41_MAX_DRAFT_MEMBERS)return cudaErrorInvalidValue;
   const uint64_t w=uint64_t(129280)*5120*2,t=uint64_t(requests)*4,
       r=uint64_t(requests)*Width*40960,p=uint64_t(requests)*Width*16;
   if(!valid(table,w,2)||!valid(tokens,t,4)||!valid(residual,r,2)||!valid(pre,p,4)||
@@ -313,7 +313,7 @@ __global__ void dspark_terminal_layout_kernel(const __nv_bfloat16* residual,
 template<int Width>
 static int32_t launch_dspark_terminal_layout(const uint16_t* residual,
     const float* pre, uint16_t* output, float* output_pre, int32_t requests, void* stream) {
-  if(requests<1 || requests>CUTEAFD_V41_MAX_LANE_MEMBERS)return cudaErrorInvalidValue;
+  if(requests<1 || requests>CUTEAFD_V41_MAX_DRAFT_MEMBERS)return cudaErrorInvalidValue;
   const uint64_t r=uint64_t(requests)*Width*40960,p=uint64_t(requests)*Width*16;
   if(!valid(residual,r,2)||!valid(pre,p,4)||!valid(output,r,2)||!valid(output_pre,p,4)||
       !disjoint(residual,r,output,r)||!disjoint(residual,r,output_pre,p)||

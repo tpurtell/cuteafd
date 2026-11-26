@@ -210,7 +210,7 @@ static int32_t create_head(void* workspace, uint64_t bytes, void** output, int w
   return 0;
 }
 extern "C" int32_t cuteafd_v41_markov_create(void* workspace, uint64_t bytes, void** output) {
-  return create_head(workspace, bytes, output, 256, CUTEAFD_V41_MAX_LANE_MEMBERS, 0);
+  return create_head(workspace, bytes, output, 256, CUTEAFD_V41_MAX_DRAFT_MEMBERS, 0);
 }
 extern "C" int32_t cuteafd_v41_vocabulary_head_create(void* workspace, uint64_t bytes, int32_t mode, void** output) {
   return create_head(workspace, bytes, output, 5120, CUTEAFD_V41_VOCAB_ROWS, mode);
@@ -449,7 +449,7 @@ __global__ void draft_step_finish(const float* shared, const float* bias,
 extern "C" int32_t cuteafd_v41_draft_step_rng(const float* shared, const float* bias,
     const uint64_t* rng, const float* temperatures, float* adjusted, uint32_t* tokens,
     int32_t rows, int32_t position, void* stream) {
-  if (rows < 1 || rows > CUTEAFD_V41_MAX_LANE_MEMBERS || position < 0 || position > 6) return cudaErrorInvalidValue;
+  if (rows < 1 || rows > CUTEAFD_V41_MAX_DRAFT_MEMBERS || position < 0 || position > 6) return cudaErrorInvalidValue;
   const uint64_t logits = uint64_t(rows) * 129280 * 4, small = uint64_t(rows) * 4;
   const void* pointers[] = {shared, bias, rng, temperatures, adjusted, tokens};
   const uint64_t bytes[] = {logits, logits, small*4, small, logits, small};

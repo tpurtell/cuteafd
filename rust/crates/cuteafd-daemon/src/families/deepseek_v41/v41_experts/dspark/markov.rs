@@ -54,7 +54,7 @@ impl<'library> DsparkWeights<'library> {
 impl DsparkMarkov<'_, '_> {
     pub fn device_bytes(capacity: usize) -> Result<usize> {
         ensure!(
-            (1..=cuteafd_core::V41_MAX_LANE_MEMBERS).contains(&capacity),
+            (1..=cuteafd_core::V41_MAX_DRAFT_MEMBERS).contains(&capacity),
             "Markov request capacity exceeds native lane capacity"
         );
         Ok(capacity * (4 + 512 + 129280 * 4) + V41VocabularyProjection::WORKSPACE_BYTES)

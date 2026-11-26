@@ -286,7 +286,7 @@ impl DsparkChain<'_, '_> {
         );
         ensure!(
             !tokens.is_empty()
-                && tokens.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS
+                && tokens.len() <= cuteafd_core::V41_MAX_DRAFT_MEMBERS
                 && tokens.len() <= self.tokens.buffer.bytes / 4,
             "invalid dSpark seed count"
         );

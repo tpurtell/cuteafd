@@ -96,7 +96,7 @@ impl DsparkAttentionWave<'_, '_> {
     pub(super) fn projection_capacity_with_width(requests: u32, width: usize) -> Result<u32> {
         ensure!(matches!(width, 5 | 7), "draft width must be five or seven");
         ensure!(
-            (1..=cuteafd_core::V41_MAX_LANE_MEMBERS as u32).contains(&requests),
+            (1..=cuteafd_core::V41_MAX_DRAFT_MEMBERS as u32).contains(&requests),
             "invalid attention request capacity"
         );
         // Storage follows compiled buckets; launches use the actual live rows.
@@ -112,7 +112,7 @@ impl DsparkAttentionWave<'_, '_> {
     }
     pub fn device_bytes_with_width(library: &NativeLibrary, requests: u32, width: usize) -> Result<usize> {
         ensure!(
-            (1..=cuteafd_core::V41_MAX_LANE_MEMBERS as u32).contains(&requests),
+            (1..=cuteafd_core::V41_MAX_DRAFT_MEMBERS as u32).contains(&requests),
             "invalid attention wave request capacity"
         );
         let rows = requests * width as u32;

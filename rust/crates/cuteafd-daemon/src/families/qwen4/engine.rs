@@ -816,6 +816,7 @@ pub(crate) struct Qwen4Engine<'a> {
     /// The bounded graph cache is configured for this launch: lazy exact-row
     /// capture and miss accounting are on. Cleared only by `CUTEAFD_QWEN4_GRAPHS=0`.
     graph_capture: Cell<bool>,
+    graph_cycles: RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
     /// Observer seeded and startup graph initialization completed.
     graph_warmed: Cell<bool>,
     /// Prefill programs over FP8-only projections quantize their activations
@@ -1022,6 +1023,7 @@ impl<'a> Qwen4Engine<'a> {
             graphs: RefCell::new(graphs),
             use_graphs: graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref()),
             graph_capture: Cell::new(false),
+            graph_cycles: RefCell::new(None),
             graph_warmed: Cell::new(false),
             w8a8_prefill: false, spark_bf16: false,
             packed_row_cap: Cell::new(None),
@@ -1062,6 +1064,9 @@ impl<'a> Qwen4Engine<'a> {
                 shape = ?shape, "Qwen exact-row graph reserve");
             reserves.push(resolved.bytes);
         }
+        if self.use_graphs && reserves.iter().any(|&bytes| bytes > 0) {
+            *self.graph_cycles.borrow_mut() = Some(crate::shared::decode_graph::device::EventCycles::new(self.library, &self.gdn_banks.iter().map(|bank| (bank.device.id, bank.stream)).collect::<Vec<_>>())?);
+        }
         self.graph_capture.set(self.use_graphs);
         Ok(reserves)
     }
@@ -1076,25 +1081,19 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
-    /// The capture-pass boundary of one submitted step: when pending
-    /// measurement or victim state needs a quiescent device, drain every
-    /// owner's stream first; then always advance the shared device cycle via
-    /// `observe_completed` so cold-donor aging and persistent victim
-    /// retirement run on every completed step without extra CUDA queries or
-    /// stream syncs on ordinary replay steps.
+    fn begin_graph_cycle(&self) -> Result<()> {
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        // SAFETY: graph operands are borrowed persistent engine storage.
+        unsafe { cycles.begin_persistent(|visit| self.visit_graphs(visit)) }
+    }
+
     fn graph_completed(&self) -> Result<()> {
-        if self.graphs.borrow().is_empty() { return Ok(()); }
-        if self.graphs.borrow().iter().any(|bank| bank.cache_needs_boundary()) {
-            // A capture's growth is only observable once every owner's stream has
-            // completed its queued launches: this is the step boundary.
-            self.drain_state()?;
-        }
-        // SAFETY: Qwen graph owners pin only borrowed, persistent engine storage
-        // (weights, KV/state pools, workspaces and their owner streams); the
-        // GraphExec owns no allocation its segments captured, so destroying an
-        // executable or advancing the serial cycle needs no lane drain.
-        unsafe { crate::shared::decode_graph::device::observe_completed(self.library, |visit| self.visit_graphs(visit)) }
-            .context("Qwen graph boundary observation")
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        for bank in self.graphs.borrow_mut().iter_mut() { bank.cache_tick(); }
+        // SAFETY: all owners' launches for the submitted step are queued.
+        unsafe { cycles.complete() }
     }
 
     /// Attribute the whole step's replay work to its cycle.
@@ -1596,7 +1595,8 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         self.last_stream_offset.set(0);
-        self.graph_completed()
+        if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() { cycles.abandon(); }
+        Ok(())
     }
 
     pub(crate) fn drain_state(&self) -> Result<()> {
@@ -2681,6 +2681,7 @@ impl<'a> Qwen4Engine<'a> {
     fn step(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
         crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(), |_| {
+            self.begin_graph_cycle()?;
             let output = self.step_inner(tables, tokens, logit_rows, on_layer, forced, media, graphs)?;
             self.graph_completed()?;
             Ok(output)
@@ -4002,23 +4003,21 @@ mod gather_recovery_tests {
         assert!(cancel.contains("!self.has_sparks()"));
         // Drop tickets, drain the consumers, then the table's own copies, then the graph boundary.
         let order = ["self.ple_pending.borrow_mut().take()", "self.drain_state()?", "ple.mapped().drain()?",
-            "w.terminal_valid.set(false)", "self.graph_completed()"];
+            "w.terminal_valid.set(false)", "cycles.abandon()"];
         let at: Vec<_> = order.iter().map(|needle| cancel.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "cancellation order {at:?}");
     }
 
     #[test]
-    fn qwen_graph_completed_always_advances_serial_cycle() {
+    fn qwen_graph_boundary_records_without_a_host_drain() {
         let source = include_str!("engine.rs");
-        let body = source.split("\n#[cfg(test)]\nmod gather_recovery_tests").next().unwrap();
-        let completed = body.split("    fn graph_completed(").nth(1).unwrap()
+        let completed = source.split("    fn graph_completed(").nth(1).unwrap()
             .split("    /// Attribute the whole step's replay work").next().unwrap();
-        assert!(completed.contains("observe_completed("),
-            "graph_completed must advance the device serial cycle on every step so cold donors age");
-        assert!(!completed.contains("cache_tick()"),
-            "graph_completed must not return early on !needs_boundary with cache_tick()");
-        assert!(completed.find("self.drain_state()?").unwrap()
-            < completed.find("observe_completed(").unwrap());
+        assert!(completed.contains("cycles.complete()"));
+        assert!(!completed.contains("drain_state") && !completed.contains("observe_completed"));
+        let step = source.split("    fn step(").nth(1).unwrap().split("    fn step_inner(").next().unwrap();
+        assert!(step.find("self.begin_graph_cycle()?").unwrap() < step.find("self.step_inner(").unwrap());
+        assert!(step.find("self.step_inner(").unwrap() < step.find("self.graph_completed()?").unwrap());
     }
 }
 

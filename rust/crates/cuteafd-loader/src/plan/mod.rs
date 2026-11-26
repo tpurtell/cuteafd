@@ -197,9 +197,9 @@ pub enum PlanError {
 
 /// Resolve the decode-lane count before layout or CUDA allocation
 /// ([`decode_lanes::resolve`]).
-pub fn resolve_decode_lanes(family: &str, requested: Option<u8>, concurrency: u64) -> Result<u8, PlanError> {
+pub fn resolve_decode_lanes(family: &str, requested: Option<u8>, concurrency: u64, rtx_gpus: usize) -> Result<u8, PlanError> {
     let descriptor = spark_executions::descriptor(family).map_err(PlanError::Checkpoint)?;
-    decode_lanes::resolve(descriptor, requested, concurrency)
+    decode_lanes::resolve(descriptor, requested, concurrency, rtx_gpus)
 }
 
 /// Resolve the per-lane verify-row budget once at boot before layout or CUDA
@@ -1246,7 +1246,7 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
     // The served concurrency (0 is the launcher's derived default), as serve resolves it.
     let resolved_concurrency = options.layout.as_ref().map_or(16, |layout| layout.resolved_concurrency(family.id()));
     let rtx_gpus = options.layout.as_ref().map_or(1, |layout| layout.rtx_bytes.len());
-    report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes, resolved_concurrency)?;
+    report.decode_lanes = resolve_decode_lanes(family.id(), options.decode_lanes, resolved_concurrency, rtx_gpus)?;
     let requested_decode_rows = options.decode_rows.or_else(|| {
         options.layout.as_ref()
             .map(|layout| layout.decode_rows)
@@ -1257,7 +1257,10 @@ fn plan_unrestricted(input: &PlanInput, options: &PlanOptions) -> Result<PlanRep
         concurrency: resolved_concurrency,
         decode_lanes: report.decode_lanes,
         rtx_gpus,
-        draft_length: options.draft_length,
+        draft_length: if family.id() == "deepseek_v41" && (options.draft_ownership == Some(spec::DraftOwnership::None)
+            || (options.draft_ownership.is_none() && options.layout.as_ref().is_some_and(|layout| layout.native_mtp_layers == 0))) {
+            Some(0)
+        } else { options.draft_length },
     })?;
     report.attention_precision = Some(attention_precision::resolve(family, options.attention_precision)?);
     report.precision_optimizations = precision_optimizations(family.id(), options);

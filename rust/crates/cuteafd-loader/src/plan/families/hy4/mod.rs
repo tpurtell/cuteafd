@@ -473,7 +473,7 @@ impl Family for Hy4 {
         "hy4"
     }
     fn runtime(&self) -> RuntimeStatus {
-        RuntimeStatus::Planned
+        RuntimeStatus::Serving
     }
     fn attention_precision(&self) -> crate::plan::attention_precision::PrecisionSupport {
         crate::plan::attention_precision::MLA_BF16_ONLY
@@ -483,8 +483,17 @@ impl Family for Hy4 {
             reason: "Hy4 serving starts on one decode lane; a second lane waits for a measured two-lane A/B (#2550, #744)",
         }
     }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        crate::plan::decode_rows::DecodeRowSupport::fixed(
+            crate::placement::families::hy4::DECODE_ROWS,
+            0,
+            "Hy4 split-K decode exports cover at most 64 rows per step",
+        )
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
-        Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
+        Some(crate::plan::spark_executions::SparkDecode {
+            rows: crate::placement::families::hy4::DECODE_ROWS,
+        })
     }
     fn eager_native_core_headers(&self) -> bool {
         true
@@ -829,15 +838,16 @@ impl FamilyModel for Model {
         match operand.encoding {
             Encoding::Exl3 { bits: 4 } => {
                 let is_mul1 = operand.companions.iter().any(|c| c == "mul1");
+                let package = if is_mul1 {
+                    "hy4:exl3-k45-mul1".to_string()
+                } else {
+                    "hy4:exl3-k45".to_string()
+                };
+                let spark_worlds = crate::plan::experts::spark_worlds(&package, self.cfg.moe_intermediate);
                 Some(ExpertContract {
-                    package: if is_mul1 {
-                        "hy4:exl3-k45-mul1".into()
-                    } else {
-                        "hy4:exl3-k45".into()
-                    },
+                    package,
                     block: 128,
-                    // 2048 / 128 = 16 blocks -> Step 3 adds `hy4:exl3` worlds 3..=6 to spark-package-ranges.json (#2550).
-                    spark_worlds: vec![3, 4, 5, 6],
+                    spark_worlds,
                     local: if is_mul1 {
                         Ok("Hy4 RTX EXL3 K4 MUL1 onboarding (whole 2048 or TP2 1024+1024)".into())
                     } else {

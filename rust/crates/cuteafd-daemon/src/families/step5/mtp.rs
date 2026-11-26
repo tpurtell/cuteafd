@@ -951,7 +951,7 @@ mod tests {
             };
             cache.capture(0, usize::from(queued) as u64, frontier as u64)?;
             cache.drain()?;
-            let mut bytes = vec![0; layout.ranks[0].bytes as usize];
+            let mut bytes = vec![0; layout.ranks[0].mark_bytes as usize];
             device.run(|| library.copy_d2h(&mut bytes, cache.mark_view(u32::from(queued))?))?;
             if let Some((expected_tokens, expected_bytes)) = &reference {
                 ensure!(draft == *expected_tokens && bytes == *expected_bytes,
@@ -1150,12 +1150,12 @@ mod tests {
             if pass == 0 {
                 cache.restore(0, 0, target_end)?;
                 cache.capture(0, 1, target_end)?;
-                ensure!(read(cache.mark_view(0)?, layout.ranks[0].bytes as usize)?
-                    == read(cache.mark_view(1)?, layout.ranks[0].bytes as usize)?, "MTP restore canonical bytes");
+                ensure!(read(cache.mark_view(0)?, layout.ranks[0].mark_bytes as usize)?
+                    == read(cache.mark_view(1)?, layout.ranks[0].mark_bytes as usize)?, "MTP restore canonical bytes");
             }
         }
-        ensure!(read(cache.mark_view(0)?, layout.ranks[0].bytes as usize)?
-            == read(cache.mark_view(1)?, layout.ranks[0].bytes as usize)?,
+        ensure!(read(cache.mark_view(0)?, layout.ranks[0].mark_bytes as usize)?
+            == read(cache.mark_view(1)?, layout.ranks[0].mark_bytes as usize)?,
             "MTP restored prefix differs byte-for-byte from fresh prefill");
         eprintln!("MTP exactness passed: abort/replay, canonical restore, restored/fresh prefix");
         // The target verifier gates output; chained draft error is informational.

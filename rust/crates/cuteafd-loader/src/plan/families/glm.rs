@@ -618,8 +618,13 @@ impl FamilyModel for GlmModel {
             // ModelOpt NVFP4 dense MLPs run natively (serve-glmf: the fp8-glmfdense-nvfp4 package).
             Component::DenseFfn if self.id == "glm5_flash" && operand.is_nvfp4()
                 && operand.scale.as_ref().is_some_and(|s| s.cols == 16) => Ok(()),
-            _ if operand.exl3_bits().is_some() => {
-                let bits = operand.exl3_bits().unwrap();
+            _ if operand.exl3_routed().is_some() => {
+                // Both MCG and MUL1 dense cores are supported; admission (`CoreCharges::from_package`)
+                // and runtime (`Projection::load_geometry_bits`) select exports strictly by codebook.
+                let (bits, codebook) = operand.exl3_routed().unwrap();
+                require(matches!(codebook, crate::formats::exl3_storage::Exl3Codebook::Mcg
+                    | crate::formats::exl3_storage::Exl3Codebook::Mul1), || format!(
+                    "{} {stem}: unsupported dense core codebook {}", self.id, codebook.marker()))?;
                 let widths = if self.id == "glm5_flash" { crate::families::glm5_flash::core::NATIVE_CORE_WIDTHS }
                     else { crate::families::glm5::core::NATIVE_CORE_WIDTHS };
                 require(widths.contains(&bits), || format!(

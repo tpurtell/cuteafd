@@ -139,9 +139,10 @@ mod tests {
                 }
                 // The full release header inventory (every expert layer), EXL3 K4 + Core-K6.
                 ("ml4", _) => testing::write_mistral_large4_snapshot(&snapshot, None, true),
+                ("hy4", _) => write_hy4_exl3_snapshot(&snapshot)?,
                 _ => anyhow::bail!("missing full launch fixture for covered {key}"),
             }
-            if !matches!(family, "v41" | "kimik3" | "muse" | "ml4" | "minimax" | "inkling2") {
+            if !matches!(family, "v41" | "kimik3" | "muse" | "ml4" | "minimax" | "inkling2" | "hy4") {
                 expand_eight_rank_fixture(&snapshot)?;
             }
             let catalog = cuteafd_loader::read_expert_catalog(&snapshot)?;
@@ -485,6 +486,109 @@ print(json.dumps(capture_real_eight_rank_launch(*map(Path, sys.argv[2:]))))
                     tensors.push(t(format!("{stem}.weight_scale"), "F8_E4M3", &[n, k / 16]));
                     for scale in ["weight_global_scale", "input_global_scale"] {
                         tensors.push(t(format!("{stem}.{scale}"), "F32", &[]));
+                    }
+                }
+            }
+        }
+        write_snapshot(snapshot, &config, &tensors, None);
+        Ok(())
+    }
+
+    fn write_hy4_exl3_snapshot(snapshot: &std::path::Path) -> Result<()> {
+        use cuteafd_loader::plan::testing::{t, write_snapshot, Tensor};
+        let indexer_types: Vec<&str> = (0..78)
+            .map(|i| if i == 0 || (i >= 1 && (i - 1) % 4 == 0) { "full" } else { "shared" })
+            .collect();
+        let layer_types: Vec<&str> = vec!["deepseek_sparse_attention"; 78];
+        let mlp_layer_types: Vec<&str> = (0..78).map(|i| if i == 0 { "dense" } else { "sparse" }).collect();
+        let mut text_config: serde_json::Value = serde_json::from_str(r#"{
+            "model_type": "hy_v4", "vocab_size": 120832, "hidden_size": 6144, "num_hidden_layers": 78,
+            "intermediate_size": 18432, "first_k_dense_replace": 1, "max_position_embeddings": 1048576,
+            "rms_norm_eps": 1e-5, "hidden_act": "silu", "attention_bias": false,
+            "enable_ihc": true, "gated_mla": true, "gating_type": "elementwise",
+            "enable_lm_head_fp32": true, "learnable_sink": true, "tie_word_embeddings": false,
+            "hc_mult": 4, "hc_eps": 1e-6, "hc_magnitude": 2.0,
+            "num_attention_heads": 64, "q_lora_rank": 2048, "kv_lora_rank": 512,
+            "qk_head_dim": 256, "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+            "index_n_heads": 32, "index_head_dim": 128, "index_topk": 2048,
+            "n_routed_experts": 256, "num_experts_per_tok": 8, "moe_intermediate_size": 2048,
+            "n_shared_experts": 1, "n_group": 1, "topk_group": 1, "norm_topk_prob": true,
+            "routed_scaling_factor": 2.827, "swiglu_limit": 10.0,
+            "rope_parameters": { "mrope_interleaved": true, "mrope_section": [12, 10, 10], "rope_theta": 10000000, "rope_type": "default" }
+        }"#)?;
+        text_config["indexer_types"] = serde_json::json!(indexer_types);
+        text_config["layer_types"] = serde_json::json!(layer_types);
+        text_config["mlp_layer_types"] = serde_json::json!(mlp_layer_types);
+        let config = serde_json::json!({
+            "architectures": ["HYV4VLForConditionalGeneration"],
+            "model_type": "hy_v4_vl",
+            "vocab_size": 120832,
+            "hidden_size": 6144,
+            "num_hidden_layers": 78,
+            "tie_word_embeddings": false,
+            "image_token_id": 120120,
+            "video_token_id": 120124,
+            "eos_token_id": [120025],
+            "quantization_config": {
+                "quant_method": "exl3", "format": "exl3", "checkpoint_format": "exl3",
+                "bits": 4.0, "codebook": "mul1", "mul1_multiplier": 2212286765u64, "expert_bits": 4.0
+            },
+            "text_config": text_config
+        });
+        let (h, v, hc) = (6144usize, 120832usize, 4usize);
+        let mut tensors: Vec<Tensor> = vec![
+            t("model.embed_tokens.weight", "BF16", &[v, h]),
+            t("model.norm.weight", "BF16", &[h]),
+            t("model.hc_head.hc_head_fn", "F32", &[hc, hc * h]),
+            t("model.hc_head.hc_head_base", "F32", &[hc]),
+            t("model.hc_head.hc_head_scale", "F32", &[1]),
+            t("lm_head.weight", "BF16", &[v, h]),
+        ];
+        for layer in 0..78usize {
+            let base = format!("model.layers.{layer}");
+            tensors.push(t(format!("{base}.input_layernorm.weight"), "BF16", &[h]));
+            tensors.push(t(format!("{base}.post_attention_layernorm.weight"), "BF16", &[h]));
+            for tag in ["hc_attn_layer", "hc_mlp_layer"] {
+                let p = format!("{base}.{tag}.hc_pre");
+                tensors.push(t(format!("{p}.hc_fn"), "F32", &[2 * hc, hc * h]));
+                tensors.push(t(format!("{p}.hc_base"), "F32", &[2 * hc]));
+                tensors.push(t(format!("{p}.hc_scale"), "F32", &[2]));
+            }
+            let a = format!("{base}.self_attn");
+            tensors.push(t(format!("{a}.q_a_proj.weight"), "BF16", &[2048, h]));
+            tensors.push(t(format!("{a}.q_a_layernorm.weight"), "BF16", &[2048]));
+            tensors.push(t(format!("{a}.q_b_proj.weight"), "BF16", &[64 * 256, 2048]));
+            tensors.push(t(format!("{a}.kv_a_proj_with_mqa.weight"), "BF16", &[576, h]));
+            tensors.push(t(format!("{a}.kv_a_layernorm.weight"), "BF16", &[512]));
+            tensors.push(t(format!("{a}.kv_b_proj.weight"), "BF16", &[64 * 448, 512]));
+            tensors.push(t(format!("{a}.linear_gate.weight"), "BF16", &[64 * 256, h]));
+            tensors.push(t(format!("{a}.o_proj.weight"), "BF16", &[h, 64 * 256]));
+            tensors.push(t(format!("{a}.learnable_sink_param"), "F32", &[64]));
+            if layer == 0 || (layer >= 1 && (layer - 1) % 4 == 0) {
+                let ip = format!("{a}.indexer");
+                tensors.push(t(format!("{ip}.wq_b.weight"), "BF16", &[32 * 128, 2048]));
+                tensors.push(t(format!("{ip}.wk.weight"), "BF16", &[128, h]));
+                tensors.push(t(format!("{ip}.k_norm.weight"), "BF16", &[128]));
+                tensors.push(t(format!("{ip}.k_norm.bias"), "BF16", &[128]));
+                tensors.push(t(format!("{ip}.weights_proj.weight"), "BF16", &[32, h]));
+            }
+            if layer == 0 {
+                tensors.push(t(format!("{base}.mlp.gate_proj.weight"), "BF16", &[18432, h]));
+                tensors.push(t(format!("{base}.mlp.up_proj.weight"), "BF16", &[18432, h]));
+                tensors.push(t(format!("{base}.mlp.down_proj.weight"), "BF16", &[h, 18432]));
+            } else {
+                tensors.push(t(format!("{base}.mlp.gate.weight"), "BF16", &[256, h]));
+                tensors.push(t(format!("{base}.mlp.gate.e_score_correction_bias"), "F32", &[256]));
+                tensors.push(t(format!("{base}.mlp.shared_experts.gate_proj.weight"), "BF16", &[2048, h]));
+                tensors.push(t(format!("{base}.mlp.shared_experts.up_proj.weight"), "BF16", &[2048, h]));
+                tensors.push(t(format!("{base}.mlp.shared_experts.down_proj.weight"), "BF16", &[h, 2048]));
+                for expert in 0..256usize {
+                    for (proj, n, k) in [("gate_proj", 2048usize, h), ("up_proj", 2048, h), ("down_proj", h, 2048)] {
+                        let stem = format!("{base}.mlp.experts.{expert}.{proj}");
+                        tensors.push(t(format!("{stem}.trellis"), "I16", &[k / 16, n / 16, 64]));
+                        tensors.push(t(format!("{stem}.suh"), "F16", &[k]));
+                        tensors.push(t(format!("{stem}.svh"), "F16", &[n]));
+                        tensors.push(t(format!("{stem}.mul1"), "I32", &[]));
                     }
                 }
             }
