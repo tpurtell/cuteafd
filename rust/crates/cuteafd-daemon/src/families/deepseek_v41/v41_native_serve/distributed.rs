@@ -407,6 +407,9 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
         } else {devices[1].own(|| crate::families::deepseek_v41::v41_experts::dspark::DsparkWeights::load_serving_with_width(&lib, &catalog,
             capacity, args.concurrency, lanes, draft_budgets(1), 16 << 20, draft_width))?})
     } else { None };
+    if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
+    // External DFly2 checkpoint loads directly after the target push recorder closes;
+    // recording TP2 draft experts into the target push group fails layer.rs:925.
     let dfly2_weights = if let Some(dfly2_path) = &args.dfly2_snapshot {
         let dfly2_catalog = cuteafd_loader::read_v41_dfly2_catalog(dfly2_path, catalog.config())?;
         let block_size = args.dfly2_block_size.map(usize::from).unwrap_or(dfly2_catalog.config().trained_block_size);
@@ -418,7 +421,6 @@ pub(super) fn worker(mut args: crate::cli::NativeServeArgs, mut receive: mpsc::R
                 &lib, &catalog, &dfly2_catalog, block_size, 32 << 30))?
         })
     } else { None };
-    if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     memory_checkpoint("draft weights")?;
     pass.bind_execution_plan(&pool.placement)?;
     if let Some(second) = &mut second { second.bind_execution_plan(&pool.placement)?; }

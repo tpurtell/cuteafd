@@ -635,6 +635,8 @@ fn worker(
     } else {
         None
     };
+    if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
+    // External DFly2 checkpoint loads directly after the target push recorder closes.
     let dfly2_weights = if let Some(dfly2_path) = &args.dfly2_snapshot {
         let dfly2_catalog = cuteafd_loader::read_v41_dfly2_catalog(dfly2_path, catalog.config())?;
         let block_size = args.dfly2_block_size.map(usize::from).unwrap_or(dfly2_catalog.config().trained_block_size);
@@ -648,7 +650,6 @@ fn worker(
     } else {
         None
     };
-    if let (Some(records), Some(recorder)) = (records.as_mut(), recorder) { records.extend(recorder.finish()); }
     let mut draft = if let Some(weights) = draft_weights.as_ref() {
         Some(DraftRuntime::with_requests(&lib, weights, &table, &vocabulary, capacity, decode_rows, args.concurrency, lanes)?)
     } else if let Some(weights) = dfly2_weights.as_ref() {
