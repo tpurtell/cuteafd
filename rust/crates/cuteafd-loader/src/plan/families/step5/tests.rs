@@ -743,7 +743,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     assert!(!pinned.wip_launchable());
     assert!(pinned.hints.iter().any(|h| h.what.contains("explicit KV pool of 262144 tokens is below the compiled/max-context floor of 1048576 tokens")), "{:?}", pinned.hints);
     // The joint solver can fit TP4 by moving 19 routed layers to the RTX pair.
-    // The KV target is not a floor: 510144 tokens still covers a 256K request.
+    // The KV target is not a floor: 559040 tokens still covers a 256K request.
     let tp4 = plan::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::from_spark_ranks(4),
         vision: MediaMode::Off, draft_ownership: Some(spec::DraftOwnership::None),
         layout: Some(layout::LayoutOptions {
@@ -754,7 +754,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     assert!(tp4.wip_launchable() && tp4.native_serving_admitted, "{:?}", tp4.hints);
     assert_eq!(tp4.onboard_layers, Some(19));
     let memory = tp4.memory_layout.as_ref().unwrap();
-    assert_eq!(memory.pool_tokens, 510_144);
+    assert_eq!(memory.pool_tokens, 559_040);
     let sparks = memory.devices.iter().filter(|device|
         device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
     assert_eq!(sparks.len(), 4);

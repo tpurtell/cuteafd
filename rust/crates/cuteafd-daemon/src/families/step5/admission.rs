@@ -429,7 +429,7 @@ mod tests {
                 assert_eq!(reservation.active as u64, live.cache.ranks[rank].bytes * 16);
                 assert_eq!(
                     reservation.marks as u64,
-                    live.cache.ranks[rank].bytes * live.marks as u64
+                    live.cache.ranks[rank].mark_bytes * live.marks as u64
                 );
             }
             inputs.inventory.gpus[0].baseline = Baseline::Planned {

@@ -44,6 +44,36 @@ fn view(buffer: CuteafdDeviceBuffer, span: ByteSpan) -> Result<CuteafdDeviceBuff
     Ok(CuteafdDeviceBuffer { ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })
 }
 
+/// Byte ranges in logical dense order and their physical page backing. Neither
+/// range includes an unfinished region. Adjacent physical pages coalesce.
+fn summary_copy_spans(pages: &[u32], page_count: u64, start: u64, end: u64)
+    -> Result<Vec<(ByteSpan, ByteSpan)>> {
+    ensure!(start <= end, "Step-5 reversed summary range");
+    let mut runs = Vec::new();
+    let per_page = PAGE_ROWS / REGION_ROWS;
+    let mut at = start;
+    while at < end {
+        let page = u64::from(*pages.get((at / per_page) as usize).context("Step-5 summary page missing")?);
+        ensure!(page < page_count, "Step-5 summary page outside pool");
+        let mut count = (per_page - at % per_page).min(end - at);
+        // Coalesce consecutive physical pages; the common restore path is a
+        // contiguous run, not one launch per region page.
+        while at + count < end && (at + count) % per_page == 0 {
+            let next = (at + count) / per_page;
+            let expected = page + (next - at / per_page);
+            if expected >= page_count || pages.get(next as usize).map(|&p| u64::from(p)) != Some(expected) {
+                break;
+            }
+            count += per_page.min(end - at - count);
+        }
+        let bytes = count * PROXY_DIM;
+        runs.push((ByteSpan { offset: at * PROXY_DIM, bytes },
+            ByteSpan { offset: page * SUMMARY_PAGE_BYTES + at % per_page * PROXY_DIM, bytes }));
+        at += count;
+    }
+    Ok(runs)
+}
+
 impl<'a> CacheRank<'a> {
     pub fn new(device: Device<'a>, layout: Step5CacheLayout, rank: usize,
         sequences: u64, slots: u64, pages: u64, available: usize) -> Result<Self> {
@@ -219,29 +249,9 @@ impl<'a> CacheRank<'a> {
         ensure!(start <= end && end <= self.layout.context.div_ceil(REGION_ROWS), "Step-5 summary extent");
         let dense = self.request_component(span, sequence)?;
         let pool = self.summary_plane(layer)?.context("Step-5 summary pool missing")?;
-        let mut runs = Vec::new();
-        let per_page = PAGE_ROWS / REGION_ROWS;
-        let mut at = start;
-        while at < end {
-            let page = u64::from(*pages.get((at / per_page) as usize).context("Step-5 summary page missing")?);
-            ensure!(page < self.page_count, "Step-5 summary page outside pool");
-            let mut count = (per_page - at % per_page).min(end - at);
-            // Coalesce consecutive physical pages; the common restore path is a
-            // contiguous run, not one launch per region page.
-            while at + count < end && (at + count) % per_page == 0 {
-                let next = (at + count) / per_page;
-                let expected = page + (next - at / per_page);
-                if expected >= self.page_count || pages.get(next as usize).map(|&p| u64::from(p)) != Some(expected) {
-                    break;
-                }
-                count += per_page.min(end - at - count);
-            }
-            let bytes = count * PROXY_DIM;
-            runs.push((view(dense, ByteSpan { offset: at * PROXY_DIM, bytes })?,
-                view(pool, ByteSpan { offset: page * SUMMARY_PAGE_BYTES + at % per_page * PROXY_DIM, bytes })?));
-            at += count;
-        }
-        Ok(runs)
+        summary_copy_spans(pages, self.page_count, start, end)?.into_iter()
+            .map(|(dense_span, page_span)| Ok((view(dense, dense_span)?, view(pool, page_span)?)))
+            .collect()
     }
 
     pub(super) fn restore_summaries(&self, sequence: u64, pages: &[u32], frontier: u64) -> Result<()> {
@@ -585,6 +595,65 @@ pub(super) mod tests {
         assert!(cache.reset_sequence(2).is_err());
         }
         Ok(())
+    }
+
+    #[test]
+    fn paged_summary_restore_round_trips_only_complete_regions() -> Result<()> {
+        // Include contiguous and fragmented physical pages, plus a nonzero tail
+        // start, exercising the exact ranges used by staging and restoration.
+        let source_pages = [4, 5, 1, 7];
+        let restored_pages = [3, 0, 1, 6];
+        let capacity = 8 * SUMMARY_PAGE_BYTES as usize;
+        let width = PROXY_DIM as usize;
+        let source: Vec<_> = (0usize..32 * width).map(|n| ((n * 37 + n / width * 11) % 251) as u8).collect();
+        for frontier in [0, 1, 7, 8, 9, 63, 64, 65, 127, 128, 129, 255, 256] {
+            let end = frontier / REGION_ROWS;
+            let mut pool = vec![0xa5; capacity];
+            let mut promoted = vec![0xa5; capacity];
+            let mut restored = vec![0xa5; source.len()];
+            let span = |s: ByteSpan| s.offset as usize..(s.offset + s.bytes) as usize;
+            // Incremental append crosses both region and page boundaries.
+            for region in 0..end {
+                for (dense, page) in summary_copy_spans(&source_pages, 8, region, region + 1)? {
+                    pool[span(page)].copy_from_slice(&source[span(dense)]);
+                }
+            }
+            // Copy retained full pages and precisely the completed summary
+            // prefix of the private partial page (the shared COW contract).
+            for (logical, (&from, &to)) in source_pages.iter().zip(&restored_pages).enumerate() {
+                let live = frontier.saturating_sub(logical as u64 * PAGE_ROWS).min(PAGE_ROWS);
+                let bytes = summary_prefix_bytes(live) as usize;
+                let from = from as usize * SUMMARY_PAGE_BYTES as usize;
+                let to = to as usize * SUMMARY_PAGE_BYTES as usize;
+                promoted[to..to + bytes].copy_from_slice(&pool[from..from + bytes]);
+            }
+            for (dense, page) in summary_copy_spans(&restored_pages, 8, 0, end)? {
+                restored[span(dense)].copy_from_slice(&promoted[span(page)]);
+            }
+            let bytes = end as usize * width;
+            assert_eq!(&restored[..bytes], &source[..bytes], "frontier {frontier}");
+            assert!(restored[bytes..].iter().all(|&b| b == 0xa5));
+        }
+        assert!(summary_copy_spans(&source_pages, 8, 0, 33).is_err());
+        assert!(summary_copy_spans(&[8], 8, 0, 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn shipping_mark_is_context_independent_and_summary_pages_scale() {
+        use cuteafd_loader::families::qwen4::Qwen4KvCache::Fp8;
+        let short = layout_with_format(32 << 10, 1, 3, 2752, Fp8);
+        let long = layout_with_format(1 << 20, 1, 3, 2752, Fp8);
+        assert_eq!(short.ranks[0].mark_bytes, long.ranks[0].mark_bytes);
+        assert_eq!(long.ranks[0].mark_bytes, 87_581_696);
+        let summary_page: u64 = long.ranks[0].regions.iter().map(|r| r.summary_page_bytes()).sum();
+        assert_eq!(summary_page * ((32 << 10) / PAGE_ROWS), 23 << 20);
+        assert_eq!(summary_page * ((1 << 20) / PAGE_ROWS), 736 << 20);
+        assert_eq!(long.geometry.ranks[0].persistent_unit_bytes, 2_355_200);
+        let geometry = cuteafd_core::prefix::HostCacheGeometry { unit_rows: PAGE_ROWS,
+            page_bytes: long.geometry.ranks[0].persistent_unit_bytes,
+            mark_bytes: long.ranks[0].mark_bytes, draft_bytes: 0 };
+        assert_eq!(geometry.conversations(32 << 30, 50_000, geometry.chunk_bytes()), 16);
     }
 
     #[test]

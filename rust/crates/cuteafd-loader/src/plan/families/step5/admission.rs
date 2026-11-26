@@ -1144,7 +1144,7 @@ mod tests {
                     assert_eq!(admitted.marks, slots);
                     for rank in 0..ranks {
                         assert_eq!(admitted.reservations[rank].marks as u64,
-                            admitted.cache.ranks[rank].bytes * slots as u64);
+                            admitted.cache.ranks[rank].mark_bytes * slots as u64);
                     }
                 }
             }
