@@ -1146,7 +1146,7 @@ impl<'a> RankRuntime<'a> {
         )
     }
 
-    /// Direct MoE router + FP8 K32 quant on `w.y` (`H=6144`, no LatentMoE) + shared expert FFN.
+    /// Local MoE frontend: direct router, FP8 K32 quant and shared expert FFN.
     fn moe_router_shared(
         &self,
         p: &str,
@@ -1154,68 +1154,79 @@ impl<'a> RankRuntime<'a> {
         wave_slot: usize,
         rows: usize,
         routed_scaling_factor: f32,
-        needs_router: bool,
     ) -> Result<()> {
+        self.moe_router(p, wave_slot, rows, routed_scaling_factor)?;
+        self.shared_ffn(p, gpus, wave_slot, rows)
+    }
+
+    fn moe_router(&self, p: &str, wave_slot: usize, rows: usize, routed_scaling_factor: f32) -> Result<()> {
         let w = &self.waves[wave_slot];
         let s_rows = [Scalar::I32(rows as i32)];
         // SAFETY: all buffers live through stream drain.
         unsafe {
-            if needs_router {
-                self.programs.proj_router.launch(
-                    &[
-                        w.y.buffer.ptr,
-                        self.weights.weight(&format!("{p}.mlp.gate"))?.ptr,
-                        self.shared.router_logits.buffer.ptr,
-                    ],
-                    &s_rows,
-                    self.stream.raw,
-                )?;
-                let bias = self
-                    .weights
-                    .buf(&format!("{p}.mlp.gate.e_score_correction_bias"))?
-                    .ptr;
-                self.device.library.copy_d2d_async(
-                    self.shared.router_select.buffer,
-                    self.shared.router_logits.buffer,
-                    rows * EXPERTS * 4,
-                    self.stream.raw,
-                )?;
-                self.device.library.router_select(
-                    self.shared.router_select.buffer.ptr,
+            self.programs.proj_router.launch(
+                &[
+                    w.y.buffer.ptr,
+                    self.weights.weight(&format!("{p}.mlp.gate"))?.ptr,
+                    self.shared.router_logits.buffer.ptr,
+                ],
+                &s_rows,
+                self.stream.raw,
+            )?;
+            let bias = self
+                .weights
+                .buf(&format!("{p}.mlp.gate.e_score_correction_bias"))?
+                .ptr;
+            self.device.library.copy_d2d_async(
+                self.shared.router_select.buffer,
+                self.shared.router_logits.buffer,
+                rows * EXPERTS * 4,
+                self.stream.raw,
+            )?;
+            self.device.library.router_select(
+                self.shared.router_select.buffer.ptr,
+                bias,
+                std::ptr::null(),
+                std::ptr::null(),
+                self.shared.route_ids.buffer.ptr,
+                self.shared.route_weights.buffer.ptr,
+                rows,
+                EXPERTS,
+                TOPK,
+                routed_scaling_factor,
+                true,
+                self.stream.raw,
+            )?;
+            self.programs.route_weights.launch(
+                &[
+                    self.shared.router_logits.buffer.ptr,
                     bias,
-                    std::ptr::null(),
-                    std::ptr::null(),
                     self.shared.route_ids.buffer.ptr,
                     self.shared.route_weights.buffer.ptr,
-                    rows,
-                    EXPERTS,
-                    TOPK,
-                    routed_scaling_factor,
-                    true,
-                    self.stream.raw,
-                )?;
-                self.programs.route_weights.launch(
-                    &[
-                        self.shared.router_logits.buffer.ptr,
-                        bias,
-                        self.shared.route_ids.buffer.ptr,
-                        self.shared.route_weights.buffer.ptr,
-                    ],
-                    &s_rows,
-                    self.stream.raw,
-                )?;
-                let grid = self.quantize_grid.blocks(rows, H);
-                self.programs.expert_input_quant.launch(
-                    &[
-                        w.y.buffer.ptr,
-                        self.shared.wire_in.buffer.ptr,
-                        self.shared.wire_in.buffer.ptr.wrapping_byte_add(H),
-                        self.shared.wire_in.buffer.ptr,
-                    ],
-                    &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)],
-                    self.stream.raw,
-                )?;
-            }
+                ],
+                &s_rows,
+                self.stream.raw,
+            )?;
+            let grid = self.quantize_grid.blocks(rows, H);
+            self.programs.expert_input_quant.launch(
+                &[
+                    w.y.buffer.ptr,
+                    self.shared.wire_in.buffer.ptr,
+                    self.shared.wire_in.buffer.ptr.wrapping_byte_add(H),
+                    self.shared.wire_in.buffer.ptr,
+                ],
+                &[Scalar::I32(rows as i32), Scalar::I32(grid as i32)],
+                self.stream.raw,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn shared_ffn(&self, p: &str, gpus: usize, wave_slot: usize, rows: usize) -> Result<()> {
+        let w = &self.waves[wave_slot];
+        let s_rows = [Scalar::I32(rows as i32)];
+        // SAFETY: all buffers live through stream drain.
+        unsafe {
             launch_proj_out(
                 self,
                 &format!("{p}.mlp.shared_experts.gate_proj"),
@@ -3087,7 +3098,7 @@ impl<'a> Hy4Engine<'a> {
                                 if is_dense {
                                     r.dense_ffn(&p, 1, wave_slot, rows)?;
                                 } else {
-                                    r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale, true)?;
+                                    r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale)?;
                                     r.local_exl3(layer, 1, rows, skip_routed)?;
                                     r.record_expert_usage_local(
                                         usage, count_usage, skip_routed, false, layer, usage_phase, rows,
@@ -3117,7 +3128,7 @@ impl<'a> Hy4Engine<'a> {
                                 if is_dense {
                                     r.dense_ffn(&p, 1, wave_slot, rows)?;
                                 } else {
-                                    r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale, true)?;
+                                    r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale)?;
                                     r.local_exl3(layer, 1, rows, skip_routed)?;
                                     r.record_expert_usage_local(
                                         usage, count_usage, skip_routed, false, layer, usage_phase, rows,
@@ -3256,7 +3267,7 @@ impl<'a> Hy4Engine<'a> {
         Ok(())
     }
 
-    fn run_moe_router_and_shared(
+    fn run_moe_frontend(
         &mut self,
         layer: usize,
         batch: &mut ActiveBatch,
@@ -3285,7 +3296,7 @@ impl<'a> Hy4Engine<'a> {
             for (rank, r) in self.ranks.iter().enumerate() {
                 let recv_ptr = attn_recv[rank];
                 r.graphs.run(
-                    GraphKey { layer, rows, section: GraphSection::FfnFrontend },
+                    GraphKey { layer, rows, section: if local_experts { GraphSection::FfnFrontend } else { GraphSection::SparkRouter } },
                     &r.stream,
                     || {
                         r.device.run(|| {
@@ -3298,7 +3309,11 @@ impl<'a> Hy4Engine<'a> {
                             if deferred {
                                 r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                             }
-                            r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, rank == 0 || local_experts)?;
+                            if local_experts {
+                                r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale)?;
+                            } else if rank == 0 {
+                                r.moe_router(&p, wave_slot, rows, routed_scale)?;
+                            }
                             if rank == 0 {
                                 r.record_expert_usage_local(
                                     usage, count_usage, skip_routed, false, layer, usage_phase, rows,
@@ -3328,7 +3343,12 @@ impl<'a> Hy4Engine<'a> {
                 if deferred {
                     r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                 }
-                r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, rank == 0 || local_experts)
+                if local_experts {
+                    r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale)?;
+                } else if rank == 0 {
+                    r.moe_router(&p, wave_slot, rows, routed_scale)?;
+                }
+                Ok(())
             })?;
         }
         if deferred {
@@ -3336,6 +3356,22 @@ impl<'a> Hy4Engine<'a> {
             batch.use_a = !batch.use_a;
         }
         batch.reduce_attn_pending = false;
+        Ok(())
+    }
+
+    /// Enqueue the shared FFN after the Spark request has been staged, before landing its reply.
+    fn run_spark_shared_ffn(&self, layer: usize, batch: &ActiveBatch) -> Result<()> {
+        let p = format!("model.layers.{layer}");
+        let rows = batch.rows;
+        let gpus = self.ranks.len();
+        for r in &self.ranks {
+            let work = || r.device.run(|| r.shared_ffn(&p, gpus, batch.wave_slot, rows));
+            if batch.graphed {
+                r.graphs.run(GraphKey { layer, rows, section: GraphSection::SparkShared }, &r.stream, work)?;
+            } else {
+                work()?;
+            }
+        }
         Ok(())
     }
 
@@ -3508,7 +3544,7 @@ impl<'a> Hy4Engine<'a> {
                             if deferred {
                                 r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
                             }
-                            r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale, true)?;
+                            r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale)?;
                             r.local_exl3(layer, gpus, rows, skip_routed)?;
                             if rank == 0 {
                                 r.record_expert_usage_local(
@@ -3528,7 +3564,7 @@ impl<'a> Hy4Engine<'a> {
             return self.finish_ffn_combine_and_post(layer, batch, true);
         }
 
-        self.run_moe_router_and_shared(layer, batch, true)?;
+        self.run_moe_frontend(layer, batch, true)?;
         for r in &self.ranks {
             r.device.run(|| r.local_exl3(layer, gpus, rows, skip_routed))?;
         }
@@ -3903,7 +3939,7 @@ impl<'a> Hy4Engine<'a> {
                         .get_mut(unit.slot)
                         .and_then(Option::as_mut)
                         .context("Hy4 send_experts without active unit")?;
-                    self.engine.run_moe_router_and_shared(layer, batch, false)?;
+                    self.engine.run_moe_frontend(layer, batch, false)?;
                     if self.engine.ranks.len() == 2 && self.engine.prefill_waves > 1 {
                         let exchange = self.engine.peer_exchange()?;
                         exchange.signal(1, DIRECT)?;
@@ -3977,6 +4013,11 @@ impl<'a> Hy4Engine<'a> {
                             )
                         }
                     })?;
+                    // Waves::send copies route_ids, route_weights and wire_in to slot-owned staging
+                    // in stream order, then publishes staged. The shared FFN reads wave.y and writes
+                    // ffn_gate/up/act, native projection scratch and wave.shared_out/shared_f32 only.
+                    // Queue it now so Spark work overlaps it, before land/reduce and TP2 FFN exchange.
+                    self.engine.run_spark_shared_ffn(layer, batch)?;
                     if !batch.graphed {
                         self.engine.record_expert_usage(layer, batch)?;
                     }
@@ -4290,4 +4331,16 @@ mod tests {
         assert!(run.find("run_prefill_units(").unwrap() < run.find("self.graph_completed()").unwrap());
         assert!(run.contains("self.abandon_graph_cycle()"));
     }
+    #[test]
+    fn spark_shared_runs_between_send_and_land() {
+        let prod = include_str!("execution.rs").split("#[cfg(test)]").next().unwrap();
+        let hook = prod.split("fn send_experts(").nth(1).unwrap()
+            .split("fn land_experts(").next().unwrap();
+        let router = hook.find("run_moe_frontend(layer, batch, false)").unwrap();
+        let send = hook.find("waves.send(").unwrap();
+        let shared = hook.find("run_spark_shared_ffn(layer, batch)").unwrap();
+        assert!(router < send && send < shared);
+        assert!(prod.contains("section: GraphSection::SparkShared"));
+    }
+
 }
