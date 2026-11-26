@@ -15,9 +15,18 @@ pub const V41_TARGET_CAPACITIES: [u64; 6] = [1, 16, V41_VERIFY_ROWS as u64, 256,
 
 /// Persistent request identities are shared by the two decode lanes.
 pub const V41_MAX_REQUESTS: usize = crate::concurrency::MAX_CONCURRENCY as usize;
-pub const V41_MAX_LANE_MEMBERS: usize = V41_MAX_REQUESTS.div_ceil(2);
-/// Vocabulary heads cover every lane member's anchor and maximum draft suffix.
-pub const V41_VOCAB_ROWS: usize = V41_MAX_LANE_MEMBERS * (MAX_DSPARK_PROPOSALS + 1);
+/// Fixed native drafter request capacity; target lanes can admit more anchors.
+pub const V41_MAX_DRAFT_MEMBERS: usize = V41_MAX_REQUESTS.div_ceil(2);
+/// Total request capacity divided across the resolved target decode lanes.
+pub const fn v41_lane_members(lanes: usize) -> usize { V41_MAX_REQUESTS.div_ceil(lanes) }
+/// Physical draft request capacity, independent of target membership.
+pub const fn v41_draft_members(members: usize, width: usize) -> usize {
+    let cap = V41_DRAFT_WIDE_ROWS / width;
+    let cap = if cap < V41_MAX_DRAFT_MEMBERS { cap } else { V41_MAX_DRAFT_MEMBERS };
+    if members < cap { members } else { cap }
+}
+/// Vocabulary heads cover the compiled target verify-row budget (256).
+pub const V41_VOCAB_ROWS: usize = V41_MAX_DRAFT_MEMBERS * (MAX_DSPARK_PROPOSALS + 1);
 pub const V41_WRITE_DESCRIPTOR_BYTES: usize = V41_MAX_REQUESTS * 24;
 pub const V41_READ_DESCRIPTOR_BYTES: usize = V41_MAX_REQUESTS * 8;
 

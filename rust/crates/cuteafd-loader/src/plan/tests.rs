@@ -1140,6 +1140,7 @@ fn v41_full_concurrency_launcher_admission_at_the_native_draft_block() {
             assert!(start.elapsed() < std::time::Duration::from_secs(10));
             assert!(report.fits && report.placement_supported && report.executable(),
                 "C{concurrency} GPUs={gpus}: {}", render(&report));
+            assert_eq!(usize::from(report.decode_lanes), gpus);
             let memory = report.memory_layout.as_ref().unwrap();
             assert!(memory.devices.iter().flat_map(|d| &d.items)
                 .filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum::<u64>() > 0);

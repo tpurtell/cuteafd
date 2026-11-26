@@ -42,17 +42,12 @@ impl LaneSupport {
 /// Resolve the decode-lane count before layout or any CUDA allocation.
 ///
 /// A family that admits one or two resolves its layout default (`rtx_gpus`),
-/// promotes an unspecified default to two lanes when `concurrency` exceeds one
-/// lane's member cap (`V41_MAX_LANE_MEMBERS` = 32), honors an explicit override
+/// honors an explicit override
 /// (`requested`), and resolves one lane at configured concurrency one: an idle
 /// second lane would cost memory for nothing.
 pub fn resolve(family: &dyn super::Family, requested: Option<u8>, concurrency: u64, rtx_gpus: usize) -> Result<u8, PlanError> {
     let support = family.decode_lanes();
-    let default = match support {
-        LaneSupport::One { .. } => 1,
-        LaneSupport::OneOrTwo { .. } if concurrency > cuteafd_core::V41_MAX_LANE_MEMBERS as u64 => MAX_DECODE_LANES,
-        LaneSupport::OneOrTwo { .. } => support.default_lanes(rtx_gpus),
-    };
+    let default = support.default_lanes(rtx_gpus);
     let lanes = requested.unwrap_or(default);
     if !(1..=MAX_DECODE_LANES).contains(&lanes) {
         return Err(PlanError::InvalidOption { option: "--decode-lanes", reason: "must be 1 or 2".into() });
@@ -111,7 +106,8 @@ mod tests {
         for (rtx_gpus, requested, concurrency, expected) in [
             (1, None, 16, 1), (1, Some(1), 16, 1), (1, Some(2), 16, 2),
             (1, None, 1, 1), (1, Some(2), 1, 1), (1, None, 32, 1), (1, Some(1), 32, 1),
-            (1, None, 33, 2), (1, None, 64, 2),
+            (1, None, 33, 1), (1, None, 64, 1), (1, Some(1), 64, 1),
+            (2, None, 64, 2), (2, Some(1), 64, 1),
             (2, None, 16, 2), (2, Some(2), 16, 2), (2, Some(1), 16, 1),
             (2, None, 1, 1), (2, Some(2), 1, 1), (2, Some(1), 1, 1), (2, Some(1), 32, 1),
         ] {

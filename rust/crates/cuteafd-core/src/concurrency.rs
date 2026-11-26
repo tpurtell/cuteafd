@@ -42,11 +42,21 @@ pub fn validate(family: &str, concurrency: u64) -> Result<(), ConcurrencyError> 
 mod tests {
     use super::*;
     #[test]
+    fn v41_lane_capacity_is_total_concurrency_split_by_lanes() {
+        assert_eq!(crate::v41_lane_members(1), 64);
+        assert_eq!(crate::v41_lane_members(2), 32);
+        for width in [5, 7] {
+            assert_eq!(crate::v41_draft_members(64, width), 32);
+            assert_eq!(crate::v41_draft_members(16, width), 16);
+            assert!(crate::v41_draft_members(64, width) * width <= crate::V41_DRAFT_WIDE_ROWS);
+        }
+    }
+    #[test]
     fn v41_two_lanes_cover_the_boot_concurrency_matrix() {
         for c in [1, 4, 16, 17, 32, 64] {
             validate("deepseek_v41", c).unwrap();
             let members = members_per_lane(c, 2);
-            assert!(members <= crate::V41_MAX_LANE_MEMBERS as u64);
+            assert!(members <= crate::V41_MAX_DRAFT_MEMBERS as u64);
             assert!(members <= crate::V41_VERIFY_ROWS as u64);
             assert!(members * crate::MAX_DSPARK_PROPOSALS as u64 <= crate::V41_DRAFT_WIDE_ROWS as u64);
         }

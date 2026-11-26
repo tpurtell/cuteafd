@@ -201,7 +201,7 @@ impl NativeLibrary {
             launch_tensor_invariant,
             destroy,
             width: if full { 5120 } else { 256 },
-            max_rows: if full { cuteafd_core::V41_VOCAB_ROWS } else { cuteafd_core::V41_MAX_LANE_MEMBERS },
+            max_rows: if full { cuteafd_core::V41_VOCAB_ROWS } else { cuteafd_core::V41_MAX_DRAFT_MEMBERS },
             vocab_rows: 129280,
         })
     }
@@ -343,7 +343,7 @@ impl V41DraftStep<'_> {
         position: usize,
         stream: *mut c_void,
     ) -> Result<()> {
-        ensure!((1..=cuteafd_core::V41_MAX_LANE_MEMBERS).contains(&rows), "invalid draft sampling rows");
+        ensure!((1..=cuteafd_core::V41_MAX_DRAFT_MEMBERS).contains(&rows), "invalid draft sampling rows");
         ensure!(position < 7, "invalid draft position");
         for (buffer, bytes) in [
             (shared, rows * 129280 * 4),

@@ -142,7 +142,7 @@ template<int Width>
 int32_t launch_attention(const uint16_t* query,const uint8_t* ring,
     const uint16_t* draft,const float* sink,const cuteafd_v41_attention_window_t* windows,
     uint16_t* output,int32_t requests,int32_t slots,void* stream) {
-  if(requests<1||requests>CUTEAFD_V41_MAX_LANE_MEMBERS||slots<1||slots>CUTEAFD_V41_MAX_REQUESTS)return cudaErrorInvalidValue;
+  if(requests<1||requests>CUTEAFD_V41_MAX_DRAFT_MEMBERS||slots<1||slots>CUTEAFD_V41_MAX_REQUESTS)return cudaErrorInvalidValue;
   const uint64_t q=uint64_t(requests)*Width*64*512*2,
       r=uint64_t(slots)*128*CUTEAFD_V41_DSPARK_KV_ROW_BYTES,d=uint64_t(requests)*Width*512*2;
   if(!span(output,q,32))return cudaErrorInvalidValue;
