@@ -43,6 +43,10 @@ pub(crate) enum Section {
     DsaAttnOut,
     /// Post-attn iHC + Dense/MoE frontend (TP2 or Spark-routed; includes TP2 local EXL3 when onboarded).
     FfnFrontend,
+    /// Spark-routed post-attention and router, before request staging.
+    SparkRouter,
+    /// Shared expert FFN launched after staging, ahead of the landed wait.
+    SparkShared,
     /// Post-FFN combine + norm + iHC post (TP2 or Spark-routed).
     FfnFinish,
     /// Rank-0 final layer post-FFN combine + norm + iHC post + terminal `hc_head`.
@@ -282,6 +286,8 @@ mod tests {
                     Section::DsaLocalPost,
                     Section::DsaAttnOut,
                     Section::FfnFrontend,
+                    Section::SparkRouter,
+                    Section::SparkShared,
                     Section::FfnFinish,
                 ] {
                     for rows in [1, 4, 16, 64] {
