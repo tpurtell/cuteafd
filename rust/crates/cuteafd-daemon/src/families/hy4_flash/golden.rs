@@ -261,6 +261,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         device_ids.push(second);
     }
     let devices: Vec<Device<'_>> = device_ids.iter().map(|&id| Device { library: &library, id }).collect();
+    for dev in &devices {
+        dev.run(|| crate::shared::inventory::preload_native_modules(&library))?;
+    }
     let decode_rows = cuteafd_loader::plan::resolve_decode_rows("hy4_flash",
         cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
             requested: args.decode_rows.as_option(),
