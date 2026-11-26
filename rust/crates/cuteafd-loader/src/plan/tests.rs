@@ -878,6 +878,12 @@ fn boot_concurrency_full_plan_matrix() {
             options.attention_placement = None;
             Case { family: "hy4_flash", label: "hy4_flash", dir, topologies: &[(2, 0), (1, 2)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: Some(options) }
         }),
+        Box::new(|| {
+            let (dir, manifest) = families::hy4::tests::concurrency_matrix_snapshot();
+            let mut options = wave_plan_options(dir.path(), 4);
+            options.attention_placement = None;
+            Case { family: "hy4", label: "hy4", dir, topologies: &[(1, 4), (2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: Some(options) }
+        }),
     ];
 
     let queue = std::sync::Mutex::new(builders.into_iter());

@@ -473,7 +473,7 @@ impl Family for Hy4 {
         "hy4"
     }
     fn runtime(&self) -> RuntimeStatus {
-        RuntimeStatus::Planned
+        RuntimeStatus::Serving
     }
     fn attention_precision(&self) -> crate::plan::attention_precision::PrecisionSupport {
         crate::plan::attention_precision::MLA_BF16_ONLY
@@ -483,8 +483,17 @@ impl Family for Hy4 {
             reason: "Hy4 serving starts on one decode lane; a second lane waits for a measured two-lane A/B (#2550, #744)",
         }
     }
+    fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
+        crate::plan::decode_rows::DecodeRowSupport::fixed(
+            crate::placement::families::hy4::DECODE_ROWS,
+            0,
+            "Hy4 split-K decode exports cover at most 64 rows per step",
+        )
+    }
     fn spark_decode(&self) -> Option<crate::plan::spark_executions::SparkDecode> {
-        Some(crate::plan::spark_executions::SparkDecode { rows: 64 })
+        Some(crate::plan::spark_executions::SparkDecode {
+            rows: crate::placement::families::hy4::DECODE_ROWS,
+        })
     }
     fn eager_native_core_headers(&self) -> bool {
         true

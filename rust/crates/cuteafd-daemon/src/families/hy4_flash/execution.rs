@@ -423,7 +423,7 @@ impl<'a> SharedScratch<'a> {
             None
         };
         let native = if native_layout.is_some() || native_head_layout.is_some() {
-            Some(Hy4NativeScratch::allocate(device, native_layout, native_head_layout)?)
+            Some(super::native::allocate_native_scratch(device, native_layout, native_head_layout)?)
         } else {
             None
         };

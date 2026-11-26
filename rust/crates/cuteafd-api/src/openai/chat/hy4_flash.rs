@@ -55,14 +55,18 @@ impl Hy4TokenIds {
 pub struct Hy4Encoding {
     template: ChatTemplate,
     tokens: Hy4TokenIds,
+    allow_max_effort: bool,
 }
 
 impl Hy4Encoding {
     pub fn new(source: impl Into<String>, tokens: Hy4TokenIds) -> Result<Self> {
-        anyhow::ensure!(!tokens.eos.is_empty(), "Hy4-flash EOS token list must not be empty");
+        anyhow::ensure!(!tokens.eos.is_empty(), "Hy4 EOS token list must not be empty");
+        let source = source.into();
+        let allow_max_effort = source.contains("'max'") || source.contains("\"max\"");
         Ok(Self {
-            template: ChatTemplate::new(source).context("compile Hy4-flash chat template")?,
+            template: ChatTemplate::new(source).context("compile Hy4 chat template")?,
             tokens,
+            allow_max_effort,
         })
     }
 
@@ -116,8 +120,8 @@ impl Hy4Encoding {
 
     pub fn render(&self, body: &Value, options: &Hy4PromptOptions) -> Result<String, String> {
         self.template
-            .render(&prompt::template_context(body, options)?)
-            .map_err(|error| format!("Hy4-flash chat template: {error:#}"))
+            .render(&prompt::template_context_with_max(body, options, self.allow_max_effort)?)
+            .map_err(|error| format!("Hy4 chat template: {error:#}"))
     }
 }
 

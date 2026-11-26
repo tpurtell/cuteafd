@@ -4,6 +4,9 @@
 //! `hy4-flash-v1_20261118_own-text-bf16-f32`, agg. NLL `1.283684105386`) and
 //! `python/reference/families/hy4_flash`, reading FP8 Engram shards only and
 //! verifying unit `N=1` vs chunked byte-exactness and exact prefix restore.
+use crate::families::hy4_common::golden::{
+    digest_f32, load_published_reference, read_u32_bin, score_window_direct_tail,
+};
 use super::execution::Hy4Engine;
 use crate::shared::golden_scores::{scored_nll, ReferenceRows};
 use crate::shared::memory::device::Device;
@@ -104,72 +107,15 @@ pub(crate) struct GoldenArgs {
     pub(crate) resume_verify: bool,
 }
 
-fn read_u32_bin(path: &Path) -> Result<Vec<u32>> {
-    let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    ensure!(bytes.len() % 4 == 0 && !bytes.is_empty(), "invalid u32 binary {}", path.display());
-    Ok(bytes
-        .chunks_exact(4)
-        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-        .collect())
-}
-
-fn digest_f32(values: &[f32]) -> String {
-    let mut h = Sha256::new();
-    for v in values {
-        h.update(v.to_le_bytes());
-    }
-    format!("{:x}", h.finalize())
-}
-
 fn load_published_hy4_reference(root: &Path, vocab: usize) -> Result<cuteafd_bench::reference::Reference> {
     use cuteafd_bench::fidelity_dataset;
-    let bytes = std::fs::read(root.join("manifest.json"))
-        .with_context(|| format!("reading {}", root.join("manifest.json").display()))?;
-    let manifest: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let digest = format!("{:x}", Sha256::digest(&bytes));
-    ensure!(
-        manifest["config"].as_str() == Some(fidelity_dataset::HY4_CONFIG)
-            && digest == fidelity_dataset::HY4_MANIFEST_SHA256,
-        "Hy4-flash fidelity manifest mismatch: config={:?} sha256={digest}",
-        manifest["config"]
-    );
-    let reference = fidelity_dataset::load(root, &manifest)?;
-    ensure!(reference.vocab == vocab, "Hy4-flash fidelity vocab {} != {vocab}", reference.vocab);
-    Ok(reference)
-}
-
-fn build_probe_row(position: usize, logits: &[f32], wanted_ids: &[u32]) -> cuteafd_api::openai::probe::ProbeRow {
-    let finite = logits.iter().all(|v| v.is_finite());
-    let mut max_v = f32::NEG_INFINITY;
-    let mut argmax = 0u32;
-    for (i, &v) in logits.iter().enumerate() {
-        if v > max_v {
-            max_v = v;
-            argmax = i as u32;
-        }
-    }
-    let max_f64 = f64::from(max_v);
-    let sum_exp: f64 = logits.iter().map(|&v| (f64::from(v) - max_f64).exp()).sum();
-    let lse = max_f64 + sum_exp.ln();
-    let wanted: Vec<(u32, f32)> = wanted_ids
-        .iter()
-        .map(|&id| (id, (f64::from(logits[id as usize]) - lse) as f32))
-        .collect();
-    let mut fnv = 0xcbf2_9ce4_8422_2325u64;
-    for &v in logits {
-        for b in v.to_le_bytes() {
-            fnv ^= u64::from(b);
-            fnv = fnv.wrapping_mul(0x0100_0000_01b3);
-        }
-    }
-    cuteafd_api::openai::probe::ProbeRow {
-        position,
-        hash: format!("{fnv:016x}"),
-        argmax,
-        top: Vec::new(),
-        wanted,
-        finite,
-    }
+    load_published_reference(
+        root,
+        vocab,
+        fidelity_dataset::HY4_CONFIG,
+        fidelity_dataset::HY4_MANIFEST_SHA256,
+        "Hy4-flash",
+    )
 }
 
 fn check_headers_only(args: &GoldenArgs) -> Result<()> {
@@ -555,51 +501,11 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                 }
                 full_logits = Some(logits);
             }
-            let want = win.want();
-            let mut rows = Vec::with_capacity(win.positions.len());
             let mut scored_flat = Vec::with_capacity(win.positions.len() * vocab);
-            for (pos_id, slice) in &scored_slices {
-                rows.push(build_probe_row(*pos_id, slice, &want[pos_id]));
+            for (_, slice) in &scored_slices {
                 scored_flat.extend_from_slice(slice);
             }
-            let mut score = win.score(&rows);
-            // Recompute each row's KL and NLL using direct engine tail in f64 (matching
-            // `cuteafd_bench::fidelity_rows::score_compact`, avoiding `1 - q_mass` cancellation).
-            for ((rec, pos), (_, slice)) in score.records.iter_mut().zip(&win.positions).zip(&scored_slices) {
-                let max_v = slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let max_f64 = f64::from(max_v);
-                let lse = max_f64 + slice.iter().map(|&v| (f64::from(v) - max_f64).exp()).sum::<f64>().ln();
-                let mut chosen = vec![false; vocab];
-                let mut kl = 0.0f64;
-                for t in &pos.top {
-                    let id = t.id as usize;
-                    chosen[id] = true;
-                    let q_lp = f64::from(slice[id]) - lse;
-                    kl += t.lp.exp() * (t.lp - q_lp);
-                }
-                if pos.tail_lp.is_finite() {
-                    let mut peak = f64::NEG_INFINITY;
-                    for (id, &v) in slice.iter().enumerate() {
-                        if !chosen[id] {
-                            let lp = f64::from(v) - lse;
-                            if lp > peak {
-                                peak = lp;
-                            }
-                        }
-                    }
-                    let tail_sum: f64 = slice
-                        .iter()
-                        .enumerate()
-                        .filter(|&(id, _)| !chosen[id])
-                        .map(|(_, &v)| ((f64::from(v) - lse) - peak).exp())
-                        .sum();
-                    let tail = peak + tail_sum.ln();
-                    kl += pos.tail_lp.exp() * (pos.tail_lp - tail);
-                }
-                rec.kl = kl.max(0.0);
-                rec.nll = -(f64::from(slice[pos.next as usize]) - lse);
-            }
-            score = cuteafd_bench::reference::Fidelity::from_records(score.records);
+            let score = score_window_direct_tail(win, &scored_slices, vocab);
             let gen_win = cuteafd_bench::reference::Fidelity::from_records(
                 score.records.iter().filter(|r| r.role == "gen").cloned().collect(),
             );

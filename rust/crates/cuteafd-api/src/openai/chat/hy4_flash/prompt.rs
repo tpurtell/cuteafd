@@ -7,8 +7,12 @@ pub struct Hy4PromptOptions {
     pub tool_names: Vec<String>,
 }
 
-/// Resolve Hy4-flash `reasoning_effort` (`no_think`, `high`, or `max`).
+/// Resolve Hy4 / Hy4-flash `reasoning_effort` (`no_think`, `high`, or `max` when supported by template).
 pub fn effort(body: &Value) -> Result<String, String> {
+    effort_with_max(body, true)
+}
+
+pub fn effort_with_max(body: &Value, allow_max: bool) -> Result<String, String> {
     let raw = body
         .get("reasoning_effort")
         .filter(|v| !v.is_null())
@@ -22,14 +26,15 @@ pub fn effort(body: &Value) -> Result<String, String> {
         Some(Value::String(text)) => match text.trim() {
             "no_think" | "none" => "no_think".to_owned(),
             "high" | "medium" | "low" => "high".to_owned(),
-            "max" | "xhigh" => "max".to_owned(),
+            "max" | "xhigh" => if allow_max { "max" } else { "high" }.to_owned(),
             other => {
                 return Err(format!(
-                    "unknown Hy4-flash reasoning_effort: {other} (expected no_think/high/max)"
+                    "unknown Hy4 reasoning_effort: {other} (expected no_think/high{})",
+                    if allow_max { "/max" } else { "" }
                 ))
             }
         },
-        Some(_) => return Err("Hy4-flash reasoning_effort must be a string (no_think/high/max)".into()),
+        Some(_) => return Err("Hy4 reasoning_effort must be a string (no_think/high/max)".into()),
     };
     let mut switches = body.clone();
     if let Some(obj) = switches.as_object_mut() {
@@ -45,7 +50,11 @@ pub fn effort(body: &Value) -> Result<String, String> {
 }
 
 pub fn template_context(body: &Value, options: &Hy4PromptOptions) -> Result<Value, String> {
-    let reasoning_effort = effort(body)?;
+    template_context_with_max(body, options, true)
+}
+
+pub fn template_context_with_max(body: &Value, options: &Hy4PromptOptions, allow_max: bool) -> Result<Value, String> {
+    let reasoning_effort = effort_with_max(body, allow_max)?;
     let raw = body
         .get("messages")
         .and_then(Value::as_array)
