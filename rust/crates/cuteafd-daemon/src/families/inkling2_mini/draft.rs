@@ -250,6 +250,25 @@ impl<'a> Binding<'a> {
         for row in rows { ensure!(self.frontier(row.slot)?.1 == row.position, "Mini DFlash proposal frontier differs"); }
         gqa.stream.device.run(|| gqa.body.draft_normalized_table(rows, embed, norm, gqa.embed_eps, TargetHead::Bf16Buffer(&head)))
     }
+    pub fn dump_real_proposals(&self, dir: &std::path::Path, rows: usize, anchors: &[u32], embed: Buffer, norm: Buffer, head: Buffer) -> Result<()> {
+        let g = self.dflash.as_ref().context("Mini real-feature trace requires GQA")?;
+        self.set_scores(true, true);
+        let mut results = Vec::new();
+        for &anchor in anchors {
+            let actual = self.propose(&[DraftSeq { slot: 0, anchor, position: rows, valid_from: 0 }], embed, norm, head)?;
+            let logits = g.stream.device.run(|| g.body.last_logits(1))?;
+            let vocab = g.body.cfg.vocab;
+            let mut bytes = Vec::new();
+            for row in 1..self.block {
+                for v in &logits[row*vocab..row*vocab+200058] { bytes.extend_from_slice(&v.to_le_bytes()); }
+            }
+            std::fs::write(dir.join(format!("logits-{anchor}.bin")), bytes)?;
+            results.push(serde_json::json!({"anchor":anchor,"tokens":actual[0].tokens,"features":actual[0].features}));
+        }
+        std::fs::write(dir.join("meta.json"), serde_json::to_vec(&serde_json::json!({"rows":rows,"results":results}))?)?;
+        Ok(())
+    }
+
     /// Compare real-weight block proposals with the independent reference generator.
     pub fn check_oracle(&self, path: &std::path::Path, embed: Buffer, norm: Buffer, head: Buffer) -> Result<()> {
         use serde::Deserialize;
@@ -395,6 +414,14 @@ impl<'a> Binding<'a> {
                 drafter.append_context(slot, start + offset, features, count)?;
             } else if let Some(gqa) = &self.dflash {
                 ensure!(gqa.frontier.borrow()[slot] == start + offset, "Mini DFlash context gap");
+                if let Some(dir) = std::env::var_os("CUTEAFD_DIAG_MINI_REAL_FEATURES") {
+                    let dir = std::path::PathBuf::from(dir);
+                    std::fs::create_dir_all(&dir)?;
+                    let mut bytes = vec![0; features.bytes];
+                    gqa.stream.drain()?;
+                    gqa.stream.device.run(|| gqa.stream.device.library.copy_d2h(&mut bytes, features))?;
+                    std::fs::write(dir.join(format!("tap-{slot}-{}.bin", start + offset)), bytes)?;
+                }
                 gqa.stream.device.run(|| gqa.body.append_gqa_features(slot, start + offset, features, count))?;
                 gqa.frontier.borrow_mut()[slot] = start + offset + count;
             }
