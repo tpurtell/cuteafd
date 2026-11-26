@@ -168,7 +168,7 @@ def check_diagnosis(failure, diagnosis, identity_key):
 
 
 @contextmanager
-def producer_session(root, snapshot, corpus, vendor, local):
+def producer_session(root, snapshot, corpus, vendor, local, *, qualify=verified_identity):
     """Hold across all numerical work. A SIGKILL leaves an identifiable interrupted attempt."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
@@ -176,7 +176,7 @@ def producer_session(root, snapshot, corpus, vendor, local):
         fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if (root / "numerical-complete.json").exists():
             raise ValueError("numerical job already completed")
-        identity = verified_identity(candidate(snapshot, corpus, REPO), vendor, local)
+        identity = qualify(candidate(snapshot, corpus, REPO), vendor, local)
         frozen, attempt = root / "identity.json", root / "attempt.json"
         if frozen.exists():
             if read(frozen) != identity:
