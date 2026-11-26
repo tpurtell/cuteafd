@@ -79,3 +79,26 @@ def test_reference_attention_after_install_including_two_draft_kv_inputs(tmp_pat
             kv=core.ref.rotate_tail(kv[:,None],cos,sin).squeeze(1)
         expected=tiny.mlp_input(r["state"],weights,index,r.get("positions",torch.arange(n)),draft_context_kv=kv)
         torch.testing.assert_close(state.x,expected.x,rtol=0,atol=0)
+
+
+def test_full_moe_layer_uses_ordered_sums_for_fc2_and_successor(tmp_path, tiny, source_codec, monkeypatch):
+    from ernie55_flash import production_moe as moe
+    def fitted(name, weight, cov, evidence, values, metrics):
+        assert cov['count'] >= 1024
+        for suffix in moe.SUFFIXES:
+            values[name + "." + suffix] = weight if suffix == "trellis" else torch.zeros(1)
+        metrics.append(dict(module=name,bits=4))
+        return weight
+    monkeypatch.setattr(moe,"fit",fitted)
+    c=tiny.config
+    g=torch.Generator().manual_seed(3)
+    hidden=[torch.randn(n,c.hc_mult,c.hidden_size,generator=g) for n in (13,17,9)]
+    records=lambda start: ((i,dict(state=hidden[i])) for i in range(start,len(hidden)))
+    result = core.process_layer(tiny,Stages(tmp_path/'stages','fixture'),'layers',2,records,
+        dict(calibration=2,heldout=1),dict(calibration=30,heldout=9),lambda *a,**k:None)
+    assert len(result['k4']) == c.n_routed_experts*3*4
+    fc2=source_codec['model.layers.2.block_sparse_moe.fc2_latent_proj']
+    assert fc2[1] == 30
+    w=tiny.load_layer(2)
+    for i,row in result['outputs'](0):
+        torch.testing.assert_close(row['state'],tiny.native_layer(hidden[i],w,2),rtol=0,atol=0)
