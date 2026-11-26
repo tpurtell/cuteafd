@@ -3637,8 +3637,13 @@ impl<'a> Qwen4Engine<'a> {
         let Some(Experts::Hybrid(experts)) = &self.experts else { anyhow::bail!("Qwen hybrid missing") };
         // DIRECT also serves the return, but in the opposite direction (each
         // rank keeps independent send and receive sequences).
-        experts.with_peer(|peer| peer.push_to(1, crate::shared::peer_split::DIRECT,
-            source.ptr, destination.ptr, bytes))?.context("Qwen remote shared needs peer owner")?;
+        // Keep the shared transfer on the same SM-copy path as the original
+        // bundled planes, rather than queue a copy-engine transfer behind waits.
+        let bytes = bytes as u64;
+        let plane = cuteafd_ffi::peer_exchange::PeerPlane { source: source.ptr, destination: destination.ptr,
+            rows: 1, row_bytes: bytes, source_pitch: bytes, destination_pitch: bytes };
+        experts.with_peer(|peer| peer.push_planes(1, crate::shared::peer_split::DIRECT, &[plane]))?
+            .context("Qwen remote shared needs peer owner")?;
         Ok(ticket)
     }
 
@@ -4114,7 +4119,7 @@ mod prefill_unit_tests {
             .split_once("    fn remote_return(").unwrap().0;
         assert!(send.find("self.remote_front(").unwrap() < send.find("self.wave_send(").unwrap());
         assert!(send.find("self.wave_send(").unwrap() < send.find("self.shared(").unwrap());
-        assert!(send.find("self.shared(").unwrap() < send.find("peer.push_to(1, crate::shared::peer_split::DIRECT").unwrap());
+        assert!(send.find("self.shared(").unwrap() < send.find("peer.push_planes(1, crate::shared::peer_split::DIRECT").unwrap());
         let land = source.split_once("    fn wave_land(").unwrap().1
             .split_once("    fn wave_staging_bytes(").unwrap().0;
         assert!(land.find("exchange.land(").unwrap() < land.find("exchange.reduce(").unwrap());
