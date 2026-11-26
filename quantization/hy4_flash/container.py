@@ -45,7 +45,7 @@ def command(arguments, phase, *, family="hy4-flash", task=TASK, build=BUILD):
     return argv
 
 
-def main(*, family="hy4-flash", task=TASK, build=BUILD):
+def main(*, family="hy4-flash", task=TASK, build=BUILD, builder=command):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=("build", "preflight", "pilot", "production"))
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
@@ -59,7 +59,7 @@ def main(*, family="hy4-flash", task=TASK, build=BUILD):
     for value in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(value, interrupted)
     try:
-        child = subprocess.Popen(command(args.arguments, args.phase, family=family, task=task, build=build))
+        child = subprocess.Popen(builder(args.arguments, args.phase, family=family, task=task, build=build))
         return child.wait()
     finally:
         if child is not None and child.poll() is None:
