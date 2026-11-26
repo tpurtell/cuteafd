@@ -2030,6 +2030,63 @@ fn a_short_shared_base_survives_the_warm_wave_on_two_staging_slots() {
     }
 }
 
+/// #2783: once all host slabs are pinned by device retention, newer captures
+/// must still displace idle old leaves and preserve the common turn across fanout.
+#[test]
+fn full_host_quota_recycles_old_marks_and_keeps_new_turn_exact() {
+    for pooled in [false, true] {
+        let fake = if pooled { Fake::pooled(400, 8) } else { Fake::new(400, 8, 2) };
+        // One mark per 64-byte chunk, two KV pages per chunk. Sixteen disjoint
+        // one-page snapshots fill twenty-four chunks while both device slots stay free.
+        let host = HostConfig { bytes: 24 * 64, chunk_bytes: 64, min_tokens: 1, ..HostConfig::default() };
+        let quota = host.bytes;
+        let mut cache = PrefixCache::new(fake.layout(), config(40, fake.slots),
+            Some((host, Shared(fake.mem.clone())))).unwrap();
+        let settle = |cache: &mut PrefixCache<Shared>| { fake.mem.borrow_mut().advance(10_000_000); cache.tick(); };
+        for i in 0..16 {
+            let (_, _, p) = serve(&mut cache, &fake, 0, &seq(100 + i * 100, 4), &[], 8);
+            cache.release(&fake, &p.pages).unwrap();
+            settle(&mut cache);
+        }
+        assert_eq!(cache.stats().marks_on_host, 16);
+        assert_eq!(cache.stats().host.unwrap().bytes_used, quota);
+        // Another restore has its own pin. Reclaiming the engine's retention
+        // pin would not actually free this snapshot and must not retire it.
+        let protected = cache.host_mark_keys()[0];
+        cache.host_mut().unwrap().pin(protected);
+        let (_, base, p) = serve(&mut cache, &fake, 0, &seq(2000, 9), &seq(3000, 3), 24);
+        cache.release(&fake, &p.pages).unwrap();
+        settle(&mut cache);
+        assert!(cache.host_mark_keys().contains(&protected));
+        cache.host_mut().unwrap().release_pin(protected);
+        assert_eq!(cache.stats().marks_in_use, 0);
+        for i in 0..3u32 {
+            let mut next = base.clone();
+            next.extend(seq(4000 + i * 100, 3));
+            let (resume, turn, mut p) = serve(&mut cache, &fake, 1, &next, &seq(5000 + i * 100, 3), 24);
+            assert_eq!(resume, base.len(), "pooled={pooled} follow-up={i}");
+            // Verify all cached bytes, not only the hit length.
+            let mut longer = turn.clone(); longer.push(9000);
+            fake.forward(&mut p, &longer).unwrap();
+            cache.release(&fake, &p.pages).unwrap();
+            settle(&mut cache);
+            assert_eq!(cache.stats().marks_in_use, 0);
+            let restored = cache.admit(&fake, &longer, 24, false,
+                |pages| Placement { pages, ring: 2, len: 0, ring_from: 0 }).unwrap();
+            assert_eq!(restored.resume, turn.len());
+            assert!(restored.source.as_ref().unwrap().host);
+            let mut p = restored.placement;
+            fake.forward(&mut p, &longer).unwrap();
+            cache.release(&fake, &p.pages).unwrap();
+        }
+        let stats = cache.stats();
+        assert_eq!(stats.host_store_skips, 0);
+        assert!(stats.host.as_ref().unwrap().host_evictions > 0);
+        assert!(stats.host.unwrap().bytes_used <= quota);
+        assert_eq!((stats.dead_marks, stats.restore_failures), (0, 0));
+    }
+}
+
 /// The #2582 clamp is only for staged marks: with the host tier off, a mark family retains short
 /// marks in its full device arena as before, and a pages-only family keeps the host minimum (its
 /// device snapshot needs no slot, so a short one stays device-resident).
