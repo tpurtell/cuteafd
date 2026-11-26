@@ -246,6 +246,24 @@ def _write_f32(path: Path, t: torch.Tensor) -> None:
     path.write_bytes(arr.tobytes())
 
 
+def _write_bf16(path: Path, t: torch.Tensor) -> None:
+    arr = np.ascontiguousarray(
+        t.detach().to(torch.bfloat16).contiguous().cpu().view(torch.uint16).numpy(),
+        dtype="<u2",
+    )
+    path.write_bytes(arr.tobytes())
+
+
+def _metrics(actual: torch.Tensor, expected: torch.Tensor) -> dict[str, float]:
+    a = actual.detach().double().flatten()
+    e = expected.detach().double().flatten()
+    return {
+        "cosine": float((a @ e) / (a.norm() * e.norm()).clamp_min(1e-300)),
+        "max_abs": float((a - e).abs().max()),
+        "rel_l2": float((a - e).norm() / e.norm().clamp_min(1e-300)),
+    }
+
+
 def _structured_rgb(gh: int, gw: int, variant: int) -> np.ndarray:
     """Deterministic structured synthetic render (gradients, shapes, bands) in uint8 [H, W, 3]."""
     h, w = gh * PATCH, gw * PATCH
@@ -309,26 +327,53 @@ def generate_fixtures(snapshot: Path, out_dir: Path, device: str = "cuda") -> No
     batch_order = []
     batch_rows = []
     with torch.no_grad():
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
         for name, (gh, gw), variant in specs:
             rgb = _structured_rgb(gh, gw, variant)
             patches = _rgb_to_raster_patches(rgb, gh, gw)
             grid = [1, gh, gw]
             stages = encode(weights, patches, grid, mode="serving")
+            f32_stages = encode(weights, patches, grid, mode="f32")
             fdir = vision_dir / name
             fdir.mkdir(parents=True, exist_ok=True)
             (fdir / "rgb.u8").write_bytes(rgb.tobytes())
-            (fdir / "meta.json").write_text(json.dumps({"grid": [gh, gw], "rows": output_rows(grid)}))
+            serving_vs_f32 = {
+                "0": _metrics(stages.patch, f32_stages.patch),
+                "pos": _metrics(stages.embed, f32_stages.embed),
+                **{str(i + 1): _metrics(stages.layers[i], f32_stages.layers[i]) for i in range(LAYERS)},
+                str(LAYERS + 1): _metrics(stages.merger_norm, f32_stages.merger_norm),
+                "out": _metrics(stages.output, f32_stages.output),
+            }
+            (fdir / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "grid": [gh, gw],
+                        "rows": output_rows(grid),
+                        "serving_vs_f32": serving_vs_f32,
+                    },
+                    indent=2,
+                )
+            )
             _write_f32(fdir / "stage_0.f32", stages.patch)
             _write_f32(fdir / "stage_pos.f32", stages.embed)
-            for idx in (0, 1, 19, 38, 39):
+            _write_bf16(fdir / "teacher_0.bf16", stages.embed)
+            for idx in range(LAYERS):
                 _write_f32(fdir / f"stage_{idx + 1}.f32", stages.layers[idx])
+                if idx + 1 < LAYERS:
+                    _write_bf16(fdir / f"teacher_{idx + 1}.bf16", stages.layers[idx])
             _write_f32(fdir / f"stage_{LAYERS + 1}.f32", stages.merger_norm)
             _write_f32(fdir / "stage_out.f32", stages.output)
+            _write_f32(fdir / "stage_out_f32.f32", f32_stages.output)
             batch_pixels.append(patches)
             batch_grids.append(grid)
             batch_order.append(name)
             batch_rows.append(output_rows(grid))
-            print(f"fixture {name}: grid=({gh},{gw}) out={tuple(stages.output.shape)}")
+            print(
+                f"fixture {name}: grid=({gh},{gw}) out={tuple(stages.output.shape)} "
+                f"serving_vs_f32_out_cos={serving_vs_f32['out']['cosine']:.6f}"
+            )
 
         batched = encode_batch(weights, batch_pixels, batch_grids, mode="serving")
         bdir = vision_dir / "batch"

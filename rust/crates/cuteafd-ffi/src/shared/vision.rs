@@ -763,6 +763,53 @@ impl NativeVision {
         if let Some(error) = context.failed { return Err(error); }
         check(status)
     }
+    /// Qualification only: run one observed batch encode with per-layer host BF16
+    /// teacher forcing (`cuteafd_internal_vision_tower_teacher`), clearing the
+    /// callback before returning.
+    #[cfg(feature = "test-support")]
+    pub fn encode_batch_teacher_observed(
+        &mut self,
+        rgb: &[u8],
+        grids: &[[usize; 2]],
+        lut: &[f32; 768],
+        output: &mut [u16],
+        teacher: &mut dyn FnMut(i32, usize, usize) -> Option<*const u16>,
+        observe: &mut dyn FnMut(i32, *const c_void, usize, usize) -> Result<(), VisionError>,
+    ) -> Result<(), VisionError> {
+        type TeacherCallback = unsafe extern "C" fn(*mut c_void, i32, i32, i32) -> *const u16;
+        type SetTeacher = unsafe extern "C" fn(*mut c_void, Option<TeacherCallback>, *mut c_void) -> i32;
+        struct TeacherContext<'a> {
+            teacher: &'a mut dyn FnMut(i32, usize, usize) -> Option<*const u16>,
+        }
+        unsafe extern "C" fn teacher_trampoline(
+            context: *mut c_void,
+            next_layer: i32,
+            rows: i32,
+            width: i32,
+        ) -> *const u16 {
+            // SAFETY: `context` stays live for the synchronous encode below.
+            let context = unsafe { &mut *context.cast::<TeacherContext>() };
+            (context.teacher)(next_layer, rows.max(0) as usize, width.max(0) as usize)
+                .unwrap_or(std::ptr::null())
+        }
+        let set_teacher = unsafe {
+            *self
+                ._library
+                .get::<SetTeacher>(b"cuteafd_internal_vision_tower_teacher")?
+        };
+        let mut tctx = TeacherContext { teacher };
+        // SAFETY: `tctx` outlives the synchronous encode and the callback is cleared before return.
+        check(unsafe {
+            set_teacher(
+                self.owner,
+                Some(teacher_trampoline),
+                (&mut tctx as *mut TeacherContext).cast(),
+            )
+        })?;
+        let encode_result = self.encode_batch_observed(rgb, grids, lut, output, observe);
+        let clear_result = check(unsafe { set_teacher(self.owner, None, std::ptr::null_mut()) });
+        encode_result.and(clear_result)
+    }
     pub fn ledger(&self) -> Result<VisionLedger, VisionError> {
         let mut ledger = VisionLedger::default();
         // SAFETY: exclusive owner is live on this thread; native writes one ledger.

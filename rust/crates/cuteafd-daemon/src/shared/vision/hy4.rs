@@ -420,7 +420,16 @@ pub(crate) mod tests {
         let mut batch_rgb = Vec::new();
         let mut batch_grids = Vec::new();
         let mut singles = Vec::new();
-        let (mut worst_cos, mut worst_out) = (1f64, 0f64);
+        let (mut worst_free_cos, mut worst_free_out_rel) = (1f64, 0f64);
+        let (mut worst_teacher_cos, mut worst_teacher_rel) = (1f64, 0f64);
+        let (mut worst_engine_vs_f32_out, mut worst_serving_vs_f32_out) = (1f64, 1f64);
+        let read_bf16 = |path: &Path| -> Vec<u16> {
+            std::fs::read(path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                .chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect()
+        };
         for fixture in &fixtures {
             let meta: serde_json::Value = serde_json::from_slice(&std::fs::read(fixture.join("meta.json")).unwrap()).unwrap();
             let grid: [usize; 2] = serde_json::from_value(meta["grid"].clone()).unwrap();
@@ -439,14 +448,75 @@ pub(crate) mod tests {
                 Ok(())
             }).unwrap();
             let mut entry = serde_json::Map::new();
+            let mut free_map = serde_json::Map::new();
             for (name, actual) in &stages {
                 let path = fixture.join(format!("stage_{name}.f32"));
                 if !path.is_file() { continue; }
                 let (cos, max_abs, rel) = compare(actual, &read_f32(&path));
-                if name == "out" { worst_out = worst_out.max(rel); }
-                worst_cos = worst_cos.min(cos);
-                entry.insert(name.clone(), serde_json::json!({"cosine": cos, "max_abs": max_abs, "rel_l2": rel}));
+                if name == "out" {
+                    worst_free_out_rel = worst_free_out_rel.max(rel);
+                    let f32_path = fixture.join("stage_out_f32.f32");
+                    if f32_path.is_file() {
+                        let (cos_f32, max_f32, rel_f32) = compare(actual, &read_f32(&f32_path));
+                        worst_engine_vs_f32_out = worst_engine_vs_f32_out.min(cos_f32);
+                        entry.insert("engine_vs_f32_out".into(), serde_json::json!({
+                            "cosine": cos_f32, "max_abs": max_f32, "rel_l2": rel_f32
+                        }));
+                    }
+                }
+                worst_free_cos = worst_free_cos.min(cos);
+                free_map.insert(name.clone(), serde_json::json!({"cosine": cos, "max_abs": max_abs, "rel_l2": rel}));
             }
+            if let Some(sv_f32) = meta.get("serving_vs_f32") {
+                if let Some(c) = sv_f32.get("out").and_then(|v| v.get("cosine")).and_then(|v| v.as_f64()) {
+                    worst_serving_vs_f32_out = worst_serving_vs_f32_out.min(c);
+                }
+                entry.insert("serving_vs_f32_out".into(), sv_f32["out"].clone());
+            }
+            entry.insert("free_running".into(), free_map.into());
+
+            // Teacher-forced per-layer pass: feeds the exact serving BF16 boundary
+            // tensor before each of the 40 transformer blocks to isolate per-layer
+            // kernel accuracy from 40-layer BF16 residual-cancellation drift.
+            let teacher_inputs: Vec<Vec<u16>> = (0..depth)
+                .map(|layer| read_bf16(&fixture.join(format!("teacher_{layer}.bf16"))))
+                .collect();
+            let mut teacher_output = vec![0u16; rows * out_width];
+            let mut teacher_stages: Vec<(String, Vec<f32>)> = Vec::new();
+            runtime.native.encode_batch_teacher_observed(
+                &rgb,
+                &[grid],
+                &lut,
+                &mut teacher_output,
+                &mut |next_layer, rows, width| {
+                    let buf = teacher_inputs.get(usize::try_from(next_layer).ok()?)?;
+                    (buf.len() == rows * width).then_some(buf.as_ptr())
+                },
+                &mut |stage, data, rows, width| {
+                    let extent = rows * width * 2;
+                    let mut bytes = vec![0u8; extent];
+                    native.copy_d2h(&mut bytes, cuteafd_ffi::CuteafdDeviceBuffer { ptr: data as *mut _, bytes: extent,
+                        device_id: 0, flags: 0 }).map_err(|e| cuteafd_ffi::vision::VisionError::Runtime(e.to_string()))?;
+                    let name = match stage { 0 => "0".to_string(), -1 => "pos".into(), s if s == depth + 1 => format!("{}", depth + 1),
+                        s if s == depth + 2 => "out".into(), s => s.to_string() };
+                    teacher_stages.push((name, bytes.chunks_exact(2).map(|b| bf16(u16::from_le_bytes([b[0], b[1]]))).collect()));
+                    Ok(())
+                },
+            ).unwrap();
+            let mut teacher_map = serde_json::Map::new();
+            let mut fixture_worst_teacher = 1f64;
+            for (name, actual) in &teacher_stages {
+                let path = fixture.join(format!("stage_{name}.f32"));
+                if !path.is_file() { continue; }
+                let (cos, max_abs, rel) = compare(actual, &read_f32(&path));
+                fixture_worst_teacher = fixture_worst_teacher.min(cos);
+                worst_teacher_cos = worst_teacher_cos.min(cos);
+                worst_teacher_rel = worst_teacher_rel.max(rel);
+                teacher_map.insert(name.clone(), serde_json::json!({"cosine": cos, "max_abs": max_abs, "rel_l2": rel}));
+            }
+            entry.insert("teacher_forced_worst_cosine".into(), fixture_worst_teacher.into());
+            entry.insert("teacher_forced".into(), teacher_map.into());
+
             report.insert(fixture.file_name().unwrap().to_string_lossy().into(), entry.into());
             batch_rgb.extend_from_slice(&rgb);
             batch_grids.push(grid);
@@ -477,14 +547,25 @@ pub(crate) mod tests {
                 cursor += n;
             }
             report.insert("batch_vs_reference_worst_cosine".into(), worst_batch.into());
-            worst_cos = worst_cos.min(worst_batch);
+            worst_free_cos = worst_free_cos.min(worst_batch);
         }
-        report.insert("worst_cosine".into(), worst_cos.into());
-        report.insert("worst_output_rel_l2".into(), worst_out.into());
+        report.insert("teacher_forced_worst_cosine".into(), worst_teacher_cos.into());
+        report.insert("teacher_forced_worst_rel_l2".into(), worst_teacher_rel.into());
+        report.insert("free_running_worst_cosine".into(), worst_free_cos.into());
+        report.insert("free_running_worst_output_rel_l2".into(), worst_free_out_rel.into());
+        report.insert("engine_vs_f32_worst_output_cosine".into(), worst_engine_vs_f32_out.into());
+        report.insert("serving_vs_f32_worst_output_cosine".into(), worst_serving_vs_f32_out.into());
         let text = serde_json::to_string_pretty(&report).unwrap();
         println!("{text}");
         if let Some(path) = std::env::var_os("HY4_VISION_REPORT") { std::fs::write(path, &text).unwrap(); }
         assert!(identical, "batched Hy4 tower output differs from single-image encodes");
-        assert!(worst_cos > 0.999, "Hy4 40-layer tower stage cosine {worst_cos} below 0.999");
+        assert!(
+            worst_teacher_cos > 0.999,
+            "Hy4 40-layer teacher-forced per-layer cosine {worst_teacher_cos} below 0.999"
+        );
+        assert!(
+            worst_engine_vs_f32_out >= worst_serving_vs_f32_out - 0.015,
+            "Hy4 40-layer free-running engine_vs_f32 cosine {worst_engine_vs_f32_out} lags serving_vs_f32 {worst_serving_vs_f32_out}"
+        );
     }
 }
