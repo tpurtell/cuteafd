@@ -210,26 +210,15 @@ impl<'a> MiniHead<'a> {
         candidates: usize,
     ) -> Result<Buffer> {
         ensure!((1..=self.rows).contains(&rows), "Inkling 2 Mini normalized tap exceeds head owner");
-        k.residual(
+        k.residual_norm(
             owner,
             owner.buffer("residual_arena")?,
             target.operand("model.llm.attn_res.output_query")?.buffer,
-            owner.buffer("partial")?,
-            owner.buffer("mixed")?,
-            rows,
-            1,
-            5,
-            candidates,
-            false,
-        )?;
-        k.norm(
-            owner,
-            owner.buffer("mixed")?,
             target.operand("model.llm.norm.weight")?.buffer,
             self.normalized.buffer,
-            false,
-            Precision::Bf16,
             rows,
+            1,
+            candidates,
         )?;
         self.normalized(rows)
     }

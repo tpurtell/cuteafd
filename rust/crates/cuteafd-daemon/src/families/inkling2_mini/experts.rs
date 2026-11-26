@@ -10,6 +10,9 @@ const WIRE_ROW_BYTES: usize = 2376; // 2304 + 2304/32
 
 pub(crate) trait Dispatcher {
     fn wire_input(&self) -> bool;
+    /// Executes routed experts and returns the BF16 device buffer holding `[rows, 2304]` output.
+    /// When the backend already produces BF16 directly in its persistent workspace, it returns
+    /// that view without an intermediate `copy_rows` launch.
     fn enqueue(
         &self,
         input: Buffer,
@@ -18,7 +21,7 @@ pub(crate) trait Dispatcher {
         output: Buffer,
         rows: usize,
         stream: &Stream<'_>,
-    ) -> Result<()>;
+    ) -> Result<Buffer>;
     fn inventory(&self, inventory: &mut Inventory<'_>, prefix: &str) -> Result<()>;
 }
 
@@ -26,7 +29,6 @@ pub(crate) struct Resident<'a> {
     layer: usize,
     backend: Rc<std::cell::RefCell<Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>>>,
     stream: Rc<Stream<'a>>,
-    copy: Rc<cuteafd_ffi::DeviceRowCopy<'a>>,
 }
 
 impl<'a> Resident<'a> {
@@ -46,12 +48,10 @@ impl<'a> Resident<'a> {
             !backend.output().is_null() && backend.workspace_bytes() >= HIDDEN * element,
             "Inkling 2 Mini resident workspace cannot hold one output row"
         );
-        let copy = Rc::new(stream.device.run(|| stream.device.library.device_row_copy())?);
         Ok(Self {
             layer,
             backend: Rc::new(std::cell::RefCell::new(backend)),
             stream,
-            copy,
         })
     }
 
@@ -72,7 +72,6 @@ impl<'a> Resident<'a> {
                 layer,
                 backend: owner.backend.clone(),
                 stream: owner.stream.clone(),
-                copy: owner.copy.clone(),
             })
             .collect())
     }
@@ -91,7 +90,7 @@ impl Dispatcher for Resident<'_> {
         output: Buffer,
         rows: usize,
         stream: &Stream<'_>,
-    ) -> Result<()> {
+    ) -> Result<Buffer> {
         use crate::shared::experts::rtx::{ExpertInput, PartialDtype, PartialLayout, Routes};
         ensure!(
             self.stream.raw == stream.raw && std::ptr::eq(self.stream.device.library, stream.device.library),
@@ -156,18 +155,19 @@ impl Dispatcher for Resident<'_> {
                 ..output
             };
             ensure!(source.ptr != output.ptr, "Inkling 2 Mini resident output aliases backend storage");
-            // SAFETY: distinct buffers on the same ordered stream. Use the shared SM row-copy
-            // kernel (`DeviceRowCopy`) instead of `copy_d2d_async` so the monolithic 48-visit
-            // decode graph stays 100% kernel-only (no captured `cudaMemcpyAsync` nodes).
+            // SAFETY: distinct buffers on the same ordered stream. When backend already outputs
+            // BF16 (`element == 2`), return its persistent workspace view directly to avoid a
+            // redundant `copy_rows` kernel before `join_visit` consumes it immediately.
             unsafe {
                 if element == 4 {
                     stream
                         .device
                         .library
-                        .cuda_f32_to_bf16_async(source, output, rows * HIDDEN, stream.raw)
+                        .cuda_f32_to_bf16_async(source, output, rows * HIDDEN, stream.raw)?;
+                    Ok(output)
                 } else {
-                    self.copy
-                        .launch_rows(output, source, source.bytes, 1, source.bytes, source.bytes, stream.raw)
+                    ensure!(source.ptr as usize % 16 == 0, "Inkling 2 Mini resident output unaligned");
+                    Ok(source)
                 }
             }
         })
