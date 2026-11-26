@@ -144,3 +144,22 @@ def test_hca_observer_exposes_distinct_real_inputs_for_all_eight_groups(tiny):
     expected = reference.linear(isolated * gate, weights["self_attn.o_proj.weight"])
     actual = reference.hca_attention(x, weights | {name: delta}, c, positions)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def test_staged_layer_major_and_draft_proposal_preflight(tiny):
+    from ernie55_flash.forward_preflight import Prompt, run_forward
+
+    prompts = [Prompt(torch.arange(n) % 64, {}) for n in (10, 7)]
+    witness = torch.arange(259) % 64
+    metrics, records = run_forward(tiny, prompts, [witness], pilot_layers=(0, 1, 2))
+    assert all(r["error"] <= r["bound"] for r in metrics.values())
+    assert {"draft_tokens", "dspark", "dense", "latent_moe", "long_hca", "long_mla_dsa", "target_token"} <= metrics.keys()
+    assert records[0][0]["compressed_chunks"] == 2
+    assert records[0][1]["pruned_query_rows"] > 0
+    assert records[0][1]["stop"] == len(witness)
+    for sample in prompts:
+        assert sample.saved["layer_1"].shape == (len(sample.ids), 4, 16)
+        assert sample.saved["tap_2"].shape == (len(sample.ids), 16)
+        assert sample.saved["draft2_positions"].tolist() == list(range(len(sample.ids), len(sample.ids) + 3))
+        assert sample.saved["draft0_context_kv"].shape == (4, 16)
+        assert sample.saved["reference_proposal"].shape == (3,)

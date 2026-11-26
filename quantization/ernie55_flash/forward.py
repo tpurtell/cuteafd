@@ -171,3 +171,46 @@ class ErnieForward:
         return reference.dspark_propose(taps, anchor_token, auxiliary, stages, outer, self.config,
                                         draft_rope_mode="plain", multimax_after_markov=True,
                                         eps_outside_sqrt=False)
+
+    def staged_proposal(self, taps, anchor, auxiliary, stages, outer, run_stage):
+        """Run the proposal using the supplied calibration/decoded stage implementation.
+
+        run_stage receives the absolute block positions, context feature and rotated
+        context KV along with the incoming mHC streams. The block head follows the
+        preceding chosen token's Markov bias with the checkpoint's multimax.
+        """
+        c = self.config
+        main = self.draft_features(taps, auxiliary)
+        start = max(0, len(main) - c.sliding_window)
+        context = main[start:]
+        context_positions = torch.arange(start, len(main), device=main.device)
+        cos, sin = reference.hca_phase(context_positions, c, rope_mode="plain")
+        positions = torch.arange(len(main), len(main) + c.dspark_block_size, device=main.device)
+        block_ids = torch.full_like(positions, c.dspark_noise_token_id)
+        block_ids[0] = anchor
+        embedded = F.embedding(block_ids, outer[reference.OUTER_NAMES[0]])
+        hidden = embedded[:, None].expand(-1, c.hc_mult, -1).contiguous()
+        for index, weights in enumerate(stages):
+            kv = reference.norm(reference.linear(context, weights["self_attn.linear_kv_proj.weight"]),
+                                weights["self_attn.kv_layernorm.weight"], c.rms_norm_eps)
+            kv = reference.rotate_tail(kv[:, None], cos, sin).squeeze(1)
+            hidden = run_stage(index, hidden, weights, positions, context, kv)
+
+        head = reference.hc_head_pre_norm(hidden, auxiliary["mhc_contract.hc_head_fn"],
+                                         auxiliary["mhc_contract.hc_head_base"],
+                                         auxiliary["mhc_contract.hc_head_scale"], c, eps_outside_sqrt=False)
+        normed = reference.norm(head, auxiliary["norm.weight"], c.rms_norm_eps)
+        base = reference.linear(normed, outer[reference.OUTER_NAMES[5]])
+        previous = torch.as_tensor(anchor, device=main.device, dtype=torch.long)
+        tokens, logits, confidence = [], [], []
+        for step in range(c.dspark_block_size):
+            feature = F.embedding(previous, auxiliary["markov_head.markov_w1.weight"].t())
+            bias = reference.linear(feature[None], auxiliary["markov_head.markov_w2.weight"])[0]
+            scores = reference.multimax(base[step] + bias, outer[reference.OUTER_NAMES[6]],
+                                        outer[reference.OUTER_NAMES[7]])
+            previous = scores.argmax()
+            conf_input = torch.cat((head[step], feature))[None]
+            confidence.append(reference.linear(conf_input, auxiliary["confidence_head.projection.weight"]).sigmoid().squeeze())
+            tokens.append(previous)
+            logits.append(scores)
+        return torch.stack(tokens), torch.stack(logits), torch.stack(confidence)
