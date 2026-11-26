@@ -512,9 +512,11 @@ mod gpu_tests {
     };
 
     /// Real Inkling 2 Mini bundled drafter GPU oracle (run via `golden-run.py --native-test`):
-    /// Proves batched context update (both contiguous C64 decode and gapped speculative verify)
-    /// produces bitwise-identical `cache.last_features`, logits, confidences, and drafted tokens
-    /// compared to per-request `append_context`.
+    /// 1. Proves batched context update (both contiguous C64 decode and gapped speculative verify)
+    ///    produces bitwise-identical KV caches, `cache.last_features`, hidden states, logits,
+    ///    logprobs and drafted tokens compared to per-request `append_context`.
+    /// 2. Proves row-invariance across batch compositions (batch sizes 1, 2, 8, 11, 16, 32,
+    ///    diverse context lengths 17..1500, and reversed/shuffled batch orderings).
     #[test]
     #[ignore = "requires real Inkling 2 Mini snapshot, native programs and GPU; golden-run only"]
     fn installed_inkling_mini_drafter_batch_and_context_invariance() -> Result<()> {
@@ -751,7 +753,72 @@ mod gpu_tests {
                 );
             }
 
-            eprintln!("MINI_DRAFTER_BATCH_CONTEXT kv={kv:?} passed: serial==batched (contiguous C64 + gapped) bitwise exact");
+            // Part 2: Row-invariance across batch compositions (1, 2, 8, 11, 16, 32, 48, 64 and reversed orders).
+            let probes = [0usize, 1, 4, 6, 7, 8, 15, 31, 47, 63];
+            let block_bytes = config.transformer.block * hidden * 2;
+            let row_logit_bytes = config.valid_vocab * 4;
+            let mut solo_ref = std::collections::BTreeMap::new();
+            for &slot in &probes {
+                let seq = [draft_seq(slot, &batched)?];
+                let d = batched.draft(&seq, embed, embed_norm, |n, a| batched.lead.recurrent_tokens(n, a, unembed))?;
+                let mut h = vec![0u8; block_bytes];
+                let mut l = vec![0u8; row_logit_bytes];
+                library.copy_d2h(&mut h, Buffer { bytes: block_bytes, ..batched.lead.buffer("step.normalized")? })?;
+                library.copy_d2h(&mut l, Buffer { bytes: row_logit_bytes, ..batched.lead.buffer("head.logits")? })?;
+                let conf: Vec<u32> = d[0].confidence.iter().map(|v| v.to_bits()).collect();
+                solo_ref.insert(slot, (d[0].tokens.clone(), conf, h, l));
+            }
+            let compositions: Vec<Vec<usize>> = vec![
+                vec![0, 8],
+                vec![8, 0],
+                vec![6, 63],
+                vec![63, 6],
+                vec![0, 1, 4, 6, 7, 8, 15, 31],
+                vec![31, 15, 8, 7, 6, 4, 1, 0, 2, 10, 22], // 11 sparse drafting requests
+                (0..16).collect(),
+                (0..32).collect(),
+                (0..48).collect(),
+                (0..48).rev().collect(),
+                (0..64).collect(),
+                (0..64).rev().collect(),
+            ];
+            for comp in &compositions {
+                let seqs: Vec<_> = comp.iter().map(|&s| draft_seq(s, &batched)).collect::<Result<_>>()?;
+                let got = batched.draft(&seqs, embed, embed_norm, |n, a| batched.lead.recurrent_tokens(n, a, unembed))?;
+                let all_h_bytes = comp.len() * block_bytes;
+                let all_l_bytes = comp.len() * row_logit_bytes;
+                let mut all_h = vec![0u8; all_h_bytes];
+                let mut all_l = vec![0u8; all_l_bytes];
+                library.copy_d2h(&mut all_h, Buffer { bytes: all_h_bytes, ..batched.lead.buffer("step.normalized")? })?;
+                library.copy_d2h(&mut all_l, Buffer { bytes: all_l_bytes, ..batched.lead.buffer("head.logits")? })?;
+                for (pos, &slot) in comp.iter().enumerate() {
+                    let Some((exp_toks, exp_conf, exp_h, exp_l)) = solo_ref.get(&slot) else {
+                        continue;
+                    };
+                    let got_conf: Vec<u32> = got[pos].confidence.iter().map(|v| v.to_bits()).collect();
+                    ensure!(
+                        &got[pos].tokens == exp_toks,
+                        "kv={kv:?}: row-invariance tokens mismatch slot={slot} batch_len={} pos={pos}",
+                        comp.len()
+                    );
+                    ensure!(
+                        &got_conf == exp_conf,
+                        "kv={kv:?}: row-invariance confidence mismatch slot={slot} batch_len={} pos={pos}",
+                        comp.len()
+                    );
+                    ensure!(
+                        &all_h[pos * block_bytes..(pos + 1) * block_bytes] == exp_h.as_slice(),
+                        "kv={kv:?}: row-invariance hidden mismatch slot={slot} batch_len={} pos={pos}",
+                        comp.len()
+                    );
+                    ensure!(
+                        &all_l[pos * row_logit_bytes..(pos + 1) * row_logit_bytes] == exp_l.as_slice(),
+                        "kv={kv:?}: row-invariance logits mismatch slot={slot} batch_len={} pos={pos}",
+                        comp.len()
+                    );
+                }
+            }
+            eprintln!("MINI_DRAFTER_BATCH_INVARIANCE kv={kv:?} passed: serial==batched (contiguous C64 + gapped) and batch compositions [1,2,8,11,16,32,48,64] bitwise exact");
         }
         Ok(())
     }

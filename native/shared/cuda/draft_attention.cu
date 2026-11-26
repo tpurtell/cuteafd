@@ -42,7 +42,7 @@ template <int dim, bool fp8, bool paged>
 __global__ void partial_kernel(const bf16* q, const bf16* k_block, const bf16* v_block,
     const bf16* k_ring, const bf16* v_ring, const int32_t* slots, const int32_t* lengths,
     const int32_t* ends, const int32_t* pages, int table_width, float* partial_o, float* partial_ml, int heads, int kv_heads,
-    int block_rows, int ring, int slices, int partitions, int tiles_per_partition,
+    int block_rows, int ring, int slices, int partitions, int max_partitions,
     int max_keys, int window, bool causal, float scale) {
   constexpr int stride = dim + 8;
   constexpr int score_stride = 40;
@@ -51,8 +51,15 @@ __global__ void partial_kernel(const bf16* q, const bf16* k_block, const bf16* v
   const int local = t / 4, sub = t % 4, query = slice * queries_per_slice + local;
   const int group = heads / kv_heads, queries = group * block_rows;
   const int ctx = lengths[sequence], end = ends[sequence], slot = slots[sequence];
-  const int first = partition * tiles_per_partition * tile_keys;
-  const int last = min(min(ctx + block_rows, max_keys), first + tiles_per_partition * tile_keys);
+  // Partition each sequence from its own key length and the device capacity,
+  // independent of batch size and other sequences' lengths, so every request's
+  // WMMA/softmax reduction order is bitwise invariant across batch compositions.
+  const int total = min(ctx + block_rows, max_keys);
+  const int seq_tiles = (total + tile_keys - 1) / tile_keys;
+  const int seq_wanted = min(seq_tiles, max_partitions);
+  const int seq_tpp = seq_wanted > 0 ? (seq_tiles + seq_wanted - 1) / seq_wanted : 1;
+  const int first = partition * seq_tpp * tile_keys;
+  const int last = min(total, first + seq_tpp * tile_keys);
   const uint64_t base = (((uint64_t(sequence) * kv_heads + kvh) * slices + slice)
       * partitions + partition) * queries_per_slice;
   if (first >= last) {
@@ -321,19 +328,21 @@ int dispatch_wmma(const void* q, const void* k_block, const void* v_block, const
     const void* v_ring, const void* slots, const void* lengths, const void* ends, const void* sinks,
     void* out, void* scratch, int sequences, int block_rows, int heads, int kv_heads, int ring,
     int max_keys, int window, bool causal, int slices, int sms, float scale, cudaStream_t stream, const int32_t* pages, int table_width) {
-  const int tiles = (max_keys + tile_keys - 1) / tile_keys;
-  const int capacity = partition_capacity(kv_heads, slices, max_keys, sms);
-  const int wanted = std::min(capacity, std::max(1, (2 * sms + sequences * kv_heads * slices - 1)
-      / (sequences * kv_heads * slices)));
-  const int tiles_per_partition = (tiles + wanted - 1) / wanted;
-  const int partitions = (tiles + tiles_per_partition - 1) / tiles_per_partition;
+  const int max_partitions = (2 * sms + kv_heads * slices - 1) / (kv_heads * slices);
+  int partitions = partition_capacity(kv_heads, slices, max_keys, sms);
+  if (sequences == 1) {
+    const int tiles = (max_keys + tile_keys - 1) / tile_keys;
+    const int wanted = std::min(tiles, max_partitions);
+    const int tpp = wanted > 0 ? (tiles + wanted - 1) / wanted : 1;
+    partitions = (tiles + tpp - 1) / tpp;
+  }
   auto* partial_o = static_cast<float*>(scratch);
   auto* partial_ml = partial_o + uint64_t(sequences) * kv_heads * slices * partitions * queries_per_slice * dim;
   partial_kernel<dim, fp8, paged><<<dim3(partitions, kv_heads * slices, sequences), threads, 0, stream>>>(
       static_cast<const bf16*>(q), static_cast<const bf16*>(k_block), static_cast<const bf16*>(v_block),
       static_cast<const bf16*>(k_ring), static_cast<const bf16*>(v_ring), static_cast<const int32_t*>(slots),
       static_cast<const int32_t*>(lengths), static_cast<const int32_t*>(ends), pages, table_width, partial_o, partial_ml, heads,
-      kv_heads, block_rows, ring, slices, partitions, tiles_per_partition, max_keys, window, causal, scale);
+      kv_heads, block_rows, ring, slices, partitions, max_partitions, max_keys, window, causal, scale);
   auto status = cudaGetLastError();
   if (status != cudaSuccess) return status;
   const int queries = heads / kv_heads * block_rows;
