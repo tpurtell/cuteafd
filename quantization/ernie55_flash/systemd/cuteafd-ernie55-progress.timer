@@ -1,5 +1,5 @@
 [Unit]
-Description=Report ERNIE preflight and pilot progress every 30 minutes
+Description=Report ERNIE production progress every 30 minutes
 
 [Timer]
 OnCalendar=*-*-* *:00,30:00 Asia/Taipei

@@ -32,3 +32,37 @@ def test_incomplete_pilot_is_terminal_with_no_completion_forecast(tmp_path):
     snapshot = state(tmp_path, datetime.now(TAIPEI), set())
     assert snapshot["terminal"] and snapshot["blocker"] == "deadline"
     assert snapshot["pilot_completion_taipei"] is None
+
+
+def test_production_excludes_interrupted_and_dense_and_tracks_handoff(tmp_path):
+    from ernie55_flash.progress import production_state
+    prod = tmp_path / "production"
+    layers = prod / "layers"
+    layers.mkdir(parents=True)
+    for i, seconds, interrupted in ((0, 10, False), (1, 100, False), (2, 500, True), (3, 90, False)):
+        (layers / f"layers-{i:03d}.json").write_text(json.dumps(dict(
+            family="layers", index=i, seconds=seconds, interrupted=interrupted)))
+    (prod / "status.json").write_text(json.dumps(dict(phase="expert_group_complete", layer=4,
+        family="layers", expert_projections=96, group_seconds=10)))
+    snap = lambda: production_state(tmp_path, datetime.now(TAIPEI), {"production"})
+    state = snap()
+    assert state["target_eta"]["remaining_seconds"] == 39 * 95
+    assert state["target_eta"]["range_seconds"] == [39 * 90, 39 * 100]
+    assert state["completed_target_layers"] == 4 and state["expert_projections"] == 96
+    for name in ("numerical-complete", "publication-complete"):
+        (prod / (name+".json")).write_text('{"status":"passed"}')
+        assert not snap()["terminal"]
+    (prod / "handoff-complete.json").write_text('{"status":"passed"}')
+    assert snap()["terminal"]
+
+
+def test_production_does_not_report_finished_pilot_as_finished_quant(tmp_path):
+    from ernie55_flash.progress import production_state
+    (tmp_path / "pilot").mkdir()
+    (tmp_path / "pilot/pilot.json").write_text('{"status":"passed"}')
+    packed = tmp_path / "bootstrap-packed"
+    packed.mkdir()
+    (packed / "complete.json").write_text('{"status":"passed","projections":4}')
+    state = production_state(tmp_path, datetime.now(TAIPEI), set())
+    assert not state["terminal"] and state["target_eta"] is None
+    assert state["layer0_bootstrap_projections"] == 4
