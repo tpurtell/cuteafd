@@ -246,7 +246,8 @@ pub(super) fn prepare_prefix_cache<'a>(lib: &'a NativeLibrary, args: &crate::cli
 /// the previous key shape when one is bound.
 fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache<'_>,
     kv_waiter: &cuteafd_engine::prefix::DeferredAdmission<admission::Prepared>,
-    media: &admission::Media<C>, prefilling: usize, reserve: &KvReserve, stalled: usize) -> serde_json::Value {
+    media: &admission::Media<C>, prefilling: usize, reserve: &KvReserve, stalled: usize, decoding: usize)
+    -> serde_json::Value {
     // Deliberately exports the cache's whole effective `Config` under
     // `host_cache_config` (packet HC-9), not just `store_pace_ns`: fleet
     // operators tune several of these knobs, and one key keeps the export
@@ -270,6 +271,10 @@ fn serving_stats<C: cuteafd_engine::media::EncoderClient>(prefixes: &PrefixCache
         // Full expert-link resets (all three lanes) since startup; a client that
         // leaves never adds one (#2475).
         "link_resets": round_failure::resets(),
+        // Live requests decoding at this publish (`graph_capture_stats` reads this
+        // into `phases.active_decode`, alongside the shared `phases`, `exchange` and
+        // `graph_instantiate_ns` groups).
+        "active": decoding,
     });
     stats
 }
@@ -445,6 +450,38 @@ fn packing_group_fits(chunks: &[(usize, usize)], limits: &crate::shared::prefill
 
 fn pending_prefix_hit(prompt: &[u32], earlier: &[u32]) -> bool {
     !earlier.is_empty() && prompt.starts_with(earlier)
+}
+
+/// The one admission predicate: `prepared` is deferred while an earlier text
+/// member (this wave or still prefilling) shares a pending prefix hit, because
+/// that member will publish its prompt snapshot once prefilled. `earlier` yields
+/// `(is_text, member)`; the flag is the queued entry's `images` flag, not
+/// `member.images`, which queued entries store empty. The admission loop and
+/// `host_pending` both call this, so they cannot disagree.
+fn prefix_deferred<'a>(prepared: &admission::Prepared,
+    mut earlier: impl Iterator<Item = (bool, &'a admission::Prepared)>) -> bool {
+    prepared.images.is_empty() && !crate::shared::probe::cold(&prepared.job.probe)
+        && earlier.any(|(text, earlier)| text && !crate::shared::probe::cold(&earlier.job.probe)
+            && pending_prefix_hit(&prepared.prompt, &earlier.prompt))
+}
+
+/// Every `prefix_waiters` entry is blocked on an in-flight donor. Waking the
+/// lanes for them spins `independent::run` at round 0 with no work done: lane 0
+/// stops with `StopReason::Admission` before executing a decode step, `serve`
+/// re-runs admission, pops the waiter, sees the donor still in `prefills`,
+/// pushes it back and re-enters the round — tens of thousands of times until
+/// the donor's decode debt drains.
+fn prefix_waiters_blocked(waiters: &std::collections::VecDeque<admission::Prepared>,
+    donors: &[(bool, &admission::Prepared)]) -> bool {
+    !waiters.is_empty() && waiters.iter().all(|waiter| prefix_deferred(waiter, donors.iter().copied()))
+}
+
+/// The `Wake`'s host-side pending flag: an image backlog with a free encoder
+/// slot, or a `prefix_waiter` that is admissible now. A waiter blocked on a
+/// donor still in `prefills` is NOT pending: it must not stop lane 0 at round 0.
+fn host_pending(media_full: bool, media_backlog: bool,
+    waiters: &std::collections::VecDeque<admission::Prepared>, donors: &[(bool, &admission::Prepared)]) -> bool {
+    (!media_full && media_backlog) || (!waiters.is_empty() && !prefix_waiters_blocked(waiters, donors))
 }
 
 /// Only cold, whole-unit text prompts pack in this phase. Prefix continuations,
@@ -862,7 +899,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         ensure!(native_coordinator_exact_cap(&manifest)? == NATIVE_COORDINATOR_EXACT_CAP,
             "native coordinator exact cap differs from validated inventory");
     }
-    let lanes = args.decode_lanes;
+    let lanes = args.resolved_decode_lanes();
     ensure!(second.is_some() == (lanes > 1) && second_transport.is_some() == (lanes > 1),
         "V4.1 serve owners differ from the {lanes} resolved decode lane(s)");
     let _capture_session = crate::shared::decode_graph::CaptureWatch::session();
@@ -913,8 +950,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         if stats_published.elapsed() >= std::time::Duration::from_secs(1) {
             stats_published = Instant::now();
             if let Ok(mut slot) = stats.lock() {
+                // Requests finished in the last round are retired just below: not decoding.
                 *slot = serving_stats(&prefixes, &kv_waiter, &media, prefills.len(), &reserve,
-                    active.iter().flatten().filter(|r| r.stalled).count());
+                    active.iter().flatten().filter(|r| r.stalled).count(),
+                    active.iter().flatten().filter(|r| !(r.finished || r.job.events.is_closed())).count());
             }
         }
         if let Some(live) = console::live().filter(|live| live.gauges_due()) {
@@ -988,11 +1027,15 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
                     // non-zero `prefill_queue.prefilling` while the queue is empty.
                     // `prefills.len()` is 0 here (it counts in `busy_slots`).
                     if let Ok(mut slot) = stats.lock() {
+                        // `active` is empty here (it counts in `busy_slots`), so the
+                        // published `phases.active_decode` is 0 across the wait.
                         *slot = serving_stats(&prefixes, &kv_waiter, &media, prefills.len(), &reserve,
-                            active.iter().flatten().filter(|r| r.stalled).count());
+                            active.iter().flatten().filter(|r| r.stalled).count(), active.iter().flatten().count());
                         stats_published = Instant::now();
                     }
-                    match receive.blocking_recv() {
+                    // Idle is exactly this wait: nothing admitted, nothing queued.
+                    let received = crate::shared::phase_stats::GLOBAL.time_idle_wait(|| receive.blocking_recv());
+                    match received {
                         Some(job) => {
                             stall::mark(stall::Phase::Admission, 1);
                             crate::shared::decode_graph::census::idle();
@@ -1018,13 +1061,10 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             // An earlier member (this wave or still prefilling) will publish its
             // prompt snapshot once prefilled. Defer before leasing, while unrelated
             // queued prompts still pack.
-            if prefixes.engine().enabled() && prepared.images.is_empty()
-                && !crate::shared::probe::cold(&prepared.job.probe)
-                && admitted.iter().map(|(earlier, ..)| (earlier.images.is_empty(), earlier))
+            if prefixes.engine().enabled()
+                && prefix_deferred(&prepared, admitted.iter().map(|(earlier, ..)| (earlier.images.is_empty(), earlier))
                     .chain(prefills.iter().filter_map(|queued| queued.request())
-                        .map(|waiting| (!waiting.images, &waiting.prepared)))
-                    .any(|(text, earlier)| text && !crate::shared::probe::cold(&earlier.job.probe)
-                        && pending_prefix_hit(&prepared.prompt, &earlier.prompt)) {
+                        .map(|waiting| (!waiting.images, &waiting.prepared)))) {
                 next_wave.push_back(prepared);
                 continue;
             }
@@ -1195,6 +1235,7 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
             match ready {
                 Ok((constraint, decoder, reserve)) => { loads[lane] += 1; prefills.push(queue::Queued { slot,
                     cursor: super::prefill_target::V41Prefill::new(),
+                    queued_at: Instant::now(), started: false,
                     request: Some(Waiting { prepared: admission::Prepared { job, prompt, images: Vec::new() }, id, lease,
                         image_keys, cached, hit_scores, images: image_count > 0, ticket, constraint, decoder,
                         packed: None, reserve }) }) }
@@ -1277,15 +1318,25 @@ pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>(lib: &'a NativeLibrary, ar
         // boundary past it (share 0 never gets here with prompts waiting).
         let cycle = (!whole && !prefills.is_empty()).then(Instant::now);
         stall::mark(stall::Phase::Decode, active.iter().flatten().count() + prefills.len());
+        let decode_started = cycle.unwrap_or_else(Instant::now);
         let result = room.and_then(|_| P::decode_round(lib, runtime, first, second.as_deref_mut(),
             requests, first_transport, second_transport.as_deref_mut(), &mut active, &members,
             draft.as_deref_mut(), &mut prefixes, receive,
             admission::Wake { media_pending: media.len() > 0,
                 media_slots: media.len() + prefills.len(),
-                host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),
+                host_pending: {
+                    let donors: Vec<(bool, &admission::Prepared)> = prefills.iter().filter_map(|queued| queued.request())
+                        .map(|waiting| (!waiting.images, &waiting.prepared)).collect();
+                    host_pending(media.full(), !media.backlog.is_empty(), &prefix_waiters, &donors)
+                },
                 retry: kv_waiter.pending().map(|prepared| (&prepared.job, requests.release_epoch())),
                 prefill_due: cycle.map(|started| started + Duration::from_secs_f64(prefills.decode_seconds())) }));
-        if let Some(started) = cycle { prefills.stepped(started.elapsed().as_secs_f64()); }
+        // The call's wall time, whether prompts were waiting to prefill behind it, and
+        // its member rows.
+        let decode_elapsed = decode_started.elapsed();
+        crate::shared::phase_stats::GLOBAL.record_decode_call(decode_elapsed.as_nanos() as u64, cycle.is_some(),
+            members.iter().map(Vec::len).sum::<usize>() as u64);
+        if let Some(started) = cycle { prefills.stepped(decode_elapsed.as_secs_f64()); let _ = started; }
         if let Some(started) = census_started {
             tracing::info!(target: "cuteafd::graph_capture", arm=crate::shared::decode_graph::census::arm(),
                 host_ns=started.elapsed().as_nanos() as u64, success=result.is_ok(), "graph census decode step end");
@@ -2076,9 +2127,9 @@ fn admission_loads<T>(active: &mut [T], lanes: u8, queued: impl IntoIterator<Ite
 }
 
 /// Members one decode lane holds: the request slots split across `lanes`
-/// lanes, capped by the per-lane member limit (`V41_MAX_LANE_MEMBERS`).
+/// lanes, capped by the per-lane member limit (64 total).
 pub(super) fn lane_capacity(slots: usize, lanes: usize) -> usize {
-    slots.div_ceil(lanes.max(1)).min(cuteafd_core::V41_MAX_LANE_MEMBERS)
+    slots.div_ceil(lanes.max(1)).min(cuteafd_core::v41_lane_members(lanes.max(1)))
 }
 
 fn prepare_decode_lane<'a>(requests: &mut Requests<'a>, active: &[Option<Active<'a>>],
@@ -2148,7 +2199,7 @@ fn single_lane_round<'w, 'a>(lib: &'a NativeLibrary, runtime: &tokio::runtime::R
 ) -> Result<()> {
     let _capture_watch = crate::shared::decode_graph::CaptureWatch::round();
     let started = Instant::now();
-    ensure!(!members.is_empty() && members.len() <= cuteafd_core::V41_MAX_LANE_MEMBERS, "invalid single decode lane");
+    ensure!(!members.is_empty() && members.len() <= cuteafd_core::V41_MAX_REQUESTS, "invalid single decode lane");
     let speculative = draft.is_some();
     let capture = draft.as_deref().map(DraftRuntime::capture).unwrap_or_default();
     // Speculative rows vary every round: keep each decode shape's graphs,
@@ -2946,8 +2997,13 @@ mod sampling_tests {
         assert!(prologue.find("pack_waiting::<P>(").unwrap() < prologue.find("queue::recover_packed(").unwrap());
         let code = source.split("#[cfg(test)]\nmod sampling_tests").next().unwrap();
         assert_eq!(code.matches("pack_waiting::<P>(").count(), 1);
-        // A prompt deferred behind a pending snapshot wakes the lanes (#976 review A2).
-        assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
+        // A prompt deferred behind a pending snapshot wakes the lanes (#976 review A2),
+        // but only once it is admissible: a waiter blocked on a donor still in
+        // `prefills` must not stop lane 0 at round 0.
+        assert!(serve.contains("host_pending(media.full(), !media.backlog.is_empty(), &prefix_waiters, &donors)"));
+        assert!(!serve.contains("|| !prefix_waiters.is_empty(),"),
+            "a blocked prefix waiter must not set host_pending: lane 0 stops at round 0 with \
+             StopReason::Admission and spins");
         // Queued prompts decode on the lane they were announced on (review A4).
         assert!(serve.contains("prefills.iter().filter_map(|queued| queued.request()).map(|waiting| waiting.ticket.lane()),"));
         assert!(serve.contains("Ok((constraint, decoder, reserve)) => { loads[lane] += 1; prefills.push("));
@@ -3034,6 +3090,77 @@ mod sampling_tests {
         assert!(!pending_prefix_hit(&[1, 3], &[1, 2]));
         assert!(!pending_prefix_hit(&[1], &[1, 2]));
         assert!(!pending_prefix_hit(&[1], &[]));
+    }
+
+    fn prepared(prompt: &[u32]) -> admission::Prepared {
+        let (events, _output) = mpsc::unbounded_channel();
+        admission::Prepared {
+            job: NativeRequest { image_groups: Vec::new(), prefix_cache_source: Default::default(),
+                finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(),
+                constraint: None, images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 1,
+                sampling: Default::default(), stop_token_ids: Vec::new(), events, usage: None, probe: None },
+            prompt: prompt.to_vec(),
+            images: Vec::new(),
+        }
+    }
+
+    /// A `prefix_waiter` blocked on a donor still in `prefills` is not
+    /// admissible, so it must not set `host_pending`: `Wake::ready` would return
+    /// `true` at `round_id == 0` and lane 0 would stop with
+    /// `StopReason::Admission` without executing a decode step, spinning until
+    /// the donor's decode debt drains.
+    #[test]
+    fn prefix_waiters_blocked_on_in_flight_donor_do_not_trigger_round_zero_admission_spin() {
+        let waiters = std::collections::VecDeque::from([prepared(&[1, 2, 3, 4])]);
+        let donor = prepared(&[1, 2]);
+        let donors = [(true, &donor)];
+        assert!(prefix_waiters_blocked(&waiters, &donors), "the donor is still prefilling");
+        assert!(!host_pending(false, false, &waiters, &donors),
+            "a blocked waiter is not host_pending: no round-0 Admission spin");
+        let wake = admission::Wake { host_pending: false, ..Default::default() };
+        assert!(!wake.ready(1, 16, false, 0), "no work done: lane 0 must decode");
+    }
+
+    /// The companion: the moment the donor publishes its snapshot (it leaves
+    /// `prefills`), the waiter IS admissible and wakes the lanes at the next
+    /// boundary (#976 review A2 liveness).
+    #[test]
+    fn a_blocked_prefix_waiter_wakes_once_its_donor_publishes() {
+        let waiters = std::collections::VecDeque::from([prepared(&[1, 2, 3, 4])]);
+        let donor = prepared(&[1, 2]);
+        assert!(prefix_waiters_blocked(&waiters, &[(true, &donor)]));
+        // The donor left `prefills`: the waiter is admissible and wakes the lanes.
+        assert!(!prefix_waiters_blocked(&waiters, &[]));
+        assert!(host_pending(false, false, &waiters, &[]));
+        assert!(admission::Wake { host_pending: true, ..Default::default() }.ready(1, 16, false, 0));
+    }
+
+    /// An unrelated donor does not block a waiter, and the media backlog wakeup
+    /// is unchanged.
+    #[test]
+    fn an_unrelated_donor_does_not_block_a_waiter_and_media_backlog_still_wakes() {
+        let waiters = std::collections::VecDeque::from([prepared(&[9, 9, 9])]);
+        let donor = prepared(&[1, 2]);
+        assert!(!prefix_waiters_blocked(&waiters, &[(true, &donor)]), "no shared prefix: admissible");
+        assert!(host_pending(false, false, &waiters, &[(true, &donor)]));
+        let empty = std::collections::VecDeque::new();
+        assert!(host_pending(false, true, &empty, &[]), "an image backlog still wakes the lanes");
+        assert!(!host_pending(true, true, &empty, &[]), "a full encoder does not");
+        assert!(!host_pending(false, false, &empty, &[]));
+    }
+
+    /// Queued entries keep `prepared.images` empty and carry the image flag
+    /// beside it, so a queued image donor is not a text donor: admission lets
+    /// the waiter in, and so must `host_pending`.
+    #[test]
+    fn a_queued_image_donor_does_not_block_a_waiter() {
+        let waiters = std::collections::VecDeque::from([prepared(&[1, 2, 3, 4])]);
+        let donor = prepared(&[1, 2]);
+        assert!(prefix_waiters_blocked(&waiters, &[(true, &donor)]));
+        assert!(!prefix_waiters_blocked(&waiters, &[(false, &donor)]), "an image donor publishes no text snapshot");
+        assert!(host_pending(false, false, &waiters, &[(false, &donor)]));
+        assert!(prefix_deferred(&waiters[0], [(true, &donor)].into_iter()));
+        assert!(!prefix_deferred(&waiters[0], [(false, &donor)].into_iter()));
     }
 
     #[test]
@@ -3450,7 +3577,7 @@ mod sampling_tests {
         let mut encoder = cuteafd_engine::media::FakeEncoder::default();
         let media = admission::Media::new(&mut encoder, 4).unwrap();
         let reserve = KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 131_072).unwrap(), UNIT_TOKENS);
-        let snapshot = serving_stats(&disabled, &waiter, &media, 2, &reserve, 2);
+        let snapshot = serving_stats(&disabled, &waiter, &media, 2, &reserve, 2, 0);
         assert!(snapshot["admission"]["deferred"].is_u64(), "missing admission deferred in {snapshot}");
         for key in ["top_ups", "stalls", "early_terminations", "deadlock_breaks", "admission_waits"] {
             assert!(snapshot["kv_reserve"]["stats"][key].is_u64(), "missing kv_reserve {key} in {snapshot}");
@@ -3468,7 +3595,7 @@ mod sampling_tests {
         }
         // A configured bank keeps the **full** key set (the host keys stay null
         // here, because this fixture has no host cache attached either).
-        let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media, 0, &reserve, 0);
+        let configured = serving_stats(&PrefixCache::configured(8), &waiter, &media, 0, &reserve, 0, 0);
         assert!(configured["prefix"]["promotions"].is_u64(), "{configured}");
         assert!(configured["host_cache"].is_null(), "{configured}");
         assert!(configured["host_cache_config"].is_null(), "{configured}");
@@ -3882,5 +4009,32 @@ mod loop_abort_tests {
                 assert_eq!(*finish_reason, InferenceFinishReason::Stop),
             other => panic!("last chunk is not Finish: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    /// `active_decode` is read from each publish's live `active` count by
+    /// `graph_capture_stats`, so the idle publish (an empty running set) reports 0
+    /// whatever an earlier publish reported: nothing is stored that could stay set
+    /// across the idle wait.
+    #[test]
+    fn active_decode_is_the_running_set_at_each_publish() {
+        use super::*;
+        let waiter = cuteafd_engine::prefix::DeferredAdmission::default();
+        let mut encoder = cuteafd_engine::media::FakeEncoder::default();
+        let media = admission::Media::new(&mut encoder, 4).unwrap();
+        let reserve = KvReserve::new(cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 131_072).unwrap(), UNIT_TOKENS);
+        let prefixes = PrefixCache::disabled();
+        let mut busy = serving_stats(&prefixes, &waiter, &media, 0, &reserve, 0, 3);
+        crate::shared::probe::graph_capture_stats(&mut busy);
+        assert_eq!(busy["phases"]["active_decode"], 3);
+        let mut idle = serving_stats(&prefixes, &waiter, &media, 0, &reserve, 0, 0);
+        crate::shared::probe::graph_capture_stats(&mut idle);
+        assert_eq!(idle["phases"]["active_decode"], 0, "the idle publish must not keep the busy count");
+        assert!(idle["graph_instantiate_ns"].is_u64());
+        // The exchange group is published beside it, per rank.
+        assert_eq!(idle["exchange"]["expert_prefill_units"]["units_total"].as_array().unwrap().len(),
+            cuteafd_core::MAX_SPARK_WORLD);
     }
 }

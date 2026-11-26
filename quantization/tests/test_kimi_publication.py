@@ -1,4 +1,4 @@
-"""Exercise qualified publication adapters without network/GPU."""
+"""Exercise qualified Kimi publication entry points without network/GPU."""
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -6,48 +6,13 @@ from unittest.mock import patch
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from kimi_k3.uniform_k2.publish import install_upload_compat, main
-
-
-def test_modern_api_preserves_upload_selection_and_uses_streaming_folder_api():
-    class Api:
-        def upload_folder(self, **kwargs):
-            self.received = kwargs
-            return "committed"
-
-    with patch("huggingface_hub.HfApi", Api), patch("huggingface_hub.utils._runtime.is_xet_available", return_value=True):
-        install_upload_compat()
-    api = Api()
-    selection = dict(repo_id="owner/model", repo_type="model", folder_path="/export",
-                     ignore_patterns=["*-receipt.json", ".cache/**"])
-    assert api.upload_large_folder(**selection, num_workers=4, print_report=True,
-                                   print_report_every=1800) == "committed"
-    assert api.received == selection
-
-
-def test_existing_adapter_is_not_replaced():
-    class Api:
-        def upload_large_folder(self):
-            return "legacy"
-
-    original = Api.upload_large_folder
-    with patch("huggingface_hub.HfApi", Api), patch("huggingface_hub.utils._runtime.is_xet_available", return_value=True):
-        install_upload_compat()
-    assert Api.upload_large_folder is original
-
-
-def test_modern_api_refuses_nonresumable_fallback_without_xet():
-    class Api:
-        pass
-
-    with patch("huggingface_hub.HfApi", Api), patch("huggingface_hub.utils._runtime.is_xet_available", return_value=False):
-        with pytest.raises(ValueError, match="with Xet enabled"):
-            install_upload_compat()
-    assert not hasattr(Api, "upload_large_folder")
+from kimi_k3.uniform_k2.publish import main
 
 
 def test_uniform_producer_publication_qualifies_before_remote_mutation(tmp_path, monkeypatch):
-    from kimi_k3.uniform_k2 import publish as adapter, run
+    from kimi_k3.uniform_k2 import run
+    from huggingface_hub import constants
+    import hub_lfs
     import hub_requirements
 
     events = []
@@ -62,28 +27,52 @@ def test_uniform_producer_publication_qualifies_before_remote_mutation(tmp_path,
         def create_repo(self, *args, **kwargs):
             events.append("create")
 
-        def upload_folder(self, **kwargs):
-            assert kwargs["folder_path"] == str(tmp_path / "export")
-            events.append("upload")
-            raise UploadReached
+    def upload(api, repo_id, folder, **kwargs):
+        assert folder == tmp_path / "export" and kwargs["state"] == tmp_path / "state"
+        assert kwargs["options"] is None and kwargs["digests"] == {}
+        events.append("upload")
+        raise UploadReached
 
-    real_check = adapter.require_qualified_hub
+    real_check = hub_requirements.require_qualified_hub
 
     def check():
         events.append("qualify")
         real_check()
 
-    monkeypatch.setattr(adapter, "require_qualified_hub", check)
+    (tmp_path / "export").mkdir()
+    monkeypatch.setattr(hub_requirements, "require_qualified_hub", check)
+    monkeypatch.setattr(hub_lfs, "upload_folder", upload)
     monkeypatch.setattr("huggingface_hub.HfApi", Api)
     with pytest.raises(UploadReached):
         run.publish(tmp_path / "export", tmp_path / "state", "test/model")
     assert events == ["qualify", "api", "create", "upload"]
 
     events.clear()
+    monkeypatch.setattr(constants, "HF_HUB_DISABLE_XET", False)
+    with pytest.raises(ValueError, match="HF_HUB_DISABLE_XET=1"):
+        run.publish(tmp_path / "export", tmp_path / "state", "test/model")
+    assert events == ["qualify"]
+
+    events.clear()
+    monkeypatch.setattr(constants, "HF_HUB_DISABLE_XET", True)
     monkeypatch.setattr(hub_requirements.importlib.metadata, "version", lambda _: "2.2.0")
     with pytest.raises(ValueError, match="qualified huggingface_hub 1.33.0"):
         run.publish(tmp_path / "export", tmp_path / "state", "test/model")
     assert events == ["qualify"]
+
+
+def test_publication_cli_pins_http_lfs_before_producer(monkeypatch):
+    import os
+    from huggingface_hub import constants
+    import runpy
+    monkeypatch.setattr(constants, "HF_HUB_DISABLE_XET", False)
+    monkeypatch.delenv("HF_HUB_DISABLE_XET", raising=False)
+    seen = []
+    monkeypatch.setattr(runpy, "run_path", lambda *a, **k: seen.append(
+        (constants.HF_HUB_DISABLE_XET, os.environ["HF_HUB_DISABLE_XET"])))
+    with patch.object(sys, "argv", ["publish.py", "--publish-only"]):
+        main()
+    assert seen == [(True, "1")]
 
 
 def test_publication_entry_point_cannot_start_quantization():

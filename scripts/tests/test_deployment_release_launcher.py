@@ -25,6 +25,12 @@ BASELINE_CAPTURES = {
 def release_entry(entry: dict) -> dict:
     """Apply all smoke overrides while keeping process fixtures portable."""
     entry = {**entry, "set": {**MATRIX["defaults"]["set"], **entry.get("set", {})}}
+    cfg_path = ROOT / entry["config"]
+    for line in cfg_path.read_text().splitlines():
+        if line.startswith("SPARK_") and "_HOST=" in line:
+            key, val = line.split("=", 1)
+            if "replace-me" in val.lower() and key not in entry["set"]:
+                entry["set"][key] = f"worker-{key.split('_')[1]}"
     for key in entry["set"]:
         if key.startswith("SPARK_") and key.endswith("_HOST"):
             entry["set"][key] = f"worker-{key.split('_')[1]}"
@@ -168,7 +174,7 @@ def test_deployment_preserves_release_container_commands(
                 position = after["command"].index("--tp2-dflash")
                 assert after["command"].count("--tp2-dflash") == 1
                 tp2_dflash = ("true" if "--split-device" in before["command"]
-                              and "--draft" in before["command"] else "false")
+                              and ("--draft" in before["command"] or "--dspark" in before["command"]) else "false")
                 assert after["command"][position + 1] == tp2_dflash
                 del after["command"][position:position + 2]
             if entry["family"] == "glm5_flash":
@@ -243,6 +249,8 @@ def test_deployment_preserves_release_container_commands(
             # The reserve the units cut.
             reserve = command[command.index("--prefill-reserve-rows") + 1]
             before["command"][position:position] = ["--prefill-waves", waves, "--prefill-reserve-rows", reserve]
+            if before["command"][before["command"].index("--rtx-gpus") + 1] == "1" and "--dspark" in before["command"]:
+                before["command"][position:position] = ["--decode-rows", "128"]
             # Serve's unit is the planner's: a third of the reserve with Sparks.
             if waves == "3":
                 before["command"][before["command"].index("--prefill-batch-tokens") + 1] = "2752"

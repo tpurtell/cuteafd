@@ -1469,6 +1469,7 @@ pub(crate) struct GlmfEngine<'a> {
     /// budget when one is set.
     graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,
     use_graphs: bool,
+    graph_cycles: RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
     graphs_ready: std::cell::Cell<bool>,
     /// Opt-in matched-token/route evidence; never adds a device readback.
     split_audit: bool,
@@ -1502,7 +1503,7 @@ pub(crate) struct Fp8Prefill {
     pub kda_bits: i32,
 }
 
-use cuteafd_loader::serving_capacity::glmf_graphs::{GraphGeometry, decode_strides};
+use crate::shared::decode_graph::{GraphGeometry, decode_strides};
 
 fn check_decode_slots(sequences: impl IntoIterator<Item = i32>) -> Result<()> {
     let mut slots = std::collections::HashSet::new();
@@ -1546,12 +1547,12 @@ impl GraphKey {
     fn normalized(mut self, attention: Option<GlmNextAttention>) -> Self {
         self.head = attention.is_none();
         if self.head { self.spec = false; }
-        if attention != Some(GlmNextAttention::Mla) {
-            self.long = false;
-            self.pool_width = 0;
-            self.page_stride = 0;
-            self.pool_stride = 0;
-        }
+        let geometry = GraphGeometry::keyed(self.pool_width, self.page_stride, self.pool_stride, self.long)
+            .for_table(attention == Some(GlmNextAttention::Mla));
+        self.long = geometry.long;
+        self.pool_width = geometry.pool_width;
+        self.page_stride = geometry.page_stride;
+        self.pool_stride = geometry.pool_stride;
         self
     }
 }
@@ -1715,6 +1716,7 @@ impl<'a> GlmfEngine<'a> {
             prefill_slots: RefCell::new(Vec::new()),
             experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::with_family("glm5_flash")),
             use_graphs: Self::graphs_enabled(),
+            graph_cycles: RefCell::new(None),
             graphs_ready: std::cell::Cell::new(false),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
             selection_dump: None,
@@ -1760,30 +1762,32 @@ impl<'a> GlmfEngine<'a> {
             crate::shared::decode_graph::device::set_reserve_policy(device, policy)?;
             drop(self.decode_workspace_of(rank)?);
         }
+        let streams = (0..self.ranks()).map(|rank| Ok((if rank == 0 { self.device } else { self.peer()?.device }, self.stream_of(rank))))
+            .collect::<Result<Vec<_>>>()?;
+        *self.graph_cycles.borrow_mut() = Some(crate::shared::decode_graph::device::EventCycles::new(self.library, &streams)?);
         self.graphs_ready.set(true);
         Ok(())
     }
 
-    /// Every rank's launches for the completed step are queued: observe the
-    /// device once per physical GPU, tick each site's cycle and retire the
-    /// victims without draining a lane. GLM Flash every graph owner pins `()`
-    /// and captures only persistent engine buffers, so destroying a victim
-    /// executable never releases storage an in-flight launch reads.
+    fn begin_graph_cycle(&self) -> Result<()> {
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        // SAFETY: all graphs pin only persistent engine buffers.
+        unsafe { cycles.begin_persistent(|visit| {
+            for rank in 0..self.ranks() {
+                let device = if rank == 1 { self.peer()?.device } else { self.device };
+                visit(device, "glm5_flash.decode_local", false, &mut *self.graphs_of(rank).borrow_mut())?;
+            }
+            Ok(())
+        }) }
+    }
+
     fn observe_graphs_completed(&self) -> Result<()> {
-        if !self.graphs_ready.get() { return Ok(()); }
-        // SAFETY: every GLM Flash graph owner pins `()` (see `GraphOwner::new`
-        // in `replay_on`) and its captured pointers are persistent engine
-        // buffers, never per-graph allocations.
-        unsafe {
-            crate::shared::decode_graph::device::observe_completed(&self.library, |visit| {
-                for rank in 0..self.ranks() {
-                    let device = if rank == 1 { self.peer()?.device } else { self.device };
-                    visit(device, "glm5_flash.decode_local", false,
-                        &mut *self.graphs_of(rank).borrow_mut())?;
-                }
-                Ok(())
-            })
-        }
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        for rank in 0..self.ranks() { self.graphs_of(rank).borrow_mut().cache_tick(); }
+        // SAFETY: the complete primitive submitted every rank's launches.
+        unsafe { cycles.complete() }
     }
 
     /// Installs the exact admitted routed inventory on both head-split GPUs. Graphs
@@ -3897,6 +3901,7 @@ impl<'a> GlmfEngine<'a> {
         crate::shared::experts::rtx::pair::submit_recoverable(
             || self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(),
             |scope| {
+                self.begin_graph_cycle()?;
                 let result = self.decode_primitive_inner(scope, tables, tokens, logit_rows, on_layer, trace, media)?;
                 // Every rank's launches are queued now: this completed step is the
                 // measurement boundary for a capture queued inside it.

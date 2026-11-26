@@ -422,9 +422,9 @@ mod draft_storage_tests {
         assert!(ReferenceRows::open(&path, 1, 1, false).is_err());
         std::fs::write(&path, [0u8; 3]).unwrap();
         assert!(ReferenceRows::open(&path, 1, 1, true).is_err());
-        std::fs::write(&path, 1.0f32.to_le_bytes()).unwrap();
+        std::fs::write(&path, [1.0f32, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
         for optional in [false, true] {
-            assert_eq!(ReferenceRows::open(&path, 1, 1, optional).unwrap().unwrap().row(0).unwrap(), vec![1.0]);
+            assert_eq!(ReferenceRows::open(&path, 1, 2, optional).unwrap().unwrap().row(0).unwrap(), vec![1.0, 2.0]);
         }
     }
 
@@ -1056,7 +1056,7 @@ pub(crate) fn open(args: &EngineArgs) -> Result<Opened> {
 }
 
 fn open_checked(args: &EngineArgs, bf16_replay: bool) -> Result<Opened> {
-    cuteafd_loader::plan::resolve_decode_lanes("mimo_v2", Some(args.decode_lanes), args.rings as u64)?;
+    cuteafd_loader::plan::resolve_decode_lanes("mimo_v2", Some(args.decode_lanes), args.rings as u64, 1)?;
     // Validate immutable representation, capacity and kernel alignment before
     // the native module or any device allocation is admitted.
     args.draft_storage()?;
@@ -1927,11 +1927,7 @@ fn golden_body(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'
     let argmax = |l: &[f32]| l.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i);
     let report = |label: &str, metrics: &crate::shared::golden_scores::RowMetrics| {
         if reference.is_none() || metrics.rows == 0 { return; }
-        let (rows, scored) = (metrics.rows, metrics.scored.max(1) as f64);
-        println!("{label} logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
-            golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * metrics.agree as f64 / rows as f64,
-            100.0 * metrics.next_ok as f64 / scored, 100.0 * metrics.reference_next as f64 / scored,
-            metrics.nll / scored, metrics.kl / rows as f64);
+        println!("{}", metrics.context_only_line(label));
     };
     if let Some(writer) = &mut saved {
         ensure!(prefill_metrics.rows == prefill && decode_logits.len() == (tokens.len() - prefill) * cfg.vocab_size,
@@ -2026,10 +2022,9 @@ fn draft_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<
     let ref_hidden = bf16s(&std::fs::read(dir.join("hidden.bin"))?);
     let tokens: Vec<u32> = std::fs::read(args.golden.join("tokens.bin"))?
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
-    let greedy: Vec<u32> = std::fs::read(args.golden.join("logits.bin"))?.chunks_exact(vocab * 4).map(|row| {
-        let values = row.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()));
-        values.enumerate().max_by(|a, b| a.1.total_cmp(&b.1)).map_or(0, |(i, _)| i as u32)
-    }).collect();
+    let greedy: Vec<u32> = crate::shared::golden_scores::read_reference_logits(&args.golden.join("logits.bin"), vocab)?
+        .chunks_exact(vocab).map(|row| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))
+            .map_or(0, |(i, _)| i as u32)).collect();
     let layers: Vec<Vec<u8>> = drafter.cfg.taps.iter()
         .map(|l| std::fs::read(args.golden.join(format!("layer{l:02}.bin")))).collect::<std::io::Result<_>>()?;
     let row = hidden * 2;
@@ -2140,10 +2135,9 @@ fn mtp_oracle(args: &GoldenArgs, opened: &Opened, engine: &engine::MimoEngine<'_
         .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     let ref_stages = meta["stages"].as_u64().unwrap_or(0) as usize;
     ensure!(ref_stages >= stages && predictions.len() == ref_stages * t, "reference predictions do not cover {stages} stages");
-    let greedy: Vec<u32> = std::fs::read(args.golden.join("logits.bin"))?.chunks_exact(vocab * 4).map(|row| {
-        let values = row.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap()));
-        values.enumerate().max_by(|a, b| a.1.total_cmp(&b.1)).map_or(0, |(i, _)| i as u32)
-    }).collect();
+    let greedy: Vec<u32> = crate::shared::golden_scores::read_reference_logits(&args.golden.join("logits.bin"), vocab)?
+        .chunks_exact(vocab).map(|row| row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))
+            .map_or(0, |(i, _)| i as u32)).collect();
     let last = std::fs::read(args.golden.join(format!("layer{:02}.bin", opened.cfg.layers - 1)))?;
     let row = hidden * 2;
     engine.mtp_reset(0, anchors[0]);

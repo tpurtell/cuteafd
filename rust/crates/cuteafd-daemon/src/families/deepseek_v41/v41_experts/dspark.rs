@@ -167,9 +167,7 @@ pub(crate) fn draft_lanes(requests: u32, lanes: u8) -> Result<(u32, u32)> {
     ensure!((1..=cuteafd_core::V41_MAX_REQUESTS as u32).contains(&requests), "invalid draft request limit");
     ensure!(matches!(lanes, 1 | 2), "V4.1 drafts on one or two decode lanes");
     let lanes = if requests == 1 { 1 } else { u32::from(lanes) };
-    let members = requests.div_ceil(lanes);
-    ensure!(members as usize <= cuteafd_core::V41_MAX_LANE_MEMBERS,
-        "{members} draft lane members exceed the {} per lane", cuteafd_core::V41_MAX_LANE_MEMBERS);
+    let members = cuteafd_core::v41_draft_members(requests.div_ceil(lanes) as usize, cuteafd_core::MAX_DSPARK_PROPOSALS) as u32;
     Ok((lanes, members))
 }
 
@@ -253,7 +251,7 @@ impl<'library> DsparkWeights<'library> {
             projection_packed_scale_bytes: projection::packed_bytes(library)?,
             grouped_output_resident_bytes: 3 * 1048576,
             projection_bytes_per_wave: projection::wave_bytes(library, capacity)?,
-            draft_token_bytes_per_wave: cuteafd_core::V41_MAX_LANE_MEMBERS * 4,
+            draft_token_bytes_per_wave: cuteafd_core::V41_MAX_DRAFT_MEMBERS * 4,
             main_context_additional_bytes_per_wave: DsparkMainContext::additional_bytes(library, capacity)?,
             attention_output_additional_bytes_per_wave: DsparkAttentionOutput::additional_bytes(library, capacity)? * 3,
             attention_wave_additional_bytes_per_wave: DsparkAttentionWave::additional_bytes(capacity)? * 3,
@@ -265,9 +263,9 @@ impl<'library> DsparkWeights<'library> {
             hc_bytes_per_wave: HcSublayer::device_bytes(capacity as usize)?
                 .checked_mul(6)
                 .context("mHC wave budget overflow")?,
-            confidence_bytes_per_wave: DsparkConfidence::device_bytes((capacity as usize).max(cuteafd_core::V41_MAX_LANE_MEMBERS * width))?,
-            markov_bytes_per_wave: DsparkMarkov::device_bytes(cuteafd_core::V41_MAX_LANE_MEMBERS)?,
-            terminal_additional_bytes_per_wave: DsparkTerminal::additional_bytes_with_width(cuteafd_core::V41_MAX_LANE_MEMBERS, width)?,
+            confidence_bytes_per_wave: DsparkConfidence::device_bytes((capacity as usize).max(cuteafd_core::V41_MAX_DRAFT_MEMBERS * width))?,
+            markov_bytes_per_wave: DsparkMarkov::device_bytes(cuteafd_core::V41_MAX_DRAFT_MEMBERS)?,
+            terminal_additional_bytes_per_wave: DsparkTerminal::additional_bytes_with_width(cuteafd_core::V41_MAX_DRAFT_MEMBERS, width)?,
         })
     }
     /// Single-RTX `serving_bytes` as a drafter inventory: weights, the

@@ -400,7 +400,10 @@ def test_every_golden_retires_layer_storage_and_owns_cpu_reads(family):
     tree = ast.parse((ROOT / "python/reference/families" / family / "golden.py").read_text())
     reader = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Weights")
     assert ".clone()" in ast.unparse(reader)
-    for function in (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("main", "run_windows")):
+    # The legacy prompt loop lives in run_tokens where a golden has one (#2719).
+    names = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+    legacy = "run_tokens" if "run_tokens" in names else "main"
+    for function in (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in (legacy, "run_windows")):
         source = ast.unparse(function)
         assert "CheckpointStorage(" in source
         assert "memory.release()" in source and "memory.check(" in source

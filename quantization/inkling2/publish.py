@@ -17,6 +17,7 @@ import tempfile
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import hub_lfs
 from hub_requirements import require_qualified_hub
 from kimi_k3.uniform_k2.storage import atomic_json, canonical, file_identity, fsync_directory, verify_receipt
 
@@ -204,7 +205,15 @@ def _attribute_files(api, revision, files, root, fetch_metadata, *, repo_id=TARG
     if (not original.endswith(b'\n') or not isinstance(size, int)
             or not len(original) < size <= len(original) + 4096 * len(files)):
         raise ValueError('unexpected server-normalized attributes')
-    raw = fetch_metadata(revision, name)
+    target = root / 'published.gitattributes'
+    if target.is_symlink():
+        raise ValueError('normalized metadata destination is a symlink')
+    recorded = target.read_bytes() if target.is_file() else None
+    if (recorded is not None and len(recorded) == size
+            and hashlib.sha1(f'blob {size}\0'.encode() + recorded).hexdigest() == _field(row, 'blob_id')):
+        raw = recorded  # Same Git blob as already fetched; batch verifies need no new download.
+    else:
+        raw = fetch_metadata(revision, name)
     if not isinstance(raw, bytes) or len(raw) != size or not raw.startswith(original):
         raise ValueError('unexpected server-normalized attributes')
     added = raw[len(original):].splitlines(keepends=True)
@@ -212,10 +221,8 @@ def _attribute_files(api, revision, files, root, fetch_metadata, *, repo_id=TARG
                for n in files if not any(c in n for c in '*?[]\\\r\n\t ')}
     if not added or len(added) != len(set(added)) or not set(added) <= allowed:
         raise ValueError('unexpected server-normalized attributes')
-    target = root / 'published.gitattributes'
-    if target.is_symlink():
-        raise ValueError('normalized metadata destination is a symlink')
-    target.write_bytes(raw)
+    if raw != recorded:
+        target.write_bytes(raw)
     hashes = metadata_identity(target)
     result = dict(files)
     result[name] = dict(path=str(target), bytes=len(raw), file_identity=file_identity(target),
@@ -230,51 +237,33 @@ def _check_sources(files):
             raise ValueError('publication source changed since receipt')
 
 
-def _upload_with_writer_hashes(api, arguments, files, *, target=INKLING):
-    """Keep the native folder pipeline, supplying its lazy SHA fields from receipts."""
-    require_qualified_hub()
-    builder = getattr(api, '_prepare_upload_folder_additions', None)
-    if not callable(builder):
-        raise ValueError('native folder operation builder is unavailable')
-    name = '_prepare_upload_folder_additions'
-    missing = object()
-    prior = vars(api).get(name, missing)
+def _upload_http_lfs(api, head, files, root, fetch_metadata, *, target, options):
+    """Commit verified, parallel HTTP LFS batches; resume skips committed files."""
+    repo = target.repo_id
+    present = {_field(row, 'rfilename') for row in _field(head, 'siblings') or []}
+    if present == {'.gitattributes'}:
+        # The new repository's default attributes are replaced by the sealed rules.
+        present.clear()
+    pending = [name for name in hub_lfs.upload_order(files) if name not in present]
 
-    def prepared(*args, **kwargs):
-        operations = builder(*args, **kwargs)
-        names = [operation.path_in_repo for operation in operations]
-        if len(names) != len(set(names)) or set(names) != set(files):
-            raise ValueError('native upload operations differ from publication inventory')
-        _check_sources(files)
-        for operation in operations:
-            row = files[operation.path_in_repo]
-            info = operation.upload_info
-            if (not isinstance(operation.path_or_fileobj, (str, Path))
-                    or Path(operation.path_or_fileobj).absolute() != Path(row['path'])
-                    or info.size != row['bytes']):
-                raise ValueError('native upload source differs from sealed receipt')
-            digest = bytes.fromhex(row['sha256'])
-            if info.is_hashed and info.sha256 != digest:
-                raise ValueError('native upload digest differs from writer receipt')
-            info.sha256 = digest  # Never mark uploaded/committed: the SDK owns those states.
-        return operations
+    def verify(commit, batch, operations):
+        expected = _attribute_files(api, commit, files, root, fetch_metadata, repo_id=repo)
+        verified = verify_hub(api, commit, expected, partial=True, repo_id=repo)
+        present.update(batch)
+        if {_field(row, 'rfilename') for row in _field(verified, 'siblings')} != present:
+            raise ValueError('HTTP LFS batch inventory differs from expected files')
 
-    # Only this task-owned client is adapted, for this synchronous upload call.
-    setattr(api, name, prepared)
-    try:
-        return api.upload_folder(**arguments, commit_message=target.commit_message)
-    finally:
-        if prior is missing:
-            delattr(api, name)
-        else:
-            setattr(api, name, prior)
+    return hub_lfs.commit_batches(api, repo, files, pending, revision=_field(head, 'sha'),
+        commit_message=target.commit_message, options=options,
+        check_sources=lambda batch: _check_sources({name: files[name] for name in batch}), verify=verify)
 
 
-def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None, target=INKLING):
-    """Resume native Hub upload, then seal a metadata-verified publication receipt.
+def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None, target=INKLING,
+            options=None):
+    """Resume HTTP LFS batch upload, then seal a metadata-verified publication receipt.
 
-    Call only after numerical completion. Native folder/Xet upload handles
-    interrupted transfers; no parent repository or CommitOperationCopy is used.
+    Call only after numerical completion. Verified batch commits survive an
+    interruption; no parent repository or CommitOperationCopy is used.
     """
     from huggingface_hub import HfApi, hf_hub_download
     from huggingface_hub.errors import RepositoryNotFoundError
@@ -300,6 +289,7 @@ def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None, 
                 raise ValueError('publication completion receipt differs')
             verify_hub(anonymous_api, saved['revision'], saved['files'], repo_id=repo_id)
             return saved  # Completed jobs stay complete even after standalone cleanup.
+        require_qualified_hub()  # Before any remote mutation.
         prepare_publication_metadata(output, root, target=target)
         packet = publication_inventory(output, target=target)
         plan_path = root / 'publication-plan.json'
@@ -319,7 +309,7 @@ def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None, 
             atomic_json(guard, dict(repo_id=repo_id, initial_revision=_field(info, 'sha')))
         elif load(guard).get('repo_id') != repo_id:
             raise ValueError('destination recovery guard differs')
-        # Native resumable upload may have published a subset before interruption.
+        # An interrupted publication leaves verified batch commits behind.
         head = api.model_info(repo_id, files_metadata=True)
         if _field(head, 'private') is not False:
             raise ValueError('destination became private')
@@ -328,9 +318,8 @@ def publish(output, root, *, api=None, anonymous_api=None, fetch_metadata=None, 
             partial_files = _attribute_files(api, _field(head, 'sha'), packet['files'], root, fetch_metadata, repo_id=repo_id)
             verify_hub(api, _field(head, 'sha'), partial_files, partial=True, repo_id=repo_id)
         _check_sources(packet['files'])
-        arguments = dict(repo_id=repo_id, repo_type='model', folder_path=str(output),
-                         allow_patterns=sorted(packet['files']))
-        _upload_with_writer_hashes(api, arguments, packet['files'], target=target)
+        _upload_http_lfs(api, head, packet['files'], root, fetch_metadata, target=target,
+                         options=options or hub_lfs.UploadOptions())
         _check_sources(packet['files'])
         head = api.model_info(repo_id, files_metadata=True)
         revision = _field(head, 'sha')
@@ -356,8 +345,10 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--inventory-only', action='store_true')
+    hub_lfs.add_arguments(parser)
     args = parser.parse_args()
-    result = publication_inventory(args.output) if args.inventory_only else publish(args.output, args.root)
+    result = (publication_inventory(args.output) if args.inventory_only
+              else publish(args.output, args.root, options=hub_lfs.options_from(args)))
     print(json.dumps(result), flush=True)
 
 

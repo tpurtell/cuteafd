@@ -72,7 +72,7 @@ impl MlaDraftBuffer {
             "received_partial" | "received_lse" => Transport,
             "taps" | "fused" | "fused_norm" | "context_positions" | "context_slots" | "query" | "attention"
             | "lse" | "native_scratch" | "lengths" | "query_offsets" | "native_slots" | "native_positions"
-            | "head_workspace" | "h" | "n" | "delta" | "gate_up" | "act" | "logits" | "markov_workspace"
+            | "head_workspace" | "h" | "n" | "delta" | "reduced" | "gate_up" | "act" | "logits" | "markov_workspace"
             | "anchors" | "ids" | "tokens" | "positions" | "candidates" | "conv" | "dynamic" | "features"
             | "fp8_scratch" | "projected" | "q_residual" | "topk_workspace" | "unary" | "page_table"
             | "intervals" | "partial" | "scratch" | "producer_cache" | "producer_slots" | "sink" => DrafterWorkspace,
@@ -118,15 +118,47 @@ pub struct MlaDraftView {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MlaDraftPacking { Direct, Uk, Uv, GateUp, UnitScale }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MlaDraftShardAxis { Rows, Columns }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MlaDraftShard {
+    pub axis: MlaDraftShardAxis,
+    pub rank: usize,
+    pub ranks: usize,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftWeight {
     pub owner: String,
     pub shape: Vec<usize>,
     pub sources: Vec<(String, Vec<usize>)>,
     pub packing: MlaDraftPacking,
+    pub shard: Option<MlaDraftShard>,
 }
 
 impl MlaDraftWeight {
+    fn slice_source(bytes: Vec<u8>, shape: &[usize], shard: Option<MlaDraftShard>) -> anyhow::Result<Vec<u8>> {
+        let Some(MlaDraftShard { axis, rank, ranks }) = shard else { return Ok(bytes); };
+        anyhow::ensure!(ranks > 0 && rank < ranks && shape.len() == 2, "invalid MLA draft shard {shard:?} for {shape:?}");
+        let (rows, cols) = (shape[0], shape[1]);
+        match axis {
+            MlaDraftShardAxis::Rows => {
+                anyhow::ensure!(rows % ranks == 0, "MLA draft row shard {rows} not divisible by {ranks}");
+                let part = (rows / ranks) * cols * 2;
+                Ok(bytes[rank * part..(rank + 1) * part].to_vec())
+            }
+            MlaDraftShardAxis::Columns => {
+                anyhow::ensure!(cols % ranks == 0, "MLA draft column shard {cols} not divisible by {ranks}");
+                let row_bytes = cols * 2;
+                let part = (cols / ranks) * 2;
+                let mut out = Vec::with_capacity(rows * part);
+                for row in bytes.chunks_exact(row_bytes) {
+                    out.extend_from_slice(&row[rank * part..(rank + 1) * part]);
+                }
+                Ok(out)
+            }
+        }
+    }
+
     /// Materialize only this destination; source headers remain in checkpoint order.
     pub fn pack(&self, read: &mut impl FnMut(&str, &[usize]) -> anyhow::Result<Vec<u8>>)
         -> anyhow::Result<Vec<u8>> {
@@ -136,7 +168,7 @@ impl MlaDraftWeight {
             let expected = shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d))
                 .ok_or_else(|| anyhow::anyhow!("draft source extent overflow"))?;
             anyhow::ensure!(bytes.len() == expected, "draft source {name} byte extent differs from header");
-            Ok::<_, anyhow::Error>(bytes)
+            Self::slice_source(bytes, shape, self.shard)
         };
         let bytes = match self.packing {
             MlaDraftPacking::Direct => source(0, read)?,
@@ -154,7 +186,9 @@ impl MlaDraftWeight {
             MlaDraftPacking::Uk | MlaDraftPacking::Uv => {
                 let kv = source(0, read)?;
                 let (heads, latent) = (self.shape[0], self.sources[0].1[1]);
-                let head_rows = self.sources[0].1[0] / heads;
+                let total_rows = kv.len() / (latent * 2);
+                anyhow::ensure!(heads > 0 && total_rows % heads == 0, "draft absorption row count mismatch");
+                let head_rows = total_rows / heads;
                 let mut bytes = vec![0u8; self.shape.iter().product::<usize>() * 2];
                 match self.packing {
                     MlaDraftPacking::Uk => {
@@ -188,6 +222,7 @@ impl MlaDraftWeight {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MlaDraftRuntimeLayout {
     kind: cuteafd_core::coordinator_programs::MlaDraftKind,
+    tp2_rank: Option<usize>,
     hidden_stream: crate::families::kimi_k3::draft::DraftHiddenStream,
     complete_fp8_body: bool,
     cache_format: MlaCacheFormat,
@@ -233,7 +268,7 @@ pub fn draft_selector_workspace_bytes(kind: cuteafd_core::coordinator_programs::
     match kind {
         MlaDraftKind::Dflash2 | MlaDraftKind::CausalDflash2 => drafted.checked_mul(64 * kind.selector_top_k() * 8)
             .map(|bytes| bytes.max(256)).ok_or_else(|| unsupported("draft selector workspace overflow")),
-        MlaDraftKind::Ml4Dspark => Ok(0),
+        MlaDraftKind::Ml4Dspark | MlaDraftKind::Ml4DsparkTp2 => Ok(0),
     }
 }
 
@@ -241,6 +276,8 @@ impl MlaDraftRuntimeLayout {
     pub const TAP_ROWS: usize = 2048;
 
     pub fn kind(&self) -> cuteafd_core::coordinator_programs::MlaDraftKind { self.kind }
+    pub fn tp2_rank(&self) -> Option<usize> { self.tp2_rank }
+    pub fn has_head(&self) -> bool { self.tp2_rank != Some(1) }
     pub fn selector_workspace_bytes(&self) -> Result<usize> {
         draft_selector_workspace_bytes(self.kind, self.capacity.block_rows - self.capacity.max_batch_sequences)
     }
@@ -255,8 +292,7 @@ impl MlaDraftRuntimeLayout {
     pub fn weight_destinations(&self) -> &[MlaDraftWeight] { &self.weight_destinations }
     pub fn is_immutable_buffer(&self, name: &str) -> bool {
         self.weight_destinations.iter().any(|weight| weight.owner == name)
-            || (self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark
-                && name == "markov_norms")
+            || (self.kind.is_ml4() && self.has_head() && name == "markov_norms")
     }
     /// The exact immutable subset handed to the serving weight allocator.
     pub fn immutable_arena_requests(&self) -> Vec<(String, usize)> {
@@ -303,7 +339,7 @@ impl MlaDraftRuntimeLayout {
         let offset = first_sequence.checked_mul(block).and_then(|n| n.checked_mul(row))
             .ok_or_else(|| unsupported("draft block offset overflow"))?;
         let bytes = rows.checked_mul(row).ok_or_else(|| unsupported("draft block extent overflow"))?;
-        let input = if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark { "n" } else { "conv" };
+        let input = if self.kind.is_ml4() { "n" } else { "conv" };
         Ok([self.view("block.input", input, offset, bytes)?, self.view("block.output", "delta", offset, bytes)?])
     }
     pub fn mask_view(&self, sequence: usize) -> Result<MlaDraftView> {
@@ -324,7 +360,7 @@ impl MlaDraftRuntimeLayout {
             return Err(unsupported("draft result count outside capacity"));
         }
         let block = self.capacity.block_rows / self.capacity.max_batch_sequences;
-        let drafts = if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark { block } else { block - 1 };
+        let drafts = if self.kind.is_ml4() { block } else { block - 1 };
         let bytes = sequences * drafts * 4;
         Ok([self.view("result.tokens", "tokens", 0, bytes)?, self.view("result.landing", "host.landing", 0, bytes)?])
     }
@@ -1023,7 +1059,20 @@ impl MlaDflashConfig {
             kind: cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark, markov_rank: dspark.markov_rank })
     }
 
-    fn is_ml4(&self) -> bool { self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark }
+    /// Two-GPU head/FFN-split mtp_dspark (32 heads and half dense intermediate per rank).
+    pub fn ml4_tp2(dspark: &crate::families::mistral_large4::dspark::Ml4DsparkConfig,
+        target: &crate::families::mistral_large4::Ml4Config) -> Result<Self> {
+        let mut cfg = Self::ml4(dspark, target)?;
+        if cfg.mla.heads % 2 != 0 || cfg.intermediate % 2 != 0 {
+            return Err(unsupported("mtp_dspark TP2 requires even heads and intermediate width"));
+        }
+        cfg.mla.heads /= 2;
+        cfg.intermediate /= 2;
+        cfg.kind = cuteafd_core::coordinator_programs::MlaDraftKind::Ml4DsparkTp2;
+        Ok(cfg)
+    }
+
+    fn is_ml4(&self) -> bool { self.kind.is_ml4() }
 
     /// Every MLA drafter owns records independently of target KV storage.
     pub fn cache_format(&self, draft: crate::families::qwen4::Qwen4KvCache) -> MlaCacheFormat {
@@ -1054,13 +1103,15 @@ impl MlaDflashConfig {
     /// from the target, matching the checkpoint's reference execution.
     pub fn tensor_shapes(&self) -> Vec<(String, Vec<usize>)> {
         if self.is_ml4() {
-            // The drafter ships in the target checkpoint under mtp_dspark.* (BF16).
+            // The drafter ships in the target checkpoint under mtp_dspark.* (BF16),
+            // always with full (unsharded) checkpoint headers.
+            let ranks = if self.kind == cuteafd_core::coordinator_programs::MlaDraftKind::Ml4DsparkTp2 { 2 } else { 1 };
             let dspark = crate::families::mistral_large4::dspark::Ml4DsparkConfig { layers: self.windows.len(),
                 depth: self.block, taps: self.taps.clone(), window: self.windows[0].unwrap_or(0),
                 markov_rank: self.markov_rank };
             let m = &self.mla;
-            return dspark.tensors(m.hidden, m.heads, m.nope + m.rope, m.kv_rank, m.rope, m.nope, m.value,
-                self.intermediate, self.vocab);
+            return dspark.tensors(m.hidden, m.heads * ranks, m.nope + m.rope, m.kv_rank, m.rope, m.nope, m.value,
+                self.intermediate * ranks, self.vocab);
         }
         let h = self.mla.hidden;
         let mut shapes = vec![
@@ -1273,7 +1324,7 @@ impl MlaDflashConfig {
         } else { None };
         let weight_arena_requests = crate::families::glm5::draft_physical::mla_arena_requests(self, mode)
             .map_err(|error| unsupported(&error.to_string()))?;
-        let layout = MlaDraftRuntimeLayout { kind: self.kind, hidden_stream: self.hidden_stream, complete_fp8_body: false, cache_format, target_hidden: h, target_vocab: self.vocab,
+        let layout = MlaDraftRuntimeLayout { kind: self.kind, tp2_rank: None, hidden_stream: self.hidden_stream, complete_fp8_body: false, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch, sm_count, fp8_mode, buffers, owners: Vec::new(), weight_destinations: Vec::new(),
             weight_arena_requests, context_split: false };
@@ -1309,6 +1360,19 @@ impl MlaDflashConfig {
         Ok(layout)
     }
 
+    /// Per-rank runtime layout for two-GPU head/FFN-split mtp_dspark (rank 0 lead
+    /// owns the RNN Markov head and masks; rank 1 peer owns only its 32-head/half-FFN
+    /// slice and replicated KV cache/norms/target_projection).
+    pub fn ml4_tp2_runtime_layout(&self, rank: usize,
+        capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
+        compiled_context: usize, target_pool_tokens: usize, sm_count: usize, cache_format: MlaCacheFormat)
+        -> Result<MlaDraftRuntimeLayout> {
+        if self.kind != cuteafd_core::coordinator_programs::MlaDraftKind::Ml4DsparkTp2 || rank >= 2 {
+            return Err(unsupported("mtp_dspark TP2 layout requires Ml4DsparkTp2 kind and rank 0 or 1"));
+        }
+        self.ml4_runtime_layout_for(Some(rank), capacity, compiled_context, target_pool_tokens, sm_count, cache_format)
+    }
+
     /// mtp_dspark: the shared cache/paged layouts and native arenas, its own
     /// layer bodies (no convolutions), head (RNN Markov, the target's head and
     /// soft cap) and inputs (position-specific mask rows), BF16 weights. The
@@ -1316,7 +1380,17 @@ impl MlaDflashConfig {
     fn ml4_runtime_layout(&self, capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
         compiled_context: usize, target_pool_tokens: usize, sm_count: usize, cache_format: MlaCacheFormat)
         -> Result<MlaDraftRuntimeLayout> {
-        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftRepresentation};
+        if self.kind != cuteafd_core::coordinator_programs::MlaDraftKind::Ml4Dspark {
+            return Err(unsupported("mtp_dspark whole layout requires Ml4Dspark kind; use ml4_tp2_runtime_layout for TP2"));
+        }
+        self.ml4_runtime_layout_for(None, capacity, compiled_context, target_pool_tokens, sm_count, cache_format)
+    }
+
+    fn ml4_runtime_layout_for(&self, tp2_rank: Option<usize>,
+        capacity: crate::families::glm5::draft_representation::GlmDraftCapacity,
+        compiled_context: usize, target_pool_tokens: usize, sm_count: usize, cache_format: MlaCacheFormat)
+        -> Result<MlaDraftRuntimeLayout> {
+        use crate::families::glm5::draft_representation::{GlmDraftCapacity, GlmDraftWeightLayout};
         use cuteafd_core::coordinator_programs::MlaDraftProgramLayout;
         let invalid = || unsupported("mtp_dspark runtime geometry/capacity outside native limits");
         if capacity != GlmDraftCapacity::new(capacity.context_slots, capacity.max_batch_sequences, self.block)
@@ -1325,12 +1399,12 @@ impl MlaDflashConfig {
             || self.markov_rank != 512 {
             return Err(invalid());
         }
+        let has_head = tp2_rank != Some(1);
         let program = self.program_layout(compiled_context)?;
         let cache = self.cache_layout(capacity.context_slots, compiled_context, cache_format)?;
         let paged_cache = self.paged_cache_layout(capacity.context_slots, compiled_context, target_pool_tokens, cache_format)?;
-        let weights = self.weight_layout(GlmDraftRepresentation::Bf16Only)?;
-        let (h, inter, rows, seq) = (self.mla.hidden, self.intermediate, capacity.block_rows,
-            capacity.max_batch_sequences);
+        let (h, heads, inter, rows, seq) = (self.mla.hidden, self.mla.heads, self.intermediate,
+            capacity.block_rows, capacity.max_batch_sequences);
         let tap_rows = MlaDraftRuntimeLayout::TAP_ROWS;
         let native_rows = MlaDraftProgramLayout::ROWS;
         let mut buffers = Vec::new();
@@ -1357,24 +1431,34 @@ impl MlaDflashConfig {
             ("fused", vec![tap_rows, h], Bf16), ("fused_norm", vec![tap_rows, h], Bf16),
             ("context_positions", vec![tap_rows], I64), ("context_slots", vec![tap_rows], I64),
             ("inverse_frequencies", vec![compiled_context, self.mla.rope], F32),
-            ("query", vec![native_rows, 64, 576], Bf16),
-            ("attention", vec![native_rows, 64, 512], Bf16), ("lse", vec![native_rows, 64], F32),
+            ("query", vec![native_rows, heads, 576], Bf16),
+            ("attention", vec![native_rows, heads, 512], Bf16), ("lse", vec![native_rows, heads], F32),
             ("native_scratch", vec![program.scratch_bytes()], Bytes),
             ("lengths", vec![seq], I32), ("query_offsets", vec![seq + 1], I32),
             ("native_slots", vec![native_rows], I64), ("native_positions", vec![native_rows], I64),
-            ("head_workspace", vec![4 << 20], Bytes),
             ("h", vec![rows, h], Bf16), ("n", vec![rows, h], Bf16), ("delta", vec![rows, h], Bf16),
             ("gate_up", vec![rows, 2 * inter], Bf16), ("act", vec![rows, inter], Bf16),
-            ("logits", vec![rows, self.vocab], F32), ("markov_norms", vec![self.vocab], F32),
-            // cuteafd_ml4_dspark_markov_workspace: partial values+indices (296
-            // blocks x 8 B), base argmax top, state+embedding (2 x rank BF16) and
-            // the joint projection (3 x rank F32).
-            ("markov_workspace", vec![seq * 296 * 8 + rows * 4 + seq * self.markov_rank * 4
-                + seq * 3 * self.markov_rank * 4], Bytes),
-            ("anchors", vec![seq], U32), ("ids", vec![rows], U32),
-            ("tokens", vec![seq * self.drafts()], U32), ("positions", vec![rows], I64),
+            ("positions", vec![rows], I64),
         ] { add(name.into(), &dims, dtype)?; }
-        let weight_destinations = self.ml4_weight_destinations()?;
+        if tp2_rank.is_some() {
+            add("reduced".into(), &[rows, h], Bf16)?;
+        }
+        if has_head {
+            for (name, dims, dtype) in [
+                ("head_workspace", vec![4 << 20], Bytes),
+                ("logits", vec![rows, self.vocab], F32), ("markov_norms", vec![self.vocab], F32),
+                // cuteafd_ml4_dspark_markov_workspace: partial values+indices (296
+                // blocks x 8 B), base argmax top, state+embedding (2 x rank BF16) and
+                // the joint projection (3 x rank F32).
+                ("markov_workspace", vec![seq * 296 * 8 + rows * 4 + seq * self.markov_rank * 4
+                    + seq * 3 * self.markov_rank * 4], Bytes),
+                ("anchors", vec![seq], U32), ("ids", vec![rows], U32),
+                ("tokens", vec![seq * self.drafts()], U32),
+            ] { add(name.into(), &dims, dtype)?; }
+        }
+        let weight_destinations = self.ml4_weight_destinations(tp2_rank)?;
+        let mut weights = GlmDraftWeightLayout { bf16_values: 0, fp8_values: 0, fp8_scales: 0,
+            bf16_auxiliary: 0, bf16_codebooks: 0, max_load_staging: 0 };
         for weight in &weight_destinations {
             let bytes = weight.shape.iter().try_fold(2usize, |n, &d| n.checked_mul(d))
                 .ok_or_else(|| unsupported("mtp_dspark weight destination overflow"))?.max(256);
@@ -1382,6 +1466,14 @@ impl MlaDflashConfig {
                 resident_weights: crate::placement::ResidentWeights(bytes as u64),
                 alignment: 256, dtype: Bf16, shape: weight.shape.clone(), lifetime: MlaDraftLifetime::Runtime,
                 shared_key: None, staging_for: None, on_use: false });
+            let dst = if weight.owner.contains("autoregressive_head.embedding")
+                || weight.owner.contains("autoregressive_head.output") {
+                &mut weights.bf16_codebooks
+            } else if weight.shape.len() == 1 || weight.packing == MlaDraftPacking::UnitScale {
+                &mut weights.bf16_auxiliary
+            } else { &mut weights.bf16_values };
+            *dst = dst.checked_add(bytes as u64)
+                .ok_or_else(|| unsupported("mtp_dspark weight owner total overflow"))?;
         }
         // Ordered uploads keep one pinned backing per destination until library teardown.
         // Host-row and put_taps diagnostics are lazy; normal serving supplies device rows.
@@ -1395,10 +1487,12 @@ impl MlaDflashConfig {
                 shared_key: Some(format!("ordered-h2d/{}", o.id)), staging_for: Some(o.id.clone()),
                 on_use: matches!(o.id.as_str(), "h" | "taps") }).collect();
         owners.extend(staging);
-        owners.push(MlaDraftOwner { id: "host.landing".into(), domain: MlaDraftDomain::HostPinned,
-            resident_weights: crate::placement::ResidentWeights::default(),
-            bytes: seq * self.drafts() * 4, alignment: 1, dtype: U32, shape: vec![seq, self.drafts()],
-            lifetime: MlaDraftLifetime::Runtime, shared_key: None, staging_for: None, on_use: false });
+        if has_head {
+            owners.push(MlaDraftOwner { id: "host.landing".into(), domain: MlaDraftDomain::HostPinned,
+                resident_weights: crate::placement::ResidentWeights::default(),
+                bytes: seq * self.drafts() * 4, alignment: 1, dtype: U32, shape: vec![seq, self.drafts()],
+                lifetime: MlaDraftLifetime::Runtime, shared_key: None, staging_for: None, on_use: false });
+        }
         let largest_upload = owners.iter().filter(|o| o.domain == MlaDraftDomain::Device
             && (o.id.starts_with("weight.") || o.id == "inverse_frequencies"))
             .map(|o| o.bytes).max().unwrap_or(0);
@@ -1407,15 +1501,7 @@ impl MlaDflashConfig {
             bytes: largest_upload, alignment: 1, dtype: Bytes, shape: vec![largest_upload],
             lifetime: MlaDraftLifetime::Library, shared_key: Some("library/sync-h2d".into()),
             staging_for: None, on_use: false });
-        let destination_bytes = owners.iter().filter(|o| o.id.starts_with("weight."))
-            .try_fold(0u64, |sum, o| sum.checked_add(o.bytes as u64))
-            .ok_or_else(|| unsupported("mtp_dspark weight owner total overflow"))?;
-        let mut weights = weights;
-        let source_bytes = weights.resident_bytes().map_err(|_| unsupported("mtp_dspark weight total overflow"))?;
-        weights.bf16_auxiliary = weights.bf16_auxiliary.checked_add(destination_bytes.checked_sub(source_bytes)
-            .ok_or_else(|| unsupported("mtp_dspark packing lost source bytes"))?)
-            .ok_or_else(|| unsupported("mtp_dspark generated weight overflow"))?;
-        let layout = MlaDraftRuntimeLayout { kind: self.kind, hidden_stream: self.hidden_stream, complete_fp8_body: false, cache_format, target_hidden: h, target_vocab: self.vocab,
+        let layout = MlaDraftRuntimeLayout { kind: self.kind, tp2_rank, hidden_stream: self.hidden_stream, complete_fp8_body: false, cache_format, target_hidden: h, target_vocab: self.vocab,
             target_taps: self.taps.clone(), capacity, weights, cache, paged_cache, program,
             fp8_scratch: None, sm_count, fp8_mode: 0, buffers, owners, weight_destinations,
             weight_arena_requests: Vec::new(), context_split: false };
@@ -1423,33 +1509,52 @@ impl MlaDflashConfig {
         Ok(layout)
     }
 
-    fn ml4_weight_destinations(&self) -> Result<Vec<MlaDraftWeight>> {
+    fn ml4_weight_destinations(&self, tp2_rank: Option<usize>) -> Result<Vec<MlaDraftWeight>> {
         use MlaDraftPacking::{Direct, GateUp, Uk, UnitScale, Uv};
         let prefix = crate::families::mistral_large4::dspark::PREFIX;
+        let has_head = tp2_rank != Some(1);
+        let shard = |axis: MlaDraftShardAxis| tp2_rank.map(|rank| MlaDraftShard { axis, rank, ranks: 2 });
         let mut destinations = Vec::new();
         for (source, shape) in self.tensor_shapes() {
             let name = source.strip_prefix(prefix).ok_or_else(|| unsupported("mtp_dspark tensor prefix"))?;
+            if !has_head && (name == "backbone.mask_embedding" || name.starts_with("autoregressive_head.")) {
+                continue;
+            }
             if name.ends_with(".attention.wkv_b.weight") {
                 for (suffix, packed, packing) in [
                     ("uk", vec![self.mla.heads, self.mla.kv_rank, self.mla.nope], Uk),
                     ("uv", vec![self.mla.heads, self.mla.value, self.mla.kv_rank], Uv),
                 ] {
                     destinations.push(MlaDraftWeight { owner: format!("weight.{name}.{suffix}"), shape: packed,
-                        sources: vec![(source.clone(), shape.clone())], packing });
+                        sources: vec![(source.clone(), shape.clone())], packing,
+                        shard: shard(MlaDraftShardAxis::Rows) });
                 }
+            } else if name.ends_with(".attention.wq.weight") {
+                destinations.push(MlaDraftWeight { owner: format!("weight.{name}"),
+                    shape: vec![self.mla.heads * (self.mla.nope + self.mla.rope), self.mla.hidden],
+                    sources: vec![(source, shape)], packing: Direct, shard: shard(MlaDraftShardAxis::Rows) });
+            } else if name.ends_with(".attention.wo.weight") {
+                destinations.push(MlaDraftWeight { owner: format!("weight.{name}"),
+                    shape: vec![self.mla.hidden, self.mla.heads * self.mla.value],
+                    sources: vec![(source, shape)], packing: Direct, shard: shard(MlaDraftShardAxis::Columns) });
             } else if name.ends_with(".feed_forward.w1.weight") {
                 destinations.push(MlaDraftWeight { owner: format!("weight.{name}.gate_up"),
                     shape: vec![2 * self.intermediate, self.mla.hidden],
                     sources: vec![(source.clone(), shape.clone()),
-                        (source.replace(".w1.weight", ".w3.weight"), shape)], packing: GateUp });
+                        (source.replace(".w1.weight", ".w3.weight"), shape)], packing: GateUp,
+                    shard: shard(MlaDraftShardAxis::Rows) });
+            } else if name.ends_with(".feed_forward.w2.weight") {
+                destinations.push(MlaDraftWeight { owner: format!("weight.{name}"),
+                    shape: vec![self.mla.hidden, self.intermediate],
+                    sources: vec![(source, shape)], packing: Direct, shard: shard(MlaDraftShardAxis::Columns) });
             } else if !name.ends_with(".feed_forward.w3.weight") {
                 destinations.push(MlaDraftWeight { owner: format!("weight.{name}"), shape: shape.clone(),
-                    sources: vec![(source, shape)], packing: Direct });
+                    sources: vec![(source, shape)], packing: Direct, shard: None });
             }
         }
         for index in 0..self.windows.len() {
             destinations.push(MlaDraftWeight { owner: format!("weight.backbone.layers.{index}.attention.unit_scale"),
-                shape: vec![2, self.mla.heads], sources: Vec::new(), packing: UnitScale });
+                shape: vec![2, self.mla.heads], sources: Vec::new(), packing: UnitScale, shard: None });
         }
         Ok(destinations)
     }
@@ -2057,14 +2162,61 @@ mod tests {
         let source = ("kv".into(), vec![6, 2]);
         let bytes: Vec<u8> = (0u16..12).flat_map(u16::to_le_bytes).collect();
         let mut read = |_: &str, _: &[usize]| Ok(bytes.clone());
-        let make = |packing, shape| MlaDraftWeight { owner: "weight.test".into(), shape, sources: vec![source.clone()], packing };
+        let make = |packing, shape, shard| MlaDraftWeight { owner: "weight.test".into(), shape,
+            sources: vec![source.clone()], packing, shard };
         let words = |bytes: Vec<u8>| bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0],b[1]])).collect::<Vec<_>>();
-        assert_eq!(words(make(MlaDraftPacking::Uk, vec![2,2,1]).pack(&mut read)?), [0,1,6,7]);
-        assert_eq!(words(make(MlaDraftPacking::Uv, vec![2,2,2]).pack(&mut read)?), [2,3,4,5,8,9,10,11]);
-        let unit = MlaDraftWeight { owner: "unit".into(), shape: vec![2,2], sources: vec![], packing: MlaDraftPacking::UnitScale };
+        assert_eq!(words(make(MlaDraftPacking::Uk, vec![2,2,1], None).pack(&mut read)?), [0,1,6,7]);
+        assert_eq!(words(make(MlaDraftPacking::Uv, vec![2,2,2], None).pack(&mut read)?), [2,3,4,5,8,9,10,11]);
+        // TP2 row-sharded Uk/Uv splits heads cleanly across rank 0 and rank 1.
+        let r0 = Some(MlaDraftShard { axis: MlaDraftShardAxis::Rows, rank: 0, ranks: 2 });
+        let r1 = Some(MlaDraftShard { axis: MlaDraftShardAxis::Rows, rank: 1, ranks: 2 });
+        assert_eq!(words(make(MlaDraftPacking::Uk, vec![1,2,1], r0).pack(&mut read)?), [0,1]);
+        assert_eq!(words(make(MlaDraftPacking::Uk, vec![1,2,1], r1).pack(&mut read)?), [6,7]);
+        assert_eq!(words(make(MlaDraftPacking::Uv, vec![1,2,2], r0).pack(&mut read)?), [2,3,4,5]);
+        assert_eq!(words(make(MlaDraftPacking::Uv, vec![1,2,2], r1).pack(&mut read)?), [8,9,10,11]);
+        // TP2 column-sharded Direct slices each row cleanly.
+        let c0 = Some(MlaDraftShard { axis: MlaDraftShardAxis::Columns, rank: 0, ranks: 2 });
+        let c1 = Some(MlaDraftShard { axis: MlaDraftShardAxis::Columns, rank: 1, ranks: 2 });
+        assert_eq!(words(make(MlaDraftPacking::Direct, vec![6,1], c0).pack(&mut read)?), [0,2,4,6,8,10]);
+        assert_eq!(words(make(MlaDraftPacking::Direct, vec![6,1], c1).pack(&mut read)?), [1,3,5,7,9,11]);
+        let unit = MlaDraftWeight { owner: "unit".into(), shape: vec![2,2], sources: vec![],
+            packing: MlaDraftPacking::UnitScale, shard: None };
         assert_eq!(words(unit.pack(&mut read)?), [0,0,0x3f80,0x3f80]);
-        let fused = MlaDraftWeight { owner: "fused".into(), shape: vec![12,2], sources: vec![source.clone(),source], packing: MlaDraftPacking::GateUp };
-        assert_eq!(fused.pack(&mut read)?, [bytes.clone(),bytes].concat());
+        let fused = MlaDraftWeight { owner: "fused".into(), shape: vec![12,2], sources: vec![source.clone(),source.clone()],
+            packing: MlaDraftPacking::GateUp, shard: None };
+        assert_eq!(fused.pack(&mut read)?, [bytes.clone(),bytes.clone()].concat());
+        let fused_r1 = MlaDraftWeight { owner: "fused".into(), shape: vec![6,2], sources: vec![source.clone(),source],
+            packing: MlaDraftPacking::GateUp, shard: r1 };
+        assert_eq!(words(fused_r1.pack(&mut read)?), [6,7,8,9,10,11,6,7,8,9,10,11]);
+        Ok(())
+    }
+
+    #[test]
+    fn ml4_tp2_runtime_layout_shards_heads_and_ffn_and_keeps_head_on_lead() -> anyhow::Result<()> {
+        use crate::families::{glm5::draft_representation::GlmDraftCapacity,
+            mistral_large4::{dspark::Ml4DsparkConfig, Ml4Config}};
+        let target = Ml4Config::from_hf(&crate::families::mistral_large4::config::tests::official())?;
+        let dspark = Ml4DsparkConfig { layers: 3, depth: 3, taps: vec![1, 18, 36, 54, 71], window: 2048, markov_rank: 512 };
+        let whole_cfg = MlaDflashConfig::ml4(&dspark, &target)?;
+        let tp2_cfg = MlaDflashConfig::ml4_tp2(&dspark, &target)?;
+        assert_eq!(tp2_cfg.kind, cuteafd_core::coordinator_programs::MlaDraftKind::Ml4DsparkTp2);
+        assert_eq!((tp2_cfg.mla.heads, tp2_cfg.intermediate), (32, 12288));
+        assert_eq!(tp2_cfg.tensor_shapes(), whole_cfg.tensor_shapes());
+        let capacity = GlmDraftCapacity::new(20, 16, 3)?;
+        let lead = tp2_cfg.ml4_tp2_runtime_layout(0, capacity, 1 << 20, 1 << 20, 188, MlaCacheFormat::Fp8)?;
+        let peer = tp2_cfg.ml4_tp2_runtime_layout(1, capacity, 1 << 20, 1 << 20, 188, MlaCacheFormat::Fp8)?;
+        assert!(lead.has_head() && !peer.has_head());
+        assert_eq!(lead.window_mark_bytes()?, peer.window_mark_bytes()?);
+        assert_eq!(lead.buffers().iter().find(|b| b.name == "query").unwrap().bytes, 64 * 32 * 576 * 2);
+        assert_eq!(lead.buffers().iter().find(|b| b.name == "native_scratch").unwrap().bytes, 33_685_504);
+        assert_eq!(lead.buffers().iter().find(|b| b.name == "reduced").unwrap().bytes, 16 * 3 * 6144 * 2);
+        assert_eq!(peer.buffers().iter().find(|b| b.name == "reduced").unwrap().bytes, 16 * 3 * 6144 * 2);
+        for lead_only in ["head_workspace", "logits", "markov_norms", "markov_workspace", "anchors", "ids", "tokens", "host.landing"] {
+            assert!(lead.owners().iter().any(|o| o.id == lead_only), "lead missing {lead_only}");
+            assert!(!peer.owners().iter().any(|o| o.id == lead_only), "peer must omit {lead_only}");
+        }
+        assert!(peer.weight_destinations().iter().all(|w| !w.owner.contains("autoregressive_head") && !w.owner.contains("mask_embedding")));
+        assert!(lead.weights().resident_bytes()? > peer.weights().resident_bytes()?);
         Ok(())
     }
 

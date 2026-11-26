@@ -151,7 +151,14 @@ impl CaptureTicket {
         // Instantiation/upload and budget sampling may block. Telemetry and
         // physical observers must not wait on CUDA while holding this mutex.
         drop(cache);
-        let exec = source.instantiate(stream)?;
+        // Time inside instantiation (instantiate and upload), counted whether or not it
+        // succeeds: published top-level as `graph_instantiate_ns`. The counter is shared
+        // code beside the bank, because every graph-using family captures through it.
+        let instantiate_started = std::time::Instant::now();
+        let exec = source.instantiate(stream);
+        crate::shared::decode_graph::stats::GLOBAL
+            .record_graph_instantiate(instantiate_started.elapsed().as_nanos() as u64);
+        let exec = exec?;
         self.cache.lock().unwrap_or_else(|p| p.into_inner())
             .register_native(self.id, exec as usize, source.signature.clone());
         Ok((exec, source.nodes, source.width, source.spans_devices, inspection_error))
@@ -850,6 +857,9 @@ mod device_tests {
             banks[lane].cache_measured(10);
         }
         let cache = banks[0].device.as_ref().unwrap().cache.clone();
+        // Age both idle owners past K before starting the retirement test.
+        cache.lock().unwrap().serial_boundary();
+        cache.lock().unwrap().serial_boundary();
         // SAFETY: fixture owners contain counters, not captured allocations.
         for lane in 0..2 { unsafe { device::lane_cycle(lane, true,
             |visit| visit(-394, "bank-test", false, &mut banks[lane])) }?; }

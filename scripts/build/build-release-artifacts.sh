@@ -281,6 +281,7 @@ cmake \
   -DCUTEAFD_ENABLE_INKLING2_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_INKLING2_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_INKLING2_MINI_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_INKLING2_MINI_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_HY4F_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_HY4F_AOT:-OFF}" || echo OFF)" \
+  -DCUTEAFD_ENABLE_HY4_AOT="$( [[ "$role" == coordinator ]] && echo "${CUTEAFD_RELEASE_HY4_AOT:-OFF}" || echo OFF)" \
   -DCUTEAFD_ENABLE_EXLR8_AOT="${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" \
   -DCUTEAFD_EXLR8_FAMILIES="${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}" \
   -DCUTEAFD_ENABLE_V41_ATTENTION_AOT="$coordinator_aot" \

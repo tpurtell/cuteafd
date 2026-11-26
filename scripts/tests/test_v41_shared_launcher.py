@@ -146,6 +146,8 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
             expected_command[expected_command.index("--prefill-batch-tokens") + 1] = "2752"
         if role == "coordinator" and value("--rtx-gpus") == "2" and "--dspark" in expected_command:
             expected_command.append("--tp2-dspark-experts")
+        if role == "coordinator" and value("--rtx-gpus") == "1" and "--dspark" in expected_command:
+            expected_command += ["--decode-rows", "128"]
         if role == "worker":
             # Old captures confused the weight ceiling (100 GiB) with the
             # planner's automatic CUDA allocation ceiling (108 GiB).
@@ -240,7 +242,7 @@ def test_scale_preload_cap_reaches_plan_and_native_serve(tmp_root, monkeypatch, 
 
 
 @pytest.mark.parametrize("limit", [None, "7", "99"])
-def test_draft_length_reaches_serve_and_never_the_plan(tmp_root, monkeypatch, limit) -> None:
+def test_draft_length_reaches_serve_and_verify_budget_plan(tmp_root, monkeypatch, limit) -> None:
     import v41_launch_capture as capture_module
     original = capture_module.example_config
 
@@ -256,11 +258,14 @@ def test_draft_length_reaches_serve_and_never_the_plan(tmp_root, monkeypatch, li
     monkeypatch.setattr(capture_module, "example_config", with_limit)
     result = capture_module.capture(ROOT, "deepseek-v41-mxfp4-max")
     command = parse_run(result["containers"][0]["argv"])["command"]
-    # The drafter always loads its native block, so the plan does not depend on the fixed width.
+    # The drafter loads its native block, but fixed width bounds verify demand.
     assert command.count("--draft-length") == (limit is not None)
     if limit is not None:
         assert command[command.index("--draft-length") + 1] == limit
-    assert all("--draft-length" not in plan for plan in result["plans"])
+    for plan in result["plans"]:
+        assert plan.count("--draft-length") == (limit is not None)
+        if limit is not None:
+            assert plan[plan.index("--draft-length") + 1] == limit
 
 
 def test_goldens_cover_every_v41_example_and_archived_gate_card() -> None:

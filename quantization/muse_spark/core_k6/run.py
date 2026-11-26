@@ -384,6 +384,7 @@ def argument_parser():
     parser.add_argument('--core-bits',type=int,choices=(6,8),default=6)
     parser.add_argument('--core-only',action='store_true',
         help='export only 373 packed core modules; retain native experts for causal propagation')
+    import hub_lfs;hub_lfs.add_arguments(parser)
     return parser
 
 
@@ -410,7 +411,7 @@ def main():
         with exclusive_run(args.root):
             done=json.loads((args.root/'quantization-complete.json').read_text())
             if done['identity']!=plan['identity']:raise ValueError('publication producer differs')
-            publish(args.export,args.root,TARGET_REPO)
+            import hub_lfs;publish(args.export,args.root,TARGET_REPO,options=hub_lfs.options_from(args))
         return
     torch.set_num_threads(8);numerical.configure_math()
     torch.cuda.set_per_process_memory_fraction((40 if args.core_only else 86)*GIB/torch.cuda.get_device_properties(0).total_memory)

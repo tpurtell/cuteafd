@@ -1,5 +1,9 @@
 //! Canonical serving decode shapes and exact-key graph ownership.
 
+pub(crate) use cuteafd_loader::serving_capacity::decode_graph_key::{
+    GraphGeometry, MIN_PAGE_STRIDE, decode_page_stride, decode_strides,
+};
+
 #[derive(Clone, Copy, Default)]
 struct Options { no_prewarm: bool, donor_always: bool, donor_cold_lag: u64 }
 impl Options {
@@ -80,6 +84,7 @@ macro_rules! cache_attached_methods {
 mod bank;
 pub(crate) mod device;
 pub(crate) mod census;
+pub(crate) mod stats;
 mod owner;
 pub(crate) mod sites;
 mod native;

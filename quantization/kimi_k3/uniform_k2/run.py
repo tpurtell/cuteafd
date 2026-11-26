@@ -594,18 +594,30 @@ artifact. Full-model generation/benchmark evaluation has not been performed.
     return dict(tensors=len(weight_map), payload_bytes=total, shards=94, routed_projections=247296)
 
 
-def publish(export, root, repo_id):
+def _receipt_digests(export):
+    """Writer SHA256 per shard from its layer receipt; HTTP LFS never rehashes weights."""
+    digests = {}
+    for path in Path(export).glob("*.safetensors"):
+        name = ("extras-receipt.json" if path.name.startswith("model-00094")
+                else f"layer-{int(path.name.split('-')[1]) - 1:03d}-receipt.json")
+        receipt = json.loads((Path(export) / name).read_text())
+        verify_receipt(path, receipt)
+        digests[path.name] = receipt["sha256"]
+    return digests
+
+
+def publish(export, root, repo_id, *, options=None):
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
     from huggingface_hub.constants import HF_HUB_CACHE
-    from kimi_k3.uniform_k2.publish import install_upload_compat
-    install_upload_compat()
+    import hub_lfs
+    from hub_requirements import require_qualified_hub
+    require_qualified_hub()  # HTTP LFS before any remote mutation.
     api = HfApi()
     api.create_repo(repo_id, repo_type="model", exist_ok=True, private=False)
-    # The resumable large-folder API retains upload hashes/tasks under export's
-    # ignored cache; no second payload copy or terminal-session dependency.
-    api.upload_large_folder(repo_id=repo_id, repo_type="model", folder_path=str(export),
-                            ignore_patterns=["*-receipt.json", "layer-*-receipt.json", ".cache/**"],
-                            num_workers=4, print_report=True, print_report_every=1800)
+    # Verified, resumable HTTP LFS batches; hashes of small files persist under root.
+    hub_lfs.upload_folder(api, repo_id, export, ignore_patterns=["*-receipt.json", "layer-*-receipt.json", ".cache/**"], state=root,
+                          digests=_receipt_digests(export), options=options,
+                          commit_message="Publish calibrated EXL3 checkpoint")
     info = api.model_info(repo_id, files_metadata=True)
     remote = {file.rfilename: file for file in info.siblings}
     published_files = {}
@@ -677,6 +689,8 @@ def main():
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--publish", action="store_true")
     parser.add_argument("--publish-only", action="store_true")
+    import hub_lfs
+    hub_lfs.add_arguments(parser)
     args = parser.parse_args()
     args.root.mkdir(parents=True, exist_ok=True)
     source = KimiK3Source(args.source_snapshot)
@@ -693,7 +707,7 @@ def main():
                 raise ValueError("publication requires a verified complete quantization")
             progress = Progress(args.root)
             progress.emit("publication_started", layer=92)
-            revision = publish(args.export, args.root, plan["publication_repo"])
+            revision = publish(args.export, args.root, plan["publication_repo"], options=hub_lfs.options_from(args))
             progress.state["status"] = "complete"
             progress.emit("complete", layer=92, revision=revision, **complete["summary"])
         return
@@ -784,7 +798,7 @@ def main():
                         summary=summary, time=utc_now()))
             shutil.rmtree(boundary.root)
             if args.publish:
-                revision = publish(args.export, args.root, plan["publication_repo"])
+                revision = publish(args.export, args.root, plan["publication_repo"], options=hub_lfs.options_from(args))
                 progress.emit("published", revision=revision, repo=plan["publication_repo"])
             progress.state["status"] = "complete" if args.publish else "quantized"
             progress.emit("complete" if args.publish else "quantization_complete", layer=92, **summary)

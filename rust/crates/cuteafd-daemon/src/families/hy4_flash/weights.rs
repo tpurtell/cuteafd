@@ -1,6 +1,9 @@
 //! Header-admitted packed target weight arena and host-resident FP8 Engram tables
 //! with earliest-possible look-ahead and background pinned staging for Hy4-flash.
-use super::native::{dequant_kv_b_trellis_absorbed, Hy4NativeCore};
+use super::native::{dequant_kv_b_trellis_absorbed, load_native_core, Hy4NativeCore};
+pub(super) use crate::families::hy4_common::weights::{
+    inv_freq_bytes, kv_b_absorbed_ptrs, pack_kv_b_absorbed, read_tensor_bytes,
+};
 use crate::shared::mapped_table::wait_rows;
 use crate::shared::memory::{
     budget::admit_host_memory,
@@ -28,7 +31,6 @@ use cuteafd_loader::families::hy4_flash::Hy4FlashConfig;
 use cuteafd_loader::formats::mapped_preload::{MappedPlacement, DEFAULT_CAP_BYTES};
 use cuteafd_loader::formats::mapped_table::lookahead::{LookaheadHandle, UnitPlan};
 use cuteafd_loader::formats::mapped_table::ReadPriority;
-use cuteafd_loader::formats::trellis_core::CoreSplit;
 use cuteafd_loader::placement::families::hy4_flash as hy4_placement;
 use cuteafd_loader::placement::AttentionPlacement;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
@@ -37,7 +39,7 @@ use cuteafd_loader::shared::token_table::{AdmissionTimedOut, TablePipeline};
 use cuteafd_loader::{GatherLease, GatherTicket, TableStatsSnapshot};
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::{fs::File, ops::Range, os::unix::fs::FileExt};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -430,87 +432,8 @@ fn packed_engram_rects(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig, name: &str
     Ok(None)
 }
 
-pub(super) fn read_tensor_bytes(checkpoint: &Checkpoint, name: &str) -> Result<(Vec<u8>, DType, Vec<usize>)> {
-    let entry = checkpoint
-        .tensors
-        .iter()
-        .find(|t| t.meta.name == name)
-        .with_context(|| format!("Hy4-flash checkpoint missing tensor {name}"))?;
-    let file = File::open(checkpoint.snapshot.join(&entry.shard))
-        .with_context(|| format!("opening shard {} for {name}", entry.shard))?;
-    let mut bytes = vec![0u8; usize::try_from(entry.meta.byte_length)?];
-    file.read_exact_at(&mut bytes, entry.meta.byte_offset)?;
-    Ok((bytes, entry.meta.dtype.clone(), entry.meta.shape.clone()))
-}
-
 fn dense_rect(checkpoint: &Checkpoint, name: &str, rank: usize, gpus: usize) -> Result<Rect> {
-    let stem = name.strip_suffix(".weight").unwrap_or(name);
-    let tensor = if checkpoint.contains_tensor(name) { name.to_owned() } else { format!("{name}.weight") };
-    let header = checkpoint.header(&tensor).with_context(|| format!("Hy4-flash checkpoint missing {tensor}"))?;
-    let element = match header.dtype {
-        DType::Bf16 | DType::F16 => 2,
-        DType::F32 => 4,
-        ref other => bail!("Hy4-flash unsupported target tensor dtype {other:?} for {tensor}"),
-    };
-    let share = |n: usize| -> Result<Range<usize>> {
-        ensure!(n % gpus == 0, "Hy4-flash {tensor} cannot split extent {n} across {gpus} ranks");
-        let width = n / gpus;
-        Ok(rank * width..(rank + 1) * width)
-    };
-    let (rows, cols) = if stem.ends_with(".self_attn.learnable_sink_param") {
-        ensure!(header.dtype == DType::F32 && header.shape.len() == 1, "bad sink shape for {tensor}");
-        (None, Some(share(header.shape[0] * element)?))
-    } else if gpus == 2 && header.shape.len() == 2 {
-        let split = if stem == "lm_head" { CoreSplit::Output } else { core_split(stem) };
-        match split {
-            CoreSplit::Output => (Some(share(header.shape[0])?), None),
-            CoreSplit::Input => (None, Some(share(header.shape[1] * element)?)),
-            CoreSplit::Whole => (None, None),
-        }
-    } else {
-        (None, None)
-    };
-    Rect::tensor(checkpoint, &tensor, rows, cols)
-}
-
-pub(super) fn pack_kv_b_absorbed(
-    raw: &[u8],
-    local_heads: usize,
-    nope: usize,
-    v_dim: usize,
-    kv_lora: usize,
-) -> Result<Vec<u8>> {
-    let head_rows = nope + v_dim;
-    ensure!(
-        raw.len() == local_heads * head_rows * kv_lora * 2,
-        "kv_b_proj raw length {} != expected {}",
-        raw.len(),
-        local_heads * head_rows * kv_lora * 2
-    );
-    let uk_bytes = local_heads * kv_lora * nope * 2;
-    let uv_bytes = local_heads * v_dim * kv_lora * 2;
-    let mut out = vec![0u8; uk_bytes + uv_bytes];
-    // Transform [local_heads, nope + v_dim, kv_lora] ->
-    //   w_uk [local_heads, kv_lora, nope] followed by w_uv [local_heads, v_dim, kv_lora].
-    for h in 0..local_heads {
-        let src_h = h * head_rows * kv_lora * 2;
-        // w_uk: transpose [nope, kv_lora] -> [kv_lora, nope]
-        let dst_uk = h * kv_lora * nope * 2;
-        for d in 0..nope {
-            for c in 0..kv_lora {
-                let s = src_h + (d * kv_lora + c) * 2;
-                let t = dst_uk + (c * nope + d) * 2;
-                out[t] = raw[s];
-                out[t + 1] = raw[s + 1];
-            }
-        }
-        // w_uv: copy [v_dim, kv_lora] verbatim
-        let src_v = src_h + nope * kv_lora * 2;
-        let dst_uv = uk_bytes + h * v_dim * kv_lora * 2;
-        let v_span = v_dim * kv_lora * 2;
-        out[dst_uv..dst_uv + v_span].copy_from_slice(&raw[src_v..src_v + v_span]);
-    }
-    Ok(out)
+    crate::families::hy4_common::weights::dense_rect(checkpoint, name, rank, gpus, core_split)
 }
 
 /// Pack column-major `W^T [kv_lora, local_heads * (nope + v_dim)]` BF16 (as returned by
@@ -557,16 +480,6 @@ fn pack_kv_b_absorbed_from_transposed(
     Ok(out)
 }
 
-fn inv_freq_bytes(rope_dim: usize, theta: f64) -> Vec<u8> {
-    let half = rope_dim / 2;
-    let mut bytes = Vec::with_capacity(half * 4);
-    for i in 0..half {
-        let freq = (1.0f64 / theta.powf((2 * i) as f64 / rope_dim as f64)) as f32;
-        bytes.extend_from_slice(&freq.to_le_bytes());
-    }
-    bytes
-}
-
 impl<'a> Hy4RankWeights<'a> {
     pub(crate) fn load_all(
         devices: &[Device<'a>],
@@ -605,7 +518,7 @@ impl<'a> Hy4RankWeights<'a> {
                 )?;
 
                 // Load compact-core EXL3/FP8 projections directly into their preplanned arena views.
-                let native = Hy4NativeCore::load(device, programs, checkpoint, &layout, max_rows, &arena)?;
+                let native = load_native_core(device, programs, checkpoint, &layout, max_rows, &arena)?;
                 let claimed_by_native = |name: &str| -> bool {
                     for suffix in [".trellis", ".suh", ".svh"] {
                         if let Some(stem) = name.strip_suffix(suffix) {
@@ -784,10 +697,7 @@ impl<'a> Hy4RankWeights<'a> {
     /// Return `(w_uk [local_heads, 512, 192], w_uv [local_heads, 256, 512])` pointers inside `kv_b_proj`.
     pub(crate) fn kv_b_absorbed(&self, layer: usize, local_heads: usize) -> Result<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
         let buf = self.weight(&format!("model.layers.{layer}.self_attn.kv_b_proj"))?;
-        let uk_bytes = local_heads * 512 * 192 * 2;
-        let uv_bytes = local_heads * 256 * 512 * 2;
-        ensure!(buf.bytes == uk_bytes + uv_bytes, "kv_b_proj absorbed view size mismatch");
-        Ok((buf.ptr, buf.ptr.cast::<u8>().wrapping_add(uk_bytes).cast()))
+        kv_b_absorbed_ptrs(buf, local_heads, 192, 256, 512)
     }
 
     /// Record the packed target weight arena (one physical backing + all named views)
@@ -815,6 +725,7 @@ impl<'a> Hy4RankWeights<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cuteafd_loader::formats::trellis_core::CoreSplit;
     use cuteafd_loader::plan::checkpoint::{CheckpointView, CoreView};
 
     #[test]

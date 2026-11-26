@@ -511,4 +511,107 @@ mod tests {
         assert!(bind.contains("draft_head.as_ref()"));
         Ok(())
     }
+
+    #[test]
+    fn runtime_dense_core_selects_mul1_and_mcg_programs_by_weight_codebook() -> Result<()> {
+        use cuteafd_loader::formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook};
+        use serde_json::json;
+
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+
+        let (k, n, side, rows) = (128usize, 256usize, 1usize, 64usize);
+        let mut entries = Vec::new();
+        let mut policies = Vec::new();
+        for bits in [6usize, 8] {
+            for book in ["mcg", "mul1"] {
+                let shape = format!("glmf_test_k{bits}_{book}");
+                let routes = [format!("input_{shape}"), format!("core_{shape}"), format!("output_{shape}")];
+                policies.push(json!({"shape": shape, "input_features": k, "output_features": n,
+                    "sharded_side": side, "bits": bits, "codebook": book,
+                    "native_input": routes[0], "native_program": routes[1], "output_program": routes[2]}));
+                let geometries = [
+                    json!({"features": k, "input_dtype": "bf16", "max_rows": 4096}),
+                    json!({"abi_version": 1, "input_features": k, "output_features": n, "bits": bits,
+                        "codebook": book, "sharded_side": side, "rotation_count": 1, "max_rows": 4096,
+                        "split_k_blocks": 8, "splits": 1, "ctas_per_sm": 4}),
+                    json!({"features": n, "output_dtype": "bf16", "max_rows": 4096}),
+                ];
+                let pointers = [
+                    vec!["input", "suh", "rotated", "input_block_scales"],
+                    vec!["rotated_inputs", "payload", "input_block_scales", "partial", "output"],
+                    vec!["input", "svh", "output"],
+                ];
+                for i in 0..3 {
+                    entries.push(json!({"name": format!("dense_trellis_k6_{}", routes[i]), "capacity_rows": 4096,
+                        "geometry": geometries[i],
+                        "pointers": pointers[i].iter().map(|p| json!({"name": p})).collect::<Vec<_>>(),
+                        "scalars": vec![json!({"type": "int32"}); if i == 1 { 3 } else { 2 }],
+                        "scratch_bytes_at_capacity": if i == 1 { json!({"partial": 4096 * n * 4}) } else { json!({}) }}));
+                }
+            }
+        }
+        fixture.register_programs(&library, &entries)?;
+        let dir = tempfile::tempdir()?;
+        let write_manifest = |name: &str, keep: Option<&str>| -> Result<std::path::PathBuf> {
+            let path = dir.path().join(name);
+            let filtered: Vec<_> = policies.iter()
+                .filter(|p| keep.is_none_or(|b| p["codebook"].as_str() == Some(b)))
+                .cloned().collect();
+            std::fs::write(&path, serde_json::to_vec(&json!({
+                "families": {"dense_trellis_k6": {"abi_version": 1, "row_policies": filtered}},
+                "programs": entries,
+            }))?)?;
+            Ok(path)
+        };
+        let dual_programs = library.programs()?.with_manifest(&write_manifest("dual.json", None)?)?;
+        let mcg_only = library.programs()?.with_manifest(&write_manifest("mcg.json", Some("mcg"))?)?;
+
+        let make_weights = |bits: usize, book: Exl3Codebook| -> Result<CoreWeights<'_>> {
+            Ok(CoreWeights {
+                payload: Allocation::new(device, n * k * bits / 8, crate::shared::memory::TEST)?,
+                suh: Allocation::new(device, k * 2, crate::shared::memory::TEST)?,
+                svh: Allocation::new(device, n * 2, crate::shared::memory::TEST)?,
+                shape: [n, k], side: TrellisSide::Output, bits, codebook: book,
+            })
+        };
+
+        for bits in [6usize, 8] {
+            let mul1_w = make_weights(bits, Exl3Codebook::Mul1)?;
+            let mcg_w = make_weights(bits, Exl3Codebook::Mcg)?;
+            let mul1_key = key(&mul1_w);
+            let mcg_key = key(&mcg_w);
+            assert_eq!(mul1_key.3, "mul1");
+            assert_eq!(mcg_key.3, "mcg");
+            assert_ne!(mul1_key, mcg_key);
+
+            let mul1_proj = Projection::load_geometry_bits(&dual_programs,
+                mul1_key.0, mul1_key.1, mul1_key.2, mul1_key.4, mul1_key.3, rows, TrellisDType::Bf16)?;
+            let mcg_proj = Projection::load_geometry_bits(&dual_programs,
+                mcg_key.0, mcg_key.1, mcg_key.2, mcg_key.4, mcg_key.3, rows, TrellisDType::Bf16)?;
+
+            assert_eq!(mul1_proj.program.policy().codebook, "mul1");
+            assert_eq!(mul1_proj.program.policy().native, format!("dense_trellis_k6_core_glmf_test_k{bits}_mul1"));
+            assert_eq!(mcg_proj.program.policy().codebook, "mcg");
+            assert_eq!(mcg_proj.program.policy().native, format!("dense_trellis_k6_core_glmf_test_k{bits}_mcg"));
+
+            // Mismatched weight codebook must be rejected at launch time on both core() and core_into().
+            let scratch = ProjectionLayout::new(&mul1_proj.program, rows)?
+                .allocate(device, crate::shared::memory::TEST)?;
+            let input = Allocation::new(device, rows * k * 2, crate::shared::memory::TEST)?;
+            let accum = Allocation::new(device, rows * n * 4, crate::shared::memory::TEST)?;
+            assert!(mul1_proj.core(1, input.buffer, &mcg_w, &scratch, std::ptr::null_mut()).is_err());
+            assert!(mcg_proj.core(1, input.buffer, &mul1_w, &scratch, std::ptr::null_mut()).is_err());
+            assert!(mul1_proj.core_into(1, input.buffer, &mcg_w, &scratch, accum.buffer, std::ptr::null_mut()).is_err());
+            assert!(mcg_proj.core_into(1, input.buffer, &mul1_w, &scratch, accum.buffer, std::ptr::null_mut()).is_err());
+
+            // Missing mul1 policy in PROGRAMS.json must fail closed, never fall back to mcg.
+            assert!(Projection::load_geometry_bits(&mcg_only,
+                mul1_key.0, mul1_key.1, mul1_key.2, mul1_key.4, mul1_key.3, rows, TrellisDType::Bf16).is_err());
+        }
+        Ok(())
+    }
 }

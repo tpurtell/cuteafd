@@ -878,6 +878,12 @@ fn boot_concurrency_full_plan_matrix() {
             options.attention_placement = None;
             Case { family: "hy4_flash", label: "hy4_flash", dir, topologies: &[(2, 0), (1, 2)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: Some(options) }
         }),
+        Box::new(|| {
+            let (dir, manifest) = families::hy4::tests::concurrency_matrix_snapshot();
+            let mut options = wave_plan_options(dir.path(), 4);
+            options.attention_placement = None;
+            Case { family: "hy4", label: "hy4", dir, topologies: &[(1, 4), (2, 6)], concurrencies: ALL_CONCURRENCIES, manifest: Some(manifest), base_options: Some(options) }
+        }),
     ];
 
     let queue = std::sync::Mutex::new(builders.into_iter());
@@ -1134,6 +1140,7 @@ fn v41_full_concurrency_launcher_admission_at_the_native_draft_block() {
             assert!(start.elapsed() < std::time::Duration::from_secs(10));
             assert!(report.fits && report.placement_supported && report.executable(),
                 "C{concurrency} GPUs={gpus}: {}", render(&report));
+            assert_eq!(usize::from(report.decode_lanes), gpus);
             let memory = report.memory_layout.as_ref().unwrap();
             assert!(memory.devices.iter().flat_map(|d| &d.items)
                 .filter(|i| i.category == Category::Drafter).map(|i| i.bytes).sum::<u64>() > 0);
@@ -1144,7 +1151,7 @@ fn v41_full_concurrency_launcher_admission_at_the_native_draft_block() {
             let sms = crate::placement::ArchContext::for_device("sm_120", 96 << 30).sms;
             let programs = crate::placement::families::deepseek_v41::owners::NativePrograms::new(&manifest, sms).unwrap();
             let expected = programs.dspark(&experts, 4096,
-                crate::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS, concurrency, 2, 7, gpus,
+                u64::from(report.decode_rows), concurrency, u64::from(report.decode_lanes), 7, gpus,
                 crate::placement::families::deepseek_v41::resident::Fp8Head::Packed).unwrap();
             for owner in expected.iter().filter(|owner| owner.group == "dSpark request lanes") {
                 let actual: u64 = memory.devices[usize::from(owner.gpu)].items.iter()
@@ -1198,6 +1205,79 @@ fn v41_one_decode_lane_charges_one_lane_and_returns_the_rest_to_kv() {
     }
 }
 
+/// V4.1 default decode lanes follow the coordinator RTX count: 1×RTX resolves
+/// to 1 lane (128 rows), 2×RTX resolves to 2 lanes (64 rows), with explicit
+/// 1|2 overrides on either layout, 1 lane at C1, and plan/admission/graph
+/// reserve all following the resolved lane count.
+#[test]
+fn v41_default_decode_lanes_follows_rtx_count() {
+    let dir = strict_v41_snapshot(false);
+    let input = PlanInput::open(dir.path()).unwrap();
+    let plan = |gpus: usize, lanes: Option<u8>, concurrency: u64| {
+        let sparks = if gpus == 1 { 3 } else { 6 };
+        let mut options = wave_plan_options(dir.path(), sparks);
+        options.decode_lanes = lanes;
+        let layout = options.layout.as_mut().unwrap();
+        layout.rtx_bytes = vec![96 << 30; gpus];
+        layout.concurrency = concurrency;
+        layout.context_tokens = 262_144;
+        layout.pool_tokens = None;
+        layout.workspace_manifest = v41_workspace(dir.path());
+        layout.native_mtp_layers = 3;
+        input.plan_spark_count(&options, sparks, Some(sparks)).unwrap()
+    };
+    let graph_bytes = |report: &PlanReport, gpu: usize| -> u64 {
+        report.memory_layout.as_ref().unwrap().devices.iter()
+            .find(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx && d.index == gpu as u32)
+            .unwrap().items.iter()
+            .find(|i| i.group.starts_with("graph reserve")).unwrap().bytes
+    };
+    let lane_bytes = |report: &PlanReport, prefix: &str| -> u64 {
+        report.memory_layout.as_ref().unwrap().devices.iter()
+            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+            .flat_map(|d| &d.items).filter(|i| i.group.starts_with(prefix)).map(|i| i.bytes).sum()
+    };
+
+    // 1×RTX defaults to 1 lane (128 verify rows), charges no lane-1 owners, and uses 1-lane graph reserve.
+    let min_default = plan(1, None, 16);
+    assert!(min_default.fits, "{}", render(&min_default));
+    assert_eq!(min_default.decode_lanes, 1);
+    assert_eq!(min_default.decode_rows, 128);
+    assert!(render(&min_default).contains("decode     1 lane(s), 128 verify rows"));
+    assert_eq!(lane_bytes(&min_default, "lane 1 "), 0);
+    assert_eq!(graph_bytes(&min_default, 0),
+        crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 1, 128).unwrap().bytes);
+
+    // Explicit DECODE_LANES=2 override works on 1×RTX and scales reserve & lane owners up.
+    let min_two = plan(1, Some(2), 16);
+    assert!(min_two.fits, "{}", render(&min_two));
+    assert_eq!(min_two.decode_lanes, 2);
+    assert!(lane_bytes(&min_two, "lane 1 ") > 0);
+    assert_eq!(graph_bytes(&min_two, 0),
+        crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 2, 64).unwrap().bytes);
+    assert!(graph_bytes(&min_two, 0) < graph_bytes(&min_default, 0));
+
+    // 2×RTX defaults to 2 lanes (64 verify rows), charges lane-1 owners, and uses 2-lane graph reserve.
+    let max_default = plan(2, None, 16);
+    assert!(max_default.fits, "{}", render(&max_default));
+    assert_eq!(max_default.decode_lanes, 2);
+    assert_eq!(max_default.decode_rows, 64);
+    assert!(render(&max_default).contains("decode     2 lane(s), 64 verify rows"));
+    assert!(lane_bytes(&max_default, "lane 1 ") > 0);
+    for gpu in [0usize, 1] {
+        assert_eq!(graph_bytes(&max_default, gpu),
+            crate::placement::families::deepseek_v41::admission::graph_allowance(2, gpu, 2, 64).unwrap().bytes);
+    }
+
+    // Explicit DECODE_LANES=1 override works on 2×RTX; C1 always resolves to 1 lane on both layouts.
+    let max_one = plan(2, Some(1), 16);
+    assert_eq!(max_one.decode_lanes, 1);
+    assert_eq!(lane_bytes(&max_one, "lane 1 "), 0);
+    assert_eq!(plan(1, Some(2), 1).decode_lanes, 1);
+    assert_eq!(plan(2, None, 1).decode_lanes, 1);
+    assert_eq!(plan(2, Some(2), 1).decode_lanes, 1);
+}
+
 /// V4.1 `DECODE_ROWS`: `auto` resolves 64; 128 and 256 grow decode-lane and Spark
 /// decode-execution charges and shrink the admitted KV pool accordingly; values
 /// past `CONCURRENCY * (max_draft + 1)` or past 256 are refused before layout.
@@ -1231,11 +1311,19 @@ fn v41_decode_rows_admits_wider_lanes_and_refuses_over_cap() {
             .map(|i| i.bytes).sum()
     };
     for gpus in [1, 2] {
-        let r64 = plan(None, Some(1), 16, gpus).unwrap();
+        let r64 = plan(Some(64), Some(1), 16, gpus).unwrap();
         let r128 = plan(Some(128), Some(1), 16, gpus).unwrap();
         let r256 = plan(Some(256), Some(1), 32, gpus).unwrap();
         assert!(r64.fits && r128.fits && r256.fits);
         assert_eq!((r64.decode_rows, r128.decode_rows, r256.decode_rows), (64, 128, 256));
+        for report in [&r64, &r128, &r256] {
+            for rank in 0..gpus {
+                let graph = report.memory_layout.as_ref().unwrap().devices[rank].items.iter()
+                    .find(|item| item.group.starts_with("graph reserve")).unwrap();
+                assert_eq!(graph.bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(
+                    gpus, rank, report.decode_lanes, report.decode_rows).unwrap().bytes);
+            }
+        }
         assert!(lane0(&r128) > lane0(&r64), "gpus={gpus}: 128 rows must cost more decode-lane bytes");
         assert!(lane0(&r256) > lane0(&r128), "gpus={gpus}: 256 rows must cost more decode-lane bytes");
         assert!(spark_exec(&r128) > spark_exec(&r64), "gpus={gpus}: 128 rows must raise Spark decode execution from 64 to 256");
@@ -2223,7 +2311,7 @@ fn v41_tp3_tp6_layout_charges_packed_residency_and_bf16_rings() {
                             &catalog, &dir.path().join("share/PROGRAMS.json"),
                             report.prefill_unit_rows.unwrap(), gpus, 188, report.prefill_waves.unwrap() as usize,
                             report.prefill_waves.unwrap() * report.prefill_unit_rows.unwrap(),
-                            crate::placement::families::deepseek_v41::owners::DECODE_LANE_ROWS, report.decode_lanes).unwrap();
+                            u64::from(report.decode_rows), report.decode_lanes).unwrap();
                         let cost = if gpus == 1 { costs[0].whole } else { costs[0].half[device.index as usize] };
                         assert_eq!(cost.resident, packed(gpus as u64));
                         assert_eq!(local.bytes, cost.resident + cost.staging + workspace);
@@ -2830,14 +2918,18 @@ fn glm5_flash_standard_exllamav3_checkpoint_is_ready() {
     assert!(crate::placement::families::glm5_flash::expert_workspace(&mul1_catalog,
         Some(&share.join("PROGRAMS.json")), 1, 1).is_ok());
 
-    // Dense core remains MCG-only for GLM (no dense feature/schema drift).
-    let mut mul1_dense = mul1_tensors;
-    mul1_dense.retain(|(name, ..)| !name.starts_with("model.language_model.layers.0.mlp.gate_proj."));
-    let mut dense_proj = exl3("model.language_model.layers.0.mlp.gate_proj", 12288, 4096, 6);
-    dense_proj[3].0 = "model.language_model.layers.0.mlp.gate_proj.mul1".into();
-    mul1_dense.extend(dense_proj);
-    let dense_report = plan(snapshot(config, &mul1_dense).path(), &quant_options(4)).unwrap();
-    assert_eq!(component(&dense_report, Component::DenseFfn).status, Status::MissingKernel);
+    // Native trellis dense core supports MUL1 (K6 and K8) as well as MCG for GLM Flash.
+    for dense_bits in [6usize, 8] {
+        let mut mul1_dense = mul1_tensors.clone();
+        mul1_dense.retain(|(name, ..)| !name.starts_with("model.language_model.layers.0.mlp.gate_proj."));
+        let mut dense_proj = exl3("model.language_model.layers.0.mlp.gate_proj", 12288, 4096, dense_bits);
+        dense_proj[3].0 = "model.language_model.layers.0.mlp.gate_proj.mul1".into();
+        mul1_dense.extend(dense_proj);
+        let mut mul1_cfg = config.clone();
+        mul1_cfg["quantization_config"]["codebook"] = json!("mul1");
+        let dense_report = plan(snapshot(mul1_cfg, &mul1_dense).path(), &quant_options(4)).unwrap();
+        assert_eq!(component(&dense_report, Component::DenseFfn).status, Status::Ready, "{}", render(&dense_report));
+    }
 }
 
 #[test]
@@ -5255,7 +5347,7 @@ fn v41_graph_reserve_is_one_card_size_independent_arena() {
         assert!(report.executable(), "{}", render(&report));
         let memory = report.memory_layout.unwrap();
         let graph = memory.devices[0].items.iter().find(|item| item.group.starts_with("graph reserve")).unwrap();
-        assert_eq!(graph.bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0).unwrap().bytes);
+        assert_eq!(graph.bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, report.decode_lanes, report.decode_rows).unwrap().bytes);
     }
 }
 
@@ -5266,20 +5358,26 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     let mut options = sparks(4);
     options.layout = Some(layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], context_tokens: 512, pool_tokens: Some(0),
         prefix_slots: Some(0), native_mtp_layers: 0, workspace_manifest: v41_workspace(dir.path()), ..Default::default() });
-    let automatic = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let auto_report = plan(dir.path(), &options).unwrap();
+    let auto_lanes = auto_report.decode_lanes;
+    let auto_rows = auto_report.decode_rows;
+    let automatic = auto_report.memory_layout.unwrap();
     assert_eq!(automatic.devices[0].capacity_bytes, crate::placement::inventory::PRO_TOTAL_BYTES);
     // The graph arena is one configured owner; automatic admission does not
     // grow it.
-    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0).unwrap().bytes);
+    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, auto_lanes, auto_rows).unwrap().bytes);
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
     let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
     let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&crate::read_json_file::<Value>(&dir.path().join("config.json")).unwrap(), 1).unwrap();
     let rank = cache.ranks[0];
     assert_eq!(state, (rank.active_state_per_sequence_bytes - 4 * 4096 * 4) * 16);
     options.layout.as_mut().unwrap().pool_tokens = Some(512);
-    let explicit = plan(dir.path(), &options).unwrap().memory_layout.unwrap();
+    let explicit_report = plan(dir.path(), &options).unwrap();
+    let explicit_lanes = explicit_report.decode_lanes;
+    let explicit_rows = explicit_report.decode_rows;
+    let explicit = explicit_report.memory_layout.unwrap();
     assert_eq!(explicit.devices[0].capacity_bytes, crate::placement::inventory::PRO_TOTAL_BYTES);
-    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0).unwrap().bytes);
+    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, explicit_lanes, explicit_rows).unwrap().bytes);
 }
 
 #[test]
@@ -5532,17 +5630,17 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     // original E4M3-relative and graph-relative headroom, not a real-card claim.
     let source = 129280 * 5120 * 2;
     let head_delta = Fp8Head::configured().resident(source).0 - Fp8Head::All.resident(source).0;
-    let graph_delta = crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0).unwrap().bytes - 1_048_576_000;
+    let graph_reserve = crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 1, 64).unwrap().bytes;
     let layout = layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
-        drafter_bytes: (4 << 30) - head_delta - graph_delta, prefill_rows: 0, ..Default::default() };
-    let roomy = PlanOptions { layout: Some(layout::LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], ..layout.clone() }), ..sparks(4) };
+        drafter_bytes: (4 << 30) - head_delta + 1_048_576_000 - graph_reserve, prefill_rows: 0, ..Default::default() };
+    let roomy = PlanOptions { decode_rows: Some(64), layout: Some(layout::LayoutOptions { rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES], ..layout.clone() }), ..sparks(4) };
     let roomy = input.plan_spark_count(&roomy, 6, Some(4)).unwrap();
     assert!(roomy.executable(), "{}", render(&roomy));
     // Three units of roundup64(reserve / 3).
     assert_eq!((roomy.prefill_reserve_rows, roomy.prefill_unit_rows, roomy.prefill_waves),
         (Some(8192), Some(2752), Some(3)));
-    let options = PlanOptions { layout: Some(layout.clone()), ..sparks(4) };
+    let options = PlanOptions { decode_rows: Some(64), layout: Some(layout.clone()), ..sparks(4) };
     let capped = input.plan_spark_count(&options, 6, Some(4)).unwrap();
     // Full physical capacity now fits the 1M pool without shrinking the
     // reserve. The former automatic ceiling made this same card refuse.
@@ -5553,7 +5651,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     assert!(capped.memory_layout.as_ref().unwrap().pool_tokens >= 1 << 20);
     // The BLAS/code split retires the mixed 2 GiB row, not the independent
     // graph reserve. This synthetic 31 GiB card now fits as well.
-    let compact = PlanOptions { layout: Some(layout::LayoutOptions {
+    let compact = PlanOptions { decode_rows: Some(64), layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![31 << 30], ..layout.clone() }), ..sparks(4) };
     let compact = input.plan_spark_count(&compact, 6, Some(4)).unwrap();
     assert!(compact.executable(), "{}", render(&compact));
@@ -5568,26 +5666,26 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     assert!(modules >= 34 << 20);
     let blas = bytes("cuBLAS handles:") + bytes("BLAS device initialization");
     assert_eq!(blas, 66 << 20);
-    assert_eq!(bytes("graph reserve"), crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0).unwrap().bytes);
+    assert_eq!(bytes("graph reserve"), crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, compact.decode_lanes, 64).unwrap().bytes);
     assert_eq!(bytes("native LoadedCode estimate"), 0);
     let retired = (2u64 << 30) + arch.cublas_bytes - modules - blas;
     eprintln!("V4.1 synthetic 31 GiB: selected modules {modules}, named BLAS {blas}, retired mixed allowance delta {retired} B; one graph reserve");
     // Less physical capacity still refuses rather than shrinking the reserve.
-    let limited = PlanOptions { layout: Some(layout::LayoutOptions {
+    let limited = PlanOptions { decode_rows: Some(64), layout: Some(layout::LayoutOptions {
         rtx_bytes: vec![28 << 30], ..layout.clone() }), ..sparks(4) };
     let limited = input.plan_spark_count(&limited, 6, Some(4)).unwrap();
     assert!(!limited.executable(), "{}", render(&limited));
     assert_eq!((limited.prefill_reserve_rows, limited.prefill_unit_rows, limited.prefill_waves),
         (Some(8192), Some(2752), Some(3)));
     assert!(limited.hints.iter().any(|hint| hint.what.contains("cannot fit")), "{}", render(&limited));
-    let explicit = PlanOptions { layout: Some(layout::LayoutOptions {
+    let explicit = PlanOptions { decode_rows: Some(64), layout: Some(layout::LayoutOptions {
         prefill_reserve_rows: Some(4096), ..layout.clone() }), ..sparks(4) };
     let explicit = input.plan_spark_count(&explicit, 6, Some(4)).unwrap();
     assert!(explicit.executable(), "{}", render(&explicit));
     assert_eq!((explicit.prefill_reserve_rows, explicit.prefill_unit_rows, explicit.prefill_waves),
         (Some(4096), Some(unit_rows_in(3, 4096)), Some(3)), "{}", render(&explicit));
     // An explicit pin keeps its shape whether or not it fits.
-    let pinned = PlanOptions { layout: Some(layout::LayoutOptions { prefill_rows: 1024, prefill_waves: 2, ..layout }), ..sparks(4) };
+    let pinned = PlanOptions { decode_rows: Some(64), layout: Some(layout::LayoutOptions { prefill_rows: 1024, prefill_waves: 2, ..layout }), ..sparks(4) };
     let pinned = input.plan_spark_count(&pinned, 6, Some(4)).unwrap();
     // The pinned shape reports the standard reserve the launcher forwards.
     assert_eq!((pinned.prefill_unit_rows, pinned.prefill_waves, pinned.prefill_reserve_rows), (Some(1024), Some(2), Some(8192)));

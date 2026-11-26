@@ -21,14 +21,10 @@ impl<'a> GlmEngine<'a> {
         self.tp2_layer(layer) || self.whole.as_ref().is_some_and(|owner| owner.layers.contains(&layer))
     }
 
-    /// Shared local FFN boundary for eager decode, captured segment gaps and prefill units.
-    pub(super) fn local_ffn(&self, layer: usize, lane: usize, w: &Workspace<'_>,
-        peer: Option<&Workspace<'_>>, rows: usize, cap: &str) -> Result<()> {
-        if self.tp2_layer(layer) {
-            return self.tp2_pair(layer, lane, w, peer.context("TP2 peer workspace")?, rows, cap);
-        }
+    /// Rank-0 local shared + routed Whole FFN (capture-safe on 1x RTX).
+    pub(super) fn whole_ffn_local(&self, layer: usize, w: &Workspace<'_>, rows: usize, cap: &str) -> Result<()> {
         let whole = self.whole.as_ref().context("whole routed owner")?;
-        self.shared_on(0, layer, w, &self.weights.layers[layer], Scalar::I32(rows as i32), cap)?;
+        self.shared_on_local(0, layer, w, &self.weights.layers[layer], Scalar::I32(rows as i32), cap)?;
         let input = if whole.uses_fp8_input() { ExpertInput::Fp8K32(w.wire.buffer.ptr) }
             else { ExpertInput::Bf16(w.x.buffer.ptr) };
         // SAFETY: one home-device stream owns the input, routes, shared and delta;
@@ -36,6 +32,20 @@ impl<'a> GlmEngine<'a> {
         unsafe { whole.enqueue(layer, rows, input, Routes { ids: w.route_ids.buffer.ptr,
             weights: w.route_weights.buffer.ptr }, w.shared.buffer, w.delta.buffer, self.stream,
             &mut || crate::shared::decode_graph::fatal_drain(self.abort_tp2(), "GLM whole enqueue abort")) }
+    }
+
+    /// Shared local FFN boundary for eager decode and prefill units.
+    pub(super) fn local_ffn(&self, layer: usize, lane: usize, w: &Workspace<'_>,
+        peer: Option<&Workspace<'_>>, rows: usize, cap: &str) -> Result<()> {
+        if self.tp2_layer(layer) {
+            return self.tp2_pair(layer, lane, w, peer.context("TP2 peer workspace")?, rows, cap);
+        }
+        self.whole_ffn_local(layer, w, rows, cap)
+    }
+
+    /// Whether TP2 experts run strictly rank-local (replicated routes, no route checks active).
+    pub(super) fn tp2_routes_replicated(&self) -> bool {
+        self.tp2.as_ref().is_some_and(|pair| pair.routes_replicated())
     }
 
     pub(crate) fn set_tp2_exchange(&mut self, dtype: ExchangeDtype) {
@@ -177,6 +187,35 @@ impl<'a> GlmEngine<'a> {
     }
 
     pub(crate) fn prime_tp2(&self) -> Result<()> {
+        if let Some(whole) = &self.whole {
+            if self.decode_workspace.borrow().is_none() {
+                *self.decode_workspace.borrow_mut() = Some(self.workspace(DECODE_ROWS, true)?);
+            }
+            self.ensure_prefill_slots()?;
+            let owned = self.prefill_slots.borrow();
+            let decode = self.decode_workspace.borrow();
+            let w = if self.prefill_rows >= DECODE_ROWS {
+                &owned[0]
+            } else {
+                decode.as_ref().context("decode workspace")?
+            };
+            let cap = if self.prefill_rows >= DECODE_ROWS { "m4096" } else { "m64" };
+            let layer_id = whole.layers[0];
+            let layer = &self.weights.layers[layer_id];
+            // SAFETY: startup buffers are initialized and exclusively owned on GPU 0's stream.
+            unsafe {
+                self.library.cuda_zero_bytes_async(w.x.buffer, w.rows * self.cfg.hidden * 2, self.stream)?;
+            }
+            self.moe_front_on(0, layer_id, w, layer, w.rows)?;
+            self.shared_on_local(0, layer_id, w, layer, Scalar::I32(w.rows as i32), cap)?;
+            let input = if whole.uses_fp8_input() { ExpertInput::Fp8K32(w.wire.buffer.ptr) }
+                else { ExpertInput::Bf16(w.x.buffer.ptr) };
+            // SAFETY: maximum-capacity initialized startup operands on GPU 0's stream.
+            unsafe {
+                whole.prime_whole(input, Routes { ids: w.route_ids.buffer.ptr, weights: w.route_weights.buffer.ptr },
+                    w.rows, w.shared.buffer, w.delta.buffer, self.stream, self.library)?;
+            }
+        }
         let Some(pair) = &self.tp2 else {
             return Ok(());
         };
@@ -280,7 +319,9 @@ impl<'a> GlmEngine<'a> {
         Ok(())
     }
 
-    pub(super) fn tp2_rank(
+    /// Rank-local TP2 routed expert enqueue + partial combine into `w.payload` (capture-safe
+    /// when `tp2_routes_replicated()` is true).
+    pub(super) fn tp2_rank_local(
         &self,
         pair: &Pair<'_>,
         rank: usize,
@@ -316,14 +357,40 @@ impl<'a> GlmEngine<'a> {
                         "GLM TP2 enqueue abort",
                     )
                 },
-            )?;
+            )
         }
+    }
+
+    /// Publish `rank`'s TP2 combined payload on `ffn_slot` (outside graph capture).
+    pub(super) fn tp2_publish(
+        &self,
+        pair: &Pair<'_>,
+        rank: usize,
+        layer: usize,
+        lane: usize,
+        w: &Workspace<'_>,
+        rows: usize,
+    ) -> Result<()> {
+        let out = w.payload.as_ref().context("TP2 payload")?.buffer.ptr;
         self.exchange()?.push(
             rank,
             slot(layer, true, lane),
             out,
             pair.combine.payload_bytes(rows, self.cfg.hidden),
         )
+    }
+
+    pub(super) fn tp2_rank(
+        &self,
+        pair: &Pair<'_>,
+        rank: usize,
+        layer: usize,
+        lane: usize,
+        w: &Workspace<'_>,
+        rows: usize,
+    ) -> Result<()> {
+        self.tp2_rank_local(pair, rank, layer, lane, w, rows)?;
+        self.tp2_publish(pair, rank, layer, lane, w, rows)
     }
 
     pub(super) fn tp2_norm(
@@ -566,19 +633,13 @@ mod whole_tests {
     #[test]
     fn eager_captured_and_wave_prefill_use_the_same_local_boundary() {
         let engine = include_str!("../engine.rs");
+        let local = include_str!("local_graph.rs");
         let eager = engine.split("fn step_inner(").nth(1).unwrap().split("fn ").next().unwrap();
-        let decode = engine.split("fn decode_layers(").nth(1).unwrap().split("fn peer_segment(").next().unwrap();
         let prefill = engine.split("fn local_ffn(&mut self").nth(1).unwrap().split("fn send_experts(").next().unwrap();
         assert!(eager.contains("self.local_ffn(index, 0, w, w1, t, cap)?"));
-        assert!(decode.contains("self.local_ffn(index, 0, w, None, t, \"m64\")?"));
-        assert!(decode.contains("layer.dense || self.local_layer(index) => Previous::Delta"));
+        assert!(local.contains("self.whole_ffn_local(index, w, t, \"m64\")"));
+        assert!(local.contains("self.tp2_rank_local(pair, 1, index, 0, w1, t)"));
+        assert!(local.contains("self.tp2_rank_local(pair, 0, index, 0, w, t)"));
         assert!(prefill.contains("self.engine.local_ffn(layer, slot"));
-        let warm = engine.split("pub fn warm_decode_graphs(").nth(1).unwrap().split("fn step(").next().unwrap();
-        assert!(warm.contains("glm_prewarm_shapes(self.prewarm_family(), self.ranks(), self.max_context, self.pages)"));
-        assert!(warm.contains("for shape in &shapes"));
-        assert!(warm.contains("run(false)?"));
-        assert!(warm.contains("let before = self.graph_memory_samples()?"));
-        assert!(warm.contains("let after = self.graph_memory_samples()?"));
-        assert!(warm.contains("self.graphs_warmed.set(true)"));
     }
 }

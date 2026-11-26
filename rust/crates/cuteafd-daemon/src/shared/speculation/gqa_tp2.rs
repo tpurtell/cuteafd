@@ -25,6 +25,18 @@ impl<'a,D> GqaHeadSplit<'a,D> {
         Ok(Self { peer,exchange,lead,reduced,peer_reduced })
     }
 
+    /// Reuse admitted per-rank reduction buffers owned by a typed draft recipe (e.g. ML4 TP2).
+    pub fn from_buffers(peer:DeviceOwner<'a,Box<D>>,exchange:Rc<PeerExchange<'a>>,lead:usize,
+        reduced:DeviceAllocation<'a>,peer_reduced:DeviceOwner<'a,DeviceAllocation<'a>>)->Result<Self> {
+        ensure!(lead<2 && peer.device.id==exchange.device(1-lead)
+            && reduced.buffer.device_id==exchange.device(lead)
+            && peer_reduced.device.id==exchange.device(1-lead)
+            && peer_reduced.buffer.device_id==exchange.device(1-lead)
+            && reduced.buffer.bytes>0 && reduced.buffer.bytes==peer_reduced.buffer.bytes,
+            "invalid TP2 head-split admitted reduction buffers");
+        Ok(Self { peer,exchange,lead,reduced,peer_reduced })
+    }
+
     /// Exchange complete F32 partials and deliver them in physical rank order
     /// to a local reducer. Both receivers acknowledge before the slot is reused.
     pub fn reduce_f32(&self, partials: [CuteafdDeviceBuffer; 2], elements: usize,

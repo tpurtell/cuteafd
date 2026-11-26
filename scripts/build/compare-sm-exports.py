@@ -477,6 +477,11 @@ def jobs(scope):
         ("vision-tower-kimi", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "tower", "--tower", "kimi",
             "--omit-program", "vision_projection_h4096_o4096", "--omit-program", "vision_gelu_h4096"]),
         ("vision-tower-minimax", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "tower", "--tower", "minimax"]),
+        ("vision-tower-hy4f", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "tower", "--tower", "hy4f"]),
+        ("vision-perception-inkling2", "export_b12x_vision_aot.py", ["--capability", "120", "--group", "perception", "--perception", "inkling2",
+            "--omit-program", "vision_gelu_h4096"]),
+        ("hy4f", "export_b12x_dsv4_aot.py", ["--geometry", "hy4f", "--decode-rows", "64", "--prefill-rows", "4096"]),
+        ("hy4f2", "export_b12x_dsv4_aot.py", ["--geometry", "hy4f2", "--decode-rows", "64", "--prefill-rows", "4096"]),
         ("audio-pcm", "export_b12x_audio_aot.py", ["--capability", "120", "--group", "pcm"]),
     ])
     for name, _, args in result:
@@ -503,6 +508,12 @@ def opt_in_jobs(scope="all"):
                     "--bits", "4,5", "--codebook", "mul1"]))
     result.append(("exl3-compact-hy4f-k45-mul1", "package_exl3_aot.py",
                    ["--geometry", "hy4f", "--capacities", EXL3_CAPACITIES,
+                    "--bits", "4,5", "--compact-companions", "--codebook", "mul1"]))
+    result.append(("exl3-hy4-k45-mul1", "package_exl3_aot.py",
+                   ["--geometry", "hy4", "--capacities", EXL3_CAPACITIES,
+                    "--bits", "4,5", "--codebook", "mul1"]))
+    result.append(("exl3-compact-hy4-k45-mul1", "package_exl3_aot.py",
+                   ["--geometry", "hy4", "--capacities", EXL3_CAPACITIES,
                     "--bits", "4,5", "--compact-companions", "--codebook", "mul1"]))
     return result
 

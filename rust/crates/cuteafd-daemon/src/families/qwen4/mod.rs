@@ -1477,11 +1477,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
                     let reference = golden.row(prefill + row)?;
                     metrics.push(values, Some(&reference), tokens.get(prefill + row + 1).copied())?;
                 }
-                let (rows, scored) = (metrics.rows, metrics.scored.max(1));
-                println!("decode logits: top-1 agreement {:.1}% over {rows} rows | next-token accuracy engine {:.1}% \
-                    golden {:.1}% | mean NLL {:.4} | mean KL(golden||engine) {:.5}", 100.0 * metrics.agree as f64 / rows as f64,
-                    100.0 * metrics.next_ok as f64 / scored as f64, 100.0 * metrics.reference_next as f64 / scored as f64,
-                    metrics.nll / scored as f64, metrics.kl / rows as f64);
+                println!("{}", metrics.context_only_line("decode"));
             }
         }
     }
@@ -1571,12 +1567,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::Qwen4Engine<'
         }
         let Some(golden) = &reference_logits else { return Ok(()) };
         if args.nll {
-            let m = &prefill_metrics;
-            let scored = m.scored.max(1) as f64;
-            println!("prefill logits: top-1 agreement {:.1}% over {prefill} rows | next-token accuracy engine {:.1}% \
-                golden {:.1}% | mean NLL engine {:.4} golden {:.4}", 100.0 * m.agree as f64 / prefill as f64,
-                100.0 * m.next_ok as f64 / scored, 100.0 * m.reference_next as f64 / scored,
-                m.nll / scored, m.reference_nll / scored);
+            println!("{}", prefill_metrics.context_only_line("prefill"));
         }
         let logits = &logits[logits.len() - vocab..];
         let last = golden.row(prefill - 1)?;
@@ -1618,8 +1609,8 @@ mod golden_tests {
         assert_eq!(reference.row(1).unwrap(), values[2..]);
         assert!(reference.row(2).is_err());
         assert!(golden_logits(dir.path(), true, 3, 1).is_err());
-        std::fs::write(&path, f32::NAN.to_le_bytes()).unwrap();
-        assert!(golden_logits(dir.path(), true, 1, 1).unwrap().unwrap().row(0).is_err());
+        std::fs::write(&path, [f32::NAN, 1.0].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()).unwrap();
+        assert!(golden_logits(dir.path(), true, 1, 2).is_err()); // refused at open (#2719)
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(golden_logits(dir.path(), true, 1, 1).is_err());

@@ -413,8 +413,8 @@ mod tests {
         assert!(norm.contains("if self.shared_zero_elided(index, layer) { 1 } else { 2 }"));
         let engine = include_str!("engine.rs");
         assert_eq!(engine.matches("if !self.shared_zero_elided(index, &layers[index]) { self.exchange()?.wait(0, ffn)?; }").count(), 2);
-        assert!(engine.contains("if !self.shared_zero_elided(before, &layers[before]) { self.exchange()?.wait(0, ffn)?; }"));
-        assert!(engine.contains("if !self.shared_zero_elided(index, layer) { exchange.push(1, ffn, out, bytes)?; }"));
+        let local = include_str!("engine/local_graph.rs");
+        assert!(local.contains("if !self.shared_zero_elided(before, &layers[before]) {"));
         let owned = include_str!("engine/layers.rs");
         assert!(owned.contains("rank == 1 || !e.shared_zero_elided(index, self.layer(rank, index))"));
         assert!(owned.contains("rank == 1 && e.shared_zero_elided(index, layer) { continue; }"));

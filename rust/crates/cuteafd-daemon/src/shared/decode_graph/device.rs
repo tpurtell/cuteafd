@@ -177,6 +177,9 @@ pub(crate) struct EpochStats {
     pub lagged_chunks: usize,
     pub uncredited_nodes: u64,
     pub reuse_growth_bytes: u64,
+    pub event_pending_cycles: u64,
+    pub boundary_drains: u64,
+    pub boundary_wait_us: u64,
 }
 
 #[derive(Default)]
@@ -423,6 +426,19 @@ impl SoftState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SoftRoom {
+    /// Incoming nodes fit in live soft capacity right now; capture immediately.
+    Available,
+    /// Live soft capacity is full, but cold victims covering this cycle's
+    /// accumulated unfulfilled capture demand (within the per-cycle clamp) are
+    /// queued for retirement at the next cycle boundary.
+    Queued,
+    /// Cannot make room this cycle (reclaimable cold capacity is insufficient
+    /// or the per-cycle eviction batch clamp is reached).
+    Full,
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct TraceRow {
     device: i32,
@@ -630,6 +646,17 @@ fn existing_cache(device: i32) -> Option<SharedCache> {
         .get(&device).and_then(std::sync::Weak::upgrade)
 }
 
+/// Measure an actual host graph-boundary wait, once per physical device.
+pub(crate) fn record_boundary_drain(devices: impl IntoIterator<Item = i32>, elapsed: Duration) {
+    for device in devices {
+        if let Some(cache) = existing_cache(device) {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.epochs.boundary_drains += 1;
+            cache.epochs.boundary_wait_us += elapsed.as_micros().min(u64::MAX as u128) as u64;
+        }
+    }
+}
+
 /// Reuse a periodic report's physical sample; older asynchronous reports may
 /// not replace a newer boundary sample. No CUDA query or graph-level mutation.
 pub(crate) fn monitor_physical(device: i32, sampled_at: Instant, free: u64, tracked: u64) {
@@ -648,13 +675,15 @@ fn observe_device_sampled(device: i32,
     sample: impl FnOnce() -> anyhow::Result<(u64, u64, u64, u64, u64)>) -> anyhow::Result<()> {
     let Some(cache) = existing_cache(device) else { return Ok(()) };
     let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-    if cache.needs_boundary() {
+    if cache.needs_boundary() && (!cache.event_completion || cache.lanes[0].completed >= cache.capture_frontier) {
         let (free, total, tracked, rounding, unclaimed) = match sample() {
             Ok(sample) => sample,
             Err(error) => {
                 tracing::warn!(%error, device, "boundary graph measurement failed; capture disabled, serving eagerly");
                 cache.measurement_failed = true;
                 cache.floor_resample_pending = false;
+                // Live event-backed owners cannot be invalidated by a failed sample.
+                if cache.event_completion { return Ok(()) }
                 let pending: Vec<_> = cache.records.iter().filter(|(_, r)| r.pending_capture).map(|(&id, _)| id).collect();
                 for id in pending { cache.cancel_capture(id); }
                 cache.unmeasured = false;
@@ -724,6 +753,206 @@ pub(crate) unsafe fn observe_completed(library: &cuteafd_ffi::NativeLibrary,
     Ok(())
 }
 
+/// Fixed-capacity event slots. If all slots are occupied, re-record the newest
+/// marker: the later FIFO marker covers the previous one. Keep older markers
+/// available for incremental progress, without allocating or waiting.
+const COMPLETION_SLOTS: usize = 8;
+
+#[derive(Default)]
+struct CompletionSlots {
+    pending: [Option<u64>; COMPLETION_SLOTS],
+}
+impl CompletionSlots {
+    fn slot(&self) -> usize {
+        self.pending.iter().position(Option::is_none).unwrap_or_else(||
+            self.pending.iter().enumerate().max_by_key(|(_, cycle)| *cycle).unwrap().0)
+    }
+    fn record(&mut self, slot: usize, cycle: u64, record: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        // A partial multi-rank record error cannot leave a valid old marker.
+        self.pending[slot] = None;
+        record()?;
+        self.pending[slot] = Some(cycle);
+        Ok(())
+    }
+    fn query(&mut self, mut query: impl FnMut(usize) -> anyhow::Result<bool>) -> anyhow::Result<Option<u64>> {
+        let mut newest = None;
+        for (slot, cycle) in self.pending.iter().enumerate() {
+            if let Some(cycle) = cycle {
+                if query(slot)? { newest = Some(newest.map_or(*cycle, |old: u64| old.max(*cycle))); }
+            }
+        }
+        // A later marker on the same FIFO streams proves earlier work even
+        // if an older marker wasn't ready when we queried it.
+        if let Some(done) = newest {
+            for cycle in &mut self.pending {
+                if cycle.is_some_and(|cycle| cycle <= done) { *cycle = None; }
+            }
+        }
+        Ok(newest)
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn completion_waits_for_all_owners_and_handles_out_of_order_queries() -> anyhow::Result<()> {
+        let mut slots = CompletionSlots::default();
+        slots.record(0, 1, || Ok(()))?;
+        slots.record(1, 2, || Ok(()))?;
+        let mut ready = [[true, false], [false, true]];
+        assert_eq!(slots.query(|slot| Ok(ready[slot].iter().all(|x| *x)))?, None);
+        ready[1][0] = true;
+        assert_eq!(slots.query(|slot| Ok(ready[slot].iter().all(|x| *x)))?, Some(2));
+        assert!(slots.pending.iter().all(Option::is_none));
+        Ok(())
+    }
+
+    #[test]
+    fn completion_pool_is_bounded_and_errors_never_prove_completion() -> anyhow::Result<()> {
+        let mut slots = CompletionSlots::default();
+        for cycle in 1..=100 {
+            let slot = slots.slot();
+            slots.record(slot, cycle, || Ok(()))?;
+        }
+        assert_eq!(slots.pending.iter().flatten().count(), COMPLETION_SLOTS);
+        assert!(slots.pending.contains(&Some(100)));
+        let slot = slots.slot();
+        assert!(slots.record(slot, 101, || anyhow::bail!("record failed")).is_err());
+        assert!(!slots.pending.contains(&Some(100)));
+        let before = slots.pending;
+        assert!(slots.query(|slot| if slot == 1 { anyhow::bail!("query failed") } else { Ok(true) }).is_err());
+        assert_eq!(slots.pending, before);
+        assert_eq!(slots.query(|_| Ok(true))?, Some((COMPLETION_SLOTS - 1) as u64));
+        Ok(())
+    }
+}
+
+/// One serial cycle shared by all owner streams (including peer ranks).
+/// Allocate all timing-disabled events before the first step. An error never
+/// publishes completion; teardown owns the existing family drain contract.
+pub(crate) struct EventCycles<'a> {
+    owners: Vec<(crate::shared::memory::device::Device<'a>, *mut std::ffi::c_void,
+        [crate::shared::memory::device::Event<'a>; COMPLETION_SLOTS])>,
+    devices: Vec<(crate::shared::memory::device::Device<'a>, SharedCache)>,
+    slots: CompletionSlots,
+    index: u64,
+}
+impl<'a> EventCycles<'a> {
+    pub fn new(library: &'a cuteafd_ffi::NativeLibrary,
+        streams: &[(i32, *mut std::ffi::c_void)]) -> anyhow::Result<Self> {
+        use crate::shared::memory::device::{Device, Event};
+        let mut owners: Vec<(Device<'a>, *mut std::ffi::c_void, [Event<'a>; COMPLETION_SLOTS])> = Vec::with_capacity(streams.len());
+        let mut devices: Vec<(Device<'a>, SharedCache)> = Vec::new();
+        for &(id, stream) in streams {
+            if owners.iter().any(|(device, raw, _)| device.id == id && *raw == stream) { continue; }
+            let device = Device { library, id };
+            if !devices.iter().any(|(device, _)| device.id == id) {
+                let cache = existing_cache(id).ok_or_else(|| anyhow::anyhow!("no graph cache on device {id}"))?;
+                devices.push((device, cache));
+            }
+            let events: [Event<'a>; COMPLETION_SLOTS] = (0..COMPLETION_SLOTS)
+                .map(|_| Event::new(device)).collect::<anyhow::Result<Vec<_>>>()?
+                .try_into().ok().expect("fixed event pool size");
+            owners.push((device, stream, events));
+        }
+        for (_, cache) in &devices {
+            cache.lock().unwrap_or_else(|p| p.into_inner()).event_completion = true;
+        }
+        let index = devices.iter().map(|(_, cache)| cache.lock().unwrap_or_else(|p| p.into_inner())
+            .clocks[0].index.load(Ordering::Acquire)).max().unwrap_or(0);
+        Ok(Self { owners, devices, slots: CompletionSlots::default(), index })
+    }
+
+    pub fn record_drain(&self, elapsed: Duration) {
+        for (_, cache) in &self.devices {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.epochs.boundary_drains += 1;
+            cache.epochs.boundary_wait_us += elapsed.as_micros().min(u64::MAX as u128) as u64;
+        }
+    }
+
+    pub fn poll(&mut self) -> anyhow::Result<()> {
+        let owners = &self.owners;
+        let completed = self.slots.query(|slot| {
+            let mut ready = true;
+            for (device, _, events) in owners {
+                // SAFETY: the pool owns this live event on this device.
+                ready &= device.run(|| unsafe { device.library.cuda_event_query(events[slot].raw) })?;
+            }
+            Ok(ready)
+        })?;
+        for (device, cache) in &self.devices {
+            {
+                let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(done) = completed {
+                    cache.clocks[0].completed.fetch_max(done, Ordering::Release);
+                    cache.refresh_cycles();
+                }
+                cache.epochs.event_pending_cycles = self.index.saturating_sub(cache.lanes[0].completed);
+            }
+            if cache.lock().unwrap_or_else(|p| p.into_inner()).needs_boundary() {
+                observe_device(device.library, device.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Poll prior submissions and retire only proved-idle persistent owners.
+    /// # Safety
+    /// Visitor banks capture only persistent engine storage.
+    pub unsafe fn begin_persistent(&mut self,
+        mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        self.poll()?;
+        visit(&mut |_, _, _, bank| {
+            // SAFETY: forwarded persistent-storage contract.
+            unsafe { bank.evict_persistent(); }
+            Ok(())
+        })?;
+        self.begin();
+        Ok(())
+    }
+
+    pub fn abandon(&mut self) {
+        for (_, cache) in &self.devices {
+            cache.lock().unwrap_or_else(|p| p.into_inner()).clocks[0].active.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn begin(&mut self) {
+        self.index += 1;
+        for (_, cache) in &self.devices {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.clocks[0].index.store(self.index, Ordering::Release);
+            cache.clocks[0].active.store(true, Ordering::Release);
+            cache.refresh_cycles();
+        }
+    }
+
+    /// # Safety
+    /// Every owner stream is live and all this cycle's launches have been queued.
+    pub unsafe fn complete(&mut self) -> anyhow::Result<()> {
+        {
+            let slot = self.slots.slot();
+            let owners = &self.owners;
+            self.slots.record(slot, self.index, || {
+                for (device, stream, events) in owners {
+                    // SAFETY: caller guarantees live streams; no stream waits on this query-only event.
+                    device.run(|| unsafe { device.library.cuda_event_record(events[slot].raw, *stream) })?;
+                }
+                Ok(())
+            })?;
+        }
+        for (_, cache) in &self.devices {
+            let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            cache.clocks[0].active.store(false, Ordering::Release);
+            cache.epochs.event_pending_cycles = self.index.saturating_sub(cache.lanes[0].completed);
+        }
+        Ok(())
+    }
+}
+
 /// Start/finish one independently scheduled cycle, visiting only its own banks.
 /// # Safety
 /// The visitor contains only this lane's persistent-storage banks. At start,
@@ -780,7 +1009,6 @@ impl LaneCycles {
         let clocks = devices.iter().filter_map(|&device| existing_cache(device))
             .map(|cache| {
                 let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
-                cache.concurrent_cycles = concurrent_cycles as u64;
                 cache.lane_max_cycles[lane] = concurrent_cycles as u64;
                 HIT_EPOCHS.with(|epochs| { epochs.borrow_mut().insert(cache.device,
                     cache.clocks.as_ref().each_ref().map(|clock| clock.index.load(Ordering::Acquire))); });
@@ -856,6 +1084,8 @@ pub(crate) struct DeviceCache {
     measurement_failed: bool,
     failed_measurement_credit: u64,
     pending_bytes: u64,
+    event_completion: bool,
+    capture_frontier: u64,
     next_id: u64,
     next_bank: u64,
     identity_generation: u64,
@@ -871,6 +1101,7 @@ pub(crate) struct DeviceCache {
     chain_only: bool,
     unmeasured: bool,
     pending_destroy: usize,
+    cycle_demand_nodes: u64,
     bank_lanes: HashMap<u64, usize>,
     lanes: [LaneEpoch; 2],
     clocks: Arc<[EpochClock; 2]>,
@@ -879,7 +1110,6 @@ pub(crate) struct DeviceCache {
     reuse_captures: HashSet<u64>,
     selected_epochs: HashMap<u64, [u64; 2]>,
     pending_lanes: [usize; 2],
-    concurrent_cycles: u64,
     donor_always: bool,
     donor_cold_lag: u64,
     lane_max_cycles: [u64; 2],
@@ -934,15 +1164,15 @@ pub(crate) fn seal_cross_device_capture_on_this_thread(sealed: bool) {
 
 impl DeviceCache {
     fn new(device: i32, reserve: u64) -> Self {
-        Self { device, reserve, reserve_policy: None, charged: 0, live_bytes: 0, inventory: Inventory::default(), ranked_hits: Vec::new(), ranked_churn: Vec::new(), ranked_at: Instant::now() - Duration::from_secs(30), level: None, pending_bytes: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
+        Self { device, reserve, reserve_policy: None, charged: 0, live_bytes: 0, inventory: Inventory::default(), ranked_hits: Vec::new(), ranked_churn: Vec::new(), ranked_at: Instant::now() - Duration::from_secs(30), level: None, pending_bytes: 0, event_completion: false, capture_frontier: 0, next_id: 0, next_bank: 0, identity_generation: 0, recovery_generation: 0,
             soft: SoftState::new(reserve), margin_clamp_warned: false, measurement_failed: false, failed_measurement_credit: 0, physical_floor: 0, physical_sample: None, physical_floor_warned: false,
             floor_resample_pending: false, floor_resample_used: false,
             recent_target: 0, records: HashMap::new(), identities: HashMap::new(),
             queues: std::array::from_fn(|_| Queue::default()), classes: HashMap::new(),
             pending_growth: 0, pools: Pools::default(), basis: Basis::Bytes,
-            chain_only: true, unmeasured: false, pending_destroy: 0,
+            chain_only: true, unmeasured: false, pending_destroy: 0, cycle_demand_nodes: 0,
             bank_lanes: HashMap::new(), lanes: std::array::from_fn(|_| LaneEpoch::default()), clocks: Arc::new(std::array::from_fn(|_| EpochClock::default())),
-            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], concurrent_cycles: 1, donor_always: super::donor_always(), donor_cold_lag: super::donor_cold_lag(), lane_max_cycles: [1; 2], site_lanes: HashMap::new(), update_sites: Default::default(), native_graphs: HashMap::new(), bank_native: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
+            lagged: Vec::new(), epochs: EpochStats::default(), reuse_captures: HashSet::new(), selected_epochs: HashMap::new(), pending_lanes: [0; 2], donor_always: super::donor_always(), donor_cold_lag: super::donor_cold_lag(), lane_max_cycles: [1; 2], site_lanes: HashMap::new(), update_sites: Default::default(), native_graphs: HashMap::new(), bank_native: HashMap::new(), donor_candidates: HashMap::new(), update_requests: HashMap::new(),
             observer: GrowthObserver::default(), memory_query: None, launch_query: None, captured_since_observation: false,
             counters: HashMap::new(), started: Instant::now(), clock_ms: 0, last_report: Instant::now(),
             interval_evictions: 0, trace: std::env::var_os("CUTEAFD_GRAPH_TRACE").and_then(|path| {
@@ -1060,14 +1290,17 @@ impl DeviceCache {
     }
 
     pub(super) fn refresh_cycles(&mut self) {
+        let mut index_advanced = false;
         for (lane, clock) in self.lanes.iter_mut().zip(self.clocks.iter()) {
             let index = clock.index.load(Ordering::Acquire);
             let completed = clock.completed.load(Ordering::Acquire);
+            if lane.index != index { index_advanced = true; }
             if lane.index != index || lane.completed != completed { lane.vampires.clear(); }
             lane.index = index;
             lane.completed = completed;
             lane.active = clock.active.load(Ordering::Acquire);
         }
+        if index_advanced { self.cycle_demand_nodes = 0; }
         self.epochs.cycles = self.lanes.each_ref().map(|lane| lane.index);
         self.epochs.completed = self.lanes.each_ref().map(|lane| lane.completed);
         self.credit_completed();
@@ -1109,7 +1342,7 @@ impl DeviceCache {
     // begin/complete and these boundaries serially; not a multi-thread barrier.
     pub(super) fn serial_boundary(&mut self) {
         self.refresh_cycles();
-        if self.lanes.iter().any(|lane| lane.active) { return }
+        if self.event_completion || self.lanes.iter().any(|lane| lane.active) { return }
         for clock in self.clocks.iter() {
             let next = clock.index.fetch_add(1, Ordering::AcqRel) + 1;
             clock.completed.store(next, Ordering::Release);
@@ -1136,6 +1369,10 @@ impl DeviceCache {
         self.records.get(&id).is_some_and(|record| {
             let lane = self.bank_lane(record.identity.bank);
             let epoch = &self.lanes[lane];
+            if self.event_completion {
+                return record.pending_destroy && record.used().is_some_and(|used| used <= epoch.completed)
+                    && self.selected_epochs.get(&id).is_none_or(|until| epoch.completed >= until[lane]);
+            }
             let closed = if epoch.active { epoch.completed >= epoch.index.saturating_sub(1) }
                 else { epoch.completed >= epoch.index };
             record.pending_destroy && closed && self.selected_epochs.get(&id).is_none_or(|until|
@@ -1338,20 +1575,40 @@ impl DeviceCache {
 
     fn resident_bytes(&self) -> u64 { self.inventory.resident }
 
+    fn reported_live_bytes(&self) -> u64 {
+        match (self.soft.measured_bytes, self.soft.measured_nodes) {
+            (Some(_), Some(measured_nodes)) if measured_nodes > 0 => {
+                let live_nodes = self.native_pools().live_nodes;
+                ((u128::from(self.charged) * u128::from(live_nodes)) / u128::from(measured_nodes))
+                    .min(u128::from(self.charged)) as u64
+            }
+            _ => self.live_bytes,
+        }
+    }
+
     fn estimate(&self, site: Site, node_estimate: Option<u64>) -> (u64, u64) {
         let class = self.classes.get(site.name);
         let estimate = node_estimate.filter(|n| *n > 0).unwrap_or_else(|| class
-            .filter(|c| c.samples > 0).map_or(site.bootstrap, |c| c.total.div_ceil(c.samples)));
+            .filter(|c| c.samples > 0 && c.total > 0)
+            .map_or(site.bootstrap, |c| c.total.div_ceil(c.samples)));
         (estimate, class.map_or(estimate, |c| c.largest.max(estimate)))
     }
 
     #[cfg(test)]
     pub(super) fn mark_victim(&mut self, _frequent_ghost: bool) -> Option<u64> { self.select_victim(None) }
 
-    fn hot(&self, record: &Record) -> bool {
+    /// Shared eviction and donor safety floor. Event-enabled caches also
+    /// require proof that the last use completed; others use cycle age alone.
+    fn cold_age(&self, record: &Record) -> Option<u64> {
+        let used = record.used()?;
         let lane = self.bank_lane(record.identity.bank);
-        record.used().is_some_and(|used| used > self.lanes[lane].index.saturating_sub(self.concurrent_cycles)
-            || (self.lanes[lane].index < self.concurrent_cycles && used == 0))
+        if self.event_completion && used > self.lanes[lane].completed { return None }
+        let age = self.lanes[lane].index.saturating_sub(used);
+        (age > self.lane_max_cycles[lane]).then_some(age)
+    }
+
+    fn hot(&self, record: &Record) -> bool {
+        self.cold_age(record).is_none()
     }
 
     fn select_victim(&mut self, excluded: Option<u64>) -> Option<u64> {
@@ -1512,8 +1769,8 @@ impl DeviceCache {
             record.spans_devices ||
             !matches!(record.list, Some(List::Recent | List::Frequent)) ||
             !self.native_graphs.contains_key(&id) { return None }
+        let age = self.cold_age(record)?;
         let lane = self.bank_lane(record.identity.bank);
-        let age = self.lanes[lane].index.saturating_sub(record.used()?);
         // Pressure keeps the safety floor K; optional extra lag only protects
         // reusable shapes while donor-always is operating below the soft cap.
         let lag = if self.donor_always && self.charged < self.soft.limit && self.charged < self.reserve {
@@ -1849,7 +2106,10 @@ impl DeviceCache {
         // waits for that GPU forever). The miss runs eagerly and stays a remembered
         // key, so a GRAPH_TRACE run still lists it for the layout's prewarm set.
         let sealed = site.spans_devices && cross_device_capture_sealed();
-        let allowed = site.preference != Preference::Eager && estimate > 0 && !sealed;
+        // A physical sample covers the entire outstanding capture batch. Do
+        // not mix a newer capture cycle into that batch before its proof.
+        let allowed = site.preference != Preference::Eager && estimate > 0 && !sealed
+            && (!self.event_completion || !self.unmeasured || self.capture_frontier == self.lanes[lane].index);
         let mut projected_hard_stop = false;
         if allowed && !vampire {
             // No CUDA query or ticket for a planned physical-headroom miss.
@@ -1882,8 +2142,13 @@ impl DeviceCache {
             }
             let new_nodes = metadata.nodes.filter(|nodes| *nodes > 0)
                 .or_else(|| old.and_then(|id| self.records[&id].stats.native_nodes).filter(|n| *n > 0))
-                .or_else(|| self.records.values().filter(|r| r.identity.site == site.name)
-                    .filter_map(|r| r.stats.native_nodes).max());
+                .or_else(|| {
+                    let (sum, count) = self.records.values()
+                        .filter(|r| r.identity.site == site.name)
+                        .filter_map(|r| r.stats.native_nodes.filter(|n| *n > 0))
+                        .fold((0u64, 0u64), |(s, c), n| (s.saturating_add(n), c + 1));
+                    (count > 0).then(|| sum.div_ceil(count))
+                });
             // Historical physical shares are slab-sized, not the cost of a
             // replacement graph. Known native nodes that fit the frozen soft
             // capacity after retirement reuse the arena; pending/uncredited
@@ -1895,21 +2160,17 @@ impl DeviceCache {
                 self.soft.fits(self.native_pools().live_nodes.saturating_add(self.epochs.uncredited_nodes)
                     .saturating_sub(reclaimable).saturating_add(incoming))
             });
-            let hard_room = self.soft.measured_bytes.is_none() || native_reuse
+            let hard_room = (!self.event_completion && self.soft.measured_bytes.is_none()) || native_reuse
                 || self.charged.saturating_add(projected) <= self.reserve;
             projected_hard_stop = !hard_room;
-            let selected_before = self.pending_destroy;
-            let room = if !hard_room { false } else if self.soft.measured_bytes.is_none() { true }
-                else {
-                if let Some(nodes) = new_nodes {
-                    self.make_soft_room(nodes, None)
-                } else { true }
-            };
-            let evicted = self.pending_destroy > selected_before;
-            if evicted || !room { self.lanes[lane].vampires.insert(identity.clone()); }
+            let room = if !hard_room { SoftRoom::Full }
+                else if self.soft.measured_bytes.is_none() { SoftRoom::Available }
+                else if let Some(nodes) = new_nodes { self.make_soft_room(nodes, None) }
+                else { SoftRoom::Available };
+            if room != SoftRoom::Available { self.lanes[lane].vampires.insert(identity.clone()); }
             // Selected owners and lagged chunks still consume capacity. Only
             // their owner's next cycle can destroy them; no device-wide gate.
-            if room && !evicted && hard_room {
+            if room == SoftRoom::Available && hard_room {
             let id = if let Some(id) = old { self.unlink(id); id } else {
                 self.next_id += 1;
                 let id = self.next_id;
@@ -1927,6 +2188,7 @@ impl DeviceCache {
             if projected == 0 || native_reuse { self.reuse_captures.insert(id); }
             self.pending_growth = self.pending_growth.max(projected);
             self.unmeasured = true;
+            if self.event_completion { self.capture_frontier = self.lanes[lane].index; }
             self.pools.live_nodes = next_nodes;
             self.pools.live_execs = next_execs;
             let stats = &mut record.stats;
@@ -2081,6 +2343,7 @@ impl DeviceCache {
     }
 
     pub fn completed_capture(&mut self, id: u64) -> bool {
+        if self.event_completion { return true }
         let Some(query) = &self.memory_query else { return true };
         let sample = query.sample(self.device);
         match sample {
@@ -2107,22 +2370,46 @@ impl DeviceCache {
         }
     }
 
-    fn make_soft_room(&mut self, incoming_nodes: u64, excluded: Option<u64>) -> bool {
+    fn make_soft_room(&mut self, incoming_nodes: u64, excluded: Option<u64>) -> SoftRoom {
         let native = self.native_pools();
-        let selected = self.records.values().filter(|r| r.pending_destroy)
+        let uncredited = self.epochs.uncredited_nodes;
+        let live_total = native.live_nodes.saturating_add(uncredited);
+        if self.soft.fits(live_total.saturating_add(incoming_nodes)) {
+            return SoftRoom::Available;
+        }
+        let mut selected = self.records.values().filter(|r| r.pending_destroy)
             .map(|r| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
         let reclaimable = self.records.iter().filter(|(&id, r)| Some(id) != excluded && !r.pending_capture && !r.spans_devices
             && !self.hot(r) && matches!(r.list, Some(List::Recent | List::Frequent)))
             .map(|(_, r)| r.stats.native_nodes.unwrap_or(0)).sum::<u64>();
-        let uncredited = self.epochs.uncredited_nodes;
-        let mut nodes = native.live_nodes.saturating_add(uncredited).saturating_sub(selected);
-        if !self.soft.fits(nodes.saturating_sub(reclaimable).saturating_add(incoming_nodes)) { return false }
-        while !self.soft.fits(nodes.saturating_add(incoming_nodes)) {
-            let Some(id) = self.select_victim(excluded) else { return false };
-            nodes = nodes.saturating_sub(self.records[&id].stats.native_nodes.unwrap_or(0));
+        let mut nodes = live_total.saturating_sub(selected);
+        if incoming_nodes == 0 {
+            if !self.soft.fits(nodes.saturating_sub(reclaimable)) { return SoftRoom::Full; }
+            while !self.soft.fits(nodes) {
+                let Some(id) = self.select_victim(excluded) else { return SoftRoom::Full; };
+                nodes = nodes.saturating_sub(self.records[&id].stats.native_nodes.unwrap_or(0));
+            }
+            return SoftRoom::Queued;
         }
-        // Victim selection is not capacity credit.
-        self.soft.fits(native.live_nodes.saturating_add(uncredited).saturating_add(incoming_nodes))
+        // Size the victim batch to this cycle's accumulated unfulfilled capture
+        // demand, clamped to <= min(total_reclaimable, soft.measured_nodes / 4)
+        // (with a floor of incoming_nodes so tiny fixtures can still admit one graph).
+        let total_reclaimable = selected.saturating_add(reclaimable);
+        let quarter = self.soft.measured_nodes.map_or(u64::MAX, |m| m / 4);
+        let batch_cap = total_reclaimable.min(quarter.max(incoming_nodes));
+        let target_demand = self.cycle_demand_nodes.saturating_add(incoming_nodes);
+        if !self.soft.fits(live_total.saturating_sub(batch_cap).saturating_add(target_demand)) {
+            return SoftRoom::Full;
+        }
+        while !self.soft.fits(nodes.saturating_add(target_demand)) {
+            if selected >= batch_cap { return SoftRoom::Full; }
+            let Some(id) = self.select_victim(excluded) else { return SoftRoom::Full; };
+            let vnodes = self.records[&id].stats.native_nodes.unwrap_or(0);
+            selected = selected.saturating_add(vnodes);
+            nodes = nodes.saturating_sub(vnodes);
+        }
+        self.cycle_demand_nodes = target_demand;
+        SoftRoom::Queued
     }
 
     fn apply_reserve_policy(&mut self, policy: cuteafd_loader::placement::graph_reserve::Resolved) {
@@ -2214,7 +2501,8 @@ impl DeviceCache {
             self.live_bytes = self.live_bytes.saturating_sub(record.bytes).saturating_add(share);
             record.bytes = share;
             let class = self.classes.entry(record.identity.site).or_default();
-            if share > 0 { class.total = class.total.saturating_add(share); class.samples += 1; class.largest = class.largest.max(share); }
+            class.samples += 1;
+            if share > 0 { class.total = class.total.saturating_add(share); class.largest = class.largest.max(share); }
             self.counters.entry(record.cycle).or_default().captures += 1;
             self.update_sites.entry(record.identity.site).or_default().entry(record.cycle).or_default().captures += 1;
             if let Some(list) = list { self.push(id, list); }
@@ -2295,6 +2583,7 @@ impl DeviceCache {
             self.records.get_mut(&id).unwrap().bytes = 0;
             self.sync_inventory(id);
         }
+        if self.pending_destroy == 0 { self.cycle_demand_nodes = 0; }
         self.credit_completed();
         if !self.lanes.iter().any(|lane| lane.active) { self.serial_boundary(); }
         self.trim_ghosts();
@@ -2357,7 +2646,7 @@ impl DeviceCache {
     pub fn report_due(&mut self, elapsed: Duration) -> bool {
         if elapsed < Duration::from_secs(30) || self.interval_evictions == 0 { return false }
         tracing::info!(device = self.device, evictions = self.interval_evictions,
-            reserve = self.reserve, charged = self.charged, live_bytes = self.live_bytes, resident_bytes = self.resident_bytes(), cycles = ?self.counters, "graph cache interval");
+            reserve = self.reserve, charged = self.charged, live_bytes = self.reported_live_bytes(), resident_bytes = self.resident_bytes(), cycles = ?self.counters, "graph cache interval");
         self.interval_evictions = 0;
         self.last_report = Instant::now();
         true
@@ -2379,7 +2668,7 @@ impl DeviceCache {
         let per_cycle = self.per_cycle(&update_sites);
         let records = self.records.values().map(RawRecord::copy).collect();
         TraceSnapshot { cache: Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor,
-            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft, level: self.level,
+            reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.reported_live_bytes(), resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft, level: self.level,
             pinned: self.inventory.pinned, spanning_bytes: self.inventory.spanning_bytes, spanning_nodes: self.inventory.spanning_nodes, spanning_execs: self.inventory.spanning_execs,
             pending_capture: self.pending_bytes, cycles, pools: self.pools.clone(),
             basis: self.basis, sampled_at_ms: self.started.elapsed().as_millis() as u64,
@@ -2432,7 +2721,7 @@ impl DeviceCache {
         let (cycles, update_sites) = self.launch_counts();
         let per_cycle = self.per_cycle(&update_sites);
         let now = self.started.elapsed().as_millis() as u64;
-        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.live_bytes, resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft,
+        Snapshot { device: self.device, reserve: self.reserve, physical_floor: self.physical_floor, reserve_policy: self.reserve_policy, charged: self.charged, live_bytes: self.reported_live_bytes(), resident_estimated_bytes: self.resident_bytes(), hard_stopped: self.charged >= self.reserve || self.measurement_failed || self.soft.limit == 0, native_pools: self.native_pools(), soft: self.soft,
             level: self.level,
             pinned: self.inventory.pinned, spanning_bytes: self.inventory.spanning_bytes, spanning_nodes: self.inventory.spanning_nodes, spanning_execs: self.inventory.spanning_execs,
             pending_capture: self.pending_bytes, cycles, pools: self.pools.clone(), basis: self.basis,
@@ -2640,6 +2929,52 @@ mod tests {
         (cache, donor)
     }
     #[test]
+    fn event_completion_gates_donors_and_retirement_independent_of_age() {
+        let (mut cache, donor) = aged_update_fixture(5, false);
+        cache.event_completion = true;
+        let used = cache.records[&donor].used().unwrap();
+        cache.clocks[0].completed.store(used - 1, Ordering::Release);
+        cache.refresh_cycles();
+        assert!(cache.donor_age(donor).is_none());
+        cache.serial_boundary();
+        assert_eq!(cache.lanes[0].completed, used - 1);
+        cache.clocks[0].completed.store(used, Ordering::Release);
+        cache.refresh_cycles();
+        assert!(cache.donor_age(donor).is_some());
+        assert_eq!(cache.mark_victim(false), Some(donor));
+        assert!(!cache.persistent_victim_ready(donor));
+        cache.clocks[0].completed.store(cache.lanes[0].index, Ordering::Release);
+        cache.refresh_cycles();
+        assert!(cache.persistent_victim_ready(donor));
+    }
+
+    #[test]
+    fn event_capture_measurement_is_deferred_until_cycle_proof() -> anyhow::Result<()> {
+        let device = -28105;
+        let controller = device_cache_sampled(device, 1000, Basis::Bytes, || Ok((1000, 1000, 0, 0, 0)))?;
+        {
+            let mut cache = controller.lock().unwrap();
+            cache.event_completion = true;
+            cache.clocks[0].index.store(1, Ordering::Release);
+            let Miss::Capture(id) = cache.miss(key(1), site(Preference::Capture), None, false) else { panic!("capture expected") };
+            assert!(cache.completed_capture(id));
+            assert!(cache.records[&id].pending_capture);
+            assert_eq!(cache.charged, 0);
+        }
+        observe_device_sampled(device, || panic!("premature measurement"))?;
+        {
+            let mut cache = controller.lock().unwrap();
+            cache.clocks[0].completed.store(1, Ordering::Release);
+            cache.refresh_cycles();
+        }
+        observe_device_sampled(device, || Ok((990, 1000, 0, 0, 0)))?;
+        let cache = controller.lock().unwrap();
+        assert_eq!(cache.charged, 10);
+        assert_eq!(cache.pending_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
     fn spanning_residents_are_unevictable_before_and_after_ready() {
         let (mut cache, spanning) = aged_update_fixture(5, false);
         cache.records.get_mut(&spanning).unwrap().spans_devices = true;
@@ -2722,6 +3057,7 @@ mod tests {
                         cache.lane_max_cycles[0] = k;
                         cache.soft.limit = if pressure { cache.charged } else { 500 };
                         let eligible = age > k + if pressure { 0 } else { lag };
+                        assert_eq!(cache.hot(&cache.records[&donor]), age <= k);
                         assert_eq!(cache.cold_donor(&[3, 7, 11]), eligible.then_some(donor));
                         let ticket = cache.update_ticket(key(2), site(Preference::Capture), None, false);
                         assert_eq!(ticket.is_some(), eligible, "K={k}, lag={lag}, age={age}, pressure={pressure}");
@@ -3030,7 +3366,7 @@ mod tests {
     }
 
     #[test]
-    fn soft_hot_donor_falls_back_to_existing_eviction() {
+    fn soft_hot_donor_runs_eager_without_evicting_protected_graph() {
         let (mut cache, donor) = aged_update_fixture(1, false);
         cache.soft.measured_bytes = Some(10);
         cache.soft.measured_nodes = Some(10);
@@ -3039,7 +3375,8 @@ mod tests {
         let id = update_request(&mut cache, key(2));
         assert_eq!(cache.finish_update(id, |_| panic!(), |_| panic!(), |_| panic!()), None);
         assert!(matches!(cache.fallback_update(id), Miss::Eager));
-        assert!(cache.records[&donor].pending_destroy);
+        assert!(!cache.records[&donor].pending_destroy, "age-K hot donor must not be evicted on fallback");
+        assert_eq!(cache.pending_destroy, 0);
         assert_eq!(cache.counters[&Cycle::Decode].updates_soft, 0);
         assert_eq!(cache.counters[&Cycle::Decode].no_cold_donor_soft, 1);
     }
@@ -3276,7 +3613,7 @@ mod tests {
     fn hot_stamp_without_thread_mirror_uses_locked_owner_epoch() {
         std::thread::spawn(|| {
             let mut cache = epoch_fixture();
-            cache.concurrent_cycles = 2;
+            cache.lane_max_cycles[0] = 2;
             cache.begin_lane(0);
             let id = *cache.records.keys().next().unwrap();
             HIT_EPOCHS.with(|epochs| { epochs.borrow_mut().remove(&cache.device); });
@@ -3298,26 +3635,120 @@ mod tests {
     fn hot_entries_are_not_selected_inside_k1_or_k2_lag_window() {
         for k in [1, 2] {
             let mut cache = epoch_fixture();
-            cache.concurrent_cycles = k;
+            cache.lane_max_cycles[0] = k;
             cache.begin_lane(0);
             let ids: Vec<_> = cache.records.keys().copied().collect();
             for &id in &ids { cache.hit(id); }
             assert!(cache.select_victim(None).is_none());
             cache.complete_lane(0);
-            for _ in 1..k {
+            for _ in 0..k {
                 cache.begin_lane(0);
-                assert!(cache.select_victim(None).is_none());
+                assert!(cache.select_victim(None).is_none(), "age <= K must stay protected");
                 cache.complete_lane(0);
             }
             cache.begin_lane(0);
-            assert!(cache.select_victim(None).is_some(), "exactly K elapsed cycles closes the guard");
+            assert!(cache.select_victim(None).is_some(), "K+1 elapsed cycles closes the guard");
+        }
+    }
+
+    #[test]
+    fn hot_and_donor_share_lane_max_cycles_threshold() {
+        for event_completion in [false, true] {
+            for k in [1, 2] {
+                let (mut cache, donor) = aged_update_fixture(k, false);
+                cache.event_completion = event_completion;
+                cache.lane_max_cycles[0] = k;
+                assert!(cache.hot(&cache.records[&donor]));
+                assert!(cache.select_victim(None).is_none());
+                assert!(cache.donor_age(donor).is_none());
+                assert!(cache.cold_donor(&[3, 7, 11]).is_none());
+                cache.begin_lane(0);
+                cache.complete_lane(0);
+                assert!(!cache.hot(&cache.records[&donor]));
+                assert_eq!(cache.donor_age(donor), Some(k + 1));
+                assert_eq!(cache.cold_donor(&[3, 7, 11]), Some(donor));
+                assert_eq!(cache.select_victim(None), Some(donor));
+            }
+        }
+    }
+
+    #[test]
+    fn uncompleted_old_graph_is_protected_only_with_event_completion() {
+        for event_completion in [false, true] {
+            let (mut cache, donor) = aged_update_fixture(2, false);
+            cache.event_completion = event_completion;
+            let used = cache.records[&donor].used().unwrap();
+            cache.clocks[0].completed.store(used - 1, Ordering::Release);
+            cache.refresh_cycles();
+            assert_eq!(cache.hot(&cache.records[&donor]), event_completion);
+            assert_eq!(cache.donor_age(donor), (!event_completion).then_some(2));
+            assert_eq!(cache.cold_donor(&[3, 7, 11]), (!event_completion).then_some(donor));
+            if event_completion {
+                assert!(cache.select_victim(None).is_none());
+                cache.clocks[0].completed.store(used, Ordering::Release);
+                cache.refresh_cycles();
+                assert!(!cache.hot(&cache.records[&donor]));
+                assert_eq!(cache.donor_age(donor), Some(2));
+                assert_eq!(cache.cold_donor(&[3, 7, 11]), Some(donor));
+            }
+            assert_eq!(cache.select_victim(None), Some(donor));
+        }
+    }
+
+    #[test]
+    fn two_lane_hot_and_donor_use_each_lanes_own_max_cycles() {
+        let mut cache = test_cache(-1035, 1000);
+        cache.lane_max_cycles = [1, 2];
+        cache.assign_bank_lane(1, 0);
+        cache.assign_bank_lane(2, 1);
+        let id0 = capture(&mut cache, 1, false);
+        let key_lane1 = Identity { bank: 2, site: "test", key: 2, shape: "2".into() };
+        let Miss::Capture(id1) = cache.miss(key_lane1, site(Preference::Capture), None, false) else { panic!() };
+        cache.measured_capture(10);
+        cache.soft.limit = 20;
+        cache.charged = 20;
+        cache.event_completion = true;
+        for (id, lane, native, signature) in [(id0, 0, 101, vec![3, 7, 11]), (id1, 1, 102, vec![3, 7, 12])] {
+            cache.records.get_mut(&id).unwrap().last_used = Some(cache.lanes[lane].index);
+            cache.register_native(id, native, signature);
+            for _ in 0..2 { cache.begin_lane(lane); cache.complete_lane(lane); }
+        }
+        assert!(!cache.hot(&cache.records[&id0]) && cache.donor_age(id0) == Some(2));
+        assert!(cache.hot(&cache.records[&id1]) && cache.donor_age(id1).is_none());
+        assert_eq!(cache.cold_donor(&[3, 7, 11]), Some(id0));
+        assert!(cache.cold_donor(&[3, 7, 12]).is_none());
+        assert_eq!(cache.select_victim(Some(id0)), None);
+        assert_eq!(cache.select_victim(None), Some(id0));
+        cache.begin_lane(1); cache.complete_lane(1);
+        assert!(!cache.hot(&cache.records[&id1]) && cache.donor_age(id1) == Some(3));
+        assert_eq!(cache.cold_donor(&[3, 7, 12]), Some(id1));
+        assert_eq!(cache.select_victim(None), Some(id1));
+    }
+
+    #[test]
+    fn soft_room_full_without_cold_candidates_runs_eager() {
+        for (age, event_completion) in [(1, false), (1, true), (2, true)] {
+            let (mut cache, donor) = aged_update_fixture(age, false);
+            cache.event_completion = event_completion;
+            if event_completion && age == 2 {
+                let used = cache.records[&donor].used().unwrap();
+                cache.clocks[0].completed.store(used - 1, Ordering::Release);
+                cache.refresh_cycles();
+            }
+            cache.captured_topology(donor, 10, 1, false);
+            cache.soft.measured_bytes = Some(10);
+            cache.soft.measured_nodes = Some(10);
+            assert_eq!(cache.make_soft_room(10, None), SoftRoom::Full);
+            assert!(matches!(cache.miss(key(2), site(Preference::Capture), None, false), Miss::Eager));
+            assert_eq!(cache.pending_destroy, 0);
+            assert!(!cache.records[&donor].pending_destroy);
         }
     }
 
     #[test]
     fn hot_per_layer_workload_remains_cached_without_evictions() {
         let mut cache = epoch_fixture();
-        cache.concurrent_cycles = 2;
+        cache.lane_max_cycles[0] = 2;
         let ids: Vec<_> = cache.records.keys().copied().collect();
         for _ in 0..20 {
             cache.begin_lane(0);
@@ -3333,7 +3764,7 @@ mod tests {
     #[test]
     fn hot_over_cap_workload_runs_vampires_instead_of_evicting_layers() {
         let mut cache = epoch_fixture();
-        cache.concurrent_cycles = 2;
+        cache.lane_max_cycles[0] = 2;
         cache.begin_lane(0);
         let ids: Vec<_> = cache.records.keys().copied().collect();
         for &id in &ids { cache.hit(id); }
@@ -3382,7 +3813,7 @@ mod tests {
             if k == 2 {
                 assert_eq!(cache.pools.live_nodes, pool_nodes, "peer's in-flight cycle retains credit");
                 assert_eq!(cache.epochs.uncredited_nodes, 10);
-                assert!(!cache.make_soft_room(10, None), "uncredited nodes do not fit incoming work");
+                assert_ne!(cache.make_soft_room(10, None), SoftRoom::Available, "uncredited nodes do not fit incoming work");
                 cache.complete_lane(1);
             }
             assert_eq!(cache.pools.live_nodes, pool_nodes - 10);
@@ -4659,6 +5090,222 @@ mod tests {
         assert_eq!(row["cycles"]["decode"], 2);
         assert_eq!(row["cycles"]["verify"], 1);
         assert!(row["first_seen_ms"].is_u64());
+    }
+
+    fn large_soft_fixture(count: u64, nodes_each: u64) -> DeviceCache {
+        let mut cache = test_cache(-99120, 10_000);
+        for n in 0..count {
+            let id = capture(&mut cache, n, false);
+            cache.captured_topology(id, nodes_each, 1, false);
+        }
+        let total_nodes = count * nodes_each;
+        cache.soft.measured_bytes = Some(1000);
+        cache.soft.measured_nodes = Some(total_nodes);
+        cache.soft.limit = 1000;
+        cache.charged = 1000;
+        cache
+    }
+
+    #[test]
+    fn soft_room_batches_unfulfilled_cycle_demand_and_captures_after_retirement() {
+        // 40 cold graphs x 10 nodes = 400-node soft cap (quarter clamp = 100 nodes).
+        let mut cache = large_soft_fixture(40, 10);
+        cache.begin_lane(0);
+        // 6 distinct misses of 10 nodes in one cycle must queue 6 victims (60 nodes),
+        // not stop at 1 victim while running misses #2..#6 without queuing room.
+        for n in 100..106 {
+            assert!(matches!(cache.miss(key(n), site(Preference::Capture), None, false), Miss::Eager));
+        }
+        assert_eq!(cache.pending_destroy, 6, "each unfulfilled miss must grow the cycle's victim batch");
+        assert_eq!(cache.cycle_demand_nodes, 60);
+        assert_eq!(cache.charged, 1000, "charged must remain strictly monotone");
+        // Complete cycle, retire the whole batch on the next cycle boundary.
+        cache.complete_lane(0);
+        cache.begin_lane(0);
+        let ready: Vec<u64> = cache.records.keys().copied().filter(|&id| cache.persistent_victim_ready(id)).collect();
+        assert_eq!(ready.len(), 6);
+        cache.destroyed(&ready, ReleaseMeasurement { released: 0 });
+        assert_eq!(cache.charged, 1000, "destruction never credits charged");
+        assert_eq!(cache.native_pools().live_nodes, 340);
+        assert_eq!(cache.cycle_demand_nodes, 0);
+        // All 6 previously eager shapes now fit and capture immediately in one cycle.
+        for n in 100..106 {
+            let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, false) else {
+                panic!("key {n} must capture immediately after batched retirement");
+            };
+            cache.captured_topology(id, 10, 1, false);
+            cache.measured_capture(0);
+        }
+        assert_eq!(cache.native_pools().live_nodes, 400);
+        assert_eq!(cache.charged, 1000);
+    }
+
+    #[test]
+    fn soft_room_return_value_matches_queued_state() {
+        let mut cache = large_soft_fixture(40, 10);
+        cache.begin_lane(0);
+        // At full soft cap, queuing victims returns Queued (never Full when room was queued).
+        assert_eq!(cache.make_soft_room(10, None), SoftRoom::Queued);
+        assert_eq!(cache.pending_destroy, 1);
+        // A second distinct miss in the same cycle queues a second victim and also returns Queued.
+        assert_eq!(cache.make_soft_room(10, None), SoftRoom::Queued);
+        assert_eq!(cache.pending_destroy, 2);
+        // Retiring those 2 victims makes room Available immediately without further evictions.
+        cache.complete_lane(0);
+        cache.begin_lane(0);
+        let ready: Vec<u64> = cache.records.keys().copied().filter(|&id| cache.persistent_victim_ready(id)).collect();
+        cache.destroyed(&ready, ReleaseMeasurement { released: 0 });
+        assert_eq!(cache.make_soft_room(10, None), SoftRoom::Available);
+        assert_eq!(cache.pending_destroy, 0);
+        // When all remaining entries are hot, cannot make room -> Full with 0 selections.
+        cache.soft.measured_nodes = Some(cache.native_pools().live_nodes);
+        let ids: Vec<u64> = cache.records.iter()
+            .filter(|(_, r)| matches!(r.list, Some(List::Recent | List::Frequent)))
+            .map(|(&id, _)| id).collect();
+        for id in ids { cache.hit(id); }
+        assert_eq!(cache.make_soft_room(10, None), SoftRoom::Full);
+        assert_eq!(cache.pending_destroy, 0);
+    }
+
+    #[test]
+    fn soft_room_clamps_cycle_victim_batch_to_quarter_soft_cap() {
+        // 40 cold graphs x 10 nodes = 400-node soft cap -> quarter clamp = 100 nodes (10 victims).
+        let mut cache = large_soft_fixture(40, 10);
+        cache.begin_lane(0);
+        let mut queued = 0usize;
+        let mut full = 0usize;
+        for _ in 0..25 {
+            match cache.make_soft_room(10, None) {
+                SoftRoom::Queued => queued += 1,
+                SoftRoom::Full => full += 1,
+                SoftRoom::Available => panic!("soft cap is full before retirement"),
+            }
+        }
+        assert_eq!(queued, 10, "at most soft.measured_nodes / 4 nodes queued in one cycle");
+        assert_eq!(full, 15, "misses past the clamp must return Full without over-evicting");
+        assert_eq!(cache.pending_destroy, 10);
+        assert_eq!(cache.cycle_demand_nodes, 100);
+
+        // Also check min(reclaimable, quarter): if only 40 nodes (4 graphs) are cold, clamp to 40.
+        let mut cache2 = large_soft_fixture(40, 10);
+        cache2.begin_lane(0);
+        let all_ids: Vec<u64> = cache2.records.keys().copied().collect();
+        for &id in &all_ids[..36] { cache2.hit(id); }
+        let mut q2 = 0usize;
+        for _ in 0..10 {
+            if cache2.make_soft_room(10, None) == SoftRoom::Queued { q2 += 1; }
+        }
+        assert_eq!(q2, 4, "clamp must also respect reclaimable_nodes when < soft.measured_nodes / 4");
+        assert_eq!(cache2.pending_destroy, 4);
+    }
+
+    #[test]
+    fn soft_room_never_evicts_hot_graphs_when_demand_exceeds_cold_set_and_clamp() {
+        // 40 graphs x 10 nodes = 400-node soft cap (quarter clamp = 100 nodes).
+        // Put all 40 graphs in Frequent, keep 36 hot via HitToken at the LRU head
+        // ahead of 4 cold graphs (40 reclaimable nodes < 100 quarter clamp).
+        let mut cache = large_soft_fixture(40, 10);
+        let mut ids: Vec<u64> = (0..40).map(|n| cache.identities[&key(n)]).collect();
+        for &id in &ids { cache.hit(id); }
+        cache.serial_boundary();
+        cache.serial_boundary();
+        cache.begin_lane(0);
+        let epoch = cache.lanes[0].index;
+        let hot_ids: Vec<u64> = ids.drain(..36).collect();
+        let cold_ids = ids;
+        for &id in &hot_ids {
+            let token = cache.hit_token(id);
+            token.hit(epoch);
+        }
+        // Demand 150 nodes (15 distinct misses x 10) > quarter clamp (100) AND > cold set (40).
+        for n in 200..215 {
+            assert!(matches!(cache.miss(key(n), site(Preference::Capture), None, false), Miss::Eager));
+        }
+        assert_eq!(cache.make_soft_room(10, None), SoftRoom::Full,
+            "demand past the available cold set must return Full");
+        assert_eq!(cache.pending_destroy, 4,
+            "pending_destroy must never increase beyond the 4 cold victims");
+        for &id in &cold_ids {
+            assert!(cache.records[&id].pending_destroy, "cold graph {id} should be selected");
+        }
+        for &id in &hot_ids {
+            assert!(!cache.records[&id].pending_destroy, "hot graph {id} must never be selected");
+        }
+        assert!(cache.counters[&Cycle::Decode].hot_guard_skips >= 36,
+            "select_victim must walk past and skip hot graphs (saw {})",
+            cache.counters[&Cycle::Decode].hot_guard_skips);
+    }
+
+    #[test]
+    fn calibrated_live_bytes_tracks_node_share_not_slab_carrier_tags() {
+        let mut cache = test_cache(-99121, 100 << 20);
+        // 15 zero-growth captures + 1 slab-crossing 2 MiB capture, all 10 nodes each.
+        let mut ids = Vec::new();
+        for n in 0..16 {
+            let Miss::Capture(id) = cache.miss(key(n), site(Preference::Capture), None, false) else { panic!() };
+            cache.captured_topology(id, 10, 1, false);
+            cache.measured_capture(if n == 0 { 2 << 20 } else { 0 });
+            ids.push(id);
+        }
+        cache.serial_boundary();
+        cache.serial_boundary();
+        cache.soft.limit = 2 << 20;
+        cache.soft.measured_bytes = Some(2 << 20);
+        cache.soft.measured_nodes = Some(160);
+        assert_eq!(cache.snapshot().live_bytes, 2 << 20);
+        // Evict the slab-crossing carrier (id 0) and replace with a 0-byte reuse capture.
+        let victim = ids[0];
+        cache.records.get_mut(&victim).unwrap().pending_destroy = true;
+        cache.pending_destroy += 1;
+        cache.pending_lanes[0] += 1;
+        cache.clocks[0].pending.fetch_add(1, Ordering::Release);
+        cache.destroyed(&[victim], ReleaseMeasurement { released: 0 });
+        assert_eq!(cache.snapshot().live_bytes, (2 << 20) * 150 / 160);
+        let Miss::Capture(repl) = cache.miss(key(99), site(Preference::Capture), None, false) else { panic!() };
+        cache.captured_topology(repl, 10, 1, false);
+        cache.measured_capture(0);
+        assert_eq!(cache.snapshot().live_bytes, 2 << 20, "reuse replacement keeps live_bytes proportional to live_nodes");
+        assert_eq!(cache.charged, 2 << 20);
+    }
+
+    #[test]
+    fn class_samples_counts_all_settled_captures_and_prevents_estimate_inflation() {
+        let mut cache = test_cache(-99122, 100 << 20);
+        // Initial zero-growth capture increments samples but still falls back to bootstrap (> 0).
+        let Miss::Capture(_) = cache.miss(key(0), site(Preference::Capture), None, false) else { panic!() };
+        cache.measured_capture(0);
+        assert_eq!(cache.classes["test"].samples, 1);
+        assert_eq!(cache.estimate(site(Preference::Capture), None).0, 10);
+        // 14 more zero-growth captures + 1 two-MiB slab capture -> 16 samples total, 128 KiB mean.
+        for n in 1..16 {
+            let Miss::Capture(_) = cache.miss(key(n), site(Preference::Capture), None, false) else { panic!() };
+            cache.measured_capture(if n == 15 { 2 << 20 } else { 0 });
+        }
+        assert_eq!(cache.classes["test"].samples, 16);
+        let (est, headroom) = cache.estimate(site(Preference::Capture), None);
+        assert_eq!(est, (2 << 20) / 16, "estimate amortizes slab bytes across all settled captures");
+        assert_eq!(headroom, 2 << 20, "headroom retains worst single slab jump");
+    }
+
+    #[test]
+    fn unseen_key_uses_site_mean_nodes_instead_of_max() {
+        let mut cache = test_cache(-99123, 10_000);
+        for n in 0..9 {
+            let id = capture(&mut cache, n, false);
+            cache.captured_topology(id, 6, 1, false);
+        }
+        let outlier = capture(&mut cache, 9, false);
+        cache.captured_topology(outlier, 27, 1, false);
+        // Total live_nodes = 9*6 + 27 = 81; site mean = ceil(81/10) = 9, max = 27.
+        // Set soft cap to 91 (10 free nodes): fits site mean (9) without evicting, would fail max (27).
+        cache.soft.measured_bytes = Some(100);
+        cache.soft.measured_nodes = Some(91);
+        cache.soft.limit = 100;
+        cache.charged = 100;
+        cache.begin_lane(0);
+        assert!(matches!(cache.miss(key(100), site(Preference::Capture), None, false), Miss::Capture(_)),
+            "unseen key must admit against site mean (9 <= 10), not max (27)");
+        assert_eq!(cache.pending_destroy, 0);
     }
 }
 

@@ -76,7 +76,9 @@ exits fails the run at once), runs with host networking and /dev/infiniband, and
 CUTEAFD_GOLDEN_PEERS (lane-A IP:PORT by rank, from --config), CUTEAFD_GOLDEN_SPARK_WORLD,
 CUTEAFD_GOLDEN_EXPERT_LAYERS (expanded --expert-layers) and CUTEAFD_GOLDEN_SPARK_PACKAGES
 (the workers' package manifest.json files, identical on every host, read-only under
-/opt/cuteafd/spark). A golden subcommand must take them as `--peers {peers}`. Workers are
+/opt/cuteafd/spark). A golden subcommand must take them as `--peers {peers}`. Its
+explicit --core-view (or CUTEAFD_CORE_VIEW in an arm's environment) also selects the
+workers' core view; conflicting worker overrides are refused before enqueue. Workers are
 removed (logs kept) after every run, on failure, timeout and SIGTERM/SIGINT too, before
 the locks are released. The LAN-only build seeds are refused.
 
@@ -87,7 +89,8 @@ pairs share conditions. Slots, images, Spark hosts and container names are check
 before enqueue and again at grant; --preflight adds a shell check at both points, like
 hwlock's. Each container (golden-TASK-ARM) first checks it sees its GPUs (exit 86 when
 not), is removed on any exit before the locks are released, and runs under a per-arm
-timeout. --dry-run runs the checks and reports the lock set without taking locks or printing argv.
+timeout. --dry-run runs the checks and reports the lock set and workers' core-view
+arguments (if any), without taking locks or printing the full argv.
 
 Output, under ~/.cache/cuteafd/builds/TASK/golden/: ARM/rN/{log,exit,argv.json,
 workers/HOST.log} and whatever the run wrote to {out}; argv.json holds the exact docker
@@ -123,13 +126,13 @@ SUBCOMMANDS = {'dsv4': 'dsv4-golden', 'v41': 'v41-golden', 'glm': 'glm-golden', 
                'mimo': 'mimo-golden', 'qwen4': 'qwen4-golden', 'qwen35': 'qwen35-golden',
                'step5': 'step5-golden', 'muse': 'muse-golden', 'kimi': 'kimi-golden',
                'minimax': 'minimax-golden', 'inkling2': 'inkling2-golden',
-               'inkling2_mini': 'inkling2-mini-golden', 'hy4f': 'hy4f-golden'}
+               'inkling2_mini': 'inkling2-mini-golden', 'hy4f': 'hy4f-golden', 'hy4': 'hy4-golden'}
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*\Z')
 ROW_FILE = re.compile(r'row-[0-9]+\.safetensors\Z')
 ENV_KEY = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 ANSI = re.compile(r'\x1b\[[0-9;]*m')
 # Key result lines across the families' goldens.
-KEY_LINE = re.compile(r'(?i)(admission|prefill logits|decode logits|logits digest|top-1|agreement|mean nll|mean kl|'
+KEY_LINE = re.compile(r'(?i)(admission|context-only|nll sanity|prefill logits|decode logits|logits digest|top-1|agreement|mean nll|mean kl|'
                       r'resume at|resume check|vs one straight|byte-identical|rows:|verify|layer +[0-9]+: cosine|'
                       r'test result|^test |^running [0-9]+ test|'
                       r'\berror\b|panicked|failed|refus|out of memory|golden-run:)')
@@ -278,6 +281,40 @@ def golden_args(family, args, sparks=False):
         if sep and flag in WRITERS and not value.startswith('{out}'):
             raise ValueError(f'{arg}: write outputs under the arm directory ({flag}={{out}}/NAME)')
     return [SUBCOMMANDS[family], *args]
+
+
+def core_view_arg(args):
+    view = None
+    for i, arg in enumerate(args):
+        flag, sep, value = arg.partition('=')
+        if flag != '--core-view':
+            continue
+        if view is not None:
+            raise ValueError('--core-view supplied more than once')
+        view = value if sep else (args[i + 1] if i + 1 < len(args) else '')
+        if not view or view.startswith('--'):
+            raise ValueError('--core-view requires a value')
+    return view
+
+
+def worker_core_view_args(state, name, arm):
+    """Match the coordinator's Clap precedence: CLI, environment, then original."""
+    sparks = state['sparks']
+    key = 'CUTEAFD_CORE_VIEW'
+    view = core_view_arg(run_args(state, arm)) if state['mode'] == 'golden' else None
+    if view is None and key in arm['env']:
+        view = substitute([arm['env'][key]], state['snapshot_container'], **placeholder_values(state))[0]
+    worker_arg = core_view_arg(sparks['args'])
+    # Arbitrary commands/tests may select their view internally; without an
+    # explicit coordinator selection, leave their worker settings alone.
+    if view is None and state['mode'] != 'golden':
+        return []
+    expected = view if view is not None else 'original'
+    worker_env = {**sparks['env'], **sparks['arm_env'][name]}.get(key)
+    for source, actual in (('--worker-arg --core-view', worker_arg), ('worker ' + key, worker_env)):
+        if actual is not None and actual != expected:
+            raise ValueError(f'arm {name}: {source}={actual!r} disagrees with coordinator core view {expected!r}')
+    return ['--core-view', view] if view is not None and worker_arg is None else []
 
 
 PLACEHOLDERS = ('snapshot', 'hub', 'out', 'fixtures', 'peers', 'expert_layers')
@@ -600,7 +637,7 @@ def worker_command(state, arm, rank, record):
     cmd += ['--entrypoint', 'timeout', record['image_id'], '--kill-after=30', str(lifetime), ENTRYPOINT,
             'cuteafd', 'expertd-native', '--snapshot', snapshot, '--native-lib', f'{SLOT_LIB}/libcuteafd_native.so',
             '--rank', str(rank), '--world', str(len(sparks['hosts'])), '--device-budget-bytes', str(sparks['budget']),
-            '--listen', f"0.0.0.0:{sparks['port']}", *sparks['args']]
+            '--listen', f"0.0.0.0:{sparks['port']}", *sparks['args'], *sparks['core_view_args'][arm]]
     return cmd
 
 
@@ -1740,7 +1777,10 @@ def write_summary(state, records, comparisons):
             lines += ['', f"workers (ready after {r.get('workers_ready_s', '-')} s):", '', '```',
                       *(worker_lines(run_dir / 'workers') or ['(no worker logs)']), '```']
     if comparisons:
-        lines += ['', '## Logits comparisons', '', '| a | b | repeat | file | byte-identical | rows | max abs diff | mean KL | max KL | top-1 | worst row |',
+        lines += ['', '## Logits comparisons', '',
+                  'KL and top-1 here are arm-vs-arm numerics drift between two runs of the same fixture, '
+                  'not a quality score against a reference: context-only fixture: no quality verdict '
+                  '(use the published fidelity set).', '', '| a | b | repeat | file | byte-identical | rows | max abs diff | arm-drift mean KL | arm-drift max KL | arm-drift top-1 | worst row |',
                   '|---|---|---|---|---|---|---|---|---|---|---|']
         for c in comparisons:
             if c.get('error'):
@@ -1779,7 +1819,72 @@ def resolve_fixtures(args, task_root):
         raise ValueError(f'--fixtures {path} is not a directory')
     if not re.fullmatch(r'/[A-Za-z0-9._/+-]+', str(path)):
         raise ValueError(f'--fixtures {path}: path characters must be [A-Za-z0-9._/+-]')
+    if not args.fixtures_writable:
+        check_reference_logits(path)
     return str(path)
+
+
+def golden_reference_dirs(args):
+    """The --golden DIR values after `--` (the reference a family golden scores against)."""
+    dirs = []
+    for i, arg in enumerate(args):
+        flag, sep, value = arg.partition('=')
+        if flag == '--golden':
+            value = value if sep else (args[i + 1] if i + 1 < len(args) else '')
+            if value.startswith('/') and '{' not in value:
+                dirs.append(Path(value))
+    return dirs
+
+
+REFERENCE_CHUNK = 1 << 24
+
+
+def check_reference_logits(directory):
+    """Refuse a legacy golden reference (tokens.bin + [T, vocab] F32 logits.bin) whose
+    logits carry no information: all zero, a constant row, or non-finite (#2719).
+
+    A KL against an all-zero reference is a number about the engine alone (8.95 for
+    GLM 5.3), so the run must not reach the hardware queue. Reads the file once in
+    bounded chunks; a directory without that pair (a fidelity set, a fresh dump) passes.
+    """
+    directory = Path(directory)
+    logits, tokens = directory / 'logits.bin', directory / 'tokens.bin'
+    if not (logits.is_file() and tokens.is_file()):
+        return
+    rows, size = tokens.stat().st_size // 4, logits.stat().st_size
+    if rows == 0 or size == 0 or size % (rows * 4):
+        raise ValueError(f'golden reference {logits}: {size} bytes are not [{rows} tokens, vocab] F32 rows')
+    vocab = size // (rows * 4)
+    # Stdlib only (the host python3 has no numpy). Per row: a constant row is its
+    # first value repeated (one bytes compare); a non-finite value makes the row's
+    # float64 sum non-finite (F32 magnitudes cannot overflow a double sum).
+    import array
+    import math
+    row_bytes = vocab * 4
+    per_chunk = max(1, REFERENCE_CHUNK // row_bytes)
+    zero = bytes(row_bytes)
+    with logits.open('rb') as handle:
+        for first in range(0, rows, per_chunk):
+            block = handle.read(min(per_chunk, rows - first) * row_bytes)
+            for offset in range(0, len(block), row_bytes):
+                row, data = first + offset // row_bytes, block[offset:offset + row_bytes]
+                values = array.array('f')
+                values.frombytes(data)
+                if sys.byteorder != 'little':
+                    values.byteswap()
+                if not math.isfinite(sum(values)):
+                    column = next(i for i, v in enumerate(values) if not math.isfinite(v))
+                    raise ValueError(f'golden reference {logits}: row {row} column {column} is non-finite '
+                                     f'({values[column]}); regenerate it from the family reference golden.py')
+                if data == data[:4] * vocab:
+                    if row == 0 and data == zero and handle.read().strip(b'\0') == b'' \
+                            and block.strip(b'\0') == b'':
+                        raise ValueError(f'golden reference {logits}: all {rows} x {vocab} logits are zero (a '
+                                         'shape-only placeholder); no reference logits for this fixture. '
+                                         'Regenerate it from the family reference golden.py (#2719)')
+                    raise ValueError(f'golden reference {logits}: row {row} is constant (every logit is '
+                                     f'{values[0]}), so KL and top-1 against it carry no information; '
+                                     'regenerate it from the family reference golden.py (#2719)')
 
 
 def build_state(args, arms):
@@ -1823,6 +1928,8 @@ def build_state(args, arms):
         raise ValueError('SparkNest snapshots require push loading: add --rdma (host network and verbs)')
     if mode == 'golden':
         golden = golden_args(args.family, args.golden, sparks=sparks is not None)
+        for directory in golden_reference_dirs(args.golden):
+            check_reference_logits(directory)
     else:
         golden = list(args.golden)
     native_test = native_digest = None
@@ -1850,6 +1957,8 @@ def build_state(args, arms):
     for arm in arms.values():
         for value in arm['env'].values():
             substitute([value], container_path, **placeholder_values(state))
+    if sparks:
+        sparks['core_view_args'] = {name: worker_core_view_args(state, name, arm) for name, arm in arms.items()}
     return state
 
 
@@ -1954,7 +2063,7 @@ def main(argv=None):
                         help='exit 1 unless every --compare-logits pair is byte-identical (comparisons are otherwise report-only)')
     parser.add_argument('--vocab', type=int, help='logits row width (default: the checkpoint config.json vocab_size)')
     parser.add_argument('--overwrite', action='store_true', help='replace an earlier golden/ of this task')
-    parser.add_argument('--dry-run', action='store_true', help='run the checks, print the commands, take no locks')
+    parser.add_argument('--dry-run', action='store_true', help='run the checks, report locks and worker core-view args, take no locks')
     parser.add_argument('--preflight-only', action='store_true', help='run the CPU checks and exit (0 = pass)')
     parser.add_argument('golden', nargs=argparse.REMAINDER, help='-- GOLDEN ARGS (verbatim, after the subcommand)')
     args = parser.parse_args(argv)
@@ -1995,6 +2104,12 @@ def main(argv=None):
         if args.dry_run:
             print(f"# locks (fair queue, in order): {','.join(state['locks'])}; "
                   f"--max-run {turn_max_run(state, len(order), args):.0f}")
+            if state.get('sparks'):
+                for name in arms:
+                    record = next(iter(state['slots'][name]['sparks'].values()))
+                    view = core_view_arg(worker_command(state, name, 0, record))
+                    if view is not None:
+                        print(f'# arm {name} worker argv: {shlex.join(["--core-view", view])}')
         print('golden-run: preflight pass')
         return 0
     root = Path(state['root'])

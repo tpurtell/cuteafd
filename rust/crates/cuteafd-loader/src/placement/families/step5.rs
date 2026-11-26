@@ -334,7 +334,7 @@ impl<'a> Step5Recipe<'a> {
         let host_geometry = cuteafd_core::prefix::HostCacheGeometry {
             unit_rows: PAGE_ROWS,
             page_bytes: checked_sum(figures.cache.geometry.ranks.iter().map(|rank| rank.persistent_unit_bytes))?,
-            mark_bytes: checked_sum(figures.cache.ranks.iter().map(|rank| rank.bytes))?,
+            mark_bytes: checked_sum(figures.cache.ranks.iter().map(|rank| rank.mark_bytes))?,
             draft_bytes: 0,
         };
         let host_cache_bytes = if !inputs.marks.host || inputs.marks.entries == 0 { 0 } else {
@@ -417,7 +417,7 @@ impl<'a> Step5Recipe<'a> {
             inputs.rows as u64,
             inputs.kv_format,
         )?;
-        let mark_bytes = usize::try_from(checked_sum(cache.ranks.iter().map(|r| r.bytes))?)?;
+        let mark_bytes = usize::try_from(checked_sum(cache.ranks.iter().map(|r| r.mark_bytes))?)?;
         let marks = inputs.marks.slots(mark_bytes) as u64;
         let hops = crate::placement::hop_buffer_bytes(
             &crate::placement::plan_hops(ownership.execution().modes(), &inputs.hops())?,

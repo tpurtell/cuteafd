@@ -184,6 +184,7 @@ fn golden_fidelity(engine: &GlmEngine<'_>, tokens: &[u32], golden: &std::path::P
     ensure!(lengths.iter().enumerate().all(|(i, &rows)| start(i) + rows <= tokens.len()),
         "stored golden needs every unshifted prompt prefix");
     let vocab = engine.cfg.vocab_size;
+    crate::shared::golden_scores::ReferenceRows::open(&golden.join("logits.bin"), tokens.len(), vocab, false)?;
     let mut reference = std::fs::File::open(golden.join("logits.bin"))?;
     ensure!(reference.metadata()?.len() == (tokens.len() * vocab * 4) as u64, "stored golden logits shape differs");
     let mut allocator = PageAllocator::new(engine);

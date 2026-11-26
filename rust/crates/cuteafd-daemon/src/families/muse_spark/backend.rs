@@ -242,7 +242,9 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             for bank in &self.graphs { bank.tick(); }
             return Ok(());
         }
+        let wait = std::time::Instant::now();
         self.diagnostic_sync()?;
+        crate::shared::decode_graph::device::record_boundary_drain(self.ranks.iter().map(|r| r.device.id), wait.elapsed());
         // SAFETY: all participating ranks are joined; graphs retain no private allocations.
         unsafe { crate::shared::decode_graph::device::observe_completed(self.library, |visit| {
             for bank in &self.graphs { bank.visit(visit)?; }

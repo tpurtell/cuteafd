@@ -804,6 +804,31 @@ impl<E: CopyEngine, P> HostCache<E, P> {
         self.snapshots.as_ref().and_then(|s| s.get(key)).is_some_and(|s| s.pins > 0)
     }
 
+    /// Only the engine retention pin remains; an outstanding restore DMA can hold another.
+    pub fn singly_pinned(&self, key: Key) -> bool {
+        self.snapshots.as_ref().and_then(|s| s.get(key)).is_some_and(|s| s.pins == 1)
+    }
+
+    /// Can the snapshot's slabs ever fit the quota, even with an empty pool?
+    pub fn fits_empty(&self, snapshot: &DeviceSnapshot) -> bool {
+        use crate::pool::Class;
+        let chunk = self.config.chunk_bytes;
+        if chunk == 0 { return false; }
+        let mut counts = [0u64; Class::ALL.len()];
+        for (bank, pages) in snapshot.pages.iter().enumerate() {
+            counts[Layout::page_class(bank).index()] += pages.len() as u64;
+        }
+        counts[Class::Tail.index()] = 1;
+        counts[Class::Draft.index()] = u64::from(snapshot.meta.has_draft && self.layout.draft > 0);
+        counts[Class::Scores.index()] = u64::from(self.layout.scores > 0);
+        Class::ALL.into_iter().zip(counts).try_fold(0u64, |total, (class, count)| {
+            if count == 0 { return Some(total); }
+            let per_chunk = chunk.checked_div(self.layout.size(class) as u64)?;
+            if per_chunk == 0 { return None; }
+            total.checked_add(count.div_ceil(per_chunk))
+        }).is_some_and(|chunks| chunks <= self.config.bytes / chunk)
+    }
+
     /// Why `snapshot` is not cached, or `None` when it is.
     fn skip_reason(&self, snapshot: &DeviceSnapshot) -> Option<SkipReason> {
         let tokens = snapshot.meta.tokens.len();

@@ -411,22 +411,25 @@ mod tests {
         use cuteafd_core::memory_policy::DeviceKind;
         for ranks in [1, 2] {
             for rank in 0..ranks {
-                let owner = cuteafd_loader::placement::families::deepseek_v41::admission::graph_allowance(ranks, rank).unwrap();
-                let items = [Item { category: Category::Runtime, group: owner.source.clone(),
-                    format: String::new(), bytes: owner.bytes, basis: Basis::Calibrated,
-                    lifetime: ItemLifetime::PostReadyReserve }];
-                let id = format!("rtx{rank}");
-                let owners = cuteafd_loader::placement::reserve::breakdown(&id,
-                    DeviceKind::Gpu, 96 << 30, 0, &items);
-                let graphs: Vec<_> = owners.reserve.iter().filter(|owner| owner.name == "graph reserve").collect();
-                assert_eq!(graphs.len(), 1);
-                assert!(graphs[0].bytes > 0);
-                assert_eq!(graphs[0].bytes, owner.bytes);
-                let (base, _) = cuteafd_loader::placement::graph_reserve::v41_default(ranks, rank);
-                let sample = row(&id, Some(i128::from(base)), &owners, Some(base), json!({}), None);
-                assert_eq!(sample["graph_reserve_bytes"], owner.bytes);
-                assert_eq!(sample["graph_reserve_slack"], owner.bytes - base);
-                assert_eq!(sample["delta_vs_measured"], 0);
+                for lanes in [1u8, 2] {
+                    let owner = cuteafd_loader::placement::families::deepseek_v41::admission::graph_allowance(ranks, rank, lanes, 64).unwrap();
+                    let items = [Item { category: Category::Runtime, group: owner.source.clone(),
+                        format: String::new(), bytes: owner.bytes, basis: Basis::Calibrated,
+                        lifetime: ItemLifetime::PostReadyReserve }];
+                    let id = format!("rtx{rank}");
+                    let owners = cuteafd_loader::placement::reserve::breakdown(&id,
+                        DeviceKind::Gpu, 96 << 30, 0, &items);
+                    let graphs: Vec<_> = owners.reserve.iter().filter(|owner| owner.name == "graph reserve").collect();
+                    assert_eq!(graphs.len(), 1);
+                    assert!(graphs[0].bytes > 0);
+                    assert_eq!(graphs[0].bytes, owner.bytes);
+                    let measured = cuteafd_loader::placement::graph_reserve::v41_working_set(ranks, rank, lanes, 64).unwrap();
+                    let soft = cuteafd_loader::placement::graph_reserve::resolve_working_set(None, None, None, rank, measured).unwrap().base_bytes;
+                    let sample = row(&id, Some(i128::from(soft)), &owners, Some(soft), json!({}), None);
+                    assert_eq!(sample["graph_reserve_bytes"], owner.bytes);
+                    assert_eq!(sample["graph_reserve_slack"], owner.bytes - soft);
+                    assert_eq!(sample["delta_vs_measured"], 0);
+                }
             }
         }
     }

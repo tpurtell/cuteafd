@@ -107,6 +107,44 @@ impl DecodeShareArgs {
     }
 }
 
+/// Always-on prefill-round counters.
+///
+/// The round is where these quantities exist, so [`PrefillQueue`] records them itself: every
+/// family that prefills through the queue counts the same way, and a caller cannot forget
+/// to. Three relaxed adds per round; nothing allocates.
+pub(crate) mod round_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// One queue's counters. Serving queues share [`GLOBAL`]; a test queue is given its own
+    /// ([`super::PrefillQueue::counted_by`]), so its assertions never see another test's rounds.
+    pub(crate) struct RoundStats {
+        /// The time rounds were charged for: their wall time less the time the caller
+        /// excluded (work for non-prefill owners between chunks). Exchange included.
+        round_ns: AtomicU64,
+        rounds: AtomicU64,
+        /// Per round, the prompts that ran at least one chunk in it (finished ones plus the
+        /// ones rotated back to wait). A prompt that takes five rounds counts five times.
+        prompt_rounds: AtomicU64,
+    }
+
+    pub(crate) static GLOBAL: RoundStats = RoundStats::new();
+
+    impl RoundStats {
+        pub(crate) const fn new() -> Self {
+            Self { round_ns: AtomicU64::new(0), rounds: AtomicU64::new(0), prompt_rounds: AtomicU64::new(0) }
+        }
+        /// One round: its charged seconds and the prompts that ran a chunk in it.
+        pub(super) fn record_round(&self, seconds: f64, prompts: u64) {
+            self.round_ns.fetch_add((seconds.max(0.0) * 1e9) as u64, Ordering::Relaxed);
+            self.rounds.fetch_add(1, Ordering::Relaxed);
+            self.prompt_rounds.fetch_add(prompts, Ordering::Relaxed);
+        }
+        pub(crate) fn round_ns(&self) -> u64 { self.round_ns.load(Ordering::Relaxed) }
+        pub(crate) fn rounds(&self) -> u64 { self.rounds.load(Ordering::Relaxed) }
+        pub(crate) fn prompt_rounds(&self) -> u64 { self.prompt_rounds.load(Ordering::Relaxed) }
+    }
+}
+
 /// A chunk's outcome for [`PrefillQueue::round`].
 pub(crate) enum Chunk {
     /// More of the prompt remains.
@@ -122,11 +160,21 @@ pub(crate) struct PrefillQueue<P> {
     owed: f64,
     last_round: f64,
     round_s: f64,
+    /// Where this queue's rounds are counted.
+    stats: &'static round_stats::RoundStats,
 }
 
 impl<P> PrefillQueue<P> {
     pub fn new(share: f64) -> Self {
-        Self { waiting: VecDeque::new(), share, owed: 0.0, last_round: 0.0, round_s: ROUND_S }
+        Self { waiting: VecDeque::new(), share, owed: 0.0, last_round: 0.0, round_s: ROUND_S,
+            stats: &round_stats::GLOBAL }
+    }
+
+    /// Count this queue's rounds in `stats` instead of the process counters.
+    #[cfg(test)]
+    pub(crate) fn counted_by(mut self, stats: &'static round_stats::RoundStats) -> Self {
+        self.stats = stats;
+        self
     }
 
     /// Limit a family round to one completed wave without changing its row plan.
@@ -211,8 +259,10 @@ impl<P> PrefillQueue<P> {
                 break;
             }
         }
+        let prompts = (out.len() + ran.len()) as u64;
         self.waiting.extend(ran);
         self.last_round = started.elapsed().saturating_sub(excluded.get()).as_secs_f64();
+        self.stats.record_round(self.last_round, prompts);
         out
     }
 
@@ -249,8 +299,10 @@ impl<P> PrefillQueue<P> {
             for prompt in unfinished.into_iter().rev() { self.waiting.push_front(prompt); }
             steps += 1;
         }
+        let prompts = (out.len() + ran.len()) as u64;
         self.waiting.extend(ran);
         self.last_round = started.elapsed().as_secs_f64();
+        self.stats.record_round(self.last_round, prompts);
         out
     }
 
@@ -310,8 +362,10 @@ impl<P> PrefillQueue<P> {
             for prompt in unfinished.into_iter().rev() { self.waiting.push_front(prompt); }
             steps += 1;
         }
+        let prompts = (out.len() + ran.len()) as u64;
         self.waiting.extend(ran);
         self.last_round = started.elapsed().saturating_sub(excluded.get()).as_secs_f64();
+        self.stats.record_round(self.last_round, prompts);
         out
     }
 
@@ -480,6 +534,42 @@ mod tests {
         assert_eq!(log, vec![0, 0, 0, 1, 1]);
         queue.settle(true);
         assert!(!queue.due(true));
+    }
+
+    /// Driving a round moves the queue's counters: one round, the time it was charged for,
+    /// and the prompts that ran a chunk in it — finished ones plus the ones rotated back.
+    #[test]
+    fn a_round_moves_its_counters() {
+        static STATS: round_stats::RoundStats = round_stats::RoundStats::new();
+        let mut queue = PrefillQueue::new(0.0).counted_by(&STATS);
+        queue.push(Prompt { id: 0, left: 1 });
+        queue.push(Prompt { id: 1, left: 1 });
+        let mut log = Vec::new();
+        assert_eq!(run(&mut queue, &mut log, 0), vec![0, 1]);
+        assert_eq!(STATS.rounds(), 1, "one round ran");
+        assert_eq!(STATS.prompt_rounds(), 2, "both prompts ran a chunk");
+        assert_eq!(STATS.round_ns(), (queue.last_round * 1e9) as u64, "the round's charged time is what was recorded");
+    }
+
+    /// The counter is prompt-rounds: a prompt that runs several chunks in one round counts
+    /// once for that round, and once more for every later round it runs a chunk in.
+    #[test]
+    fn a_prompt_counts_once_per_round_it_runs_in() {
+        static STATS: round_stats::RoundStats = round_stats::RoundStats::new();
+        let mut queue = PrefillQueue::new(0.0).counted_by(&STATS);
+        queue.push(Prompt { id: 0, left: 3 });
+        let mut log = Vec::new();
+        assert_eq!(run(&mut queue, &mut log, 0), vec![0]);
+        assert_eq!(log, vec![0, 0, 0], "three chunks in one round");
+        assert_eq!((STATS.rounds(), STATS.prompt_rounds()), (1, 1), "one prompt-round, not three chunks");
+        // With a share, the same prompt takes one chunk per round: three rounds, three prompt-rounds.
+        static SHARED: round_stats::RoundStats = round_stats::RoundStats::new();
+        let mut queue = PrefillQueue::new(0.2).counted_by(&SHARED);
+        queue.push(Prompt { id: 0, left: 3 });
+        let mut log = Vec::new();
+        for _ in 0..3 { run(&mut queue, &mut log, 0); }
+        assert_eq!(log, vec![0, 0, 0]);
+        assert_eq!((SHARED.rounds(), SHARED.prompt_rounds()), (3, 3), "one prompt, three rounds it ran in");
     }
 
     #[test]

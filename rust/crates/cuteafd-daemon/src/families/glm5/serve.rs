@@ -527,6 +527,9 @@ fn prefill_group(engine: &GlmEngine<'_>, family: &GlmPrefix<'_, '_>,
     cache: &mut PrefixCache<CudaCopyEngine<'_>>, selector: &mut TokenSelector<'_>, group: &mut [Prefill<'_>])
     -> Vec<Result<Chunk>> {
     let timer = Instant::now();
+    for p in group.iter() {
+        crate::shared::phase_stats::GLOBAL.record_first_chunk_wait(p.chunks, p.started, timer);
+    }
     let ends = group.iter().map(|p| p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len())).collect::<Vec<_>>();
     let counts = group.iter().zip(&ends).map(|(p, end)| end - p.done).collect::<Vec<_>>();
     cuteafd_transport::route_log::step(|| group.iter().zip(&counts).map(|(p, &n)| (p.id, n as u32)).collect());
@@ -693,7 +696,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                             cache.tick();
                             publish(stats, requests, generated_total, 0, 0, &cache, &reserve, 0);
                             console::gauges_now(|| console::Gauges::prefix_cache(&cache, 0, 0, 0));
-                            match turn.receive(runtime, receive)? {
+                            match crate::shared::phase_stats::GLOBAL.time_idle_wait(|| turn.receive(runtime, receive))? {
                                 Some(job) => job,
                                 None => return Ok(()),
                             }
@@ -907,6 +910,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
                         }
                         offer()?;
                         let timer = Instant::now();
+                        crate::shared::phase_stats::GLOBAL.record_first_chunk_wait(p.chunks, p.started, timer);
                         let end = p.plan.chunks.get(p.chunks).copied().unwrap_or(p.tokens.len());
                         let chunk = &p.tokens[p.done..end];
                         let start = p.placement.len;
@@ -1088,10 +1092,15 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
             continue;
         }
         offer()?;
+        let members = active.len() as u64;
+        let prefill_waiting = !prefills.is_empty();
         let cycle = Instant::now();
         let Some(finished) = runtime.block_on(lanes.run_one(|lease| decode_round(lease, engine, opened,
             &mut transport, runtime, &mut phases, &mut active, &mut shared, &mut selector, &family, &mut cache,
-            &mut free_slots, trace.as_ref(), &mut trace_round)))? else { continue };
+            &mut free_slots, trace.as_ref(), &mut trace_round)))? else {
+            crate::shared::phase_stats::GLOBAL.record_decode_call(cycle.elapsed().as_nanos() as u64, prefill_waiting, members);
+            continue;
+        };
         for index in (0..active.len()).rev() {
             if !finished[index] {
                 continue;
@@ -1130,9 +1139,11 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
         publish(stats, requests, generated_total, active.len(), prefills.len(), &cache, &reserve, stalled.len());
         console::gauges(|| console::Gauges::prefix_cache(&cache, active.len() + stalled.len(), prefills.len(),
             receive.len() + kv_waiter.len() + media.len()));
+        let elapsed = cycle.elapsed();
+        crate::shared::phase_stats::GLOBAL.record_decode_call(elapsed.as_nanos() as u64, prefill_waiting, members);
         // Encodes in flight: wake for their completion without spinning.
         if active.is_empty() && prefills.is_empty() && !media.is_empty() { std::thread::park_timeout(Duration::from_millis(1)); }
-        prefills.stepped(cycle.elapsed().as_secs_f64());
+        prefills.stepped(elapsed.as_secs_f64());
     }
     })
 }
@@ -1669,7 +1680,7 @@ mod chat_encoding_tests {
             .expect("CUTEAFD_DEPLOYMENT_TEST_HF_HOME is required")).join("hub");
         for (snapshot, mistral) in [
             ("models--mistralai--Mistral-Large-4-1T-A52B/snapshots/f12dabdc0c1e99e7f7924461a6f308859b05af4d", true),
-            ("models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-v1/snapshots/47af23347db743b4666d952e2eb48f2b01c3fede", false),
+            ("models--wrldsuksgo2mars--GLM-5.3-EXL3-K4-MC/snapshots/2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e", false),
         ] {
             let path = hub.join(snapshot);
             assert!(path.exists(), "required checkpoint missing: {}", path.display());

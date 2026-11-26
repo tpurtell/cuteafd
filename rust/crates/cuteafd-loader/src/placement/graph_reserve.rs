@@ -2,16 +2,56 @@
 use crate::serving_capacity::glm_graphs::GlmPrewarmFamily;
 use cuteafd_core::memory_policy::{Size, SizeError};
 
-/// Trace-derived prewarm arena and its allocation tail. Together these are the base.
-pub fn glm_default(family: GlmPrewarmFamily, ranks: usize) -> (u64, u64) {
-    let list = crate::serving_capacity::glm_graphs::glm_prewarm(family, ranks);
-    (list.reserve_base_bytes, list.reserve_extra_bytes)
+/// Measured C1 working-set inputs for GLM 5.3 / ML4 exact-row rank-local decode graphs.
+pub fn glm_default(family: GlmPrewarmFamily, ranks: usize, rank: usize) -> WorkingSet {
+    crate::serving_capacity::glm_graphs::glm_working_set(family, ranks, rank)
 }
-/// Each layout rank charges only its trace-qualified identities and one tail.
-/// An unmeasured layout has no borrowed inventory; explicit policy still works.
-pub fn v41_default(ranks: usize, rank: usize) -> (u64, u64) {
-    crate::serving_capacity::v41_graphs::v41_prewarm(ranks, rank)
-        .map_or((0, 0), |list| (list.reserve_base_bytes, list.reserve_extra_bytes))
+/// Per-device V4.1 measured C1 working set under shipping settings (rank-local
+/// prewarm intact), scaled by the number of decode lanes sharing the device.
+/// Passed directly to `resolve_working_set` / `current_working_set` with no
+/// family-local margin or hard-extra arithmetic.
+///
+/// Measured from `v41-strided-lanes-ab` reconciliation logs + C1 bands and the
+/// five Nov 18 V4.1 graph traces (`v41-width7-layout1`, `v41-width7-layout2`,
+/// `v41-history-final`; `largest_bytes = 4 MiB` across all five traces):
+/// - 1x RTX GPU 0: `W1_lane = 984 MiB` (944 MiB prewarm/lane + 38 MiB C1
+///   `backbone.shared` + 2 MiB 32K index), `shared = 80 MiB` (14 MiB ready
+///   shared + 66 MiB `first_request` prefill), `step_growth = 27 MiB/lane`.
+/// - 2x RTX GPU 0: `W1_lane = 592 MiB` (590 MiB prewarm/lane + 2 MiB 32K index),
+///   `shared = 12 MiB`, `step_growth = 11 MiB/lane`.
+/// - 2x RTX GPU 1: `W1_lane = 594 MiB` (592 MiB prewarm/lane + 2 MiB 32K index),
+///   `shared = 14 MiB` (incl. 6 MiB spanning `dspark_chain`), `step_growth = 11 MiB/lane`.
+/// An unknown layout returns `None` so it never borrows another layout's inventory.
+/// For 128 verify rows, the Nov 25 no-churn StridedPLE census (#2460,
+/// `v41-r128-nochurn-traces`) measured one-lane charged high-water of
+/// 3286 / 1348 / 1356 MiB (TP1 / TP2 GPU0 / GPU1). Use that retained
+/// working set, not the C1-only boundary, to prevent churn at C8/C16.
+/// Remove the existing shared allowance before scaling per-lane storage;
+/// scale the step estimate by the same measured ratio. Interpolate between
+/// the two measured row bands, extrapolate above 128 (not a measured band).
+/// Single-capture high-water is still 4 MiB on all three devices.
+pub fn v41_working_set(ranks: usize, rank: usize, lanes: u8, decode_rows: u32) -> Option<WorkingSet> {
+    const MIB: u64 = 1 << 20;
+    let lanes = u64::from(lanes.max(1));
+    let (lane64, shared, step64, total128) = match (ranks, rank) {
+        (1, 0) => (984u64, 80, 27, 3286),
+        (2, 0) => (592, 12, 11, 1348),
+        (2, 1) => (594, 14, 11, 1356),
+        _ => return None,
+    };
+    let additional = (total128 - shared - lane64) * u64::from(decode_rows.saturating_sub(64));
+    let lane = lane64 * MIB + (additional * MIB).div_ceil(64);
+    let step = (step64 * lane).div_ceil(lane64);
+    Some(WorkingSet { w1: lanes * lane + shared * MIB, step_growth: lanes * step, capture_growth: 4 * MIB })
+}
+
+/// Resolve V4.1's reserve through the shared `current_working_set` rule for
+/// measured layouts, or `current(rank, false, 0, 0)` for unknown layouts.
+pub fn v41_current(ranks: usize, rank: usize, lanes: u8, decode_rows: u32) -> Result<Resolved, Error> {
+    match v41_working_set(ranks, rank, lanes, decode_rows) {
+        Some(measured) => current_working_set(rank, measured),
+        None => current(rank, false, 0, 0),
+    }
 }
 
 /// Kimi K3 selects its arena by checkpoint core format and coordinator rank count: TP2 captures a
@@ -272,16 +312,24 @@ mod tests {
             assert_eq!(policy.cap_bytes, Some(base));
             assert_eq!(policy.source, "family default with extra");
         }
-        let (base, tail) = glm_default(GlmPrewarmFamily::Glm5, 1);
-        assert_eq!(resolve(None, 0, false, base, tail).unwrap().bytes, 675_282_944);
+        let measured = glm_default(GlmPrewarmFamily::Glm5, 1, 0);
+        let policy = resolve_working_set(None, None, None, 0, measured).unwrap();
+        let headroom = policy.growth_headroom.unwrap();
+        assert!(headroom >= GRAPH_CHUNK && headroom % GRAPH_CHUNK == 0);
+        assert!(policy.base_bytes > measured.w1 && policy.base_bytes % GRAPH_CHUNK == 0);
+        assert_eq!(policy.bytes, policy.base_bytes + headroom);
     }
     #[test]
-    fn ml4_layout_bases_get_shared_headroom() {
-        for (ranks, expected_base) in [(1, 715_128_832), (2, 914_358_272)] {
-            let (base, tail) = glm_default(GlmPrewarmFamily::MistralLarge4, ranks);
-            let policy = resolve(None, 0, false, base, tail).unwrap();
-            assert_eq!(policy.base_bytes, expected_base);
-            assert_eq!(policy.bytes, expected_base + 500_000_000);
+    fn ml4_layout_bases_get_working_set_margin() {
+        for ranks in [1, 2] {
+            for rank in 0..ranks {
+                let measured = glm_default(GlmPrewarmFamily::MistralLarge4, ranks, rank);
+                let policy = resolve_working_set(None, None, None, rank, measured).unwrap();
+                let headroom = policy.growth_headroom.unwrap();
+                assert!(headroom >= GRAPH_CHUNK && headroom % GRAPH_CHUNK == 0);
+                assert!(policy.base_bytes > measured.w1 && policy.base_bytes % GRAPH_CHUNK == 0);
+                assert_eq!(policy.bytes, policy.base_bytes + headroom);
+            }
         }
     }
     #[test]
@@ -396,4 +444,45 @@ mod tests {
         }
         assert!(resolve_working_set(None, Some("gpu1=1MB"), None, 0, measured).is_ok());
     }
+
+    #[test]
+    fn v41_working_set_uses_shared_resolver_across_layouts_and_lanes() {
+        const MIB: u64 = 1 << 20;
+        for (ranks, rank, lanes, w1_mib, soft_mib, hard_mib) in [
+            (1, 0, 1, 1_064, 1_278, 1_286),
+            (1, 0, 2, 2_048, 2_458, 2_466),
+            (2, 0, 1, 604, 726, 734),
+            (2, 0, 2, 1_196, 1_436, 1_444),
+            (2, 1, 1, 608, 730, 738),
+            (2, 1, 2, 1_202, 1_444, 1_452),
+        ] {
+            let measured = v41_working_set(ranks, rank, lanes, 64).unwrap();
+            assert_eq!(measured.w1, w1_mib * MIB, "ranks={ranks} rank={rank} lanes={lanes}");
+            let policy = resolve_working_set(None, None, None, rank, measured).unwrap();
+            assert_eq!(policy.base_bytes, soft_mib * MIB);
+            assert_eq!(policy.growth_headroom, Some(8 * MIB));
+            assert_eq!(policy.bytes, hard_mib * MIB);
+        }
+        assert!(v41_working_set(3, 0, 1, 64).is_none());
+    }
+    #[test]
+    fn v41_wide_rows_cover_no_churn_census_and_scale_only_lane_bytes() {
+        const MIB: u64 = 1 << 20;
+        for (ranks, rank, shared, w128) in [(1, 0, 80, 3286), (2, 0, 12, 1348), (2, 1, 14, 1356)] {
+            let base = v41_working_set(ranks, rank, 1, 64).unwrap();
+            let wide = v41_working_set(ranks, rank, 1, 128).unwrap();
+            let two = v41_working_set(ranks, rank, 2, 128).unwrap();
+            assert_eq!(wide.w1, w128 * MIB);
+            assert_eq!(two.w1, 2 * wide.w1 - shared * MIB);
+            assert_eq!(two.step_growth, 2 * wide.step_growth);
+            assert!(wide.step_growth > base.step_growth);
+            assert_eq!(wide.capture_growth, base.capture_growth);
+            assert!(v41_working_set(ranks, rank, 1, 256).unwrap().w1 > wide.w1);
+            let resolved = resolve_working_set(None, None, None, rank, wide).unwrap();
+            assert!(resolved.base_bytes > wide.w1);
+            let override_ = resolve_working_set(Some("6GiB"), None, None, rank, wide).unwrap();
+            assert_eq!(override_.bytes, 6 << 30);
+        }
+    }
+
 }

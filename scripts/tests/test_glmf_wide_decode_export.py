@@ -105,11 +105,14 @@ def test_ml4_context_fc_exports_the_canonical_bf16_projection(exporter, monkeypa
     ml4 = _Compilers("b12x.integration.cuteafd.mistral_large4")
     ml4.rope_attention = lambda g: g
     ml4.ML4_DRAFT = types.SimpleNamespace(kv_cache="fp8", window_size=2048)
+    ml4.ML4_DRAFT_TP2 = types.SimpleNamespace(kv_cache="fp8", window_size=2048)
     monkeypatch.setattr(package, "mistral_large4", ml4, raising=False)
     monkeypatch.setitem(sys.modules, ml4.__name__, ml4)
     g = types.SimpleNamespace(hidden=6144, index_head_dim=128, index_heads=32,
                               dense_inter=24576, moe_inter=6144, index_norm_eps=1e-5)
     programs = exporter.ml4_programs(g, 64, 4096, 1048576)
+    stems = {stem for stem, _, _, _ in programs}
+    assert {"draft2_producer_m64", "draft2_attention_m64", "draft2_output_m64"} <= stems
     op, params, build = next((op, params, build) for stem, op, params, build in programs
                             if stem == "draft_context_fc")
     assert op == "bf16_projection"

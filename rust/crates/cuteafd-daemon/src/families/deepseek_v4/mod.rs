@@ -1067,8 +1067,8 @@ fn nll_run(args: &GoldenArgs, cfg: &DeepseekV4Config, engine: &engine::Engine<'_
     for writer in [&mut output, &mut raw].into_iter().flatten() { writer.flush()?; }
     let rows = tokens.len();
     if golden.is_some() {
-        println!("prefill logits: {rows} tokens in {seconds:.2} s | top-1 agreement {:.2}% | mean NLL engine {:.4} golden {:.4} | mean KL(golden||engine) {:.5}",
-            100.0 * metrics.agree as f64 / rows as f64, metrics.nll / (rows-1) as f64, metrics.reference_nll / (rows-1) as f64, metrics.kl / rows as f64);
+        println!("prefill: {rows} tokens in {seconds:.2} s");
+        println!("{}", metrics.context_only_line("prefill"));
     } else {
         println!("prefill logits: {rows} tokens in {seconds:.2} s | mean NLL engine {:.4} | logits digest {:016x}",
             metrics.nll / (rows-1) as f64, digest.finish());
@@ -1221,7 +1221,7 @@ fn golden_run(
         let digest = logits.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
             (h ^ u64::from(v.to_bits())).wrapping_mul(0x100_0000_01b3)
         });
-        println!("decode rows: top-1 agreement {:.1}% | worst row cosine {worst:.6} | logits digest {digest:016x}",
+        println!("decode rows (context-only, argmax match, no quality verdict): {:.1}% | worst row cosine {worst:.6} | logits digest {digest:016x}",
             100.0 * decode_agree as f64 / decode_steps as f64);
     }
     if let Some(dir) = &args.save_logits {

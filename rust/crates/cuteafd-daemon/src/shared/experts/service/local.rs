@@ -666,6 +666,10 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
     let idle_wait = Duration::from_millis(100);
     let mut last_activity = Instant::now();
     let mut idle_cursor = 0usize;
+    // The unit counters' debug line: off unless `cuteafd::expert_stats` is enabled at
+    // debug, and then the loop reads no clock for it either.
+    let stats_line = tracing::enabled!(target: "cuteafd::expert_stats", tracing::Level::DEBUG);
+    let mut stats_published = Instant::now();
     // One steady-state memory observation per admission event: after the owned
     // connection set changes, the next successful request triggers a single
     // sample. This is "first success after the admission event", not a proof
@@ -936,6 +940,12 @@ pub(super) fn run(mut config: NativeExpertServiceConfig, listen: &str) -> Result
         if progressed {
             last_activity = Instant::now();
         }
+        // A debugging aid only: `/v1/stats` `exchange.expert_prefill_units` on the
+        // coordinator is the interface for this data.
+        if stats_line && stats_published.elapsed() >= Duration::from_secs(1) {
+            stats_published = Instant::now();
+            queues.log_stats(config.rank);
+        }
         if waiting {
             idle_cursor = idle_cursor.wrapping_add(1);
         } else {
@@ -1004,6 +1014,20 @@ struct OwnerQueues {
     next_id: u64,
     /// The prefill owner's index: only its units report a pace (#762).
     prefill: usize,
+    stats: UnitStats,
+}
+
+/// Units this worker completed, counted where every executor format publishes a unit
+/// (`OwnerQueues::publish_oldest`), with no flag: the prefill pace is the one each reply
+/// header already carries. Plain integers: the owner loop is the only writer and reader.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+struct UnitStats {
+    decode_units_total: u64,
+    prefill_units_total: u64,
+    /// Sums of the prefill units' measured pace (busy: arrival to fence; idle: the
+    /// previous fence on the owner stream to this arrival).
+    prefill_unit_busy_ns_total: u64,
+    prefill_unit_idle_ns_total: u64,
 }
 impl OwnerQueues {
     fn new(owners: &cuteafd_transport::worker_selection::SparkExecutions) -> Self {
@@ -1012,7 +1036,7 @@ impl OwnerQueues {
         Self { retained: vec![0; limits.len()],
             pending: limits.iter().map(|&limit| std::collections::VecDeque::with_capacity(limit)).collect(),
             limits, completed: std::collections::HashMap::with_capacity(capacity), next_id: 0,
-            prefill: owners.decode.len() }
+            prefill: owners.decode.len(), stats: UnitStats::default() }
     }
     fn admit(&self, owner: usize) -> Result<()> {
         if self.retained[owner] >= self.limits[owner] {
@@ -1057,7 +1081,22 @@ impl OwnerQueues {
         pace: Option<crate::shared::experts::execution::timing::UnitPace>) -> Result<()> {
         let unit = self.pending[owner].pop_front().context("expert owner has no queued unit")?;
         ensure!(self.completed.insert(unit, pace).is_none(), "expert unit published twice");
+        if owner == self.prefill {
+            self.stats.prefill_units_total += 1;
+            if let Some(pace) = pace {
+                self.stats.prefill_unit_busy_ns_total += u64::from(pace.busy_us) * 1000;
+                self.stats.prefill_unit_idle_ns_total += u64::from(pace.idle_us) * 1000;
+            }
+        } else {
+            self.stats.decode_units_total += 1;
+        }
         Ok(())
+    }
+    /// One `Spark expert stats` line at debug (`cuteafd::expert_stats`): silent at the
+    /// default `RUST_LOG=info`.
+    fn log_stats(&self, rank: usize) {
+        tracing::debug!(target: "cuteafd::expert_stats", rank,
+            stats = %serde_json::to_string(&self.stats).unwrap_or_default(), "Spark expert stats");
     }
     fn release(&mut self, unit: HeldUnit) -> Result<()> {
         ensure!(self.completed.remove(&unit).is_some(), "expert I/O released before unit completion");
@@ -1302,6 +1341,61 @@ mod owner_tests {
             queues.release(unit)?;
         }
         assert_eq!(queues.retained, [0; 3]);
+        Ok(())
+    }
+
+    /// Every published unit is counted with no timing flag set: decode units by count,
+    /// prefill units with the pace their reply carries.
+    #[test]
+    fn published_units_move_the_unit_counters_without_a_timing_flag() -> Result<()> {
+        use crate::shared::experts::execution::timing::UnitPace;
+        let mut queues = OwnerQueues::new(&owners());
+        assert_eq!(queues.stats, UnitStats::default());
+        let (decode, first) = (queues.record(0)?, queues.record(2)?);
+        queues.publish_oldest(0, Some(UnitPace { busy_us: 0, idle_us: 0 }))?;
+        queues.publish_oldest(2, Some(UnitPace { busy_us: 700, idle_us: 30 }))?;
+        queues.release(first)?;
+        let second = queues.record(2)?;
+        queues.publish_oldest(2, Some(UnitPace { busy_us: 900, idle_us: 0 }))?;
+        assert_eq!(queues.stats, UnitStats { decode_units_total: 1, prefill_units_total: 2,
+            prefill_unit_busy_ns_total: 1_600_000, prefill_unit_idle_ns_total: 30_000 });
+        queues.release(second)?;
+        queues.release(decode)?;
+        Ok(())
+    }
+
+    /// The stats line is a debugging aid: nothing at the default info level, one line
+    /// with the counters at debug.
+    #[test]
+    fn the_unit_stats_line_is_debug_only() -> Result<()> {
+        use crate::shared::experts::execution::timing::UnitPace;
+        #[derive(Clone, Default)]
+        struct Buffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut queues = OwnerQueues::new(&owners());
+        let unit = queues.record(2)?;
+        queues.publish_oldest(2, Some(UnitPace { busy_us: 700, idle_us: 30 }))?;
+        let logged = |level: tracing::Level| {
+            let buffer = Buffer::default();
+            let writer = buffer.clone();
+            let subscriber = tracing_subscriber::fmt().with_max_level(level).with_ansi(false)
+                .with_writer(move || writer.clone()).finish();
+            tracing::subscriber::with_default(subscriber, || queues.log_stats(3));
+            let bytes = buffer.0.lock().unwrap().clone();
+            String::from_utf8(bytes).unwrap()
+        };
+        assert_eq!(logged(tracing::Level::INFO), "", "nothing at the default level");
+        let line = logged(tracing::Level::DEBUG);
+        assert!(line.contains("DEBUG") && line.contains("cuteafd::expert_stats") && line.contains("Spark expert stats")
+            && line.contains("prefill_unit_busy_ns_total") && line.contains("700000"), "{line}");
+        assert_eq!(line.lines().count(), 1, "{line}");
+        queues.release(unit)?;
         Ok(())
     }
 

@@ -1413,16 +1413,18 @@ All 62 component tests pass (`reports/component-tests-cache-card.log`).
 ### Upload receipts and publication integration
 
 `upload_model.py` and the other publication entrypoints require the shared
-`hub_requirements.py` qualification: `huggingface_hub==1.33.0` with Xet enabled.
+`hub_requirements.py` qualification: `huggingface_hub==1.33.0` over HTTP LFS
+(`HF_HUB_DISABLE_XET=1`), and upload through `hub_lfs.py`'s verified batches.
 The self-contained CPU test environment recipe is in the root `PLAN.md`.
-Its lazy upload metadata reads only a bounded file sample at operation creation;
-Xet computes the large-file SHA during transfer rather than a separate hashing
-pass. Completed preuploads persist their returned blob ID, size, upload mode and
-local file fingerprint. Explicit resume restores those operation records without
-hashing or uploading completed shards again. Regular Git-file IDs require only
-bounded small-file hashing. No routine full-weight SHA verification was added.
+HTTP LFS needs every SHA256 before transfer. This V4.1 export records none, so
+the publisher hashes each file once into `upload-hashes.json`, keyed by stat
+identity; a resume rereads nothing. Writers that record SHA256 receipts (MC
+packages, Core K6) supply them directly. Regular Git-file IDs require only
+bounded small-file hashing.
 
-All files are preuploaded before a single parent-guarded model commit. The writer
+Files upload in parent-guarded batch commits, each verified against the Hub tree
+before the next; resume skips committed files. (Formerly: per-file preupload
+before a single commit.) The writer
 refuses to overwrite a populated repository, compares the committed remote file
 inventory/IDs/sizes against its exact prepared inventory, and writes the durable
 upload receipt only after this check. If the commit response is lost, explicit

@@ -28,6 +28,7 @@ pub(crate) struct Engine<'a> {
     draft: Option<Rc<super::draft::NativeDraft<'a>>>,
     execution: Execution<'a>,
     lanes: RefCell<Lanes<'a>>,
+    graph_cycles: RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
     prefix: RefCell<Option<super::prefix::KimiPrefix<'a>>>,
     provisional: RefCell<Option<super::state::Provisional>>,
     hops: Option<HopLink<'a>>,
@@ -336,7 +337,7 @@ impl<'a> Engine<'a> {
         let depth = crate::shared::prefill_depth::PrefillDepth::new(prefill.waves, prefill.unit_rows)?;
         let served_context = local[0][0].max_context();
         Ok(Self { probe_media: RefCell::new(Default::default()), host_prefix: None, max_pool_tokens_no_onboard: None, target_view, depth, draft: None, execution, lanes: RefCell::new(Lanes { local, routed, io, experts }),
-            prefix: RefCell::new(None), provisional: RefCell::new(None),
+            graph_cycles: RefCell::new(None), prefix: RefCell::new(None), provisional: RefCell::new(None),
             hops, peer, terminal: Cell::new(TerminalState::Active), exchange_streams, prefill, packed_row_cap: Cell::new(None), coordinator_packing_cap, served_context })
     }
 
@@ -429,7 +430,8 @@ impl<'a> Engine<'a> {
         let family = self.prefix_family()?;
         for (placement, tokens) in sequences.iter() { family.check_append(placement, tokens.len())?; }
         if let Some(draft) = &self.draft { draft.prepare_target()?; }
-        submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
+        let output = submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
+            self.begin_graph_cycle()?;
             let mut lanes = self.lanes.try_borrow_mut()?;
             for local in lanes.local.iter_mut().flatten() {
                 local.graph_cycle(crate::shared::decode_graph::device::Cycle::Prefill);
@@ -470,7 +472,9 @@ impl<'a> Engine<'a> {
                 }
                 Ok(Ok(()))
             })
-        })
+        })?;
+        if let Err(error) = self.graph_settle() { self.shutdown()?; return Err(error); }
+        Ok(output)
     }
 
     pub(crate) fn native_draft(&self) -> Option<&super::draft::NativeDraft<'a>> { self.draft.as_deref() }
@@ -621,18 +625,23 @@ impl<'a> Engine<'a> {
                 captured += local.warm_graphs(&binding, rank, reserves[rank])?;
             }
         }
-        // Lane banks now retain every controller seeded before startup capture.
+        // Startup capture does not launch graphs; drain the metadata uploads
+        // before measuring and installing the runtime completion pool.
+        for local in lanes.local.iter().flatten() { local.stream().drain()?; }
+        let streams = lanes.local.iter().flatten().map(|local| (local.stream().device.id, local.stream().raw)).collect::<Vec<_>>();
         drop(controllers);
         drop(lanes);
-        // Startup activity is attributed to Other and charged once, here,
-        // before the first serving step can see the arenas as its own.
         self.graph_settle()?;
+        if reserves.iter().any(|&bytes| bytes > 0) {
+            *self.graph_cycles.borrow_mut() = Some(crate::shared::decode_graph::device::EventCycles::new(self.library(), &streams)?);
+        }
         Ok(GraphWarmup { captured, before_capture })
     }
 
     /// Capture one explicit speculative width across every physical rank without
     /// launching, then settle device graph accounting (golden wide-batch oracle).
     pub(crate) fn warm_explicit_verify_graphs(&self, rows: usize) -> Result<usize> {
+        self.begin_graph_cycle()?;
         let mut captured = 0;
         {
             let mut lanes = self.lanes.try_borrow_mut()?;
@@ -645,23 +654,28 @@ impl<'a> Engine<'a> {
         Ok(captured)
     }
 
-    /// Completed-step graph boundary. Every rank's step is queued and no lane is
-    /// mid-segment, so each physical device is sampled once and growth charged.
+    fn begin_graph_cycle(&self) -> Result<()> {
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        let mut lanes = self.lanes.try_borrow_mut()?;
+        // SAFETY: Kimi owners pin persistent engine storage only.
+        unsafe { cycles.begin_persistent(|visit| {
+            for lane in lanes.local.iter_mut().flatten() { lane.visit_graphs(visit)?; }
+            Ok(())
+        }) }
+    }
+
     fn graph_settle(&self) -> Result<()> {
         let mut lanes = self.lanes.try_borrow_mut()?;
-        let boundary = lanes.local.iter().flatten().any(|lane| lane.graph_needs_boundary());
-        if !boundary {
+        if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() {
             for lane in lanes.local.iter_mut().flatten() { lane.graph_tick(); }
-            return Ok(());
+            // SAFETY: all lane graph submissions for this cycle are queued.
+            return unsafe { cycles.complete() };
         }
-        let library = self.library();
-        // SAFETY: Kimi owners pin `()`; a capture references only the lane's
-        // persistent buffers and admitted weights, never a per-graph allocation,
-        // and those outlive every queued launch.
-        unsafe { crate::shared::decode_graph::device::observe_completed(library, |visit| {
-            for lane in lanes.local.iter_mut().flatten() {
-                lane.visit_graphs(visit)?;
-            }
+        // Startup only: no graph was launched, and metadata streams drained.
+        if !lanes.local.iter().flatten().any(|lane| lane.graph_needs_boundary()) { return Ok(()) }
+        unsafe { crate::shared::decode_graph::device::observe_completed(self.library(), |visit| {
+            for lane in lanes.local.iter_mut().flatten() { lane.visit_graphs(visit)?; }
             Ok(())
         }) }
     }
@@ -713,6 +727,7 @@ impl<'a> Engine<'a> {
         }
         if let Some(draft) = &self.draft { draft.prepare_target()?; }
         let output = submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
+            self.begin_graph_cycle()?;
             let mut lanes = self.lanes.try_borrow_mut()?;
             let cfg = lanes.local[0][self.head()].config();
             if self.execution.skip_routed_experts { cfg.prefix_geometry()?; } else { cfg.release_geometry()?; }
@@ -898,7 +913,8 @@ impl<'a> Engine<'a> {
     pub(crate) fn prefix_residual(&self, tokens: &[u32], pages: &[u32],
         pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Vec<f32>> {
         ensure!(self.provisional.borrow().is_none(), "Kimi diagnostic cannot overwrite pending verify");
-        submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
+        let output = submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
+            self.begin_graph_cycle()?;
             let mut lanes = self.lanes.try_borrow_mut()?;
             ensure!(!tokens.is_empty() && tokens.len() <= self.prefill.unit_rows,
                 "Kimi diagnostic prefix has no tokens or exceeds one prefill unit");
@@ -922,7 +938,9 @@ impl<'a> Engine<'a> {
                 Ok(bytes.chunks_exact(2).map(|bytes| f32::from_bits(
                     u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16)).collect())
             })
-        })
+        })?;
+        if let Err(error) = self.graph_settle() { self.shutdown()?; return Err(error); }
+        Ok(output)
     }
 
     /// Sequential cold diagnostics reuse a single recurrent slot. Each rank's
@@ -953,7 +971,8 @@ impl<'a> Engine<'a> {
             if self.execution.skip_routed_experts { cfg.prefix_geometry()?; } else { cfg.release_geometry()?; }
         }
         ensure!(self.provisional.borrow().is_none(), "Kimi diagnostic cannot overwrite pending verify");
-        submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
+        let output = submit_scoped(|| self.require_live(), || self.shutdown(), |scope| {
+            self.begin_graph_cycle()?;
             let mut lanes = self.lanes.try_borrow_mut()?;
             ensure!(!tokens.is_empty() && tokens.len() == sequences.len() && tokens.len() <= lanes.local.len(),
                 "Kimi forward token/sequence lane count");
@@ -1002,6 +1021,8 @@ impl<'a> Engine<'a> {
                 }
             }
             Ok(())
-        })
+        })?;
+        if let Err(error) = self.graph_settle() { self.shutdown()?; return Err(error); }
+        Ok(output)
     }
 }

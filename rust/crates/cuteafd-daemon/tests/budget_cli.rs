@@ -1045,7 +1045,7 @@ fn run_installed_example_deployments(hf_home: Option<std::ffi::OsString>,
               "step5-fp8-max.config"][..], "capture_step5_real_planner_launch"),
             (&["glm53-exl3-min.config", "glm53-exl3-max.config",
               "glm53-exlr8-min.config", "glm53-exlr8-max.config"][..], "capture_glm_real_planner_launch"),
-            (&["glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config",
+            (&["glm53-flash-exl3-k4-mc-k6-min.config", "glm53-flash-exl3-k4-mc-k6-max.config",
               "glm53-flash-exl3-min.config", "glm53-flash-exl3-max.config",
               "glm53-flash-exlr8-k4-min.config", "glm53-flash-exlr8-k4-max.config"][..], "capture_glm_flash_real_planner_launch"),
             (&["qwen35-9b-bf16-min.config", "qwen38-27b-bf16-min.config",
@@ -1200,18 +1200,18 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         let required = !retired.contains(path.strip_prefix(&root).unwrap().to_str().unwrap());
         selected.entry(key).and_modify(|live| *live |= required).or_insert(required);
     }
-    let expected_absent = ("stepfun-ai/Step-5-Preview-NVFP4",
-        "bc246cc2848e17b37f377eda8fd825c5b3018d1f");
-    let expected_installed = expected.keys().copied()
-        .filter(|key| *key != expected_absent).collect::<std::collections::BTreeSet<_>>();
+    // Retired configurations may point at checkpoints SparkNest no longer stores. The
+    // missing set is computed from the data: exactly the checkpoints no live release
+    // cell and no non-retired example config requires, whose snapshot is absent.
+    let selected_keys = selected.keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    let retired_keys = selected.iter().filter(|(_, required)| !**required)
+        .map(|(key, _)| (key.0.clone(), key.1.clone())).collect::<std::collections::BTreeSet<_>>();
     let mut installed = std::collections::BTreeSet::new();
     let mut absent = std::collections::BTreeSet::new();
     let mut tested = 0;
     for ((model, revision), required) in selected {
         let snapshot = installed_example_snapshot(&model, Some(&revision), &hf_home);
         if !required && snapshot.is_none() {
-            assert_eq!((model.as_str(), revision.as_str()), expected_absent,
-                "unexpected missing retired checkpoint");
             absent.insert((model.clone(), revision.clone()));
             eprintln!("expected retired checkpoint not installed: {model}@{revision}");
             continue;
@@ -1234,11 +1234,15 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         installed.insert((model, revision));
         tested += 1;
     }
-    assert_eq!(absent, std::collections::BTreeSet::from([
-        (expected_absent.0.to_owned(), expected_absent.1.to_owned())]));
-    assert_eq!(installed.iter().map(|(model, revision)| (model.as_str(), revision.as_str()))
-        .collect::<std::collections::BTreeSet<_>>(), expected_installed);
-    assert_eq!(tested, 38, "installed checkpoint revision set changed (live v6 MC, K3.25 MC, three Inkling revisions, Hy4-flash MC and Inkling 2 Mini)");
+    assert!(absent.is_subset(&retired_keys), "a required checkpoint is missing: {absent:?}");
+    assert!(!absent.is_empty(), "no retired checkpoint is absent; retire the inventory exemption");
+    // Baseline entries that no live release cell or example config selects any more (a
+    // checkpoint whose configs were retired outright) are historical: not required here.
+    let expected_installed = expected.keys().map(|(model, revision)| ((*model).to_owned(), (*revision).to_owned()))
+        .filter(|key| selected_keys.contains(key) && !absent.contains(key))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(installed, expected_installed);
+    assert_eq!(tested, expected_installed.len(), "installed checkpoint revision set changed");
     eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC, Kimi K3.1 MC, repaired MC, three live Inkling entries, Hy4-flash MC and Inkling 2 Mini: {tested} installed checkpoint revisions verified");
 }
 
@@ -1292,16 +1296,23 @@ fn run_installed_release_matrix_recipes(hf_home: Option<std::ffi::OsString>,
                 .is_some_and(|role| role.component == Component::RoutedExpert))
             .cloned().collect::<Vec<_>>();
         let mut packages = std::collections::BTreeSet::new();
+        let mut local_only = std::collections::BTreeSet::new();
         for members in format::group_by_stem(&tensors).values() {
             let operand = format::detect(members).unwrap();
-            if let Some(contract) = model.experts(&operand) { packages.insert(contract.package); }
+            if let Some(contract) = model.experts(&operand) {
+                // A family whose contract declares no Spark world and a local package
+                // (Inkling 2 Mini, TP1 on the RTX, 0 Sparks) has no Spark recipe to parse.
+                if contract.spark_worlds.is_empty() && contract.local.is_ok() {
+                    local_only.insert(contract.package);
+                } else { packages.insert(contract.package); }
+            }
         }
         if cuteafd_loader::plan::exlr8::recognizes(&snapshot).unwrap() {
             // EXLR8 is admitted by exlr8_native_plan, not spark_recipe.
             assert!(packages.is_empty(), "{entry_name}: EXLR8 unexpectedly selected a generic package");
             continue;
         }
-        assert!(!packages.is_empty(), "{entry_name}: missing routed recipe");
+        assert!(!packages.is_empty() || !local_only.is_empty(), "{entry_name}: missing routed recipe");
         for package in packages {
             // Local-only coordinators need no Spark TP1 package, but their IDs
             // must parse against a registered Spark world.

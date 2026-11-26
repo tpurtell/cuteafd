@@ -3516,12 +3516,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
                 let theirs = golden.row(prefill + row)?;
                 metrics.push(values, Some(&theirs), tokens.get(prefill + row + 1).copied())?;
             }
-            let (rows, scored) = (metrics.rows, metrics.scored.max(1) as f64);
-            println!("decode logits: top-1 agreement {:.2}% over {rows} rows | next-token accuracy engine {:.1}% \
-                golden {:.1}% | mean NLL engine {:.4} golden {:.4} | mean KL(golden||engine) {:.5}",
-                100.0 * metrics.agree as f64 / rows as f64, 100.0 * metrics.next_ok as f64 / scored,
-                100.0 * metrics.reference_next as f64 / scored, metrics.nll / scored,
-                metrics.reference_nll / scored, metrics.kl / rows as f64);
+            println!("{}", metrics.context_only_line("decode"));
         }
     }
     if args.bench_prefill > 0 {
@@ -3605,12 +3600,7 @@ fn golden_run(args: &GoldenArgs, opened: &Opened, engine: &engine::GlmfEngine<'_
     };
     if let Some(logits) = logits {
         if args.nll {
-            let scored = metrics.scored.max(1) as f64;
-            println!("prefill logits: top-1 agreement {:.1}% over {prefill} rows | next-token accuracy engine {:.1}% \
-                golden {:.1}% | mean NLL engine {:.4} golden {:.4}", 100.0 * metrics.agree as f64 / prefill as f64,
-                100.0 * metrics.next_ok as f64 / scored, 100.0 * metrics.reference_next as f64 / scored,
-                metrics.nll / scored, metrics.reference_nll / scored);
-            println!("prefill logits: mean KL(golden||engine) {:.5}", metrics.kl / metrics.rows as f64);
+            println!("{}", metrics.context_only_line("prefill"));
         }
         let last = golden.row(prefill - 1)?;
         let (cosine, _) = similarity(&logits, &last);

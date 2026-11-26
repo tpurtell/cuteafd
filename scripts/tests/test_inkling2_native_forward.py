@@ -63,7 +63,8 @@ def test_persistent_layer_state_is_borrowed_and_metadata_uses_retained_uploads()
     assert local.index('layers::dispatch_experts(owner,') < local.index('self.join(layer, unit)')
     assert 'impl<\'a> UnitIo<\'a> for TokenIo' in prefill
     assert 'self.head.embed_unit(' in prefill
-    assert 'probe::head_spans(unit.rows.len(), 64)' in prefill
+    assert 'probe::head_spans(rows, 64)' in prefill
+    assert 'projected_spans(unit.rows.len(), &members, self.head_rows)' in prefill
     assert '(self.on_logits)(member.sequence,' in prefill
 
 

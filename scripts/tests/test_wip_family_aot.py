@@ -1383,4 +1383,37 @@ def test_hy4_flash_dense_trellis_policies_are_mul1_k6_k8_with_f32_heads():
     }
 
 
+def test_hy4_wip_scope_requires_mul1_routed_index_and_dense_trellis_policies(tmp_path, monkeypatch):
+    monkeypatch.setenv('HF_HOME', str(tmp_path))
+    mul1_model = 'wrldsuksgo2mars/Hy4-EXL3-K4-MC'
+    seed_exl3_index(tmp_path, mul1_model, codebook='mul1')
+    _, scopes = aot.config_scopes({'FAMILY': 'hy4', 'MODEL_ID': mul1_model, 'SPARK_COUNT': '4'})
+    assert scopes['CUTEAFD_WIP_HY4_AOT'] == 'ON'
+    assert scopes['CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES'] == 'hy4:exl3-k45-mul1'
+    assert scopes['CUTEAFD_WIP_EXPERT_FAMILIES'] == 'hy4:exl3-k45-mul1'
+    assert scopes['CUTEAFD_WIP_GENERIC_SPARK_COUNTS'] == 'hy4=4'
+
+    mcg_model = 'test/Hy4-EXL3-MCG-Invalid'
+    seed_exl3_index(tmp_path, mcg_model, codebook='mcg')
+    with pytest.raises(ValueError, match='MUL1 only'):
+        aot.config_scopes({'FAMILY': 'hy4', 'MODEL_ID': mcg_model, 'SPARK_COUNT': '4'})
+
+    spec = importlib.util.spec_from_file_location(
+        'hy4_full_dense_trellis', ROOT / 'python/tools/aot/export_b12x_dense_trellis_k6_aot.py'
+    )
+    dense = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(dense)
+    policies = dense.row_policies(('hy4',))
+    assert policies, 'hy4 dense trellis policies must be populated'
+    assert {p['codebook'] for p in policies} == {'mul1'}
+    assert {p.get('bits', 6) for p in policies} == {6, 8}
+    heads = [p for p in policies if p['output_features'] in (120832, 60416)]
+    assert len(heads) == 4  # TP1/TP2 x K6/K8
+    assert all(p['output_program'].endswith('_f32') for p in heads)
+    ksplit = [p for p in policies if p['sharded_side'] == 2]
+    assert {(p['input_features'], p['output_features']) for p in ksplit} == {
+        (8192, 6144), (9216, 6144), (1024, 6144)
+    }
+
+
 

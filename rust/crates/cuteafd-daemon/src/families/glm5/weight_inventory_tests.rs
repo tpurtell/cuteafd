@@ -26,6 +26,15 @@ fn installed(model: &str, revision: &str) -> Result<PathBuf> {
     Ok(root)
 }
 
+/// An installed snapshot's selected core view. The standalone Core-K6 checkpoints are
+/// retired: their core is the MC checkpoint's `k6-compact` view.
+fn installed_view(model: &str, revision: &str, mode: cuteafd_loader::plan::checkpoint::CoreView)
+    -> Result<cuteafd_loader::plan::checkpoint::CheckpointView> {
+    cuteafd_loader::plan::checkpoint::CheckpointView::select(&installed(model, revision)?, mode)
+}
+
+const GLM_MC: (&str, &str) = ("wrldsuksgo2mars--GLM-5.3-EXL3-K4-MC", "2e42b53e61f0f59f664c915fe2424ce9c9fa5f8e");
+
 fn signatures(
     owners: impl IntoIterator<Item = Allocation>,
 ) -> BTreeMap<String, (cuteafd_loader::placement::planner::Location, u64, String)> {
@@ -87,65 +96,66 @@ fn replay(
     Ok(requests)
 }
 
+/// Synthetic ModelOpt NVFP4 GLM headers: the official NVFP4 checkpoint is deprecated
+/// and no longer stored, but its format must keep working.
+fn nvfp4_glm_snapshot(root: &std::path::Path) {
+    let mut config = fixture::glm5_config();
+    config["quantization_config"] = serde_json::json!({"quant_method":"modelopt", "quant_algo":"NVFP4",
+        "group_size":16, "ignore":["lm_head", "*self_attn*", "*mlp.gate", "*mlp.gate_proj", "*mlp.up_proj", "*mlp.down_proj", "*shared_experts*"]});
+    let tensors = fixture::glm5_tensors(|name, n, k| fixture::nvfp4(name, n, k));
+    fixture::write_snapshot(root, &config, &tensors, None);
+}
+
+fn check_variant_inventory(label: &str, checkpoint: &cuteafd_loader::plan::Checkpoint,
+    catalog: &OfficialV41Catalog, cfg: &GlmDsaConfig) -> Result<()> {
+    for ranks in [1, 2] {
+        for whole in [false, true] {
+            if whole && ranks == 1 {
+                continue;
+            }
+            let owners = (0..cfg.layers).map(|l| (l % 2) as u8).collect::<Vec<_>>();
+            let owners = whole.then_some(owners.as_slice());
+            for home in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned] {
+                let expected = WeightInventory::from_checkpoint(
+                    checkpoint, ranks, cfg.layers, owners, true, false, home)?;
+                let actual = replay(catalog, cfg, checkpoint, ranks, owners, true, home)?;
+                assert_eq!(
+                    signatures(expected.owners.into_iter().map(|o| o.allocation)),
+                    signatures(actual),
+                    "{label} ranks={ranks} whole={whole} home={home:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn installed_variant_weight_inventory_equals_production_requests() -> Result<()> {
+    use cuteafd_loader::plan::checkpoint::CoreView;
     for (model, revision) in [
-        (
-            "zai-org--GLM-5.3",
-            "aca966e4e02791568aa6a4ced368624b3d897f42",
-        ),
-        (
-            "nvidia--GLM-5.3-NVFP4",
-            "e3b8f9f2fad29727dfa95e766c5cac18ea1414bf",
-        ),
-        (
-            "wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6",
-            "5a4e83a09a11f3145332ed632d28a9894ea88225",
-        ),
-        (
-            "wrldsuksgo2mars--Mistral-Large-4-EXL3-K4",
-            "9c354cee78cd6feddb057549b8edde6e3b319822",
-        ),
+        ("zai-org--GLM-5.3", "aca966e4e02791568aa6a4ced368624b3d897f42"),
+        ("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4", "9c354cee78cd6feddb057549b8edde6e3b319822"),
     ] {
         let root = installed(model, revision)?;
         let checkpoint = cuteafd_loader::plan::Checkpoint::open(&root)?;
         let catalog = cuteafd_loader::read_expert_catalog(&root)?;
         let cfg = GlmDsaConfig::read(&root)?;
-        for ranks in [1, 2] {
-            for whole in [false, true] {
-                if whole && ranks == 1 {
-                    continue;
-                }
-                let owners = (0..cfg.layers).map(|l| (l % 2) as u8).collect::<Vec<_>>();
-                let owners = whole.then_some(owners.as_slice());
-                for home in [EmbeddingHome::Device(0), EmbeddingHome::HostPinned] {
-                    let expected = WeightInventory::from_checkpoint(
-                        &checkpoint,
-                        ranks,
-                        cfg.layers,
-                        owners,
-                        true,
-                        false,
-                        home,
-                    )?;
-                    let actual = replay(
-                        &catalog,
-                        &cfg,
-                        &checkpoint,
-                        ranks,
-                        owners,
-                        true,
-                        home,
-                    )?;
-                    assert_eq!(
-                        signatures(expected.owners.into_iter().map(|o| o.allocation)),
-                        signatures(actual),
-                        "{model} ranks={ranks} whole={whole} home={home:?}"
-                    );
-                }
-            }
-        }
+        check_variant_inventory(model, &checkpoint, &catalog, &cfg)?;
     }
+    // The retired standalone Core-K6 checkpoint is the MC checkpoint's k6-compact view.
+    let view = installed_view(GLM_MC.0, GLM_MC.1, CoreView::K6Compact)?;
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open_view(&view)?;
+    let catalog = cuteafd_loader::read_expert_catalog_view(&view)?;
+    let cfg = GlmDsaConfig::from_hf(&view.config()?)?;
+    check_variant_inventory("GLM-5.3-EXL3-K4-MC k6-compact", &checkpoint, &catalog, &cfg)?;
+    // Deprecated NVFP4 stays supported without its (retired) official checkpoint.
+    let root = tempfile::tempdir()?;
+    nvfp4_glm_snapshot(root.path());
+    let checkpoint = cuteafd_loader::plan::Checkpoint::open(root.path())?;
+    let catalog = cuteafd_loader::read_expert_catalog(root.path())?;
+    let cfg = GlmDsaConfig::read(root.path())?;
+    check_variant_inventory("synthetic GLM NVFP4", &checkpoint, &catalog, &cfg)?;
     Ok(())
 }
 
@@ -272,13 +282,14 @@ fn arena_inventory(label: &str, inventory: &WeightInventory) -> Result<()> {
 
 #[test]
 fn installed_arena_cpu_inventory() -> Result<()> {
-    for (model, revision) in [
-        ("wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6", "5a4e83a09a11f3145332ed632d28a9894ea88225"),
-        ("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4", "9c354cee78cd6feddb057549b8edde6e3b319822"),
+    use cuteafd_loader::plan::checkpoint::CoreView;
+    for (model, revision, mode) in [
+        (GLM_MC.0, GLM_MC.1, CoreView::K6Compact),
+        ("wrldsuksgo2mars--Mistral-Large-4-EXL3-K4", "9c354cee78cd6feddb057549b8edde6e3b319822", CoreView::Original),
     ] {
-        let root = installed(model, revision)?;
-        let checkpoint = cuteafd_loader::plan::Checkpoint::open(&root)?;
-        let cfg = GlmDsaConfig::read(&root)?;
+        let view = installed_view(model, revision, mode)?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open_view(&view)?;
+        let cfg = GlmDsaConfig::from_hf(&view.config()?)?;
         for ranks in [1, 2] {
             let owners = cuteafd_loader::placement::families::glm5::attention_owners(&cfg, cfg.layers)?;
             for whole in [false, true] {
@@ -365,6 +376,18 @@ fn installed_glm_and_ml4_draft_arena_charges_equal_shared_load_recipes() -> Resu
         eprintln!("ARENA_CHARGE ML4-bundled-draft home={home} old={old} logical={logical} B={} tail={tail} new={} delta={} old_rounding=no",
             arena.bytes(), arena.bytes() as u64 + tail, arena.bytes() as u64 + tail - old);
     }
+    let tp2_layouts = cuteafd_loader::placement::families::glm5::ml4_tp2_draft_layouts(&snapshot, 20, 16, 16384, 188)?;
+    let tp2_facts = DraftFacts::ml4_tp2(&tp2_layouts)?;
+    let tp2_components = tp2_facts.tp2_components(1)?;
+    for (rank, rank_layout) in tp2_layouts.iter().enumerate() {
+        let id = format!("glm/draft/{rank}");
+        let rank_arena = WeightArenaLayout::new(id.clone(), rank_layout.immutable_arena_requests())?;
+        let rank_logical = rank_layout.owners().iter().map(|o| o.resident_weights.0).sum::<u64>();
+        let tail = arena_charge(&tp2_components, &id, Location::coordinator(rank as u8),
+            rank_arena.bytes() as u64, rank_logical, MemoryKind::DrafterWeights)?;
+        eprintln!("ARENA_CHARGE ML4-tp2-draft rank={rank} logical={rank_logical} B={} tail={tail} new={}",
+            rank_arena.bytes(), rank_arena.bytes() as u64 + tail);
+    }
     Ok(())
 }
 
@@ -372,12 +395,11 @@ fn installed_glm_and_ml4_draft_arena_charges_equal_shared_load_recipes() -> Resu
 fn installed_k6_max_streaming_staging_covers_measured_pools() -> Result<()> {
     use crate::shared::experts::rtx::dense::{HostStaging, Rect};
     for (model, revision, observed, old_dense) in [
-        ("wrldsuksgo2mars--GLM-5.3-EXL3-K4-Core-K6", "5a4e83a09a11f3145332ed632d28a9894ea88225",
-            [240060416usize, 27942912], 11891580928usize),
+        (GLM_MC.0, GLM_MC.1, [240060416usize, 27942912], 11891580928usize),
     ] {
-        let root = installed(model, revision)?;
-        let checkpoint = cuteafd_loader::plan::Checkpoint::open(&root)?;
-        let cfg = GlmDsaConfig::read(&root)?;
+        let view = installed_view(model, revision, cuteafd_loader::plan::checkpoint::CoreView::K6Compact)?;
+        let checkpoint = cuteafd_loader::plan::Checkpoint::open_view(&view)?;
+        let cfg = GlmDsaConfig::from_hf(&view.config()?)?;
         let core = CoreInventory::from_checkpoint(&cfg, &checkpoint)?;
         let mut rects: [Vec<Vec<Rect>>; 2] = Default::default();
         let mut add = |rank: usize, layout: cuteafd_loader::formats::trellis_core::CoreWeightLayout| -> Result<()> {

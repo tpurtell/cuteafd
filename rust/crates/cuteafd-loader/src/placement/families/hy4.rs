@@ -1,15 +1,16 @@
 //! Hy4 (`hy_v4_vl`) physical owners for the shared contract planner (#2550).
 //!
 //! One `Recipe` over `placement::planner::solve_prepared` shared by
-//! `cuteafd plan --layout` and future runtime admission:
+//! `cuteafd plan --layout` and `serve-hy4`:
 //! - packed target arena per coordinator GPU (globals + 78 layers, split or whole),
 //! - optional RTX routed-expert onboarding arena per prefix count (whole on 1 GPU,
 //!   TP2 halves on 2 GPUs; 77 MoE layers x 256 x 3 EXL3 K4 MUL1),
 //! - Spark experts + owners + runtime residual + SM121 arena page tables when remote,
 //! - 78 DSA MLA layers' paged KV + 21 full IndexCache layers' index K cache (linear
 //!   curve in pages; zero SWA rings, zero pending state, zero prefix marks, zero Engram),
-//! - decode + prefill unit workspaces, FP32 vocabulary head rows, canonical `graph reserve`,
-//!   loaded code, stream slabs, selector, and host prefix quota.
+//! - packed rank & per-wave scratch arenas, FP32 vocabulary head workspace, TP2
+//!   PeerExchange & ContextExchange, canonical `graph reserve`, loaded code, stream slabs,
+//!   selector, and host prefix quota.
 use cuteafd_core::memory_layout::{Category, MemoryKind};
 use cuteafd_core::spark_reply::SparkReplyFormats;
 
@@ -19,7 +20,10 @@ use super::super::{
     ExpertRange, FfnMode, HopSpec, HopStorage, LayerAssignment, LayerMode, Placement, PoolLimits,
     ResidentWeights, TerminalHome, Tp2Range,
 };
-use crate::families::hy4::execution::{CacheLayout, UnitLayout};
+use crate::families::hy4::execution::{
+    hy4_context_buffers, hy4_peer_slot_sizes, wave_metadata_layout_for_rank, CacheLayout,
+    IndexTopkScratch, SharedScratchLayout, WaveScratchLayout,
+};
 use crate::families::hy4::weight_layout::CoordinatorWeights;
 use crate::families::hy4::{Hy4Config, Hy4KvCache};
 use crate::families::hy4_common::PAGE_ROWS;
@@ -27,7 +31,10 @@ use crate::serving_capacity::WeightArenaLayout;
 
 pub const LANES: u64 = 1;
 pub const DECODE_ROWS: u32 = 64;
-const WHOLE: LayerMode = LayerMode::Whole { gpu: 0, ffn: FfnMode::Owner };
+const WHOLE: LayerMode = LayerMode::Whole {
+    gpu: 0,
+    ffn: FfnMode::Owner,
+};
 
 /// Supported coordinator attention placements for Hy4:
 /// - `context` (default on 2 GPUs): context-split DSA across all 78 layers
@@ -40,7 +47,10 @@ pub const HY4: ExecutorModes = ExecutorModes {
         LayerMode::HeadSplit,
         LayerMode::ContextSplit,
         WHOLE,
-        LayerMode::Whole { gpu: 1, ffn: FfnMode::Owner },
+        LayerMode::Whole {
+            gpu: 1,
+            ffn: FfnMode::Owner,
+        },
     ],
     hops: true,
     attention: AttentionPlacement::Context,
@@ -61,6 +71,36 @@ pub fn layer_modes(cfg: &Hy4Config, gpus: usize, placement: AttentionPlacement) 
             },
         })
         .collect()
+}
+
+pub fn planned_budget(gpu: u8, physical: u64, logical: u64, context: u64) -> Budget {
+    Budget {
+        id: format!("rtx{gpu}"),
+        locations: vec![Location::coordinator(gpu)],
+        physical_bytes: physical,
+        logical_bytes: logical,
+        baseline: Baseline::Forecast {
+            occupied: context,
+            source: "CUDA context and modules on the coordinator GPU".into(),
+            assumed: true,
+        },
+        headroom: crate::placement::reserve::gpu("hy4"),
+    }
+}
+
+pub fn measured_budget(gpu: u8, physical: u64, logical: u64, free: u64) -> Budget {
+    Budget {
+        id: format!("rtx{gpu}"),
+        locations: vec![Location::coordinator(gpu)],
+        physical_bytes: physical,
+        logical_bytes: logical,
+        baseline: Baseline::Sampled {
+            free,
+            phase: Phase::Load,
+            source: "Hy4 pre-weight CUDA sample".into(),
+        },
+        headroom: crate::placement::reserve::gpu("hy4"),
+    }
 }
 
 fn invalid(detail: impl std::fmt::Display) -> Refusal {
@@ -149,11 +189,15 @@ pub struct Hy4Inputs {
     pub context: Context,
     pub pool: crate::placement::PoolPolicy,
     pub prefill: PrefillShape,
+    pub decode_rows: u32,
     pub sequences: u64,
     pub targets: Vec<CoordinatorWeights>,
+    pub target_mount_load: crate::shared::dense_read::MountLoad,
+    pub index_topk: IndexTopkScratch,
     pub placement: AttentionPlacement,
     pub modes: Vec<LayerMode>,
     pub routed: Vec<usize>,
+    pub expert_usage: Option<cuteafd_core::expert_usage::Geometry>,
     pub local: LocalPackage,
     pub spark: Vec<Vec<SparkCharge>>,
     pub links: Vec<crate::placement::PreparedSparkLink>,
@@ -172,7 +216,10 @@ pub struct AdmittedHy4 {
 }
 
 impl AdmittedHy4 {
-    pub fn host_ledger(&self, quota: u64) -> Result<cuteafd_core::memory_layout::HostLayout, Refusal> {
+    pub fn host_ledger(
+        &self,
+        quota: u64,
+    ) -> Result<cuteafd_core::memory_layout::HostLayout, Refusal> {
         use cuteafd_core::memory_layout::{Basis, HostLayout, Item, ItemLifetime};
         let budget = self
             .solved
@@ -316,7 +363,7 @@ impl Hy4Inputs {
         HopSpec {
             storage: HopStorage::ReceiveSlots,
             row_bytes: (self.cfg.hc_mult * self.cfg.hidden * 2) as u64,
-            rows: self.prefill.rows.max(u64::from(DECODE_ROWS)),
+            rows: self.prefill.rows.max(u64::from(self.decode_rows)),
             lanes: LANES,
             entry_gpu: 0,
             head_gpu: self.head_gpu(),
@@ -405,7 +452,11 @@ impl Hy4Inputs {
         let spec = self.hop_spec();
         let residual = residual_homes(&modes, &spec).map_err(invalid)?;
         let hops = plan_hops(&modes, &spec).map_err(invalid)?;
-        let attention = if pair { self.placement } else { AttentionPlacement::Heads };
+        let attention = if pair {
+            self.placement
+        } else {
+            AttentionPlacement::Heads
+        };
         let placement = Placement {
             pool_tokens: solved.pool_tokens,
             pool_limits: PoolLimits(vec![]),
@@ -436,7 +487,10 @@ impl Hy4Inputs {
         let LocalPackage::Installed { backings } = &self.local else {
             return Err(invalid("onboarded layers require installed Hy4 RTX expert backings"));
         };
-        for backing in backings.get(count).ok_or_else(|| invalid("missing onboarding prefix"))? {
+        for backing in backings
+            .get(count)
+            .ok_or_else(|| invalid("missing onboarding prefix"))?
+        {
             let ws = backing
                 .workspace
                 .iter()
@@ -453,32 +507,60 @@ impl Hy4Inputs {
     fn rank_owners(&self, gpu: usize, maximum: u64) -> Result<Vec<Component>, Refusal> {
         let location = Location::coordinator(gpu as u8);
         let cfg = &self.cfg;
-        let rows = u32::try_from(self.prefill.rows).map_err(|_| Refusal::Overflow("Hy4 prefill rows"))?;
+        let rows = usize::try_from(self.prefill.rows)
+            .map_err(|_| Refusal::Overflow("Hy4 prefill rows"))?;
+        let capacity_rows = rows.max(self.decode_rows as usize);
         let mut out = Vec::new();
 
-        let target = self.targets.get(gpu).ok_or_else(|| invalid("missing target arena"))?;
+        let target = self
+            .targets
+            .get(gpu)
+            .ok_or_else(|| invalid("missing target arena"))?;
         out.extend(target.weight_components(maximum)?);
         if !target.core.is_empty() {
-            out.push(crate::shared::dense_read::trellis_device_staging(gpu as u8, maximum));
-            if let Some(scratch) = target
-                .trellis_scratch(rows as usize, DECODE_ROWS as usize)
-                .map_err(refusal)?
-            {
-                out.extend(buffer(
-                    format!("hy4.target.{gpu}.trellis"),
-                    location,
-                    scratch.packed_bytes().map_err(refusal)? as u64,
-                    Lifetime::TARGET,
-                    Category::Workspace,
-                    "serialized target trellis projection",
-                    maximum,
-                ));
-            }
+            out.push(crate::shared::dense_read::trellis_device_staging(
+                gpu as u8, maximum,
+            ));
+        }
+        if let Some(scratch) = target.native_core_scratch(capacity_rows).map_err(refusal)? {
+            out.extend(buffer(
+                format!("hy4.target.{gpu}.native_scratch"),
+                location,
+                scratch.packed_bytes().map_err(refusal)? as u64,
+                Lifetime::TARGET,
+                Category::Workspace,
+                "Hy4 native compact-core scratch",
+                maximum,
+            ));
+        }
+        if let Some(head_scratch) = target
+            .native_head_scratch(capacity_rows.min(DECODE_ROWS as usize))
+            .map_err(refusal)?
+        {
+            out.extend(buffer(
+                format!("hy4.target.{gpu}.native_head_scratch"),
+                location,
+                head_scratch.packed_bytes().map_err(refusal)? as u64,
+                Lifetime::TARGET,
+                Category::Workspace,
+                "Hy4 native compact-head scratch",
+                maximum,
+            ));
+        }
+        if target.has_bf16_head() {
+            out.extend(buffer(
+                format!("hy4.head.{gpu}.workspace"),
+                location,
+                cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64,
+                Lifetime::TARGET,
+                Category::Workspace,
+                "Hy4 FP32 vocabulary head cuBLAS workspace",
+                maximum,
+            ));
         }
 
-        // Owned MLA KV layers (all 78 under split, or owned half under Layers)
-        // and owned full IndexCache layers (21 full layers only; 57 shared layers
-        // own zero index cache pages).
+        // Contiguous multi-layer DSA KV (78 layers) and IndexCache (21 full layers only)
+        // matching `Hy4CacheRank`.
         let mut owned_kv = 0usize;
         let mut owned_full_idx = 0usize;
         for (layer, &mode) in self.modes.iter().enumerate() {
@@ -495,79 +577,156 @@ impl Hy4Inputs {
             }
         }
         let cache = CacheLayout::new(self.kv_format, owned_kv, owned_full_idx).map_err(refusal)?;
-        let kv_stride = cache.kv_page_bytes as u64;
-        let idx_stride = cache.index_page_bytes as u64;
-
-        for (layer, &mode) in self.modes.iter().enumerate() {
-            let owns = match mode {
-                LayerMode::Whole { gpu: owner, .. } => usize::from(owner) == gpu,
-                LayerMode::HeadSplit | LayerMode::ContextSplit => true,
-            };
-            if !owns {
-                continue;
-            }
+        if owned_kv > 0 {
+            let kv_page = (owned_kv as u64)
+                .checked_mul(cache.kv_page_bytes as u64)
+                .ok_or(Refusal::Overflow("Hy4 DSA KV page"))?;
             out.push(Component::allocation(
                 Allocation::buffer(
-                    format!("hy4.kv.{layer}.{gpu}.records"),
+                    format!("hy4.cache.{gpu}.dsa_kv"),
                     location,
-                    kv_stride,
+                    kv_page,
                     Lifetime::TARGET,
                     Category::Kv,
                     "DSA MLA paged KV records",
                 ),
-                ByteCurve::linear_rounded(kv_stride, kv_stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
+                ByteCurve::linear_rounded(
+                    kv_page,
+                    kv_page,
+                    maximum,
+                    SM120_ALLOCATION_GRANULARITY_BYTES,
+                ),
                 false,
                 maximum,
             ));
-            if cfg.is_full_indexer(layer) {
-                out.push(Component::allocation(
-                    Allocation::buffer(
-                        format!("hy4.index.{layer}.{gpu}.keys"),
-                        location,
-                        idx_stride,
-                        Lifetime::TARGET,
-                        Category::Kv,
-                        "DSA IndexCache per-token key cache (full layers only)",
-                    ),
-                    ByteCurve::linear_rounded(idx_stride, idx_stride, maximum, SM120_ALLOCATION_GRANULARITY_BYTES),
-                    false,
+        }
+        if owned_full_idx > 0 {
+            let idx_page = (owned_full_idx as u64)
+                .checked_mul(cache.index_page_bytes as u64)
+                .ok_or(Refusal::Overflow("Hy4 DSA index page"))?;
+            out.push(Component::allocation(
+                Allocation::buffer(
+                    format!("hy4.cache.{gpu}.dsa_index"),
+                    location,
+                    idx_page,
+                    Lifetime::TARGET,
+                    Category::Kv,
+                    "DSA IndexCache per-token key cache (full layers only)",
+                ),
+                ByteCurve::linear_rounded(
+                    idx_page,
+                    idx_page,
+                    maximum,
+                    SM120_ALLOCATION_GRANULARITY_BYTES,
+                ),
+                false,
+                maximum,
+            ));
+        }
+
+        // Packed rank scratch arena + packed per-wave scratch arenas (with per-wave IndexCache selection).
+        let context_split = self.modes.iter().any(|m| *m == LayerMode::ContextSplit);
+        let max_seq_pages = usize::try_from(self.context.maximum)
+            .map_err(|_| Refusal::Overflow("Hy4 context pages"))?
+            .div_ceil(PAGE_ROWS)
+            .max(16);
+        let local_vocab = cfg.vocab_size / self.gpus;
+        let shared = SharedScratchLayout::new(
+            cfg,
+            gpu,
+            self.gpus,
+            capacity_rows,
+            self.decode_rows as usize,
+            local_vocab,
+            context_split,
+            self.index_topk,
+        )
+        .map_err(refusal)?;
+        out.extend(buffer(
+            SharedScratchLayout::arena_id(gpu),
+            location,
+            shared.arena.bytes() as u64,
+            Lifetime::TARGET,
+            Category::Workspace,
+            "Hy4 packed rank scratch arena",
+            maximum,
+        ));
+        for slot in 0..usize::try_from(self.prefill.waves)
+            .map_err(|_| Refusal::Overflow("Hy4 waves"))?
+        {
+            let wave = WaveScratchLayout::new(
+                cfg,
+                gpu,
+                slot,
+                self.gpus,
+                capacity_rows,
+                max_seq_pages,
+                self.sequences as usize,
+            )
+            .map_err(refusal)?;
+            out.extend(buffer(
+                WaveScratchLayout::arena_id(gpu, slot),
+                location,
+                wave.arena.bytes() as u64,
+                Lifetime::TARGET,
+                Category::Workspace,
+                "Hy4 packed wave scratch arena",
+                maximum,
+            ));
+            if gpu == 0 || context_split {
+                let host =
+                    wave_metadata_layout_for_rank(gpu, slot, &wave.arena).map_err(refusal)?;
+                out.extend(buffer(
+                    host.id(),
+                    Location::PINNED,
+                    host.bytes() as u64,
+                    Lifetime::TARGET,
+                    Category::Staging,
+                    "hy4/wave-metadata",
                     maximum,
                 ));
             }
         }
 
-        // Decode + prefill unit workspaces (no SWA rings, no prefix marks, no Engram).
-        let head_parts = if self
-            .modes
-            .iter()
-            .all(|m| matches!(m, LayerMode::HeadSplit | LayerMode::ContextSplit))
-        {
-            2
-        } else {
-            1
-        };
-        let decode_unit = UnitLayout::new(cfg, DECODE_ROWS as usize, head_parts).map_err(refusal)?;
-        for (name, bytes) in decode_unit.buffers {
-            out.extend(buffer(
-                format!("hy4.decode.{gpu}.{name}"),
-                location,
-                bytes as u64,
-                Lifetime::TARGET,
-                Category::Workspace,
-                "Hy4 decode unit workspace",
-                maximum,
-            ));
-        }
-        let prefill_unit = UnitLayout::new(cfg, rows as usize, head_parts).map_err(refusal)?;
-        for slot in 0..self.prefill.waves {
-            for (name, &bytes) in &prefill_unit.buffers {
+        if self.gpus == 2 {
+            let sizes = hy4_peer_slot_sizes(cfg, capacity_rows);
+            let peer = crate::serving_capacity::PeerStorageLayout::new(
+                sizes.len(),
+                sizes[1],
+                crate::serving_capacity::peer_wait_diagnostics(),
+            )
+            .map_err(refusal)?;
+            for (name, bytes) in [
+                ("peer.recv.0", sizes[0].max(256) as u64),
+                ("peer.recv.1", sizes[1].max(256) as u64),
+                ("peer.control", peer.control_bytes as u64),
+                ("peer.progress", peer.progress_bytes as u64),
+                ("peer.abort", 256),
+            ] {
                 out.extend(buffer(
-                    format!("hy4.unit.{gpu}.{slot}.{name}"),
+                    format!("hy4.peer.{gpu}.{name}"),
                     location,
-                    bytes as u64,
+                    bytes,
                     Lifetime::TARGET,
-                    Category::Workspace,
-                    "Hy4 prefill unit workspace",
+                    Category::Transport,
+                    "Hy4 TP2 peer exchange",
+                    maximum,
+                ));
+            }
+            if context_split {
+                let ctx_bytes = crate::placement::ContextExchangeLayout::new(&hy4_context_buffers(
+                    cfg,
+                    self.decode_rows as usize,
+                ))
+                .bytes()
+                .ok_or(Refusal::Overflow("Hy4 ContextSplit exchange"))?;
+                out.extend(buffer(
+                    format!("hy4.context_exchange.{gpu}"),
+                    location,
+                    ctx_bytes,
+                    Lifetime::TARGET,
+                    Category::Transport,
+                    "Hy4 ContextSplit exchange",
                     maximum,
                 ));
             }
@@ -604,29 +763,6 @@ impl Hy4Inputs {
         ));
         Ok(out)
     }
-
-    fn head_owners(&self, maximum: u64) -> Result<Vec<Component>, Refusal> {
-        let head = self.head_gpu();
-        let rows = u64::from(DECODE_ROWS);
-        let mut out = Vec::new();
-        for (name, bytes) in [
-            ("tokens", rows * 4),
-            ("normalized", rows * self.cfg.hidden as u64 * 2),
-            ("logits_f32", rows * self.cfg.vocab_size as u64 * 4),
-            ("workspace", cuteafd_ffi::programs::VOCABULARY_HEAD_WORKSPACE as u64),
-        ] {
-            out.extend(buffer(
-                format!("hy4.head.{name}"),
-                Location::coordinator(head),
-                bytes,
-                Lifetime::TARGET,
-                Category::Workspace,
-                "Hy4 FP32 vocabulary head rows",
-                maximum,
-            ));
-        }
-        Ok(out)
-    }
 }
 
 impl Recipe for Hy4Inputs {
@@ -644,6 +780,8 @@ impl Recipe for Hy4Inputs {
             || self.spark.len() != self.routed.len() + 1
             || self.prefill.rows == 0
             || self.prefill.waves == 0
+            || !(1..=DECODE_ROWS).contains(&self.decode_rows)
+            || self.sequences > u64::from(self.decode_rows)
             || self.sequences == 0
         {
             return Err(invalid("invalid extent or empty domain"));
@@ -654,14 +792,36 @@ impl Recipe for Hy4Inputs {
         for gpu in 0..self.gpus {
             components.extend(self.rank_owners(gpu, maximum)?);
         }
-        components.extend(self.head_owners(maximum)?);
+        if let Some(geometry) = &self.expert_usage {
+            components.extend(crate::placement::expert_usage::components(
+                geometry,
+                &[0],
+                maximum,
+            )?);
+        }
+        for reader in ["dense", "native"] {
+            components.extend(
+                self.target_mount_load
+                    .allocations(&format!("hy4.{reader}.mount"))
+                    .into_iter()
+                    .map(|owner| {
+                        let bytes = owner.bytes;
+                        Component::allocation(
+                            owner,
+                            ByteCurve::fixed(bytes, maximum),
+                            false,
+                            maximum,
+                        )
+                    }),
+            );
+        }
         components.extend(
             serving::ServingOwners {
                 selector: serving::SelectorOwners {
                     location: Location::coordinator(head),
                     capacity: usize::try_from(self.sequences)
                         .map_err(|_| Refusal::Overflow("Hy4 selector"))?
-                        .max(DECODE_ROWS as usize),
+                        .max(self.decode_rows as usize),
                     vocab: self.cfg.vocab_size,
                     device_sampling: true,
                 },
@@ -747,43 +907,13 @@ impl Recipe for Hy4Inputs {
                         )?,
                         &activation,
                     ));
-                    if let Some(rows) = backing.tp2_rows {
-                        let peer = crate::serving_capacity::PeerStorageLayout::new(
-                            2,
-                            usize::try_from(rows.exchange_slot_bytes)
-                                .map_err(|_| Refusal::Overflow("Hy4 expert peer slot"))?,
-                            crate::serving_capacity::peer_wait_diagnostics(),
-                        )
-                        .map_err(refusal)?;
-                        for (name, bytes) in [
-                            ("send", rows.bytes),
-                            ("reduced", rows.reduction_bytes),
-                            ("peer.recv.0", peer.receive_bytes as u64),
-                            ("peer.recv.1", peer.receive_bytes as u64),
-                            ("peer.control", peer.control_bytes as u64),
-                            ("peer.progress", peer.progress_bytes as u64),
-                            ("peer.abort", 256),
-                        ] {
-                            components.extend(with(
-                                buffer(
-                                    format!("hy4.tp2.{group}.{name}"),
-                                    location,
-                                    bytes,
-                                    Lifetime::TARGET,
-                                    Category::Transport,
-                                    "shared resident expert exchange",
-                                    maximum,
-                                )
-                                .into_iter()
-                                .collect(),
-                                &activation,
-                            ));
-                        }
-                    }
                     for (name, bytes) in &backing.workspace {
                         components.extend(with(
                             buffer(
-                                format!("hy4.expert_workspace.{}.{}.{}.{}", backing.gpu, count, group, name),
+                                format!(
+                                    "hy4.expert_workspace.{}.{}.{}.{}",
+                                    backing.gpu, count, group, name
+                                ),
                                 location,
                                 *bytes,
                                 Lifetime::RESIDENT,
@@ -811,7 +941,12 @@ impl Recipe for Hy4Inputs {
                             charge.experts,
                             Category::Experts,
                         ),
-                        ("owners", "Spark rank I/O and execution owners", charge.owners, Category::Workspace),
+                        (
+                            "owners",
+                            "Spark rank I/O and execution owners",
+                            charge.owners,
+                            Category::Workspace,
+                        ),
                         (
                             "startup",
                             cuteafd_core::memory_layout::spark_runtime_reserve_group(),

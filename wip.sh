@@ -130,6 +130,7 @@ done
 [[ "$slot" != "$from_slot" ]] || release_die "--from-slot must differ from --slot"
 [[ -z "$seed_option" || "$seed_option" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] ||
   release_die "invalid WIP seed host: $seed_option"
+release_validate_host_value "WIP_SEED_HOST" "$seed_option"
 case "$role" in coordinator|expert|both) ;; *) release_die "--role must be coordinator, expert, or both" ;; esac
 ((!recreate || !refresh_containers)) ||
   release_die "--recreate and --refresh-containers cannot be combined"
@@ -984,13 +985,14 @@ if [[ "$source_revision" != *dirty* && "$source_revision" != unknown && -z "$fro
       printf 'host-isa coordinator %s spark grace\n' "$wip_coordinator_host_isa"
       printf 'spark-tp-roles %s\nbf16 %s\naudio %s\n' "$wip_spark_tp_roles" "$bf16_families" "$audio_aot"
       for key in EXL3_AOT NVFP4_AOT DSV4_MAX_CONTEXT DSV4_AOT GLM_AOT CONTEXT_SPLIT_AOT MIMO_AOT MIMO_GEOMETRIES \
-        GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT QWEN_DENSE_AOT STEP5_AOT KIMIK3_AOT ML4_AOT MINIMAX_AOT INKLING2_AOT INKLING2_MINI_AOT HY4F_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
+        GLMF_AOT GLMF_WIDE_DECODE_ROWS QWEN4_AOT QWEN_DENSE_AOT STEP5_AOT KIMIK3_AOT ML4_AOT MINIMAX_AOT INKLING2_AOT INKLING2_MINI_AOT HY4F_AOT HY4_AOT COORDINATOR_EXPERT_FAMILIES EXPERT_FAMILIES GENERIC_SPARK_COUNTS \
         VISION_ATTENTION_AOT V41_AOT CARGO_FEATURES; do
         [[ "$key" != KIMIK3_AOT || "${CUTEAFD_WIP_KIMIK3_AOT:-OFF}" != OFF ]] || continue
         [[ "$key" != ML4_AOT || "${CUTEAFD_WIP_ML4_AOT:-OFF}" != OFF ]] || continue
         [[ "$key" != INKLING2_AOT || "${CUTEAFD_WIP_INKLING2_AOT:-OFF}" != OFF ]] || continue
         [[ "$key" != INKLING2_MINI_AOT || "${CUTEAFD_WIP_INKLING2_MINI_AOT:-OFF}" != OFF ]] || continue
         [[ "$key" != HY4F_AOT || "${CUTEAFD_WIP_HY4F_AOT:-OFF}" != OFF ]] || continue
+        [[ "$key" != HY4_AOT || "${CUTEAFD_WIP_HY4_AOT:-OFF}" != OFF ]] || continue
         local_name="CUTEAFD_WIP_$key"
         printf '%s=%s\n' "$local_name" "${!local_name:-<default>}"
       done
@@ -1340,6 +1342,7 @@ build_coordinator() {
     -e "CUTEAFD_WIP_INKLING2_AOT=${CUTEAFD_WIP_INKLING2_AOT:-OFF}" \
     -e "CUTEAFD_WIP_INKLING2_MINI_AOT=${CUTEAFD_WIP_INKLING2_MINI_AOT:-OFF}" \
     -e "CUTEAFD_WIP_HY4F_AOT=${CUTEAFD_WIP_HY4F_AOT:-OFF}" \
+    -e "CUTEAFD_WIP_HY4_AOT=${CUTEAFD_WIP_HY4_AOT:-OFF}" \
     ${wip_exlr8_env[@]+"${wip_exlr8_env[@]}"} \
     -e "CUTEAFD_WIP_EXPERT_FAMILIES=${CUTEAFD_WIP_COORDINATOR_EXPERT_FAMILIES:-${CUTEAFD_WIP_EXPERT_FAMILIES:-}}" \
     -e "CUTEAFD_WIP_GENERIC_SPARK_COUNTS=${CUTEAFD_WIP_GENERIC_SPARK_COUNTS:-}" \

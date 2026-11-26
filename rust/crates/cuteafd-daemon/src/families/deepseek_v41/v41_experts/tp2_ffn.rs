@@ -236,11 +236,10 @@ unsafe fn peer_copy(
     source: CuteafdDeviceBuffer,
     bytes: usize,
 ) -> Result<()> {
-    // Device-ordered passes copy decode-width transfers on the SMs and
-    // prefill-width ones on the copy engines (`device::sm_peer_copy_for`).
-    // The issuing stream is this wave's own, ordered by a
-    // `cudaStreamWaitEvent` on the chain head, never a memory wait.
-    match sm.filter(|_| crate::shared::memory::device::sm_peer_copy_for(crate::shared::memory::chain::deferred(), bytes, crate::shared::memory::device::DECODE_PEER_COPY_BYTES)) {
+    // The issuing stream is this wave's own, ordered by `cudaStreamWaitEvent`
+    // only (never a memory wait), so copy-engine peer transfers do not park
+    // other lanes' DMA (`device::sm_peer_copy_for_stream`).
+    match sm.filter(|_| crate::shared::memory::device::sm_peer_copy_for_stream(crate::shared::memory::chain::deferred(), true, bytes, crate::shared::memory::device::DECODE_PEER_COPY_BYTES)) {
         Some(sm) => unsafe { sm.launch(destination, source, bytes, stream.raw) },
         None => unsafe {
             stream

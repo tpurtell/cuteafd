@@ -151,7 +151,7 @@ pub(crate) fn layout(args: &crate::cli::NativeServeArgs) -> Layout {
         "prefill_chunk_rows": args.prefill_batch_tokens,
         "max_context_tokens": args.max_context_tokens,
         "prefix_cache_entries": args.resolved_prefix_entries(),
-        "lane_capacity": super::scheduler::lane_capacity(args.concurrency as usize, usize::from(args.decode_lanes)),
+        "lane_capacity": super::scheduler::lane_capacity(args.concurrency as usize, usize::from(args.resolved_decode_lanes())),
     });
     let dspark = args.dspark;
     layout.dynamic = Some(Box::new(move || dynamic(&super::speculative::policy_snapshot(), dspark)));

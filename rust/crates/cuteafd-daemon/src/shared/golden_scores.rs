@@ -70,7 +70,43 @@ pub(crate) mod push_regression {
         Ok(())
     }
 }
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
+
+/// Refuses a reference logits row that carries no information: a non-finite
+/// value, or every logit equal (a uniform softmax, which is what an all-zero
+/// placeholder file scores as; #2719). A KL against such a row is a number
+/// about the engine alone, so the golden must fail instead of printing it.
+pub(crate) fn check_reference_row(path: &std::path::Path, row: usize, values: &[f32]) -> Result<()> {
+    if let Some(column) = values.iter().position(|v| !v.is_finite()) {
+        bail!("golden reference {}: row {row} column {column} is non-finite ({}); \
+            regenerate it from the family's reference golden.py", path.display(), values[column]);
+    }
+    let first = *values.first().with_context(|| format!("golden reference {}: row {row} is empty", path.display()))?;
+    if values.iter().all(|&v| v == first) {
+        let what = if row == 0 && first == 0.0 { "is all zeros from row 0 (a shape-only placeholder?)" }
+            else { "is constant" };
+        bail!("golden reference {}: row {row} {what}: every one of its {} logits is {first}, so KL, top-1 and \
+            NLL against it carry no information; regenerate it from the family's reference golden.py (#2719)",
+            path.display(), values.len());
+    }
+    Ok(())
+}
+
+/// Checks every row of an in-memory [rows, vocab] F32 reference.
+pub(crate) fn check_reference_logits(path: &std::path::Path, values: &[f32], vocab: usize) -> Result<()> {
+    ensure!(vocab > 0 && !values.is_empty() && values.len().is_multiple_of(vocab),
+        "golden reference {}: {} values are not whole rows of {vocab}", path.display(), values.len());
+    values.chunks_exact(vocab).enumerate().try_for_each(|(row, values)| check_reference_row(path, row, values))
+}
+
+/// Reads and checks a whole [rows, vocab] F32 reference (`logits.bin`).
+pub(crate) fn read_reference_logits(path: &std::path::Path, vocab: usize) -> Result<Vec<f32>> {
+    let bytes = std::fs::read(path).with_context(|| format!("golden logits {}", path.display()))?;
+    ensure!(bytes.len().is_multiple_of(4), "golden reference {}: not whole F32 values", path.display());
+    let values = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+    check_reference_logits(path, &values, vocab)?;
+    Ok(values)
+}
 
 /// Full-vocabulary references stay on disk; diagnostics retain at most one row.
 pub(crate) struct ReferenceRows {
@@ -80,7 +116,10 @@ pub(crate) struct ReferenceRows {
 }
 
 impl ReferenceRows {
+    /// Opens and checks every row once (one row resident at a time), so a
+    /// placeholder or degenerate reference fails before any engine work.
     pub(crate) fn open(path: &std::path::Path, rows: usize, vocab: usize, optional: bool) -> Result<Option<Self>> {
+        use std::io::Read;
         let file = match std::fs::File::open(path) {
             Ok(file) => file,
             Err(error) if optional && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -90,6 +129,14 @@ impl ReferenceRows {
             .context("golden logits extent overflow")?;
         ensure!(rows > 0 && vocab > 0 && file.metadata()?.is_file() && file.metadata()?.len() == bytes as u64,
             "golden logits shape differs");
+        let mut reader = std::io::BufReader::with_capacity(1 << 24, &file);
+        let mut raw = vec![0u8; vocab * 4];
+        for row in 0..rows {
+            reader.read_exact(&mut raw)?;
+            let values = raw.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
+            check_reference_row(path, row, &values)?;
+        }
+        drop(reader);
         Ok(Some(Self { file, rows, vocab }))
     }
 
@@ -148,6 +195,25 @@ impl RowMetrics {
         }
         self.rows += 1;
         Ok(())
+    }
+}
+
+/// Printed once after any legacy-fixture score line.
+pub(crate) const CONTEXT_ONLY_NOTE: &str =
+    "context-only fixture: no quality verdict (use the published fidelity set)";
+
+impl RowMetrics {
+    /// The score line for a legacy `tokens.bin` + `logits.bin` fixture, which has no
+    /// generated-row roles: every row is prompt context. Teacher-forced NLL of the
+    /// actual next tokens (engine vs reference, same tokens) is a sanity bound; the
+    /// reference KL and top-1 are deliberately not reported, since a headline from
+    /// context rows reads as a quality score (the verdict gates generated rows only).
+    pub(crate) fn context_only_line(&self, label: &str) -> String {
+        let scored = self.scored.max(1) as f64;
+        let (engine, reference) = (self.nll / scored, self.reference_nll / scored);
+        format!("{label} logits (context-only, {} rows, {} scored): NLL sanity bound engine {engine:.4} \
+            reference {reference:.4} delta {:+.4} (not a verdict)\n{CONTEXT_ONLY_NOTE}",
+            self.rows, self.scored, engine - reference)
     }
 }
 
@@ -226,6 +292,20 @@ mod bounded_rows_tests {
     use super::*;
 
     #[test]
+    fn context_only_line_reports_nll_bound_without_kl_or_top1() -> Result<()> {
+        let mut metrics = RowMetrics::default();
+        metrics.push(&[2.0, 0.0, -1.0], Some(&[1.0, 0.5, -1.0]), Some(0))?;
+        metrics.push(&[0.0, 1.0, 3.0], Some(&[0.0, 2.0, 1.0]), Some(2))?;
+        let line = metrics.context_only_line("prefill");
+        assert!(line.contains("2 rows, 2 scored") && line.contains("NLL sanity bound engine"), "{line}");
+        assert!(line.contains("delta ") && line.contains("not a verdict"), "{line}");
+        assert!(line.ends_with("context-only fixture: no quality verdict (use the published fidelity set)"), "{line}");
+        let lower = line.to_lowercase();
+        assert!(!lower.contains("kl") && !lower.contains("top-1") && !lower.contains("agreement"), "{line}");
+        Ok(())
+    }
+
+    #[test]
     fn streamed_metrics_preserve_legacy_nll_kl_and_top1_bits() -> Result<()> {
         let (vocab, first) = (5, 1);
         let ours = [2.0, -1.0, 2.0, 0.0, -0.0, -7.0, 3.0, 0.25, 3.0, -4.0];
@@ -300,7 +380,7 @@ mod bounded_rows_tests {
         let path = root.path().join("logits.bin");
         assert!(ReferenceRows::open(&path, 2, 2, true)?.is_none());
         assert!(ReferenceRows::open(&path, 2, 2, false).is_err());
-        let values = [-0.0f32, 0.0, f32::MIN, f32::MAX];
+        let values = [-0.0f32, f32::MIN_POSITIVE, f32::MIN, f32::MAX];
         std::fs::write(&path, values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
         let rows = ReferenceRows::open(&path, 2, 2, false)?.unwrap();
         for row in 0..2 {
@@ -310,10 +390,37 @@ mod bounded_rows_tests {
         assert!(rows.row(2).is_err());
         assert!(ReferenceRows::open(&path, usize::MAX, 2, false).is_err());
         assert!(ReferenceRows::open(&path, 1, 2, false).is_err());
-        std::fs::write(&path, f32::NAN.to_le_bytes())?;
-        assert!(ReferenceRows::open(&path, 1, 1, false)?.unwrap().row(0).is_err());
+        std::fs::write(&path, [f32::NAN, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
+        assert!(ReferenceRows::open(&path, 1, 2, false).is_err());
         std::fs::write(&path, [0u8; 3])?;
         assert!(ReferenceRows::open(&path, 1, 1, false).is_err());
+        Ok(())
+    }
+
+    /// #2719: a shape-only placeholder (all zeros), a constant row or a
+    /// non-finite value fails at open, naming the file, before any scoring.
+    #[test]
+    fn placeholder_constant_and_nonfinite_references_fail_at_open() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().join("logits.bin");
+        let write = |values: &[f32]| std::fs::write(&path, values.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+        let message = |rows, vocab| ReferenceRows::open(&path, rows, vocab, true).err().map(|e| format!("{e:#}"));
+        write(&[0.0; 12])?;
+        let zero = message(3, 4).expect("all-zero reference must fail");
+        assert!(zero.contains(&path.display().to_string()) && zero.contains("row 0") && zero.contains("all zeros"), "{zero}");
+        assert!(read_reference_logits(&path, 4).is_err());
+        write(&[1.0, 2.0, 3.0, 4.0, 7.5, 7.5, 7.5, 7.5, 1.0, 0.0, 0.0, 0.0])?;
+        let constant = message(3, 4).expect("a constant row must fail");
+        assert!(constant.contains("row 1 is constant") && constant.contains("7.5"), "{constant}");
+        assert!(check_reference_logits(&path, &[1.0, 2.0, 3.0, 3.0], 2).unwrap_err().to_string().contains("row 1"));
+        write(&[1.0, 2.0, 3.0, 4.0, 1.0, f32::INFINITY, 0.0, 0.0])?;
+        let infinite = message(2, 4).expect("a non-finite value must fail");
+        assert!(infinite.contains("row 1 column 1 is non-finite"), "{infinite}");
+        // One distinct logit anywhere in a row makes it informative.
+        write(&[0.0, 0.0, 0.0, -1e-30, 5.0, 4.0, 3.0, 2.0])?;
+        assert!(ReferenceRows::open(&path, 2, 4, false)?.is_some());
+        assert_eq!(read_reference_logits(&path, 4)?.len(), 8);
+        assert!(check_reference_logits(&path, &[1.0, 2.0, 3.0], 2).is_err());
         Ok(())
     }
 

@@ -326,12 +326,15 @@ https://github.com/tpurtell/cuteafd/tree/main/quantization
     return reused, changed|ple_files
 
 
-def publish(base_receipt,reused,changed):
-    from huggingface_hub import HfApi, CommitOperationCopy, CommitOperationAdd
+def publish(base_receipt,reused,changed,options=None):
+    """Server-side copies of reused base files plus verified HTTP LFS batches."""
+    from huggingface_hub import HfApi, CommitOperationCopy
     from huggingface_hub.errors import RepositoryNotFoundError
-    from upload_model import _remote, _restored_operation
+    from upload_model import _remote
     from materialize_cache import materialize_cache
+    import hub_lfs
     require_qualified_hub()
+    options=options or hub_lfs.UploadOptions()
     api=HfApi()
     base_remote={n:{k:r[k] for k in ('bytes','blob')} for n,r in base_receipt['files'].items()}
     if _remote(api,BASE_REPO,BASE_COMMIT)!=base_remote:
@@ -347,52 +350,38 @@ def publish(base_receipt,reused,changed):
             raise ValueError('destination must be new and public')
         parent=dict(commit=info.sha)
         _publish_json(ROOT/'upload-parent.json',parent)
-    operations=[CommitOperationCopy(src_path_in_repo=n,path_in_repo=n,src_revision=BASE_COMMIT,
-        src_repo_id=BASE_REPO,src_repo_type='model') for n in sorted(reused)]
+    copies={n:base_remote[n] for n in reused}
+    # The converted PLE shards have no writer SHA256: hash once, cached by stat identity.
+    files=hub_lfs.hashed_rows({n:OUTPUT/n for n in changed},ROOT/'upload-hashes.json',workers=options.workers)
     prepared={n:dict(**base_remote[n],local=_fingerprint(OUTPUT/n)) for n in reused}
-    uploads=ROOT/'preuploaded'; uploads.mkdir(exist_ok=True)
-    for name in sorted(changed):
-        path=OUTPUT/name; local=_fingerprint(path)
-        record_path=uploads/(name+'.json'); record=load(record_path)
-        if record is None:
-            event('upload_started',file=name,bytes=local['bytes'])
-            op=CommitOperationAdd(name,path)
-            api.preupload_lfs_files(REPO,[op],repo_type='model',revision='main',
-                                   num_threads=1,free_memory=False,gitignore_content='')
-            if op._should_ignore or op._upload_mode not in ('lfs','regular'):
-                raise ValueError('unexpected upload classification')
-            if op._upload_mode=='lfs':
-                if not op._is_uploaded or not op.upload_info.is_hashed:
-                    raise ValueError('new payload upload not acknowledged')
-                blob=op.upload_info.sha256.hex()
-            else:
-                if local['bytes']>64*1024*1024:
-                    raise ValueError('unexpected large regular upload')
-                payload=path.read_bytes()
-                blob=hashlib.sha1(f'blob {len(payload)}\0'.encode()+payload).hexdigest()
-            record=dict(mode=op._upload_mode,bytes=local['bytes'],blob=blob,local=local)
-            _publish_json(record_path,record)
-            event('upload_prepared',file=name,bytes=local['bytes'])
-        else:
-            if record['local']!=local:
-                raise ValueError('changed prepared upload')
-            op=_restored_operation(name,path,record)
-        if _fingerprint(path)!=local:
-            raise ValueError('variant changed during upload')
-        prepared[name]={k:record[k] for k in ('bytes','blob','local')}
-        operations.append(op)
-    expected={n:{k:r[k] for k in ('bytes','blob')} for n,r in prepared.items()}
     info=api.repo_info(REPO,repo_type='model')
     if info.private:
         raise ValueError('destination became private')
+    done=set()
     if info.sha!=parent['commit']:
-        if _remote(api,REPO,info.sha)!=expected:
-            raise ValueError('destination head changed unexpectedly')
-        commit=info.sha
-    else:
-        commit=api.create_commit(REPO,operations,repo_type='model',revision='main',
-            parent_commit=parent['commit'],commit_message='Publish CPU-quantized NVFP4 PLE variant; reuse base weights server-side').oid
-    if _remote(api,REPO,commit)!=expected:
+        done=hub_lfs.committed_names(_remote(api,REPO,info.sha),files,fixed=copies)
+    leading=[] if done else [CommitOperationCopy(src_path_in_repo=n,path_in_repo=n,src_revision=BASE_COMMIT,
+        src_repo_id=BASE_REPO,src_repo_type='model') for n in sorted(reused)]
+    def verify(commit,batch,operations):
+        done.update(batch)
+        tree=_remote(api,REPO,commit)
+        if set(tree)!=set(copies)|done or any(tree[n]!=r for n,r in copies.items()):
+            raise ValueError('published variant differs')
+        for n in done:
+            hub_lfs.resolved(tree[n],files[n],n)
+    pending=[n for n in hub_lfs.upload_order(files) if n not in done]
+    commit=info.sha
+    if pending or leading:
+        event('upload_started',files=len(pending),bytes=sum(files[n]['bytes'] for n in pending))
+        commit=hub_lfs.commit_batches(api,REPO,files,pending,revision=info.sha,leading=leading,
+            commit_message='Publish CPU-quantized NVFP4 PLE variant; reuse base weights server-side',options=options,
+            check_sources=lambda batch:hub_lfs.check_fingerprints(files,batch),verify=verify,
+            log=lambda message:event('upload_progress',message=message))
+    tree=_remote(api,REPO,commit)
+    for n in changed:
+        prepared[n]=dict(**hub_lfs.resolved(tree.get(n,{}),files[n],n),local=files[n]['local'])
+    expected={n:{k:r[k] for k in ('bytes','blob')} for n,r in prepared.items()}
+    if tree!=expected:
         raise ValueError('published variant differs')
     receipt=dict(schema='cuteafd-upload-receipt-v1',status='uploaded',repo_id=REPO,commit=commit,files=prepared)
     _publish_json(ROOT/'upload-complete.json',receipt)
@@ -408,7 +397,7 @@ def publish(base_receipt,reused,changed):
     event('publication_complete',**result)
 
 
-def main(stage):
+def main(stage,options=None):
     import fcntl
     ROOT.mkdir(parents=True,exist_ok=True); OUTPUT.mkdir(parents=True,exist_ok=True)
     with (ROOT/'run.lock').open('a') as lock:
@@ -429,11 +418,13 @@ def main(stage):
             f'model-{b:05d}-of-00052.safetensors',receipt,index) for layer,a,b in ((1,49,50),(14,51,52))]
         reused,changed=assemble(receipt,tables)
         if stage=='all':
-            publish(receipt,reused,changed)
+            publish(receipt,reused,changed,options)
 
 
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--stage',choices=['convert','all'],default='all')
+    import hub_lfs
+    hub_lfs.add_arguments(parser)
     args=parser.parse_args()
-    main(args.stage)
+    main(args.stage,hub_lfs.options_from(args))

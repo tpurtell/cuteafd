@@ -125,29 +125,37 @@ pub struct MlaDraftProgramLayout {
 
 /// Which native block-draft program set a drafter runs: the DFlash2 MLA draft
 /// (`mla_draft_*`, q-LoRA 1536 at hidden 7168) or Mistral Large 4's bundled
-/// mtp_dspark (`ml4_draft_*`: no q-LoRA, hidden 6144, block-anchored window).
-/// Both share the attention geometry (64 heads, 576/512 latent) and the
-/// ungated UV/o output; they differ in the producer and its scratch.
+/// mtp_dspark (`ml4_draft_*` whole 64 heads, `ml4_draft2_*` TP2 32 heads/rank:
+/// no q-LoRA, hidden 6144, block-anchored window).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MlaDraftKind { Dflash2, CausalDflash2, Ml4Dspark }
+pub enum MlaDraftKind { Dflash2, CausalDflash2, Ml4Dspark, Ml4DsparkTp2 }
 
 impl MlaDraftKind {
     /// RadixArk's trained block is 5; causal path sampling extends verification
     /// to the current token plus seven drafts without changing checkpoint math.
     pub const CAUSAL_VERIFY_ROWS: usize = 8;
 
-    pub fn hidden(self) -> usize { match self { Self::Dflash2 | Self::CausalDflash2 => 7168, Self::Ml4Dspark => 6144 } }
-    pub fn heads(self) -> usize { if self == Self::CausalDflash2 { 96 } else { 64 } }
-    pub fn is_dflash(self) -> bool { self != Self::Ml4Dspark }
-    pub fn selector_top_k(self) -> usize { match self { Self::Dflash2 => 16, Self::CausalDflash2 => 32, Self::Ml4Dspark => 0 } }
+    pub fn is_ml4(self) -> bool { matches!(self, Self::Ml4Dspark | Self::Ml4DsparkTp2) }
+    pub fn hidden(self) -> usize { if self.is_ml4() { 6144 } else { 7168 } }
+    pub fn heads(self) -> usize {
+        match self {
+            Self::Dflash2 | Self::Ml4Dspark => 64,
+            Self::CausalDflash2 => 96,
+            Self::Ml4DsparkTp2 => 32,
+        }
+    }
+    pub fn is_dflash(self) -> bool { !self.is_ml4() }
+    pub fn selector_top_k(self) -> usize {
+        match self { Self::Dflash2 => 16, Self::CausalDflash2 => 32, Self::Ml4Dspark | Self::Ml4DsparkTp2 => 0 }
+    }
 
-    /// Producer scratch at `rows`: DFlash2 [rows, 2112] q|kv_a then [rows, 64, 192] q;
-    /// mtp_dspark [rows, 64, 128] q then [rows, 576] kv_a.
+    /// Producer scratch at `rows`: DFlash2 [rows, 2112] q|kv_a then [rows, heads, 192] q;
+    /// mtp_dspark [rows, heads, 128] q then [rows, 576] kv_a.
     fn producer_scratch(self, rows: usize) -> usize {
         let align = |n: usize| n.div_ceil(1024) * 1024;
         match self {
             Self::Dflash2 | Self::CausalDflash2 => align(rows * 2112 * 2) + align(rows * self.heads() * 192 * 2),
-            Self::Ml4Dspark => align(rows * MlaDraftProgramLayout::HEADS * 128 * 2) + align(rows * 576 * 2),
+            Self::Ml4Dspark | Self::Ml4DsparkTp2 => align(rows * self.heads() * 128 * 2) + align(rows * 576 * 2),
         }
     }
 }

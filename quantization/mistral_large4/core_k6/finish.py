@@ -12,6 +12,8 @@ def main():
         parser.add_argument('--'+name,type=Path,required=True)
     parser.add_argument('--resume',action='store_true')
     parser.add_argument('--publish-only',action='store_true',help='CPU-only publication and storage finalization')
+    sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
+    import hub_lfs;hub_lfs.add_arguments(parser)
     args=parser.parse_args()
     root=args.root.expanduser().resolve()
     # Published artifacts already passed remote validation. Resume only native
@@ -25,6 +27,7 @@ def main():
         common+=['--'+name.replace('_','-'),str(getattr(args,name).expanduser().resolve())]
     if args.resume:
         common+=['--resume']
+    common+=['--upload-workers',str(args.upload_workers),'--upload-batch-files',str(args.upload_batch_files)]
     subprocess.run([sys.executable,str(Path(__file__).with_name('run.py')),*common,'--publish-only'],
                    check=True,timeout=7*24*3600)
     from mistral_large4.core_k6.archive import archive

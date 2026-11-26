@@ -445,15 +445,24 @@ fn production_serving(options: &LayoutOptions, checkpoint: &Checkpoint, cfg: &Gl
         anyhow::ensure!(!options.tp2_dflash, "TP2 DFlash requires an active DFlash2 drafter");
         DraftFacts::default()
     } else if checkpoint.model_type() == Some("mistral_large4") {
-        anyhow::ensure!(!options.tp2_dflash, "TP2 DFlash applies to GQA DFlash2, not bundled Mistral Large 4 mtp_dspark");
-        let layout = glm::ml4_draft_layout(&checkpoint.snapshot, slots, sequences, context as usize, sms)?;
-        mark_bytes = glm::draft_window_mark_bytes(&layout)? as u64;
+        let (facts, mark_layout) = if options.tp2_dflash {
+            anyhow::ensure!(gpus == 2 && options.drafter_bytes == 0,
+                "TP2 DFlash requires two coordinator GPUs and checkpoint-derived physical owners");
+            let layouts = glm::ml4_tp2_draft_layouts(&checkpoint.snapshot, slots, sequences, context as usize, sms)?;
+            let facts = DraftFacts::ml4_tp2(&layouts)?;
+            (facts, layouts[0].clone())
+        } else {
+            let layout = glm::ml4_draft_layout(&checkpoint.snapshot, slots, sequences, context as usize, sms)?;
+            let facts = DraftFacts::ml4(&layout)?;
+            (facts, layout)
+        };
+        mark_bytes = glm::draft_window_mark_bytes(&mark_layout)? as u64;
         if options.mimo_prefix_entries > 0 {
             mark_slots = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
                 concurrency as u64, options.mimo_prefix_entries, mark_bytes, options.mimo_prefix_mark_bytes,
                 host_enabled));
         }
-        DraftFacts::ml4(&layout)?
+        facts
     } else {
         let snapshot = options.glm5_drafter_snapshot.clone().or_else(|| {
             let home = std::env::var_os("HF_HOME").map(std::path::PathBuf::from)

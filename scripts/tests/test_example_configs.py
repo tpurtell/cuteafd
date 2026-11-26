@@ -25,6 +25,7 @@ STARTING = re.compile(r"^(?P<model>[a-z0-9.-]+)-(?P<profile>min|max)(?:-(?:fp8|n
 ML4_QUALIFICATION = {f"mistral-large4-exl3-k4-{size}.config" for size in ("min", "max")}
 NEW_PUBLICATIONS = {f"{model}-{size}.config" for model in
                     ("mistral-large4-exl3-k4", "glm53-flash-exl3-k4-mc",
+                     "glm53-flash-exl3-k4-mc-mul1",
                      "glm53-flash-exl3-k325-mc",
                      "glm53-exl3-k4-mc", "step5-exl3-k4-mc", "muse-spark-exl3-k4-mc") for size in ("min", "max")}
 QUALIFICATION = {"inkling2-mxfp8-min.config", "inkling2-mxfp8-max.config",
@@ -36,10 +37,10 @@ QUALIFICATION = {"inkling2-mxfp8-min.config", "inkling2-mxfp8-max.config",
                  "hy4-flash-exl3-k4-mc-1rtx-4spark.config",
                  "kimi-k31-exl3-k2-mc-min.config", "kimi-k31-exl3-k2-mc-max.config", "minimax-m31-flash-nvfp4-min.config", "minimax-m31-flash-nvfp4-max.config", "kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
                  "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
-                 "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config"} | ML4_QUALIFICATION | NEW_PUBLICATIONS
+                 "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config",
+                 "glm53-flash-exl3-k4-mc-k6-min.config", "glm53-flash-exl3-k4-mc-k6-max.config"} | ML4_QUALIFICATION | NEW_PUBLICATIONS
 V4_PREP = {"qwen35-9b-bf16-min.config", "glm53-exlr8-min.config", "glm53-exlr8-max.config",
-           "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config",
-           "glm53f-exl3-k4-core-k6-min.config", "glm53f-exl3-k4-core-k6-max.config"}
+           "qwen38-27b-bf16-min.config", "qwen38-27b-fp8-min.config"}
 FP8_EXAMPLES = {"glm53-flash-exl3-k4-mc-fp8-max.config"}
 PRIVATE = ("raptor", "ostrich", "dodo", "emu", "kiwi", "rhea", "moa", "10.55.", "/home/", "/mnt/",
            "sparknest")
@@ -73,6 +74,8 @@ CHECKPOINTS = {
     "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-Core-FP8": GLMF,
     "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6": {**GLMF, "quantization_config": {
         "quant_method": "exl3", "bits": 4.0, "core_bits": 6.0, "head_bits": 6.0, "mtp_bits": 4.0}},
+    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC": {**GLMF, "quantization_config": {"quant_method": "exl3"}},
+    "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1": {**GLMF, "quantization_config": {"quant_method": "exl3", "codebook": "mul1"}},
     "nvidia/GLM-5.3-Flash-NVFP4": GLMF,
     "XiaomiMiMo/MiMo-V2.6-Flash-MOPD": {**MIMO, "hidden_size": 4096},
     "XiaomiMiMo/MiMo-V2.6-Pro-MOPD": {**MIMO, "hidden_size": 6144},
@@ -174,8 +177,19 @@ def _stubs(tmp_path: Path) -> Path:
     return bin_dir
 
 
+def _with_real_hosts(config: Path, tmp_path: Path) -> Path:
+    """Substitute template REPLACE-ME-spark-N hostnames with real-looking test hosts
+    before invoking release_load_config / run.sh (which refuse placeholder hosts)."""
+    text = config.read_text().replace("REPLACE-ME-spark-", "spark-")
+    staged = tmp_path / f"real-{config.name}"
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    staged.write_text(text)
+    return staged
+
+
 def _family_launch(tmp_path: Path, config: Path) -> subprocess.CompletedProcess[str]:
     """run.sh --config CONFIG for a non-V4.1 family: dispatch to the real run-family.sh."""
+    config = _with_real_hosts(config, tmp_path)
     hf = _hub(tmp_path)
     _pin_snapshots(hf, keys(config))
     bin_dir = _stubs(tmp_path)
@@ -236,7 +250,7 @@ print(json.dumps(dict(report, resolved_settings=fake_resolved_settings(args, fam
 
 def _strip(config: Path, tmp_path: Path, drop: tuple[str, ...]) -> Path:
     """The example without the named keys: what a user gets from the launcher's bare defaults."""
-    lines = [line for line in config.read_text().splitlines()
+    lines = [line.replace("REPLACE-ME-spark-", "spark-") for line in config.read_text().splitlines()
              if not any(line.startswith(f"{key}=") for key in drop)]
     bare = tmp_path / f"bare-{config.name}"
     bare.write_text("\n".join(lines) + "\n")
@@ -261,7 +275,7 @@ def test_one_starting_config_per_release_card() -> None:
     names = {p.name for p in starting_configs()}
     expected = {f"{model}-{profile}.config" for model in (
         "deepseek-v41-mxfp4", "v41-flash-strided", "deepseek-v4-flash-mxfp4", "deepseek-v4-pro-exl3",
-        "glm53-exl3", "glm53-exl3-k6core", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-exl3-k6", "glm53-flash-nvfp4",
+        "glm53-exl3", "glm53-exl3-k6core", "glm53-nvfp4", "glm53-flash-fp8", "glm53-flash-exl3", "glm53-flash-nvfp4",
         "glm53-flash-exlr8-k4", "mimo-v26-flash-mxfp4", "mimo-v26-pro-mxfp4") for profile in ("min", "max")}
     # Qwen fits one RTX: the 2x RTX column is n/a, so only min exists.
     expected |= {"qwen38-exl3-min.config", "qwen38-nvfp4-min.config"}
@@ -819,14 +833,23 @@ def test_v7_release_cards_match_live_and_retired_inventory():
             for e in v6["entries"] if e["name"] not in V7_RETIREMENTS}
     assert cards == kept | {("hy4_flash", HY4_MC, 1, n) for n in (1, 4)} | {
         ("inkling2_mini", "thinkingmachines/Inkling-2-Mini", 1, 0),
+        ("glm5_flash", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1", 1, 2),
+        ("glm5_flash", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1", 2, 0),
     }
     primary = {(f, m, g) for f, m, g, n in cards if m != HY4_MC or n == 0}
     assert primary == {(row["family"], row["checkpoint"], g) for row in published["cells"]
                        for g in (1, 2) if row[f"{g}rtx"]["status"] != "na"}
     assert {(row["family"], row["checkpoint"], row["spark_ranks"], row["1rtx"]["status"])
-            for row in published["supplemental"]} == {("hy4_flash", HY4_MC, n, "pending") for n in (1, 4)}
+            for row in published["supplemental"]} == {("hy4_flash", HY4_MC, n, "current") for n in (1, 4)}
     hy4, = [row for row in published["cells"] if row["checkpoint"] == HY4_MC]
-    assert hy4["1rtx"]["status"] == hy4["2rtx"]["status"] == "pending"
+    assert hy4["1rtx"]["status"] == hy4["2rtx"]["status"] == "current"
+    # #2675 / #2782: the K8-compact v7 smoke cards are published, each on its own report.
+    for row in published["cells"] + published["supplemental"]:
+        if row["checkpoint"] in MC_CHECKPOINTS | {HY4_MC}:
+            for key in ("1rtx", "2rtx"):
+                cell = row.get(key)
+                if cell and cell["status"] == "current":
+                    assert (ROOT / cell["report"] / "report.json").is_file(), cell["report"]
 
 
 def test_v7_comparisons_change_only_view_and_endpoints_from_the_k8_max():
@@ -871,7 +894,8 @@ def test_v7_comparisons_change_only_view_and_endpoints_from_the_k8_max():
                 snapshot = Path(report["server"]["configuration"]["snapshot"])
                 assert snapshot.name == revision, (study["checkpoint"], view, snapshot.name, revision)
         if study["checkpoint"] == HY4_MC:
-            assert not any(study["views"].values())
+            # #2675: Hy4-flash has only its K8 main card (2x+0); compare views are unmeasured.
+            assert {v for v, d in study["views"].items() if d} == {"k8-compact"}
 
 
 @pytest.mark.parametrize("path", starting_configs(), ids=lambda p: p.name)
@@ -914,7 +938,7 @@ def test_release_smoke_entry_passes_config_validation(entry: dict, tmp_path: Pat
     for key in ("BENCH_SIMULATED", "BENCH_HARDWARE_CLASS"):
         values.pop(key, None)
     path = tmp_path / "entry.config"
-    path.write_text("".join(f"{key}={value}\n" for key, value in values.items()))
+    path.write_text("".join(f"{key}={str(value).replace('REPLACE-ME-spark-', 'spark-')}\n" for key, value in values.items()))
     hf = _hub(tmp_path)
     snapshot = hf / "hub" / f"models--{values['MODEL_ID'].replace('/', '--')}" / "snapshots/abc/config.json"
     checkpoint = json.loads(snapshot.read_text())
@@ -937,10 +961,11 @@ def test_v41_starting_config_passes_the_native_config_validation(path: Path, tmp
     topology and the rails before any image or host is touched."""
     hf = _hub(tmp_path)
     _pin_snapshots(hf, keys(path))
+    staged = _with_real_hosts(path, tmp_path)
     result = subprocess.run(
         ["bash", "-euc", 'source scripts/lib/release-common.sh; [[ "$(release_config_family "$1")" == deepseek_v41 ]]; '
          'release_load_config "$1"; printf "%s\\n" "$SPARK_COUNT" "$RTX_GPUS" "$POOL_TOKENS" "$SPECULATOR"',
-         "test", str(path)], cwd=ROOT, env={**os.environ, "HF_HOME": str(hf)}, capture_output=True, text=True)
+         "test", str(staged)], cwd=ROOT, env={**os.environ, "HF_HOME": str(hf)}, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     count, gpus, pool, dspark = result.stdout.split()
     assert (count, gpus, pool, dspark) == (keys(path)["SPARK_COUNT"], keys(path)["RTX_GPUS"], "auto", "dspark")
@@ -1032,7 +1057,7 @@ def test_ml4_qualification_config_preserves_native_draft_defaults(name: str, tmp
         "model_type": "mistral_large4_text", "num_hidden_layers": 4, "first_k_dense_replace": 1}}
     launches = []
     for label, drop in (("example", ()), ("bare", SPECULATOR_KEYS + POOL_KEYS)):
-        config = "".join(f"{k}={v}\n" for k, v in values.items()
+        config = "".join(f"{k}={v.replace('REPLACE-ME-spark-', 'spark-')}\n" for k, v in values.items()
                          if k not in ("MODEL_ID", "MODEL_REVISION", *drop))
         result = _family_launch_result(tmp_path / label, checkpoint, values["MODEL_ID"], config,
                                       extra_args=("--wip", "ml4-test"))
@@ -1055,6 +1080,8 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         assert values["SPARK_COUNT"] == ("5" if minimum else "6")
         assert values["RTX_GPUS"] == ("1" if minimum else "2")
         assert values["SPECULATOR"] == "dspark" and values["POOL_TOKENS"] == "auto"
+    elif name.startswith("glm53-flash-exl3-k4-mc-mul1-"):
+        expected = keys(EXAMPLES / name.replace("k4-mc-mul1-", "k4-mc-"))
     elif name.startswith("glm53-flash-exl3-k325-mc-"):
         expected = keys(EXAMPLES / name.replace("k325-mc-", "k4-mc-"))
     elif name.startswith("glm53-exl3-k4-mc-"):
@@ -1066,9 +1093,12 @@ def test_new_publications_preserve_pinned_recipe_layouts(name: str) -> None:
         if name.endswith('-min.config'):
             expected['MAX_CONTEXT_TOKENS'] = 'auto'
     else:
-        expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k6-"))
+        # GLM Flash: the K6 view example shares every layout key with the original view.
+        expected = keys(EXAMPLES / name.replace("exl3-k4-mc-", "exl3-k4-mc-k6-"))
     publication = next((model, revision, doc) for stem, model, revision, doc in [
         ("mistral-", "Mistral-Large-4-EXL3-K4", "9c354cee78cd6feddb057549b8edde6e3b319822", "mistral_large4"),
+        ("glm53-flash-exl3-k4-mc-mul1-", "GLM-5.3-Flash-EXL3-K4-MC-MUL1",
+         "1bca67feffab2747e0e489e571185bc06336ee26", "glm5_flash"),
         ("glm53-flash-exl3-k325-mc-", "GLM-5.3-Flash-EXL3-K3.25-MC",
          "83da6981e57e110fd1ba166e0a989c411e4289b6", "glm5_flash"),
         ("glm53-flash-", "GLM-5.3-Flash-EXL3-K4-MC", "558931fe149f59b49d19b2376a692bd7a12fb8b7", "glm5_flash"),
@@ -1183,15 +1213,6 @@ def test_v4_candidate_config_contract(name: str, tmp_path: Path) -> None:
     values = keys(path)
     text = path.read_text()
     assert f"./run.sh --config examples/configs/{name}" in text and "--dry-run" in text
-    if name.startswith("glm53f-exl3-k4-core-k6"):
-        assert values["MODEL_ID"] == "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-Core-K6"
-        assert values["SPECULATOR"] == "dflash2"
-        assert values["SPECULATOR_MODEL_ID"] == "incoai/GLM-5.3-Flash-DFlash2"
-        assert values["SPARK_COUNT"] == ("2" if "-min" in name else "0")
-        assert values["RTX_GPUS"] == ("1" if "-min" in name else "2")
-        assert values["POOL_TOKENS"] == "auto"
-        assert not any(needle in text.lower() for needle in PRIVATE)
-        return
     assert re.fullmatch("[0-9a-f]{40}", values["MODEL_REVISION"])
     assert not any(needle in text.lower() for needle in PRIVATE)
     assert "EXLR8_DENSE_FROM" not in values
@@ -1375,11 +1396,12 @@ def test_glmf_mc_comparison_keeps_compact_modes_supplementary() -> None:
     published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     assert not any(row["checkpoint"] == old_model for row in published["cells"])
     current = next(row for row in published["cells"] if row["checkpoint"] == config["MODEL_ID"])
-    assert current["1rtx"]["status"] == "pending"
-    assert current["2rtx"]["status"] == "current"
-    report = json.loads((ROOT / current["2rtx"]["report"] / "report.json").read_text())
-    settings = {item["name"]: item["value"] for item in report["server"]["configuration"]["settings"]}
-    assert settings["core-view"] == "k8-compact"
+    # #2675: v7 main cards are K8 compact on both columns.
+    assert current["1rtx"]["status"] == current["2rtx"]["status"] == "current"
+    for column in ("1rtx", "2rtx"):
+        report = json.loads((ROOT / current[column]["report"] / "report.json").read_text())
+        settings = {item["name"]: item["value"] for item in report["server"]["configuration"]["settings"]}
+        assert settings["core-view"] == "k8-compact", column
     for suffix in ("5090", "min", "max"):
         retired = next(entry for entry in published["retired"] if entry["name"] == f"glm53f-exl3-k6-{suffix}")
         assert retired["release_note"] == "replaced by K4 MC original"
@@ -1463,8 +1485,9 @@ def test_kimi_k31_mc_cards_keep_original_primary_and_k6_supplementary() -> None:
     published = json.loads((ROOT / "benchmarks/current-matrix.json").read_text())
     row, = [row for row in published["cells"] if row["checkpoint"] == model]
     assert row["family"] == "kimi_k3"
-    assert row["1rtx"]["status"] == "pending"
-    assert row["2rtx"]["status"] == "current"
+    # #2675: v7 main cards are K8 compact on both columns.
+    assert row["1rtx"]["status"] == row["2rtx"]["status"] == "current"
+    assert row["1rtx"]["report"].endswith("-kimi-k31-mc-k8-compact-min")
     study, = [entry for entry in published["mc_views"] if entry["checkpoint"] == model]
     assert study["views"]["k8-compact"] == row["2rtx"]["report"]
     for view in ("k8-compact", "k6-compact", "fp8-compact"):

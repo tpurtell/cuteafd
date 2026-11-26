@@ -753,6 +753,7 @@ impl Hy4Inputs {
             if context_split {
                 let ctx_bytes = crate::placement::ContextExchangeLayout::new(&hy4_context_buffers(
                     cfg,
+                    capacity_rows,
                     self.decode_rows as usize,
                 ))
                 .bytes()

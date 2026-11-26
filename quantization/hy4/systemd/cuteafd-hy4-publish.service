@@ -9,8 +9,7 @@ Type=oneshot
 WorkingDirectory=%h/Developer/cute-worktrees/hy4-k4-mc
 Environment=PYTHONPATH=%h/Developer/cute-worktrees/hy4-k4-mc/quantization
 Environment=CUDA_VISIBLE_DEVICES=
-Environment=HF_XET_HIGH_PERFORMANCE=1
-Environment=HF_XET_FIXED_UPLOAD_CONCURRENCY=32
+Environment=HF_HUB_DISABLE_XET=1
 UnsetEnvironment=HF_TOKEN HUGGING_FACE_HUB_TOKEN
 ExecCondition=/usr/bin/cmp --silent /proc/sys/kernel/random/boot_id %h/Developer/quantization-runs/hy4-k4-mc/admitted-boot-id
 StandardInput=file:%h/.cache/huggingface/token

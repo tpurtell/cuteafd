@@ -615,7 +615,7 @@ fn prefix_state_bytes(layout: &Step5CacheLayout, rows: usize) -> Result<u64> {
     ensure!(rows > 576, "Step-5 prefix state check needs at least 577 tokens");
     let pages = (rows as u64).div_ceil(64).checked_mul(4)
         .and_then(|n| n.checked_add(4)).context("prefix page capacity overflow")?;
-    layout.ranks[0].bytes.checked_mul(6)
+    layout.ranks[0].bytes.checked_add(layout.ranks[0].mark_bytes).and_then(|bytes| bytes.checked_mul(3))
         .and_then(|n| n.checked_add(layout.geometry.ranks[0].persistent_unit_bytes.checked_mul(pages)?))
         .and_then(|n| n.checked_add(Staging::bytes(layout, 0).ok()? as u64))
         .context("prefix state admission overflow")
@@ -642,9 +642,9 @@ fn canonical_state(cache: &RefCell<CacheRank<'_>>, placement: &Placement) -> Res
     let mut pages = Vec::new();
     for (logical, &physical) in placement.pages.iter().take(placement.committed.div_ceil(64)).enumerate() {
         let live = (placement.committed - logical * 64).min(64);
-        for plane in owner.page_views(physical)? {
+        for (plane, visible) in owner.page_parts(physical, live as u64)? {
             let mut bytes = read_buffer(device, plane)?;
-            bytes.truncate(bytes.len() / 64 * live);
+            bytes.truncate(visible);
             pages.push(bytes);
         }
     }
@@ -1757,7 +1757,7 @@ mod tests {
         assert_eq!(PREFIX_FRONTIERS, [63, 64, 65, 575, 576]);
         assert!(prefix_state_bytes(&layout, 576).is_err());
         assert_eq!(prefix_state_bytes(&layout, 640)?,
-            layout.ranks[0].bytes * 6 + layout.geometry.ranks[0].persistent_unit_bytes * 44
+            (layout.ranks[0].bytes + layout.ranks[0].mark_bytes) * 3 + layout.geometry.ranks[0].persistent_unit_bytes * 44
                 + Staging::bytes(&layout, 0)? as u64);
         Ok(())
     }

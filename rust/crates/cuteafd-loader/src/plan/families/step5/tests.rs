@@ -369,22 +369,22 @@ fn execution_owners_bind_native_weights_cache_and_exact_snapshots() {
             for rank in 0..ranks {
                 let state = &layout.ranks[rank];
                 let cost = layout.geometry.ranks[rank];
-                assert_eq!(cost.persistent_unit_bytes, state.regions.iter().map(|r| r.page_bytes * 2).sum::<u64>());
+                assert_eq!(cost.persistent_unit_bytes, state.regions.iter().map(|r| r.persistent_page_bytes()).sum::<u64>());
                 assert_eq!(cost.active_state_per_sequence_bytes, state.bytes);
-                assert_eq!(cost.retained_mark_bytes, state.bytes);
+                assert_eq!(cost.retained_mark_bytes, state.mark_bytes);
                 assert_eq!(weights[rank].resident_bytes, weights[rank].operands.iter().map(|o| o.allocation_bytes).sum::<u64>());
                 assert_eq!(weights[rank].operands.iter().any(|o| o.name == "model.embed_tokens.weight"), rank == 0);
                 assert_eq!(weights[rank].operands.iter().any(|o| o.name == "lm_head.weight"), rank == head as usize);
                 for frontier in [0, 63, 64, 65, 575, 576, 1024] {
                     let spans = layout.snapshot_spans(rank, frontier, &vec![0; state.mtp_lengths.len()]).unwrap();
                     let expected = 8 + state.sliding.iter().map(|s| 2 * frontier.min(512) * s.key.bytes / layout.ring.rows).sum::<u64>()
-                        + state.regions.len() as u64 * (2 * 8 * 256 * 2 + frontier / 8 * 256);
+                        + state.regions.len() as u64 * (2 * 8 * 256 * 2);
                     assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
                     let copies = layout.snapshot_copies(rank, frontier, &[], 3, 2, 4, 3).unwrap();
                     assert_eq!(copies.iter().map(|s| s.active.bytes).sum::<u64>(), expected);
                     assert!(copies.iter().all(|c| c.active.offset + c.active.bytes <= state.bytes * 3
-                        && c.mark.offset >= state.bytes * 3 && c.mark.offset + c.mark.bytes <= state.bytes * 4));
-                    assert_eq!(layout.csa_tail_bytes(rank, frontier % 64).unwrap(), cost.persistent_unit_bytes / 64 * (frontier % 64));
+                        && c.mark.offset >= state.mark_bytes * 3 && c.mark.offset + c.mark.bytes <= state.mark_bytes * 4));
+                    assert_eq!(layout.csa_tail_bytes(rank, frontier % 64).unwrap(), state.regions.iter().map(|r| r.page_bytes * 2 / 64 * (frontier % 64) + if r.summaries.is_some() { frontier % 64 / 8 * 256 } else { 0 }).sum::<u64>());
                 }
             }
             let mtp = Step5CacheLayout::for_execution(&cfg, &owners, 1024, 3, 64, 64, crate::families::qwen4::Qwen4KvCache::Bf16).unwrap();
@@ -555,7 +555,7 @@ fn predictor_marks_validate_independent_frontiers_and_ignore_rejected_rows() {
                     assert_eq!(copy.active.bytes % stride, 0);
                     for row in 0..copy.active.bytes / stride {
                         let source = (copy.active.offset - component.offset) / stride + row;
-                        let canonical = (copy.mark.offset - component.offset) / stride + row;
+                        let canonical = (copy.mark.offset - state.mark_component(component).unwrap().offset) / stride + row;
                         retained.push((canonical, source));
                     }
                 }
@@ -612,18 +612,18 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
         }
         for (rank, state) in layout.ranks.iter().enumerate() {
             let geometry = layout.geometry.ranks[rank];
-            assert_eq!(geometry.retained_mark_bytes, state.bytes);
+            assert_eq!(geometry.retained_mark_bytes, state.mark_bytes);
             assert_eq!(geometry.active_state_per_sequence_bytes, state.bytes);
             for frontier in [0, 1, 7, 8, 63, 64, 65, 511, 512, 513, 1 << 20] {
                 let spans = layout.snapshot_spans(rank, frontier, &vec![0; state.mtp_lengths.len()]).unwrap();
                 assert!(spans.iter().all(|s| s.offset.checked_add(s.bytes).unwrap() <= state.bytes));
-                let summary_bytes = if rank == 0 { 23 * (frontier / REGION_ROWS) * 256 } else { 0 };
+
                 let maximum: u64 = layout.snapshot_spans(rank, 1 << 20, &vec![0; state.mtp_lengths.len()]).unwrap().iter().map(|s| s.bytes).sum();
                 let missing_rings: u64 = state.sliding.iter().filter(|s| !s.mtp)
                     .map(|s| 2 * (512 - frontier.min(512)) * s.key.bytes / layout.ring.rows).sum();
                 let missing_history = state.mtp_hidden.map_or(0, |span|
                     (516 - frontier.min(516)) * span.bytes / layout.mtp_hidden_rows);
-                let expected = maximum - if rank == 0 { summaries - summary_bytes } else { 0 } - missing_rings - missing_history;
+                let expected = maximum - missing_rings - missing_history;
                 assert_eq!(spans.iter().map(|s| s.bytes).sum::<u64>(), expected);
                 assert!(state.regions.iter().all(|region| spans.contains(&region.pending_key)
                     && spans.contains(&region.pending_z)));
@@ -639,13 +639,13 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
                     assert!(!spans.contains(&region.next_key) && !spans.contains(&region.next_z));
                 }
                 assert_eq!(layout.csa_tail_bytes(rank, frontier % PAGE_ROWS).unwrap(),
-                    geometry.persistent_unit_bytes / PAGE_ROWS * (frontier % PAGE_ROWS));
+                    state.regions.iter().map(|r| r.page_bytes * 2 / PAGE_ROWS * (frontier % PAGE_ROWS) + if r.summaries.is_some() { frontier % PAGE_ROWS / REGION_ROWS * 256 } else { 0 }).sum::<u64>());
             }
         }
         let (slots, arena) = layout.prefix_arena_bytes(16, 20, 2 << 30).unwrap();
-        assert_eq!(slots, (2 << 30) / layout.ranks.iter().map(|r| r.bytes).sum::<u64>());
+        assert_eq!(slots, (2 << 30) / layout.ranks.iter().map(|r| r.mark_bytes).sum::<u64>());
         assert!(arena.iter().sum::<u64>() <= 2 << 30);
-        assert_eq!(arena[0], slots * layout.ranks[0].bytes);
+        assert_eq!(arena[0], slots * layout.ranks[0].mark_bytes);
         assert_eq!(layout.prefix_arena_bytes(16, 0, 2 << 30).unwrap(), (0, vec![0; ranks]));
         assert!(layout.snapshot_spans(ranks, 0, &[]).is_err());
         assert!(layout.snapshot_spans(0, (1 << 20) + 1, &[0; 3]).is_err());
@@ -656,16 +656,15 @@ fn exact_cache_layout_charges_dense_summaries_and_every_retained_byte() {
             let spans = layout.snapshot_spans(0, 65, &[0; 3]).unwrap();
             assert_eq!(copies.len(), spans.len());
             for (copy, span) in copies.iter().zip(spans) {
-                assert!(copy.mark.offset >= sequence * layout.ranks[0].bytes
-                    && copy.mark.offset + copy.mark.bytes <= (sequence + 1) * layout.ranks[0].bytes);
+                assert!(copy.mark.offset >= sequence * layout.ranks[0].mark_bytes
+                    && copy.mark.offset + copy.mark.bytes <= (sequence + 1) * layout.ranks[0].mark_bytes);
                 assert_eq!(copy.active.bytes, span.bytes);
                 assert_eq!(copy.mark.bytes, span.bytes);
                 occupied.push((copy.active.offset, copy.active.offset + copy.active.bytes));
             }
             let summary = layout.ranks[0].regions[0].summaries.unwrap();
-            let copy = copies.iter().find(|c| c.mark.offset == sequence * layout.ranks[0].bytes + summary.offset).unwrap();
-            assert_eq!(copy.active.offset, summary.offset * 3 + sequence * summary.bytes);
-            assert_eq!(copy.active.bytes, 8 * 256); // Never copy the unfinished ninth region.
+            assert!(layout.ranks[0].mark_component(summary).is_err());
+            assert!(copies.iter().all(|c| c.active.offset < summary.offset * 3 || c.active.offset >= (summary.offset + summary.bytes) * 3));
         }
         occupied.sort_unstable();
         assert!(occupied.windows(2).all(|pair| pair[0].1 <= pair[1].0));
@@ -744,7 +743,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     assert!(!pinned.wip_launchable());
     assert!(pinned.hints.iter().any(|h| h.what.contains("explicit KV pool of 262144 tokens is below the compiled/max-context floor of 1048576 tokens")), "{:?}", pinned.hints);
     // The joint solver can fit TP4 by moving 19 routed layers to the RTX pair.
-    // The KV target is not a floor: 510144 tokens still covers a 256K request.
+    // The KV target is not a floor: 559040 tokens still covers a 256K request.
     let tp4 = plan::plan(dir.path(), &PlanOptions { placement: ExpertPlacement::from_spark_ranks(4),
         vision: MediaMode::Off, draft_ownership: Some(spec::DraftOwnership::None),
         layout: Some(layout::LayoutOptions {
@@ -755,7 +754,7 @@ fn card_memory_conclusions_and_request_vs_pool_extent() {
     assert!(tp4.wip_launchable() && tp4.native_serving_admitted, "{:?}", tp4.hints);
     assert_eq!(tp4.onboard_layers, Some(19));
     let memory = tp4.memory_layout.as_ref().unwrap();
-    assert_eq!(memory.pool_tokens, 510_144);
+    assert_eq!(memory.pool_tokens, 559_040);
     let sparks = memory.devices.iter().filter(|device|
         device.kind == cuteafd_core::memory_layout::DeviceKind::Spark).collect::<Vec<_>>();
     assert_eq!(sparks.len(), 4);

@@ -635,17 +635,31 @@ class CoreEngine:
         return summary
 
 
-def publish(export, root, repo_id):
+def _receipt_digests(export):
+    """Writer SHA256 per shard from its layer receipt; HTTP LFS never rehashes weights."""
+    digests = {}
+    for path in Path(export).glob("*.safetensors"):
+        name = ("extras-receipt.json" if path.name.startswith("model-00094")
+                else f"layer-{int(path.name.split('-')[1]) - 1:03d}-receipt.json")
+        receipt = json.loads((Path(export) / name).read_text())
+        verify_receipt(path, receipt)
+        digests[path.name] = receipt["sha256"]
+    return digests
+
+
+def publish(export, root, repo_id, *, options=None):
     """CPU-only upload, remote checksum audit, and hardlinked HF snapshot."""
     from huggingface_hub import HfApi, hf_hub_download, snapshot_download
     from huggingface_hub.constants import HF_HUB_CACHE
-    from kimi_k3.uniform_k2.publish import install_upload_compat
-    install_upload_compat()
+    import hub_lfs
+    from hub_requirements import require_qualified_hub
+    require_qualified_hub()  # HTTP LFS before any remote mutation.
     api = HfApi()
     api.create_repo(repo_id, repo_type="model", exist_ok=True, private=False)
-    api.upload_large_folder(repo_id=repo_id, repo_type="model", folder_path=str(export),
-                            ignore_patterns=["*-receipt.json", ".cache/**"], num_workers=4,
-                            print_report=True, print_report_every=1800)
+    # Verified, resumable HTTP LFS batches; hashes of small files persist under root.
+    hub_lfs.upload_folder(api, repo_id, export, ignore_patterns=["*-receipt.json", ".cache/**"], state=root,
+                          digests=_receipt_digests(export), options=options,
+                          commit_message="Publish calibrated EXL3 checkpoint")
     info = api.model_info(repo_id, files_metadata=True)
     remote, published = {file.rfilename: file for file in info.siblings}, {}
     for path in Path(export).rglob("*"):
@@ -710,6 +724,8 @@ def main():
     parser.add_argument("--preflight", "--plan-only", dest="preflight", action="store_true")
     parser.add_argument("--publish", action="store_true", help="record publication intent; supervisor runs a separate CPU publisher")
     parser.add_argument("--publish-only", action="store_true")
+    import hub_lfs
+    hub_lfs.add_arguments(parser)
     args = parser.parse_args()
     if args.publish_only:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -760,7 +776,7 @@ def main():
                 if complete["identity"] != plan["identity"]:
                     raise ValueError("publication requires verified complete quantization identity")
                 progress.emit("publication_started", layer=93)
-                revision = publish(args.export, args.root, TARGET_REPO)
+                revision = publish(args.export, args.root, TARGET_REPO, options=hub_lfs.options_from(args))
                 progress.state["status"] = "complete"
                 progress.emit("complete", layer=93, revision=revision, **complete["summary"])
                 return

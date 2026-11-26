@@ -535,11 +535,20 @@ pub(crate) fn mla_weights_into(
     source: &dyn Fn(&str, &[usize]) -> Result<Rect>,
     stream: *mut c_void,
 ) -> Result<()> {
-    use cuteafd_loader::formats::dflash::MlaDraftPacking;
+    use cuteafd_loader::formats::dflash::{MlaDraftPacking, MlaDraftShard, MlaDraftShardAxis};
     for weight in weights {
         if matches!(weight.packing, MlaDraftPacking::UnitScale | MlaDraftPacking::Uv) { continue; }
         let buffer = destination(&weight.owner)?;
-        let rects = weight.sources.iter().map(|(name, shape)| source(name, shape)).collect::<Result<Vec<_>>>()?;
+        let rects = weight.sources.iter().map(|(name, shape)| {
+            let rect = source(name, shape)?;
+            match weight.shard {
+                Some(MlaDraftShard { axis: MlaDraftShardAxis::Rows, rank, ranks }) =>
+                    shard(rect, ShardAxis::Rows, rank, ranks),
+                Some(MlaDraftShard { axis: MlaDraftShardAxis::Columns, rank, ranks }) =>
+                    shard(rect, ShardAxis::Columns, rank, ranks),
+                None => Ok(rect),
+            }
+        }).collect::<Result<Vec<_>>>()?;
         if weight.packing == MlaDraftPacking::Uk {
             let uv_id = weight.owner.strip_suffix(".uk").context("draft Uk owner suffix")?.to_owned() + ".uv";
             absorb_into(dense, rects.into_iter().next().context("draft Uk source missing")?,

@@ -636,7 +636,13 @@ mod tests {
         let source = include_str!("../scheduler.rs");
         let serve = &source[source.find("pub(super) fn serve<'w, 'a, P: ServingTarget<'w, 'a>>").unwrap()..];
         let serve = &serve[..serve.find("\n/// Process-wide device-terminal instrumentation.").unwrap()];
-        assert!(serve.contains("host_pending: (!media.full() && !media.backlog.is_empty()) || !prefix_waiters.is_empty(),"));
+        // A prompt deferred behind a pending snapshot wakes the lanes (#976 review A2),
+        // but only once it is admissible: a waiter blocked on a donor still in
+        // `prefills` must not stop lane 0 at round 0.
+        assert!(serve.contains("host_pending(media.full(), !media.backlog.is_empty(), &prefix_waiters, &donors)"));
+        assert!(!serve.contains("|| !prefix_waiters.is_empty(),"),
+            "a blocked prefix waiter must not set host_pending: lane 0 stops at round 0 with \
+             StopReason::Admission and spins");
         assert!(serve.contains("AdmissionPoll::Empty if !prefix_waiters.is_empty() => prefix_waiters.pop_front().unwrap(),"));
         assert!(serve.contains("let mut intake = receive.len().max(1);"), "an empty HTTP queue must still run admission");
     }

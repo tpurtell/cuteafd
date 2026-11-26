@@ -543,7 +543,7 @@ impl<'a> BackboneRouterWave<'_, 'a> {
     }
     pub fn set_local_mode(&mut self, local: bool) -> Result<()> {
         if self.full_request == !local { return Ok(()); }
-        self.stream().require_complete()?;
+        if !crate::shared::memory::chain::active() { self.stream().require_complete()?; }
         self.invalidate();
         std::mem::swap(&mut self.graphs, &mut self.other_graphs);
         self.full_request = !local;

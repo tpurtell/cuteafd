@@ -395,13 +395,18 @@ struct World {
     fail_poll: Option<u32>,
     released: AtomicBool,
     polls: AtomicUsize,
+    /// This world's own exchange counters (never the process ones).
+    stats: exchange_stats::ExchangeStats,
+    /// The unit pace every landed wave's replies carry, per rank.
+    pace: [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD],
 }
 
 impl World {
     fn new(slots: usize) -> Arc<Self> {
         Arc::new(Self { words: (0..Counter::words(slots)).map(|_| AtomicU32::new(0)).collect(), slots,
             posted: Mutex::new(Vec::new()), occupied: Mutex::new(vec![None; slots]), fail_post: None, fail_poll: None,
-            released: AtomicBool::new(false), polls: AtomicUsize::new(0) })
+            released: AtomicBool::new(false), polls: AtomicUsize::new(0),
+            stats: exchange_stats::ExchangeStats::new(), pace: [None; cuteafd_core::MAX_SPARK_WORLD] })
     }
     fn load(&self, counter: Counter) -> u32 { self.words[counter.index(self.slots)].load(Ordering::Acquire) }
     fn store(&self, counter: Counter, value: u32) { self.words[counter.index(self.slots)].store(value, Ordering::Release) }
@@ -437,6 +442,8 @@ impl Backend for Fake {
         self.world.occupied.lock().unwrap()[slot] = None;
         Ok(true)
     }
+    fn unit_pace(&self, _wave: &FakeWave) -> [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD] { self.world.pace }
+    fn stats(&self) -> &exchange_stats::ExchangeStats { &self.world.stats }
     fn publish(&mut self, sequence: u32) {
         if !reached(self.world.load(Counter::Landed), sequence) { self.world.store(Counter::Landed, sequence); }
         self.world.released.store(true, Ordering::Release);
@@ -2023,5 +2030,62 @@ fn native_wait_guard_reuses_preweight_load_on_each_device() -> Result<()> {
     library.cuda_set_device(0)?;
     native_initialize_before_waits(&library)?;
     assert_eq!(fixture.native_initializations(&library)?, 2);
+    Ok(())
+}
+
+/// Drives the real worker loop over the fake backend until `waves` waves landed, and
+/// returns the world (its own counters, so nothing another test lands is counted).
+fn land_waves(waves: u32, pace: [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD]) -> Result<Arc<World>> {
+    let mut world = World::new(1);
+    Arc::get_mut(&mut world).unwrap().pace = pace;
+    let (jobs, inbox) = mpsc::channel();
+    std::thread::scope(|scope| -> Result<()> {
+        let mut backend = Fake { world: world.clone() };
+        let worker = scope.spawn(move || run_worker(&mut backend, &inbox, Duration::from_secs(5), false));
+        for sequence in 1..=waves {
+            world.store(Counter::Staged(0), sequence);
+            jobs.send(Command::Wave(Job { rows: 16, ..job(sequence, 0, sequence - 1) }))
+                .map_err(|_| anyhow::anyhow!("worker command channel closed"))?;
+            wait(&world, Counter::Landed, sequence)?;
+            world.store(Counter::Consumed(0), sequence);
+        }
+        drop(jobs);
+        let (result, _) = worker.join().unwrap();
+        result.map(|_| ())
+    })?;
+    Ok(world)
+}
+
+/// The worker counts every wave it lands: its host times, its rows (the wave's own count,
+/// whatever the workers merged), one rank's reply plane, and nothing for a rank whose reply
+/// carried no pace (decode units report none).
+#[test]
+fn a_landed_wave_moves_the_exchange_counters() -> Result<()> {
+    let world = land_waves(2, [None; cuteafd_core::MAX_SPARK_WORLD])?;
+    let stats = world.stats.snapshot();
+    assert_eq!(stats["waves_total"], 2, "two landed waves");
+    assert_eq!(stats["wave_rows_total"], 2 * 16, "each wave's rows, once");
+    assert_eq!(stats["reply_plane_bytes_total"], 2 * 64, "one rank's reply plane per wave");
+    let times = &stats["wave_ns_total"];
+    assert!(times["staging"].as_u64().unwrap() + times["post"].as_u64().unwrap() + times["wait"].as_u64().unwrap() > 0,
+        "the waves' host times were recorded");
+    assert!(stats["expert_prefill_units"]["units_total"].as_array().unwrap().iter().all(|units| units == 0),
+        "no reply carried a pace");
+    Ok(())
+}
+
+/// The prefill unit pace each worker returns in its reply header reaches the coordinator's
+/// counters with no worker flag set: per rank, one unit per landed wave and the sums of its
+/// busy and idle times. A rank that reported none stays at zero.
+#[test]
+fn the_reply_pace_of_every_rank_reaches_the_exchange_counters() -> Result<()> {
+    let mut pace = [None; cuteafd_core::MAX_SPARK_WORLD];
+    pace[0] = Some((700, 30));
+    pace[2] = Some((900, 0));
+    let world = land_waves(3, pace)?;
+    let units = &world.stats.snapshot()["expert_prefill_units"];
+    assert_eq!(units["units_total"], serde_json::json!([3, 0, 3, 0, 0, 0, 0, 0]));
+    assert_eq!(units["busy_ns_total"], serde_json::json!([2_100_000, 0, 2_700_000, 0, 0, 0, 0, 0]));
+    assert_eq!(units["idle_ns_total"], serde_json::json!([90_000, 0, 0, 0, 0, 0, 0, 0]));
     Ok(())
 }

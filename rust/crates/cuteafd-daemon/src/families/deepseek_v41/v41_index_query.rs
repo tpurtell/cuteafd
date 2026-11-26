@@ -234,7 +234,7 @@ impl<'w, 'a> IndexQueryWave<'w, 'a> {
                     == self.storage.hidden.buffer.device_id,
             "index query rebound library or device differs"
         );
-        self.storage.stream.require_complete()?;
+        if !crate::shared::memory::chain::active() { self.storage.stream.require_complete()?; }
         self.weights = weights;
         Ok(())
     }

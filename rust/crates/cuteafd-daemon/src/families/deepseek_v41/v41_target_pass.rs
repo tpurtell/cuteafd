@@ -136,10 +136,9 @@ pub(crate) struct Pass<'a, R> {
     sampled: Option<SampledTargetRows>,
     chain: Option<crate::shared::memory::chain::StageChain<'a>>,
     device_order: bool,
-    /// Device order a pass returns to after a one-pass override: on for the
-    /// two-RTX pass, off for the single-RTX pass (measured 2026-10-25, V4.1
-    /// 1 RTX + 3 Sparks: device-ordered verify 37.9 -> 38.3-39.1 ms, decode
-    /// 0.97-0.98x; 2 RTX + 6 Sparks: 25.8 -> 24.0 ms, decode 1.08-1.10x).
+    /// Device order a pass returns to after a one-pass override: on for both
+    /// single-RTX and two-RTX passes when one lane is active (the independent
+    /// scheduler disables device order per pass while both lanes are busy).
     device_default: bool,
     /// The next pass may L2-prefetch during its exchanges ([`Self::set_l2_prefetch`]).
     l2_solo: bool,
@@ -296,8 +295,8 @@ impl<'w, 'a> TargetPass<'w, 'a> {
             state: State::Idle,
             sampled: None,
             chain,
-            device_order: false,
-            device_default: false,
+            device_order: true,
+            device_default: true,
             l2_solo: true,
         })
     }
@@ -938,12 +937,19 @@ mod tests {
         assert!(pass.state.begin().is_err());
         pass.set_device_order(true);
         assert!(pass.device_order);
-        // A single-RTX pass stays host-ordered whatever a scheduler asks.
+        pass.set_device_order(false);
+        assert!(!pass.device_order);
+        // A pass whose default is false stays host-ordered whatever a scheduler asks.
         pass.device_default = false;
         pass.set_device_order(true);
         assert!(!pass.device_order);
         pass.set_l2_prefetch(false);
         assert!(!pass.l2_solo);
+        // Single-RTX TargetPass defaults to device-ordered for one-lane passes.
+        let src = include_str!("v41_target_pass.rs");
+        let new_fn = &src[src.find("impl<'w, 'a> TargetPass<'w, 'a>").unwrap()..];
+        let new_fn = &new_fn[..new_fn.find("pub fn enable_l2_prefetch").unwrap()];
+        assert!(new_fn.contains("device_order: true") && new_fn.contains("device_default: true"));
         Ok(())
     }
 

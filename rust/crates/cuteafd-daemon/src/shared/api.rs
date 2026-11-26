@@ -339,6 +339,119 @@ mod tests {
         assert_eq!(stats["verify"]["drafted_tokens"], 99, "preserve private diagnostics");
     }
 
+    #[tokio::test]
+    async fn every_family_profile_publishes_shared_graph_phase_and_exchange_stats() {
+        use axum::{body::Body, http::Request};
+        use cuteafd_api::openai::{chat, ModelEncoding, ModelProfile};
+        use tower::ServiceExt;
+
+        let snapshot = tempfile::tempdir().unwrap();
+        cuteafd_loader::plan::testing::write_kimi_tokenizer(snapshot.path());
+        let kimi_dir = tempfile::tempdir().unwrap();
+        let mut added = serde_json::Map::new();
+        for (id, content) in [(163587, "<|open|>"), (163588, "<|close|>"), (163589, "<|sep|>"), (163586, "<|end_of_msg|>")] {
+            added.insert(id.to_string(), serde_json::json!({"content": content}));
+        }
+        std::fs::write(kimi_dir.path().join("tokenizer_config.json"),
+            serde_json::json!({"added_tokens_decoder": added}).to_string()).unwrap();
+        std::fs::write(kimi_dir.path().join("generation_config.json"),
+            serde_json::json!({"eos_token_id": 163586}).to_string()).unwrap();
+
+        let template = "{{ messages[0].content }}";
+        let glm = Arc::new(chat::glm5::GlmEncoding::new(template, chat::glm5::GlmTokenIds {
+            eos: vec![1], think_close: 2, tool_call: [3, 4], turn_markers: vec![],
+        }).unwrap());
+        let qwen = Arc::new(chat::qwen4::QwenEncoding::new(template, chat::qwen4::QwenTokenIds {
+            eos: vec![1], think_close: 2, tool_call: [3, 4], turn_markers: vec![],
+        }).unwrap());
+        let kimi = Arc::new(chat::kimi::KimiEncoding::from_snapshot(kimi_dir.path()).unwrap());
+        let minimax = Arc::new(chat::minimax::MiniMaxEncoding::new(template, chat::minimax::MiniMaxTokenIds {
+            eos: vec![1], think: [2, 3], namespace: 4, tool_call: [5, 6], turn_markers: vec![],
+        }).unwrap());
+        let step5 = Arc::new(chat::step5::Step5Encoding::new(template, chat::step5::Step5TokenIds {
+            bos: 0, eos: vec![1], think_close: 2, tool_call: [3, 4], turn_markers: vec![],
+        }, "<s>".into()).unwrap());
+        let hy4 = Arc::new(chat::hy4_flash::Hy4Encoding::new(template, chat::hy4_flash::Hy4TokenIds {
+            eos: vec![1], think_open: 2, think_close: 3, tool_calls: [4, 5], tool_call: [6, 7], turn_markers: vec![],
+        }).unwrap());
+        let inkling = Arc::new(chat::inkling2::InklingEncoding::new(template, chat::inkling2::InklingTokenIds {
+            eos: vec![1], message_model: 2, thinking: 3, text: 4, invoke_tool_json: 5, end_message: 6,
+        }).unwrap());
+        let muse = Arc::new(chat::muse::MuseEncoding::new(template, chat::muse::MuseTokenIds {
+            bos: 0, eos: vec![1], start: 2, message: 3, end_of_message: 4,
+        }, "<s>".into()).unwrap());
+        let mistral = Arc::new(chat::mistral::MistralEncoding::new(template, chat::mistral::MistralTokenIds {
+            eos: vec![1], think: [2, 3], tool_calls: 4, args: 5, turn_markers: vec![],
+        }, "<s>".into(), "</s>".into()).unwrap());
+
+        let families = [
+            ("deepseek_v4", ModelEncoding::DeepseekV4),
+            ("deepseek_v41", ModelEncoding::DeepseekV41),
+            ("glm5", ModelEncoding::Glm(glm.clone())),
+            ("glm5_flash", ModelEncoding::Glm(glm)),
+            ("kimi_k3", ModelEncoding::Kimi(kimi)),
+            ("qwen4", ModelEncoding::Qwen(qwen.clone())),
+            ("qwen3_5", ModelEncoding::Qwen(qwen.clone())),
+            ("mimo_v2", ModelEncoding::Qwen(qwen)),
+            ("minimax_m3", ModelEncoding::MiniMax(minimax)),
+            ("step5", ModelEncoding::Step5(step5)),
+            ("hy4_flash", ModelEncoding::Hy4Flash(hy4)),
+            ("inkling2", ModelEncoding::Inkling(inkling.clone())),
+            ("inkling2_mini", ModelEncoding::Inkling(inkling)),
+            ("muse_spark", ModelEncoding::Muse(muse)),
+            ("mistral_large4", ModelEncoding::Mistral(mistral)),
+        ];
+        let policy = ApiArgs::default().load().unwrap();
+        for (family, encoding) in families {
+            let profile = policy.serve(ModelProfile::new(family, encoding), snapshot.path()).unwrap();
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            let router = cuteafd_api::openai::router_for_model(
+                tx,
+                Default::default(),
+                Arc::new(std::sync::Mutex::new(serde_json::json!({"active": 2}))),
+                std::time::Duration::from_secs(1),
+                cuteafd_api::openai::ConsoleHub::disabled(),
+                profile,
+            );
+            let response = router.oneshot(Request::get("/v1/stats").body(Body::empty()).unwrap()).await.unwrap();
+            let stats: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap(),
+            ).unwrap();
+            // Shared graph group.
+            assert!(stats["graph_captures"].is_u64(), "{family}: missing graph_captures");
+            assert!(stats["graph_capture_sites"].is_array(), "{family}: missing graph_capture_sites");
+            assert!(stats["graph_capture_site_deltas"].is_array(), "{family}: missing graph_capture_site_deltas");
+            assert!(stats["graph_cache"].is_array(), "{family}: missing graph_cache");
+            assert!(stats["graph_missing_variants"].is_array(), "{family}: missing graph_missing_variants");
+            assert!(stats["graph_instantiate_ns"].is_u64(), "{family}: missing graph_instantiate_ns");
+            // Shared phase group.
+            let phases = &stats["phases"];
+            for phase in ["prefill_round", "decode_call", "decode_call_with_prefill_waiting", "idle_wait"] {
+                assert!(phases["phase_ns_total"][phase].is_u64(), "{family}: missing phases.phase_ns_total.{phase}");
+            }
+            assert!(phases["phase_ns_total"].get("graph_instantiate").is_none(),
+                "{family}: graph_instantiate must not be duplicated under phases");
+            assert!(phases["rounds_total"]["prefill"].is_u64(), "{family}: missing rounds_total.prefill");
+            assert!(phases["rounds_total"]["decode_calls"].is_u64(), "{family}: missing rounds_total.decode_calls");
+            assert!(phases["decode_call_members_total"].is_u64(), "{family}: missing decode_call_members_total");
+            assert!(phases["prefill_prompt_rounds_total"].is_u64(), "{family}: missing prefill_prompt_rounds_total");
+            assert!(phases["prefill_queue_wait_ns_total"].is_u64(), "{family}: missing prefill_queue_wait_ns_total");
+            assert_eq!(phases["active_decode"], 2, "{family}: active_decode must mirror published active count");
+            // Shared exchange group.
+            let exchange = &stats["exchange"];
+            for key in ["staging", "post", "wait"] {
+                assert!(exchange["wave_ns_total"][key].is_u64(), "{family}: missing exchange.wave_ns_total.{key}");
+            }
+            assert!(exchange["waves_total"].is_u64(), "{family}: missing exchange.waves_total");
+            assert!(exchange["wave_rows_total"].is_u64(), "{family}: missing exchange.wave_rows_total");
+            assert!(exchange["reply_plane_bytes_total"].is_u64(), "{family}: missing exchange.reply_plane_bytes_total");
+            for key in ["busy_ns_total", "idle_ns_total", "units_total"] {
+                assert_eq!(exchange["expert_prefill_units"][key].as_array().unwrap().len(),
+                    cuteafd_core::MAX_SPARK_WORLD, "{family}: bad expert_prefill_units.{key}");
+            }
+        }
+    }
+
     #[test]
     fn sigterm_closes_monitor_but_preserves_completion_grace() {
         const CHILD: &str = "CUTEAFD_HTTP_DRAIN_CHILD";

@@ -424,10 +424,10 @@ def test_optional_levers_are_default_off_and_documented():
                 assert '`GRAPH_DONOR_ALWAYS=on GRAPH_DONOR_COLD_LAG=16`' in DOC.read_text()
                 assert 'graph_donor_cold_lag="$(get GRAPH_DONOR_COLD_LAG 0)"' in (ROOT / "scripts/launch/run-family.sh").read_text()
             elif key == "DECODE_LANES":
-                # V4.1's default is two lanes; the lever is the one-lane opt-in.
+                # V4.1 defaults by coordinator RTX count (1 on 1× RTX, 2 on 2× RTX); explicit 1/2 overrides.
                 assert lever["families"] == ["V4.1"]
-                assert default == "2"
-                assert "`DECODE_LANES=1`" in lever["enable"]
+                assert default == "unset"
+                assert "`DECODE_LANES=1`" in lever["enable"] and "`DECODE_LANES=2`" in lever["enable"]
             elif key == "DRAFT_POLICY":
                 # The lever is the opt-in `clamped` policy; `history` stays the default.
                 assert default == "history"

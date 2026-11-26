@@ -21,13 +21,17 @@ pinned transformers carries glm5_next) and ``USE_HUB_KERNELS=0``.
 
 Writes the raw files ``glmf-golden`` reads:
 
-  tokens.bin      i32  [T]
+  tokens.bin      u32  [T]
   layerNN.bin     bf16 [T, 4, hidden]   mHC streams after layer NN
   logits.bin      f32  [T, vocab]
   meta.json
 
-  golden.py --snapshot SNAP [--experts-snapshot SNAP] --text-file prompt.txt --out DIR
-            [--layers 0 1 ...] [--stop-after N] [--max-tokens T]
+  golden.py --snapshot SNAP [--experts-snapshot SNAP] (--text-file prompt.txt | --tokens-file tokens.bin)
+            --out DIR [--layers 0 1 ...] [--stop-after N] [--max-tokens T]
+
+``--tokens-file`` takes the u32 ids exactly (an existing fixture's
+``tokens.bin``), so the reference is keyed to those ids with no
+decode/re-tokenize round trip.
 """
 from __future__ import annotations
 
@@ -46,7 +50,8 @@ from safetensors import safe_open
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from shape_invariant import install, qualify
-from fidelity_windows import CheckpointStorage, release_checkpoint, load_set, verify_snapshot, write_scored_logits, finish_golden
+from fidelity_windows import (CheckpointStorage, release_checkpoint, load_set, verify_snapshot, write_scored_logits,
+                              finish_golden, read_tokens_file, write_tokens_file)
 
 PREFIX = "model.language_model."
 
@@ -241,12 +246,73 @@ def bounded_kda(function, heads=4):
     return forward
 
 
+def run_tokens(a, config, ref, dense, experts_src, tokens):
+    """One prompt, layer by layer: tokens.bin, layerNN.bin, logits.bin, meta.json."""
+    if not tokens:
+        raise ValueError("the prompt is empty")
+    write_tokens_file(a.out / "tokens.bin", tokens)
+    n_layers = config.num_hidden_layers
+    layers = n_layers if a.stop_after is None else min(a.stop_after + 1, n_layers)
+    save = set(range(layers)) if not a.layers else set(a.layers)
+    t = len(tokens)
+    ids = torch.tensor([tokens], device="cuda")
+    positions = torch.arange(t, device="cuda")[None]
+    mask = torch.ones(1, t, dtype=torch.bool, device="cuda")
+    fp32_keys = FP32_KEYS
+    with torch.inference_mode():
+        embed = torch.nn.functional.embedding(ids, dense.get(PREFIX + "embed_tokens.weight"))
+        h = embed.unsqueeze(2).expand(-1, -1, config.hc_mult, -1).contiguous()
+        memory = CheckpointStorage(torch.cuda, dense, experts_src)
+        topk = None
+        for layer_id in range(layers):
+            start = time.time()
+            kind = config.layer_types[layer_id]
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device("meta"):
+                layer = ref.Glm5NextTextDecoderLayer(config, layer_id)
+            torch.set_default_dtype(torch.float32)
+            layer = layer.to_empty(device="cuda").eval()
+            for name, param in list(layer.named_parameters()) + list(layer.named_buffers()):
+                if any(k in name for k in fp32_keys):
+                    param.data = param.data.float()
+            load_layer(layer, dense, experts_src, f"{PREFIX}layers.{layer_id}.")
+            # Mirror the official model loop, including its cross-layer DSA indices.
+            h, topk = layer(h, attention_mask=mask, position_ids=positions, past_key_values=None,
+                            prev_topk_indices=topk)
+            if layer_id in save:
+                (a.out / f"layer{layer_id:02d}.bin").write_bytes(
+                    h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
+            del layer
+            memory.release()
+            memory.check(f"layer {layer_id}")
+            print(f"layer {layer_id} ({kind}) {time.time() - start:.1f}s", flush=True)
+        if layers < n_layers:
+            return
+        norm = ref.Glm5NextTextRMSNorm(config.hidden_size, config.rms_norm_eps).cuda().to(torch.bfloat16)
+        norm.weight.copy_(dense.get(PREFIX + "norm.weight"))
+        final = norm(h.mean(dim=2))
+        logits = torch.nn.functional.linear(final.float(), dense.get("lm_head.weight").float())
+        (a.out / "logits.bin").write_bytes(logits[0].contiguous().cpu().numpy().tobytes())
+    argmax = logits[0].argmax(-1)
+    next_ok = (argmax[:-1] == ids[0, 1:]).float().mean().item()
+    nll = -torch.log_softmax(logits[0, :-1].double(), -1).gather(1, ids[0, 1:, None]).mean().item()
+    (a.out / "meta.json").write_text(json.dumps({
+        "family": "glm5_flash", "tokens": t, "snapshot": str(a.snapshot),
+        "experts_snapshot": str(a.experts_snapshot or a.snapshot),
+        "tokens_file": str(a.tokens_file) if a.tokens_file else None,
+        "reference": "transformers glm5_next (eager, FP32 routed sum)", "argmax_last": int(argmax[-1]),
+        "next_token_accuracy": next_ok, "mean_nll": nll,
+    }, indent=1))
+    print(f"argmax of last position: {int(argmax[-1])}; next-token accuracy {next_ok:.3f}; mean NLL {nll:.4f}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--snapshot", type=Path, required=True, help="coordinator weights, config and tokenizer")
     p.add_argument("--experts-snapshot", type=Path, help="routed experts (FP8 or BF16); default --snapshot")
     p.add_argument("--text", help="prompt text (tokenized with the snapshot tokenizer)")
     p.add_argument("--text-file", type=Path, help="prompt text from a file")
+    p.add_argument("--tokens-file", type=Path, help="u32 tokens.bin: the prompt's exact token ids")
     p.add_argument("--windows", type=Path, help="pinned fidelity set; layer-major scored-row logits")
     p.add_argument("--prefix-only", action="store_true", help="qualify prefix arithmetic without the full panel")
     p.add_argument("--max-tokens", type=int, help="keep the first T tokens")
@@ -265,8 +331,10 @@ def main() -> None:
         p.error("--media requires --windows")
     if (a.media_root or a.media_features_out or a.tower_dtype != "bf16") and not a.media:
         p.error("media fixture/feature/precision options require --media")
-    if a.windows and (a.text or a.text_file or a.max_tokens or a.stop_after is not None):
-        p.error("--windows cannot be combined with legacy text/truncation/stop options")
+    if a.windows and (a.text or a.text_file or a.tokens_file or a.max_tokens or a.stop_after is not None):
+        p.error("--windows cannot be combined with legacy text/tokens/truncation/stop options")
+    if not a.windows and sum(x is not None for x in (a.text, a.text_file, a.tokens_file)) != 1:
+        p.error("give exactly one of --text, --text-file, --tokens-file or --windows")
 
     from tokenizers import Tokenizer
     from transformers import AutoConfig
@@ -288,64 +356,17 @@ def main() -> None:
         experts_src = Weights(a.experts_snapshot) if a.experts_snapshot else dense
         run_windows(a, config, ref, dense, experts_src)
         return
-    text = a.text_file.read_text() if a.text_file else a.text
-    tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
+    if a.tokens_file:
+        tokens = read_tokens_file(a.tokens_file, config.vocab_size)
+    else:
+        text = a.text_file.read_text() if a.text_file else a.text
+        tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
     if a.max_tokens:
         tokens = tokens[:a.max_tokens]
     dense = Weights(a.snapshot)
     experts_src = Weights(a.experts_snapshot) if a.experts_snapshot else dense
     a.out.mkdir(parents=True, exist_ok=True)
-    (a.out / "tokens.bin").write_bytes(torch.tensor(tokens, dtype=torch.int32).numpy().tobytes())
-    n_layers = config.num_hidden_layers
-    layers = n_layers if a.stop_after is None else min(a.stop_after + 1, n_layers)
-    save = set(range(layers)) if not a.layers else set(a.layers)
-    t = len(tokens)
-    ids = torch.tensor([tokens], device="cuda")
-    positions = torch.arange(t, device="cuda")[None]
-    mask = torch.ones(1, t, dtype=torch.bool, device="cuda")
-    fp32_keys = FP32_KEYS
-    with torch.inference_mode():
-        embed = torch.nn.functional.embedding(ids, dense.get(PREFIX + "embed_tokens.weight"))
-        h = embed.unsqueeze(2).expand(-1, -1, config.hc_mult, -1).contiguous()
-        memory = CheckpointStorage(torch.cuda, dense, experts_src)
-        for layer_id in range(layers):
-            start = time.time()
-            kind = config.layer_types[layer_id]
-            torch.set_default_dtype(torch.bfloat16)
-            with torch.device("meta"):
-                layer = ref.Glm5NextTextDecoderLayer(config, layer_id)
-            torch.set_default_dtype(torch.float32)
-            layer = layer.to_empty(device="cuda").eval()
-            for name, param in list(layer.named_parameters()) + list(layer.named_buffers()):
-                if any(k in name for k in fp32_keys):
-                    param.data = param.data.float()
-            load_layer(layer, dense, experts_src, f"{PREFIX}layers.{layer_id}.")
-            h, _ = layer(h, attention_mask=mask, position_ids=positions, past_key_values=None,
-                         prev_topk_indices=None)
-            if layer_id in save:
-                (a.out / f"layer{layer_id:02d}.bin").write_bytes(
-                    h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
-            del layer
-            memory.release()
-            memory.check(f"layer {layer_id}")
-            print(f"layer {layer_id} ({kind}) {time.time() - start:.1f}s", flush=True)
-        if layers < n_layers:
-            return
-        norm = ref.Glm5NextTextRMSNorm(config.hidden_size, config.rms_norm_eps).cuda().to(torch.bfloat16)
-        norm.weight.copy_(dense.get(PREFIX + "norm.weight"))
-        final = norm(h.mean(dim=2))
-        logits = torch.nn.functional.linear(final.float(), dense.get("lm_head.weight").float())
-        (a.out / "logits.bin").write_bytes(logits[0].contiguous().cpu().numpy().tobytes())
-    argmax = logits[0].argmax(-1)
-    next_ok = (argmax[:-1] == ids[0, 1:]).float().mean().item()
-    nll = -torch.log_softmax(logits[0, :-1].double(), -1).gather(1, ids[0, 1:, None]).mean().item()
-    (a.out / "meta.json").write_text(json.dumps({
-        "tokens": t, "snapshot": str(a.snapshot), "experts_snapshot": str(a.experts_snapshot or a.snapshot),
-        "reference": "transformers glm5_next (eager, FP32 routed sum)", "argmax_last": int(argmax[-1]),
-        "next_token_accuracy": next_ok, "mean_nll": nll,
-    }, indent=1))
-    print(f"argmax of last position: {int(argmax[-1])}; next-token accuracy {next_ok:.3f}; mean NLL {nll:.4f}")
-
+    run_tokens(a, config, ref, dense, experts_src, tokens)
 
 if __name__ == "__main__":
     main()

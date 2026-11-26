@@ -454,11 +454,17 @@ def test_output_overlap_refused(tmp_path, monkeypatch):
 
 
 class FakePublishApi:
+    """Hub fake for parent-guarded HTTP LFS batches with server-side copies."""
+    token = False
+
     def __init__(self, packet):
         self.packet = packet
         self.head = 'a' * 40
         self.files = {}
+        self.trees = {}
         self.uploaded = []
+        self.batches = []
+        self.workers = []
         self.commits = 0
         self.fail_after = None
         self.lose_reply = False
@@ -472,65 +478,140 @@ class FakePublishApi:
         assert revision == self.head
         return SimpleNamespace(sha=self.head)
 
-    def preupload_lfs_files(self, repo, operations, **kwargs):
-        import hashlib
-        for operation in operations:
-            if self.fail_after is not None and len(self.uploaded) >= self.fail_after:
-                raise RuntimeError('transport interrupted')
-            operation._should_ignore = False
-            operation._upload_mode = 'lfs'
-            with operation.as_file() as stream:
-                operation.upload_info.sha256 = hashlib.sha256(stream.read()).digest()
-            operation._is_uploaded = True
-            self.uploaded.append(operation.path_in_repo)
+    def tree(self, client, repo, revision):
+        return self.parent if repo == self.packet['parent_repo'] else self.trees.get(revision, {})
 
     def create_commit(self, repo, operations, **kwargs):
         from huggingface_hub import CommitOperationCopy
         assert kwargs['parent_commit'] == self.head
+        files = dict(self.files)
+        names = []
         for operation in operations:
             if isinstance(operation, CommitOperationCopy):
-                self.files[operation.path_in_repo] = self.parent[operation.src_path_in_repo]
-            else:
-                self.files[operation.path_in_repo] = dict(bytes=operation.upload_info.size,
-                    blob=operation.upload_info.sha256.hex())
+                files[operation.path_in_repo] = self.parent[operation.src_path_in_repo]
+                continue
+            name = operation.path_in_repo
+            assert name not in self.files, 'committed file sent again'
+            planned = self.packet['new_files'][name]
+            # Receipt SHA256 supplied; no payload hashing in the SDK.
+            assert operation.upload_info.is_hashed
+            assert operation.upload_info.sha256.hex() == planned['sha256']
+            if self.fail_after is not None and len(self.uploaded) >= self.fail_after:
+                raise RuntimeError('transport interrupted')
+            self.uploaded.append(name)
+            names.append(name)
+            files[name] = dict(bytes=operation.upload_info.size, blob=planned['sha256'])
+        self.batches.append(names)
+        self.workers.append(kwargs['num_threads'])
+        self.files = files
         self.commits += 1
-        self.head = 'b' * 40
+        self.head = f'{self.commits + 10:040x}'
+        self.trees[self.head] = dict(files)
         if self.lose_reply:
+            self.lose_reply = False
             raise RuntimeError('lost commit reply')
         return SimpleNamespace(oid=self.head)
 
 
 def publisher_fixture(tmp_path, monkeypatch):
     import mc_publish
-    import upload_model
+    import hub_lfs
     import huggingface_hub
-    from huggingface_hub.utils import _runtime
     args = fixture(tmp_path, monkeypatch)
     package.assemble(**args)
     packet = mc_publish.publication_inventory(args['output'])
     api = FakePublishApi(packet)
-    monkeypatch.setattr(_runtime, 'is_xet_available', lambda: True)
     monkeypatch.setattr(huggingface_hub, 'HfApi', lambda **kwargs: api)
-    monkeypatch.setattr(upload_model, '_remote', lambda client, repo, rev:
-        api.parent if repo == packet['parent_repo'] else api.files)
+    monkeypatch.setattr(hub_lfs, 'remote_tree', api.tree)
     return mc_publish, args['output'], tmp_path / 'upload-state', packet, api
 
 
-def test_publish_recovers_preupload_and_lost_commit_reply(tmp_path, monkeypatch):
+def test_publish_resumes_batches_and_lost_commit_reply_without_resending(tmp_path, monkeypatch):
     publisher, output, state, packet, api = publisher_fixture(tmp_path, monkeypatch)
-    api.fail_after = 2
+    options = publisher.hub_lfs.UploadOptions(workers=5, batch_files=2)
+    api.fail_after = 3  # Batch 1 (2 files) commits; batch 2 fails after its first file.
     with pytest.raises(RuntimeError, match='transport interrupted'):
-        publisher.publish(output, state, packet, api=api)
-    assert api.commits == 0
+        publisher.publish(output, state, packet, api=api, options=options)
+    committed = set(api.files) - set(api.packet['copies'])
+    assert api.commits == 1 and len(committed) == 2 and len(api.uploaded) == 3
+    assert set(api.packet['copies']) <= set(api.files)  # Copies ride the first batch.
     api.fail_after = None
     api.lose_reply = True
     with pytest.raises(RuntimeError, match='lost commit reply'):
-        publisher.publish(output, state, packet, api=api)
-    prepared = list(api.uploaded)
-    result = publisher.publish(output, state, packet, api=api)
+        publisher.publish(output, state, packet, api=api, options=options)
+    result = publisher.publish(output, state, packet, api=api, options=options)
     assert result['status'] == 'uploaded'
-    assert api.uploaded == prepared
-    assert len(prepared) == len(set(prepared)) == len(packet['new_files'])
+    sent = [name for batch in api.batches for name in batch]  # Committed transfers.
+    assert len(sent) == len(set(sent)) == len(packet['new_files'])
+    assert set(api.workers) == {5} and all(len(batch) <= 2 for batch in api.batches)
+    assert not committed & {name for batch in api.batches[1:] for name in batch}
+    assert set(result['files']) == set(packet['new_files']) | set(packet['copies'])
+
+
+def test_publish_defaults_to_16_workers_and_48_file_batches(tmp_path, monkeypatch):
+    publisher, output, state, packet, api = publisher_fixture(tmp_path, monkeypatch)
+    publisher.publish(output, state, packet, api=api)
+    assert set(api.workers) == {16}
+    assert [len(batch) for batch in api.batches] == [min(48, len(packet['new_files']))]
+
+
+def test_publish_reuses_writer_shard_sha256_without_rereading_weights(tmp_path, monkeypatch):
+    publisher, output, state, packet, api = publisher_fixture(tmp_path, monkeypatch)
+    shards = {n for n in packet['new_files'] if n.endswith('.safetensors')}
+    assert shards
+    real_open = Path.open
+
+    def no_weight_reads(path, *args, **kwargs):
+        if path.name in shards:
+            pytest.fail('publication reread a shard with a writer SHA256 receipt')
+        return real_open(path, *args, **kwargs)
+
+    real_read_bytes = Path.read_bytes
+
+    def no_weight_read_bytes(path):
+        if path.name in shards:
+            pytest.fail('publication reread a shard with a writer SHA256 receipt')
+        return real_read_bytes(path)
+
+    monkeypatch.setattr(Path, 'open', no_weight_reads)
+    monkeypatch.setattr(Path, 'read_bytes', no_weight_read_bytes)
+    assert publisher.publication_inventory(output) == packet
+    publisher.publish(output, state, packet, api=api)
+    assert set(api.uploaded) == set(packet['new_files'])
+
+
+def test_publish_refuses_receipt_mismatch_without_hub_action(tmp_path, monkeypatch):
+    publisher, output, state, packet, api = publisher_fixture(tmp_path, monkeypatch)
+    shard = next(n for n in packet['new_files'] if n.endswith('.safetensors'))
+    receipt = package.load_json(output / (shard + '.receipt.json'))
+    state_doc = package.load_json(output / 'package-state.json')
+    state_doc['new_shards'][shard]['sha256'] = '0' * 64
+    package.atomic_json(output / 'package-state.json', state_doc)
+    with pytest.raises(ValueError, match='validated new file changed'):
+        publisher.publish(output, state, packet, api=api)
+    assert receipt['sha256'] != '0' * 64 and not api.uploaded and api.commits == 0
+
+
+def test_publish_refuses_source_changed_mid_batch(tmp_path, monkeypatch):
+    publisher, output, state, packet, api = publisher_fixture(tmp_path, monkeypatch)
+    import hub_lfs
+    options = hub_lfs.UploadOptions(batch_files=2)
+    victim = hub_lfs.upload_order(packet['new_files'])[1]
+    create = api.create_commit
+
+    def mutate_during_transfer(repo, operations, **kwargs):
+        result = create(repo, operations, **kwargs)
+        if api.commits == 1:
+            with (output / victim).open('ab') as stream:
+                stream.write(b'changed during transfer')
+        return result
+
+    api.create_commit = mutate_during_transfer
+    with pytest.raises(ValueError, match='source changed'):
+        publisher.publish(output, state, packet, api=api, options=options)
+    assert api.commits == 1 and not (state / 'upload-complete.json').exists()
+    with pytest.raises(ValueError, match='changed|separately approved'):
+        publisher.publish(output, state, packet, api=api, options=options)
     assert api.commits == 1
 
 
@@ -539,7 +620,7 @@ def test_publish_rejects_approval_mismatch_without_hub_action(tmp_path, monkeypa
     with pytest.raises(ValueError, match='separately approved'):
         publisher.publish(output, state, dict(packet, new_bytes=-1), api=api)
     assert not state.exists()
-    assert not api.uploaded
+    assert not api.uploaded and api.commits == 0
 
 
 def test_publish_rejects_wrong_pinned_parent_bytes(tmp_path, monkeypatch):
@@ -655,3 +736,17 @@ def test_seed_package_rejects_missing_encoder_delta(tmp_path, monkeypatch, famil
     dump(args['k8'], 'core-export.json', receipt)
     with pytest.raises(ValueError, match='encoder delta'):
         package.assemble(**args)
+
+
+def test_publish_refuses_moved_head_without_first_batch(tmp_path, monkeypatch):
+    publisher, output, state, packet, api = publisher_fixture(tmp_path, monkeypatch)
+    publisher.publish(output, state, packet, api=api)  # Writes the destination guard.
+    # A foreign writer moves an empty destination: only Hub default attributes, no copies.
+    api.head, api.files = 'c' * 40, {'.gitattributes': dict(bytes=1, blob='e' * 40)}
+    api.trees[api.head] = dict(api.files)
+    (state / 'upload-complete.json').unlink()
+    (state / 'destination.json').write_text('{"commit": "' + 'd' * 40 + '"}')
+    commits = api.commits
+    with pytest.raises(ValueError, match='before the first verified batch'):
+        publisher.publish(output, state, packet, api=api)
+    assert api.commits == commits

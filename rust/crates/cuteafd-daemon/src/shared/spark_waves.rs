@@ -341,6 +341,94 @@ fn answer_census<B: Backend>(backend: &B, idle: bool,
     let _ = reply.send(census);
 }
 
+/// Always-on exchange counters, published in `/v1/stats` `exchange`.
+///
+/// The `CUTEAFD_PROTOCOL_V2_TCP_TIMING` profile prints one `spark exchange wave` line per
+/// landed wave. These counters carry the same three host times, the wave's rows and its
+/// reply plane, plus each rank's prefill unit pace: the worker measures every prefill unit
+/// on its owner stream and returns (busy, idle) in the reply header (#762), so no worker
+/// flag and no worker endpoint is needed for it to reach the coordinator.
+///
+/// A wave is one layer's exchange (a decode step posts one wave per layer), so the cost is
+/// per layer: six relaxed adds per landed wave, and three more per rank that reported a
+/// pace. Nothing allocates, no lock is taken and no clock is read that the worker did not
+/// already read.
+pub(crate) mod exchange_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const RANKS: usize = cuteafd_core::MAX_SPARK_WORLD;
+
+    /// One link set's counters. Serving uses [`GLOBAL`]; a test backend owns its own, so its
+    /// assertions never see another test's waves.
+    pub(crate) struct ExchangeStats {
+        /// From the engine's send until the wave's staged copies completed.
+        staging_ns: AtomicU64,
+        /// Request build and post.
+        post_ns: AtomicU64,
+        /// From the post until the last rank's rows arrived (and were copied).
+        wait_ns: AtomicU64,
+        /// One rank's reply plane per landed wave (every rank returns a plane this size).
+        reply_plane_bytes: AtomicU64,
+        /// Rows carried by landed waves (each wave's row count, counted once, not per rank).
+        rows: AtomicU64,
+        waves: AtomicU64,
+        /// Per rank: prefill units whose reply carried a pace, and the sums of that pace.
+        /// Busy is from the unit's arrival on its owner stream (before its input copies) to
+        /// its fence; idle is from the previous unit's fence on that stream to this arrival.
+        /// Decode units report no pace and are not counted here. When units merge, each
+        /// merged member's pace runs from its own arrival to a fence after the shared
+        /// launch, so `expert_prefill_units.busy_ns_total` can exceed wall time.
+        unit_busy_ns: [AtomicU64; RANKS],
+        unit_idle_ns: [AtomicU64; RANKS],
+        units: [AtomicU64; RANKS],
+    }
+
+    pub(crate) static GLOBAL: ExchangeStats = ExchangeStats::new();
+
+    impl ExchangeStats {
+        pub(crate) const fn new() -> Self {
+            const ZERO: AtomicU64 = AtomicU64::new(0);
+            Self { staging_ns: ZERO, post_ns: ZERO, wait_ns: ZERO, reply_plane_bytes: ZERO, rows: ZERO, waves: ZERO,
+                unit_busy_ns: [ZERO; RANKS], unit_idle_ns: [ZERO; RANKS], units: [ZERO; RANKS] }
+        }
+
+        /// One landed wave: its three host times, its rows, one rank's reply plane and the
+        /// pace each rank's reply header carried.
+        pub(crate) fn record_wave(&self, times: &super::WaveTimes, rows: u64, reply_plane_bytes: u64,
+            pace: &[Option<(u32, u32)>; RANKS]) {
+            self.staging_ns.fetch_add((times.staged.max(0.0) * 1e9) as u64, Ordering::Relaxed);
+            self.post_ns.fetch_add((times.posted.max(0.0) * 1e9) as u64, Ordering::Relaxed);
+            self.wait_ns.fetch_add((times.received.max(0.0) * 1e9) as u64, Ordering::Relaxed);
+            self.reply_plane_bytes.fetch_add(reply_plane_bytes, Ordering::Relaxed);
+            self.rows.fetch_add(rows, Ordering::Relaxed);
+            self.waves.fetch_add(1, Ordering::Relaxed);
+            for (rank, pace) in pace.iter().enumerate() {
+                let Some((busy_us, idle_us)) = *pace else { continue };
+                self.unit_busy_ns[rank].fetch_add(u64::from(busy_us) * 1000, Ordering::Relaxed);
+                self.unit_idle_ns[rank].fetch_add(u64::from(idle_us) * 1000, Ordering::Relaxed);
+                self.units[rank].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        pub(crate) fn snapshot(&self) -> serde_json::Value {
+            let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+            let ranks = |c: &[AtomicU64; RANKS]| c.iter().map(get).collect::<Vec<_>>();
+            serde_json::json!({
+                "wave_ns_total": {"staging": get(&self.staging_ns), "post": get(&self.post_ns), "wait": get(&self.wait_ns)},
+                "waves_total": get(&self.waves),
+                "wave_rows_total": get(&self.rows),
+                "reply_plane_bytes_total": get(&self.reply_plane_bytes),
+                // Indexed by Spark rank.
+                "expert_prefill_units": {
+                    "busy_ns_total": ranks(&self.unit_busy_ns),
+                    "idle_ns_total": ranks(&self.unit_idle_ns),
+                    "units_total": ranks(&self.units),
+                },
+            })
+        }
+    }
+}
+
 /// Host seconds of one wave on the worker (the transport-timing profile).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct WaveTimes {
@@ -369,6 +457,13 @@ pub(crate) trait Backend {
     /// are in place.
     fn poll(&mut self, wave: &mut Self::Wave, info: &WaveInfo) -> Result<bool>;
     fn payload_bytes(&self, _slot: usize, admitted: usize) -> usize { admitted }
+    /// Per rank: the prefill unit pace (busy µs, idle µs) a landed wave's reply
+    /// headers carried; `None` for a rank that reported none.
+    fn unit_pace(&self, _wave: &Self::Wave) -> [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD] {
+        [None; cuteafd_core::MAX_SPARK_WORLD]
+    }
+    /// Where this backend's landed waves are counted.
+    fn stats(&self) -> &exchange_stats::ExchangeStats { &exchange_stats::GLOBAL }
     /// Stores `landed = sequence`.
     fn publish(&mut self, sequence: u32);
     /// Returns retained reply frames whose wave's reduce was consumed; true
@@ -525,6 +620,10 @@ pub(crate) fn run_worker<B: Backend>(backend: &mut B, inbox: &mpsc::Receiver<Com
                     Pace::add(&mut pace.round_trip, done.times.received);
                     last_landed = Instant::now();
                     backend.publish(done.info.sequence);
+                    // Counted on every landed wave; the `spark exchange wave` line
+                    // below stays behind its own flag.
+                    backend.stats().record_wave(&done.times, done.info.rows as u64, done.info.payload_bytes as u64,
+                        &backend.unit_pace(&done.wave));
                     if timing {
                         tracing::info!(target: "cuteafd::timing", sequence = done.info.sequence, slot = done.info.slot,
                             rows = done.info.rows, staged_us = (done.times.staged * 1e6) as u64,
@@ -664,6 +763,10 @@ pub(crate) trait Transport: Send + 'static {
     /// rank's rows arrived.
     fn poll(&mut self, wave: &mut Self::Wave, sink: &mut dyn FnMut(usize, u32, Self::Frame) -> Result<()>)
         -> Result<Option<u8>>;
+    /// Per rank: the unit pace a wave's reply headers carried so far.
+    fn unit_pace(_wave: &Self::Wave) -> [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD] {
+        [None; cuteafd_core::MAX_SPARK_WORLD]
+    }
     /// The response deadline every wave is held to.
     fn timeout(&self) -> Duration;
     /// Gives up every outstanding wave (after a failure).
@@ -691,6 +794,7 @@ impl Transport for SparkExperts {
         let done = self.poll_wave(wave, receipt, |rank, first, payload| sink(rank, first, payload))?;
         Ok(done.then_some(receipt.landed))
     }
+    fn unit_pace(wave: &Self::Wave) -> [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD] { wave.1.pace }
     fn timeout(&self) -> Duration { SparkExperts::timeout(self) }
     fn abandon(&mut self) { self.abandon_waves("Spark exchange failed with waves in flight"); }
     fn cancel(&mut self) { self.cancel_waves(); }
@@ -898,6 +1002,10 @@ impl<T: Transport> Backend for Native<T> {
     }
 
     fn payload_bytes(&self, slot: usize, _admitted: usize) -> usize { self.reply_payloads[slot] }
+
+    fn unit_pace(&self, wave: &Self::Wave) -> [Option<(u32, u32)>; cuteafd_core::MAX_SPARK_WORLD] {
+        T::unit_pace(wave)
+    }
 
     fn poll(&mut self, wave: &mut Self::Wave, info: &WaveInfo) -> Result<bool> {
         let (ranks, row_bytes, landing, words, pulls) = (self.ranks, self.row_bytes, self.landing, self.words, self.pulls);

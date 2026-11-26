@@ -466,6 +466,7 @@ def main():
     parser.add_argument("--resume",action="store_true")
     parser.add_argument("--preflight",action="store_true")
     parser.add_argument("--publish-only",action="store_true")
+    import hub_lfs;hub_lfs.add_arguments(parser)
     parser.add_argument("--core-bits",type=int,choices=(6,8),default=6)
     parser.add_argument("--core-only",action="store_true",
         help="produce only reviewed target core/head packed modules; retain native experts for calibration")
@@ -502,7 +503,7 @@ def main():
             completed=json.loads((args.root/"quantization-complete.json").read_text())
             if completed["identity"]!=plan["identity"]:
                 raise ValueError("publication requires completed matching producer")
-            publish(args.export,args.root,plan["publication_repo"])
+            publish(args.export,args.root,plan["publication_repo"],options=hub_lfs.options_from(args))
         return
     torch.set_num_threads(8)
     torch.backends.cuda.matmul.allow_tf32=False

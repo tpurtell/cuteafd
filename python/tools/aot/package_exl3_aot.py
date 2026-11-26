@@ -57,9 +57,20 @@ def verify(package: Path, revision: str | None = None, runtime: Path | None = No
     if role is not None and manifest['role'] != ('spark' if role == 'expert' else role):
         raise ValueError('EXL3 package/serving role mismatch')
     expected = manifest['files']
+    expected_set = set(expected) | {'manifest.json'}
     actual = {str(p.relative_to(package)) for p in package.rglob('*') if p.is_file()}
-    if actual != set(expected) | {'manifest.json'}:
-        raise ValueError('EXL3 package contains missing or unlisted files')
+    if actual != expected_set:
+        def _fmt(items: list[str], limit: int = 20) -> str:
+            shown = ', '.join(items[:limit])
+            return f'{shown} (+{len(items) - limit} more)' if len(items) > limit else shown
+        missing = sorted(expected_set - actual)
+        unlisted = sorted(actual - expected_set)
+        parts = []
+        if missing:
+            parts.append(f'missing ({len(missing)}): {_fmt(missing)}')
+        if unlisted:
+            parts.append(f'unlisted ({len(unlisted)}): {_fmt(unlisted)}')
+        raise ValueError(f'EXL3 package contains missing or unlisted files: {"; ".join(parts)}')
     for name, spec in expected.items():
         path = package / name
         if Path(name).is_absolute() or '..' in Path(name).parts or path.is_symlink():
@@ -304,9 +315,11 @@ GEOMETRIES = {
     'inkling2': (4608, 2304, 384, 8),
     # Hy4-flash LatentMoE: 512 experts, top-16 on the 1536 latent, SwiGLU clamped at 10, K4 MUL1 only.
     'hy4f': (1536, 1536, 512, 16),
+    # Hy4 direct MoE: 256 experts, top-8 on hidden 6144, I=2048, SwiGLU clamped at 10, K4 MUL1 only.
+    'hy4': (6144, 2048, 256, 8),
 }
 # Geometries whose published checkpoints ship MUL1 routed experts only (no MCG).
-MUL1_ONLY_GEOMETRIES = frozenset({'hy4f'})
+MUL1_ONLY_GEOMETRIES = frozenset({'hy4f', 'hy4'})
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
 SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0, 'muse': None, 'ml4': None, 'inkling2': None}

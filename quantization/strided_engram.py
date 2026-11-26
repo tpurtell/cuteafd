@@ -13,6 +13,7 @@ import struct
 import time
 import urllib.request
 
+import hub_lfs
 from hub_requirements import require_qualified_hub
 
 SOURCE = "deepseek-ai/DeepSeek-V4.1-Flash-1017"
@@ -348,19 +349,38 @@ def upload(args):
                 value._stop()
             operations.append(operation)
             print(f"publication bytes checked {name}", flush=True)
-        # Preupload only after all byte checks. LFS skips content-addressed objects
-        # already present; serialize missing objects and release each stream.
+        # Upload only after all byte checks, as verified parallel HTTP LFS
+        # batches on a guarded parent. Each SSH stream is its own process, so
+        # parallel workers stay bounded-memory; a rerun skips committed files.
         api.create_repo(TARGET, repo_type="model", exist_ok=True)
-        for operation in operations:
-            value = operation.path_or_fileobj
-            api.preupload_lfs_files(TARGET, additions=[operation], num_threads=1)
-            if isinstance(value, SshFile):
-                value.close()
-            print(f"publication object ready {operation.path_in_repo}", flush=True)
-        commit = api.create_commit(TARGET, operations=operations, num_threads=1,
-            commit_message="Publish byte-identical row-interleaved Engram storage")
-    write_json(output.parent / "upload.json", dict(repo=TARGET, commit=str(commit), revision=commit.oid))
-    print(commit, flush=True)
+        info = api.repo_info(TARGET, repo_type="model")
+        by_name = {operation.path_in_repo: operation for operation in operations}
+        rows = {name: dict(bytes=operation.upload_info.size, sha256=operation.upload_info.sha256.hex())
+                for name, operation in by_name.items()}
+        tree = hub_lfs.remote_tree(api, TARGET, info.sha)
+        done = {name for name, row in tree.items() if name in rows and hub_lfs.matches(row, rows[name])}
+        if set(tree) - done - {".gitattributes"}:
+            raise ValueError("destination holds files outside this publication")
+
+        def verify(commit, batch, batch_operations):
+            done.update(batch)
+            remote = hub_lfs.remote_tree(api, TARGET, commit)
+            if set(remote) - {".gitattributes"} != done or not all(
+                    hub_lfs.matches(remote[name], rows[name]) for name in done):
+                raise ValueError("published Engram inventory differs")
+            for name in batch:
+                value = by_name[name].path_or_fileobj
+                if isinstance(value, SshFile):
+                    value.close()
+            print(f"publication objects committed {len(done)}/{len(rows)}", flush=True)
+
+        pending = [name for name in hub_lfs.upload_order(rows) if name not in done]
+        revision = hub_lfs.commit_batches(api, TARGET, rows, pending, revision=info.sha,
+            commit_message="Publish byte-identical row-interleaved Engram storage", options=args.upload_options,
+            check_sources=lambda batch: None,  # Byte checks above hashed every operation input.
+            verify=verify, operation=lambda name, row: by_name[name]) if pending else info.sha
+    write_json(output.parent / "upload.json", dict(repo=TARGET, commit=revision, revision=revision))
+    print(revision, flush=True)
 
 
 if __name__ == "__main__":
@@ -370,7 +390,9 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--remote-output-host", help="Stream rewritten shards over SSH during upload")
     parser.add_argument("--remote-output", type=Path, help="Remote export directory (upload only)")
+    hub_lfs.add_arguments(parser)
     arguments = parser.parse_args()
+    arguments.upload_options = hub_lfs.options_from(arguments)
     if bool(arguments.remote_output_host) != bool(arguments.remote_output):
         parser.error("--remote-output-host and --remote-output must be specified together")
     globals()[arguments.action](arguments)

@@ -395,6 +395,8 @@ def test_compare_logits_byte_identical_arms(env, monkeypatch):
     assert golden.main(argv) == 0
     summary = (env['home'] / '.cache/cuteafd/builds/gr/golden/summary.md').read_text()
     assert '| a | b | 1 | logits/logits.bin | True | 4 | 0.0000e+00 |' in summary
+    assert 'context-only fixture: no quality verdict (use the published fidelity set)' in summary
+    assert 'arm-drift mean KL' in summary and '| mean KL |' not in summary
 
 
 def test_require_identical_fails_on_differing_logits(env, monkeypatch):
@@ -428,6 +430,8 @@ def test_compare_tool_on_synthetic_logits(tmp_path):
     assert diff['top1_agreement'] < 1 and diff['top1_agreement'] >= 128 / 130
     assert diff['max_kl'] > diff['mean_kl'] > 0
     assert diff['nll_rows'] == 130 and diff['nll_a'] > 0
+    assert same['last_row_argmax_match'] is True and diff['last_row_argmax_match'] is True
+    assert 'last-row argmax match: True' in compare.describe(diff)
     with pytest.raises(ValueError):
         compare.compare(pa, pb, 7)
     cli = subprocess.run([sys.executable, str(COMPARE), str(pa), str(pa), '50'], capture_output=True, text=True)
@@ -987,6 +991,70 @@ def test_dry_run_reports_locks_without_argv_and_takes_nothing(spark_env, monkeyp
     assert not (spark_env['home'] / '.cache/cuteafd/builds/gr/golden').exists()
 
 
+def family_spark_argv(env, *options, golden_args=()):
+    return SPARK_BASE + ['--model', 'org/model', '--arm', 'a=i1:s1', '--gpus', '1',
+                         '--config', str(env['config']), '--spark-hosts', 'dodo', '--worker-poll', '0.05',
+                         *options, '--', '--snapshot', '{snapshot}', '--peers', '{peers}', *golden_args]
+
+
+@pytest.mark.parametrize('options,golden_args,expected', [
+    ([], ['--core-view', 'k8-compact'], 'k8-compact'),
+    (['--env', 'CUTEAFD_CORE_VIEW=k6-compact'], ['--core-view=k8-compact'], 'k8-compact'),
+    (['--arm-arg=a:--core-view', '--arm-arg=a:fp8-compact'], [], 'fp8-compact'),
+    (['--env', 'CUTEAFD_CORE_VIEW=k6-compact'], [], 'k6-compact'),
+    (['--worker-arg=--core-view=k8-compact'], ['--core-view', 'k8-compact'], 'k8-compact'),
+    (['--worker-env', 'CUTEAFD_CORE_VIEW=k8-compact'], ['--core-view', 'k8-compact'], 'k8-compact'),
+    ([], [], None),
+])
+def test_worker_core_view_argv(spark_env, options, golden_args, expected):
+    assert golden.main(family_spark_argv(spark_env, *options, golden_args=golden_args)) == 0
+    command = next(shlex.split(c) for _, c in ssh_calls(spark_env) if 'expertd-native' in c)
+    view_options = [a for a in command if a == '--core-view' or a.startswith('--core-view=')]
+    assert len(view_options) == (1 if expected is not None else 0)
+    if expected is not None:
+        assert ('--core-view=' + expected in command or
+                command[command.index('--core-view') + 1] == expected)
+    else:
+        assert not any(a.startswith('CUTEAFD_CORE_VIEW=') for a in command)
+
+
+def test_core_view_per_arm(spark_env, capsys):
+    argv = family_spark_argv(spark_env, '--arm', 'b=i1:s1', '--env', 'CUTEAFD_CORE_VIEW=k8-compact',
+                             '--arm-env', 'b:CUTEAFD_CORE_VIEW=k6-compact', '--dry-run')
+    assert golden.main(argv) == 0
+    out = capsys.readouterr().out
+    assert '# arm a worker argv: --core-view k8-compact' in out
+    assert '# arm b worker argv: --core-view k6-compact' in out
+    assert not runs(spark_env)
+    assert not any(c[:2] == ['run', '-d'] for c in docker_calls(spark_env))
+
+
+@pytest.mark.parametrize('options,golden_args,source,expected', [
+    (['--worker-arg=--core-view', '--worker-arg=k6-compact'], ['--core-view=k8-compact'],
+     '--worker-arg --core-view', 'k8-compact'),
+    (['--arm-env', 'a:CUTEAFD_CORE_VIEW=k8-compact', '--worker-env', 'CUTEAFD_CORE_VIEW=k6-compact'], [],
+     'worker CUTEAFD_CORE_VIEW', 'k8-compact'),
+    (['--worker-env', 'CUTEAFD_CORE_VIEW=k8-compact', '--arm-worker-env', 'a:CUTEAFD_CORE_VIEW=k6-compact'],
+     ['--core-view=k8-compact'], 'worker CUTEAFD_CORE_VIEW', 'k8-compact'),
+    (['--worker-arg=--core-view=k8-compact'], [], '--worker-arg --core-view', 'original'),
+])
+def test_core_view_mismatch_refused_before_preflight(spark_env, options, golden_args, source, expected, capsys):
+    assert golden.main(family_spark_argv(spark_env, *options, golden_args=golden_args)) == 2
+    err = capsys.readouterr().err
+    assert f'arm a: {source}=' in err
+    assert f'disagrees with coordinator core view {expected!r}' in err
+    assert not docker_calls(spark_env) and not ssh_calls(spark_env)
+
+
+@pytest.mark.parametrize('options,expected', [
+    (['--arm-env', 'a:CUTEAFD_CORE_VIEW=k8-compact'], 'k8-compact'),
+    (['--worker-arg=--core-view=k6-compact'], 'k6-compact'),
+])
+def test_native_core_view_env_or_manual_override(spark_env, options, expected, capsys):
+    assert golden.main(spark_argv(spark_env, *options, '--dry-run')) == 0
+    assert f'# arm a worker argv: --core-view {expected}' in capsys.readouterr().out
+
+
 def test_spark_hosts_without_lanes_in_config(spark_env, capsys):
     spark_env['config'].write_text('SPARK_0_HOST=dodo\nSPARK_0_LANE_A=10.9.0.1\n')
     assert golden.main(spark_argv(spark_env)) == 2
@@ -1016,6 +1084,60 @@ def test_fixture_generation_command_mode(env, monkeypatch):
     assert run_env['STEP5_REFERENCE_SNAPSHOT'] == str(env['tmp'] / 'hub/models--x/snapshots/r')
     assert run_env['PYTHONDONTWRITEBYTECODE'] == '1' and '/workspace/cuteafd/python/reference' in run_env['PYTHONPATH']
     assert 'CUTEAFD_GOLDEN_PEERS' not in run_env
+
+
+def write_reference(directory, rows):
+    import struct
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'tokens.bin').write_bytes(struct.pack(f'<{len(rows)}I', *range(len(rows))))
+    (directory / 'logits.bin').write_bytes(b''.join(struct.pack(f'<{len(r)}f', *r) for r in rows))
+    return directory
+
+
+@pytest.mark.parametrize('rows,match', [
+    ([[0.0] * 8] * 3, 'all 3 x 8 logits are zero (a shape-only placeholder)'),
+    ([[1.0, 2.0, 0.0, 0.0], [3.5] * 4], 'row 1 is constant (every logit is 3.5)'),
+    ([[0.0] * 4, [1.0, 2.0, 3.0, 4.0]], 'row 0 is constant (every logit is 0.0)'),
+    ([[1.0, 2.0, 3.0, 4.0], [1.0, float('nan'), 0.0, 0.0]], 'row 1 column 1 is non-finite'),
+    ([[1.0, float('inf'), 0.0, 0.0]], 'row 0 column 1 is non-finite'),
+])
+def test_golden_refuses_uninformative_reference_before_the_queue(env, capsys, rows, match):
+    """#2719: an all-zero / constant / non-finite logits.bin fails at preflight, naming the file."""
+    write_slot(env['home'], 'i1')
+    ref = write_reference(env['tmp'] / 'ref', rows)
+    for argv in (BASE + ['--arm', 'a=i1:s1', '--gpus', '1', '--', '--snapshot', '{snapshot}', '--golden', str(ref),
+                         '--skip-routed-experts', '--nll'],
+                 BASE + ['--arm', 'a=i1:s1', '--gpus', '1', '--fixtures', str(ref), '--', '--snapshot', '{snapshot}',
+                         '--golden={fixtures}', '--skip-routed-experts', '--nll']):
+        assert golden.main(argv) == 2
+        err = capsys.readouterr().err
+        assert match in err and str(ref / 'logits.bin') in err, err
+    assert not runs(env) and not list(env['locks'].iterdir())
+
+
+def test_golden_accepts_informative_reference_and_skips_other_layouts(env, tmp_path):
+    ref = write_reference(tmp_path / 'ok', [[0.0, 0.0, 0.0, -1e-30], [5.0, 4.0, 3.0, 2.0]])
+    golden.check_reference_logits(ref)
+    golden.check_reference_logits(tmp_path / 'missing')  # a fresh dump target or fidelity set
+    (tmp_path / 'fidelity').mkdir()
+    (tmp_path / 'fidelity/a00.safetensors').write_bytes(b'x')
+    golden.check_reference_logits(tmp_path / 'fidelity')
+    (ref / 'logits.bin').write_bytes(b'\0' * 12)
+    with pytest.raises(ValueError, match='not \\[2 tokens, vocab\\] F32 rows'):
+        golden.check_reference_logits(ref)
+    assert golden.golden_reference_dirs(['--golden', '/a', '--golden=/b', '--golden', '{fixtures}', '--x']) \
+        == [Path('/a'), Path('/b')]
+    # A writable fixture directory is being generated; its placeholder state is not scored.
+    many = write_reference(tmp_path / 'chunked', [[float(i), 1.0, 2.0] for i in range(9)])
+    old = golden.REFERENCE_CHUNK
+    try:
+        golden.REFERENCE_CHUNK = 24  # two rows per read: rows span several chunks
+        golden.check_reference_logits(many)
+        (many / 'logits.bin').write_bytes((many / 'logits.bin').read_bytes()[:-12] + b'\0' * 12)
+        with pytest.raises(ValueError, match='row 8 is constant'):
+            golden.check_reference_logits(many)
+    finally:
+        golden.REFERENCE_CHUNK = old
 
 
 @pytest.mark.parametrize('extra,match', [
@@ -1171,6 +1293,7 @@ Options:
       --resume-span <RESUME_SPAN>
       --resume-decode <RESUME_DECODE>
       --peers <PEERS>
+      --core-view <CORE_VIEW> [default: original]
       --prefill-rows <PREFILL_ROWS>
       --prefill-waves <PREFILL_WAVES>
 """

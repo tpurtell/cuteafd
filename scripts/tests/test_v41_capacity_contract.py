@@ -229,9 +229,9 @@ def test_native_manifest_decode_contract_matches_shared_planner_recipe():
 
 def test_v41_terminal_head_bound_is_derived_for_wide_lanes():
     source = (ROOT / "rust/crates/cuteafd-core/src/dspark_verify.rs").read_text()
-    assert "V41_VOCAB_ROWS: usize = V41_MAX_LANE_MEMBERS * (MAX_DSPARK_PROPOSALS + 1)" in source
+    assert "V41_VOCAB_ROWS: usize = V41_MAX_DRAFT_MEMBERS * (MAX_DSPARK_PROPOSALS + 1)" in source
     cmake = (ROOT / "native/CMakeLists.txt").read_text()
-    assert 'CUTEAFD_V41_VOCAB_ROWS "${CUTEAFD_V41_MAX_LANE_MEMBERS} * (${CMAKE_MATCH_1} + 1)"' in cmake
+    assert 'CUTEAFD_V41_VOCAB_ROWS "${CUTEAFD_V41_MAX_DRAFT_MEMBERS} * (${CMAKE_MATCH_1} + 1)"' in cmake
     native = (ROOT / "native/families/deepseek_v41/cuda/v41_dspark.cu").read_text()
     assert "rows > CUTEAFD_V41_VOCAB_ROWS" in native
     assert "vocabulary_merge_greedy<<<1, CUTEAFD_V41_VOCAB_ROWS" in native

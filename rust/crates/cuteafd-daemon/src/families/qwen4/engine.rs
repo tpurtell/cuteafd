@@ -110,9 +110,9 @@ pub(crate) fn spark_session_shape(cfg: &Qwen4Config, rows: usize, bf16: bool)
 /// next draft step (the MTP stash, per state slot).
 pub(crate) const MTP_PENDING_ROWS: usize = 64;
 
-fn remote_front_plane_bytes(rows: usize, hidden: usize, topk: usize, bf16: bool) -> [usize; 4] {
+fn remote_front_plane_bytes(rows: usize, hidden: usize, topk: usize, bf16: bool) -> [usize; 3] {
     let input = if bf16 { hidden * 2 } else { hidden + hidden / 32 };
-    [rows * input, rows * topk * 4, rows * topk * 4, rows * hidden * 2]
+    [rows * input, rows * topk * 4, rows * topk * 4]
         .map(|bytes| bytes.next_multiple_of(16))
 }
 
@@ -816,6 +816,7 @@ pub(crate) struct Qwen4Engine<'a> {
     /// The bounded graph cache is configured for this launch: lazy exact-row
     /// capture and miss accounting are on. Cleared only by `CUTEAFD_QWEN4_GRAPHS=0`.
     graph_capture: Cell<bool>,
+    graph_cycles: RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
     /// Observer seeded and startup graph initialization completed.
     graph_warmed: Cell<bool>,
     /// Prefill programs over FP8-only projections quantize their activations
@@ -1022,6 +1023,7 @@ impl<'a> Qwen4Engine<'a> {
             graphs: RefCell::new(graphs),
             use_graphs: graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref()),
             graph_capture: Cell::new(false),
+            graph_cycles: RefCell::new(None),
             graph_warmed: Cell::new(false),
             w8a8_prefill: false, spark_bf16: false,
             packed_row_cap: Cell::new(None),
@@ -1062,6 +1064,9 @@ impl<'a> Qwen4Engine<'a> {
                 shape = ?shape, "Qwen exact-row graph reserve");
             reserves.push(resolved.bytes);
         }
+        if self.use_graphs && reserves.iter().any(|&bytes| bytes > 0) {
+            *self.graph_cycles.borrow_mut() = Some(crate::shared::decode_graph::device::EventCycles::new(self.library, &self.gdn_banks.iter().map(|bank| (bank.device.id, bank.stream)).collect::<Vec<_>>())?);
+        }
         self.graph_capture.set(self.use_graphs);
         Ok(reserves)
     }
@@ -1076,25 +1081,19 @@ impl<'a> Qwen4Engine<'a> {
         Ok(())
     }
 
-    /// The capture-pass boundary of one submitted step: when pending
-    /// measurement or victim state needs a quiescent device, drain every
-    /// owner's stream first; then always advance the shared device cycle via
-    /// `observe_completed` so cold-donor aging and persistent victim
-    /// retirement run on every completed step without extra CUDA queries or
-    /// stream syncs on ordinary replay steps.
+    fn begin_graph_cycle(&self) -> Result<()> {
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        // SAFETY: graph operands are borrowed persistent engine storage.
+        unsafe { cycles.begin_persistent(|visit| self.visit_graphs(visit)) }
+    }
+
     fn graph_completed(&self) -> Result<()> {
-        if self.graphs.borrow().is_empty() { return Ok(()); }
-        if self.graphs.borrow().iter().any(|bank| bank.cache_needs_boundary()) {
-            // A capture's growth is only observable once every owner's stream has
-            // completed its queued launches: this is the step boundary.
-            self.drain_state()?;
-        }
-        // SAFETY: Qwen graph owners pin only borrowed, persistent engine storage
-        // (weights, KV/state pools, workspaces and their owner streams); the
-        // GraphExec owns no allocation its segments captured, so destroying an
-        // executable or advancing the serial cycle needs no lane drain.
-        unsafe { crate::shared::decode_graph::device::observe_completed(self.library, |visit| self.visit_graphs(visit)) }
-            .context("Qwen graph boundary observation")
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        for bank in self.graphs.borrow_mut().iter_mut() { bank.cache_tick(); }
+        // SAFETY: all owners' launches for the submitted step are queued.
+        unsafe { cycles.complete() }
     }
 
     /// Attribute the whole step's replay work to its cycle.
@@ -1596,7 +1595,8 @@ impl<'a> Qwen4Engine<'a> {
             }
         }
         self.last_stream_offset.set(0);
-        self.graph_completed()
+        if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() { cycles.abandon(); }
+        Ok(())
     }
 
     pub(crate) fn drain_state(&self) -> Result<()> {
@@ -2681,6 +2681,7 @@ impl<'a> Qwen4Engine<'a> {
     fn step(&self, tables: &Arc<StepTables>, tokens: &[u32], logit_rows: usize, on_layer: LayerHook<'_>,
         forced: Forced<'_>, media: &cuteafd_engine::media::MediaChunk, graphs: bool) -> Result<Option<DeviceLogits>> {
         crate::shared::experts::rtx::pair::submit_recoverable(|| self.require_live(), |kind| self.cancel_submission(kind), || self.shutdown_submission(), |_| {
+            self.begin_graph_cycle()?;
             let output = self.step_inner(tables, tokens, logit_rows, on_layer, forced, media, graphs)?;
             self.graph_completed()?;
             Ok(output)
@@ -3521,13 +3522,12 @@ impl<'a> Qwen4Engine<'a> {
                     let exchange = link.exchange()?;
                     if self.active_owner.get() == 0 {
                         let wave = self.wave_send(w, index, t, rows, decode, exchange, None)?;
-                        return self.wave_land(w, t, wave, exchange);
+                        return self.wave_land(w, index, t, wave, exchange);
                     }
                     let landing = self.workspace_slot(0, decode)?.borrow();
                     let landing = landing.as_ref().context("Qwen Spark landing workspace")?;
-                    self.remote_front(1, w, landing, index, t, rows)?;
-                    let wave = self.on_owner(0, || self.wave_send(landing, index, t, rows, decode, exchange, None))?;
-                    self.on_owner(0, || self.wave_land(landing, t, wave, exchange))?;
+                    let wave = self.remote_wave_send(w, landing, index, t, rows, decode, exchange, None)?;
+                    self.on_owner(0, || self.wave_land(landing, index, t, wave, exchange))?;
                     return self.remote_return(1, landing, w, t);
                 }
                 self.exchange_window(index, decode, true)?;
@@ -3589,10 +3589,8 @@ impl<'a> Qwen4Engine<'a> {
             &[rows])
     }
 
-    fn remote_front(&self, owner: usize, source: &Workspace<'_>, landing: &Workspace<'_>,
-        layer: usize, rows: usize, scalar: Scalar) -> Result<()> {
-        ensure!(owner == 1 && self.active_owner.get() == owner, "Qwen remote front owner");
-        self.shared(source, &self.weights.layers[layer], scalar)?;
+    fn remote_front(&self, source: &Workspace<'_>, landing: &Workspace<'_>, rows: usize) -> Result<()> {
+        ensure!(self.active_owner.get() == 1, "Qwen remote front owner");
         let Some(Experts::Hybrid(experts)) = &self.experts else { anyhow::bail!("Qwen hybrid missing") };
         experts.with_peer(|peer| {
             // Protect the landing scratch from a previous unit's reader before
@@ -3603,8 +3601,7 @@ impl<'a> Qwen4Engine<'a> {
                 landing.live_buffer(&landing.x, self.cfg.hidden * 2)) }
                 else { (source.wire.buffer, landing.wire.buffer) };
             let buffers = [input, (source.route_ids.buffer, landing.route_ids.buffer),
-                (source.route_weights.buffer, landing.route_weights.buffer),
-                (source.live_buffer(&source.shared, self.cfg.hidden * 2), landing.live_buffer(&landing.shared, self.cfg.hidden * 2))];
+                (source.route_weights.buffer, landing.route_weights.buffer)];
             let bytes = remote_front_plane_bytes(rows, self.cfg.hidden, self.cfg.topk, self.spark_bf16);
             for ((source, destination), bytes) in buffers.iter().zip(bytes) {
                 ensure!(bytes <= source.bytes && bytes <= destination.bytes, "Qwen remote plane exceeds workspace");
@@ -3621,6 +3618,33 @@ impl<'a> Qwen4Engine<'a> {
             peer.wait(0, 0)
         })?.context("Qwen remote front needs peer owner")?;
         Ok(())
+    }
+
+    /// Stage the routed planes on GPU0 before issuing the GPU1 shared FFN.
+    /// Its result has a separate publication from the request, and lives in
+    /// the unit slot until the matching land/reduce (FIFO on the link).
+    fn remote_wave_send(&self, source: &Workspace<'_>, landing: &Workspace<'_>,
+        index: usize, t: usize, rows: Scalar, decode: bool,
+        exchange: &mut crate::shared::spark_waves::Waves<'_>, origins: Option<crate::shared::prefill_pipeline::ReplyOrigins>) -> Result<crate::shared::spark_waves::WaveTicket> {
+        self.remote_front(source, landing, t)?;
+        let ticket = self.on_owner(0, || self.wave_send(landing, index, t, rows, decode, exchange, origins))?;
+        self.shared(source, &self.weights.layers[index], rows)?;
+        let stride = self.cfg.hidden * 2;
+        let source = source.live_buffer(&source.shared, stride);
+        let destination = landing.live_buffer(&landing.shared, stride);
+        let bytes = t * stride;
+        ensure!(bytes <= source.bytes && bytes <= destination.bytes, "Qwen remote shared plane exceeds workspace");
+        let Some(Experts::Hybrid(experts)) = &self.experts else { anyhow::bail!("Qwen hybrid missing") };
+        // DIRECT also serves the return, but in the opposite direction (each
+        // rank keeps independent send and receive sequences).
+        // Keep the shared transfer on the same SM-copy path as the original
+        // bundled planes, rather than queue a copy-engine transfer behind waits.
+        let bytes = bytes as u64;
+        let plane = cuteafd_ffi::peer_exchange::PeerPlane { source: source.ptr, destination: destination.ptr,
+            rows: 1, row_bytes: bytes, source_pitch: bytes, destination_pitch: bytes };
+        experts.with_peer(|peer| peer.push_planes(1, crate::shared::peer_split::DIRECT, &[plane]))?
+            .context("Qwen remote shared needs peer owner")?;
+        Ok(ticket)
     }
 
     fn remote_return(&self, owner: usize, landing: &Workspace<'_>, destination: &Workspace<'_>, rows: usize) -> Result<()> {
@@ -3681,10 +3705,15 @@ impl<'a> Qwen4Engine<'a> {
 
     /// The land half of [`Self::wave_send`]: the stream waits for the wave's
     /// planes and sums them with the shared expert into `delta`.
-    fn wave_land(&self, w: &Workspace<'_>, t: usize, wave: crate::shared::spark_waves::WaveTicket,
+    fn wave_land(&self, w: &Workspace<'_>, index: usize, t: usize, wave: crate::shared::spark_waves::WaveTicket,
         exchange: &mut crate::shared::spark_waves::Waves<'_>) -> Result<()> {
         let slot = wave.slot();
         exchange.land(wave, self.execution_stream())?;
+        if self.state_map.layers[index].owner != self.active_owner.get() {
+            let Some(Experts::Hybrid(experts)) = &self.experts else { anyhow::bail!("Qwen hybrid missing") };
+            experts.with_peer(|peer| peer.wait(0, crate::shared::peer_split::DIRECT))?
+                .context("Qwen remote shared needs peer owner")?;
+        }
         // SAFETY: the shared-expert plane and `delta` are live [t, h] BF16
         // buffers; the slot's planes are ordered after the wave by `land`.
         unsafe {
@@ -3772,7 +3801,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for PackedHooks<'_, '_, '_, '
             self.transport.as_mut().context("packed Spark exchange")?, unit.reply_origins()?)
     }
     fn land_experts(&mut self, index: usize, unit: &crate::shared::prefill_pipeline::Unit, ticket: Self::Ticket) -> Result<()> {
-        self.engine.wave_land(self.w, unit.rows.len(), ticket, self.transport.as_mut().context("packed Spark exchange")?)?;
+        self.engine.wave_land(self.w, index, unit.rows.len(), ticket, self.transport.as_mut().context("packed Spark exchange")?)?;
         self.finish(index, Scalar::I32(unit.rows.len() as i32))
     }
     fn end_unit(&mut self, _: &crate::shared::prefill_pipeline::Unit) -> Result<()> { self.aggregate(); Ok(()) }
@@ -3916,8 +3945,9 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
             self.engine.moe_front(w, layer, &self.engine.weights.layers[layer], unit.rows.len(), rows)?;
             if owner == 1 {
                 self.engine.on_owner(0, || self.select(0, unit))?;
-                self.engine.remote_front(owner, w, self.work[0].context("Qwen unit landing workspace")?,
-                    layer, unit.rows.len(), rows)?;
+                return self.engine.remote_wave_send(w, self.work[0].context("Qwen unit landing workspace")?,
+                    layer, unit.rows.len(), rows, false, self.transports.get_mut(0)
+                        .context("Qwen unit Spark landing link")?, unit.reply_origins()?);
             }
             self.engine.on_owner(0, || self.engine.wave_send(self.work[0].context("Qwen unit landing workspace")?,
                 layer, unit.rows.len(), rows, false, self.transports.get_mut(0)
@@ -3931,7 +3961,7 @@ impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks<'_, '_, '_, '_,
             let w = self.work[owner].context("Qwen unit land workspace")?;
             if owner == 1 { self.engine.on_owner(0, || self.select(0, unit))?; }
             self.engine.on_owner(0, || self.engine.wave_land(self.work[0].context("Qwen unit landing workspace")?,
-                unit.rows.len(), ticket, self.transports.get_mut(0).context("Qwen unit Spark landing link")?))?;
+                layer, unit.rows.len(), ticket, self.transports.get_mut(0).context("Qwen unit Spark landing link")?))?;
             if owner == 1 { self.engine.remote_return(owner, self.work[0].context("Qwen unit landing workspace")?, w, unit.rows.len())?; }
             Ok(())
         })?;
@@ -4002,23 +4032,21 @@ mod gather_recovery_tests {
         assert!(cancel.contains("!self.has_sparks()"));
         // Drop tickets, drain the consumers, then the table's own copies, then the graph boundary.
         let order = ["self.ple_pending.borrow_mut().take()", "self.drain_state()?", "ple.mapped().drain()?",
-            "w.terminal_valid.set(false)", "self.graph_completed()"];
+            "w.terminal_valid.set(false)", "cycles.abandon()"];
         let at: Vec<_> = order.iter().map(|needle| cancel.find(needle).unwrap_or_else(|| panic!("{needle}"))).collect();
         assert!(at.windows(2).all(|pair| pair[0] < pair[1]), "cancellation order {at:?}");
     }
 
     #[test]
-    fn qwen_graph_completed_always_advances_serial_cycle() {
+    fn qwen_graph_boundary_records_without_a_host_drain() {
         let source = include_str!("engine.rs");
-        let body = source.split("\n#[cfg(test)]\nmod gather_recovery_tests").next().unwrap();
-        let completed = body.split("    fn graph_completed(").nth(1).unwrap()
+        let completed = source.split("    fn graph_completed(").nth(1).unwrap()
             .split("    /// Attribute the whole step's replay work").next().unwrap();
-        assert!(completed.contains("observe_completed("),
-            "graph_completed must advance the device serial cycle on every step so cold donors age");
-        assert!(!completed.contains("cache_tick()"),
-            "graph_completed must not return early on !needs_boundary with cache_tick()");
-        assert!(completed.find("self.drain_state()?").unwrap()
-            < completed.find("observe_completed(").unwrap());
+        assert!(completed.contains("cycles.complete()"));
+        assert!(!completed.contains("drain_state") && !completed.contains("observe_completed"));
+        let step = source.split("    fn step(").nth(1).unwrap().split("    fn step_inner(").next().unwrap();
+        assert!(step.find("self.begin_graph_cycle()?").unwrap() < step.find("self.step_inner(").unwrap());
+        assert!(step.find("self.step_inner(").unwrap() < step.find("self.graph_completed()?").unwrap());
     }
 }
 
@@ -4074,10 +4102,33 @@ mod prefill_unit_tests {
         assert!(!links.contains("for device in devices"));
         assert_eq!(cuteafd_loader::plan::layout::spark_endpoints("qwen4", 1), 1);
         let source = include_str!("engine.rs");
-        let begin = source.split_once("    fn remote_front(").unwrap().1.split_once("    fn remote_return(").unwrap().0;
+        let begin = source.split_once("    fn remote_front(").unwrap().1.split_once("    fn remote_wave_send(").unwrap().0;
         assert!(begin.contains("peer.push_planes(1, 0"));
         assert!(begin.contains("peer.wait(0, 0)"));
         assert!(!begin.contains("synchronize"));
+        assert!(!begin.contains("self.shared("));
+        assert!(!begin.contains("source.shared"));
+        assert!(begin.find("peer.signal(0, 0)").unwrap() < begin.find("peer.wait(1, 0)").unwrap());
+        assert!(begin.find("peer.wait(1, 0)").unwrap() < begin.find("peer.push_planes(1, 0").unwrap());
+    }
+
+    #[test]
+    fn remote_spark_send_precedes_shared_and_land_waits_for_both() {
+        let source = include_str!("engine.rs");
+        let send = source.split_once("    fn remote_wave_send(").unwrap().1
+            .split_once("    fn remote_return(").unwrap().0;
+        assert!(send.find("self.remote_front(").unwrap() < send.find("self.wave_send(").unwrap());
+        assert!(send.find("self.wave_send(").unwrap() < send.find("self.shared(").unwrap());
+        assert!(send.find("self.shared(").unwrap() < send.find("peer.push_planes(1, crate::shared::peer_split::DIRECT").unwrap());
+        let land = source.split_once("    fn wave_land(").unwrap().1
+            .split_once("    fn wave_staging_bytes(").unwrap().0;
+        assert!(land.find("exchange.land(").unwrap() < land.find("exchange.reduce(").unwrap());
+        assert!(land.find("peer.wait(0, crate::shared::peer_split::DIRECT)").unwrap() < land.find("exchange.reduce(").unwrap());
+        let decode = source.split_once("    fn moe_experts(").unwrap().1
+            .split_once("    fn remote_front(").unwrap().0;
+        assert!(decode.find("self.remote_wave_send(").unwrap() < decode.rfind("self.wave_land(").unwrap());
+        let prefill = source.split_once("impl crate::shared::prefill_pipeline::PrefillHooks for UnitHooks").unwrap().1;
+        assert!(prefill.find("self.engine.remote_wave_send(").unwrap() < prefill.find("self.engine.wave_land(").unwrap());
     }
 
     #[test]

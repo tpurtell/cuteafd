@@ -2733,23 +2733,43 @@ def validate_matched_pairs(rows, arm_names):
                 save(Path(row['state']) / 'result.json', row)
 
 
+def arm_pairs(arm_names):
+    """(candidate, baseline) for every arm after the first.
+
+    Arms named `<role><tag>` in exactly two roles, the first arm's role being
+    the baseline and each tag having one arm of each role (base1/cand1,
+    base2/cand2), pair within their tag: a four-arm lane study compares each
+    lane mode against its own baseline, never cand2 against base1. Any other
+    naming compares every arm against the first."""
+    split = [re.fullmatch(r'(.*?)(\d+)', name) for name in arm_names]
+    if len(arm_names) > 2 and all(split):
+        roles = list(dict.fromkeys(m.group(1) for m in split))
+        by_tag = {}
+        for name, m in zip(arm_names, split):
+            by_tag.setdefault(m.group(2), {})[m.group(1)] = name
+        if len(roles) == 2 and all(set(arms) == set(roles) for arms in by_tag.values()):
+            base, cand = roles
+            return [(arms[cand], arms[base]) for arms in by_tag.values()]
+    return [(candidate, arm_names[0]) for candidate in arm_names[1:]]
+
+
 def summary_math(rows, arm_names, metrics=METRICS):
     medians, paired = [], []
     for card in sorted({r['card'] for r in rows}):
         for arm in arm_names:
             group = [r for r in rows if r['card'] == card and r['arm'] == arm and r['status'] == 'pass' and not r['simulated']]
             medians.append(dict(card=card, arm=arm, **{m: statistics.median([r[m] for r in group if isinstance(r.get(m), (float, int))]) if any(isinstance(r.get(m), (float, int)) for r in group) else None for m in metrics}))
-        for candidate in arm_names[1:]:
+        for candidate, baseline in arm_pairs(arm_names):
             for m in metrics:
                 deltas, percentages = [], []
                 for repeat in sorted({r['repeat'] for r in rows}):
                     pair = {r['arm']: r for r in rows if r['card'] == card and r['repeat'] == repeat and r['status'] == 'pass' and not r['simulated']}
-                    a, b = pair.get(arm_names[0], {}).get(m), pair.get(candidate, {}).get(m)
+                    a, b = pair.get(baseline, {}).get(m), pair.get(candidate, {}).get(m)
                     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
                         deltas.append(b - a)
                         if a:
                             percentages.append(100 * (b - a) / a)
-                paired.append(dict(card=card, baseline=arm_names[0], candidate=candidate, metric=m, pairs=len(deltas), median_delta=statistics.median(deltas) if deltas else None, median_percent=statistics.median(percentages) if percentages else None))
+                paired.append(dict(card=card, baseline=baseline, candidate=candidate, metric=m, pairs=len(deltas), median_delta=statistics.median(deltas) if deltas else None, median_percent=statistics.median(percentages) if percentages else None))
     return medians, paired
 
 
@@ -2826,21 +2846,29 @@ def write_summary(state, rows, arms):
         text += ('Headline speed is the final same-server pass (pass ' + '/'.join(map(str, multipass)) + ' of each '
                  'launch); every pass is in summary.json `passes` / `rows[].passes` and sweep.json `passes`.\n\n')
     # Before -> after per card and metric: medians of passing real-hardware rows,
-    # ratio after/before, and the paired median where pairs exist.
+    # each candidate's ratio to its own baseline (arm_pairs), and the paired
+    # median where pairs exist. Two arms keep the single Ratio column.
     if len(names) > 1:
-        text += '## Before -> after\n\n| Card | Metric | ' + names[0] + ' | ' + ' | '.join(names[1:]) + ' | Ratio | Paired % | Pairs |\n'
-        text += '| --- | --- |' + ' ---: |' * len(names) + ' ---: | ---: | ---: |\n'
+        pairs = arm_pairs(names)
+        labels = ['Ratio'] if len(pairs) == 1 else [f'{cand}/{base}' for cand, base in pairs]
+        text += ('## Before -> after\n\n| Card | Metric | ' + ' | '.join(names) + ' | '
+                 + ' | '.join(f'{label} | Paired % | Pairs' for label in labels) + ' |\n')
+        text += '| --- | --- |' + ' ---: |' * (len(names) + 3 * len(pairs)) + '\n'
         for card in sorted({r['card'] for r in rows}):
             by_arm = {m['arm']: m for m in medians if m['card'] == card}
             for metric in present:
                 values = [by_arm.get(arm, {}).get(metric) for arm in names]
                 if all(v is None for v in values):
                     continue
-                before, after = values[0], values[-1]
-                ratio = after / before if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before else None
-                pair = next((p for p in paired if p['card'] == card and p['candidate'] == names[-1] and p['metric'] == metric), {})
+                cells = []
+                for cand, base in pairs:
+                    before, after = by_arm.get(base, {}).get(metric), by_arm.get(cand, {}).get(metric)
+                    ratio = after / before if isinstance(before, (int, float)) and isinstance(after, (int, float)) and before else None
+                    pair = next((p for p in paired if p['card'] == card and p['candidate'] == cand
+                                 and p['baseline'] == base and p['metric'] == metric), {})
+                    cells.append(f"{cell(ratio)} | {cell(pair.get('median_percent'))} | {pair.get('pairs', 0)}")
                 note = ' (lower is better)' if metric in LOWER_IS_BETTER or metric.endswith('TTFT s') else ''
-                text += f"| {card} | {metric}{note} | " + ' | '.join(cell(v) for v in values) + f" | {cell(ratio)} | {cell(pair.get('median_percent'))} | {pair.get('pairs', 0)} |\n"
+                text += f"| {card} | {metric}{note} | " + ' | '.join(cell(v) for v in values) + ' | ' + ' | '.join(cells) + ' |\n'
         text += '\n'
     else:
         text += '## Results\n\n| Card | ' + ' | '.join(present) + ' |\n| --- |' + ' ---: |' * len(present) + '\n'

@@ -111,35 +111,52 @@ def test_segmented_upload_inventory_and_storage_declaration(tmp_path, monkeypatc
     repack.write_json(tmp_path / "source-verified.json", evidence)
     repack.write_json(tmp_path / "repack-verified.json", dict(source=repack.SOURCE, target=repack.TARGET,
                       revision=repack.REVISION, source_files=len(siblings), shards=receipts))
-    operations_seen, preuploaded = [], []
+    operations_seen, batches, workers = [], [], []
+    trees = {"0" * 40: {}}
 
     class Operation:
         def __init__(self, path_in_repo, path_or_fileobj):
             self.path_in_repo = path_in_repo
             self.path_or_fileobj = path_or_fileobj
-            self.upload_info = types.SimpleNamespace(sha256=hashlib.sha256(Path(path_or_fileobj).read_bytes()).digest())
+            data = Path(path_or_fileobj).read_bytes()
+            self.upload_info = types.SimpleNamespace(sha256=hashlib.sha256(data).digest(), size=len(data))
 
     class Api:
+        head = "0" * 40
+
         def create_repo(self, *args, **kwargs):
             pass
 
-        def preupload_lfs_files(self, repo, additions, num_threads):
-            assert num_threads == 1 and len(additions) == 1
-            preuploaded.extend(additions)
+        def repo_info(self, repo, **kwargs):
+            return types.SimpleNamespace(sha=self.head, private=False)
 
         def create_commit(self, repo, operations, **kwargs):
-            assert kwargs["num_threads"] == 1
-            assert operations == preuploaded
+            assert kwargs["parent_commit"] == self.head and kwargs["num_threads"] == 16
+            tree = dict(trees[self.head])
+            assert not {op.path_in_repo for op in operations} & set(tree), "committed file sent again"
+            for op in operations:
+                tree[op.path_in_repo] = dict(bytes=op.upload_info.size, blob=op.upload_info.sha256.hex())
             operations_seen.extend(operations)
-            return types.SimpleNamespace(oid="commit")
+            batches.append(len(operations))
+            Api.head = f"{len(batches):040x}"
+            trees[Api.head] = tree
+            return types.SimpleNamespace(oid=Api.head)
 
+    import hub_lfs
     monkeypatch.setattr(huggingface_hub, "HfApi", Api)
     monkeypatch.setattr(huggingface_hub, "CommitOperationAdd", Operation)
-    args = types.SimpleNamespace(source=source, output=output, remote_output_host=None)
+    monkeypatch.setattr(hub_lfs, "remote_tree", lambda api, repo, revision: trees[revision])
+    monkeypatch.setattr(hub_lfs, "require_qualified_hub", lambda: None)
+    monkeypatch.setattr(repack, "require_qualified_hub", lambda: None)
+    args = types.SimpleNamespace(source=source, output=output, remote_output_host=None,
+                                 upload_options=hub_lfs.UploadOptions(batch_files=4))
     repack.upload(args)
     assert len(operations_seen) == len(siblings) + 6
+    assert all(size <= 4 for size in batches)
     assert {op.path_in_repo for op in operations_seen} >= {
         f"engram-{layer:02}-part-{part:05}.safetensors" for layer in [1, 14] for part in range(3)}
+    repack.upload(args)  # A rerun resumes from the Hub tree and sends nothing again.
+    assert len(operations_seen) == len(siblings) + 6
     receipt_path = tmp_path / "repack-verified.json"
     original_receipt = receipt_path.read_text()
     mixed = json.loads(original_receipt)

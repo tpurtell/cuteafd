@@ -43,8 +43,8 @@ pub(crate) fn resolve_tp2_dflash(command: &mut Commands, matches: &clap::ArgMatc
         return Ok(());
     }
     let (enabled, family, split, draft) = match command {
-        Commands::ServeGlm(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some()),
-        Commands::GlmGolden(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some()),
+        Commands::ServeGlm(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some() || args.engine.dspark),
+        Commands::GlmGolden(args) => (&mut args.engine.tp2_dflash, "glm5", args.engine.split_device.is_some(), args.engine.draft.is_some() || args.engine.dspark),
         Commands::ServeMimo(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::MimoGolden(args) => (&mut args.engine.tp2_dflash, "mimo_v2", args.engine.split_device.is_some(), args.engine.draft.is_some()),
         Commands::ServeKimi(args) => (&mut args.tp2_dflash, "kimi_k3", args.split_device.is_some(), args.draft.is_some()),
@@ -275,6 +275,12 @@ pub(crate) enum Commands {
     /// Serve Hy4-flash through the shared scheduler on 1x or 2x RTX (and Spark experts).
     #[command(hide = true)]
     ServeHy4f(crate::families::hy4_flash::serve::ServeArgs),
+    /// Qualify Hy4 coordinator text forward, IndexCache sharing, pages-only prefix restore, and TP2.
+    #[command(hide = true)]
+    Hy4Golden(crate::families::hy4::golden::GoldenArgs),
+    /// Serve Hy4 through the shared scheduler on 1x or 2x RTX and Spark experts.
+    #[command(hide = true)]
+    ServeHy4(crate::families::hy4::serve::ServeArgs),
     /// Serve Inkling through the shared scheduler on one RTX and Spark experts.
     #[command(hide = true)]
     ServeInkling2(crate::families::inkling2::serve::ServeArgs),
@@ -630,7 +636,7 @@ pub(crate) struct PlanArgs {
     /// Prefill units in flight for --layout (0: the family default).
     #[arg(long, default_value_t = 0)]
     pub(crate) prefill_waves: u64,
-    /// Decode views: V4.1 accepts 1 or 2 (default 2), other families require 1.
+    /// Decode views: V4.1 accepts 1 or 2 (default 1 on 1× RTX, 2 on 2× RTX; 1 at C1), other families require 1.
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
     pub(crate) decode_lanes: Option<u8>,
     /// Rows one continuous prefill call streams for --layout (0: the family
@@ -1027,14 +1033,19 @@ mod tests {
                 }
             }
         }
-        // Bundled ML4 --dspark without --draft must never default-enable TP2 DFlash.
-        let argv = ["cuteafd", "serve-glm", "--snapshot", "/model", "--native-lib", "/native.so",
-            "--split-device", "1", "--dspark"];
-        let matches = super::Cli::command().try_get_matches_from(argv).unwrap();
-        let mut cli = super::Cli::from_arg_matches(&matches).unwrap();
-        super::resolve_tp2_dflash(&mut cli.command, &matches).unwrap();
-        let super::Commands::ServeGlm(args) = cli.command else { panic!("expected ServeGlm"); };
-        assert!(!args.engine.tp2_dflash);
+        // Bundled ML4 --dspark defaults TP2 on when split is active, preserves explicit false, and stays off on 1 GPU.
+        for (split, explicit, expected) in [
+            (false, None, false), (true, None, true), (true, Some("false"), false), (true, Some("true"), true),
+        ] {
+            let mut argv = vec!["cuteafd", "serve-glm", "--snapshot", "/model", "--native-lib", "/native.so", "--dspark"];
+            if split { argv.extend(["--split-device", "1"]); }
+            if let Some(value) = explicit { argv.extend(["--tp2-dflash", value]); }
+            let matches = super::Cli::command().try_get_matches_from(argv).unwrap();
+            let mut cli = super::Cli::from_arg_matches(&matches).unwrap();
+            super::resolve_tp2_dflash(&mut cli.command, &matches).unwrap();
+            let super::Commands::ServeGlm(args) = cli.command else { panic!("expected ServeGlm"); };
+            assert_eq!(args.engine.tp2_dflash, expected, "dspark split={split} explicit={explicit:?}");
+        }
     }
 
     #[test]
@@ -1534,7 +1545,13 @@ mod tests {
         let Commands::ServeNative(args) = Cli::try_parse_from([
             "cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
             "--peers", "127.0.0.1:19441"]).unwrap().command else { panic!("native"); };
-        assert_eq!(args.decode_lanes, 2);
+        assert_eq!(args.decode_lanes, None);
+        assert_eq!(args.resolved_decode_lanes(), 1);
+        let Commands::ServeNative(args2) = Cli::try_parse_from([
+            "cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so",
+            "--peers", "127.0.0.1:19441", "--rtx-gpus", "2"]).unwrap().command else { panic!("native2"); };
+        assert_eq!(args2.decode_lanes, None);
+        assert_eq!(args2.resolved_decode_lanes(), 2);
     }
 
     #[test]
@@ -1643,10 +1660,10 @@ pub(crate) struct NativeServeArgs {
     pub expert_usage: bool,
     #[arg(skip)]
     pub expert_usage_reader: cuteafd_core::expert_usage::Reader,
-    /// V4.1 decode lanes: 1 or 2 (default 2; one at concurrency 1). Serve
-    /// replaces the request with the resolved count before any allocation.
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u8).range(1..=2))]
-    pub decode_lanes: u8,
+    /// V4.1 decode lanes: 1 or 2 (default 1 on 1× RTX, 2 on 2× RTX; one at concurrency 1).
+    /// Serve replaces unset with the resolved count before any allocation.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=2))]
+    pub decode_lanes: Option<u8>,
     /// Decode/verify row budget per lane: `auto` (64) or 1..=256 within
     /// concurrency * (max_draft + 1) (`DECODE_ROWS`). Serve resolves this once
     /// at boot before any allocation.
@@ -1783,6 +1800,16 @@ pub(crate) struct NativeServeArgs {
 impl NativeServeArgs {
     pub fn adaptive_dspark(&self) -> bool {
         self.dspark && self.draft_length.draft_length.is_none()
+    }
+    /// Resolved decode lanes: explicit `--decode-lanes`, else 1 on 1× RTX and 2 on 2× RTX (1 at C1).
+    pub(crate) fn resolved_decode_lanes(&self) -> u8 {
+        cuteafd_loader::plan::resolve_decode_lanes(
+            "deepseek_v41",
+            self.decode_lanes,
+            u64::from(self.concurrency),
+            self.rtx_gpus as usize,
+        )
+        .unwrap_or_else(|_| self.decode_lanes.unwrap_or(if self.rtx_gpus >= 2 { 2 } else { 1 }))
     }
     /// Resolved decode/verify row budget (64 when `auto`/unset).
     pub(crate) fn resolved_decode_rows(&self) -> u32 {

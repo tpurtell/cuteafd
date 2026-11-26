@@ -11,7 +11,13 @@ harnesses read:
   logits.bin      f32  [T, vocab]
   meta.json
 
-  golden.py --snapshot SNAP --text "..." --out DIR [--layers 0 1 2 ...] [--device 0]
+  golden.py --snapshot SNAP (--text "..." | --text-file F | --tokens-file tokens.bin) --out DIR
+            [--layers 0 1 2 ...] [--device 0]
+
+``--tokens-file`` takes the u32 ids exactly (an existing fixture's
+``tokens.bin``), so the reference is keyed to those ids with no
+decode/re-tokenize round trip. The prompt runs as one causal window through
+the same DSA adaptation, mask and BF16 final norm as ``--windows``.
 """
 from __future__ import annotations
 
@@ -32,7 +38,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from shape_invariant import install, qualify
 from fidelity_windows import (CheckpointStorage, LayerCheckpoints, release_checkpoint, load_set,
-                              verify_snapshot, write_scored_logits, finish_golden, log_checkpoint_reads)
+                              verify_snapshot, write_scored_logits, finish_golden, log_checkpoint_reads,
+                              read_tokens_file, write_tokens_file)
 
 
 def index_scores(q, k, weights, scaling, extent):
@@ -364,11 +371,74 @@ def run_windows(a, config, ref, weights):
         prefix_qualification=proof)
 
 
+def run_tokens(a, config, ref, weights, tokens):
+    """One causal prompt, layer by layer: tokens.bin, layerNN.bin, logits.bin, meta.json."""
+    if not tokens:
+        raise ValueError("the prompt is empty")
+    install_dsa(ref, len(tokens))
+    write_tokens_file(a.out / "tokens.bin", tokens)
+    layers = config.num_hidden_layers
+    save = set(range(layers)) if not a.layers else set(a.layers)
+    started, times = time.time(), []
+    ids = torch.tensor([tokens], device="cuda")
+    positions = torch.arange(len(tokens), device="cuda")[None]
+    with torch.inference_mode():
+        h = torch.nn.functional.embedding(ids, weights.get("model.embed_tokens.weight"))
+        rotary = ref.GlmMoeDsaRotaryEmbedding(config=config).cuda()
+        cos_sin = rotary(h, position_ids=positions)
+        # The official model's causal mask; DSA top-k narrows it per query row.
+        mask = torch.full((len(tokens), len(tokens)), -float("inf"),
+                          device="cuda", dtype=h.dtype).triu(1)[None, None]
+        topk = None
+        memory = CheckpointStorage(torch.cuda, weights)
+        for layer_id in range(layers):
+            start = time.time()
+            read_started, read_before = time.monotonic(), weights.read_bytes
+            weights.stage_layer(f"model.layers.{layer_id}.")
+            # BF16 parameters; the router keeps its explicit FP32 bias buffer.
+            torch.set_default_dtype(torch.bfloat16)
+            with torch.device("meta"):
+                layer = ref.GlmMoeDsaDecoderLayer(config, layer_id)
+            torch.set_default_dtype(torch.float32)
+            layer = layer.to_empty(device="cuda")
+            load_layer(layer, weights, f"model.layers.{layer_id}.")
+            if weights.staged:
+                raise ValueError(f"unconsumed layer staging: {sorted(weights.staged)[:8]}")
+            log_checkpoint_reads(f"layer {layer_id} load", (weights,), read_before, read_started)
+            layer.eval()
+            h, topk = layer(h, attention_mask=mask, position_ids=positions, position_embeddings=cos_sin,
+                            prev_topk_indices=topk)
+            if layer_id in save:
+                (a.out / f"layer{layer_id:02d}.bin").write_bytes(h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
+            del layer
+            memory.release()
+            memory.check(f"layer {layer_id}")
+            times.append(time.time() - start)
+            print(f"layer {layer_id} {times[-1]:.1f}s", flush=True)
+        norm = ref.GlmMoeDsaRMSNorm(config.hidden_size, config.rms_norm_eps).cuda().to(torch.bfloat16)
+        norm.weight.copy_(weights.get("model.norm.weight"))
+        logits = torch.nn.functional.linear(norm(h).float()[0], weights.get("lm_head.weight").float())
+        (a.out / "logits.bin").write_bytes(logits.contiguous().cpu().numpy().tobytes())
+    argmax = logits.argmax(-1)
+    next_ok = (argmax[:-1] == ids[0, 1:]).float().mean().item()
+    nll = -torch.log_softmax(logits[:-1].double(), -1).gather(1, ids[0, 1:, None]).mean().item()
+    (a.out / "meta.json").write_text(json.dumps({
+        "family": "glm5", "tokens": len(tokens), "snapshot": str(a.snapshot),
+        "tokens_file": str(a.tokens_file) if a.tokens_file else None,
+        "reference": "transformers glm_moe_dsa (eager, causal mask, fixed-M128 linears/index/attention, "
+                     "fixed ascending-id2048 DSA slots); BF16 final norm, FP32 head",
+        "requant_ue8m0": a.requant_ue8m0, "seconds": time.time() - started, "seconds_per_layer": times,
+        "argmax_last": int(argmax[-1]), "next_token_accuracy": next_ok, "mean_nll": nll,
+    }, indent=1))
+    print(f"argmax of last position: {int(argmax[-1])}; next-token accuracy {next_ok:.3f}; mean NLL {nll:.4f}")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--snapshot", type=Path, required=True)
     p.add_argument("--text", help="prompt text (tokenized with the snapshot tokenizer)")
     p.add_argument("--text-file", type=Path, help="prompt text from a file")
+    p.add_argument("--tokens-file", type=Path, help="u32 tokens.bin: the prompt's exact token ids")
     p.add_argument("--layers", type=int, nargs="*", help="layers whose outputs to save (default all)")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--device", type=int, default=0)
@@ -391,8 +461,11 @@ def main() -> None:
         p.error("--resume-layers requires --checkpoint-layers")
     if a.prefix_only and not a.windows:
         p.error("--prefix-only requires --windows")
-    if a.windows and (a.text is not None or a.text_file is not None or a.requant_ue8m0):
-        p.error("--windows cannot be combined with legacy text or serving requantization")
+    if a.windows and (a.text is not None or a.text_file is not None or a.tokens_file is not None
+                      or a.requant_ue8m0):
+        p.error("--windows cannot be combined with legacy text/tokens or serving requantization")
+    if not a.windows and sum(x is not None for x in (a.text, a.text_file, a.tokens_file)) != 1:
+        p.error("give exactly one of --text, --text-file, --tokens-file or --windows")
 
     from tokenizers import Tokenizer
     from transformers import AutoConfig
@@ -409,49 +482,15 @@ def main() -> None:
         a.out.mkdir(parents=True, exist_ok=True)
         run_windows(a, config, ref, Weights(a.snapshot))
         return
-    text = a.text_file.read_text() if a.text_file else a.text
-    tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
+    if a.tokens_file:
+        tokens = read_tokens_file(a.tokens_file, config.vocab_size)
+    else:
+        text = a.text_file.read_text() if a.text_file else a.text
+        tokens = Tokenizer.from_file(str(a.snapshot / "tokenizer.json")).encode(text, add_special_tokens=False).ids
     weights = Weights(a.snapshot)
     weights.requant_ue8m0 = a.requant_ue8m0
     a.out.mkdir(parents=True, exist_ok=True)
-    (a.out / "tokens.bin").write_bytes(torch.tensor(tokens, dtype=torch.int32).numpy().tobytes())
-    layers = config.num_hidden_layers
-    save = set(range(layers)) if not a.layers else set(a.layers)
-    ids = torch.tensor([tokens], device="cuda")
-    positions = torch.arange(len(tokens), device="cuda")[None]
-    with torch.inference_mode():
-        h = torch.nn.functional.embedding(ids, weights.get("model.embed_tokens.weight"))
-        rotary = ref.GlmMoeDsaRotaryEmbedding(config=config).cuda()
-        cos_sin = rotary(h, position_ids=positions)
-        topk = None
-        memory = CheckpointStorage(torch.cuda, weights)
-        for layer_id in range(layers):
-            start = time.time()
-            # BF16 parameters; the router keeps its explicit FP32 bias buffer.
-            torch.set_default_dtype(torch.bfloat16)
-            with torch.device("meta"):
-                layer = ref.GlmMoeDsaDecoderLayer(config, layer_id)
-            torch.set_default_dtype(torch.float32)
-            layer = layer.to_empty(device="cuda")
-            load_layer(layer, weights, f"model.layers.{layer_id}.")
-            layer.eval()
-            h, topk = layer(h, attention_mask=None, position_ids=positions, position_embeddings=cos_sin,
-                            prev_topk_indices=topk)
-            if layer_id in save:
-                (a.out / f"layer{layer_id:02d}.bin").write_bytes(h[0].contiguous().view(torch.int16).cpu().numpy().tobytes())
-            del layer
-            memory.release()
-            memory.check(f"layer {layer_id}")
-            print(f"layer {layer_id} {time.time() - start:.1f}s", flush=True)
-        norm = ref.GlmMoeDsaRMSNorm(config.hidden_size, config.rms_norm_eps).cuda()
-        norm.weight.copy_(weights.get("model.norm.weight"))
-        logits = torch.nn.functional.linear(norm(h).float(), weights.get("lm_head.weight").float())
-        (a.out / "logits.bin").write_bytes(logits[0].contiguous().cpu().numpy().tobytes())
-    argmax = logits[0].argmax(-1)
-    next_ok = (argmax[:-1] == ids[0, 1:]).float().mean().item()
-    (a.out / "meta.json").write_text(json.dumps({"tokens": len(tokens), "snapshot": str(a.snapshot),
-        "argmax_last": int(argmax[-1]), "next_token_accuracy": next_ok}, indent=1))
-    print(f"argmax of last position: {int(argmax[-1])}; next-token accuracy {next_ok:.3f}")
+    run_tokens(a, config, ref, weights, tokens)
 
 
 if __name__ == "__main__":

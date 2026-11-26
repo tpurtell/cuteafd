@@ -1887,6 +1887,25 @@ def test_first_real_error_wins_and_kinds_are_distinguished(entry, tmp_path):
     assert row['failure_kind'] == 'quality' and 'spec_lossless: greedy drafts-on/off token IDs differ' in row['error']
 
 
+def test_arm_pairs_match_lane_tags_and_fall_back_to_the_first_arm():
+    assert cards.arm_pairs(['base', 'cand']) == [('cand', 'base')]
+    assert cards.arm_pairs(['base1', 'cand1', 'base2', 'cand2']) == [('cand1', 'base1'), ('cand2', 'base2')]
+    assert cards.arm_pairs(['base', 'a', 'b']) == [('a', 'base'), ('b', 'base')]
+    assert cards.arm_pairs(['base1', 'cand1', 'cand2']) == [('cand1', 'base1'), ('cand2', 'base1')]
+
+
+def test_summary_md_ratios_pair_each_lane_with_its_own_baseline(tmp_path):
+    values = dict(base1=100.0, cand1=110.0, base2=200.0, cand2=180.0)
+    rows = [dict(card='c', arm=arm, repeat=1, status='pass', simulated=False, C1=v) for arm, v in values.items()]
+    medians, paired = cards.summary_math(rows, list(values))
+    by = {(p['candidate'], p['baseline']): p['median_percent'] for p in paired if p['metric'] == 'C1'}
+    assert by == {('cand1', 'base1'): pytest.approx(10.0), ('cand2', 'base2'): pytest.approx(-10.0)}
+    cards.write_summary(tmp_path, rows, {arm: {} for arm in values})
+    text = (tmp_path / 'summary.md').read_text()
+    assert '| cand1/base1 | Paired % | Pairs | cand2/base2 | Paired % | Pairs |' in text
+    assert '| c | C1 | 100 | 110 | 200 | 180 | 1.1 | 10 | 1 | 0.9 | -10 | 1 |' in text
+
+
 def test_summary_md_has_before_after_ratios_and_failures(tmp_path):
     rows = [dict(card='c', arm=arm, repeat=r, status='pass', simulated=False, C1=c1, **{'sweep C16': c16, 'post-load C1': p})
             for r, (arm, c1, c16, p) in enumerate([('base', 100.0, 800.0, 95.0), ('cand', 110.0, 880.0, 100.0)], 1)]

@@ -390,6 +390,8 @@ def main():
     p.add_argument('--resume', action='store_true')
     p.add_argument('--preflight', action='store_true')
     p.add_argument('--publish-only', action='store_true')
+    import hub_lfs
+    hub_lfs.add_arguments(p)
     args = p.parse_args()
     from gptqmodel.utils.kimi_k31 import KimiK31Source
     source = KimiK31Source(args.source_snapshot, reference_root=REPO / 'python/reference')
@@ -423,7 +425,7 @@ def main():
             record = json.loads(complete.read_text())
             if record['identity'] != plan['identity']:
                 raise ValueError('publication identity differs')
-            publish(args.export, args.root, TARGET_REPO)
+            publish(args.export, args.root, TARGET_REPO, options=hub_lfs.options_from(args))
             return
         if complete.exists():
             if json.loads(complete.read_text())['identity'] != plan['identity']:

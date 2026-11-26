@@ -431,6 +431,24 @@ pub fn ml4_draft_layout(snapshot: &std::path::Path, slots: usize, sequences: usi
         cuteafd_core::MlaCacheFormat::Fp8)?)
 }
 
+/// Per-rank runtime layouts for Mistral Large 4's two-GPU head/FFN-split mtp_dspark
+/// (32 heads and half dense intermediate per rank; RNN Markov head on rank 0).
+pub fn ml4_tp2_draft_layouts(snapshot: &std::path::Path, slots: usize, sequences: usize, compiled_context: usize,
+    sms: usize) -> anyhow::Result<[crate::formats::dflash::MlaDraftRuntimeLayout; 2]> {
+    use crate::families::glm5::draft_representation::GlmDraftCapacity;
+    use crate::families::mistral_large4::{dspark::Ml4DsparkConfig, Ml4Config};
+    let config = crate::plan::checkpoint::read_json(&snapshot.join("config.json"))?;
+    let target = Ml4Config::from_hf(&config)?;
+    let params = crate::plan::checkpoint::read_json(&snapshot.join("params.json"))?;
+    let dspark = Ml4DsparkConfig::from_params(&params, target.layers)?;
+    let draft = crate::formats::dflash::MlaDflashConfig::ml4_tp2(&dspark, &target)?;
+    let capacity = GlmDraftCapacity::new(slots, sequences, dspark.depth)?;
+    Ok([
+        draft.ml4_tp2_runtime_layout(0, capacity, compiled_context, compiled_context, sms, cuteafd_core::MlaCacheFormat::Fp8)?,
+        draft.ml4_tp2_runtime_layout(1, capacity, compiled_context, compiled_context, sms, cuteafd_core::MlaCacheFormat::Fp8)?,
+    ])
+}
+
 pub fn drafter_staging(snapshot: &std::path::Path, slots: usize, sequences: usize,
     bf16: bool) -> anyhow::Result<u64> {
     use crate::families::glm5::draft_representation::{draft_geometry, GlmDraftCapacity,

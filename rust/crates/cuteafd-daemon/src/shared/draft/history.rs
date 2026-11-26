@@ -54,6 +54,8 @@ impl Policy {
     }
 
     pub fn block(&self) -> usize { self.history.spec().block }
+    /// History estimate before a neural confidence score exists.
+    pub fn probability(&self, id: u64, position: usize) -> f64 { self.history.probability(id, position) }
     /// The most drafted positions one request verifies in a round.
     pub fn max_positions(&self) -> usize { self.history.max_positions() }
     pub fn fixed(&self) -> bool { matches!(self.history.control(), DraftControl::Fixed(_)) }
