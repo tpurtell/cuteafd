@@ -264,7 +264,7 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
-    fn reduce_projection(&self, rank: usize, index: usize, lane: usize, w: &Workspace<'_>,
+    pub(super) fn reduce_projection(&self, rank: usize, index: usize, lane: usize, w: &Workspace<'_>,
         layer: &GlmLayer<'_>, key: &str, rows: usize, output: Buffer) -> Result<()> {
         let programs = self.core_programs(rank)?;
         let retained = w.core_rows.as_ref().context("GLM K6 retained core rows")?;
@@ -334,6 +334,46 @@ impl<'a> GlmEngine<'a> {
             self.on(rank, || unsafe { self.library.cuda_zero_bytes_async(w.shared.buffer,
                 rows * self.cfg.hidden * 2, self.stream_of(rank)) })
         }
+    }
+
+    /// Zero rank 1's shared FFN output buffer locally (capture-safe): only rank 0
+    /// contributes the reduced split-core shared partial.
+    pub(super) fn core_zero_shared(&self, rank: usize, w: &Workspace<'_>, rows: usize) -> Result<()> {
+        ensure!(rank == 1, "core_zero_shared is rank-1 only");
+        // SAFETY: only rank 0 contributes the reduced shared partial; rank 1's TP2
+        // combine reads its zeroed BF16 shared buffer after this on the same stream.
+        self.on(rank, || unsafe {
+            self.library.cuda_zero_bytes_async(w.shared.buffer, rows * self.cfg.hidden * 2, self.stream_of(rank))
+        })
+    }
+
+    /// Rank-local shared FFN without peer meet (capture-safe). For split-core `down`
+    /// projections, rank 1 publishes its retained core one-way (1->0) outside capture
+    /// and rank 0 reduces into `w.shared` after waiting outside capture.
+    pub(super) fn shared_on_local(&self, rank: usize, index: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>,
+        rows: Scalar, cap: &str) -> Result<()> {
+        if let Some(native) = self.native_experts.get(rank) {
+            let Scalar::I32(rows) = rows else { anyhow::bail!("EXLR8 shared rows must be I32"); };
+            let execution = w.native_shared.as_ref().context("EXLR8 lane shared workspace")?;
+            self.on(rank, || native.shared(self.library, index, execution, w.x.buffer,
+                w.shared.buffer, rows as usize, self.stream_of(rank)))
+        } else {
+            self.ffn_on(rank, w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)
+        }
+    }
+
+    /// Rank 0's one-way shared FFN completion on a 2-GPU Spark MoE layer: runs the
+    /// local shared FFN, and when `core_split(down)` is active waits for rank 1's
+    /// one-way 1->0 core partial and reduces both halves into `w.shared`.
+    pub(super) fn shared_on_rank0_one_way(&self, index: usize, lane: usize, w: &Workspace<'_>,
+        layer: &GlmLayer<'_>, rows: Scalar, cap: &str) -> Result<()> {
+        self.shared_on_local(0, index, w, layer, rows, cap)?;
+        if Self::core_split(layer, "down") {
+            let count = scalar_rows(rows)?;
+            self.exchange()?.wait(0, slot(index, true, lane))?;
+            self.reduce_projection(0, index, lane, w, layer, "down", count, w.shared.buffer)?;
+        }
+        Ok(())
     }
 
     /// Input-side native projections retain F32 partials, while trellis cores

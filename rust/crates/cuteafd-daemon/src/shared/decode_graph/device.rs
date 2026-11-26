@@ -3267,6 +3267,46 @@ mod tests {
     }
 
     #[test]
+    fn memset_1d_signature_is_indexed_and_donor_updated_not_eagered() {
+        let mut cache = test_cache(-1088, 1000);
+        // [count=3, kernel(0x101), memset(element_size, device), kernel(0x202), edges...]
+        let memset_sig = |element_size: u64, device: u64| {
+            vec![3, 0, 0x101, 2, element_size, device, 0, 0x202, 2, 0, 1, 0, 0, 0, 1, 2, 0, 0, 0]
+        };
+        let donor = capture(&mut cache, 1, false);
+        cache.records.get_mut(&donor).unwrap().last_used = Some(cache.lanes[0].index);
+        cache.register_native(donor, 601, memset_sig(4, 1));
+        cache.soft.limit = 10;
+        cache.charged = 10;
+        for _ in 0..2 { cache.begin_lane(0); cache.complete_lane(0); }
+        // Matching 1D memset signature across different row byte counts / fill values donor-updates without eager fallback.
+        let id = cache.update_ticket(key(2), site(Preference::Adaptive), None, false)
+            .expect("graph with 1D memset signature must get a donor update ticket");
+        cache.register_native(id, 0, memset_sig(4, 1));
+        let mut updated_exec = None;
+        let transferred = cache.finish_update(id, |exec| { updated_exec = Some(exec); Ok(true) },
+            |exec| Ok(exec + 1000), |_| panic!());
+        assert_eq!(updated_exec, Some(601));
+        assert_eq!(transferred, Some(1601));
+        assert!(cache.owns(id, 1) && !cache.owns(donor, 1));
+        assert_eq!(cache.counters[&Cycle::Decode].updates_soft, 1);
+        assert_eq!(cache.counters[&Cycle::Decode].eager_soft_room, 0);
+        assert_eq!(cache.counters[&Cycle::Decode].no_cold_donor_soft, 0);
+        // Mismatched elementSize or device must not steal the donor.
+        cache.records.get_mut(&id).unwrap().last_used = Some(cache.lanes[0].index);
+        for _ in 0..2 { cache.begin_lane(0); cache.complete_lane(0); }
+        cache.charged = cache.reserve;
+        for (other_key, sig) in [(3, memset_sig(1, 1)), (4, memset_sig(4, 0))] {
+            let id_diff = cache.update_ticket(key(other_key), site(Preference::Adaptive), None, false)
+                .expect("unseen shape probes signature via host-only capture");
+            cache.register_native(id_diff, 0, sig);
+            assert!(cache.finish_update(id_diff, |_| panic!(), |_| panic!(), |_| panic!()).is_none());
+            assert!(matches!(cache.fallback_update(id_diff), Miss::Eager));
+            assert!(cache.owns(id, 1), "mismatched elementSize/device must leave existing donor intact");
+        }
+    }
+
+    #[test]
     fn working_set_reserve_seeds_adaptive_headroom() {
         use cuteafd_loader::placement::graph_reserve::{WorkingSet, resolve_working_set};
         let policy = resolve_working_set(None, None, None, 0, WorkingSet {
@@ -3407,6 +3447,30 @@ mod tests {
         cache.insert_donor_candidate(donor);
         assert_eq!(cache.cold_donor(&[3, 7, 11]), Some(donor));
         assert!(cache.cold_donor(&[3, 7, 12]).is_none());
+        assert!(cache.cold_donor(&[]).is_none());
+    }
+
+    #[test]
+    fn event_record_signature_is_indexed_per_event_and_empty_never_matches() {
+        let (mut cache, donor_a) = aged_update_fixture(40, false);
+        cache.remove_donor_candidate(donor_a);
+        let sig_a = vec![0, 0x1000, 7, 0xaaaa, 0, 0x2000];
+        let sig_b = vec![0, 0x1000, 7, 0xbbbb, 0, 0x2000];
+        let sig_c = vec![0, 0x1000, 7, 0xcccc, 0, 0x2000];
+        cache.register_native(donor_a, 202, sig_a.clone());
+        let mut second = cache.records[&donor_a].clone();
+        cache.next_id += 1;
+        let donor_b = cache.next_id;
+        second.identity = key(2);
+        second.list = None; second.previous = None; second.next = None;
+        second.accounted = Inventory::default();
+        cache.identities.insert(second.identity.clone(), donor_b);
+        cache.records.insert(donor_b, second);
+        cache.push(donor_b, List::Recent);
+        cache.register_native(donor_b, 303, sig_b.clone());
+        assert_eq!(cache.cold_donor(&sig_a), Some(donor_a));
+        assert_eq!(cache.cold_donor(&sig_b), Some(donor_b));
+        assert!(cache.cold_donor(&sig_c).is_none());
         assert!(cache.cold_donor(&[]).is_none());
     }
 
