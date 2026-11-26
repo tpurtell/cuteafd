@@ -87,6 +87,9 @@ pub(crate) struct GoldenArgs {
     /// Optional path to `exl3-hy4-k45-mul1/rtx-tp{1,2}` routed expert package directory.
     #[arg(long)]
     pub(crate) expert_package: Option<PathBuf>,
+    /// Number of leading routed MoE layers to onboard on RTX (hybrid RTX+Spark parity).
+    #[arg(long)]
+    pub(crate) rtx_expert_layers: Option<usize>,
     /// Exact pages-only prefix-restore gate: prefill `tokens[..P]`, capture, restore into slot 1,
     /// assert 0 state bytes differ at P, and compare 1-token decode continuations.
     #[arg(long, value_delimiter = ',')]
@@ -265,12 +268,32 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         },
     )? as usize;
 
+    let routed_layers: Vec<usize> = cfg
+        .routed_layers()
+        .into_iter()
+        .filter(|&l| l <= args.last_layer)
+        .collect();
+    let onboard_count = match (args.rtx_expert_layers, &args.expert_package) {
+        (Some(n), _) => {
+            ensure!(
+                n <= routed_layers.len(),
+                "--rtx-expert-layers {n} exceeds {} routed layers",
+                routed_layers.len()
+            );
+            n
+        }
+        (None, Some(_)) => routed_layers.len(),
+        (None, None) => 0,
+    };
     ensure!(
-        args.expert_package.is_none() || !args.skip_routed_experts,
-        "--expert-package conflicts with --skip-routed-experts"
+        onboard_count == 0 || !args.skip_routed_experts,
+        "--rtx-expert-layers / --expert-package conflicts with --skip-routed-experts"
     );
+    let onboarded_layers = routed_layers[..onboard_count].to_vec();
+    let spark_layers = routed_layers[onboard_count..].to_vec();
+
     let onboarded: Vec<Option<crate::shared::experts::rtx::exl3::Exl3Tp2<'_>>> =
-        if let Some(pkg) = &args.expert_package {
+        if !onboarded_layers.is_empty() {
             use crate::shared::experts::rtx::{exl3::Exl3Tp2, RtxSelectionPolicy};
             let catalog = cuteafd_loader::read_expert_catalog_view(
                 checkpoint
@@ -278,18 +301,19 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                     .as_ref()
                     .context("Hy4 checkpoint view required for routed experts")?,
             )?;
-            let layers: Vec<usize> = cfg
-                .routed_layers()
-                .into_iter()
-                .filter(|&l| l <= args.last_layer)
-                .collect();
+            let pkg = super::serve::resolve_expert_package(
+                lib_path,
+                args.expert_package.as_deref(),
+                devices.len(),
+                &catalog,
+            )?;
             let budget = 80usize << 30;
             if devices.len() == 1 {
                 let w = Exl3Tp2::load_whole_weights(
                     devices[0],
                     &catalog,
-                    pkg,
-                    layers,
+                    &pkg,
+                    onboarded_layers.clone(),
                     unit.max(decode_rows),
                     budget,
                     RtxSelectionPolicy::CanonicalDecode,
@@ -301,7 +325,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                     &catalog,
                     cuteafd_core::ExpertGeometry::HY4,
                     [pkg.as_path(), pkg.as_path()],
-                    layers,
+                    onboarded_layers.clone(),
                     unit.max(decode_rows),
                     [budget, budget],
                     RtxSelectionPolicy::CanonicalDecode,
@@ -326,6 +350,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         Hy4Engine::new_serving(
             &devices,
             &programs,
+            None,
             None,
             manifest_opt,
             &checkpoint,
@@ -361,7 +386,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         )?
     };
 
-    if !args.peers.is_empty() && !args.skip_routed_experts {
+    if !args.peers.is_empty() && !args.skip_routed_experts && !spark_layers.is_empty() {
         use crate::shared::{
             placement::{spark_rings, SparkAdmission},
             spark_intake::SparkLink,
@@ -379,9 +404,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             checkpoint.view.as_ref().context("Hy4 checkpoint view required for Spark")?,
         )?;
         let capacity_rows = unit.max(decode_rows);
-        let spark_layers = cfg.routed_layers();
         let working = SparkWorkingSet {
-            rtx_layers: Vec::new(),
+            rtx_layers: onboarded_layers.clone(),
             spark_layers,
             spark_ranks: args.peers.len(),
             prefill_lanes: hy4_place::LANES,
@@ -447,7 +471,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         )?;
         session.flags |= EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16;
         devices[0].run(|| link.bootstrap(&session))?;
-        engine.attach_spark(link, Vec::new());
+        engine.attach_spark(link, onboarded_layers);
     }
 
     engine.dump_dir = args.dump_dir.clone();
