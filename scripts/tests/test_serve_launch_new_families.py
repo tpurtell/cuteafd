@@ -94,6 +94,15 @@ def test_hy4_flash_launcher_composes_0spark_and_spark_argv(tmp_path: Path) -> No
     assert _flag(serve_s4, "--core-view") == "k6-compact"
     assert _flag(serve_s4, "--peers") == ",".join(f"10.0.0.{i + 1}:19441" for i in range(4))
     assert "--split-device" not in shlex.split(serve_s4)
+    assert _flag(serve_s4, "--l2-prefetch") is None
+
+    res_l2 = _family_launch_result(
+        tmp_path / "s4-l2", config, "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
+        keys_s4 + "L2_PREFETCH=off\n",
+        physical_gpus=(0,), extra_args=("--wip", "hy4f"), encoder_plan={**PLANNED, "spark_ranks": 4},
+        deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
+    )
+    assert _flag(_line(res_l2, "serve-hy4f --snapshot"), "--l2-prefetch") == "off"
 
 
 def test_hy4_launcher_composes_1rtx_4spark_and_2rtx_6spark_argv(tmp_path: Path) -> None:
@@ -133,13 +142,14 @@ def test_hy4_launcher_composes_1rtx_4spark_and_2rtx_6spark_argv(tmp_path: Path) 
 
     res_heads = _family_launch_result(
         tmp_path / "hy4-heads", config, "wrldsuksgo2mars/Hy4-EXL3-K4-MC",
-        keys_max + "ATTENTION_PLACEMENT=heads\n",
+        keys_max + "ATTENTION_PLACEMENT=heads\nL2_PREFETCH=auto\n",
         physical_gpus=(0, 1), extra_args=("--wip", "hy4"), encoder_plan={**PLANNED, "spark_ranks": 6},
         deployment_overrides={"prefill_unit_rows": 2048, "prefill_waves": 1},
     )
     serve_heads = _line(res_heads, "serve-hy4 --snapshot")
     plan_heads = _line(res_heads, "cuteafd plan")
     assert "CUTEAFD_ATTENTION_PLACEMENT=heads" in serve_heads
+    assert _flag(serve_heads, "--l2-prefetch") == "auto"
     assert _flag(plan_heads, "--attention-placement") == "heads"
 
 
@@ -161,7 +171,7 @@ def test_hy4_standard_options_wire_through_launcher(tmp_path: Path, core_view: s
         "POOL_TOKENS=auto\nHOST_CACHE_BYTES=auto\nKV_CACHE=fp8\n"
         "VISION=auto\nAUDIO=off\nVISION_REPLICAS=1\nMEDIA_CACHE_BYTES=256MiB\n"
         "DECODE_ROWS=64\nRTX_EXPERT_LAYERS=auto\nEXPERT_USAGE=on\n"
-        f"PREFILL_PACKING=unrestricted\nGRAPH_PREWARM=on\nSPECULATION_TRACE={trace_path}\n"
+        f"PREFILL_PACKING=unrestricted\nGRAPH_PREWARM=on\nSPECULATION_TRACE={trace_path}\nL2_PREFETCH=auto\n"
         + four
     )
     res = _family_launch_result(
@@ -180,6 +190,7 @@ def test_hy4_standard_options_wire_through_launcher(tmp_path: Path, core_view: s
     assert _flag(serve, "--media-cache-bytes") == "256MiB"
     assert _flag(plan, "--media-cache-bytes") == "256MiB"
     assert _flag(serve, "--decode-rows") == "64"
+    assert _flag(serve, "--l2-prefetch") == "auto"
     assert _flag(serve, "--rtx-expert-layers") == "auto"
     assert "--expert-usage" in shlex.split(serve)
     assert "--pool-tokens" not in shlex.split(serve)
@@ -188,7 +199,6 @@ def test_hy4_standard_options_wire_through_launcher(tmp_path: Path, core_view: s
 
 
 @pytest.mark.parametrize("bad_key,needle", [
-    ("L2_PREFETCH=auto\n", "L2_PREFETCH is unsupported for Hy4"),
     ("PREFIX_CACHE_MARK_MIB=64\n", "unused configuration key: PREFIX_CACHE_MARK_MIB"),
     ("ATTENTION_PLACEMENT=layers\n", "layers is not implemented"),
     ("EMBEDDING=host\n", "GPU token embeddings only"),

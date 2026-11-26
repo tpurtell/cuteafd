@@ -2135,7 +2135,6 @@ if [[ $family == inkling2_mini ]]; then
   fi
 fi
 if [[ $family == hy4_flash ]]; then
-  [[ -z "$(get L2_PREFETCH)" ]] || release_die "L2_PREFETCH is unsupported for Hy4-flash"
   hy4_kv="$(get KV_CACHE fp8)"
   case "$hy4_kv" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$hy4_kv")
@@ -2143,7 +2142,6 @@ if [[ $family == hy4_flash ]]; then
   if [[ "$speculator" == dfly2 ]]; then family_args+=(--dfly2); else family_args+=(--dfly2=false); fi
 fi
 if [[ $family == hy4 ]]; then
-  [[ -z "$(get L2_PREFETCH)" ]] || release_die "L2_PREFETCH is unsupported for Hy4"
   hy4_kv="$(get KV_CACHE fp8)"
   case "$hy4_kv" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$hy4_kv")
@@ -2197,10 +2195,11 @@ if [[ "$family" == glm5 || "$family" == glm5_flash || "$family" == deepseek_v41 
   case "$draft_kv_cache" in bf16|fp8) ;; *) release_die "DRAFT_KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--draft-kv-cache "$draft_kv_cache")
 fi
-# GLM, GLM Flash, MiMo, Qwen: L2_PREFETCH (off, auto = 3/4 of the L2, or MiB;
-# unset: auto for GLM 5.3 and GLM 5.3 Flash, off for MiMo and Qwen) pulls the
-# next layer's weights into L2 during each one-lane decode step's Spark exchange; FP8_SCALES (amax, pow2, best) is the scale rule of the FP8
-# copies made from BF16 weights at load.
+# GLM, GLM Flash, Hy4, Hy4-flash, MiMo, Qwen: L2_PREFETCH (off, auto = 3/4 of
+# the L2, or MiB; unset: auto for GLM 5.3, GLM 5.3 Flash, Hy4 and Hy4-flash,
+# off for MiMo and Qwen) pulls the next layer's weights into L2 during each
+# one-lane decode step's Spark exchange; FP8_SCALES (amax, pow2, best) is the
+# scale rule of the FP8 copies made from BF16 weights at load.
 if [[ $serve != serve-dsv4 ]]; then
   [[ -z "$(get L2_PREFETCH)" ]] || family_args+=(--l2-prefetch "$(get L2_PREFETCH)")
   [[ -z "$(get FP8_SCALES)" ]] || family_args+=(--fp8-scales "$(get FP8_SCALES)")

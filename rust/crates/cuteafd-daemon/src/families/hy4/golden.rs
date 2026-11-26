@@ -112,6 +112,8 @@ pub(crate) struct GoldenArgs {
     /// (prompt A in wave k, prompt B in wave k+1) via the shared Hy4 wave harness.
     #[arg(long)]
     pub(crate) verify_waves: bool,
+    #[command(flatten)]
+    pub(crate) l2: crate::shared::l2_prefetch::L2PrefetchArgs,
 }
 
 fn load_published_hy4_reference(
@@ -481,6 +483,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         )?;
         engine.attach_spark(link, onboarded_layers);
     }
+    engine.configure_l2_prefetch(&args.l2)?;
 
     engine.dump_dir = args.dump_dir.clone();
     if args.decode_graphs {

@@ -350,6 +350,30 @@ impl<'a> Hy4RankWeights<'a> {
         kv_b_absorbed_ptrs(buf, local_heads, 192, 256, 512)
     }
 
+    /// Per-layer decode L2 prefetch ranges for this rank's resident weights
+    /// (native compact core or original BF16), prioritizing `q_b_proj`,
+    /// `linear_gate`, `o_proj`, and after the final layer `hc_head` + `lm_head`.
+    pub(crate) fn decode_read_order(&self, layers: usize) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
+        crate::families::hy4_common::weights::decode_prefetch_order(
+            layers,
+            &[
+                "self_attn.indexer.wq_b",
+                "self_attn.indexer.wk",
+                "self_attn.indexer.weights_proj",
+            ],
+            |stem| {
+                if let Some(ranges) = self.native.ranges(stem) {
+                    return ranges;
+                }
+                self.views
+                    .get(stem)
+                    .or_else(|| self.views.get(&format!("{stem}.weight")))
+                    .map(|a| vec![(a.buffer.ptr.cast_const(), a.buffer.bytes)])
+                    .unwrap_or_default()
+            },
+        )
+    }
+
     /// Record the packed target weight arena (one physical backing + all named views)
     /// and optional BF16 head workspace into `inventory`.
     pub(crate) fn inventory(
