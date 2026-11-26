@@ -1658,7 +1658,8 @@ fi
 speculator="$(get SPECULATOR)"
 if [[ "$family" == kimi_k3 ]]; then kimi_requested_speculator="$speculator"; speculator=off; fi
 # MiniMax uses its bundled native drafter on whole, Layers and Heads placements.
-if [[ ( "$family" == minimax_m3 || "$family" == inkling2 || "$family" == inkling2_mini ) && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
+if [[ ( "$family" == minimax_m3 || "$family" == inkling2 ) && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dspark; fi
+if [[ "$family" == inkling2_mini && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=dflash2; fi
 # Qwen resolves auto only after expert admission, not from configured inventory.
 if [[ "$family" == qwen4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then speculator=auto; fi
 if [[ "$family" == hy4_flash && ( -z "$speculator" || "$speculator" == auto ) ]]; then

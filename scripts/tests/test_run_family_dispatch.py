@@ -971,6 +971,9 @@ def _family_launch_result(tmp_path: Path, family_config: dict, model: str, keys:
         shutil.copytree(checkpoint_source, staged, dirs_exist_ok=True, copy_function=os.link)
     if family_config.get("model_type") == "glm_moe_dsa" and not (hf / "hub/models--incoai--GLM-5.3-DFlash2").exists():
         _snapshot(hf, "incoai/GLM-5.3-DFlash2", {"architectures": ["DFlash2DraftModel"]})
+    if family_config.get("model_type") == "inkling2_loop":
+        _snapshot(hf, "incoai/Inkling-2-Mini-DFlash2", {"architectures": ["DFlash2DraftModel"]},
+                  "4f9088ea66c21f2b99ed657d1941c306b03e84d2")
     if family_config.get("model_type") == "muse_spark" and not (
             hf / "hub/models--nvidia--Muse-Spark-Open-816B-A42B-DFlash2").exists():
         # Muse's plan reads the drafter it charges, so stage the shipped
@@ -6162,7 +6165,9 @@ def test_other_family_refuses_unimplemented_context_window(tmp_path):
 
 
 @pytest.mark.parametrize("extra,want_dspark,want_graphs", [
-    ("", True, "1"),
+    ("", False, "1"),
+    ("SPECULATOR=auto\n", False, "1"),
+    ("SPECULATOR=dspark\n", True, "1"),
     ("SPECULATOR=off\nDECODE_GRAPHS=off\n", False, "0"),
 ])
 def test_inkling2_mini_tp1_launch_dispatch(tmp_path, extra, want_dspark, want_graphs):
@@ -6180,6 +6185,10 @@ def test_inkling2_mini_tp1_launch_dispatch(tmp_path, extra, want_dspark, want_gr
         assert "--draft-kv-cache fp8" in serve
     else:
         assert "--dspark=false" in serve
+        if "SPECULATOR=off" not in extra:
+            assert "--draft " in serve and "4f9088ea66c21f2b99ed657d1941c306b03e84d2" in serve
+        else:
+            assert "--draft " not in serve
 
 
 def test_inkling2_mini_refuses_non_heads_attention_placement(tmp_path):

@@ -334,7 +334,7 @@ Inkling 2 Mini (`inkling2_mini`, `inkling2_loop`) exposes `cuteafd serve --famil
 All 24 physical routed-expert layers stay resident on GPU 0 (native NVFP4 W4A4 layers `0..20` +
 native MXFP8 W8A8 layers `20..24`), executed across 48 visits with 48 distinct KV + short-conv slots
 (8 global paged slots defaulting to FP8 + 40 SWA-1024 rings). `SPECULATOR=off|dspark|dflash2` defaults to
-`dspark` (bundled 3-layer recurrent Markov drafter). `dflash2` selects
+`dflash2`; `dspark` selects the bundled 3-layer recurrent Markov drafter. `dflash2` selects
 `incoai/Inkling-2-Mini-DFlash2` at revision `4f9088ea66c21f2b99ed657d1941c306b03e84d2`
 (or `SPECULATOR_MODEL_ID` / `SPECULATOR_MODEL_REVISION`), sharing target embedding and head.
 Both accept `DRAFT_KV_CACHE=fp8|bf16`. `VISION=auto|rtx|off`
@@ -1206,8 +1206,8 @@ Speculator (`SPECULATOR`):
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Inkling Mini | Hy4-flash | MiniMax |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `off` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) | ✓ | ✓ (default) | ✓ |
-| `dflash2` | ✗ | ✗ | ✓ (default) | ✓ (default) | ✓ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) | ✗ | ✓ | ✗ | ✗ |
-| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (content-paired K3.1 default in every view/layout; otherwise opt-in) | ✗ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) |
+| `dflash2` | ✗ | ✗ | ✓ (default) | ✓ (default) | ✓ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) | ✗ | ✓ (default) | ✗ | ✗ |
+| `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (content-paired K3.1 default in every view/layout; otherwise opt-in) | ✗ | ✗ | ✗ | ✓ | ✗ | ✓ (default) |
 | `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ | ✗ | ✗ | ✗ | ✗ |
 | `dfly2` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ |
 

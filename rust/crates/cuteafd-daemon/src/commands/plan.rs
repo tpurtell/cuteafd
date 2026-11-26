@@ -1111,7 +1111,8 @@ fn resolve_speculator(args: &mut PlanArgs, snapshot: &std::path::Path, family: &
             (args.speculator != "auto").then_some(args.speculator.as_str()),cfg.get("SPECULATOR").map(String::as_str), kimi_qualification(&args, &cfg))?.value;
     }
     let default = match family {
-        "minimax_m3" | "inkling2" | "inkling2_mini" => "dspark",
+        "minimax_m3" | "inkling2" => "dspark",
+        "inkling2_mini" => "dflash2",
         "hy4_flash" if (args.include_speculator || (args.speculator == "auto"
             && cfg.get("SPECULATOR").is_none_or(|value| value == "auto")))
             && cuteafd_loader::families::hy4_flash::Hy4DflyConfig::bundled(
@@ -1957,6 +1958,18 @@ mod tests {
         assert_eq!(options(&args).unwrap().layout.unwrap().draft_kv_cache, Qwen4KvCache::Bf16);
         args.draft_fp8 = Some(true);
         assert!(resolve_family_config(&mut args, "inkling2", &config).is_err());
+    }
+
+    #[test]
+    fn mini_speculator_defaults_to_dflash2_and_preserves_explicit_modes() {
+        use cuteafd_loader::plan::spec::DraftOwnership;
+        for (requested, expected) in [("auto", "dflash2"), ("dflash2", "dflash2"), ("dspark", "dspark"), ("off", "off")] {
+            let mut request = args(std::path::Path::new("/model"), 0, false);
+            request.speculator = requested.into();
+            resolve_speculator(&mut request, std::path::Path::new("/model"), "inkling2_mini", &Default::default()).unwrap();
+            assert_eq!(request.speculator, expected);
+            assert_eq!(DraftOwnership::selected("inkling2_mini", expected).uses_checkpoint(), expected == "dspark");
+        }
     }
 
     #[test]
