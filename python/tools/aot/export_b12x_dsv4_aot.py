@@ -640,6 +640,7 @@ def inkling2_mini_producer_programs(prefill_rows: int):
     from b12x.integration.cuteafd.inkling2_residual import compile_inkling2_residual_aot
     from b12x.integration.cuteafd.inkling2_loop_controller import (
         compile_inkling2_loop_pair_norm_aot, compile_inkling2_loop_blend_norm_aot,
+        compile_inkling2_mini_controller_down_aot, compile_inkling2_mini_controller_up_aot,
     )
     from b12x.integration.cuteafd.inkling2_router import compile_inkling2_router_aot, compile_inkling2_gate_aot
     from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_norm_aot, compile_inkling2_kv_pack_aot
@@ -687,6 +688,8 @@ def inkling2_mini_producer_programs(prefill_rows: int):
         add(f"loop_blend_norm_s{slots}{tag}", "loop_blend_norm",
             compile_inkling2_loop_blend_norm_aot, hidden=2304, slots=slots,
             broadcast_dest=bcast, broadcast_weight=bcast)
+    add("controller_down", "controller_down", compile_inkling2_mini_controller_down_aot)
+    add("controller_up", "controller_up", compile_inkling2_mini_controller_up_aot)
     add("router_e128_k8", "router", compile_inkling2_router_aot, experts=128, topk=8, route_scale=8.)
     return result
 

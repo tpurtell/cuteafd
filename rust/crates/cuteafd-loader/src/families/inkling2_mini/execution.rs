@@ -144,6 +144,7 @@ impl MiniUnitLayout {
 
         // Looped cross-pass controller workspaces (slots=1 for MLP, slots=3 for attn/k/v).
         add("ctrl_paired", 3 * 2 * t.hidden, 2)?; // [3, rows, 4608] BF16
+        add("ctrl_down_partial", 8 * lp.gate_rank, 4)?; // [8, rows, 64] F32, reused serially
         add("ctrl_rank", 3 * lp.gate_rank, 2)?; // [3, rows, 64] BF16 (exact f1940f40eb down_proj output)
         add("ctrl_fg", 3 * 2 * t.hidden, 4)?; // [3, rows, 4608] F32 (exact f1940f40eb forget/gain)
         add("ctrl_out", 3 * t.hidden, 2)?; // [3, rows, 2304] BF16 ([xq, xk, xv] after blend+norm)
@@ -413,6 +414,7 @@ mod tests {
         assert_eq!(decode.blocks, 5);
         assert_eq!(decode.buffers["residual_arena"], 5 * 64 * 2304 * 4);
         assert_eq!(decode.buffers["prev_pass_arena"], 2 * 64 * 2304 * 4);
+        assert_eq!(decode.buffers["ctrl_down_partial"], 8 * 64 * 64 * 4);
         assert_eq!(decode.buffers["cross_pass_msg"], 4 * 64 * 2304 * 4);
         assert_eq!(decode.buffers["expert_wire"], 64 * 2376);
         assert!(decode.buffers.contains_key("decode_zero_bf16"));

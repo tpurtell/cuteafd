@@ -104,7 +104,7 @@ impl<'a> MiniKernels<'a> {
                 broadcast_weight,
             });
         }
-        ops.push(Op::Router);
+        ops.extend([Op::Router, Op::ControllerDown, Op::ControllerUp]);
         let mut producers = BTreeMap::new();
         for op in ops {
             producers.insert(op.name()?, Producer::load(programs, op)?);
@@ -142,7 +142,6 @@ impl<'a> MiniKernels<'a> {
                 (HIDDEN, KV_WIDTH),
                 (Q_WIDTH, HIDDEN),
                 (64, 1024),
-                (2 * HIDDEN, GATE_RANK),
             ],
             4096,
             ProjectionOutput::Bf16,
@@ -153,7 +152,6 @@ impl<'a> MiniKernels<'a> {
                 (HIDDEN, HEADS),     // attn_sink_proj -> F32 sinks
                 (HIDDEN, 32),        // dynamic conv weight_proj -> F32 taps
                 (HIDDEN, 128),       // router mlp.gate -> F32 logits
-                (GATE_RANK, 2 * HIDDEN), // controller [forget; gain] -> F32
             ],
             4096,
             ProjectionOutput::F32,
@@ -491,24 +489,15 @@ pub(crate) fn begin_visit<'a>(
             let p_slot = slice(paired, slot * rows * 2 * HIDDEN * 2, rows * 2 * HIDDEN * 2)?;
             let r_slot = slice(rank, slot * rows * GATE_RANK * 2, rows * GATE_RANK * 2)?;
             let fg_slot = slice(fg, slot * rows * 2 * HIDDEN * 4, rows * 2 * HIDDEN * 4)?;
-            k.project_bf16(
-                owner,
-                p_slot,
-                w(&format!("controllers.{stream_name}.down_weight"))?,
-                r_slot,
-                rows,
-                2 * HIDDEN,
-                GATE_RANK,
-            )?;
-            k.project_f32(
-                owner,
-                r_slot,
-                w(&format!("controllers.{stream_name}.forget_gain_weight"))?,
-                fg_slot,
-                rows,
-                GATE_RANK,
-                2 * HIDDEN,
-            )?;
+            // SAFETY: each slot's dense views and the reusable split-K owner survive the stream.
+            unsafe {
+                k.producer(Op::ControllerDown)?.launch(
+                    &[p_slot, w(&format!("controllers.{stream_name}.down_weight"))?, r_slot, b("ctrl_down_partial")?],
+                    rows, None, owner.stream().raw)?;
+                k.producer(Op::ControllerUp)?.launch(
+                    &[r_slot, w(&format!("controllers.{stream_name}.forget_gain_weight"))?, fg_slot],
+                    rows, None, owner.stream().raw)?;
+            }
         }
         let norm_w = w(if local { "attn_norm.weight" } else { "qkv_input_norm.weight" })?;
         // SAFETY: fused F32 tanh blend + weighted RMSNorm -> BF16 [3, rows, 2304].
@@ -790,8 +779,13 @@ pub(crate) fn begin_visit<'a>(
             })?
             .launch(&[b("mixed")?, msg_mlp, p0], rows, None, owner.stream().raw)?;
         }
-        k.project_bf16(owner, p0, w("controllers.mlp.down_weight")?, r0, rows, 2 * HIDDEN, GATE_RANK)?;
-        k.project_f32(owner, r0, w("controllers.mlp.forget_gain_weight")?, fg0, rows, GATE_RANK, 2 * HIDDEN)?;
+        // SAFETY: retained dense MLP controller views and unit-owned split-K workspace.
+        unsafe {
+            k.producer(Op::ControllerDown)?.launch(
+                &[p0, w("controllers.mlp.down_weight")?, r0, b("ctrl_down_partial")?], rows, None, owner.stream().raw)?;
+            k.producer(Op::ControllerUp)?.launch(
+                &[r0, w("controllers.mlp.forget_gain_weight")?, fg0], rows, None, owner.stream().raw)?;
+        }
         unsafe {
             k.producer(Op::LoopBlendNorm {
                 slots: 1,

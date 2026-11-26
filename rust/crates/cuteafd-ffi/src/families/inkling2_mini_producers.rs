@@ -12,6 +12,8 @@ pub enum Op {
     Residual { queries: usize, max_candidates: usize, addend: bool },
     LoopPairNorm { slots: usize, broadcast_dest: bool },
     LoopBlendNorm { slots: usize, broadcast_dest: bool, broadcast_weight: bool },
+    ControllerDown,
+    ControllerUp,
     Router,
     Gate { precision: Precision },
     Norm { value: bool, precision: Precision },
@@ -51,6 +53,8 @@ impl Op {
                     "Inkling 2 Mini loop blend_norm geometry unsupported");
                 format!("loop_blend_norm_s{slots}{}", if broadcast_dest { "_bcast" } else { "" })
             }
+            Self::ControllerDown => "controller_down".into(),
+            Self::ControllerUp => "controller_up".into(),
             Self::Router => "router_e128_k8".into(),
             Self::Gate { precision } => format!("gate_h3072_{}", precision_suffix(precision)),
             Self::Norm { value, precision } => if value {
@@ -69,6 +73,8 @@ impl Op {
             Self::Residual { .. } => &["arena", "addend", "query", "out"],
             Self::LoopPairNorm { .. } => &["dest", "msg", "out"],
             Self::LoopBlendNorm { .. } => &["dest", "msg", "forget_gain", "weight", "out"],
+            Self::ControllerDown => &["x", "w", "out", "partial"],
+            Self::ControllerUp => &["x", "w", "out"],
             Self::Router => &["logits", "bias", "ids", "weights"],
             Self::Gate { .. } => &["x", "gate", "gamma", "out"],
             Self::Norm { .. } => &["x", "weight", "out"],
@@ -90,8 +96,11 @@ impl<'a> Producer<'a> {
         let kinds: &[u8] = if matches!(op, Op::Residual { .. }) { b"iii" }
             else if matches!(op, Op::Convolution { .. }) { b"il" }
             else { b"i" };
+        let scratch_ok = if op == Op::ControllerDown {
+            spec.scratch.len() == 1 && spec.scratch.get("partial") == Some(&(u64::from(spec.capacity_rows) * 8 * 64 * 4))
+        } else { spec.scratch.is_empty() };
         ensure!(spec.capacity_rows > 0 && spec.capacity_rows <= 4096 && spec.scalar_kinds == kinds
-            && spec.scratch.is_empty(), "Inkling 2 Mini producer export capacity/scalars/scratch differs");
+            && scratch_ok, "Inkling 2 Mini producer export capacity/scalars/scratch differs");
         let g = &spec.geometry;
         let equal = |name: &str, expected: serde_json::Value| -> Result<()> {
             ensure!(g[name] == expected,
@@ -131,6 +140,16 @@ impl<'a> Producer<'a> {
                 equal("broadcast_weight", broadcast_weight.into())?;
                 equal("eps", 1e-6.into())?;
             }
+            Op::ControllerDown => {
+                equal("width", 4608.into())?; equal("outputs", 64.into())?;
+                equal("output_dtype", "torch.bfloat16".into())?;
+                equal("reduction", "split8_ordered_k16_fold".into())?; equal("splits", 8.into())?;
+            }
+            Op::ControllerUp => {
+                equal("width", 64.into())?; equal("outputs", 4608.into())?;
+                equal("output_dtype", "torch.float32".into())?;
+                equal("reduction", "ordered_k16".into())?;
+            }
             Op::Router => {
                 equal("experts", 128.into())?; equal("topk", 8.into())?; equal("route_scale", 8.0.into())?;
             }
@@ -168,6 +187,13 @@ impl<'a> Producer<'a> {
         ensure!(rows > 0 && rows <= self.rows && buffers.len() == self.op.pointers().len()
             && buffers.iter().all(|b| !b.ptr.is_null() && b.device_id == buffers[0].device_id && b.flags == 0),
             "Inkling 2 Mini producer live rows/device/pointer count differs");
+        let required = match self.op {
+            Op::ControllerDown => vec![rows * 4608 * 2, 64 * 4608 * 2, rows * 64 * 2, rows * 8 * 64 * 4],
+            Op::ControllerUp => vec![rows * 64 * 2, 4608 * 64 * 2, rows * 4608 * 4],
+            _ => vec![],
+        };
+        ensure!(buffers.iter().zip(required).all(|(b, size)| b.bytes >= size && b.ptr as usize % 16 == 0),
+            "Inkling 2 Mini controller projection extent/alignment differs");
         let mut scalars = vec![Scalar::I32(rows as i32)];
         match (self.op, residual) {
             (Op::Residual { max_candidates, .. }, Some((arena_rows, candidates))) => {
