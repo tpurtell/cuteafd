@@ -915,6 +915,7 @@ def preflight_at_grant(job, arm):
     queued behind a running task that still holds a container of the same name."""
     artifacts = preflight_job(job, arm)
     assert_absent(job)
+    assert_port_free(job)
     if 'memory' in job['probes']:
         save(Path(job['entry']['set']['PROFILE_DIR']) / 'observer-context.json', {'pending': True})
     return artifacts
@@ -2962,6 +2963,16 @@ def write_summary(state, rows, arms):
     (state / 'summary.md').write_text(text)
 
 
+def bound_ports(stdout):
+    """Local TCP listen ports from `ss -Hltn` output."""
+    ports = set()
+    for line in stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and fields[3].rpartition(':')[2].isdigit():
+            ports.add(int(fields[3].rpartition(':')[2]))
+    return ports
+
+
 def assert_absent(job):
     for host, name in container_targets(job):
         cmd = ['docker', 'ps', '-a', '--format', '{{.Names}}']
@@ -2969,6 +2980,14 @@ def assert_absent(job):
             cmd = ['ssh', '-o', 'BatchMode=yes', host, shlex.join(cmd)]
         if name in run(cmd).stdout.splitlines():
             raise ValueError('refusing existing (possibly foreign) container: ' + name)
+
+
+def assert_port_free(job):
+    """Two separate jobs on disjoint GPUs can share a kit entry's fixed ADDR port;
+    the second would then measure the first job's server. Refuse a bound port."""
+    port = int(resolve_container_keys(job['entry'])['addr'].rpartition(':')[2])
+    if port in bound_ports(run(['ss', '-Hltn']).stdout):
+        raise ValueError(f'refusing card: ADDR port {port} is already bound on raptor (another server is listening)')
 
 
 def slot_check(arm, host):
