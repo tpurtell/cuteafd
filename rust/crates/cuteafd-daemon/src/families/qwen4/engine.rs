@@ -1888,6 +1888,14 @@ impl<'a> Qwen4Engine<'a> {
         self.stage(w, dev.buffer, bytes_of(values))
     }
 
+    pub(crate) fn stream_for_device(&self, device_id: i32) -> Result<&crate::shared::memory::device::Stream<'a>> {
+        self.rank_streams
+            .iter()
+            .find(|s| s.device.id == device_id)
+            .map(Rc::as_ref)
+            .with_context(|| format!("Qwen state stream missing for device {device_id}"))
+    }
+
     fn download(&self, dev: &Dev<'_>, bytes: usize) -> Result<Vec<u8>> {
         let stream = &self.rank_streams[self.active_owner.get()];
         stream.drain()?;

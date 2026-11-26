@@ -1219,17 +1219,21 @@ impl Opened {
             crate::shared::memory::device::Device { library: &self.library, id: args.device })?);
         let stream = stream_owner.raw;
 
-        let peer_stream = match split_device {
+        let peer_stream_owner = match split_device {
             Some(device) => {
                 // Peer access both ways first: the loader slices weights over peer copies.
                 self.library.cuda_enable_peer(device)?;
                 self.library.cuda_set_device(device)?;
-                let stream = self.library.cuda_enable_peer(args.device).and_then(|()| self.library.cuda_stream_create());
+                let peer_enabled = self.library.cuda_enable_peer(args.device);
                 self.library.cuda_set_device(args.device)?;
-                Some((device, stream?))
+                peer_enabled?;
+                let owner = std::rc::Rc::new(crate::shared::memory::device::Stream::new(
+                    crate::shared::memory::device::Device { library: &self.library, id: device })?);
+                Some((device, owner))
             }
             None => None,
         };
+        let peer_stream = peer_stream_owner.as_ref().map(|(device, owner)| (*device, owner.raw));
         let started = Instant::now();
         let layers = args.layers.unwrap_or(self.cfg.layers).min(self.cfg.layers);
         let loader = weights::MimoLoader { library: &self.library, checkpoint: &self.checkpoint, stream,
@@ -1385,8 +1389,8 @@ impl Opened {
                     bytes_per_token = per_token, tokens_per_gib = (1usize << 30) / per_token.max(1),
                     ring_mib_per_sequence = format!("{:.2}", ring_bytes as f64 / (1u64 << 20) as f64), "MiMo KV records");
             }
-            if let Some((device, stream)) = peer_stream {
-                engine.attach_peer(device, stream, shares.pop().context("head-split shares")?,
+            if let Some((device, ref peer_owner)) = peer_stream_owner {
+                engine.attach_peer(device, std::rc::Rc::clone(peer_owner), shares.pop().context("head-split shares")?,
                     usize::try_from(preflight.working_set.prefill_lanes)?)?;
             }
             if preflight.graph_layout.enabled {
@@ -1541,6 +1545,7 @@ impl Opened {
         // SAFETY: both stream handles were created here and remain owned here.
         // All native/transport/copy consumers have drained before engine Drop.
         let mut stream_owner = Some(stream_owner);
+        let mut peer_stream_owner = peer_stream_owner;
         unsafe {
             teardown::finish(result, peer_stream.is_some(), |step| match step {
                 teardown::CleanupStep::LeadStream => {
@@ -1550,9 +1555,10 @@ impl Opened {
                         .destroy()
                 }
                 teardown::CleanupStep::PeerStream => {
-                    if let Some((device, stream)) = peer_stream {
-                        self.library.cuda_set_device(device)?;
-                        self.library.cuda_stream_destroy(stream)?;
+                    if let Some((_, peer_owner)) = peer_stream_owner.take() {
+                        std::rc::Rc::into_inner(peer_owner)
+                            .context("mimo peer stream still referenced")?
+                            .destroy()?;
                     }
                     Ok(())
                 }
@@ -2255,9 +2261,8 @@ fn kv_rows(engine: &engine::MimoEngine<'_>, placement: &engine::MimoPlacement, f
                     ensure!(offset + bytes <= buffer.bytes, "KV rows outside their buffer");
                     let start = out.len();
                     out.resize(start + bytes, 0);
-                    // SAFETY: `engine.stream_of(rank)` owns rank's KV writes on this device.
-                    unsafe { engine.library.copy_d2h(&mut out[start..], cuteafd_ffi::CuteafdDeviceBuffer {
-                        ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer }, engine.stream_of(rank))?; }
+                    engine.rank_stream(rank).copy_d2h(&mut out[start..], cuteafd_ffi::CuteafdDeviceBuffer {
+                        ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })?;
                     position += rows;
                 }
             }
@@ -2268,10 +2273,9 @@ fn kv_rows(engine: &engine::MimoEngine<'_>, placement: &engine::MimoPlacement, f
 }
 
 fn opened_copy(engine: &engine::MimoEngine<'_>, out: &mut [u8], source: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<()> {
-    // SAFETY: the engine owns this stream; draining it retires every write to `source`.
-    unsafe { engine.library.cuda_stream_synchronize(engine.stream)?; }
-    // SAFETY: `engine.stream` produced `source` on this device and remains live.
-    unsafe { engine.library.copy_d2h(out, source, engine.stream) }
+    let stream = engine.rank_stream(0);
+    stream.drain()?;
+    stream.copy_d2h(out, source)
 }
 
 fn resume_mtp_check(engine: &engine::MimoEngine<'_>, tokens: &[u32], at: usize,
@@ -2362,13 +2366,10 @@ fn resume_check(args: &GoldenArgs, engine: &engine::MimoEngine<'_>, tokens: &[u3
             let template = engine.kv_layer_on(rank, 0).1;
             let start = bytes.len();
             bytes.resize(start + range.bytes, 0);
-            crate::shared::memory::device::Device { library: engine.library, id: template.device_id }.run(|| {
-                // SAFETY: this rank owns the stream; retire its capture before reading its mark.
-                unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))?; }
-                // SAFETY: `engine.stream_of(rank)` owns this rank's mark on `template.device_id`.
-                unsafe { engine.library.copy_d2h(&mut bytes[start..], cuteafd_ffi::CuteafdDeviceBuffer {
-                    ptr: range.addr as *mut std::ffi::c_void, bytes: range.bytes, ..template }, engine.stream_of(rank)) }
-            })?;
+            let stream = engine.rank_stream(rank);
+            stream.drain()?;
+            stream.copy_d2h(&mut bytes[start..], cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: range.addr as *mut std::ffi::c_void, bytes: range.bytes, ..template })?;
         }
         ensure!(bytes.len() == family.mark_bytes(), "positional mark byte coverage differs from its layout");
         Ok(bytes)

@@ -485,16 +485,14 @@ impl Runner<'_, '_, '_> {
 }
 
 fn download(engine: &Engine<'_>, range: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
-    // SAFETY: the engine owns this stream; draining it retires every write to `range`.
     for rank in 0..engine.ranks() {
-        unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))? };
+        engine.rank_stream(rank).drain()?;
     }
     let mut bytes = vec![0u8; range.bytes];
     let rank = (0..engine.ranks())
         .find(|&r| engine.device_of(r) == range.device_id)
         .unwrap_or(0);
-    // SAFETY: `engine.stream_of(rank)` owns `range`'s device work and remains live.
-    engine.on(rank, || unsafe { engine.library.copy_d2h(&mut bytes, range, engine.stream_of(rank)) })?;
+    engine.rank_stream(rank).copy_d2h(&mut bytes, range)?;
     Ok(bytes)
 }
 
@@ -587,8 +585,7 @@ pub(super) fn packed_state(engine: &Engine<'_>, placement: &Placement, clear: bo
             else {
                 let first = out.bytes.len();
                 out.bytes.resize(first + buffer.bytes, 0);
-                // SAFETY: `engine.stream_of(rank)` produced `buffer` on rank's device and remains live.
-                unsafe { engine.library.copy_d2h(&mut out.bytes[first..], buffer, engine.stream_of(rank))?; }
+                engine.rank_stream(rank).copy_d2h(&mut out.bytes[first..], buffer)?;
                 out.tensors.push((name, first..out.bytes.len()));
             }
             Ok(())

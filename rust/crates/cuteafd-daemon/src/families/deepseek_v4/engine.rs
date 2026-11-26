@@ -186,6 +186,7 @@ pub(crate) struct Engine<'a> {
 pub(crate) struct V4Peer<'a> {
     pub device: i32,
     pub stream: *mut c_void,
+    stream_owner: std::rc::Rc<crate::shared::memory::device::Stream<'a>>,
     pub layers: Vec<LayerWeights<'a>>,
     pools: Vec<LayerCache<'a>>,
     rope_window: Dev<'a>,
@@ -490,6 +491,14 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The `Stream` wrapper of rank `rank`.
+    pub(crate) fn rank_stream(&self, rank: usize) -> &crate::shared::memory::device::Stream<'a> {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.stream_owner,
+            _ => &self.stream_owner,
+        }
+    }
+
     /// The CUDA device index of rank `rank`.
     pub(crate) fn device_of(&self, rank: usize) -> i32 {
         self.peer.as_ref().filter(|_| rank == 1).map_or(self.device, |peer| peer.device)
@@ -512,8 +521,9 @@ impl<'a> Engine<'a> {
     /// Attaches the head split's second GPU: `device` with `stream`, holding
     /// `layers` (every backbone layer's rank-1 share). Loads the programs there and
     /// allocates its caches, RoPE tables and the exchange (four slots per prefill lane).
-    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<LayerWeights<'a>>, parts: PeerParts)
+    pub fn attach_peer(&mut self, device: i32, stream_owner: std::rc::Rc<crate::shared::memory::device::Stream<'a>>, layers: Vec<LayerWeights<'a>>, parts: PeerParts)
         -> Result<()> {
+        let stream = stream_owner.raw;
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("peer-split");
         ensure!(self.split_family.is_some() && layers.len() == self.cfg.n_layers && layers.iter().all(|l| l.attention_split && l.ffn_split),
             "attach_peer needs the head-split shares of every backbone layer");
@@ -531,7 +541,7 @@ impl<'a> Engine<'a> {
                 self.context_mode.is_some(), 0, self.max_context, self.prefill_waves, self.decode_rows)?;
             let pools = (0..self.cfg.n_layers).map(|l| Self::pool_layer_for(&kv_arena, &self.cfg, l))
                 .collect::<Result<Vec<_>>>()?;
-            Ok(V4Peer { device, stream, layers, pools, rope_window: kv_arena.view("rope.window")?,
+            Ok(V4Peer { device, stream, stream_owner, layers, pools, rope_window: kv_arena.view("rope.window")?,
                 rope_compressed: kv_arena.view("rope.compressed")?, kv_arena,
                 prefill_workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
                 graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()) })

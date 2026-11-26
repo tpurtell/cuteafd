@@ -382,6 +382,7 @@ pub(crate) struct Peer<'a> {
     graphs: RefCell<crate::shared::decode_graph::GraphBank<GraphKey, GraphExec<'a>>>,
     pub device: i32,
     pub stream: *mut c_void,
+    stream_owner: Rc<crate::shared::memory::device::Stream<'a>>,
     pub layers: Vec<MimoLayer<'a>>,
     kv: Vec<Rc<Allocation<'a>>>,
     workspace: RefCell<Option<Workspace<'a>>>,
@@ -1018,7 +1019,8 @@ impl<'a> MimoEngine<'a> {
     /// `layers` (every layer's rank-1 share, see `MimoLoader::model`). Enables
     /// peer access both ways, loads the programs there, and allocates its KV
     /// records, RoPE tables and both ends of the exchange.
-    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<MimoLayer<'a>>, prefill_lanes: usize) -> Result<()> {
+    pub fn attach_peer(&mut self, device: i32, stream_owner: Rc<crate::shared::memory::device::Stream<'a>>, layers: Vec<MimoLayer<'a>>, prefill_lanes: usize) -> Result<()> {
+        let stream = stream_owner.raw;
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("transport/peer-split");
         ensure!(self.split_family.is_some() && layers.len() == self.weights.layers.len()
             && layers.iter().all(|l| l.split), "attach_peer needs the head-split shares of every loaded layer");
@@ -1061,7 +1063,7 @@ impl<'a> MimoEngine<'a> {
                     MimoAttention::Sliding => self.rings * RING_ROWS * record,
                 })
             }).collect::<Result<Vec<_>>>()?;
-            Ok(Peer { device, stream, kv, layers, workspace: RefCell::new(None),
+            Ok(Peer { device, stream, stream_owner, kv, layers, workspace: RefCell::new(None),
                 prefill_kv_wide: RefCell::new(None), unit_done: (0..self.prefill_waves()).map(|_|
                     crate::shared::memory::device::Event::new(Device { library, id: device })).collect::<Result<Vec<_>>>()?,
                 decode_workspace: RefCell::new(None),
@@ -1077,6 +1079,14 @@ impl<'a> MimoEngine<'a> {
         match (rank, &self.peer) {
             (1, Some(peer)) => peer.stream,
             _ => self.stream,
+        }
+    }
+
+    /// The `Stream` wrapper of rank `rank`.
+    pub(crate) fn rank_stream(&self, rank: usize) -> &crate::shared::memory::device::Stream<'a> {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.stream_owner,
+            _ => &self.stream_owner,
         }
     }
 

@@ -30,11 +30,9 @@ fn mark(engine: &engine::MimoEngine<'_>, family: &prefix::MimoPrefix<'_, '_>, sl
     ensure!(segments.iter().map(|s| s.bytes).sum::<usize>() == family.mark_bytes(), "mark byte budget differs");
     segments.iter().enumerate().map(|(rank, segment)| {
         let template = engine.kv_layer_on(rank, 0).1;
-        let device = Device { library: engine.library, id: template.device_id };
         let mut bytes = vec![0u8; segment.bytes];
-        // SAFETY: `engine.stream_of(rank)` owns rank's work on `template.device_id`.
-        device.run(|| unsafe { engine.library.copy_d2h(&mut bytes, cuteafd_ffi::CuteafdDeviceBuffer {
-            ptr: segment.addr as *mut std::ffi::c_void, bytes: segment.bytes, ..template }, engine.stream_of(rank)) })?;
+        engine.rank_stream(rank).copy_d2h(&mut bytes, cuteafd_ffi::CuteafdDeviceBuffer {
+            ptr: segment.addr as *mut std::ffi::c_void, bytes: segment.bytes, ..template })?;
         Ok(bytes)
     }).collect()
 }

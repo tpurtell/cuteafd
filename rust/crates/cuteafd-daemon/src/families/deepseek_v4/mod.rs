@@ -466,11 +466,12 @@ pub(crate) fn with_engine<T>(
             "DeepSeek V4 programs loaded");
         Ok(())
     })?;
-    let peer_stream = match split_device {
-        Some(device) => Some((device, crate::shared::peer_split::on_device(&loaded.library, device,
-            || loaded.library.cuda_stream_create())?)),
+    let peer_stream_owner = match split_device {
+        Some(device) => Some((device, std::rc::Rc::new(crate::shared::memory::device::Stream::new(
+            crate::shared::memory::device::Device { library: &loaded.library, id: device })?))),
         None => None,
     };
+    let peer_stream = peer_stream_owner.as_ref().map(|(device, owner)| (*device, owner.raw));
     let mut max_context = crate::shared::context::checkpoint_context(
         &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;
     let prefill_kernel_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
@@ -697,8 +698,8 @@ pub(crate) fn with_engine<T>(
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let mut transports = Vec::new();
     let result = (|| -> Result<T> {
-        if let Some((device, stream)) = peer_stream {
-            engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.is_some() })?;
+        if let Some((device, ref peer_owner)) = peer_stream_owner {
+            engine.attach_peer(device, std::rc::Rc::clone(peer_owner), shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.is_some() })?;
         }
         crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-kv-pool", Default::default())?;
         // The host prefix quota and every pinned table were admitted with the placement.
@@ -851,14 +852,8 @@ pub(crate) fn with_engine<T>(
     drop(engine);
     drop(transports);
     std::rc::Rc::into_inner(stream_owner).context("deepseek_v4 lead stream still referenced")?.destroy()?;
-    // SAFETY: the engine that used the peer stream is gone.
-    unsafe {
-        if let Some((device, stream)) = peer_stream {
-            loaded.library.cuda_set_device(device)?;
-            let destroyed = loaded.library.cuda_stream_destroy(stream);
-            loaded.library.cuda_set_device(args.device)?;
-            destroyed?;
-        }
+    if let Some((_, peer_owner)) = peer_stream_owner {
+        std::rc::Rc::into_inner(peer_owner).context("deepseek_v4 peer stream still referenced")?.destroy()?;
     }
     result
 }

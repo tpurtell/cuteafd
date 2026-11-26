@@ -52,10 +52,10 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
         library: &library,
         id: 0,
     })?));
-    let peer = ManuallyDrop::new(Stream::new(Device {
+    let peer = ManuallyDrop::new(std::rc::Rc::new(Stream::new(Device {
         library: &library,
         id: 1,
-    })?);
+    })?));
     let output_dir = std::path::PathBuf::from(std::env::var("CUTEAFD_TERMINAL_FAULT_DIR")?);
     std::fs::create_dir_all(&output_dir)?;
     let path = output_dir.join(format!("{label}-embedding.bin"));
@@ -98,7 +98,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
     // No target layer executes. Attach actual persistent peer slots/flags and
     // streams using the production constructor, with an empty peer layer list.
     engine.split_family = Some("mimo2");
-    engine.attach_peer(1, peer.raw, vec![], 1)?;
+    engine.attach_peer(1, std::rc::Rc::clone(&peer), vec![], 1)?;
     engine.mtp_staging.borrow_mut().0.bytes_mut()[..256].fill(0x97);
     let exchange = engine.exchange()?;
     let control_bytes = exchange.fault_fixture_control(0)?.len();
