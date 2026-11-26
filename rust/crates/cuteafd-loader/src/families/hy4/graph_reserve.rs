@@ -20,14 +20,14 @@ impl Layout {
     }
 }
 
-// Short and 32K C1, K8 MC, FP8 KV, no drafter (hy4-gr-base, dev
-// 43a4f41f1b, 2026-11-26). The first event-completed capture batch
-// grew the arena by the entire W1; use that physical batch for both
-// step and capture headroom rather than dividing by executable count.
+// K8 MC, FP8 KV, no drafter (hy4-gr-base and hy4-gr-ab-retry,
+// 2026-11-26). Short/32K C1 alone measured 32/40/40 MiB. Use the
+// full-card charged high-water as the working set instead; capture batches
+// reached 34/42/40 MiB before ARC calibration (observed margin / 2).
 const CENSUS: &[(Layout, usize, WorkingSet)] = &[
-    (Layout::SingleSpark, 0, WorkingSet { w1: 32 << 20, step_growth: 32 << 20, capture_growth: 32 << 20 }),
-    (Layout::DualContextSpark, 0, WorkingSet { w1: 40 << 20, step_growth: 40 << 20, capture_growth: 40 << 20 }),
-    (Layout::DualContextSpark, 1, WorkingSet { w1: 40 << 20, step_growth: 40 << 20, capture_growth: 40 << 20 }),
+    (Layout::SingleSpark, 0, WorkingSet { w1: 160 << 20, step_growth: 34 << 20, capture_growth: 34 << 20 }),
+    (Layout::DualContextSpark, 0, WorkingSet { w1: 164 << 20, step_growth: 42 << 20, capture_growth: 42 << 20 }),
+    (Layout::DualContextSpark, 1, WorkingSet { w1: 158 << 20, step_growth: 40 << 20, capture_growth: 40 << 20 }),
 ];
 
 pub fn reserve_policy(layout: Option<Layout>, rank: usize) -> Result<Resolved, Error> {
@@ -39,11 +39,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn physical_c1_census_resolves_soft_and_hard_caps() {
+    fn full_card_census_resolves_soft_and_hard_caps() {
         for (layout, rank, w1, soft, hard) in [
-            (Layout::SingleSpark, 0, 32, 128, 192),
-            (Layout::DualContextSpark, 0, 40, 136, 216),
-            (Layout::DualContextSpark, 1, 40, 136, 216),
+            (Layout::SingleSpark, 0, 160, 256, 324),
+            (Layout::DualContextSpark, 0, 164, 260, 344),
+            (Layout::DualContextSpark, 1, 158, 254, 334),
         ] {
             let measured = graph_reserve::census_working_set(rank, Some(layout), CENSUS).unwrap();
             assert_eq!(measured.w1, w1 << 20);

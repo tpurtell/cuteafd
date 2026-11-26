@@ -410,15 +410,16 @@ KV/indexer pages and the Engram rolling token tail byte-identically.
 
 Full Hy4 (`hy_v4_vl`, not Hy4-flash) uses rank-local lazy decode graphs.
 The short/32K C1 physical arena census on EXL3 K4 MC K8 compact with FP8 KV
-and speculation off measured the following per-rank W1 and batch growth.
-The event-completed first capture batch is the physical growth observation;
-its bytes seed both the step and capture-growth allowance.
+and speculation off measured 32/40/40 MiB. The warmed full-card sweep
+(C1/C16 and 8K) reached the larger charged high-water below, which seeds W1.
+Event-completed physical batches, not apportioned per-executable estimates,
+seed both the step and capture-growth allowance.
 
 | Layout | W1 / step / capture (MiB) | Initial soft / charged hard (MiB) |
 | --- | ---: | ---: |
-| 1 RTX + 4 Sparks, whole | 32 / 32 / 32 | 128 / 192 |
-| 2 RTX + 6 Sparks, context, rank 0 | 40 / 40 / 40 | 136 / 216 |
-| 2 RTX + 6 Sparks, context, rank 1 | 40 / 40 / 40 | 136 / 216 |
+| 1 RTX + 4 Sparks, whole | 160 / 34 / 34 | 256 / 324 |
+| 2 RTX + 6 Sparks, context, rank 0 | 164 / 42 / 42 | 260 / 344 |
+| 2 RTX + 6 Sparks, context, rank 1 | 158 / 40 / 40 | 254 / 334 |
 
 The shared working-set rule sets the soft cap and growth headroom; donors
 are used only under pressure. `GPU_GRAPH_RESERVE` overrides the exact hard
