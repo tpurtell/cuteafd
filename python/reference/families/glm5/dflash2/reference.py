@@ -220,6 +220,8 @@ def mini_fixture(draft: Path, target: Path, out: Path, device: str):
         for anchor in (101, 501, 1013, 200006):
             h = model.body(anchor, rows, ctx, True)
             tokens, features = model.select(anchor, h)
+            logits = F.linear(h[1:], model.lm_head[:model.valid_vocab]).float()
+            logits.cpu().numpy().tofile(out / f"logits-{anchor}.bin")
             result.append(dict(anchor=anchor, tokens=tokens, features=features))
         (out / "meta.json").write_text(json.dumps(dict(rows=rows, results=result)))
 

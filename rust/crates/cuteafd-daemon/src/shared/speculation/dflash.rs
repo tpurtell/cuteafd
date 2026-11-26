@@ -3194,7 +3194,6 @@ impl<'a> DflashDrafter<'a> {
     }
 
     /// Retained vocabulary-head rows, including the anchor row, before selection.
-    #[cfg(test)]
     pub(crate) fn last_logits(&self, sequences: usize) -> Result<Vec<f32>> {
         let slot = self.workspace.borrow();
         let w = slot.as_ref().context("no draft step ran")?;
