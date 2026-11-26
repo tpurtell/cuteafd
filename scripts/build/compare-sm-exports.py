@@ -392,12 +392,13 @@ def jobs(scope):
     # Muse Spark: TP-resident K4/K5 experts; the generic partial epilogue is separate.
     result.append(("exl3-muse-k45", "package_exl3_aot.py",
                    ["--geometry", "muse", "--capacities", EXL3_CAPACITIES, "--bits", "4,5"]))
-    # Include ordinary Spark programs and their additive row-address siblings.
+    # Include ordinary Spark programs and their additive row-address siblings
+    # for every sum-epilogue EXL3 family (Muse replies per-expert partials).
     # Keep baseline packages free to use their own layout inventory and API.
     result.extend((name + '-spark', exporter, [*args, '--role', 'spark', '--source-package-layouts'])
                   for name, exporter, args in list(result)
                   if exporter == 'package_exl3_aot.py' and not name.startswith('exl3-compact-')
-                  and args[args.index('--geometry') + 1] in ('glm', 'glmf'))
+                  and args[args.index('--geometry') + 1] != 'muse')
     result.extend((f"context-split-{geometry}", "export_b12x_dsv4_aot.py",
                    ["--geometry", geometry, "--context-split-only"])
                   for geometry in ("flash", "pro", "glm", "glmf"))
@@ -503,15 +504,27 @@ def opt_in_jobs(scope="all"):
     result.append(("exl3-inkling2-k45-mul1", "package_exl3_aot.py",
                    ["--geometry", "inkling2", "--capacities", EXL3_CAPACITIES,
                     "--bits", "4,5", "--codebook", "mul1"]))
+    result.append(("exl3-inkling2-k45-spark-mul1", "package_exl3_aot.py",
+                   ["--geometry", "inkling2", "--capacities", EXL3_CAPACITIES,
+                    "--bits", "4,5", "--role", "spark", "--source-package-layouts",
+                    "--codebook", "mul1"]))
     result.append(("exl3-hy4f-k45-mul1", "package_exl3_aot.py",
                    ["--geometry", "hy4f", "--capacities", EXL3_CAPACITIES,
                     "--bits", "4,5", "--codebook", "mul1"]))
+    result.append(("exl3-hy4f-k45-spark-mul1", "package_exl3_aot.py",
+                   ["--geometry", "hy4f", "--capacities", EXL3_CAPACITIES,
+                    "--bits", "4,5", "--role", "spark", "--source-package-layouts",
+                    "--codebook", "mul1"]))
     result.append(("exl3-compact-hy4f-k45-mul1", "package_exl3_aot.py",
                    ["--geometry", "hy4f", "--capacities", EXL3_CAPACITIES,
                     "--bits", "4,5", "--compact-companions", "--codebook", "mul1"]))
     result.append(("exl3-hy4-k45-mul1", "package_exl3_aot.py",
                    ["--geometry", "hy4", "--capacities", EXL3_CAPACITIES,
                     "--bits", "4,5", "--codebook", "mul1"]))
+    result.append(("exl3-hy4-k45-spark-mul1", "package_exl3_aot.py",
+                   ["--geometry", "hy4", "--capacities", EXL3_CAPACITIES,
+                    "--bits", "4,5", "--role", "spark", "--source-package-layouts",
+                    "--codebook", "mul1"]))
     result.append(("exl3-compact-hy4-k45-mul1", "package_exl3_aot.py",
                    ["--geometry", "hy4", "--capacities", EXL3_CAPACITIES,
                     "--bits", "4,5", "--compact-companions", "--codebook", "mul1"]))

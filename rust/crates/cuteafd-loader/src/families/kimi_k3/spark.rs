@@ -10,14 +10,23 @@ fn calibrated(world: usize, executions: &SparkExecutions) -> bool {
 
 /// The 2026-11-04 TP6 census retained m1/m80 decode and m1/m80/m256/m1024
 /// prefill owners. Use those maxima for smaller admitted exports too; never
-/// extrapolate this rank-width measurement to other Spark worlds.
+/// extrapolate this rank-width measurement to other Spark worlds. Noncompact
+/// worlds (TP6 width 512, TP8 width 384, ...) charge merged-wave segments once.
 pub fn owner_bytes(world: usize, extent: OwnerExtent) -> Result<OwnerBytes> {
-    if world != 6 || extent.compiled > 1024 { return super::spark_owner_bytes(extent); }
-    Ok(OwnerBytes {
+    if world != 6 || extent.compiled > 1024 { return super::spark_owner_bytes_for_world(world, extent); }
+    let geometry = cuteafd_core::ExpertGeometry::KIMI_K3;
+    let mut bytes = OwnerBytes {
         scratch: if extent.compiled <= 80 { 29_782_116 } else { 219_531_260 },
         io: u64::from(extent.capacity) * (3584 + 3584 / 32 + 16 * 8),
         pinned_staging: u64::from(extent.staging_rows) * 16 * 8,
-    })
+    };
+    if let Some(width) = crate::plan::layout::spark_slots::exl3_segment_width("kimi_k3", geometry, world) {
+        let waves = crate::plan::layout::spark_slots::exl3_wave_bytes(geometry, width, extent)
+            .context("Kimi EXL3 merged-wave extent overflow")?;
+        bytes.io += waves.0;
+        bytes.pinned_staging += waves.1;
+    }
+    Ok(bytes)
 }
 
 /// Exact owners plus fixed startup reserve; the inventory adds arena-size growth.
@@ -31,7 +40,7 @@ pub fn reserve_bytes_for_rows(world: usize, waves: u64, unit_rows: u64, decode_r
         cuteafd_core::ExpertGeometry::KIMI_K3, world, executions.compiled_capacity())), 0)
         .context("Kimi Spark runtime reserve overflow")?;
     executions.workspace_bytes(|extent| {
-        if calibrated(world, &executions) { owner_bytes(world, extent) } else { super::spark_owner_bytes(extent) }
+        if calibrated(world, &executions) { owner_bytes(world, extent) } else { super::spark_owner_bytes_for_world(world, extent) }
     })?
         .and_then(|bytes| bytes.total()).and_then(|bytes| bytes.checked_add(runtime))
         .context("Kimi calibrated Spark reserve overflow")
@@ -48,7 +57,7 @@ pub fn charge(device: &mut cuteafd_core::memory_layout::DeviceLayout, world: usi
             4096, Basis::Calibrated));
     }
     crate::plan::layout::spark_slots::charge_owners(device, executions, |extent| {
-        if calibrated(world, executions) { owner_bytes(world, extent) } else { super::spark_owner_bytes(extent) }
+        if calibrated(world, executions) { owner_bytes(world, extent) } else { super::spark_owner_bytes_for_world(world, extent) }
     })
 }
 
@@ -59,16 +68,29 @@ mod tests {
 
     #[test]
     fn measured_tp6_execution_and_startup_owners_preserve_other_worlds() -> Result<()> {
+        let geometry = cuteafd_core::ExpertGeometry::KIMI_K3;
         let executions = super::super::spark_executions(3, 1024)?;
+        let prefill = executions.owners().last().unwrap();
+        let tp6_waves = crate::plan::layout::spark_slots::exl3_wave_bytes(geometry, 512, prefill).unwrap();
         let retained = executions.workspace_bytes(|extent| owner_bytes(6, extent))?.unwrap();
-        assert_eq!(retained.device_bytes, 253_473_888);
-        assert_eq!(retained.pinned_bytes, 401_408);
+        assert_eq!(retained.device_bytes, 253_473_888 + tp6_waves.0);
+        assert_eq!(retained.pinned_bytes, 401_408 + 3 * tp6_waves.1);
         assert_eq!(reserve_bytes(6, 3, 1024)?, retained.total().unwrap()
             + cuteafd_core::memory_layout::SPARK_WORKER_PROCESS_RESIDENT_BYTES + 4096);
         for world in [1, 2, 3, 4, 5, 7, 8] {
-            assert_eq!(reserve_bytes(world, 3, 1024)?, super::super::spark_reserve_bytes(3, 1024)?);
+            let expected = super::super::spark_reserve_bytes(3, 1024)?
+                + crate::plan::layout::spark_slots::exl3_segment_width("kimi_k3", geometry, world)
+                    .map_or(0, |w| {
+                        let (dev, pin) = crate::plan::layout::spark_slots::exl3_wave_bytes(geometry, w, prefill).unwrap();
+                        dev + 3 * pin
+                    });
+            assert_eq!(reserve_bytes(world, 3, 1024)?, expected, "TP{world}");
         }
-        assert_eq!(reserve_bytes(6, 3, 2752)?, super::super::spark_reserve_bytes(3, 2752)?);
+        let wide_exec = super::super::spark_executions(3, 2752)?;
+        let wide_waves = crate::plan::layout::spark_slots::exl3_wave_bytes(geometry, 512,
+            wide_exec.owners().last().unwrap()).unwrap();
+        assert_eq!(reserve_bytes(6, 3, 2752)?,
+            super::super::spark_reserve_bytes(3, 2752)? + wide_waves.0 + 3 * wide_waves.1);
         Ok(())
     }
 

@@ -320,6 +320,9 @@ GEOMETRIES = {
 }
 # Geometries whose published checkpoints ship MUL1 routed experts only (no MCG).
 MUL1_ONLY_GEOMETRIES = frozenset({'hy4f', 'hy4'})
+# Geometries whose routed experts reply per-expert partials (per-expert output
+# norm): partial replies never merge waves (`Exl3Worker::segments_directory`).
+PARTIAL_REPLY_GEOMETRIES = frozenset({'muse'})
 # SwiGLU clamp per geometry; None is the unclamped SwiGLU (b12x const-expr
 # elides the clamp). DeepSeek clamps at 10.
 SWIGLU_LIMITS = {'glm': None, 'qwen4': None, 'kimik3': None, 'step5': 7.0, 'muse': None, 'ml4': None, 'inkling2': None}
@@ -1126,8 +1129,10 @@ def segment_export_options(geometry: str, role: str, width: int, *, compact: boo
     """One format-matched row-address program per shipping WS Spark layout."""
     if codebook not in ('mcg', 'mul1'):
         raise ValueError(f'unsupported EXL3 codebook: {codebook}')
-    # Other families land with their planner charge and merged-wave oracle.
-    if (geometry not in ('glm', 'glmf') or role != 'spark' or compact or GEOMETRIES[geometry][0] % 512
+    if geometry in MUL1_ONLY_GEOMETRIES and codebook != 'mul1':
+        raise ValueError(f"EXL3 geometry {geometry} requires --codebook mul1 (checkpoint ships no MCG)")
+    if (geometry not in GEOMETRIES or geometry in PARTIAL_REPLY_GEOMETRIES
+            or role != 'spark' or compact or GEOMETRIES[geometry][0] % 512
             or not any(warp_specialized(geometry, role, width, rows)
                        for rows in (256, 1024, 2048, 2752, 4096))):
         return None
