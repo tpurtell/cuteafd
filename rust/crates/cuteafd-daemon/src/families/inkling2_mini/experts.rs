@@ -29,7 +29,6 @@ pub(crate) struct Resident<'a> {
     layer: usize,
     backend: Rc<std::cell::RefCell<Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>>>,
     stream: Rc<Stream<'a>>,
-    copy: Rc<cuteafd_ffi::DeviceRowCopy<'a>>,
 }
 
 impl<'a> Resident<'a> {
@@ -49,12 +48,10 @@ impl<'a> Resident<'a> {
             !backend.output().is_null() && backend.workspace_bytes() >= HIDDEN * element,
             "Inkling 2 Mini resident workspace cannot hold one output row"
         );
-        let copy = Rc::new(stream.device.run(|| stream.device.library.device_row_copy())?);
         Ok(Self {
             layer,
             backend: Rc::new(std::cell::RefCell::new(backend)),
             stream,
-            copy,
         })
     }
 
@@ -75,7 +72,6 @@ impl<'a> Resident<'a> {
                 layer,
                 backend: owner.backend.clone(),
                 stream: owner.stream.clone(),
-                copy: owner.copy.clone(),
             })
             .collect())
     }
@@ -171,7 +167,6 @@ impl Dispatcher for Resident<'_> {
                     Ok(output)
                 } else {
                     ensure!(source.ptr as usize % 16 == 0, "Inkling 2 Mini resident output unaligned");
-                    let _ = &self.copy;
                     Ok(source)
                 }
             }

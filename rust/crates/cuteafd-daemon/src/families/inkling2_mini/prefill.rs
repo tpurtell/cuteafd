@@ -1031,9 +1031,8 @@ mod tests {
         let experts_code = code_only(include_str!("experts.rs"));
         assert!(
             !experts_code.contains("copy_d2d_async")
-                && !experts_code.contains("cuda_zero_bytes_async")
-                && experts_code.contains("launch_rows"),
-            "experts.rs must use shared DeviceRowCopy::launch_rows instead of memcpy/memset inside captured graphs"
+                && !experts_code.contains("cuda_zero_bytes_async"),
+            "experts.rs must not issue memcpy/memset inside captured graphs"
         );
         let taps_entry_code = code_only(
             include_str!("draft_taps.rs")
