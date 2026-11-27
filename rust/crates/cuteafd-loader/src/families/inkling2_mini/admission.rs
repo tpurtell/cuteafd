@@ -363,9 +363,9 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         .zip(drafter)
         .map(|(selection, (config, weights, _))| {
             // Scored dSpark plans every eligible active sequence before head-score
-            // settling trims to the verify row budget; admit up to DECODE_ROWS so
-            // C48 runs in one compacted drafter batch instead of splitting.
-            let draft_sequences = usize::try_from(request.sequences)?.min(DECODE_ROWS);
+            // settling trims to the verify row budget; admit up to the admitted
+            // DECODE_ROWS so C48 runs in one compacted drafter batch instead of splitting.
+            let draft_sequences = usize::try_from(request.sequences)?.min(decode_rows as usize);
             DraftLayout::from_weights_for_decode_rows(
                 config,
                 weights,
