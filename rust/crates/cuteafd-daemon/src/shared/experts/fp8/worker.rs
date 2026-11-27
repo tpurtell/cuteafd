@@ -398,7 +398,7 @@ impl<'a> Fp8Worker<'a> {
         }
         if destination.is_none() {
             ensure!(exchange.partials.len() >= bytes, "FP8 host exchange is too small");
-            self.library.copy_d2h(&mut exchange.partials[..bytes], output)?;
+            self.stream.copy_d2h(&mut exchange.partials[..bytes], output)?;
         }
         Ok(output)
     }

@@ -640,7 +640,7 @@ mod tests {
         ticket.land()?;
         rows.boundary.before_join(rows.stream.raw)?;
         let mut output = vec![0; 6144 * 2];
-        device.run(|| library.copy_d2h(&mut output, rows.output.buffer))?;
+        device.run(|| library.copy_d2h_quiescent(&mut output, rows.output.buffer))?;
         assert!(output.iter().all(|&value| value == 37));
         rows.boundary.joined();
         Ok(())
@@ -661,7 +661,7 @@ mod tests {
         ticket.land()?;
         rows.boundary.before_join(rows.stream.raw)?;
         let mut output = vec![0; 6144 * 2];
-        device.run(|| library.copy_d2h(&mut output, rows.output.buffer))?;
+        device.run(|| library.copy_d2h_quiescent(&mut output, rows.output.buffer))?;
         assert!(output.iter().all(|&value| value == 37));
         rows.boundary.joined();
         Ok(())

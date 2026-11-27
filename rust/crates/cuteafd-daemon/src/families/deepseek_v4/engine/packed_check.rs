@@ -32,7 +32,7 @@ fn kv_arena_allocates_once_per_device_and_views_retain_the_generation() -> Resul
             let value = [i as u8; 32];
             library.copy_h2d(view.buffer, &value)?;
             let mut result = [0; 32];
-            library.copy_d2h(&mut result, view.buffer)?;
+            library.copy_d2h_quiescent(&mut result, view.buffer)?;
             assert_eq!(value, result);
         }
         drop(arena);

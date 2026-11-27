@@ -576,14 +576,14 @@ mod packed_tests {
             let buffer = unit.buffer(name)?;
             assert_eq!(buffer.ptr as usize % 16, 0, "{name} device view must be 16-byte aligned");
             let mut bytes = vec![0u8; buffer.bytes];
-            library.copy_d2h(&mut bytes, buffer)?;
+            library.copy_d2h_quiescent(&mut bytes, buffer)?;
             Ok(bytes.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect())
         };
         let i32s = |u: &UnitOwner<'_>, name: &str| -> Result<Vec<i32>> {
             let buffer = u.buffer(name)?;
             assert_eq!(buffer.ptr as usize % 16, 0, "{name} device view must be 16-byte aligned");
             let mut bytes = vec![0u8; buffer.bytes];
-            library.copy_d2h(&mut bytes, buffer)?;
+            library.copy_d2h_quiescent(&mut bytes, buffer)?;
             Ok(bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect())
         };
 

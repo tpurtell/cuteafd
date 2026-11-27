@@ -332,6 +332,12 @@ pub(crate) struct LoadStream<'a> {
     pub(crate) raw: *mut c_void,
 }
 impl LoadStream<'_> {
+    /// Copy `dst.len()` bytes from `src` to host memory, ordered after all prior
+    /// work on this stream and synchronizing only this stream.
+    pub(crate) fn copy_d2h(&self, dst: &mut [u8], src: CuteafdDeviceBuffer) -> Result<()> {
+        // SAFETY: this LoadStream owns `self.raw` on the current device.
+        unsafe { self.library.copy_d2h(dst, src, self.raw) }
+    }
     /// Rebinding requires a completed owner, not a hidden host-thread wait.
     #[track_caller]
     pub(crate) fn require_complete(&self) -> Result<()> {

@@ -375,7 +375,7 @@ mod tests {
         // (The packed window values do not change with these positions at this
         // layer, so they alone cannot detect the clobber.)
         let mut device = vec![0u8; rows * 8];
-        lib.copy_d2h(&mut device, slice(gated.storage.positions.buffer, 0, rows * 8))?;
+        lib.copy_d2h_quiescent(&mut device, slice(gated.storage.positions.buffer, 0, rows * 8))?;
         let delivered: Vec<u64> = device.chunks_exact(8).map(|b| u64::from_ne_bytes(b.try_into().unwrap())).collect();
         let intended: Vec<u64> = (300..300 + rows as u64).collect();
         gated.commit(&mut state, &[rows as u32])?;
@@ -384,8 +384,8 @@ mod tests {
         for (a, b, width) in [(actual.values, expected.values, 512), (actual.scales, expected.scales, 16)] {
             let mut left = vec![0; rows * width];
             let mut right = left.clone();
-            lib.copy_d2h(&mut left, slice(a, 0, rows * width))?;
-            lib.copy_d2h(&mut right, slice(b, 0, rows * width))?;
+            lib.copy_d2h_quiescent(&mut left, slice(a, 0, rows * width))?;
+            lib.copy_d2h_quiescent(&mut right, slice(b, 0, rows * width))?;
             equal &= left == right;
         }
         if shared_staging {
@@ -451,8 +451,8 @@ mod tests {
                     let view = state.view(lease)?;
                     let count = (round + 1) * rows;
                     let mut bytes = vec![0; count * 528];
-                    lib.copy_d2h(&mut bytes[..count * 512], slice(view.values, 0, count * 512))?;
-                    lib.copy_d2h(&mut bytes[count * 512..], slice(view.scales, 0, count * 16))?;
+                    lib.copy_d2h_quiescent(&mut bytes[..count * 512], slice(view.values, 0, count * 512))?;
+                    lib.copy_d2h_quiescent(&mut bytes[count * 512..], slice(view.scales, 0, count * 16))?;
                     Ok(bytes)
                 };
                 assert_eq!(read(&actual[layer], actual_leases[layer])?,
@@ -509,8 +509,8 @@ mod tests {
             let read = |state: &WindowState<'_>, lease| -> Result<Vec<u8>> {
                 let view = state.view(lease)?;
                 let mut bytes = vec![0; 16 * 528];
-                lib.copy_d2h(&mut bytes[..16 * 512], slice(view.values, 0, 16 * 512))?;
-                lib.copy_d2h(&mut bytes[16 * 512..], slice(view.scales, 0, 16 * 16))?;
+                lib.copy_d2h_quiescent(&mut bytes[..16 * 512], slice(view.values, 0, 16 * 512))?;
+                lib.copy_d2h_quiescent(&mut bytes[16 * 512..], slice(view.scales, 0, 16 * 16))?;
                 Ok(bytes)
             };
             assert_eq!(read(&actual[layer], actual_leases[layer])?, read(&expected[layer], expected_leases[layer])?);
@@ -546,8 +546,8 @@ mod tests {
         let read = |state: &WindowState<'_>, lease| -> Result<Vec<u8>> {
             let view = state.view(lease)?;
             let mut bytes = vec![0; rows * 528];
-            lib.copy_d2h(&mut bytes[..rows*512], slice(view.values, 0, rows*512))?;
-            lib.copy_d2h(&mut bytes[rows*512..], slice(view.scales, 0, rows*16))?;
+            lib.copy_d2h_quiescent(&mut bytes[..rows*512], slice(view.values, 0, rows*512))?;
+            lib.copy_d2h_quiescent(&mut bytes[rows*512..], slice(view.scales, 0, rows*16))?;
             Ok(bytes)
         };
         // Private runs: the expected rows, and an ungated warm-up of every
@@ -684,20 +684,20 @@ mod tests {
             for (a, b, width) in [(actual.values, expected.values, 512), (actual.scales, expected.scales, 16)] {
                 let mut left = vec![0; (i+2)*width];
                 let mut right = left.clone();
-                lib.copy_d2h(&mut left, slice(a, 0, (i+2)*width))?;
-                lib.copy_d2h(&mut right, slice(b, 0, (i+2)*width))?;
+                lib.copy_d2h_quiescent(&mut left, slice(a, 0, (i+2)*width))?;
+                lib.copy_d2h_quiescent(&mut right, slice(b, 0, (i+2)*width))?;
                 assert_eq!(left, right);
             }
             if let Some(replica)=&replica {
                 let peer=unsafe { replica.view(&state,lease)? };
                 for (a,b,width) in [(actual.values,peer.values,512),(actual.scales,peer.scales,16)] {
                     let mut left=vec![0;(i+2)*width]; let mut right=left.clone();
-                    lib.copy_d2h(&mut left,slice(a,0,(i+2)*width))?;
-                    replica.device().run(||lib.copy_d2h(&mut right,slice(b,0,(i+2)*width)))?;
+                    lib.copy_d2h_quiescent(&mut left,slice(a,0,(i+2)*width))?;
+                    replica.device().run(||lib.copy_d2h_quiescent(&mut right,slice(b,0,(i+2)*width)))?;
                     assert_eq!(left,right);
                 }
                 let mut end=[0;8];
-                replica.device().run(||lib.copy_d2h(&mut end,peer.device_end))?;
+                replica.device().run(||lib.copy_d2h_quiescent(&mut end,peer.device_end))?;
                 assert_eq!(u64::from_ne_bytes(end),actual.end);
             }
         }
@@ -712,10 +712,10 @@ mod tests {
         state.release(second)?;
         assert!(state.view(second).is_err());
         let mut end_bytes = [0; 8];
-        lib.copy_d2h(&mut end_bytes, device_end)?;
+        lib.copy_d2h_quiescent(&mut end_bytes, device_end)?;
         assert_eq!(u64::from_ne_bytes(end_bytes), 3); // Release needs no GPU clear.
         let replacement = state.begin_request(1, 33)?;
-        lib.copy_d2h(&mut end_bytes, state.view(replacement)?.device_end)?;
+        lib.copy_d2h_quiescent(&mut end_bytes, state.view(replacement)?.device_end)?;
         assert_eq!(u64::from_ne_bytes(end_bytes), 0);
         assert_eq!(state.end(replacement)?, 0);
         Ok(())

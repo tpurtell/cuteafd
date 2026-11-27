@@ -220,7 +220,7 @@ mod injection_tests {
                 inject(&stream,output.buffer,&media,0,6,2,fp32)
             })?;
             let mut actual=vec![0;original.len()];
-            device.run(||library.copy_d2h(&mut actual,output.buffer))?;
+            stream.copy_d2h(&mut actual,output.buffer)?;
             assert_eq!(&actual[..2*row_bytes],&original[..2*row_bytes]);
             assert_eq!(&actual[4*row_bytes..],&original[4*row_bytes..]);
             let expected=if fp32 { source.into_iter().flat_map(|v|(u32::from(v)<<16).to_le_bytes()).collect::<Vec<_>>() }

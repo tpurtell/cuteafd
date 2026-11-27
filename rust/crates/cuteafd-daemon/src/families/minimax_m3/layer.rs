@@ -873,14 +873,14 @@ mod tests {
     fn read_residual(owner: &UnitOwner<'_>, rows: usize) -> Result<Vec<f32>> {
         owner.stream.drain()?;
         let mut bytes = vec![0; rows * 6144 * 4];
-        owner.stream.device.run(|| owner.stream.device.library.copy_d2h(&mut bytes, owner.plane("residual")?))?;
+        owner.stream.device.run(|| owner.stream.device.library.copy_d2h_quiescent(&mut bytes, owner.plane("residual")?))?;
         Ok(bytes.chunks_exact(4).map(|value| f32::from_le_bytes(value.try_into().unwrap())).collect())
     }
 
     fn cache_bytes(library: &cuteafd_ffi::NativeLibrary, request: attention::Request) -> Result<Vec<Vec<u8>>> {
         [request.key_cache, request.value_cache, request.index_cache].into_iter().map(|buffer| {
             let mut bytes = vec![0; buffer.bytes];
-            library.copy_d2h(&mut bytes, buffer)?;
+            library.copy_d2h_quiescent(&mut bytes, buffer)?;
             Ok(bytes)
         }).collect()
     }
@@ -888,7 +888,7 @@ mod tests {
     fn read_buffer(owner: &UnitOwner<'_>, buffer: Buffer) -> Result<Vec<u8>> {
         owner.stream.drain()?;
         let mut bytes = vec![0; buffer.bytes];
-        owner.stream.device.run(|| owner.stream.device.library.copy_d2h(&mut bytes, buffer))?;
+        owner.stream.device.run(|| owner.stream.device.library.copy_d2h_quiescent(&mut bytes, buffer))?;
         Ok(bytes)
     }
 

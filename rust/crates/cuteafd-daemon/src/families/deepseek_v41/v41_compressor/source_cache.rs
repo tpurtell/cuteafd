@@ -399,7 +399,7 @@ mod tests {
                 cache
                     .lengths
                     .library
-                    .copy_d2h(&mut bytes[start..], slice(buffer, physical * width, width))?;
+                    .copy_d2h_quiescent(&mut bytes[start..], slice(buffer, physical * width, width))?;
             }
         }
         Ok(bytes)

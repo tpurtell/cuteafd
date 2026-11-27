@@ -374,7 +374,7 @@ mod tests {
             |units| Placement { media: None, units, slot: 1, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, tokens.len());
         let mut observed = vec![0; state.bytes];
-        library.copy_d2h(&mut observed, bank.rings_for_sequence(1)?)?;
+        library.copy_d2h_quiescent(&mut observed, bank.rings_for_sequence(1)?)?;
         assert_eq!(observed, prompt);
         let mut continued = restored.placement;
         let turn = vec![0x6b; state.bytes];
@@ -386,13 +386,13 @@ mod tests {
         let restored = cache.admit(&family, &turn_tokens, 128, false,
             |units| Placement { media: None, units, slot: 0, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, turn_tokens.len());
-        library.copy_d2h(&mut observed, bank.rings_for_sequence(0)?)?;
+        library.copy_d2h_quiescent(&mut observed, bank.rings_for_sequence(0)?)?;
         assert_eq!(observed, turn);
         cache.release(&family, &restored.placement.units)?;
         let restored = cache.admit(&family, &tokens, 128, false,
             |units| Placement { media: None, units, slot: 1, len: 0, state_len: 0 })?;
         assert_eq!(restored.resume, tokens.len());
-        library.copy_d2h(&mut observed, bank.rings_for_sequence(1)?)?;
+        library.copy_d2h_quiescent(&mut observed, bank.rings_for_sequence(1)?)?;
         assert_eq!(observed, prompt, "turn divergence must not mutate the prompt mark");
         cache.release(&family, &restored.placement.units)?;
         Ok(())
@@ -438,7 +438,7 @@ mod tests {
         assert_eq!((fallback.placement.len, fallback.placement.state_len), (0, 0));
         for buffer in [bank.rings_for_sequence(1)?, bank.conv_for_sequence(1)?] {
             let mut state = vec![0; buffer.bytes];
-            library.copy_d2h(&mut state, buffer)?;
+            library.copy_d2h_quiescent(&mut state, buffer)?;
             assert!(state.iter().all(|&byte| byte == 0), "cold bind must reset the abandoned slot");
         }
 
@@ -455,8 +455,8 @@ mod tests {
             for &layer in &bank.layout.global_layers {
                 let mut left = vec![0; bytes];
                 let mut right = vec![0; bytes];
-                library.copy_d2h(&mut left, view(bank.page(layer, left_page as usize)?, 0, bytes)?)?;
-                library.copy_d2h(&mut right, view(bank.page(layer, right_page as usize)?, 0, bytes)?)?;
+                library.copy_d2h_quiescent(&mut left, view(bank.page(layer, left_page as usize)?, 0, bytes)?)?;
+                library.copy_d2h_quiescent(&mut right, view(bank.page(layer, right_page as usize)?, 0, bytes)?)?;
                 assert_eq!(left, right, "page {index} layer {layer}: the fallback is not a cold prefill");
             }
         }
@@ -526,7 +526,7 @@ mod tests {
             assert!(target.mark(slots).is_err());
             assert!(draft.mark(slots).is_err());
             let mut saved = vec![0; draft.mark_bytes()];
-            library.copy_d2h(&mut saved, draft.mark(slots - 1)?)?;
+            library.copy_d2h_quiescent(&mut saved, draft.mark(slots - 1)?)?;
             assert!(saved[16..16 + planes[0]].iter().all(|&byte| byte == 0x5a));
         }
         Ok(())
@@ -564,14 +564,14 @@ mod tests {
         cache.restore(0, 1)?;
         cache.drain()?;
         let mut restored = vec![0; pattern.len()];
-        library.copy_d2h(&mut restored, cache.rings_for_sequence(1)?)?;
+        library.copy_d2h_quiescent(&mut restored, cache.rings_for_sequence(1)?)?;
         assert_eq!(restored, pattern);
-        library.copy_d2h(&mut restored, cache.rings_for_sequence(0)?)?;
+        library.copy_d2h_quiescent(&mut restored, cache.rings_for_sequence(0)?)?;
         assert!(restored.iter().all(|&byte| byte == 0));
         let mut restored_conv = vec![0; conv_pattern.len()];
-        library.copy_d2h(&mut restored_conv, cache.conv_for_sequence(1)?)?;
+        library.copy_d2h_quiescent(&mut restored_conv, cache.conv_for_sequence(1)?)?;
         assert_eq!(restored_conv, conv_pattern, "all contiguous FIR state bytes restore exactly");
-        library.copy_d2h(&mut restored_conv, cache.conv_for_sequence(0)?)?;
+        library.copy_d2h_quiescent(&mut restored_conv, cache.conv_for_sequence(0)?)?;
         assert!(restored_conv.iter().all(|&byte|byte==0));
         let page = cache.page(1, 0)?;
         let page_pattern = vec![0x5a; page.bytes];
@@ -579,7 +579,7 @@ mod tests {
         cache.copy_page(0, 2)?;
         cache.drain()?;
         let mut restored_page = vec![0; page.bytes];
-        library.copy_d2h(&mut restored_page, cache.page(1, 2)?)?;
+        library.copy_d2h_quiescent(&mut restored_page, cache.page(1, 2)?)?;
         assert_eq!(restored_page, page_pattern);
         let unit = super::super::owners::UnitOwner::new(reader, UnitLayout::serving(&cfg, 64, 256)?)?;
         assert!(unit.bind(&cache, 1, 0).is_ok());
@@ -620,14 +620,14 @@ mod tests {
         family.restore(Some(MarkSlot(0)), &mut destination, 65).map_err(|e| anyhow::anyhow!("{e}"))?;
         family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
         assert_eq!((destination.len, destination.state_len), (65, 65));
-        library.copy_d2h(&mut restored, cache.rings_for_sequence(1)?)?;
+        library.copy_d2h_quiescent(&mut restored, cache.rings_for_sequence(1)?)?;
         assert_eq!(restored, pattern);
         let sentinel = vec![0x33; page.bytes];
         library.copy_h2d(cache.page(1, 2)?, &sentinel)?;
         family.copy_rows(TailCopy { from: 0, to: 2, rows: 1, owner: None })
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         family.drain().map_err(|e| anyhow::anyhow!("{e}"))?;
-        library.copy_d2h(&mut restored_page, cache.page(1, 2)?)?;
+        library.copy_d2h_quiescent(&mut restored_page, cache.page(1, 2)?)?;
         let record_bytes = format.record_bytes(cfg.kv_heads, cfg.head_dim);
         assert_eq!(&restored_page[..record_bytes], &page_pattern[..record_bytes]);
         assert_eq!(&restored_page[record_bytes..], &sentinel[record_bytes..]);

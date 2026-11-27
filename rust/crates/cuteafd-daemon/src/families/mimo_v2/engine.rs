@@ -382,6 +382,7 @@ pub(crate) struct Peer<'a> {
     graphs: RefCell<crate::shared::decode_graph::GraphBank<GraphKey, GraphExec<'a>>>,
     pub device: i32,
     pub stream: *mut c_void,
+    stream_owner: Rc<crate::shared::memory::device::Stream<'a>>,
     pub layers: Vec<MimoLayer<'a>>,
     kv: Vec<Rc<Allocation<'a>>>,
     workspace: RefCell<Option<Workspace<'a>>>,
@@ -811,6 +812,7 @@ pub(crate) struct MimoEngine<'a> {
     pub cfg: MimoV2Config,
     pub weights: MimoWeights<'a>,
     pub stream: *mut c_void,
+    stream_owner: Rc<crate::shared::memory::device::Stream<'a>>,
     pub max_context: usize,
     pub prefill_rows: usize,
     pub prefill_unit_waves: usize,
@@ -919,9 +921,10 @@ fn kind(attention: MimoAttention) -> &'static str {
 impl<'a> MimoEngine<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: MimoV2Config,
-        weights: MimoWeights<'a>, stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_span: usize, pages: usize,
+        weights: MimoWeights<'a>, stream_owner: Rc<crate::shared::memory::device::Stream<'a>>, max_context: usize, prefill_rows: usize, prefill_span: usize, pages: usize,
         rings: usize, embedding: TokenEmbedding<'a>, kv_cache: MimoKvFormats,
         prefill_output: MimoPrefillOutput) -> Result<Self> {
+        let stream = stream_owner.raw;
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("kv");
         let prefill_span_rows = prefill_span_rows(prefill_span, prefill_rows)?;
         let family = cfg.program_family()?;
@@ -950,7 +953,7 @@ impl<'a> MimoEngine<'a> {
         }).collect::<Result<Vec<_>>>()?;
         let rope = RopeWindow::new(cfg.rope_dim, cfg.full_rope_theta, cfg.swa_rope_theta);
         Ok(Self { max_pool_tokens_no_onboard: None, terminal: Cell::new(crate::shared::peer_split::TerminalState::Active),
-            submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream,
+            submission_failed: Cell::new(false), quantize_grid, library, programs, cfg, weights, stream, stream_owner,
             max_context, prefill_rows, prefill_span_rows, prefill_unit_waves: 1, unit_index: Cell::new(None), prefill_output, pages, rings, family, device,
             split_family, peer: None, exchange: None, kv, rope, workspace: RefCell::new(None), decode_workspace: RefCell::new(None),
             prefill_kv_wide: RefCell::new(None), experts: None, expert_usage: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, rtx_local: None,
@@ -1016,7 +1019,8 @@ impl<'a> MimoEngine<'a> {
     /// `layers` (every layer's rank-1 share, see `MimoLoader::model`). Enables
     /// peer access both ways, loads the programs there, and allocates its KV
     /// records, RoPE tables and both ends of the exchange.
-    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<MimoLayer<'a>>, prefill_lanes: usize) -> Result<()> {
+    pub fn attach_peer(&mut self, device: i32, stream_owner: Rc<crate::shared::memory::device::Stream<'a>>, layers: Vec<MimoLayer<'a>>, prefill_lanes: usize) -> Result<()> {
+        let stream = stream_owner.raw;
         let _memory_scope = cuteafd_ffi::memory_ledger::scope("transport/peer-split");
         ensure!(self.split_family.is_some() && layers.len() == self.weights.layers.len()
             && layers.iter().all(|l| l.split), "attach_peer needs the head-split shares of every loaded layer");
@@ -1059,7 +1063,7 @@ impl<'a> MimoEngine<'a> {
                     MimoAttention::Sliding => self.rings * RING_ROWS * record,
                 })
             }).collect::<Result<Vec<_>>>()?;
-            Ok(Peer { device, stream, kv, layers, workspace: RefCell::new(None),
+            Ok(Peer { device, stream, stream_owner, kv, layers, workspace: RefCell::new(None),
                 prefill_kv_wide: RefCell::new(None), unit_done: (0..self.prefill_waves()).map(|_|
                     crate::shared::memory::device::Event::new(Device { library, id: device })).collect::<Result<Vec<_>>>()?,
                 decode_workspace: RefCell::new(None),
@@ -1075,6 +1079,14 @@ impl<'a> MimoEngine<'a> {
         match (rank, &self.peer) {
             (1, Some(peer)) => peer.stream,
             _ => self.stream,
+        }
+    }
+
+    /// The `Stream` wrapper of rank `rank`.
+    pub(crate) fn rank_stream(&self, rank: usize) -> &crate::shared::memory::device::Stream<'a> {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.stream_owner,
+            _ => &self.stream_owner,
         }
     }
 
@@ -1444,7 +1456,7 @@ impl<'a> MimoEngine<'a> {
         // SAFETY: the engine owns this stream.
         unsafe { self.library.cuda_stream_synchronize(self.stream)? };
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
+        self.stream_owner.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
         Ok(out)
     }
 
@@ -3372,7 +3384,7 @@ mod tests {
             norm: DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?,
             head: super::super::head::MimoHead::Bf16(DeviceAllocation::new(&library, 256, crate::shared::memory::TEST)?),
             output_fp8: false };
-        let mut engine = MimoEngine::new(&library, &programs, cfg, weights, stream.raw,
+        let mut engine = MimoEngine::new(&library, &programs, cfg, weights, Rc::new(stream),
             64, 64, 16384, 1, 1, embedding, MimoKvFormats::default(), MimoPrefillOutput::AllRows)?;
         engine.decode_graphs = true;
         engine.configure_graph_cache(&layout.reserves, &layout.bootstraps, &layout.policies)?;

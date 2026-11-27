@@ -48,14 +48,14 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
         programs.names().count() == 0,
         "fault fixture must carry no model AOT programs"
     );
-    let lead = ManuallyDrop::new(Stream::new(Device {
+    let lead = ManuallyDrop::new(std::rc::Rc::new(Stream::new(Device {
         library: &library,
         id: 0,
-    })?);
-    let peer = ManuallyDrop::new(Stream::new(Device {
+    })?));
+    let peer = ManuallyDrop::new(std::rc::Rc::new(Stream::new(Device {
         library: &library,
         id: 1,
-    })?);
+    })?));
     let output_dir = std::path::PathBuf::from(std::env::var("CUTEAFD_TERMINAL_FAULT_DIR")?);
     std::fs::create_dir_all(&output_dir)?;
     let path = output_dir.join(format!("{label}-embedding.bin"));
@@ -84,7 +84,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
         &programs,
         cfg(),
         weights,
-        lead.raw,
+        std::rc::Rc::clone(&lead),
         64,
         64,
         16384,
@@ -98,7 +98,7 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
     // No target layer executes. Attach actual persistent peer slots/flags and
     // streams using the production constructor, with an empty peer layer list.
     engine.split_family = Some("mimo2");
-    engine.attach_peer(1, peer.raw, vec![], 1)?;
+    engine.attach_peer(1, std::rc::Rc::clone(&peer), vec![], 1)?;
     engine.mtp_staging.borrow_mut().0.bytes_mut()[..256].fill(0x97);
     let exchange = engine.exchange()?;
     let control_bytes = exchange.fault_fixture_control(0)?.len();
@@ -312,15 +312,19 @@ fn run_case(label: &str, captured: bool, lanes: usize, injected: u32, serving: b
                 "rank {rank} not drained"
             );
             let mut marker = vec![0; 256];
-            library.copy_d2h(
-                &mut marker,
-                cuteafd_ffi::CuteafdDeviceBuffer {
-                    ptr: exchange.recv(rank, 2)?,
-                    bytes: 256,
-                    device_id: rank as i32,
-                    flags: 0,
-                },
-            )?;
+            // SAFETY: `engine.stream_of(rank)` owns rank's marker write and was verified drained above.
+            unsafe {
+                library.copy_d2h(
+                    &mut marker,
+                    cuteafd_ffi::CuteafdDeviceBuffer {
+                        ptr: exchange.recv(rank, 2)?,
+                        bytes: 256,
+                        device_id: rank as i32,
+                        flags: 0,
+                    },
+                    engine.stream_of(rank),
+                )?;
+            }
             ensure!(
                 marker.iter().all(|&v| v == 0x97),
                 "rank {rank} marker behind wait not completed"

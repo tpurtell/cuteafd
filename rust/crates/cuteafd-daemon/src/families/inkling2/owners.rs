@@ -382,7 +382,7 @@ mod packed_tests {
         let values = |name: &str| -> Result<Vec<i64>> {
             let buffer = unit.buffer(name)?;
             let mut bytes = vec![0; buffer.bytes];
-            library.copy_d2h(&mut bytes, buffer)?;
+            library.copy_d2h_quiescent(&mut bytes, buffer)?;
             Ok(bytes.chunks_exact(8).map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect())
         };
         assert_eq!(values("positions")?, [63, 65, 66, 67]);
@@ -392,7 +392,7 @@ mod packed_tests {
         let i32_values = |name: &str| -> Result<Vec<i32>> {
             let buffer = unit.buffer(name)?;
             let mut bytes = vec![0; buffer.bytes];
-            library.copy_d2h(&mut bytes, buffer)?;
+            library.copy_d2h_quiescent(&mut bytes, buffer)?;
             Ok(bytes.chunks_exact(4).map(|b| i32::from_le_bytes(b.try_into().unwrap())).collect())
         };
         assert_eq!(i32_values("first")?, [0, 1, 1, 1]);
@@ -408,7 +408,7 @@ mod packed_tests {
         drop(packed);
         unit.decode_attention=true;
         unit.packed_metadata(1,&cache,&members,&mut uploads)?;stream.drain()?;
-        let mut tiles=vec![0;16];library.copy_d2h(&mut tiles,unit.buffer("tile_rows")?)?;
+        let mut tiles=vec![0;16];library.copy_d2h_quiescent(&mut tiles,unit.buffer("tile_rows")?)?;
         assert_eq!(tiles.chunks_exact(4).map(|bytes|i32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>(),[0,1,2,3]);
         let packed=PackedLayerUnit{unit:&unit,cache:&cache,layer:1,members:&members,uploads:std::cell::RefCell::new(&mut uploads)};
         assert!(packed.decode_attention());

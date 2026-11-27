@@ -1042,7 +1042,10 @@ impl ExpertExecution<'_, '_> {
         }
         let executed_us = started.map(|t| t.elapsed().as_micros() as u64);
         if destination.is_none() {
-            self.library.copy_d2h(&mut exchange.partials[..bytes], CuteafdDeviceBuffer { bytes, ..output })?;
+            self.stream
+                .as_ref()
+                .context("expert execution stream missing")?
+                .copy_d2h(&mut exchange.partials[..bytes], CuteafdDeviceBuffer { bytes, ..output })?;
         }
         if let (Some(timing), Some(started)) = (&self.timing, started) {
             let total_us = started.elapsed().as_micros() as u64;

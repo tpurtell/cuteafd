@@ -272,7 +272,7 @@ mod tests {
             let output = suffix.output()?;
             assert_eq!(output.tokens, &(end.saturating_sub(128)..end).collect::<Vec<_>>());
             for (buffer, stride, salt) in [(output.residual, 40960, 0), (output.pre, 16, 79)] {
-                let mut actual = vec![0; buffer.bytes]; lib.copy_d2h(&mut actual, buffer)?;
+                let mut actual = vec![0; buffer.bytes]; lib.copy_d2h_quiescent(&mut actual, buffer)?;
                 let expected: Vec<u8> = output.tokens.iter().flat_map(|&p| std::iter::repeat_n(((p + salt) % 251) as u8, stride)).collect();
                 assert_eq!(actual, expected);
             }

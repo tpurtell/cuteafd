@@ -675,7 +675,7 @@ mod cuda_tests {
                 assert_eq!(lib.cuda_get_device()?, 1);
                 for (allocation, expected) in allocations.iter().zip(&expected) {
                     let mut actual = vec![0; expected.len()];
-                    allocation.device.run(|| lib.copy_d2h(&mut actual, allocation.buffer))?;
+                    allocation.device.run(|| lib.copy_d2h_quiescent(&mut actual, allocation.buffer))?;
                     assert_eq!(&actual, expected, "rank {} round {round} fallback={fallback}", allocation.device.id);
                 }
             }
@@ -715,7 +715,7 @@ mod cuda_tests {
             assert!(engine.completed(event)?);
             for (buffer, original) in buffers.iter().zip(&originals) {
                 let mut actual = vec![0u8; 4096];
-                buffer.device.run(|| lib.copy_d2h(&mut actual, buffer.buffer))?;
+                buffer.device.run(|| lib.copy_d2h_quiescent(&mut actual, buffer.buffer))?;
                 assert_eq!(&actual, original, "GPU {} fallback={fallback}", buffer.device.id);
             }
         }

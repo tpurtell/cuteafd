@@ -376,8 +376,8 @@ mod format_dispatch_tests {
                 steps.reverse();
                 fill_records_by_mount(library, &Records { steps, ..Default::default() }, |_| std::ptr::null_mut())?;
                 let (mut expected, mut actual) = (vec![0; bytes], vec![0; bytes]);
-                library.copy_d2h(&mut expected, mounted.buffer)?;
-                library.copy_d2h(&mut actual, pushed.buffer)?;
+                library.copy_d2h_quiescent(&mut expected, mounted.buffer)?;
+                library.copy_d2h_quiescent(&mut actual, pushed.buffer)?;
                 assert_eq!(actual, expected, "width{intermediate} plane{plane}");
             }
         }

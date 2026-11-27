@@ -114,7 +114,7 @@ impl Opened {
         // The admitted arenas were planned at the fixed cut; allocate exactly those.
         ensure!(owners == qwen4::dual_owners(layers),
             "Qwen dual solved owners differ from the planned arena cut");
-        let streams = [Stream::new(devices[0])?, Stream::new(devices[1])?];
+        let streams = [std::rc::Rc::new(Stream::new(devices[0])?), std::rc::Rc::new(Stream::new(devices[1])?)];
         let loader = weights::Qwen4Loader { library: &self.library, checkpoint: &self.checkpoint,
             fp8_decode: args.fp8_decode, fp8_scales: args.fp8_scales, stream: streams[0].raw,
             dense: std::rc::Rc::new(crate::shared::experts::rtx::dense::DenseLoad::mount(&self.library)), arenas: None };
@@ -174,7 +174,7 @@ impl Opened {
         let hybrid = self.load_hybrid(args, &devices, &streams.each_ref().map(|stream| stream.raw), &admitted)?;
         let pool = usize::try_from(placement.pool_tokens)?;
         let context = crate::shared::context::pool_context("qwen4", context, pool)?;
-        let engine_ranks = [(devices[0], &programs[0], streams[0].raw), (devices[1], &programs[1], streams[1].raw)];
+        let engine_ranks = [(devices[0], &programs[0], std::rc::Rc::clone(&streams[0])), (devices[1], &programs[1], std::rc::Rc::clone(&streams[1]))];
         let mut engine = engine::Qwen4Engine::new_placed_with_decode_rows(&self.library, self.cfg.clone(), model, ple, &owners,
             &engine_ranks, context, args.prefill_rows, pool.div_ceil(engine::PAGE_ROWS), args.slots, decode_rows, args.kv_format, embedding)?;
         engine.prefill_shape = args.prefill_shape()?;

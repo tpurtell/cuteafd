@@ -71,7 +71,7 @@ pub(super) fn qualify<'w, 'a>(
                 let mut outputs = Vec::new();
                 for logits in [a_logits, b_logits] {
                     let mut bytes = vec![0; logits.logits.bytes];
-                    lib.copy_d2h(&mut bytes, logits.logits)?;
+                    logits.stream.copy_d2h(&mut bytes, logits.logits)?;
                     ensure!(bytes.chunks_exact(4).all(|v| f32::from_ne_bytes(v.try_into().unwrap()).is_finite()),
                         "non-finite lane logit");
                     outputs.push(bytes);

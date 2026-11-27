@@ -1333,6 +1333,7 @@ impl<'a> Caches<'a> {
 pub(crate) struct GlmfPeer<'a> {
     pub device: i32,
     pub stream: *mut c_void,
+    stream_owner: Rc<crate::shared::memory::device::Stream<'a>>,
     pub layers: Vec<GlmfLayer<'a>>,
     caches: Caches<'a>,
     decode_workspace: RefCell<Option<Workspace<'a>>>,
@@ -1377,6 +1378,7 @@ pub(crate) struct GlmfEngine<'a> {
     pub cfg: GlmNextConfig,
     pub weights: GlmfWeights<'a>,
     pub stream: *mut c_void,
+    stream_owner: Rc<crate::shared::memory::device::Stream<'a>>,
     pub max_context: usize,
     /// Rows of one prefill lane (and of a serial prefill chunk).
     pub prefill_rows: usize,
@@ -1644,10 +1646,11 @@ impl<'a> GlmfEngine<'a> {
     /// rows of one decode or verify step, [`DECODE_ROWS`] or [`WIDE_DECODE_ROWS`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(library: &'a NativeLibrary, programs: &'a Programs<'a>, cfg: GlmNextConfig, weights: GlmfWeights<'a>,
-        stream: *mut c_void, max_context: usize, prefill_rows: usize, prefill_waves: usize, prefill_span_rows: usize, pages: usize,
+        stream_owner: Rc<crate::shared::memory::device::Stream<'a>>, max_context: usize, prefill_rows: usize, prefill_waves: usize, prefill_span_rows: usize, pages: usize,
         slots: usize, embedding: TokenEmbedding<'a>, index_cache: IndexCache, kda_state: KdaState, decode_rows: usize,
         records: Option<PrefillScratch<'a>>, context_mode: Option<GlmfAttention>, pool_marks: bool,
         execution: &cuteafd_loader::placement::LayerExecutionPlan, step_experts: StepExperts) -> Result<Self> {
+        let stream = stream_owner.raw;
         let sms = library.sm_count()?;
         let quantize_grid = Fp8QuantizeGrid::new(sms, None)?;
         ensure!((1..=WIDE_DECODE_ROWS).contains(&decode_rows),
@@ -1701,7 +1704,7 @@ impl<'a> GlmfEngine<'a> {
         let device = library.cuda_get_device()?;
         let (table_pages, table_pool_pages) = glmf_table_pages(max_context as u64);
         let (table_pages, table_pool_pages) = (usize::try_from(table_pages)?, usize::try_from(table_pool_pages)?);
-        Ok(Self { max_pool_tokens_no_onboard: None, core: Vec::new(), native: Vec::new(), core_admission: None, core_head: None, draft_core_head: None, step_experts, quantize_grid, library, programs, cfg, weights, stream, max_context, prefill_rows, prefill_waves,
+        Ok(Self { max_pool_tokens_no_onboard: None, core: Vec::new(), native: Vec::new(), core_admission: None, core_head: None, draft_core_head: None, step_experts, quantize_grid, library, programs, cfg, weights, stream, stream_owner, max_context, prefill_rows, prefill_waves,
             prefill_span_rows, pages, slots, decode_rows, verify_rows,
             attention_plan: cuteafd_core::coordinator_programs::AttentionReductionPlan::new(DECODE_ROWS, None, None)?,
             replay_rows: std::cell::Cell::new(DECODE_ROWS),
@@ -2467,8 +2470,9 @@ impl<'a> GlmfEngine<'a> {
     /// Attaches the head split's second GPU: `device` with `stream`, holding `layers` (every
     /// layer's rank-1 share, see `GlmfLoader::model`). Loads the programs there, allocates its
     /// caches and the exchange (four slots per prefill lane, six with the KDA output shard).
-    pub fn attach_peer(&mut self, device: i32, stream: *mut c_void, layers: Vec<GlmfLayer<'a>>,
+    pub fn attach_peer(&mut self, device: i32, stream_owner: Rc<crate::shared::memory::device::Stream<'a>>, layers: Vec<GlmfLayer<'a>>,
         execution: &cuteafd_loader::placement::LayerExecutionPlan) -> Result<()> {
+        let stream = stream_owner.raw;
         ensure!(layers.len() == self.weights.layers.len() && layers.iter().chain(&self.weights.layers).all(|l| l.split),
             "attach_peer needs the head-split shares of every loaded layer");
         // The share programs (`glmf2_*`) exist at 64 decode rows only.
@@ -2499,7 +2503,7 @@ impl<'a> GlmfEngine<'a> {
             let caches = Caches::new(self.library, &self.cfg, &layers, self.pages / local, self.pool_pages / local,
                 self.slots, self.caches.kda_heads, self.index_cache, self.kda_state, self.decode_rows, None,
                 self.caches.pool_marks)?;
-            Ok(GlmfPeer { device, stream, layers, caches,
+            Ok(GlmfPeer { device, stream, stream_owner, layers, caches,
                 decode_workspace: RefCell::new(None), prefill_slots: RefCell::new(Vec::new()),
                 graphs: RefCell::new(GraphBank::with_family("glm5_flash")), l2: None })
         })?;
@@ -2805,7 +2809,7 @@ impl<'a> GlmfEngine<'a> {
             for (out, regions) in [(&mut state, recurrent), (&mut conv, window), (&mut tails, tail)] {
                 for &region in regions {
                     let mut bytes = vec![0u8; region.bytes];
-                    self.on(rank, || self.library.copy_d2h(&mut bytes, region))?;
+                    self.rank_stream(rank).copy_d2h(&mut bytes, region)?;
                     out.extend(bytes);
                 }
             }
@@ -3170,12 +3174,18 @@ impl<'a> GlmfEngine<'a> {
         self.download_buffer(dev.buffer, bytes)
     }
 
+    pub(crate) fn rank_stream(&self, rank: usize) -> &crate::shared::memory::device::Stream<'a> {
+        match (rank, &self.peer) {
+            (1, Some(peer)) => &peer.stream_owner,
+            _ => &self.stream_owner,
+        }
+    }
+
     fn download_buffer(&self, buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize) -> Result<Vec<u8>> {
         ensure!(bytes <= buffer.bytes, "download of {bytes} bytes exceeds {}-byte buffer", buffer.bytes);
-        // SAFETY: these rank-0 diagnostic buffers stay live until this engine stream drains.
-        unsafe { self.library.cuda_stream_synchronize(self.stream)? };
+        self.stream_owner.drain()?;
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
+        self.stream_owner.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
         Ok(out)
     }
 

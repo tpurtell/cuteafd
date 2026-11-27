@@ -1043,7 +1043,7 @@ mod shared_storage_tests {
         unsafe { private.kernel.launch(private.query.buffer,sink.buffer,private.metadata.buffer,None,
             &window,None,private.output.buffer,4,0,None,private.stream.raw)?;
             lib.cuda_stream_synchronize(private.stream.raw)?; }
-        let mut want=vec![0;output_bytes];lib.copy_d2h(&mut want,private.output.buffer)?;
+        let mut want=vec![0;output_bytes];lib.copy_d2h_quiescent(&mut want,private.output.buffer)?;
         for seed in 0..2 { enqueue(&slots[seed],seed)?; unsafe { lib.cuda_stream_synchronize(storage.stream.raw)?; } }
         let reader=Stream::new(device)?;let saved=Allocation::new(device,output_bytes, crate::shared::memory::TEST)?;
         unsafe { lib.copy_d2d_async(saved.buffer,storage.output.buffer,output_bytes,reader.raw)?; }
@@ -1073,7 +1073,7 @@ mod shared_storage_tests {
         }
         drop(gate); for chain in &chains {chain.drain()?;} reader.drain()?;
         assert_eq!(done,!guarded,"sparse B completion before releasing A reader");
-        let mut got=vec![0;output_bytes];lib.copy_d2h(&mut got,saved.buffer)?;
+        let mut got=vec![0;output_bytes];lib.copy_d2h_quiescent(&mut got,saved.buffer)?;
         if guarded {assert_eq!(got,want);} else {assert_ne!(got,want,"negative control did not clobber");}
         Ok(())
     }

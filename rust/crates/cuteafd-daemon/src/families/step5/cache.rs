@@ -384,7 +384,7 @@ impl<'a> CacheRank<'a> {
             let source = if let Some(mark) = mark { view(mark, self.layout.ranks[self.rank].mark_component(span)?)? }
                 else { self.request_component(span, sequence)? };
             let mut encoded = [0; 8];
-            self.stream.device.run(|| self.stream.device.library.copy_d2h(&mut encoded, source))?;
+            self.stream.copy_d2h(&mut encoded, source)?;
             Ok(u64::from_le_bytes(encoded))
         }).collect()
     }
@@ -469,7 +469,7 @@ impl<'a> CacheRank<'a> {
         ensure!(length.bytes == 8, "Step-5 canonical mark length width");
         let source = view(mark, length)?;
         let mut encoded = [0; 8];
-        self.stream.device.run(|| self.stream.device.library.copy_d2h(&mut encoded, source))?;
+        self.stream.copy_d2h(&mut encoded, source)?;
         validate_mark_length(encoded, frontier)
     }
 
@@ -577,7 +577,7 @@ pub(super) mod tests {
         cache.publish_bank(1);
         cache.reset_sequence(1)?;
         let mut actual = vec![0; initial.len()];
-        device.run(|| library.copy_d2h(&mut actual, cache.active.buffer))?;
+        device.run(|| library.copy_d2h_quiescent(&mut actual, cache.active.buffer))?;
         let mut expected = initial;
         let state = &layout.ranks[0];
         for span in [state.length, state.next_length].into_iter()
@@ -735,7 +735,7 @@ pub(super) mod tests {
         cache.restore(1, 0, 65)?;
         let restored = layout.snapshot_copies(0, 65, &stages, 2, 1, 2, 0)?;
         let mut actual = vec![0; cache.active.buffer.bytes];
-        device.run(|| library.copy_d2h(&mut actual, cache.active.buffer))?;
+        device.run(|| library.copy_d2h_quiescent(&mut actual, cache.active.buffer))?;
         let mut expected = vec![0xa5; actual.len()];
         for (i, copy) in restored.iter().enumerate() {
             let at = copy.active.offset as usize;

@@ -180,7 +180,7 @@ fn native_planes_ring_exact_commit_and_failed_transactions_drain_before_mount() 
                         let (offset, bytes) = planes.planes[plane];
                         let expected = packed_plane(&image[offset..offset + bytes], plane, &planes);
                         let mut actual = vec![0; bytes];
-                        library.copy_d2h(&mut actual, weight.buffers[plane].buffer)?;
+                        library.copy_d2h_quiescent(&mut actual, weight.buffers[plane].buffer)?;
                         assert_eq!(actual, expected, "nvfp4={nvfp4} plane={plane}");
                     }
                     // One-expert vectors leave alignment gaps; production vectors are aligned.
@@ -191,7 +191,7 @@ fn native_planes_ring_exact_commit_and_failed_transactions_drain_before_mount() 
                     if nvfp4 {
                         assert_eq!(planes.planes[0].0, 0);
                         let mut actual = vec![0; planes.bytes];
-                        library.copy_d2h(&mut actual, cuteafd_ffi::CuteafdDeviceBuffer {
+                        library.copy_d2h_quiescent(&mut actual, cuteafd_ffi::CuteafdDeviceBuffer {
                             bytes: planes.bytes, ..weight.buffers[0].buffer
                         })?;
                         for ((offset, bytes), expected) in planes.vectors.into_iter().zip([1.0f32, 1.0, 0.5, 0.25]) {

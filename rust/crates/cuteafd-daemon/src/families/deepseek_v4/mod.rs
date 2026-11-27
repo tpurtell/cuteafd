@@ -428,7 +428,9 @@ pub(crate) fn with_engine<T>(
     let programs = loaded.library.programs()?.with_manifest(&args.manifest)?
         .with_sparse_mla_precision(args.attention_precision, |name| selected.contains(name))?;
     let caps = &loaded.manifest["capacities"];
-    let stream = loaded.library.cuda_stream_create()?;
+    let stream_owner = std::rc::Rc::new(crate::shared::memory::device::Stream::new(
+        crate::shared::memory::device::Device { library: &loaded.library, id: args.device })?);
+    let stream = stream_owner.raw;
     // The head split's second GPU and its stream (load kernels, then the engine's).
     // A head split needs its share's programs (`dsv4f2` / `dsv4p2`) in this build.
     let share_program = format!("{}2_wo_m{}", loaded.family, caps["decode_rows"].as_u64().unwrap_or(64));
@@ -464,11 +466,12 @@ pub(crate) fn with_engine<T>(
             "DeepSeek V4 programs loaded");
         Ok(())
     })?;
-    let peer_stream = match split_device {
-        Some(device) => Some((device, crate::shared::peer_split::on_device(&loaded.library, device,
-            || loaded.library.cuda_stream_create())?)),
+    let peer_stream_owner = match split_device {
+        Some(device) => Some((device, std::rc::Rc::new(crate::shared::memory::device::Stream::new(
+            crate::shared::memory::device::Device { library: &loaded.library, id: device })?))),
         None => None,
     };
+    let peer_stream = peer_stream_owner.as_ref().map(|(device, owner)| (*device, owner.raw));
     let mut max_context = crate::shared::context::checkpoint_context(
         &args.snapshot, &args.manifest, "deepseek_v4", args.max_context)?;
     let prefill_kernel_rows = caps["prefill_rows"].as_u64().context("prefill_rows")? as usize;
@@ -683,7 +686,7 @@ pub(crate) fn with_engine<T>(
         prefill_span_rows: usize::try_from(prefill.span_rows)?,
         c128_width: usize::try_from(cuteafd_loader::serving_capacity::compiled_c128_width(&loaded.manifest, loaded.family)?)?,
         max_context,
-        stream,
+        stream_owner: std::rc::Rc::clone(&stream_owner),
         sms: args.sms,
         shape,
         embedding,
@@ -695,8 +698,8 @@ pub(crate) fn with_engine<T>(
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let mut transports = Vec::new();
     let result = (|| -> Result<T> {
-        if let Some((device, stream)) = peer_stream {
-            engine.attach_peer(device, stream, shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.is_some() })?;
+        if let Some((device, ref peer_owner)) = peer_stream_owner {
+            engine.attach_peer(device, std::rc::Rc::clone(peer_owner), shares.pop().context("head-split shares")?, engine::PeerParts { shape, tp2: placement.tp2.is_some() })?;
         }
         crate::shared::inventory::startup_probe(&loaded.library, &devices, "v4/after-kv-pool", Default::default())?;
         // The host prefix quota and every pinned table were admitted with the placement.
@@ -848,15 +851,9 @@ pub(crate) fn with_engine<T>(
     }
     drop(engine);
     drop(transports);
-    // SAFETY: the engine that used the streams is gone.
-    unsafe {
-        loaded.library.cuda_stream_destroy(stream)?;
-        if let Some((device, stream)) = peer_stream {
-            loaded.library.cuda_set_device(device)?;
-            let destroyed = loaded.library.cuda_stream_destroy(stream);
-            loaded.library.cuda_set_device(args.device)?;
-            destroyed?;
-        }
+    std::rc::Rc::into_inner(stream_owner).context("deepseek_v4 lead stream still referenced")?.destroy()?;
+    if let Some((_, peer_owner)) = peer_stream_owner {
+        std::rc::Rc::into_inner(peer_owner).context("deepseek_v4 peer stream still referenced")?.destroy()?;
     }
     result
 }

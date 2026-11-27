@@ -170,7 +170,7 @@ fn placed_cache_commits_match_direct_and_preserve_peer_requests() -> Result<()> 
 }
 fn read(lib: &NativeLibrary, buffer: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
     let mut bytes = vec![0; buffer.bytes];
-    lib.copy_d2h(&mut bytes, buffer)?;
+    lib.copy_d2h_quiescent(&mut bytes, buffer)?;
     Ok(bytes)
 }
 fn row(buffers: &[(&[u8], usize)], index: usize) -> Vec<u8> {

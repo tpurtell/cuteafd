@@ -598,7 +598,7 @@ impl<'a> PrefillTarget<'a> for TargetPass<'_, 'a> {
             unsafe { self.execute_replay(requests, batch, transport, 0, selected, &encoder).await? }
         } else { unsafe { self.execute(requests, batch, transport, 0, selected).await? } };
         let mut bytes = vec![0; logits.logits.bytes];
-        lib.copy_d2h(&mut bytes, logits.logits)?;
+        logits.stream.copy_d2h(&mut bytes, logits.logits)?;
         Ok(bytes)
     }
     async fn commit_packed_prefill<C: DraftChain<'a>>(&mut self, requests: &mut Requests<'a>,

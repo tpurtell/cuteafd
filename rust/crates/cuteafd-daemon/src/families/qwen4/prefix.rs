@@ -357,14 +357,11 @@ pub(crate) fn prefill_digest(engine: &Qwen4Engine<'_>, placement: &mut Qwen4Plac
 }
 
 fn download(engine: &Qwen4Engine<'_>, range: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
-    let stream = engine.state_stream(range.device_id)?;
-    Device { library: engine.library, id: range.device_id }.run(|| {
-        // SAFETY: the owner stream retires every write to this live range.
-        unsafe { engine.library.cuda_stream_synchronize(stream)? };
-        let mut bytes = vec![0u8; range.bytes];
-        engine.library.copy_d2h(&mut bytes, range)?;
-        Ok(bytes)
-    })
+    let stream = engine.stream_for_device(range.device_id)?;
+    stream.drain()?;
+    let mut bytes = vec![0u8; range.bytes];
+    stream.copy_d2h(&mut bytes, range)?;
+    Ok(bytes)
 }
 
 /// Every byte of state slot `slot` (GDN conv and recurrent state per layer, PLE conv state).

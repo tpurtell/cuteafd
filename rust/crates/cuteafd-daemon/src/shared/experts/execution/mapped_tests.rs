@@ -55,14 +55,14 @@ fn real_registered_output_matches_device_compaction_and_preserves_guards() -> Re
         }
         execution.synchronize()?;
         let mut expected = vec![0; bytes];
-        lib.copy_d2h(&mut expected, CuteafdDeviceBuffer { bytes, ..device })?;
+        lib.copy_d2h_quiescent(&mut expected, CuteafdDeviceBuffer { bytes, ..device })?;
         assert_eq!(&host.bytes_mut()[prefix..prefix + bytes], expected.as_slice());
         // Exercise the refactored host fallback too. Compare its downloaded
         // bytes with its own device result, avoiding a second-execution atomic comparison.
         let fallback = execution.execute_host_request(&request, 1, &mut exchange)?;
         assert_eq!(fallback.header, response.header);
         let fallback_bytes = fallback.partial_output_payload.to_vec();
-        lib.copy_d2h(&mut expected, CuteafdDeviceBuffer { bytes, ..device })?;
+        lib.copy_d2h_quiescent(&mut expected, CuteafdDeviceBuffer { bytes, ..device })?;
         assert_eq!(fallback_bytes, expected);
         assert!(expected.iter().any(|&b| b != 0), "fixture must exercise nonzero outputs");
         owned.header.flags |= EXPERT_PROTOCOL_V2_FLAG_DEBUG_CHECKSUM;

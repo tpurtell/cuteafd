@@ -168,7 +168,13 @@ fn host_copy_batch_preserves_order_at_stack_boundary() -> Result<()> {
         // SAFETY: the fake copies synchronously using exclusively owned, disjoint views.
         unsafe { library.copy_host_buffers_h2d_batch_async(&dsts, &srcs, &vec![1; count], 1usize as *mut c_void)?; }
         let mut actual = vec![0; count];
-        library.copy_d2h(&mut actual, target)?;
+        assert!(
+            // SAFETY: testing null-stream rejection on a live buffer.
+            unsafe { library.copy_d2h(&mut actual, target, std::ptr::null_mut()) }.is_err(),
+            "stream-ordered copy_d2h must reject a null stream"
+        );
+        // SAFETY: the fake stream handle produced `target`.
+        unsafe { library.copy_d2h(&mut actual, target, 1usize as *mut c_void)?; }
         assert!(actual.iter().copied().eq(input[..count].iter().rev().copied()));
     }
     library.free_device_buffer(&mut target)?;
@@ -590,7 +596,7 @@ fn synchronous_upload_chunks_preserve_bytes_odd_tails_and_fixed_peak_staging() -
     for bytes in [1, SYNC_H2D_CHUNK_BYTES - 1, SYNC_H2D_CHUNK_BYTES,
         SYNC_H2D_CHUNK_BYTES + 1, capacity] {
         library.copy_h2d(dst, &source[..bytes])?;
-        library.copy_d2h(&mut output[..bytes], dst)?;
+        library.copy_d2h_quiescent(&mut output[..bytes], dst)?;
         assert_eq!(&output[..bytes], &source[..bytes], "{bytes} byte upload");
         peak = peak.max(bytes.min(SYNC_H2D_CHUNK_BYTES));
         assert_eq!(library.sync_h2d_staging_buffer()?.unwrap().bytes, peak);
@@ -599,7 +605,7 @@ fn synchronous_upload_chunks_preserve_bytes_odd_tails_and_fixed_peak_staging() -
     let before = fixture.events()?;
     let short = [0x93; 17];
     library.copy_h2d(dst, &short)?;
-    library.copy_d2h(&mut output, dst)?;
+    library.copy_d2h_quiescent(&mut output, dst)?;
     assert_eq!(&output[..short.len()], &short);
     assert_eq!(&output[short.len()..], &source[short.len()..]);
     assert_eq!(library.sync_h2d_staging_buffer()?.unwrap().ptr, staging.ptr);
@@ -635,7 +641,7 @@ fn sealed_synchronous_uploads_cannot_regrow_but_ordered_uploads_remain_valid() -
     unsafe { library.copy_h2d_ordered(dst, &[4; 8], stream)?; }
     library.release_ordered_h2d_staging()?;
     let mut output = [0; 8];
-    library.copy_d2h(&mut output, dst)?;
+    library.copy_d2h_quiescent(&mut output, dst)?;
     assert_eq!(output, [4; 8]);
     library.free_device_buffer(&mut dst)?;
     Ok(())

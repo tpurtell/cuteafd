@@ -135,8 +135,7 @@ impl<'a> WindowSnapshots<'a> {
         self.copies.drain()?;
         let saved=self.mark(mark)?;
         let mut bytes=[0u8;16];
-        self.arena.device.run(||self.arena.device.library.copy_d2h(&mut bytes,
-            CuteafdDeviceBuffer { bytes:16,..saved }))?;
+        self.copies.copy_d2h(0, &mut bytes, CuteafdDeviceBuffer { bytes:16,..saved })?;
         let origin=usize::try_from(u64::from_le_bytes(bytes[..8].try_into()?))?;
         let end=usize::try_from(u64::from_le_bytes(bytes[8..].try_into()?))?;
         ensure!(origin<=end,"window snapshot metadata invalid");
@@ -1876,13 +1875,18 @@ impl<'a> DsparkDrafter<'a> {
         }).collect())
     }
 
+    pub(crate) fn stream_raw(&self) -> *mut c_void {
+        self.stream
+    }
+
     /// The last draft step's final-norm rows [sequences * block, hidden] BF16.
     pub fn last_hidden(&self, sequences: usize) -> Result<Vec<u8>> {
         let slot = self.workspace.borrow();
         let w = slot.as_ref().context("no draft step ran")?;
         let bytes = sequences * self.cfg.block * self.cfg.hidden * 2;
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..w.n.buffer })?;
+        // SAFETY: `self.stream` produced `w.n` and remains live on this device.
+        unsafe { self.library.copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..w.n.buffer }, self.stream)?; }
         Ok(out)
     }
 
@@ -1894,7 +1898,7 @@ impl<'a> DsparkDrafter<'a> {
             .and_then(|n| n.checked_mul(4)).context("draft logit readback overflow")?;
         ensure!(sequences > 0 && bytes <= w.output()?.logits.buffer.bytes, "draft logit readback exceeds arena");
         let mut host = vec![0; bytes];
-        self.library.copy_d2h(&mut host, CuteafdDeviceBuffer { bytes, ..w.output()?.logits.buffer })?;
+        self.library.copy_d2h_quiescent(&mut host, CuteafdDeviceBuffer { bytes, ..w.output()?.logits.buffer })?;
         Ok(host.chunks_exact(4).map(|word| f32::from_le_bytes(word.try_into().unwrap())).collect())
     }
 
@@ -2103,7 +2107,7 @@ mod tests {
             unsafe { snapshots[rank].restore(0,&[planes[rank].buffer],4099)?; }
             snapshots[rank].drain()?;
             let mut actual=vec![0;256];
-            devices[rank].run(||library.copy_d2h(&mut actual,planes[rank].buffer))?;
+            devices[rank].run(||library.copy_d2h_quiescent(&mut actual,planes[rank].buffer))?;
             assert_eq!(actual,expected[rank],"rank bytes including inactive region changed");
         }
         let copies=include_str!("../prefix/copy_stream.rs");
@@ -2154,14 +2158,14 @@ mod tests {
         assert!(unsafe { snapshots.restore(0, &live, 24) }.is_err());
         for plane in &live {
             let mut bytes = vec![0; plane.bytes];
-            device.run(|| library.copy_d2h(&mut bytes, *plane))?;
+            device.run(|| library.copy_d2h_quiescent(&mut bytes, *plane))?;
             assert_eq!(bytes, vec![197; plane.bytes], "invalid restore must not mutate destinations");
         }
         assert_eq!(unsafe { snapshots.restore(0, &live, 23)? }, (0, 23));
         snapshots.drain()?;
         for (plane, cold) in live.iter().zip(&expected) {
             let mut restored = vec![0; plane.bytes];
-            device.run(|| library.copy_d2h(&mut restored, *plane))?;
+            device.run(|| library.copy_d2h_quiescent(&mut restored, *plane))?;
             assert_eq!(&restored, cold);
         }
         let before = fixture.events()?;
@@ -2301,7 +2305,7 @@ mod tests {
                     let mut owners = drafter.weight_buffers();
                     if let Some(inv) = &drafter.inv_freq { owners.push(("inv_freq".into(),inv.buffer)); }
                     owners.into_iter().map(|(name,buffer)| {
-                        let mut bytes=vec![0;buffer.bytes]; device.run(|| library.copy_d2h(&mut bytes,buffer))?;
+                        let mut bytes=vec![0;buffer.bytes]; device.run(|| library.copy_d2h_quiescent(&mut bytes,buffer))?;
                         assert!(bytes.iter().any(|&b|b!=0),"unfilled {name}"); Ok((name,bytes))
                     }).collect()
                 };
@@ -2477,7 +2481,7 @@ mod tests {
                 unsafe { library.cuda_stream_synchronize(stream.raw)?; }
                 planes.iter().map(|&plane| {
                     let mut bytes = vec![0; plane.bytes];
-                    library.copy_d2h(&mut bytes, plane)?;
+                    library.copy_d2h_quiescent(&mut bytes, plane)?;
                     Ok(bytes)
                 }).collect()
             })
@@ -2514,8 +2518,8 @@ mod tests {
                 let mut expected_mark = vec![0; marks.mark_bytes()];
                 let mut actual_mark = expected_mark.clone();
                 device.run(|| {
-                    library.copy_d2h(&mut expected_mark, marks.mark(0)?)?;
-                    library.copy_d2h(&mut actual_mark, marks.mark(1)?)
+                    library.copy_d2h_quiescent(&mut expected_mark, marks.mark(0)?)?;
+                    library.copy_d2h_quiescent(&mut actual_mark, marks.mark(1)?)
                 })?;
                 // Padding isn't state; compare origin/frontier and every physical plane.
                 let payload = 16 + planes.iter().map(|plane| plane.bytes).sum::<usize>();

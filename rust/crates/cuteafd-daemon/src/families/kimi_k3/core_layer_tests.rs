@@ -118,15 +118,15 @@ fn reverse_k_blocks(bytes:&[u8],k:usize)->Vec<u8> {
 }
 fn compare(source:&Source,device:Device<'_>,actual:Buffer,reference:Buffer,count:usize,label:&str)->Result<()> {
     let mut a=vec![0;count*2];let mut b=vec![0;count*2];
-    device.run(||{device.library.copy_d2h(&mut a,actual)?;device.library.copy_d2h(&mut b,reference)})?;
+    device.run(||{device.library.copy_d2h_quiescent(&mut a,actual)?;device.library.copy_d2h_quiescent(&mut b,reference)})?;
     source.report(label,&bf16(&a),&bf16(&b))
 }
 
 fn check_retained_partial(device:Device<'_>,source:Buffer,retained:Buffer,count:usize)->Result<()> {
     let mut f32_bytes=vec![0;count*4];let mut bf16_bytes=vec![0;count*2];
     device.run(|| {
-        device.library.copy_d2h(&mut f32_bytes,source)?;
-        device.library.copy_d2h(&mut bf16_bytes,retained)
+        device.library.copy_d2h_quiescent(&mut f32_bytes,source)?;
+        device.library.copy_d2h_quiescent(&mut bf16_bytes,retained)
     })?;
     for (source,retained) in f32_bytes.chunks_exact(4).zip(bf16_bytes.chunks_exact(2)) {
         let bits=u32::from_le_bytes(source.try_into().unwrap());
@@ -148,16 +148,16 @@ fn compare_meet(device:Device<'_>,source:&Source,stream:&Stream<'_>,rows:usize,
     let mut retained=[vec![0;rows*7168*2],vec![0;rows*7168*2]];
     let mut references=retained.clone();
     for rank in 0..2 {device.run(|| {
-        device.library.copy_d2h(&mut retained[rank],ranks[rank].1.buffer)?;
-        device.library.copy_d2h(&mut references[rank],ranks[rank].2.buffer)
+        device.library.copy_d2h_quiescent(&mut retained[rank],ranks[rank].1.buffer)?;
+        device.library.copy_d2h_quiescent(&mut references[rank],ranks[rank].2.buffer)
     })?;}
-    let mut sum=vec![0;rows*7168*4];device.run(||device.library.copy_d2h(&mut sum,reduced.buffer))?;
+    let mut sum=vec![0;rows*7168*4];device.run(||device.library.copy_d2h_quiescent(&mut sum,reduced.buffer))?;
     for ((a,b),actual) in bf16(&retained[0]).iter().zip(bf16(&retained[1])).zip(sum.chunks_exact(4)) {
         assert_eq!(u32::from_le_bytes(actual.try_into().unwrap()),((*a as f32)+(b as f32)).to_bits(),
             "K6 rank-ordered BF16 partials sum into F32");
     }
     let reference=bf16(&references[0]).iter().zip(bf16(&references[1])).map(|(a,b)|a+b).collect::<Vec<_>>();
-    let mut bytes=vec![0;rows*7168*2];device.run(||device.library.copy_d2h(&mut bytes,combined.buffer))?;
+    let mut bytes=vec![0;rows*7168*2];device.run(||device.library.copy_d2h_quiescent(&mut bytes,combined.buffer))?;
     source.report(&format!("{label} rows={rows} BF16 partial F32 meet"),&bf16(&bytes),&reference)
 }
 
@@ -226,10 +226,10 @@ fn kda_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
         // start of scratch. Compare those before recurrence can amplify error.
         let projection_width=4*local_width+128+48;
         let mut projected_reference=vec![0;rows*projection_width*2];
-        device.run(||device.library.copy_d2h(&mut projected_reference,scratch_ref.buffer))?;
+        device.run(||device.library.copy_d2h_quiescent(&mut projected_reference,scratch_ref.buffer))?;
         for (index,label) in ["q","k","v","gate"].iter().enumerate() {
             let mut actual=vec![0;rows*local_width*2];
-            device.run(||device.library.copy_d2h(&mut actual,planes[index].buffer))?;
+            device.run(||device.library.copy_d2h_quiescent(&mut actual,planes[index].buffer))?;
             let offset=if index==3 {3*local_width+128}else{index*local_width};
             let reference=(0..rows).flat_map(|row| {
                 let first=2*(row*projection_width+offset);
@@ -238,7 +238,7 @@ fn kda_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
             source.report(&format!("KDA rank={rank} rows={rows} projection {label}"),&bf16(&actual),&reference)?;
         }
         let mut a=vec![0;state.buffer.bytes];let mut b=vec![0;state_ref.buffer.bytes];
-        device.run(||{device.library.copy_d2h(&mut a,state.buffer)?;device.library.copy_d2h(&mut b,state_ref.buffer)})?;
+        device.run(||{device.library.copy_d2h_quiescent(&mut a,state.buffer)?;device.library.copy_d2h_quiescent(&mut b,state_ref.buffer)})?;
         let floats=|bytes:&[u8]|bytes.chunks_exact(4).map(|v|f32::from_le_bytes(v.try_into().unwrap())as f64).collect::<Vec<_>>();
         source.report(&format!("KDA rank={rank} rows={rows} state"),&floats(&a),&floats(&b))?;
         // Reverse matching K128 blocks of BF16 x and weights. Products and
@@ -268,7 +268,7 @@ fn kda_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
         stream.drain_or_abort("BF16 reduction-order KDA self-control");result?;
         for (index,label) in ["q","k","v","gate"].iter().enumerate() {
             let mut actual=vec![0;rows*local_width*2];
-            device.run(||device.library.copy_d2h(&mut actual,control_planes[index].buffer))?;
+            device.run(||device.library.copy_d2h_quiescent(&mut actual,control_planes[index].buffer))?;
             let offset=if index==3 {3*local_width+128}else{index*local_width};
             let reference=(0..rows).flat_map(|row| {
                 let first=2*(row*projection_width+offset);
@@ -279,7 +279,7 @@ fn kda_layer(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source:
         compare(source,device,control_normalized.buffer,normalized_ref.buffer,rows*local_width,&format!("BF16 control rank={rank} rows={rows} normalized"))?;
         compare(source,device,control_output.buffer,output_ref.buffer,rows*h,&format!("BF16 control rank={rank} rows={rows} output"))?;
         compare(source,device,control_conv.buffer,conv_ref.buffer,conv.buffer.bytes/2,&format!("BF16 control rank={rank} rows={rows} conv"))?;
-        let mut control=vec![0;state.buffer.bytes];device.run(||device.library.copy_d2h(&mut control,control_state.buffer))?;
+        let mut control=vec![0;state.buffer.bytes];device.run(||device.library.copy_d2h_quiescent(&mut control,control_state.buffer))?;
         source.report(&format!("BF16 control rank={rank} rows={rows} state"),&floats(&control),&floats(&b))?;
         rank_cores.push((out_projection,retained,output_ref));
     }
@@ -358,7 +358,7 @@ fn compare_ffn_truth(source:&Source,device:Device<'_>,actual:Buffer,count:usize,
     ensure!(truth.info.dtype==DType::Unknown("F64".into()) && truth.info.shape==[1,count] && truth.bytes.len()==count*8,
         "F64 FFN truth geometry");
     let reference=truth.bytes.chunks_exact(8).map(|v|f64::from_le_bytes(v.try_into().unwrap())).collect::<Vec<_>>();
-    let mut bytes=vec![0;count*2];device.run(||device.library.copy_d2h(&mut bytes,actual))?;
+    let mut bytes=vec![0;count*2];device.run(||device.library.copy_d2h_quiescent(&mut bytes,actual))?;
     let values=bf16(&bytes);
     let (relative,peak)=errors(&values,&reference)?;
     let (cosine,signed)=error_bias(&values,&reference);
@@ -412,7 +412,7 @@ fn shared_ffn(device:Device<'_>,base:&Programs<'_>,programs:&Programs<'_>,source
         compare(source,device,output.buffer,reference.buffer,rows*7168,&format!("layer={layer} FFN rank={rank} rows={rows} output"))?;
         if rows==1 {
             let mut packed=vec![0;6144*2];
-            device.run(||device.library.copy_d2h(&mut packed,gate_up_ref.buffer))?;
+            device.run(||device.library.copy_d2h_quiescent(&mut packed,gate_up_ref.buffer))?;
             let reference_gate=upload(device,&packed[..3072*2])?;
             let reference_up=upload(device,&packed[3072*2..])?;
             for (stage,count,k6,bf16) in [("gate",3072,gate_out.buffer,reference_gate.buffer),

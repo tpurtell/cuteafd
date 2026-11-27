@@ -42,7 +42,7 @@ int main() {
     ok(cuteafd_cuda_linear_bf16_cublas_async(static_cast<const uint16_t*>(dx.ptr), static_cast<const uint16_t*>(dw.ptr),
                                              nullptr, static_cast<uint16_t*>(dy.ptr), rows, k, n, stream));
     ok(cuteafd_cuda_stream_synchronize(stream));
-    ok(cuteafd_copy_d2h(y.data(), dy, rows * n * 2));
+    ok(cuteafd_copy_d2h(y.data(), dy, rows * n * 2, stream));
     double worst = 0.0;
     for (size_t r = 0; r < rows; ++r) {
       for (size_t c = 0; c < n; c += 61) {

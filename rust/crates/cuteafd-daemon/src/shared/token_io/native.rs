@@ -144,8 +144,8 @@ impl RowFp8Weights<'_> {
         } else {
             let first = token.checked_mul(hidden).context("native vocabulary row offset overflow")?;
             let scale_first = token.checked_mul(4).context("native vocabulary scale offset overflow")?;
-            library.copy_d2h(&mut bytes, view(self.payload(), first, hidden)?)?;
-            library.copy_d2h(&mut scale, view(self.scales(), scale_first, 4)?)?;
+            library.copy_d2h_quiescent(&mut bytes, view(self.payload(), first, hidden)?)?;
+            library.copy_d2h_quiescent(&mut scale, view(self.scales(), scale_first, 4)?)?;
         }
         let scale = f32::from_le_bytes(scale);
         for (out, &b) in output.chunks_exact_mut(2).zip(&bytes) {
@@ -571,8 +571,8 @@ mod tests {
             for (one, two) in [(&plain.embedding, &vocabulary.embedding), (&plain.head, &vocabulary.head)] {
                 for (a, b) in [(one.payload(), two.payload()), (one.scales(), two.scales())] {
                     let (mut left, mut right) = (vec![0; a.bytes], vec![0; b.bytes]);
-                    Device { library: &library, id: a.device_id }.run(|| library.copy_d2h(&mut left, a))?;
-                    Device { library: &library, id: b.device_id }.run(|| library.copy_d2h(&mut right, b))?;
+                    Device { library: &library, id: a.device_id }.run(|| library.copy_d2h_quiescent(&mut left, a))?;
+                    Device { library: &library, id: b.device_id }.run(|| library.copy_d2h_quiescent(&mut right, b))?;
                     assert_eq!(left, right, "flash={flash} world={world} embedding_rank={embedding_rank}");
                     assert!(left.iter().any(|&v| v != 0));
                 }
@@ -1093,8 +1093,8 @@ mod tests {
         let drained = library.cuda_device_synchronize();
         launched?;
         drained?;
-        library.copy_d2h(&mut embedding, output.buffer)?;
-        library.copy_d2h(&mut scores, logits.buffer)?;
+        library.copy_d2h_quiescent(&mut embedding, output.buffer)?;
+        library.copy_d2h_quiescent(&mut scores, logits.buffer)?;
         for (row, bytes) in embedding.chunks_exact(K * 2).enumerate() {
             let expected = if row < 3 { 0x3f00u16 } else { 0 };
             assert!(
@@ -1139,7 +1139,7 @@ mod tests {
                 drained?;
             }
             let mut copied = vec![0; expanded.buffer.bytes];
-            library.copy_d2h(&mut copied, expanded.buffer)?;
+            library.copy_d2h_quiescent(&mut copied, expanded.buffer)?;
             for (row, bytes) in copied.chunks_exact(4 * K * 2).enumerate() {
                 let expected = if row < 3 { 0x3f00u16 } else { 0 };
                 assert!(bytes.chunks_exact(2).all(|b| u16::from_le_bytes(b.try_into().unwrap()) == expected));

@@ -1064,7 +1064,7 @@ mod tests {
                                 for (slot, bytes) in actual.iter_mut().enumerate() {
                                     if let Some(region) = &layer.regions[index * 2 + slot] {
                                         bytes.resize(region.buffer.bytes, 0);
-                                        device.run(|| library.copy_d2h(bytes, region.buffer))?;
+                                        device.run(|| library.copy_d2h_quiescent(bytes, region.buffer))?;
                                     }
                                 }
                                 for expert in 0..tensors.shape().experts {
@@ -1132,8 +1132,8 @@ mod tests {
                                 let mut expected = vec![0; mount.buffer.bytes];
                                 let mut actual = vec![0; push.buffer.bytes];
                                 device.run(|| {
-                                    library.copy_d2h(&mut expected, mount.buffer)?;
-                                    library.copy_d2h(&mut actual, push.buffer)
+                                    library.copy_d2h_quiescent(&mut expected, mount.buffer)?;
+                                    library.copy_d2h_quiescent(&mut actual, push.buffer)
                                 })?;
                                 assert_eq!(actual, expected, "{format:?} TP{world} rank {rank}");
                             }
@@ -1255,7 +1255,7 @@ mod tests {
                     if let (Some(mount), Some(push)) = (mount, push) {
                         let mut expected = vec![0; mount.buffer.bytes];
                         let mut actual = vec![0; push.buffer.bytes];
-                        device.run(|| { library.copy_d2h(&mut expected, mount.buffer)?; library.copy_d2h(&mut actual, push.buffer) })?;
+                        device.run(|| { library.copy_d2h_quiescent(&mut expected, mount.buffer)?; library.copy_d2h_quiescent(&mut actual, push.buffer) })?;
                         assert_eq!(actual, expected, "{repo} {format:?} TP2 rank {rank}");
                     }
                 }
@@ -1516,7 +1516,7 @@ mod tests {
                 }
                 for (region, expected) in [(2 * slot, weights), (2 * slot + 1, scales)] {
                     let mut actual = vec![0; expected.len()];
-                    devices[rank].run(|| library.copy_d2h(&mut actual, owners[rank].layers[0].regions[region].as_ref().unwrap().buffer))?;
+                    devices[rank].run(|| library.copy_d2h_quiescent(&mut actual, owners[rank].layers[0].regions[region].as_ref().unwrap().buffer))?;
                     ensure!(actual == expected, "TP2 paired upload differs: rank {rank} layer {layer} {projection:?} region {region}");
                 }
             }

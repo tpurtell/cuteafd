@@ -1255,7 +1255,13 @@ type CudaGraphLaunchFn =
 type CudaGraphExecDestroyFn = unsafe extern "C" fn(cuda_graph_exec: *mut c_void) -> CuteafdStatus;
 type CopyH2DFn =
     unsafe extern "C" fn(dst: CuteafdDeviceBuffer, src: *const c_void, bytes: usize) -> CuteafdStatus;
-type CopyD2HFn =
+type CopyD2HFn = unsafe extern "C" fn(
+    dst: *mut c_void,
+    src: CuteafdDeviceBuffer,
+    bytes: usize,
+    cuda_stream: *mut c_void,
+) -> CuteafdStatus;
+type CopyD2HQuiescentFn =
     unsafe extern "C" fn(dst: *mut c_void, src: CuteafdDeviceBuffer, bytes: usize) -> CuteafdStatus;
 type CopyD2DFn = unsafe extern "C" fn(
     dst: CuteafdDeviceBuffer,
@@ -1779,6 +1785,7 @@ native_symbols! {
     cuteafd_copy_h2d_batch_async: CopyH2DBatchAsyncFn,
     cuteafd_copy_h2d_2d_async: CopyH2D2DAsyncFn,
     cuteafd_copy_d2h: CopyD2HFn,
+    cuteafd_copy_d2h_quiescent: CopyD2HQuiescentFn,
     cuteafd_copy_d2d: CopyD2DFn,
     cuteafd_copy_d2h_async: CopyD2HAsyncFn,
     cuteafd_copy_d2d_2d_async: unsafe extern "C" fn(CuteafdDeviceBuffer, usize, CuteafdDeviceBuffer, usize, usize, usize, *mut c_void) -> CuteafdStatus,
@@ -3628,10 +3635,52 @@ impl NativeLibrary {
         self.status_to_result(context, status)
     }
 
-    pub fn copy_d2h(&self, dst: &mut [u8], src: CuteafdDeviceBuffer) -> Result<()> {
+    /// Copy `dst.len()` bytes from `src` to host memory, ordered after all prior
+    /// work on `cuda_stream` and synchronizing only `cuda_stream` (never device-wide).
+    ///
+    /// Engine streams are created with `cudaStreamNonBlocking`, which does not
+    /// synchronize with CUDA's legacy default stream (`cudaMemcpy`). Taking the
+    /// producing stream prevents unordered host reads by construction; passing a
+    /// null stream is rejected.
+    ///
+    /// For buffers with no in-flight non-blocking stream writes (committed static
+    /// weights at load time, synchronous `copy_h2d`/`copy_d2d` fixtures, CPU-only
+    /// builds, or after an explicit device drain), use [`Self::copy_d2h_quiescent`].
+    ///
+    /// # Safety
+    /// `cuda_stream` must be a live, non-null CUDA stream on the current device
+    /// that produced `src` (or joined its producer via an event), `src` must remain
+    /// live through this call, and `cuda_stream` must not be capturing a graph.
+    pub unsafe fn copy_d2h(
+        &self,
+        dst: &mut [u8],
+        src: CuteafdDeviceBuffer,
+        cuda_stream: *mut c_void,
+    ) -> Result<()> {
+        if cuda_stream.is_null() {
+            anyhow::bail!(
+                "cuteafd_copy_d2h requires a non-null producing CUDA stream; \
+                 use copy_d2h_quiescent only when no stream work is in flight"
+            );
+        }
         let copy_fn: CopyD2HFn = self.cuteafd_copy_d2h()?;
-        let status = unsafe { copy_fn(dst.as_mut_ptr().cast(), src, dst.len()) };
+        let status = unsafe { copy_fn(dst.as_mut_ptr().cast(), src, dst.len(), cuda_stream) };
         self.status_to_result("cuteafd_copy_d2h", status)
+    }
+
+    /// Copy `dst.len()` bytes from a quiescent device buffer with no in-flight
+    /// non-blocking stream writes (e.g. committed static weights at load time,
+    /// synchronous `copy_h2d`/`copy_d2d` fixtures, CPU-only builds, or after an
+    /// explicit device drain).
+    ///
+    /// Uses CUDA's legacy default stream (`cudaMemcpy`), which does **not** wait
+    /// for `cudaStreamNonBlocking` engine streams. Never call this for a buffer
+    /// written on an engine or copy stream; pass the producing stream to
+    /// [`Self::copy_d2h`] instead.
+    pub fn copy_d2h_quiescent(&self, dst: &mut [u8], src: CuteafdDeviceBuffer) -> Result<()> {
+        let copy_fn: CopyD2HQuiescentFn = self.cuteafd_copy_d2h_quiescent()?;
+        let status = unsafe { copy_fn(dst.as_mut_ptr().cast(), src, dst.len()) };
+        self.status_to_result("cuteafd_copy_d2h_quiescent", status)
     }
 
     /// Frees the pinned staging buffer [`Self::copy_h2d`] grows up to
@@ -6967,13 +7016,13 @@ mod tests {
                 scratch,
             )?;
             let mut status_bytes = vec![0_u8; rows * 4];
-            library.copy_d2h(&mut status_bytes, status)?;
+            library.copy_d2h_quiescent(&mut status_bytes, status)?;
             for row in 0..rows {
                 let status = u32::from_ne_bytes(status_bytes[row * 4..row * 4 + 4].try_into().unwrap());
                 assert_eq!(status, CUTEAFD_V41_SAMPLER_STATUS_OK, "row {row} status");
             }
             let mut id_bytes = vec![0_u8; rows * 4];
-            library.copy_d2h(&mut id_bytes, ids)?;
+            library.copy_d2h_quiescent(&mut id_bytes, ids)?;
             Ok((0..rows)
                 .map(|row| u32::from_ne_bytes(id_bytes[row * 4..row * 4 + 4].try_into().unwrap()))
                 .collect())
@@ -7118,7 +7167,7 @@ mod tests {
             )?;
             let read_u32 = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u32>> {
                 let mut bytes = vec![0_u8; rows * 4];
-                library.copy_d2h(&mut bytes, buffer)?;
+                library.copy_d2h_quiescent(&mut bytes, buffer)?;
                 Ok((0..rows)
                     .map(|row| {
                         u32::from_ne_bytes(bytes[row * 4..row * 4 + 4].try_into().unwrap())
@@ -7127,7 +7176,7 @@ mod tests {
             };
             let read_f32 = |buffer: CuteafdDeviceBuffer| -> Result<Vec<f32>> {
                 let mut bytes = vec![0_u8; rows * 4];
-                library.copy_d2h(&mut bytes, buffer)?;
+                library.copy_d2h_quiescent(&mut bytes, buffer)?;
                 Ok((0..rows)
                     .map(|row| {
                         f32::from_ne_bytes(bytes[row * 4..row * 4 + 4].try_into().unwrap())
@@ -7631,7 +7680,7 @@ mod tests {
             )?;
             let read_u32 = |buffer: CuteafdDeviceBuffer, count: usize| -> Result<Vec<u32>> {
                 let mut bytes = vec![0_u8; count * 4];
-                library.copy_d2h(&mut bytes, buffer)?;
+                library.copy_d2h_quiescent(&mut bytes, buffer)?;
                 Ok((0..count)
                     .map(|index| {
                         u32::from_ne_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
@@ -7639,7 +7688,7 @@ mod tests {
                     .collect())
             };
             let mut scratch_bytes = vec![0_u8; rows * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES];
-            library.copy_d2h(&mut scratch_bytes, scratch)?;
+            library.copy_d2h_quiescent(&mut scratch_bytes, scratch)?;
             let field = |row: usize, offset: usize| -> u32 {
                 u32::from_ne_bytes(
                     scratch_bytes[row * CUTEAFD_V41_SAMPLER_SCRATCH_BYTES + offset
@@ -7992,7 +8041,7 @@ mod tests {
         let mut buffer = library.alloc_device_buffer(input.len(), crate::memory_ledger::TEST)?;
 
         library.copy_h2d(buffer, &input)?;
-        library.copy_d2h(&mut output, buffer)?;
+        library.copy_d2h_quiescent(&mut output, buffer)?;
         assert_eq!(output, input);
 
         library.free_device_buffer(&mut buffer)?;
@@ -8015,7 +8064,7 @@ mod tests {
         assert!(buffer.bytes >= input.len());
         assert_ne!(buffer.flags & CUTEAFD_DEVICE_BUFFER_FLAG_MANAGED, 0);
         library.copy_h2d(buffer, &input)?;
-        library.copy_d2h(&mut output, buffer)?;
+        library.copy_d2h_quiescent(&mut output, buffer)?;
         assert_eq!(output, input);
 
         library.free_device_buffer(&mut buffer)?;
@@ -8039,7 +8088,7 @@ mod tests {
         let first_staging = library
             .sync_h2d_staging_snapshot()
             .expect("copy_h2d allocates reusable staging");
-        library.copy_d2h(&mut output, buffer)?;
+        library.copy_d2h_quiescent(&mut output, buffer)?;
         assert_eq!(output, first);
 
         library.copy_h2d(buffer, &second)?;
@@ -8047,7 +8096,7 @@ mod tests {
             .sync_h2d_staging_snapshot()
             .expect("copy_h2d keeps reusable staging");
         output[..second.len()].fill(0);
-        library.copy_d2h(&mut output[..second.len()], buffer)?;
+        library.copy_d2h_quiescent(&mut output[..second.len()], buffer)?;
         assert_eq!(&output[..second.len()], second.as_slice());
         assert_eq!(second_staging.0, first_staging.0);
         assert_eq!(second_staging.1, first_staging.1);
@@ -8070,7 +8119,7 @@ mod tests {
 
         library.copy_h2d(src, &input)?;
         library.copy_d2d(dst, src, input.len())?;
-        library.copy_d2h(&mut output, dst)?;
+        library.copy_d2h_quiescent(&mut output, dst)?;
         assert_eq!(output, input);
 
         library.free_device_buffer(&mut src)?;
@@ -8098,7 +8147,7 @@ mod tests {
 
         let mut device = library.alloc_device_buffer(input.len(), crate::memory_ledger::TEST)?;
         library.copy_host_buffer_h2d(device, host, input.len())?;
-        library.copy_d2h(&mut output, device)?;
+        library.copy_d2h_quiescent(&mut output, device)?;
         assert_eq!(output, input);
 
         let alias = library.cuda_host_buffer_device_alias(host)?;
@@ -8121,7 +8170,7 @@ mod tests {
         unsafe {
             library.copy_host_buffer_h2d_async(device, host, input.len(), std::ptr::null_mut())?;
         }
-        library.copy_d2h(&mut output, device)?;
+        library.copy_d2h_quiescent(&mut output, device)?;
         assert_eq!(output, input);
 
         let pitched_source = [1_u8, 2, 3, 90, 91, 4, 5, 6, 92, 93, 7, 8, 9, 94, 95];
@@ -8146,7 +8195,7 @@ mod tests {
             )?;
         }
         let mut pitched_output = [0_u8; 12];
-        library.copy_d2h(&mut pitched_output, pitched_device)?;
+        library.copy_d2h_quiescent(&mut pitched_output, pitched_device)?;
         assert_eq!(pitched_output, pitched_expected);
         library.free_device_buffer(&mut pitched_device)?;
         library.free_host_buffer(&mut pitched_host)?;
@@ -8728,7 +8777,7 @@ mod tests {
             )?;
             let read_u32 = |buffer: CuteafdDeviceBuffer, count: usize| -> Result<Vec<u32>> {
                 let mut bytes = vec![0_u8; count * 4];
-                library.copy_d2h(&mut bytes, buffer)?;
+                library.copy_d2h_quiescent(&mut bytes, buffer)?;
                 Ok((0..count)
                     .map(|index| {
                         u32::from_ne_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())
@@ -8737,7 +8786,7 @@ mod tests {
             };
             let read_f32 = |buffer: CuteafdDeviceBuffer, count: usize| -> Result<Vec<f32>> {
                 let mut bytes = vec![0_u8; count * 4];
-                library.copy_d2h(&mut bytes, buffer)?;
+                library.copy_d2h_quiescent(&mut bytes, buffer)?;
                 Ok((0..count)
                     .map(|index| {
                         f32::from_ne_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap())

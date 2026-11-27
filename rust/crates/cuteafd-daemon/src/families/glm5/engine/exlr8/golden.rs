@@ -513,12 +513,15 @@ fn prefill_lanes_byte_exact(total: usize, chunk: usize, waves: usize) -> Result<
             (0..engine.ranks()).map(|rank| {
                 let (kv, index) = caches(rank)?;
                 engine.on(rank, || kv.iter().zip(index).map(|(kv, index)| {
+                    let stream = engine.stream_of(rank);
                     let mut bytes = vec![0; kv.buffer.bytes];
-                    engine.library.copy_d2h(&mut bytes, kv.buffer)?;
+                    // SAFETY: `stream` owns rank's KV/index writes and remains live.
+                    unsafe { engine.library.copy_d2h(&mut bytes, kv.buffer, stream)?; }
                     if let Some(index) = index {
                         let first = bytes.len();
                         bytes.resize(first + index.buffer.bytes, 0);
-                        engine.library.copy_d2h(&mut bytes[first..], index.buffer)?;
+                        // SAFETY: `stream` owns rank's index writes and remains live.
+                        unsafe { engine.library.copy_d2h(&mut bytes[first..], index.buffer, stream)?; }
                     }
                     Ok(bytes)
                 }).collect::<Result<Vec<_>>>())

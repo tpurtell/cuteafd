@@ -154,7 +154,7 @@ fn digests(library: &NativeLibrary, layers: &[Vec<GlmLayer<'_>>], norm: &DeviceA
     let mut out = std::collections::BTreeMap::new();
     let mut put = |key: String, buffer: CuteafdDeviceBuffer| -> Result<()> {
         let mut bytes = vec![0u8; buffer.bytes];
-        library.copy_d2h(&mut bytes, buffer)?;
+        library.copy_d2h_quiescent(&mut bytes, buffer)?;
         out.insert(key, format!("{:x}", Sha256::digest(&bytes)));
         Ok(())
     };

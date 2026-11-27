@@ -774,7 +774,7 @@ impl<'a> SwaLayer<'a> {
         if let Some((directory, rank)) = capture {
             stream.drain()?;
             super::golden::dump_plane(directory, &format!("rank{rank}-merged_o_f32"),
-                stream.device, self.planes[POST].buffer, rows, false)?;
+                stream, self.planes[POST].buffer, rows, false)?;
         }
         if let Some(output) = self.immutable.native.as_ref().and_then(|n| n.o.as_ref()) {
             // The ordered F32 sum of the two native core partials, then one svh egress.
@@ -1078,7 +1078,7 @@ mod tests {
         chain
             .stream
             .device
-            .run(|| chain.stream.device.library.copy_d2h(&mut output, buffer))?;
+            .run(|| chain.stream.device.library.copy_d2h_quiescent(&mut output, buffer))?;
         Ok(output)
     }
 

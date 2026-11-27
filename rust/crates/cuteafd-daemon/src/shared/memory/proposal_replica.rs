@@ -137,9 +137,9 @@ mod tests {
                     expected_scales[row*sw..(row+1)*sw].fill(value+1);
                 }
                 peer.run(|| {
-                    let mut actual=vec![0;16*vw];lib.copy_d2h(&mut actual,destination_values)?;
+                    let mut actual=vec![0;16*vw];lib.copy_d2h_quiescent(&mut actual,destination_values)?;
                     assert_eq!(actual,expected_values);
-                    let mut actual=vec![0;16*sw];lib.copy_d2h(&mut actual,destination_scales)?;
+                    let mut actual=vec![0;16*sw];lib.copy_d2h_quiescent(&mut actual,destination_scales)?;
                     assert_eq!(actual,expected_scales);Ok(())
                 })?;
                 assert_eq!(replica.buffers().0.ptr,destination_values.ptr);

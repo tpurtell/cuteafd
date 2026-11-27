@@ -220,15 +220,15 @@ mod tests {
                 let check = |source: &SourceCache<'_>, slot, expected: &[u8]| -> Result<()> {
                     let view = unsafe { replica.view(source,slot,expected.len())? };
                     peer.run(|| {
-                        let mut length=[0u8;8];lib.copy_d2h(&mut length,view.device_rows)?;
+                        let mut length=[0u8;8];lib.copy_d2h_quiescent(&mut length,view.device_rows)?;
                         assert_eq!(u64::from_ne_bytes(length),expected.len() as u64);
                         let mut pages=vec![0u8;view.pages.len()*4];
-                        lib.copy_d2h(&mut pages,slice(view.device_pages,0,view.pages.len()*4))?;
+                        lib.copy_d2h_quiescent(&mut pages,slice(view.device_pages,0,view.pages.len()*4))?;
                         assert_eq!(pages,view.pages.iter().flat_map(|p|p.to_ne_bytes()).collect::<Vec<_>>());
                         for (row,&value) in expected.iter().enumerate() {
                             let physical=view.pages[row/PAGE_ROWS] as usize*PAGE_ROWS+row%PAGE_ROWS;
                             for (b,width) in [(view.values,KV_VALUES),(view.scales,KV_SCALES)] {
-                                let mut bytes=vec![0;width];lib.copy_d2h(&mut bytes,slice(b,physical*width,width))?;
+                                let mut bytes=vec![0;width];lib.copy_d2h_quiescent(&mut bytes,slice(b,physical*width,width))?;
                                 assert!(bytes.iter().all(|&b|b==value),"peer KV row {row} differs");
                             }
                         }

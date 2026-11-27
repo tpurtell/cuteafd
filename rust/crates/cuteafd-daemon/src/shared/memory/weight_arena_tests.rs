@@ -32,8 +32,8 @@ fn static_weight_views_retain_backing_and_match_tensor_checksums() -> Result<()>
             library.copy_h2d(view.buffer, data)?;
             let mut old = vec![0; data.len()];
             let mut packed = vec![0; data.len()];
-            library.copy_d2h(&mut old, tensor.buffer)?;
-            library.copy_d2h(&mut packed, view.buffer)?;
+            library.copy_d2h_quiescent(&mut old, tensor.buffer)?;
+            library.copy_d2h_quiescent(&mut packed, view.buffer)?;
             assert_eq!(Sha256::digest(&old), Sha256::digest(&packed));
             assert_eq!(&packed, data);
             Ok(())
@@ -334,7 +334,7 @@ fn v41_workspace_components_allocate_once_and_retain_independent_generations() -
                 let bytes = vec![index as u8; view.buffer.bytes.min(32)];
                 library.copy_h2d(view.buffer, &bytes)?;
                 let mut actual = vec![0; bytes.len()];
-                library.copy_d2h(&mut actual, view.buffer)?;
+                library.copy_d2h_quiescent(&mut actual, view.buffer)?;
                 assert_eq!(actual, bytes);
             }
             assert_eq!(fixture.events()?.matches('D').count(), before.matches('D').count() + 1);

@@ -25,7 +25,7 @@ pub(crate) type Digests = BTreeMap<String, String>;
 
 pub(crate) fn digest(library: &NativeLibrary, buffer: CuteafdDeviceBuffer) -> Result<String> {
     let mut bytes = vec![0u8; buffer.bytes];
-    Device { library, id: buffer.device_id }.run(|| library.copy_d2h(&mut bytes, buffer))?;
+    Device { library, id: buffer.device_id }.run(|| library.copy_d2h_quiescent(&mut bytes, buffer))?;
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 

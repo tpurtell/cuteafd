@@ -23,7 +23,7 @@ impl Trace{
             ensure!(buffer.bytes.is_multiple_of(owner.layout.rows),"width trace {name} has an invalid rank-local row stride");
             let bytes=rows.checked_mul(buffer.bytes/owner.layout.rows).context("width trace extent overflow")?;
             ensure!(bytes<=buffer.bytes,"width trace {name} outside owner");
-            let mut data=vec![0;bytes];owner.stream.device.library.copy_d2h(&mut data,Buffer{bytes,..buffer})?;
+            let mut data=vec![0;bytes];owner.stream.copy_d2h(&mut data,Buffer{bytes,..buffer})?;
             Ok((name.to_owned(),data))
         }).collect::<Result<_>>()?;
         self.samples.push(Sample{layer,stage:stage.into(),rows,buffers});Ok(())
@@ -37,7 +37,7 @@ fn decode(execution:&mut Execution<'_>,placement:&mut Placement,tokens:&[u32])->
     let unit=unit(placement.len,tokens.len(),execution.cfg.layers);
     let logits=execution.decode(std::slice::from_mut(placement),&[tokens],&unit,1)?;
     let bytes=tokens.len()*logits.vocab*4;let mut data=vec![0;bytes];
-    execution.requests.decode.stream.device.library.copy_d2h(&mut data,Buffer{ptr:logits.ptr.cast_mut(),bytes,
+    execution.requests.decode.stream.copy_d2h(&mut data,Buffer{ptr:logits.ptr.cast_mut(),bytes,
         ..execution.head.logits.buffer})?;Ok(data)
 }
 fn verify(execution:&mut Execution<'_>,placement:&mut Placement,tokens:&[u32])->Result<Vec<u8>>{
@@ -69,7 +69,7 @@ fn state(execution:&Execution<'_>,placement:&Placement)->Result<BTreeMap<String,
         let stream=&requests.decode.stream;
         stream.drain()?;
         stream.device.run(||{
-            let read=|buffer:Buffer|->Result<Vec<u8>>{let mut bytes=vec![0;buffer.bytes];stream.device.library.copy_d2h(&mut bytes,buffer)?;Ok(bytes)};
+            let read=|buffer:Buffer|->Result<Vec<u8>>{let mut bytes=vec![0;buffer.bytes];stream.copy_d2h(&mut bytes,buffer)?;Ok(bytes)};
             output.insert(format!("rank.{rank}.conv"),read(bank.conv_for_sequence(placement.slot)?)?);
             for &layer in &bank.layout.global_layers{
                 let stride=bank.layout.page_bytes/64;let mut bytes=Vec::new();

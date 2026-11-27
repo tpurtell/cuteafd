@@ -432,7 +432,7 @@ impl LaneFfn<'_, '_, '_> {
         let lib = self.library;
         let read = |buffers: &[CuteafdDeviceBuffer]| -> Result<Vec<Vec<u8>>> {
             buffers.iter().map(|&buffer| { let mut out = vec![0; buffer.bytes];
-                lib.copy_d2h(&mut out, buffer)?; Ok(out) }).collect()
+                lib.copy_d2h_quiescent(&mut out, buffer)?; Ok(out) }).collect()
         };
         let mut cancelled = 0;
         for local_mode in [false, true] {
@@ -1128,7 +1128,7 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
                 output.projected, output.rotated, output.positions, output.frequencies]
                 .into_iter().map(|buffer| {
                     let mut bytes = vec![0; buffer.bytes];
-                    library.copy_d2h(&mut bytes, buffer)?;
+                    library.copy_d2h_quiescent(&mut bytes, buffer)?;
                     Ok(bytes)
                 }).collect()
         };
@@ -1538,8 +1538,9 @@ impl<'w, 'a> BackboneLane<'w, 'a> {
     /// Opt-in diagnostic at a completed layer boundary; never used by normal serving.
     pub fn trace_output(&self, directory: &std::path::Path) -> Result<()> {
         let output = self.output()?;
+        let stream = self.block.finish_stream();
         for (name, buffer) in [("residual", output.residual), ("pre", output.pre)] {
-            crate::shared::activation_trace::write_device(self.weights.library, directory, output.layer, name, buffer)?;
+            crate::shared::activation_trace::write_device(self.weights.library, directory, output.layer, name, buffer, stream)?;
         }
         Ok(())
     }

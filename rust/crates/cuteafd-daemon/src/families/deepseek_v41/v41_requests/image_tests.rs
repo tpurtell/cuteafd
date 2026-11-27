@@ -118,16 +118,16 @@ fn native_request_image_masks_features_and_history() -> Result<()> {
     let positions = batch.cache.positions();
     let text = embedding.execute(&batch.tokens, &positions)?;
     let mut baseline = vec![0; text.residual.bytes];
-    lib.copy_d2h(&mut baseline, text.residual)?;
+    lib.copy_d2h_quiescent(&mut baseline, text.residual)?;
     let mut baseline_pre = vec![0; text.pre.bytes];
-    lib.copy_d2h(&mut baseline_pre, text.pre)?;
+    lib.copy_d2h_quiescent(&mut baseline_pre, text.pre)?;
     let rows = requests.embedding_features(&batch)?;
     assert_eq!(rows.len(), 16 * 184);
     let image = embedding.execute_with_images(&batch.tokens, &positions, &rows)?;
     let mut actual = vec![0; image.residual.bytes];
-    lib.copy_d2h(&mut actual, image.residual)?;
+    lib.copy_d2h_quiescent(&mut actual, image.residual)?;
     let mut actual_pre = vec![0; image.pre.bytes];
-    lib.copy_d2h(&mut actual_pre, image.pre)?;
+    lib.copy_d2h_quiescent(&mut actual_pre, image.pre)?;
     assert_eq!(baseline_pre, actual_pre);
     for slot in 0..16 {
         let start = slot % 3 + 1;

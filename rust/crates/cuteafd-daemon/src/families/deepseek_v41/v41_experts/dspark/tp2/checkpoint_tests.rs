@@ -170,16 +170,16 @@ fn cuda_dspark_tp2_checkpoint_experts_and_graph() -> Result<()> {
                     })?;
                     root.drain()?;
                     let mut eager = vec![0; rows as usize * 10240];
-                    owner.run(|| lib.copy_d2h(&mut eager, pair.output()))?;
+                    root.copy_d2h(&mut eager, pair.output())?;
                     owner.run(|| unsafe { lib.cuda_graph_launch(graph, root.raw) })?;
                     root.drain()?;
                     ensure!(unsafe { lib.cuda_stream_query(pair.peer_stream().raw)? },
                         "root completion did not cover the producer's route write");
                     let mut actual = vec![0; rows as usize * 10240];
                     let mut expected = actual.clone();
-                    owner.run(|| lib.copy_d2h(&mut actual, pair.output()))?;
+                    root.copy_d2h(&mut actual, pair.output())?;
                     assert_eq!(actual, eager, "draft TP2 eager/replay bytes differ at stage={stage} rows={rows} shared={include_shared} seed={seed}");
-                    owner.run(|| lib.copy_d2h(&mut expected, reference.output().unwrap()))?;
+                    owner.run(|| lib.copy_d2h_quiescent(&mut expected, reference.output().unwrap()))?;
                     let (actual, expected) = (values(&actual), values(&expected));
                     let mut error = 0f64;
                     let mut norm = 0f64;

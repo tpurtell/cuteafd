@@ -425,7 +425,7 @@ fn ready_native_views_match_mount_and_retain_one_arena() -> Result<()> {
         let mut actual = vec![0; image.len()];
         let plan = RankPlan::new(&catalog, &layers, 6, 5, usize::MAX)?;
         for region in 0..plan.layers.len() {
-            library.copy_d2h(
+            library.copy_d2h_quiescent(
                 &mut actual[plan.layout.region(region)?],
                 ready.region(region)?.buffer(),
             )?;
@@ -635,7 +635,7 @@ fn installed_minimax_nvfp4_push_and_mount_match_with_synthetic_payloads() -> Res
         }
         let ready = push_initialize::initialize(arena.done()?, &[plan.layers.into_iter().next().unwrap().initialize], None, 0)?;
         let mut actual = vec![0; image.len()];
-        library.copy_d2h(&mut actual, ready.region(0)?.buffer())?;
+        library.copy_d2h_quiescent(&mut actual, ready.region(0)?.buffer())?;
         let plan = RankPlan::from_tensors(&tensors, &[(3, slicing)], 4, rank, admitted)?;
         compare_tensors(&plan, &tensors, 4, rank, &actual)?;
         // The per-expert builder lands the same expert-zero source bytes,

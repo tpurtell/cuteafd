@@ -444,7 +444,7 @@ pub(crate) mod tests {
         assert_eq!(requests, actual.iter().map(|(name, owner)| (name.clone(), owner.buffer.bytes)).collect());
         let read = |owner: &DeviceAllocation<'_>| -> Result<Vec<u8>> {
             let mut data = vec![0; owner.buffer.bytes];
-            library.copy_d2h(&mut data, owner.buffer)?;
+            library.copy_d2h_quiescent(&mut data, owner.buffer)?;
             assert!(data.iter().any(|&byte| byte != 0));
             Ok(data)
         };

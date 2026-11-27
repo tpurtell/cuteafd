@@ -1744,7 +1744,8 @@ mod tests {
             drain()?;
             let read = |buffer: Buffer| -> anyhow::Result<Vec<u8>> {
                 let mut bytes = vec![0; buffer.bytes];
-                library.copy_d2h(&mut bytes, buffer)?;
+                // SAFETY: `stream` produced `buffer` and remains live on this device.
+                unsafe { library.copy_d2h(&mut bytes, buffer, stream)?; }
                 Ok(bytes)
             };
             let expected = (read(expected_indices)?, read(expected_scores)?);

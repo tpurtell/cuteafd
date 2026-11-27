@@ -934,7 +934,7 @@ impl<'a> Engine<'a> {
                 // the terminal lane has completed, then downloads its BF16 rows.
                 unsafe { stream.device.library.cuda_stream_synchronize(stream.raw)?; }
                 let mut bytes = vec![0; outputs[0].bytes];
-                stream.device.library.copy_d2h(&mut bytes, outputs[0])?;
+                stream.copy_d2h(&mut bytes, outputs[0])?;
                 Ok(bytes.chunks_exact(2).map(|bytes| f32::from_bits(
                     u32::from(u16::from_le_bytes(bytes.try_into().unwrap())) << 16)).collect())
             })
@@ -1013,7 +1013,7 @@ impl<'a> Engine<'a> {
                         // exact lane's head finishes before its logits are reused.
                         unsafe { stream.device.library.cuda_stream_synchronize(stream.raw)?; }
                         let mut bytes = vec![0; logits.bytes];
-                        stream.device.library.copy_d2h(&mut bytes, logits)?;
+                        stream.copy_d2h(&mut bytes, logits)?;
                         Ok(bytes.chunks_exact(4).map(|bytes|
                             f32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>())
                     })?;

@@ -666,8 +666,8 @@ mod tests {
                     devices[local].run(|| {
                         let mut left = vec![0; actual.bytes];
                         let mut right = vec![0; expected.bytes];
-                        devices[local].library.copy_d2h(&mut left, actual)?;
-                        devices[local].library.copy_d2h(&mut right, expected)?;
+                        devices[local].library.copy_d2h_quiescent(&mut left, actual)?;
+                        devices[local].library.copy_d2h_quiescent(&mut right, expected)?;
                         assert_eq!(
                             left, right,
                             "decoder shared TP2 broadcast/reduction differs"
@@ -690,8 +690,8 @@ mod tests {
                     devices[local].run(|| {
                         let mut left = vec![0; returned.bytes];
                         let mut right = vec![0; expected.bytes];
-                        lib.copy_d2h(&mut left, returned)?;
-                        lib.copy_d2h(&mut right, expected)?;
+                        lib.copy_d2h_quiescent(&mut left, returned)?;
+                        lib.copy_d2h_quiescent(&mut right, expected)?;
                         ensure!(
                             left == right,
                             "peer-owned shared reduction and return differs"
@@ -753,7 +753,7 @@ mod tests {
                 vec![0; rows as usize * 10240],
             ];
             for (rank, buffer) in [x?, y?].into_iter().enumerate() {
-                devices[rank].run(|| lib.copy_d2h(&mut actual[rank], buffer))?;
+                devices[rank].run(|| lib.copy_d2h_quiescent(&mut actual[rank], buffer))?;
             }
             assert_eq!(
                 actual[0] != actual[1],
@@ -800,8 +800,8 @@ mod tests {
                 })?;
                 let mut route_bytes = vec![0; actual[0].len()];
                 let mut shared_bytes = vec![0; actual[0].len()];
-                lib.copy_d2h(&mut route_bytes, route)?;
-                lib.copy_d2h(&mut shared_bytes, shared)?;
+                lib.copy_d2h_quiescent(&mut route_bytes, route)?;
+                lib.copy_d2h_quiescent(&mut shared_bytes, shared)?;
                 for ((a, b), out) in route_bytes
                     .chunks_exact(2)
                     .zip(shared_bytes.chunks_exact(2))
@@ -1001,12 +1001,12 @@ mod shared_storage_tests {
         let mut private=Wave::new(routed.clone(),shared.clone(),1,16,[None,None])?;
         let a=inputs[0].buffers();
         let private_a=runtime.block_on(unsafe {private.execute(0,16,a[0],a[1],a[2],a[3])})?;
-        let mut want_a=vec![0;16*10240];devices[0].run(||lib.copy_d2h(&mut want_a,private_a))?;
+        let mut want_a=vec![0;16*10240];devices[0].run(||lib.copy_d2h_quiescent(&mut want_a,private_a))?;
         let private_rank=private.storage.execution.try_lock().unwrap().routed.rank_output(0);
-        let mut want=vec![0;private_rank.bytes];lib.copy_d2h(&mut want,private_rank)?;
+        let mut want=vec![0;private_rank.bytes];lib.copy_d2h_quiescent(&mut want,private_rank)?;
         let b=inputs[1].buffers();
         let private_b=runtime.block_on(unsafe {private.execute(0,16,b[0],b[1],b[2],b[3])})?;
-        let mut want_b=vec![0;16*10240];devices[1].run(||lib.copy_d2h(&mut want_b,private_b))?;
+        let mut want_b=vec![0;16*10240];devices[1].run(||lib.copy_d2h_quiescent(&mut want_b,private_b))?;
         let storage=Storage::new(routed,shared,1,48,16,[None,None])?;
         let mut slots=[Wave::on_storage(storage.clone()),Wave::on_storage(storage.clone())];
         for (i,slot) in slots.iter_mut().enumerate() {
@@ -1041,13 +1041,13 @@ mod shared_storage_tests {
         eprintln!("OwnerPair guarded={guarded}: rank0_ready={done}, final_add_ready={final_done} before reader release");
         devices[1].run(|| {drop(gate);Ok(())})?;for chain in &chains {chain.drain()?;}reader.drain()?;
         assert_eq!(done,!guarded,"TP2 FFN B rank completion before A rank-reader release");
-        let mut got=vec![0;want.len()];devices[1].run(||lib.copy_d2h(&mut got,saved.buffer))?;
+        let mut got=vec![0;want.len()];devices[1].run(||lib.copy_d2h_quiescent(&mut got,saved.buffer))?;
         if guarded {assert_eq!(got,want);}else {assert_ne!(got,want,"unguarded actual OwnerPair did not clobber");}
         let execution=storage.execution.try_lock().unwrap();
         for (slot,expected) in [(0,want_a),(1,want_b)] {
             let output=RowWindow::within(slot*16..slot*16+16,48)?.apply(execution.output[slot].buffer,10240);
             let mut actual=vec![0;expected.len()];
-            devices[slot].run(||lib.copy_d2h(&mut actual,output))?;
+            devices[slot].run(||lib.copy_d2h_quiescent(&mut actual,output))?;
             assert_eq!(actual,expected,"slot {slot} full FFN output differs from private run");
         }
         Ok(())

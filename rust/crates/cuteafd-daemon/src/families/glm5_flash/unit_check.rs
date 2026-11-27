@@ -41,7 +41,7 @@ pub(crate) fn unit_bytes(engine: &GlmfEngine<'_>, placement: &GlmfPlacement) -> 
                         let Some(unit) = local_unit(global, rank, engine.context_kv()) else { continue };
                         let unit = crate::shared::prefix::view(buffer, unit as usize * per_unit, per_unit)?;
                         let mut bytes = vec![0u8; per_unit];
-                        engine.library.copy_d2h(&mut bytes, unit)?;
+                        engine.rank_stream(rank).copy_d2h(&mut bytes, unit)?;
                         out.extend(bytes);
                     }
                 }

@@ -416,7 +416,7 @@ pub(crate) fn record_scores(
         for (host, device) in [(&mut positions, pos_view), (&mut lengths, len_view),
             (&mut frontiers, frontier_view), (&mut plain, plain_view),
             (&mut twin, twin_view), (&mut scores, score_view), (&mut table, table_view)] {
-            stream.device.library.copy_d2h(host, device)?;
+            stream.copy_d2h(host, device)?;
         }
         Ok(ScoreBatch { rows, per_row_table, table_width, positions, lengths, frontiers, plain, twin, scores, table })
     })?;

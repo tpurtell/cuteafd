@@ -753,7 +753,7 @@ mod tp2_tests {
         let read=|device:Device,output:AttentionQueryOutput<'_>|->Result<Vec<Vec<u8>>> {
             [output.hidden,output.raw_rank,output.normalized_rank,output.projected,
                 output.rotated,output.positions,output.frequencies].into_iter().map(|view| {
-                    let mut bytes=vec![0;view.bytes];device.run(||library.copy_d2h(&mut bytes,view))?;Ok(bytes)
+                    let mut bytes=vec![0;view.bytes];device.run(||library.copy_d2h_quiescent(&mut bytes,view))?;Ok(bytes)
                 }).collect()
         };
         for (owner,layer) in [(0,2),(1,20)] {
@@ -886,7 +886,7 @@ mod guarded_scratch_tests {
             library.copy_h2d(private.input(), &input(0))?;
             let expected = unsafe { private.execute_tokens(&tokens(0))? };
             let mut want = vec![0; rotated_bytes];
-            library.copy_d2h(&mut want, expected.rotated)?;
+            library.copy_d2h_quiescent(&mut want, expected.rotated)?;
             want
         };
         for (seed, slot) in slots.iter_mut().enumerate() {
@@ -944,7 +944,7 @@ mod guarded_scratch_tests {
         unsafe { library.cuda_stream_synchronize(shared.stream.raw)?; }
         reader.device.run(|| unsafe { library.cuda_stream_synchronize(reader.raw) })?;
         let mut got = vec![0; rotated_bytes];
-        reader.device.run(|| library.copy_d2h(&mut got, copy.buffer))?;
+        reader.device.run(|| library.copy_d2h_quiescent(&mut got, copy.buffer))?;
         SKIP_ACQUIRE.with(|skip| skip.set(false));
         if guarded {
             assert_eq!(got, want, "unit B overwrote shared query outputs before unit A's fork reader joined");
@@ -1049,7 +1049,7 @@ mod real_weight_tests {
     use cuteafd_loader::read_official_v41_catalog;
     fn read(lib: &NativeLibrary, b: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
         let mut v = vec![0; b.bytes];
-        lib.copy_d2h(&mut v, b)?;
+        lib.copy_d2h_quiescent(&mut v, b)?;
         Ok(v)
     }
     #[test]

@@ -36,8 +36,8 @@ int main() {
         static_cast<uint16_t*>(source.ptr)+1, rows, heads, inverse, stream) != 0);
     ok(cuteafd_cuda_stream_synchronize(stream));
     std::vector<uint16_t> expected(count+1), actual(count+1);
-    ok(cuteafd_copy_d2h(expected.data(), separate, bytes+2));
-    ok(cuteafd_copy_d2h(actual.data(), inplace, bytes+2));
+    ok(cuteafd_copy_d2h(expected.data(), separate, bytes+2, stream));
+    ok(cuteafd_copy_d2h(actual.data(), inplace, bytes+2, stream));
     check(actual == expected && actual[count] == input[count]);
     for(size_t vector=0; vector<size_t(rows)*heads; ++vector)
       for(size_t col=0; col<448; ++col) check(actual[vector*512+col] == input[vector*512+col]);

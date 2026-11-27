@@ -233,7 +233,7 @@ pub(crate) fn read_paged(dump: &SelectionDump, stream: &crate::shared::memory::d
     stream.drain()?;
     let read = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes: usize| -> Result<Vec<u8>> {
         let mut out = vec![0u8; bytes];
-        stream.device.run(|| stream.device.library.copy_d2h(&mut out, view(buffer, 0, bytes)?))?;
+        stream.copy_d2h(&mut out, view(buffer, 0, bytes)?)?;
         Ok(out)
     };
     let positions: Vec<u64> = read(buffers.positions, rows * 8)?.chunks_exact(8)

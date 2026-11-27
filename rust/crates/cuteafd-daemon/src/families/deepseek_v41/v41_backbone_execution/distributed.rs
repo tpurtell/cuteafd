@@ -689,8 +689,8 @@ mod tests {
             ] {
                 let mut left = vec![0; a.bytes];
                 let mut right = vec![0; b.bytes];
-                devices[1].run(|| lib.copy_d2h(&mut left, a))?;
-                lib.copy_d2h(&mut right, b)?;
+                devices[1].run(|| lib.copy_d2h_quiescent(&mut left, a))?;
+                lib.copy_d2h_quiescent(&mut right, b)?;
                 assert_eq!(left, right, "distributed layer-zero TP2 result differs");
             }
             runtime.block_on(unsafe {

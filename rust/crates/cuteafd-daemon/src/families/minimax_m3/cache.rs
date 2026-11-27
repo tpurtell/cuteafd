@@ -746,7 +746,7 @@ mod tests {
     }
     fn read(library: &cuteafd_ffi::NativeLibrary, buffer: Buffer, bytes: usize) -> Result<Vec<u8>> {
         let mut out = vec![0; bytes];
-        library.copy_d2h(&mut out, buffer)?;
+        library.copy_d2h_quiescent(&mut out, buffer)?;
         Ok(out)
     }
     #[test]

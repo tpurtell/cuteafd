@@ -381,7 +381,7 @@ fn coordinator_tp2_pair_is_mount_exact_on_two_devices_and_drops_before_retry() -
             for (weight, image) in weights.iter().zip(image) {
                 for (spec, expected) in weight.layout.buffers.iter().zip(image) {
                     let mut actual = vec![0; expected.len()];
-                    Device { library: &library, id: gpu as i32 }.run(|| library.copy_d2h(&mut actual, weight.buffer(&spec.name)?))?;
+                    Device { library: &library, id: gpu as i32 }.run(|| library.copy_d2h_quiescent(&mut actual, weight.buffer(&spec.name)?))?;
                     assert_eq!(actual, expected, "GPU {gpu} {}", spec.name);
                 }
             }
@@ -523,7 +523,7 @@ fn combined_rank_lands_dense_operands_and_tp2_halves_exactly() -> Result<()> {
                 // SAFETY: the load's destination range lies inside this published buffer.
                 let view = cuteafd_ffi::CuteafdDeviceBuffer { bytes: load.bytes,
                     ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, ..buffer };
-                library.copy_d2h(&mut actual, view)?;
+                library.copy_d2h_quiescent(&mut actual, view)?;
                 assert_eq!(actual, expected, "TP2 {}", load.tensor);
             }
         }
@@ -921,7 +921,7 @@ fn receive_pushed_replays_dense_records_and_tp2_halves() -> Result<()> {
         let mut expected = vec![0; rect.bytes()];
         rect.read(&mut expected)?;
         let mut actual = vec![0; rect.bytes()];
-        library.copy_d2h(&mut actual, cuteafd_ffi::CuteafdDeviceBuffer { bytes: rect.bytes(), ..allocation.buffer })?;
+        library.copy_d2h_quiescent(&mut actual, cuteafd_ffi::CuteafdDeviceBuffer { bytes: rect.bytes(), ..allocation.buffer })?;
         assert_eq!(actual, expected, "{}", rect.name);
     }
     Ok(())
@@ -975,8 +975,8 @@ fn independent_expert_sets_share_one_ring_and_retire_separately() -> Result<()> 
         let mounted = expected[1].buffer(&spec.name)?;
         let mut actual = vec![0; pushed.bytes];
         let mut baseline = vec![0; mounted.bytes];
-        library.copy_d2h(&mut actual, pushed)?;
-        library.copy_d2h(&mut baseline, mounted)?;
+        library.copy_d2h_quiescent(&mut actual, pushed)?;
+        library.copy_d2h_quiescent(&mut baseline, mounted)?;
         assert_eq!(actual, baseline, "surviving set remains mount-exact: {}", spec.name);
     }
     let before = fixture.events()?;
@@ -1049,7 +1049,7 @@ fn scales_first_shard_uploads_land_without_transform_staging() -> Result<()> {
     assert_eq!(PEAKS.with(|p| p.take()), vec![(0, 0)]);
     let file = std::fs::read(&shard)?;
     let mut actual = vec![0; experts * (scale + weight)];
-    library.copy_d2h(&mut actual, staged.buffer)?;
+    library.copy_d2h_quiescent(&mut actual, staged.buffer)?;
     for e in 0..experts {
         let base = e * (scale + weight);
         assert_eq!(&actual[base..base + scale], &file[scale_at(e)..scale_at(e) + scale]);
@@ -1074,11 +1074,11 @@ fn scales_first_shard_uploads_land_without_transform_staging() -> Result<()> {
     let (staged, pinned) = peaks[0];
     assert_eq!((staged, pinned), (0, 0), "uploads bypass whole-step staging");
     let mut actual = vec![0u8; experts * weight];
-    library.copy_d2h(&mut actual, weights.buffer)?;
+    library.copy_d2h_quiescent(&mut actual, weights.buffer)?;
     let file = std::fs::read(&shard)?;
     assert_eq!(&actual[..], &file[experts * scale..], "weights landed exactly");
     let mut actual = vec![0u8; experts * scale];
-    library.copy_d2h(&mut actual, scales.buffer)?;
+    library.copy_d2h_quiescent(&mut actual, scales.buffer)?;
     assert_eq!(&actual[..], &file[..experts * scale], "scales landed exactly");
     Ok(())
 }
@@ -1163,7 +1163,7 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
     records.peer_copies.push(crate::shared::experts::rtx::dense::PeerCopy::new(
         owned[1].1[0].buffer, replica.buffer, replica.buffer.bytes)?);
     let mut untouched = vec![0; replica.buffer.bytes];
-    devices[0].run(|| library.copy_d2h(&mut untouched, replica.buffer))?;
+    devices[0].run(|| library.copy_d2h_quiescent(&mut untouched, replica.buffer))?;
     assert_eq!(untouched, vec![0xa5; replica.buffer.bytes], "recording must not copy an unfilled source");
     let (plans, destinations) = plan_records(root.path(), records, &devices, 0)?;
     struct Observed<D> { inner: D, done: std::sync::mpsc::Sender<()> }
@@ -1276,7 +1276,7 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
         for _ in 0..2 { completed.recv_timeout(Duration::from_secs(60))?; }
         let checked = devices[0].run(|| -> Result<()> {
             let mut actual = vec![0; replica.buffer.bytes];
-            library.copy_d2h(&mut actual, replica.buffer)?;
+            library.copy_d2h_quiescent(&mut actual, replica.buffer)?;
             anyhow::ensure!(actual == untouched, "rank Done must not copy before whole-group commit");
             Ok(())
         });
@@ -1292,14 +1292,14 @@ fn coordinator_ranks_alone_push_dense_records_exactly() -> Result<()> {
     let mut expected_replica = vec![0; replica.buffer.bytes];
     owned[1].0[0].read(&mut expected_replica)?;
     let mut actual_replica = vec![0; replica.buffer.bytes];
-    devices[0].run(|| library.copy_d2h(&mut actual_replica, replica.buffer))?;
+    devices[0].run(|| library.copy_d2h_quiescent(&mut actual_replica, replica.buffer))?;
     assert_eq!(actual_replica, expected_replica, "group-post-commit peer copy reads the other rank's landed bytes");
     for (gpu, (rects, allocations)) in owned.iter().enumerate() {
         for (rect, allocation) in rects.iter().zip(allocations) {
             let mut expected = vec![0; rect.bytes()];
             rect.read(&mut expected)?;
             let mut actual = vec![0; rect.bytes()];
-            devices[gpu].run(|| library.copy_d2h(&mut actual,
+            devices[gpu].run(|| library.copy_d2h_quiescent(&mut actual,
                 cuteafd_ffi::CuteafdDeviceBuffer { bytes: rect.bytes(), ..allocation.buffer }))?;
             assert_eq!(actual, expected, "GPU {gpu} {}", rect.name);
         }
@@ -1359,7 +1359,7 @@ fn coordinator_exl3_layers_push_byte_exact_at_world_one_and_two() -> Result<()> 
                     // SAFETY: the load's destination range lies inside this published buffer.
                     let view = cuteafd_ffi::CuteafdDeviceBuffer { bytes: load.bytes,
                         ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, ..buffer };
-                    Device { library: &library, id: gpu as i32 }.run(|| library.copy_d2h(&mut actual, view))?;
+                    Device { library: &library, id: gpu as i32 }.run(|| library.copy_d2h_quiescent(&mut actual, view))?;
                     assert_eq!(actual, expected, "world {world} {}", load.tensor);
                 }
             }
@@ -1447,8 +1447,8 @@ fn combined_exlr8_tp2_rank_is_mount_exact_and_drains_on_rejection() -> Result<()
                     let mount = Exlr8Weights::load(&library, pushed.layout.clone(), usize::MAX)?;
                     let mut actual = vec![0; pushed.image().bytes];
                     let mut expected = vec![0; mount.image().bytes];
-                    library.copy_d2h(&mut actual, pushed.image())?;
-                    library.copy_d2h(&mut expected, mount.image())?;
+                    library.copy_d2h_quiescent(&mut actual, pushed.image())?;
+                    library.copy_d2h_quiescent(&mut expected, mount.image())?;
                     // Only absolute descriptor addresses relocate with the arena.
                     let (pointers, _) = pushed.layout.descriptors(pushed.image().ptr as u64)?;
                     let pointer_image = pointers.into_iter().flat_map(u64::to_le_bytes).collect::<Vec<_>>();
@@ -1459,7 +1459,7 @@ fn combined_exlr8_tp2_rank_is_mount_exact_and_drains_on_rejection() -> Result<()
                     for (offset, bytes) in [(pushed.layout.bits_offset, pushed.bits()?.bytes),
                         (pushed.layout.signs_offsets[0], pushed.layout.hidden)] {
                         let mut image = vec![0; bytes];
-                        library.copy_d2h(&mut image, view(pushed.image(), offset, bytes)?)?;
+                        library.copy_d2h_quiescent(&mut image, view(pushed.image(), offset, bytes)?)?;
                         assert_eq!(image, expected[offset..offset + bytes]);
                     }
                     Ok(())

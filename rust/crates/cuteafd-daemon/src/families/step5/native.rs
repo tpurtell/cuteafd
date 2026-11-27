@@ -305,7 +305,7 @@ mod push_tests {
                     for (name, allocation, expected) in [("trellis", &actual.payload, &expected.shard.payload),
                         ("suh", &actual.suh, &expected.shard.suh), ("svh", &actual.svh, &expected.shard.svh)] {
                         let mut got = vec![0; allocation.buffer.bytes];
-                        device.run(|| library.copy_d2h(&mut got, allocation.buffer))?;
+                        device.run(|| library.copy_d2h_quiescent(&mut got, allocation.buffer))?;
                         assert_eq!(&got, expected, "K{bits} {side:?} rank {rank}/{ranks} {name}");
                     }
                 }

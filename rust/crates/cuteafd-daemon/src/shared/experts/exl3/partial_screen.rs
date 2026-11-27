@@ -98,7 +98,7 @@ struct Screen<'a> {
 impl Screen<'_> {
     fn read(&self, buffer: CuteafdDeviceBuffer, bytes: usize) -> Result<Vec<u8>> {
         let mut out = vec![0; bytes];
-        self.library.copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..buffer })?;
+        self.stream.copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..buffer })?;
         Ok(out)
     }
 

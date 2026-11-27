@@ -822,7 +822,7 @@ mod tests {
                         };
                         for (name, buffer) in buffers {
                             let mut data = vec![0; buffer.bytes];
-                            library.copy_d2h(&mut data, buffer)?;
+                            library.copy_d2h_quiescent(&mut data, buffer)?;
                             assert!(data.iter().any(|&value| value != 0), "unfilled {name}");
                             bytes.insert(name, data);
                         }
@@ -1057,7 +1057,7 @@ mod tests {
         assert!(records.steps.iter().all(|step| step.bytes() <= STEP_BYTES));
         let read = |owner: &DeviceAllocation<'_>| device.run(|| {
             let mut bytes = vec![0; owner.buffer.bytes];
-            library.copy_d2h(&mut bytes, owner.buffer)?;
+            library.copy_d2h_quiescent(&mut bytes, owner.buffer)?;
             Ok(bytes)
         });
         for index in [3, 5] { assert_eq!(read(&pushed[index])?, [0xff; 12]); }
@@ -1171,7 +1171,7 @@ mod tests {
             let actual = &pushed[name];
             let read = |owner: &DeviceAllocation<'_>| device.run(|| {
                 let mut bytes = vec![0; owner.buffer.bytes];
-                library.copy_d2h(&mut bytes, owner.buffer)?;
+                library.copy_d2h_quiescent(&mut bytes, owner.buffer)?;
                 Ok(bytes)
             });
             // Sub-256-byte allocation padding is not checkpoint state.
@@ -1244,7 +1244,7 @@ mod tests {
             let bytes = operand.bytes;
             let read = |owner: &DeviceAllocation<'_>| device.run(|| {
                 let mut out = vec![0u8; bytes];
-                library.copy_d2h(&mut out, owner.buffer)?;
+                library.copy_d2h_quiescent(&mut out, owner.buffer)?;
                 Ok(out)
             });
             let expected_bytes = read(expected)?;

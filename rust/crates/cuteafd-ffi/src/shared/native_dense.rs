@@ -919,7 +919,7 @@ mod tests {
         let ready = buffers[1].ptr as usize as u32;
         fixture.register_reply(&library, 0, ready, b'P')?;
         fixture.register_reply(&library, 1, ready, b'Q')?;
-        let stream = std::ptr::null_mut();
+        let stream = library.cuda_stream_create()?;
         op.quantize(17, views[0], views[1], views[2], stream)?;
         for _ in 0..2 { op.project(17, views[0], views[3], views[4], views[2], views[5], stream)?; }
         assert_eq!(fixture.events()?.matches('Q').count(), 1);
@@ -932,7 +932,8 @@ mod tests {
         library.copy_h2d(buffers[5], &source)?;
         op.narrow(17, views[5], views[6], stream)?;
         let mut actual = vec![0u8; 17 * 32 * 2];
-        library.copy_d2h(&mut actual, buffers[6])?;
+        // SAFETY: `stream` produced `buffers[6]` and remains live on this device.
+        unsafe { library.copy_d2h(&mut actual, buffers[6], stream)?; }
         for (index, bytes) in actual.chunks_exact(2).enumerate() {
             assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), expected[index % expected.len()]);
         }
@@ -943,6 +944,7 @@ mod tests {
         library.cuda_set_device(0)?;
         assert_eq!(fixture.events()?.matches('Q').count(), 1);
         assert_eq!(fixture.events()?.matches('P').count(), 2);
+        unsafe { library.cuda_stream_destroy(stream)?; }
         for buffer in &mut buffers { library.free_device_buffer(buffer)?; }
         Ok(())
     }

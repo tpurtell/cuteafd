@@ -155,7 +155,7 @@ mod tests {
                     "rotary fixture length mismatch"
                 );
                 let mut actual = vec![0; buffer.bytes];
-                device.run(|| library.copy_d2h(&mut actual, buffer))?;
+                device.run(|| library.copy_d2h_quiescent(&mut actual, buffer))?;
                 assert_eq!(
                     actual, expected,
                     "native owner table differs from Python AOT fixture"

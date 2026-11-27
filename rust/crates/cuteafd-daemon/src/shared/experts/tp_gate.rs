@@ -226,7 +226,7 @@ fn native_tp_rank_sum() -> Result<()> {
                 // SAFETY: stream and all queued storage remain live here.
                 unsafe { library.cuda_stream_synchronize(stream.raw)?; }
                 let mut bytes = vec![0; output.buffer.bytes];
-                library.copy_d2h(&mut bytes, output.buffer)?;
+                stream.copy_d2h(&mut bytes, output.buffer)?;
                 let mut actual = Vec::new();
                 let mut expected = Vec::new();
                 for row in 0..rows {

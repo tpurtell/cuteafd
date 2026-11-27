@@ -795,16 +795,16 @@ mod tests {
         let mut loading = LoadingArena::new(device, layout, expected(16)?, crate::shared::memory::TEST_ARENA)?;
         let generated = loading.destination(256, 256)?;
         let mut bytes = vec![0xff; 256];
-        library.copy_d2h(&mut bytes, generated)?;
+        library.copy_d2h_quiescent(&mut bytes, generated)?;
         assert_eq!(bytes, vec![0; 256]);
         library.copy_h2d(generated, &[0x6b; 256])?;
         assert!(loading.copied(256, 256).is_err());
         loading.copied(0, 16)?;
         let ready = loading.done()?.initialize(|arena| arena.zero_padding())?;
-        library.copy_d2h(&mut bytes, ready.region(0)?.subregion(256, 256)?.buffer())?;
+        library.copy_d2h_quiescent(&mut bytes, ready.region(0)?.subregion(256, 256)?.buffer())?;
         assert_eq!(bytes, vec![0x6b; 256]);
         let mut padding = [0xff; 240];
-        library.copy_d2h(&mut padding, ready.region(0)?.subregion(16, 240)?.buffer())?;
+        library.copy_d2h_quiescent(&mut padding, ready.region(0)?.subregion(16, 240)?.buffer())?;
         assert_eq!(padding, [0; 240]);
         Ok(())
     }

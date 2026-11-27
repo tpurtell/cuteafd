@@ -621,9 +621,9 @@ fn prefix_state_bytes(layout: &Step5CacheLayout, rows: usize) -> Result<u64> {
         .context("prefix state admission overflow")
 }
 
-fn read_buffer(device: Device<'_>, buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<Vec<u8>> {
+fn read_buffer(stream: &crate::shared::memory::device::Stream<'_>, buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<Vec<u8>> {
     let mut bytes = vec![0; buffer.bytes];
-    device.run(|| device.library.copy_d2h(&mut bytes, buffer))?;
+    stream.copy_d2h(&mut bytes, buffer)?;
     Ok(bytes)
 }
 
@@ -637,13 +637,12 @@ fn canonical_state(cache: &RefCell<CacheRank<'_>>, placement: &Placement) -> Res
     let mut owner = cache.borrow_mut();
     // Slot 2 is reserved for inspection, outside the shared pool's two slots.
     owner.capture(placement.sequence, 2, placement.committed as u64)?;
-    let device = owner.stream.device;
-    let mark = read_buffer(device, owner.mark_view(2)?)?;
+    let mark = read_buffer(&owner.stream, owner.mark_view(2)?)?;
     let mut pages = Vec::new();
     for (logical, &physical) in placement.pages.iter().take(placement.committed.div_ceil(64)).enumerate() {
         let live = (placement.committed - logical * 64).min(64);
         for (plane, visible) in owner.page_parts(physical, live as u64)? {
-            let mut bytes = read_buffer(device, plane)?;
+            let mut bytes = read_buffer(&owner.stream, plane)?;
             bytes.truncate(visible);
             pages.push(bytes);
         }
@@ -667,7 +666,7 @@ fn committed_step<'a>(
     step.publish(tokens.len())?;
     let mut output = chain.output(91)?;
     output.bytes = tokens.len() * H * 4;
-    let hidden = read_buffer(device, output)?;
+    let hidden = read_buffer(&cache.borrow().stream, output)?;
     ensure!(hidden.chunks_exact(4).all(|b| f32::from_le_bytes(b.try_into().unwrap()).is_finite()),
         "nonfinite Step-5 prefix continuation");
     Ok(hidden)
@@ -756,12 +755,12 @@ fn shared_diagnostic_verdict(nll: f64, reference_nll: f64, kl: f64, max_kl: f64)
     Ok(())
 }
 
-pub(super) fn dump_plane(directory: &std::path::Path, name: &str, device: Device<'_>,
+pub(super) fn dump_plane(directory: &std::path::Path, name: &str, stream: &crate::shared::memory::device::Stream<'_>,
     buffer: cuteafd_ffi::CuteafdDeviceBuffer, rows: usize, bf16: bool) -> Result<()> {
     let bytes = rows.checked_mul(H).and_then(|n| n.checked_mul(if bf16 { 2 } else { 4 }))
         .context("layer-zero dump extent overflow")?;
     ensure!(buffer.bytes >= bytes, "layer-zero dump buffer extent");
-    let raw = read_buffer(device, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
+    let raw = read_buffer(stream, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
     let values = if bf16 {
         raw.chunks_exact(2).map(|v| f32::from_bits((u16::from_le_bytes(v.try_into().unwrap()) as u32) << 16)).collect::<Vec<_>>()
     } else {
@@ -770,12 +769,12 @@ pub(super) fn dump_plane(directory: &std::path::Path, name: &str, device: Device
     write_f32(directory.join(format!("{name}.bin")), &values, rows, H)
 }
 
-fn dump_layer0_tail(directory: &std::path::Path, prefix: &str, device: Device<'_>,
+fn dump_layer0_tail(directory: &std::path::Path, prefix: &str, stream: &crate::shared::memory::device::Stream<'_>,
     attention: &super::swa::SwaLayer<'_>, ffn: &super::ffn::DenseFfn<'_>, rows: usize) -> Result<()> {
     for (name, (buffer, bf16)) in ["attention_output", "post_attention_residual"].into_iter()
         .zip(attention.diagnostic_attention()).chain(
             ["ffn_input", "ffn_normalized_input", "ffn_delta", "post_layer_residual"].into_iter().zip(ffn.diagnostic_planes())) {
-        dump_plane(directory, &format!("{prefix}{name}"), device, buffer, rows, bf16)?;
+        dump_plane(directory, &format!("{prefix}{name}"), stream, buffer, rows, bf16)?;
     }
     Ok(())
 }
@@ -838,7 +837,7 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         ensure!(placement.committed == 0, "layer-zero diagnostic must not publish state");
         for rank in 0..2 {
             let (attention, ffn) = execution.diagnostic_layer0(rank)?;
-            dump_layer0_tail(directory, &format!("rank{rank}-"), devices[rank], attention, ffn, rows)?;
+            dump_layer0_tail(directory, &format!("rank{rank}-"), &stages[rank].stream, attention, ffn, rows)?;
         }
     } else {
         let device = Device { library: &library, id: args.device };
@@ -863,8 +862,9 @@ fn layer0_run(args: &GoldenArgs, checkpoint: &Checkpoint, cfg: &Config, referenc
         drop(step);
         ensure!(placement.committed == 0, "layer-zero diagnostic must not publish state");
         let attention = chain.diagnostic_layer0()?;
-        dump_plane(directory, "attention_input", device, attention.diagnostic_norm(), rows, true)?;
-        dump_layer0_tail(directory, "", device, attention, attention.diagnostic_dense()?, rows)?;
+        let cache = cache.borrow();
+        dump_plane(directory, "attention_input", &cache.stream, attention.diagnostic_norm(), rows, true)?;
+        dump_layer0_tail(directory, "", &cache.stream, attention, attention.diagnostic_dense()?, rows)?;
     }
     std::fs::write(directory.join("positions.bin"), (0..rows as u32).flat_map(u32::to_le_bytes).collect::<Vec<_>>())?;
     std::fs::write(directory.join("tokens.bin"), reference.tokens.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>())?;
@@ -1414,7 +1414,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         "cold qualification must not publish target state"
     );
     for (layer, expected) in hidden {
-        let bytes = read_buffer(device, chain.output(layer)?)?;
+        let bytes = read_buffer(&cache.borrow().stream, chain.output(layer)?)?;
         let actual: Vec<_> = bytes.chunks_exact(4)
             .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
         let (cosine, relative_l2) = hidden_metrics(&actual, &expected)?;
@@ -1427,7 +1427,7 @@ fn run(args: GoldenArgs) -> Result<()> {
             .then(|| head.normalized()).transpose()?;
         save_diagnostics(&args, &view, &tokens, &positions, cfg.vocab, None,
             normalized.as_deref(), |layer| {
-                Ok(read_buffer(device, chain.output(layer)?)?.chunks_exact(4)
+                Ok(read_buffer(&cache.borrow().stream, chain.output(layer)?)?.chunks_exact(4)
                     .map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect())
             })?;
         if let Some(expected) = final_norm {
@@ -1445,7 +1445,7 @@ fn run(args: GoldenArgs) -> Result<()> {
         return Ok(());
     }
     let mut bytes = vec![0; rows * H * 4];
-    library.copy_d2h(&mut bytes, chain.output(args.last_layer)?)?;
+    cache.borrow().stream.copy_d2h(&mut bytes, chain.output(args.last_layer)?)?;
     let actual: Vec<_> = bytes
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))

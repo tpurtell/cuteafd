@@ -331,10 +331,10 @@ mod tests {
             assert_eq!(head.binding()?, block.binding());
             let expected_buffer = baseline.output()?.logits;
             let mut expected = vec![0u8; selected.len() * 129280 * 4];
-            devices[1].run(|| lib.copy_d2h(&mut expected, expected_buffer))?;
+            devices[1].run(|| lib.copy_d2h_quiescent(&mut expected, expected_buffer))?;
             for (rank, buffer) in head.logits()?.into_iter().enumerate() {
                 let mut actual = vec![0u8; buffer.bytes];
-                devices[rank].run(|| lib.copy_d2h(&mut actual, buffer))?;
+                devices[rank].run(|| lib.copy_d2h_quiescent(&mut actual, buffer))?;
                 for row in 0..selected.len() {
                     let start = (row * 129280 + rank * 64640) * 4;
                     ensure!(actual[row*64640*4..(row+1)*64640*4] == expected[start..start+64640*4],

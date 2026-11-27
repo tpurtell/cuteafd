@@ -52,7 +52,7 @@ pub(crate) fn covered(name: &str) -> bool {
 
 pub(crate) fn digest(library: &NativeLibrary, buffer: cuteafd_ffi::CuteafdDeviceBuffer) -> Result<String> {
     let mut bytes = vec![0u8; buffer.bytes];
-    Device { library, id: buffer.device_id }.run(|| library.copy_d2h(&mut bytes, buffer))?;
+    Device { library, id: buffer.device_id }.run(|| library.copy_d2h_quiescent(&mut bytes, buffer))?;
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }
 
@@ -117,7 +117,7 @@ fn records_match_the_host_packing_on_installed_headers() -> Result<()> {
             let expected = super::weights::pack_reference(operand, &layout, |name| reader.raw(name))?;
             let allocation = super::weights::load_operand(device, &checkpoint, &layout, operand, None)?;
             let mut actual = vec![0u8; expected.len()];
-            library.copy_d2h(&mut actual, cuteafd_ffi::CuteafdDeviceBuffer { bytes: expected.len(), ..allocation.buffer })?;
+            library.copy_d2h_quiescent(&mut actual, cuteafd_ffi::CuteafdDeviceBuffer { bytes: expected.len(), ..allocation.buffer })?;
             anyhow::ensure!(actual == expected, "{prefix}.{}: records differ from the host packing", operand.name);
             checked += 1;
             narrowed += usize::from(operand.sources.iter().any(|s| s.meta.dtype != operand.dtype));

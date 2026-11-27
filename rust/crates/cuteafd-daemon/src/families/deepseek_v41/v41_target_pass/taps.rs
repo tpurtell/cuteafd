@@ -172,7 +172,7 @@ impl<'a> TargetTapWave<'a> {
                 let dir = std::path::PathBuf::from(dir);
                 std::fs::create_dir_all(&dir)?;
                 let mut bytes = vec![0; input.residual.bytes];
-                self.storage.stream.library.copy_d2h(&mut bytes, input.residual)?;
+                self.storage.stream.library.copy_d2h_quiescent(&mut bytes, input.residual)?;
                 std::fs::write(
                     dir.join(format!(
                         "batch{}-layer{}-tap-input.bin",
@@ -295,7 +295,7 @@ mod storage_tests {
         }))?;
         chain.drain()?;
         let mut entire = vec![0; storage.values.buffer.bytes];
-        library.copy_d2h(&mut entire, storage.values.buffer)?;
+        library.copy_d2h_quiescent(&mut entire, storage.values.buffer)?;
         for seed in 0..2 {
             let mut private = TargetTapWave::new(&library, unit, usize::MAX)?;
             private.rows = (0..rows).map(|i| row(i as u64)).collect();
@@ -305,7 +305,7 @@ mod storage_tests {
                     crate::shared::memory::chain::finish(&library, private.storage.stream.raw)?; }
             }
             let mut expected = vec![0; rows * 30720];
-            library.copy_d2h(&mut expected, private.storage.values.buffer)?;
+            library.copy_d2h_quiescent(&mut expected, private.storage.values.buffer)?;
             assert_eq!(entire[seed * unit * 30720..(seed * unit + rows) * 30720], expected);
         }
         for gap in [rows..unit, unit + rows..reserve] {

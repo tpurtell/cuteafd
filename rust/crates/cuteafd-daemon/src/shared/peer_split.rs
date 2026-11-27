@@ -644,7 +644,7 @@ impl<'a> PeerExchange<'a> {
         self.on(rank, || {
             let buffer = self.ends[rank].control.buffer;
             let mut bytes = vec![0; buffer.bytes];
-            self.library.copy_d2h(&mut bytes, buffer)?;
+            self.library.copy_d2h_quiescent(&mut bytes, buffer)?;
             Ok(bytes)
         })
     }

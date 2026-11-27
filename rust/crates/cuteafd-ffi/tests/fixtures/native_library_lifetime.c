@@ -961,7 +961,13 @@ static int peer_model_drain(void *stream) {
     return 0;
 }
 
-int cuteafd_copy_d2h(void *dst, struct device_buffer src, size_t bytes) {
+int cuteafd_copy_d2h(void *dst, struct device_buffer src, size_t bytes, void *stream) {
+    if (!stream || bytes > src.bytes) return 1;
+    memcpy(dst, src.ptr, bytes);
+    return 0;
+}
+
+int cuteafd_copy_d2h_quiescent(void *dst, struct device_buffer src, size_t bytes) {
     if (bytes > src.bytes) return 1;
     memcpy(dst, src.ptr, bytes);
     return 0;

@@ -266,9 +266,8 @@ impl<'a> Hy4CacheRank<'a> {
                         };
                         let kv_buf = slice_buf(self.dsa_kv_page(layer, phys)?, 0, take * rec)?;
                         let dst_off = (layer * owned_rows + out_cursor) * rec;
-                        self.device
-                            .library
-                            .copy_d2h(&mut dsa_kv[dst_off..dst_off + take * rec], kv_buf)?;
+                        self.copies
+                            .copy_d2h(0, &mut dsa_kv[dst_off..dst_off + take * rec], kv_buf)?;
                         out_cursor += take;
                     }
                     row_cursor += take;
@@ -296,12 +295,10 @@ impl<'a> Hy4CacheRank<'a> {
                         let s_buf = slice_buf(page_buf, INDEX_KEYS_PLANE_BYTES, take * 4)?;
                         let k_off = (full_idx * owned_rows + out_cursor) * 128;
                         let s_off = (full_idx * owned_rows + out_cursor) * 4;
-                        self.device
-                            .library
-                            .copy_d2h(&mut dsa_index_keys[k_off..k_off + take * 128], k_buf)?;
-                        self.device
-                            .library
-                            .copy_d2h(&mut dsa_index_scales[s_off..s_off + take * 4], s_buf)?;
+                        self.copies
+                            .copy_d2h(0, &mut dsa_index_keys[k_off..k_off + take * 128], k_buf)?;
+                        self.copies
+                            .copy_d2h(0, &mut dsa_index_scales[s_off..s_off + take * 4], s_buf)?;
                         out_cursor += take;
                     }
                     row_cursor += take;

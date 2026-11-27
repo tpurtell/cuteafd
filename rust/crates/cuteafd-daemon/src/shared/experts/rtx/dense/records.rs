@@ -1213,7 +1213,7 @@ mod window_tests {
                     let free = output.device.run(|| library.cuda_physical_memory_info())?.0;
                     assert_eq!(free, capacity - bytes.len(), "{cleanup} releases all scratch");
                     let mut actual = vec![0; bytes.len()];
-                    output.device.run(|| library.copy_d2h(&mut actual, output.buffer))?;
+                    output.device.run(|| library.copy_d2h_quiescent(&mut actual, output.buffer))?;
                     assert_eq!(actual, bytes, "{cleanup} keeps gathered contents");
                 }
             }
@@ -1267,7 +1267,7 @@ mod window_tests {
         assert_eq!(records.peer_copies.len(), 1);
         let read = || -> Result<Vec<u8>> {
             let mut bytes = vec![0; 256];
-            library.copy_d2h(&mut bytes, destination.buffer)?;
+            library.copy_d2h_quiescent(&mut bytes, destination.buffer)?;
             Ok(bytes)
         };
         assert_eq!(read()?, untouched);
@@ -1377,7 +1377,7 @@ mod absorb_fp8_tests {
             if valid {
                 replay?;
                 let mut actual = vec![0; values.len() * 4];
-                library.copy_d2h(&mut actual, output.buffer)?;
+                library.copy_d2h_quiescent(&mut actual, output.buffer)?;
                 let expected = values.iter().flat_map(|&value| i32::try_from(value).unwrap().to_le_bytes()).collect::<Vec<_>>();
                 assert_eq!(actual, expected);
             } else {
@@ -1451,7 +1451,7 @@ mod absorb_fp8_tests {
         fill_by_mount(&library, &[], &[step], |_| std::ptr::null_mut())?;
         let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
             let mut out = vec![0u8; buffer.bytes];
-            library.copy_d2h(&mut out, buffer)?;
+            library.copy_d2h_quiescent(&mut out, buffer)?;
             Ok(out)
         };
         let floats = |bytes: Vec<u8>| -> Vec<f32> {

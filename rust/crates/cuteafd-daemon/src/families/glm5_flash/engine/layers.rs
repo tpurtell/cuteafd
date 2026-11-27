@@ -295,12 +295,11 @@ impl Bindings<'_, '_, '_> {
         let buffer = self.work[rank].streams[0].buffer;
         let bytes = self.rows * HC * e.cfg.hidden * 2;
         ensure!(bytes <= buffer.bytes, "completed layer rows exceed residual storage");
+        let stream = e.rank_stream(rank);
         e.on(rank, || {
-            // SAFETY: both FFN joins (or the terminal copy) precede this owner
-            // stream wait. The callback borrows only downloaded residual bytes.
-            unsafe { e.library.cuda_stream_synchronize(e.stream_of(rank))?; }
+            stream.drain()?;
             let mut residual = vec![0; bytes];
-            e.library.copy_d2h(&mut residual, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
+            stream.copy_d2h(&mut residual, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..buffer })?;
             on_layer(index, &residual)
         })
     }

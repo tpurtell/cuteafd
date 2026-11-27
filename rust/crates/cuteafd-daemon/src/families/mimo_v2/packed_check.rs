@@ -80,7 +80,7 @@ fn observe(engine: &MimoEngine<'_>, placement: &MimoPlacement, logits: Vec<f32>)
                     ensure!(offset + bytes <= buffer.bytes, "packed check read exceeds KV storage");
                     let first = kv.len();
                     kv.resize(first + bytes, 0);
-                    engine.library.copy_d2h(&mut kv[first..], cuteafd_ffi::CuteafdDeviceBuffer {
+                    engine.rank_stream(rank).copy_d2h(&mut kv[first..], cuteafd_ffi::CuteafdDeviceBuffer {
                         ptr: buffer.ptr.cast::<u8>().wrapping_add(offset).cast(), bytes, ..buffer })?;
                 }
             }

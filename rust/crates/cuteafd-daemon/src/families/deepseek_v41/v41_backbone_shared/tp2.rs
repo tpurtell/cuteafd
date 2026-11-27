@@ -350,13 +350,13 @@ mod tests {
             ) });
             let outputs = [a?,b?];
             let mut actual = [vec![0; rows as usize*5120*2], vec![0; rows as usize*5120*2]];
-            for rank in 0..2 { devices[rank].run(|| lib.copy_d2h(&mut actual[rank], outputs[rank]))?; }
+            for rank in 0..2 { devices[rank].run(|| lib.copy_d2h_quiescent(&mut actual[rank], outputs[rank]))?; }
             assert_eq!(actual[0], actual[1], "destination changed shared output");
             let mut partials = [vec![0; actual[0].len()], vec![0; actual[0].len()]];
             for rank in 0..2 {
                 let mut buffer = lanes[0].storage.execution.try_lock()?.ranks[rank].output.buffer;
                 buffer.bytes = partials[rank].len();
-                devices[rank].run(|| lib.copy_d2h(&mut partials[rank], buffer))?;
+                devices[rank].run(|| lib.copy_d2h_quiescent(&mut partials[rank], buffer))?;
             }
             for ((a,b),actual) in partials[0].chunks_exact(2).zip(partials[1].chunks_exact(2)).zip(actual[0].chunks_exact(2)) {
                 let decode = |v: &[u8]| f32::from_bits((u16::from_ne_bytes([v[0],v[1]]) as u32) << 16);
@@ -400,8 +400,8 @@ mod tests {
                 let mut a = vec![0; first.output.buffer.bytes];
                 let mut b = vec![0; second.output.buffer.bytes];
                 input.device.run(|| {
-                    lib.copy_d2h(&mut a, first.output.buffer)?;
-                    lib.copy_d2h(&mut b, second.output.buffer)
+                    lib.copy_d2h_quiescent(&mut a, first.output.buffer)?;
+                    lib.copy_d2h_quiescent(&mut b, second.output.buffer)
                 })?;
                 assert_eq!(a,b);
                 assert!(a.chunks_exact(2).all(|v| u16::from_ne_bytes([v[0],v[1]]) & 0x7f80 != 0x7f80));
@@ -445,7 +445,7 @@ mod shared_storage_tests {
         let mut private=Wave::new(weights.clone(),16)?;
         runtime.block_on(unsafe {private.execute(0,16,0,inputs[0].each_ref().map(|a|a.buffer),[&producers[0],&producers[1]])})?;
         let private_rank=private.storage.execution.try_lock().unwrap().ranks[0].output.buffer;
-        let mut want=vec![0;16*10240];lib.copy_d2h(&mut want,private_rank)?;
+        let mut want=vec![0;16*10240];lib.copy_d2h_quiescent(&mut want,private_rank)?;
         let storage=Storage::new(weights,48,16)?;
         let mut slots=[Wave::on_storage(storage.clone()),Wave::on_storage(storage.clone())];
         for (i,slot) in slots.iter_mut().enumerate() {
@@ -477,7 +477,7 @@ mod shared_storage_tests {
         }
         devices[1].run(|| {drop(gate);Ok(())})?;for chain in &chains {chain.drain()?;}reader.drain()?;
         assert_eq!(done,!guarded,"shared TP2 rank B completion before reader release");
-        let mut got=vec![0;want.len()];devices[1].run(||lib.copy_d2h(&mut got,saved.buffer))?;
+        let mut got=vec![0;want.len()];devices[1].run(||lib.copy_d2h_quiescent(&mut got,saved.buffer))?;
         if guarded {assert_eq!(got,want);}else {assert_ne!(got,want,"shared rank negative did not clobber");}
         Ok(())
     }

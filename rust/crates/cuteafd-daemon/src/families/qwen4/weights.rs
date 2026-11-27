@@ -616,7 +616,7 @@ mod tests {
                 let bytes = if ["a_log", "dt_bias"].contains(&name) { 48 * 4 } else { allocation.buffer.bytes };
                 let read = |a: &Allocation<'_>| -> Result<Vec<u8>> {
                     let mut out = vec![0; bytes];
-                    library.copy_d2h(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..a.buffer })?;
+                    library.copy_d2h_quiescent(&mut out, cuteafd_ffi::CuteafdDeviceBuffer { bytes, ..a.buffer })?;
                     Ok(out)
                 };
                 assert_eq!(read(allocation)?, read(other)?, "{name}");
@@ -627,7 +627,7 @@ mod tests {
                 assert_eq!((mounted.buffer.bytes, pushed.buffer.bytes), (256, 256));
                 let read = |allocation: &Allocation<'_>| -> Result<Vec<u8>> {
                     let mut bytes = vec![0; 48 * 4];
-                    library.copy_d2h(&mut bytes, allocation.buffer)?;
+                    library.copy_d2h_quiescent(&mut bytes, allocation.buffer)?;
                     Ok(bytes)
                 };
                 assert_eq!(read(mounted)?, read(pushed)?);
@@ -695,7 +695,7 @@ mod tests {
                 }
                 for allocation in [&mounted, &pushed] {
                     let mut actual = vec![0; 256];
-                    device.run(|| library.copy_d2h(&mut actual, allocation.buffer))?;
+                    device.run(|| library.copy_d2h_quiescent(&mut actual, allocation.buffer))?;
                     assert_eq!(actual, expected, "table={table_dtype} scalar={scalar_dtype} gpu={gpu}");
                     let devices = cuteafd_loader::placement::planner::CoordinatorDevices::new(&[0, 1])?;
                     let mut inventory = crate::shared::memory::receipts::Inventory::new(devices, "ple-test",

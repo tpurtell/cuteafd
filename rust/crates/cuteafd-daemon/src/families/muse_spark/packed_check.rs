@@ -238,9 +238,10 @@ fn clear_rings(backend: &MuseBackend<'_, '_>) -> Result<()> {
     Ok(())
 }
 
-fn read(backend: &MuseBackend<'_, '_>, buffer: Buffer) -> Result<Vec<u8>> {
+fn read(backend: &MuseBackend<'_, '_>, stream: *mut std::ffi::c_void, buffer: Buffer) -> Result<Vec<u8>> {
     let mut bytes = vec![0; buffer.bytes];
-    backend.library().copy_d2h(&mut bytes, buffer)?;
+    // SAFETY: `stream` owns this rank's work on the current device and remains live.
+    unsafe { backend.library().copy_d2h(&mut bytes, buffer, stream)?; }
     Ok(bytes)
 }
 
@@ -272,8 +273,9 @@ fn snapshot_and_restore(backend: &MuseBackend<'_, '_>, family: &super::prefix::M
         rank.device.run(|| {
             let mark = |range: cuteafd_hostcache::copy::DeviceRange| Buffer {
                 ptr: range.addr as *mut std::ffi::c_void, bytes: range.bytes, device_id: rank.device.id, flags: 0 };
-            let a = read(backend, mark(before[rank_index]))?;
-            let b = read(backend, mark(after[rank_index]))?;
+            let stream = backend.streams[rank_index];
+            let a = read(backend, stream, mark(before[rank_index]))?;
+            let b = read(backend, stream, mark(after[rank_index]))?;
             let mark_layer_bytes = backend.cfg.window * record;
             let visible_bytes = placement.len.min(backend.cfg.window) * record;
             // Short prompts initialize only their visible rows, not mark padding.
@@ -287,11 +289,11 @@ fn snapshot_and_restore(backend: &MuseBackend<'_, '_>, family: &super::prefix::M
                     super::device::LayerKv::Paged { cache } => {
                         for (i, &page) in placement.pages.iter().enumerate() {
                             let rows = placement.len.saturating_sub(i * 64).min(64);
-                            if rows > 0 { snapshot.extend(read(backend, view(cache, page as usize * 64 * record, rows * record))?); }
+                            if rows > 0 { snapshot.extend(read(backend, stream, view(cache, page as usize * 64 * record, rows * record))?); }
                         }
                     }
                     super::device::LayerKv::Ring { ring } => {
-                        snapshot.extend(read(backend, view(ring, placement.slot * ring_bytes, ring_bytes))?);
+                        snapshot.extend(read(backend, stream, view(ring, placement.slot * ring_bytes, ring_bytes))?);
                     }
                 }
             }

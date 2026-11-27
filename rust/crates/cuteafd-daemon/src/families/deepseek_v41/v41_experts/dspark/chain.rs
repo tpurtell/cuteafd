@@ -624,7 +624,7 @@ impl DsparkChain<'_, '_> {
     pub fn require_live(&self) -> Result<()> { self.failure.check("dSpark draft chain") }
     /// Copy a draft output buffer to the host on this chain's stream.
     pub fn copy_d2h(&self, dst: &mut [u8], buffer: CuteafdDeviceBuffer) -> Result<()> {
-        self.stream.library.copy_d2h(dst, buffer)
+        self.stream.copy_d2h(dst, buffer)
     }
     /// Drop a pending replay so its requests can be released.
     pub fn cancel_replay(&mut self) {

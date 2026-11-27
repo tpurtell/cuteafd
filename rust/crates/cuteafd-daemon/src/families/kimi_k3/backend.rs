@@ -641,7 +641,7 @@ mod tests {
                 &[cuteafd_ffi::programs::Scalar::I32(rows)], stream.raw)?; }
             stream.drain()?;
             let mut bytes = vec![0; 96 * 896 * 4];
-            library.copy_d2h(&mut bytes, output.buffer)?;
+            library.copy_d2h_quiescent(&mut bytes, output.buffer)?;
             arms.push(bytes[..19 * 896 * 4].to_vec());
         }
         for (i, rows) in [64, 96].into_iter().enumerate() {

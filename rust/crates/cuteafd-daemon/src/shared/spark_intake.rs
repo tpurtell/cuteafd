@@ -2198,7 +2198,7 @@ mod tests {
                     library.cuda_stream_synchronize(stream.raw())?;
                 }
                 let mut expected = vec![0; bytes];
-                library.copy_d2h(&mut expected, CuteafdDeviceBuffer { bytes, ..output.buffer })?;
+                library.copy_d2h_quiescent(&mut expected, CuteafdDeviceBuffer { bytes, ..output.buffer })?;
                 for plane in &intake.planes { library.copy_h2d(plane.buffer, &vec![0; bytes])?; }
                 let drain = ReceiveDrain(Some(|| {
                     crate::shared::decode_graph::fatal_drain(intake.terminal_drain_copies()
@@ -2225,7 +2225,7 @@ mod tests {
                 intake.consumed(stream.raw())?;
                 drop(drain);
                 let mut actual = vec![0; bytes];
-                library.copy_d2h(&mut actual, CuteafdDeviceBuffer { bytes, ..output.buffer })?;
+                library.copy_d2h_quiescent(&mut actual, CuteafdDeviceBuffer { bytes, ..output.buffer })?;
                 assert_eq!(actual, expected, "ranks={ranks} rows={rows}");
                 intake.before_dispatch()?;
                 assert!(intake.held.lock().unwrap().is_empty());
@@ -2308,7 +2308,7 @@ mod tests {
                         let source = CuteafdDeviceBuffer { ptr: unsafe { plane.ptr.cast::<u8>().add(offset).cast() },
                             bytes: bytes.len(), ..plane };
                         let mut actual = vec![0; bytes.len()];
-                        library.copy_d2h(&mut actual, source)?;
+                        library.copy_d2h_quiescent(&mut actual, source)?;
                         assert_eq!(actual, bytes, "rows={rows} fail={fail} rank={rank}");
                     }
                     intake.before_dispatch()?;

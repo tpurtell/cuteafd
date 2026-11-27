@@ -1966,7 +1966,7 @@ impl<'a> DflashDrafter<'a> {
         }
         let read = |buffer| -> Result<Vec<u8>> {
             let mut bytes = vec![0; rows * h * 2];
-            self.library.copy_d2h(&mut bytes, draft_view(buffer, 0, rows * h * 2)?)?;
+            self.library.copy_d2h_quiescent(&mut bytes, draft_view(buffer, 0, rows * h * 2)?)?;
             Ok(bytes)
         };
         Ok([read(self.fused.buffer)?, read(self.fused_norm.buffer)?])
@@ -2007,7 +2007,7 @@ impl<'a> DflashDrafter<'a> {
                 } else { draft_view(attention.cache.buffer, row * record_bytes, record_bytes)? };
                 let mut row = vec![0; record_bytes];
                 crate::shared::memory::device::Device { library: self.library, id: view.device_id }
-                    .run(|| self.library.copy_d2h(&mut row, view))?;
+                    .run(|| self.library.copy_d2h_quiescent(&mut row, view))?;
                 bytes.extend(row);
             }
             layers.push(bytes);
@@ -2015,7 +2015,7 @@ impl<'a> DflashDrafter<'a> {
         let count = tap_rows * self.cfg.taps.len() * self.cfg.hidden * 2;
         let mut taps = vec![0; count];
         if count > 0 {
-            self.library.copy_d2h(&mut taps, crate::shared::prefix::view(self.taps.buffer, 0, count)?)?;
+            self.library.copy_d2h_quiescent(&mut taps, crate::shared::prefix::view(self.taps.buffer, 0, count)?)?;
         }
         let mut window_owners = Vec::new();
         for (index, layout) in cache.layers.iter().enumerate() {
@@ -2024,7 +2024,7 @@ impl<'a> DflashDrafter<'a> {
             for view in self.mla_window_layer_buffers(index, slot)? {
                 let mut part = vec![0; view.bytes];
                 crate::shared::memory::device::Device { library: self.library, id: view.device_id }
-                    .run(|| self.library.copy_d2h(&mut part, view))?;
+                    .run(|| self.library.copy_d2h_quiescent(&mut part, view))?;
                 bytes.extend(part);
             }
             window_owners.push(bytes);
@@ -3240,7 +3240,7 @@ impl<'a> DflashDrafter<'a> {
             }
         }
         self.timing.publish_completed()?;
-        self.timing.dump_head_input(w.n.buffer, rows, h)?;
+        self.timing.dump_head_input(w.n.buffer, rows, h, s)?;
         let drafted = s_count * c.drafts();
         let landing_bytes = drafted * if read_features { 20 } else { 4 };
         let (tokens, features) = w.head()?.landing.bytes()[..landing_bytes].split_at(drafted * 4);
@@ -3265,7 +3265,8 @@ impl<'a> DflashDrafter<'a> {
         let w = slot.as_ref().context("no draft step ran")?;
         let bytes = sequences * self.cfg.block * self.cfg.hidden * 2;
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..w.n.buffer })?;
+        // SAFETY: `self.stream` produced `w.n` and remains live on this device.
+        unsafe { self.library.copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..w.n.buffer }, self.stream)?; }
         Ok(out)
     }
 
@@ -3277,7 +3278,8 @@ impl<'a> DflashDrafter<'a> {
             .and_then(|n| n.checked_mul(4)).context("draft logit readback overflow")?;
         ensure!(sequences > 0 && bytes <= w.head()?.logits.buffer.bytes, "draft logit readback exceeds workspace");
         let mut out = vec![0u8; bytes];
-        self.library.copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..w.head()?.logits.buffer })?;
+        // SAFETY: `self.stream` produced `w.head()?.logits` and remains live on this device.
+        unsafe { self.library.copy_d2h(&mut out, CuteafdDeviceBuffer { bytes, ..w.head()?.logits.buffer }, self.stream)?; }
         Ok(out.chunks_exact(4).map(|value| f32::from_le_bytes(value.try_into().unwrap())).collect())
     }
 

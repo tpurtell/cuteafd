@@ -730,7 +730,7 @@ mod window_graph_tests {
             library.copy_h2d(private.input(), &input(seed))?;
             library.copy_h2d(private.positions(), &positions)?;
             let out = unsafe { private.execute(rows)? };
-            let mut bytes = vec![0; out.projected.bytes]; library.copy_d2h(&mut bytes, out.projected)?;
+            let mut bytes = vec![0; out.projected.bytes]; library.copy_d2h_quiescent(&mut bytes, out.projected)?;
             expect.push(bytes);
         }
         assert_ne!(expect[0], expect[1], "distinct inputs must project differently");
@@ -753,7 +753,7 @@ mod window_graph_tests {
                 library.copy_h2d(slot.input(), &input(seed))?;
                 library.copy_h2d(slot.positions(), &positions)?;
                 let out = unsafe { slot.run_unit(rows)? };
-                let mut bytes = vec![0; out.projected.bytes]; library.copy_d2h(&mut bytes, out.projected)?;
+                let mut bytes = vec![0; out.projected.bytes]; library.copy_d2h_quiescent(&mut bytes, out.projected)?;
                 got.push(bytes);
             }
             Ok(got)
@@ -805,7 +805,7 @@ mod tp2_tests {
                 Wave::device_bytes(&library,Kind::OutputB,capacity,owner)?)?;
             let input=Allocation::new(device,capacity as usize*ROW_BYTES[0], crate::shared::memory::TEST)?;
             let read=|buffer:CuteafdDeviceBuffer|->Result<Vec<u8>> {
-                let mut bytes=vec![0;buffer.bytes];device.run(||library.copy_d2h(&mut bytes,buffer))?;Ok(bytes)
+                let mut bytes=vec![0;buffer.bytes];device.run(||library.copy_d2h_quiescent(&mut bytes,buffer))?;Ok(bytes)
             };
             for (cycle,rows) in [1,6,16,6,1].into_iter().enumerate() {
                 let host:Vec<u8>=(0..capacity as usize*32768).flat_map(|i| {
@@ -924,7 +924,7 @@ mod bounded_graph_oracle {
                 wave.synchronize()?;
                 let output = wave.finish_prepared(rows, wave.storage.stream.raw)?;
                 let mut bytes = vec![0; output.bytes];
-                library.copy_d2h(&mut bytes, output)?;
+                library.copy_d2h_quiescent(&mut bytes, output)?;
                 bytes
             };
             let (graph, _) = wave.graphs.cached_launch(weights.layer, &weights, rows)
@@ -934,7 +934,7 @@ mod bounded_graph_oracle {
             unsafe { library.cuda_graph_launch(graph, wave.storage.stream.raw)?; }
             wave.synchronize()?;
             let mut actual = vec![0; expected.len()];
-            library.copy_d2h(&mut actual, wave.b(2))?;
+            library.copy_d2h_quiescent(&mut actual, wave.b(2))?;
             assert_eq!(actual, expected, "prepared eager/replay differs at rows={rows}");
             wave.graphs.cache_measured(0);
         }

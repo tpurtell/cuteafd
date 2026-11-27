@@ -304,7 +304,7 @@ mod tests {
                 library.cuda_stream_synchronize(stream)?;
             }
             let mut bytes = vec![0u8; rows * vocab * 4];
-            library.copy_d2h(&mut bytes, logits.buffer)?;
+            library.copy_d2h_quiescent(&mut bytes, logits.buffer)?;
             Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
         };
         let logits = DeviceAllocation::new(&library, rows * vocab * 4, crate::shared::memory::TEST)?;
@@ -342,7 +342,7 @@ mod tests {
             exec
         };
         let mut bytes = vec![0u8; rows * vocab * 4];
-        library.copy_d2h(&mut bytes, replayed.buffer)?;
+        library.copy_d2h_quiescent(&mut bytes, replayed.buffer)?;
         let graph: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
         ensure!(graph.iter().zip(&direct).all(|(a, b)| a.to_bits() == b.to_bits()), "graph replay differs from the launch");
         // SAFETY: the replay drained; nothing else uses the executable or the stream.

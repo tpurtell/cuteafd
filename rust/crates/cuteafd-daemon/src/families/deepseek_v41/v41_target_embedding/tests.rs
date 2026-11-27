@@ -27,8 +27,8 @@ fn native_image_replacement_and_reuse() -> Result<()> {
     let copy = |value: TargetEmbedding<'_>| -> Result<(Vec<u8>, Vec<u8>)> {
         let mut residual = vec![0; value.residual.bytes];
         let mut pre = vec![0; value.pre.bytes];
-        lib.copy_d2h(&mut residual, value.residual)?;
-        lib.copy_d2h(&mut pre, value.pre)?;
+        lib.copy_d2h_quiescent(&mut residual, value.residual)?;
+        lib.copy_d2h_quiescent(&mut pre, value.pre)?;
         Ok((residual, pre))
     };
     for rows in [1, 35, 129, 4096, 35] {
@@ -118,8 +118,8 @@ fn native_host_embedding_exact_512() -> Result<()> {
     let positions: Vec<u64> = (0..512).collect();
     let copy = |output: TargetEmbedding<'_>| -> Result<(Vec<u8>, Vec<u8>)> {
         let (mut residual, mut pre) = (vec![0; output.residual.bytes], vec![0; output.pre.bytes]);
-        lib.copy_d2h(&mut residual, output.residual)?;
-        lib.copy_d2h(&mut pre, output.pre)?;
+        lib.copy_d2h_quiescent(&mut residual, output.residual)?;
+        lib.copy_d2h_quiescent(&mut pre, output.pre)?;
         Ok((residual, pre))
     };
     let reader = catalog.coordinator_tensor_reader("embed.weight")?;
@@ -164,9 +164,9 @@ fn native_host_embedding_exact_512() -> Result<()> {
             // SAFETY: replay has completed and the graph has no queued users.
             unsafe { lib.cuda_graph_exec_destroy(graph)?; }
             let mut actual = vec![0; residual.buffer.bytes];
-            lib.copy_d2h(&mut actual, residual.buffer)?;
+            lib.copy_d2h_quiescent(&mut actual, residual.buffer)?;
             let mut actual_pre = vec![0; pre.buffer.bytes];
-            lib.copy_d2h(&mut actual_pre, pre.buffer)?;
+            lib.copy_d2h_quiescent(&mut actual_pre, pre.buffer)?;
             for row in 0..16 * width {
                 assert_eq!(&actual_pre[row * 16..row * 16 + 4], 1.0_f32.to_ne_bytes());
                 assert_eq!(&actual_pre[row * 16 + 4..(row + 1) * 16], [0; 12]);

@@ -265,7 +265,7 @@ mod tests {
         let download = |buffers: [CuteafdDeviceBuffer; 3]| -> Result<Vec<Vec<u8>>> {
             buffers.into_iter().map(|buffer| {
                 let mut bytes = vec![0; buffer.bytes];
-                devices[1].run(|| lib.copy_d2h(&mut bytes, buffer))?;
+                devices[1].run(|| lib.copy_d2h_quiescent(&mut bytes, buffer))?;
                 Ok(bytes)
             }).collect()
         };

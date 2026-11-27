@@ -710,7 +710,7 @@ mod tests {
             let buffer = super::super::cache::view(buffer, 0, bytes)?;
             let mut output = vec![0; bytes];
             library.cuda_set_device(buffer.device_id)?;
-            library.copy_d2h(&mut output, buffer)?;
+            library.copy_d2h_quiescent(&mut output, buffer)?;
             Ok(output)
         };
         let hash = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
@@ -1007,7 +1007,7 @@ mod tests {
             retain_decode_taps(&library, source.buffer, target.buffer, rows, pitch, std::ptr::null_mut())?;
             library.copy_h2d(source.buffer, &vec![83; source.buffer.bytes])?;
             let mut actual = vec![0; target.buffer.bytes];
-            library.copy_d2h(&mut actual, target.buffer)?;
+            library.copy_d2h_quiescent(&mut actual, target.buffer)?;
             assert_eq!(&actual[..rows * pitch], &bytes[..rows * pitch]);
             assert!(actual[rows * pitch..].iter().all(|&byte| byte == 197));
         }
@@ -1055,7 +1055,7 @@ mod tests {
         }
         library.copy_h2d(head.buffer,&vec![197;head.buffer.bytes])?;
         let mut actual=vec![0;retained.buffer.bytes];
-        library.copy_d2h(&mut actual,retained.buffer)?;
+        library.copy_d2h_quiescent(&mut actual,retained.buffer)?;
         assert_eq!(actual,expected);
         assert!(retain_logit_tile(&library,retained.buffer,31,8,DeviceLogits { ptr:head.buffer.ptr,
             rows:4,vocab:8,stride:8,stream:std::ptr::null_mut(),greedy:None }).is_err());
@@ -1112,7 +1112,7 @@ mod tests {
     fn read(bank: &super::super::cache::PageBank<'_>, buffer: Buffer) -> Result<Vec<u8>> {
         bank.stream.drain()?;
         let mut bytes = vec![0; buffer.bytes];
-        bank.stream.device.run(|| bank.stream.device.library.copy_d2h(&mut bytes, buffer))?;
+        bank.stream.device.run(|| bank.stream.device.library.copy_d2h_quiescent(&mut bytes, buffer))?;
         Ok(bytes)
     }
     fn row(bank: &super::super::cache::PageBank<'_>, placement: &Placement, layer: usize,

@@ -426,12 +426,14 @@ impl MtpCache<'_> {
             let region = crate::shared::prefix::view(mtp.kv.buffer,
                 page as usize * 64 * mtp.layout.record_bytes, rows * mtp.layout.record_bytes)?;
             let mut data = vec![0; region.bytes];
-            mtp.library.copy_d2h(&mut data, region)?;
+            // SAFETY: `mtp.stream` produced `region` on this device and remains live.
+            unsafe { mtp.library.copy_d2h(&mut data, region, mtp.stream)?; }
             bytes.extend(data);
         }
         let hidden = mtp.tail_hidden(frontier)?;
         let mut data = vec![0; hidden.bytes];
-        mtp.library.copy_d2h(&mut data, hidden)?;
+        // SAFETY: `mtp.stream` produced `hidden` on this device and remains live.
+        unsafe { mtp.library.copy_d2h(&mut data, hidden, mtp.stream)?; }
         bytes.extend(data);
         Ok(bytes)
     }
@@ -643,7 +645,7 @@ pub(crate) fn oracle<'a>(args: &super::super::GoldenArgs, library: &'a NativeLib
         let logits = mtp.step(&mut engine, input.buffer, &tokens[first + 1..end + 1], first)?;
         let byte_count = (end - first) * width;
         let mut bytes = vec![0; byte_count];
-        library.copy_d2h(&mut bytes, CuteafdDeviceBuffer { bytes: byte_count, ..engine.planes.norm })?;
+        engine.stream.copy_d2h(&mut bytes, CuteafdDeviceBuffer { bytes: byte_count, ..engine.planes.norm })?;
         let ours = bf16(&bytes);
         let theirs = bf16(&expected[first * width..end * width]);
         for (a, b) in ours.chunks_exact(cfg.hidden).zip(theirs.chunks_exact(cfg.hidden)) { hidden_cos.push(cosine(a, b)?); }
@@ -684,13 +686,15 @@ pub(crate) fn oracle<'a>(args: &super::super::GoldenArgs, library: &'a NativeLib
         let logits = mtp.step_device(&mut engine, input.buffer, &tokens[position + 1..position + 2], position)?;
         if let Ok(index) = selected.binary_search(&position) {
             let feedback = CuteafdDeviceBuffer { bytes: width, ..engine.planes.norm };
+            let mtp_stream = mtp.stream;
             mtp.chain_from_logits(&mut engine, logits, position + 1, 3, |logits, step| {
                 let scores = logits.to_host(library)?;
                 let row = index * 3 + step;
                 chain_logit_min = chain_logit_min.min(cosine(&scores,
                     &chain_logits[row * cfg.vocab..(row + 1) * cfg.vocab])?);
                 let mut bytes = vec![0; width];
-                library.copy_d2h(&mut bytes, feedback)?;
+                // SAFETY: `mtp_stream` produced `feedback` on this device and remains live.
+                unsafe { library.copy_d2h(&mut bytes, feedback, mtp_stream)?; }
                 chain_hidden_min = chain_hidden_min.min(cosine(&bf16(&bytes),
                     &bf16(&chain_hidden[row * width..(row + 1) * width]))?);
                 let best = scores.iter().enumerate()
@@ -757,7 +761,7 @@ mod tests {
         let boxed = |error: cuteafd_engine::prefix::BoxError| anyhow::anyhow!("dense MTP boundary: {error}");
         let download = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
             let mut bytes = vec![0; buffer.bytes];
-            library.copy_d2h(&mut bytes, buffer)?;
+            library.copy_d2h_quiescent(&mut bytes, buffer)?;
             Ok(bytes)
         };
         for frontier in [64usize, 65, 128, 129] {

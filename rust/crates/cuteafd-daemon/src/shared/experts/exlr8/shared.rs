@@ -275,13 +275,13 @@ mod receipt_tests {
                             use std::os::unix::fs::FileExt;
                             std::fs::File::open(&source.path)?.read_exact_at(&mut expected, source.offset)?;
                             let mut actual = vec![0; source.bytes];
-                            library.copy_d2h(&mut actual, view(weights.buffer, offset, source.bytes)?)?;
+                            library.copy_d2h_quiescent(&mut actual, view(weights.buffer, offset, source.bytes)?)?;
                             assert_eq!(actual, expected);
                         }
                     }
                     let (pointers, _) = weights.layout.descriptors(weights.buffer.ptr as u64)?;
                     let mut actual = vec![0; pointers.len() * 8];
-                    library.copy_d2h(&mut actual, weights.pointers()?)?;
+                    library.copy_d2h_quiescent(&mut actual, weights.pointers()?)?;
                     assert_eq!(actual, pointers.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<_>>());
                 }
                 let mut weights = cuteafd_loader::placement::families::glm5::weights::WeightInventory {
@@ -342,14 +342,14 @@ mod receipt_tests {
                             for (source, &offset) in unit.source.iter().zip(&unit.destination) {
                                 let mut expected = vec![0; source.bytes];
                                 let mut actual = expected.clone();
-                                library.copy_d2h(&mut expected, view(mount.buffer, offset, source.bytes)?)?;
-                                library.copy_d2h(&mut actual, view(push.buffer, offset, source.bytes)?)?;
+                                library.copy_d2h_quiescent(&mut expected, view(mount.buffer, offset, source.bytes)?)?;
+                                library.copy_d2h_quiescent(&mut actual, view(push.buffer, offset, source.bytes)?)?;
                                 assert_eq!(actual, expected);
                             }
                         }
                         let (pointers, _) = push.layout.descriptors(push.buffer.ptr as u64)?;
                         let mut actual = vec![0; pointers.len() * 8];
-                        library.copy_d2h(&mut actual, push.pointers()?)?;
+                        library.copy_d2h_quiescent(&mut actual, push.pointers()?)?;
                         assert_eq!(actual, pointers.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<_>>());
                     }
                     Ok(())

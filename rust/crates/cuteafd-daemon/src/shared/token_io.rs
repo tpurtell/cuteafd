@@ -493,7 +493,7 @@ impl<'a> TokenEmbedding<'a> {
             self.file.read_exact_at(&mut host[..n], self.source.offset + at as u64)?;
             // SAFETY: `at + n` lies inside the table.
             let ptr = unsafe { table.ptr.cast::<u8>().add(at) }.cast();
-            self.library.copy_d2h(&mut device[..n], CuteafdDeviceBuffer { ptr, bytes: n, ..table })?;
+            self.library.copy_d2h_quiescent(&mut device[..n], CuteafdDeviceBuffer { ptr, bytes: n, ..table })?;
             ensure!(host[..n] == device[..n], "resident embedding table differs from the shard at byte {at}");
             at += n;
         }
@@ -1044,18 +1044,18 @@ pub(crate) fn gate(library: &NativeLibrary, embedding: &TokenEmbedding<'_>, firs
         let row = embedding.hidden() * 2;
         let (ids, out) = (DeviceAllocation::new(library, sample.len() * 4, Tag::workspace("shared/embedding-check"))?,
             DeviceAllocation::new(library, sample.len() * 4 * row, Tag::workspace("shared/embedding-check"))?);
-        let stream = library.cuda_stream_create()?;
+        let stream = crate::shared::memory::device::Stream::new(
+            crate::shared::memory::device::Device { library, id: library.cuda_get_device()? })?;
         let checked = (|| -> Result<()> {
-            embedding.embed(&sample, ids.buffer, 4, out.buffer, stream)?;
-            // SAFETY: our stream.
-            unsafe { library.cuda_stream_synchronize(stream)? };
+            embedding.embed(&sample, ids.buffer, 4, out.buffer, stream.raw)?;
+            stream.drain()?;
             let mut device = vec![0u8; sample.len() * 4 * row];
-            library.copy_d2h(&mut device, out.buffer)?;
+            stream.copy_d2h(&mut device, out.buffer)?;
             ensure!(device == embedding.host_rows_repeated(&sample, 4)?, "device-gathered rows differ from the shard");
             Ok(())
         })();
-        // SAFETY: drained above (or failed before queueing more).
-        unsafe { library.cuda_stream_synchronize(stream)?; library.cuda_stream_destroy(stream)? };
+        stream.drain()?;
+        stream.destroy()?;
         checked?;
         println!("token gate: embedding table {:.2} GiB identical to the shard; {} gathered rows x4 identical ({:.1} s)",
             bytes as f64 / (1u64 << 30) as f64, sample.len(), started.elapsed().as_secs_f64());
@@ -1548,7 +1548,7 @@ mod tests {
         assert_eq!(mounted.verify_resident()?, payload.len());
         let read = |table: &TokenEmbedding<'_>| -> Result<Vec<u8>> {
             let mut bytes = vec![0; payload.len()];
-            library.copy_d2h(&mut bytes, table.table.buffer())?;
+            library.copy_d2h_quiescent(&mut bytes, table.table.buffer())?;
             Ok(bytes)
         };
         assert_eq!(read(&pushed)?, payload);
@@ -1611,7 +1611,7 @@ mod tests {
         devices[1].run(|| -> Result<()> { assert_eq!(read(&peer_embedding)?, payload); Ok(()) })?;
         devices[0].run(|| -> Result<()> {
             let mut actual = vec![0; payload.len()];
-            library.copy_d2h(&mut actual, model.buffer)?;
+            library.copy_d2h_quiescent(&mut actual, model.buffer)?;
             assert_eq!(actual, payload);
             Ok(())
         })?;

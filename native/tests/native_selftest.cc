@@ -32,7 +32,7 @@ void test_allocate_copy_free_roundtrip() {
   assert(buffer.bytes == input.size());
 
   assert(cuteafd_copy_h2d(buffer, input.data(), input.size()) == CUTEAFD_STATUS_OK);
-  assert(cuteafd_copy_d2h(output.data(), buffer, output.size()) == CUTEAFD_STATUS_OK);
+  assert(cuteafd_copy_d2h_quiescent(output.data(), buffer, output.size()) == CUTEAFD_STATUS_OK);
   assert(output == input);
 
   assert(cuteafd_free_device_buffer(&buffer) == CUTEAFD_STATUS_OK);
@@ -51,7 +51,7 @@ void test_device_to_device_copy_roundtrip() {
 
   assert(cuteafd_copy_h2d(src, input.data(), input.size()) == CUTEAFD_STATUS_OK);
   assert(cuteafd_copy_d2d(dst, src, input.size()) == CUTEAFD_STATUS_OK);
-  assert(cuteafd_copy_d2h(output.data(), dst, output.size()) == CUTEAFD_STATUS_OK);
+  assert(cuteafd_copy_d2h_quiescent(output.data(), dst, output.size()) == CUTEAFD_STATUS_OK);
   assert(output == input);
 
   assert(cuteafd_free_device_buffer(&src) == CUTEAFD_STATUS_OK);
@@ -72,7 +72,7 @@ void test_host_buffer_copy_roundtrip() {
   cuteafd_device_buffer_t device = {};
   assert(cuteafd_alloc_device_buffer(input.size(), &device, CUTEAFD_MEMORY_KIND_WORKSPACE, "selftest") == CUTEAFD_STATUS_OK);
   assert(cuteafd_copy_h2d(device, host.ptr, input.size()) == CUTEAFD_STATUS_OK);
-  assert(cuteafd_copy_d2h(output.data(), device, output.size()) == CUTEAFD_STATUS_OK);
+  assert(cuteafd_copy_d2h_quiescent(output.data(), device, output.size()) == CUTEAFD_STATUS_OK);
   assert(output == input);
 
   assert(cuteafd_free_device_buffer(&device) == CUTEAFD_STATUS_OK);
@@ -109,7 +109,7 @@ void test_small_and_large_h2d_batches() {
     assert(cuteafd_copy_h2d_batch_async(destinations, sources, sizes, count, stream) == CUTEAFD_STATUS_OK);
     assert(cuteafd_cuda_stream_synchronize(stream) == CUTEAFD_STATUS_OK);
     unsigned char result[kMax]{};
-    assert(cuteafd_copy_d2h(result, dst, count) == CUTEAFD_STATUS_OK);
+    assert(cuteafd_copy_d2h(result, dst, count, stream) == CUTEAFD_STATUS_OK);
     for (size_t i = 0; i < count; ++i) assert(result[i] == input[count - i - 1]);
   }
   assert(cuteafd_free_device_buffer(&dst) == CUTEAFD_STATUS_OK);

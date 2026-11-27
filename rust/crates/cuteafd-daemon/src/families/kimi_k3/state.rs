@@ -370,7 +370,7 @@ mod tests {
         cfg.dense = vec![true];
         let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
             let mut bytes = vec![0; buffer.bytes];
-            device.run(|| library.copy_d2h(&mut bytes, buffer))?;
+            device.run(|| library.copy_d2h_quiescent(&mut bytes, buffer))?;
             Ok(bytes)
         };
         let upload = |bytes: &[u8]| -> Result<Allocation<'_>> {

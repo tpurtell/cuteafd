@@ -236,7 +236,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             for (name, source) in [("input_partial", "partial"), ("input_arena", "residual_arena")] {
                 let buffer = owner.buffer(source)?;
                 let mut bytes = vec![0u8; buffer.bytes];
-                device.run(|| library.copy_d2h(&mut bytes, buffer))?;
+                stream.copy_d2h(&mut bytes, buffer)?;
                 std::fs::write(out.join(format!("{name}.bin")), bytes)?;
             }
         }
@@ -252,7 +252,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             for name in ["partial", "mixed", "projection_input", "route_ids", "route_weights", "route_logits"] {
                 let buffer = owner.buffer(name)?;
                 let mut bytes = vec![0u8; buffer.bytes];
-                device.run(|| library.copy_d2h(&mut bytes, buffer))?;
+                stream.copy_d2h(&mut bytes, buffer)?;
                 std::fs::write(out.join(format!("{name}.bin")), bytes)?;
             }
             std::fs::write(out.join("meta.json"), serde_json::to_vec_pretty(&serde_json::json!({
@@ -296,7 +296,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
     stream.drain()?;
     let mut bytes = vec![0u8; rows*cfg.unpadded_vocab_size*4];
     let download_bytes = bytes.len();
-    device.run(|| library.copy_d2h(&mut bytes, raw(logits, download_bytes)?))?;
+    stream.copy_d2h(&mut bytes, raw(logits, download_bytes)?)?;
     let values = bytes.chunks_exact(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>();
     ensure!(values.iter().all(|v| v.is_finite()), "Inkling golden nonfinite logits");
     let mut nll = 0f64;

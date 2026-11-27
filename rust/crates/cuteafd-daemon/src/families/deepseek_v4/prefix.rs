@@ -485,12 +485,14 @@ impl Runner<'_, '_, '_> {
 }
 
 fn download(engine: &Engine<'_>, range: CuteafdDeviceBuffer) -> Result<Vec<u8>> {
-    // SAFETY: the engine owns this stream; draining it retires every write to `range`.
     for rank in 0..engine.ranks() {
-        unsafe { engine.library.cuda_stream_synchronize(engine.stream_of(rank))? };
+        engine.rank_stream(rank).drain()?;
     }
     let mut bytes = vec![0u8; range.bytes];
-    engine.library.copy_d2h(&mut bytes, range)?;
+    let rank = (0..engine.ranks())
+        .find(|&r| engine.device_of(r) == range.device_id)
+        .unwrap_or(0);
+    engine.rank_stream(rank).copy_d2h(&mut bytes, range)?;
     Ok(bytes)
 }
 
@@ -583,7 +585,7 @@ pub(super) fn packed_state(engine: &Engine<'_>, placement: &Placement, clear: bo
             else {
                 let first = out.bytes.len();
                 out.bytes.resize(first + buffer.bytes, 0);
-                engine.library.copy_d2h(&mut out.bytes[first..], buffer)?;
+                engine.rank_stream(rank).copy_d2h(&mut out.bytes[first..], buffer)?;
                 out.tensors.push((name, first..out.bytes.len()));
             }
             Ok(())

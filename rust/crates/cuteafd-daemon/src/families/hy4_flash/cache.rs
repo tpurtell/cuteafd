@@ -374,11 +374,12 @@ impl<'a> Hy4CacheRank<'a> {
                         };
                         let kv_buf = slice_buf(self.dsa_kv_page(d, phys)?, 0, take * rec)?;
                         let dst_off = (d * owned_rows + out_row_cursor) * rec;
-                        self.device.library.copy_d2h(&mut dsa_kv[dst_off..dst_off + take * rec], kv_buf)?;
+                        self.copies.copy_d2h(0, &mut dsa_kv[dst_off..dst_off + take * rec], kv_buf)?;
                         if take_groups > 0 {
                             let idx_buf = slice_buf(self.dsa_index_page(d, phys)?, 0, take_groups * idx_group_bytes)?;
                             let g_off = (d * owned_groups + out_group_cursor) * idx_group_bytes;
-                            self.device.library.copy_d2h(
+                            self.copies.copy_d2h(
+                                0,
                                 &mut dsa_index[g_off..g_off + take_groups * idx_group_bytes],
                                 idx_buf,
                             )?;
@@ -392,7 +393,7 @@ impl<'a> Hy4CacheRank<'a> {
                 if pending_tok_bytes > 0 {
                     let p_buf = slice_buf(self.pending_key_slot(placement.slot, d)?, 0, pending_tok_bytes)?;
                     let p_off = d * pending_tok_bytes;
-                    self.device.library.copy_d2h(&mut pending_keys[p_off..p_off + pending_tok_bytes], p_buf)?;
+                    self.copies.copy_d2h(0, &mut pending_keys[p_off..p_off + pending_tok_bytes], p_buf)?;
                 }
             }
             let runs = self.swa_ring.visible(len as u64);
@@ -402,7 +403,7 @@ impl<'a> Hy4CacheRank<'a> {
                     let bytes = (run.rows as usize) * rec;
                     let src = slice_buf(ring, (run.slot as usize) * rec, bytes)?;
                     let dst_off = (s * vis_rows + run.offset as usize) * rec;
-                    self.device.library.copy_d2h(&mut swa_visible[dst_off..dst_off + bytes], src)?;
+                    self.copies.copy_d2h(0, &mut swa_visible[dst_off..dst_off + bytes], src)?;
                 }
             }
             Ok(())
@@ -876,11 +877,11 @@ mod tests {
         assert_eq!(restored.placement.len, tokens.len());
         assert_eq!(rank.pending_counts.borrow()[1][0], tokens.len() % 4);
         let mut got_swa = vec![0u8; swa0.bytes];
-        library.copy_d2h(&mut got_swa, rank.swa_ring(1, 0)?)?;
+        library.copy_d2h_quiescent(&mut got_swa, rank.swa_ring(1, 0)?)?;
         assert_eq!(&got_swa[..tokens.len() * rec], &swa_bytes[..tokens.len() * rec]);
         assert!(got_swa[tokens.len() * rec..].iter().all(|&b| b == 0));
         let mut got_pend = vec![0u8; pend0.bytes];
-        library.copy_d2h(&mut got_pend, rank.pending_key_slot(1, 0)?)?;
+        library.copy_d2h_quiescent(&mut got_pend, rank.pending_key_slot(1, 0)?)?;
         assert_eq!(got_pend, pend_bytes);
         cache.release(&family, &restored.placement.units)?;
 
@@ -903,7 +904,7 @@ mod tests {
         })?;
         assert_eq!(wrap_restored.resume, wrap_len);
         assert_eq!(rank.pending_counts.borrow()[1][0], wrap_len % 4);
-        library.copy_d2h(&mut got_swa, rank.swa_ring(1, 0)?)?;
+        library.copy_d2h_quiescent(&mut got_swa, rank.swa_ring(1, 0)?)?;
         for pos in (wrap_len - cfg.sliding_window)..wrap_len {
             let slot = pos % rank.swa_ring_rows;
             let lo = slot * rec;

@@ -655,8 +655,8 @@ void copy_h2d(cuteafd_device_buffer_t buffer, const std::vector<T>& values) {
 template <typename T>
 std::vector<T> copy_d2h(cuteafd_device_buffer_t buffer, size_t count) {
   std::vector<T> values(count);
-  require_status(cuteafd_copy_d2h(values.data(), buffer, values.size() * sizeof(T)),
-                 "cuteafd_copy_d2h");
+  require_status(cuteafd_copy_d2h_quiescent(values.data(), buffer, values.size() * sizeof(T)),
+                 "cuteafd_copy_d2h_quiescent");
   return values;
 }
 

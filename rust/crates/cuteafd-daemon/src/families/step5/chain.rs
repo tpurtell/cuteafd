@@ -842,7 +842,7 @@ mod tests {
         let input = Allocation::new(device, 64 * H * 4, crate::shared::memory::TEST)?;
         let read = |buffer, bytes| {
             let mut result = vec![0; bytes];
-            device.run(|| library.copy_d2h(&mut result, buffer))?;
+            device.run(|| library.copy_d2h_quiescent(&mut result, buffer))?;
             Ok::<_, anyhow::Error>(result)
         };
         for rows in [1, 7, 8, 9, 64] {
@@ -998,7 +998,7 @@ mod tests {
         ensure!(link.borrow().world_size() == 6, "BF16 tail qualification requires TP6");
         let read = |buffer, bytes| {
             let mut result = vec![0; bytes];
-            device.run(|| library.copy_d2h(&mut result, buffer))?;
+            device.run(|| library.copy_d2h_quiescent(&mut result, buffer))?;
             Ok::<_, anyhow::Error>(result)
         };
         for layer in 88..=90 {

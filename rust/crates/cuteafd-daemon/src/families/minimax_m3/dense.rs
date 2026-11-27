@@ -404,7 +404,7 @@ mod tests {
         let owner = ExecutionOwner::new(device, &weights, 17)?;
         assert_eq!(owner.input_layout, DenseInput { rows: 17, width: 128, bytes: 17 * 128 * 2 });
         let mut table = [0; 8];
-        device.run(|| library.copy_d2h(&mut table, owner.workspace.inputs.buffer))?;
+        device.run(|| library.copy_d2h_quiescent(&mut table, owner.workspace.inputs.buffer))?;
         assert_eq!(u64::from_le_bytes(table), owner.activation.buffer.ptr as u64);
         let devices = [1];
         let mut inventory = Inventory::new(CoordinatorDevices::new(&devices)?, "minimax", Lifetime::TARGET,

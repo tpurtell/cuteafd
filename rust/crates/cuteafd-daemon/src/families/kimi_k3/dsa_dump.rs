@@ -333,9 +333,9 @@ where
             let mut pos_bytes = vec![0u8; pos_view.bytes];
             let mut len_bytes = vec![0u8; len_view.bytes];
             let mut idx_bytes = vec![0u8; idx_view.bytes];
-            stream.device.library.copy_d2h(&mut pos_bytes, pos_view)?;
-            stream.device.library.copy_d2h(&mut len_bytes, len_view)?;
-            stream.device.library.copy_d2h(&mut idx_bytes, idx_view)?;
+            stream.copy_d2h(&mut pos_bytes, pos_view)?;
+            stream.copy_d2h(&mut len_bytes, len_view)?;
+            stream.copy_d2h(&mut idx_bytes, idx_view)?;
             Ok(RawBatch { rows, positions: pos_bytes, lengths: len_bytes, indices: idx_bytes })
         })
     }

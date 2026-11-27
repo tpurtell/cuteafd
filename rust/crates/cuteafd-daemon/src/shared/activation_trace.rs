@@ -4,9 +4,10 @@ use cuteafd_ffi::{CuteafdDeviceBuffer as Buffer, NativeLibrary};
 use std::{ffi::OsStr, io::Write, path::{Path, PathBuf}};
 
 pub(crate) fn write_device(library: &NativeLibrary, directory: &Path, layer: usize,
-    component: &str, buffer: Buffer) -> Result<()> {
+    component: &str, buffer: Buffer, stream: *mut std::ffi::c_void) -> Result<()> {
     let mut bytes = vec![0; buffer.bytes];
-    library.copy_d2h(&mut bytes, buffer)?;
+    // SAFETY: caller supplies the live producing stream on `buffer`'s current device.
+    unsafe { library.copy_d2h(&mut bytes, buffer, stream)?; }
     write_bytes(directory, layer, component, &bytes)
 }
 
@@ -20,10 +21,11 @@ pub(crate) fn write_bytes(directory: &Path, layer: usize, component: &str, bytes
 
 /// Preserve native F32 diagnostics too, with a BF16 view matching reference trace files.
 pub(crate) fn write_f32(library: &NativeLibrary, directory: &Path, layer: usize,
-    component: &str, buffer: Buffer) -> Result<()> {
+    component: &str, buffer: Buffer, stream: *mut std::ffi::c_void) -> Result<()> {
     ensure!(buffer.bytes % 4 == 0, "activation trace F32 plane is not element aligned");
     let mut bytes = vec![0; buffer.bytes];
-    library.copy_d2h(&mut bytes, buffer)?;
+    // SAFETY: caller supplies the live producing stream on `buffer`'s current device.
+    unsafe { library.copy_d2h(&mut bytes, buffer, stream)?; }
     let bf16: Vec<u8> = bytes.chunks_exact(4).flat_map(|word|
         bf16_rne(u32::from_le_bytes(word.try_into().unwrap())).to_le_bytes()).collect();
     write_bytes(directory, layer, &format!("{component}.f32"), &bytes)?;

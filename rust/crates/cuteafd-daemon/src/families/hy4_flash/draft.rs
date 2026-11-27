@@ -1527,11 +1527,7 @@ impl<'a> Drafter<'a> {
         }
         let mut ids = vec![0u8; depth * count * 4];
         let bytes = ids.len();
-        r0.device.run(|| {
-            r0.device
-                .library
-                .copy_d2h(&mut ids, slice_buf(r0.b("greedy_ids"), 0, bytes)?)
-        })?;
+        s0.copy_d2h(&mut ids, slice_buf(r0.b("greedy_ids"), 0, bytes)?)?;
         members
             .iter()
             .enumerate()

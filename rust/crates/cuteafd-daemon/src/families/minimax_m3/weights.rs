@@ -196,7 +196,7 @@ mod tests {
         for (name, bytes) in &expected {
             let operand = weights.operand(name)?;
             let mut actual = vec![0; bytes.len()];
-            device.run(|| library.copy_d2h(&mut actual, operand.buffer))?;
+            device.run(|| library.copy_d2h_quiescent(&mut actual, operand.buffer))?;
             assert_eq!(&actual, bytes, "{name}");
         }
         let devices = [1];
@@ -269,7 +269,7 @@ mod tests {
         let device = Device { library: &library, id: 1 };
         let weights = TargetWeights::mount(device, &checkpoint, &layout)?;
         let mut actual = vec![0; bytes];
-        device.run(|| library.copy_d2h(&mut actual, weights.operand("payload")?.buffer))?;
+        device.run(|| library.copy_d2h_quiescent(&mut actual, weights.operand("payload")?.buffer))?;
         assert_eq!((actual[0], actual[STEP_BYTES - 1], actual[STEP_BYTES], actual[bytes - 1]), (17, 29, 31, 43));
         assert_eq!(actual.iter().filter(|value| **value != 0).count(), 4);
         assert_eq!(fixture.events()?.matches('D').count(), 1);
@@ -302,8 +302,8 @@ mod tests {
         for (name, expected) in &expected {
             let mut actual = vec![0; expected.len()];
             let mut baseline = vec![0; expected.len()];
-            device.run(|| library.copy_d2h(&mut actual, pushed.operand(name)?.buffer))?;
-            device.run(|| library.copy_d2h(&mut baseline, mounted.operand(name)?.buffer))?;
+            device.run(|| library.copy_d2h_quiescent(&mut actual, pushed.operand(name)?.buffer))?;
+            device.run(|| library.copy_d2h_quiescent(&mut baseline, mounted.operand(name)?.buffer))?;
             assert_eq!(&actual, expected, "{name}");
             assert_eq!(actual, baseline, "{name}");
         }
@@ -441,7 +441,7 @@ mod tests {
             for (name, expected) in &expected {
                 for weights in [&mounted, &pushed] {
                     let mut bytes = vec![0; expected.len()];
-                    device.run(|| library.copy_d2h(&mut bytes, weights.operand(name)?.buffer))?;
+                    device.run(|| library.copy_d2h_quiescent(&mut bytes, weights.operand(name)?.buffer))?;
                     assert_eq!(&bytes, expected, "rank {rank} {name}");
                 }
             }
@@ -498,7 +498,7 @@ mod tests {
             for (name, expected) in &expected {
                 for weights in [&mounted, &pushed] {
                     let mut bytes = vec![0; expected.len()];
-                    device.run(|| library.copy_d2h(&mut bytes, weights.operand(name)?.buffer))?;
+                    device.run(|| library.copy_d2h_quiescent(&mut bytes, weights.operand(name)?.buffer))?;
                     assert_eq!(&bytes, expected, "rank {rank} {name}");
                 }
             }

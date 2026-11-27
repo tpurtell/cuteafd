@@ -434,7 +434,7 @@ mod tests {
                 })?;
                 full_stream.drain()?;
                 let mut expected = vec![0u8; rows * 129280 * 4];
-                devices[1].run(|| lib.copy_d2h(&mut expected, slice(full_logits.buffer, 0, rows * 129280 * 4)?))?;
+                devices[1].run(|| lib.copy_d2h_quiescent(&mut expected, slice(full_logits.buffer, 0, rows * 129280 * 4)?))?;
                 references.push(expected);
             }
             for greedy in [true, false, false, true] {
@@ -454,11 +454,11 @@ mod tests {
                 })?;
                 for ((wave, expected), output) in [&first, &second].into_iter().zip(&references).zip(&assembled) {
                     let mut combined = vec![0u8; rows * 129280 * 4];
-                    devices[1].run(|| lib.copy_d2h(&mut combined, slice(output.buffer, 0, rows * 129280 * 4)?))?;
+                    devices[1].run(|| lib.copy_d2h_quiescent(&mut combined, slice(output.buffer, 0, rows * 129280 * 4)?))?;
                     ensure!(combined == *expected, "GPU-assembled vocabulary differs from full head");
                     let logits = wave.logits()?;
                     let mut parts = [vec![0u8; rows * 64640 * 4], vec![0u8; rows * 64640 * 4]];
-                    for rank in 0..2 { devices[rank].run(|| lib.copy_d2h(&mut parts[rank], logits[rank]))?; }
+                    for rank in 0..2 { devices[rank].run(|| lib.copy_d2h_quiescent(&mut parts[rank], logits[rank]))?; }
                     let mut max_error = 0f32;
                     for row in 0..rows {
                         for (rank, part) in parts.iter().enumerate() {
@@ -481,7 +481,7 @@ mod tests {
                     let (ids, scores) = wave.greedy()?;
                     let mut ids_bytes = vec![0u8; rows * 4];
                     let mut scores_bytes = vec![0u8; rows * 4];
-                    devices[1].run(|| { lib.copy_d2h(&mut ids_bytes, ids)?; lib.copy_d2h(&mut scores_bytes, scores) })?;
+                    devices[1].run(|| { lib.copy_d2h_quiescent(&mut ids_bytes, ids)?; lib.copy_d2h_quiescent(&mut scores_bytes, scores) })?;
                     for row in 0..rows {
                         let values: Vec<f32> = expected[row*129280*4..(row+1)*129280*4].chunks_exact(4)
                             .map(|v| f32::from_ne_bytes(v.try_into().unwrap())).collect();

@@ -86,7 +86,8 @@ impl<'a> PackedHead<'a> {
         }
         launched?;
         let mut words = [0u8; STATUS_WORDS * 8];
-        library.copy_d2h(&mut words, status)?;
+        // Quiescent: load-time one-shot status read immediately after `cuda_stream_synchronize(stream)` above.
+        library.copy_d2h_quiescent(&mut words, status)?;
         let status = PackStatus::from_bytes(&words);
         status.check(layout.capacity).with_context(|| format!("packed head [{n}, {k}]"))?;
         self.status.set(Some(status));
@@ -185,7 +186,7 @@ mod tests {
         for (region, expected) in expected {
             for owner in [&baseline, &packed] {
                 let mut actual = vec![0; expected.len()];
-                device.run(|| library.copy_d2h(&mut actual, CuteafdDeviceBuffer {
+                device.run(|| library.copy_d2h_quiescent(&mut actual, CuteafdDeviceBuffer {
                     ptr: owner.storage.buffer.ptr.wrapping_byte_add(layout.offset(region)),
                     bytes: expected.len(), ..owner.storage.buffer }))?;
                 assert_eq!(actual, expected, "{region:?}");

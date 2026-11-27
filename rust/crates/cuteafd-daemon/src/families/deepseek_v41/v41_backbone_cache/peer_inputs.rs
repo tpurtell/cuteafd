@@ -87,10 +87,10 @@ mod tests {
                 let requests=original.attention_requests();
                 let (expected,expected_projection)=source.run(||unsafe {
                     let output=full.execute_query(&q,sink,&requests,Some(&selected))?;
-                    let mut bytes=vec![0;output.values.bytes];lib.copy_d2h(&mut bytes,output.values)?;
+                    let mut bytes=vec![0;output.values.bytes];lib.copy_d2h_quiescent(&mut bytes,output.values)?;
                     let projected=reference_projection.execute_attention(&output)?;
                     let mut projected_bytes=vec![0;projected.projected.bytes];
-                    lib.copy_d2h(&mut projected_bytes,projected.projected)?;
+                    lib.copy_d2h_quiescent(&mut projected_bytes,projected.projected)?;
                     Ok((bytes,projected_bytes))
                 })?;
                 // Cancel before completing cold preparation or a warm replay,
@@ -112,7 +112,7 @@ mod tests {
                         Ok((output,projected))
                     }) })?;
                     let mut actual=vec![0;output.values.bytes];
-                    source.run(||lib.copy_d2h(&mut actual,output.values))?;
+                    source.run(||lib.copy_d2h_quiescent(&mut actual,output.values))?;
                     assert_eq!(actual.len(),expected.len());
                     let mut max_error=0f32;
                     for (a,b) in actual.chunks_exact(2).zip(expected.chunks_exact(2)) {
@@ -125,7 +125,7 @@ mod tests {
                     eprintln!("dual cached attention layer={layer} seed={seed} max_abs_error={max_error}");
                     assert_eq!(actual,expected,"compact attention differs from full-head attention");
                     let mut actual_projection=vec![0;projected.bytes];
-                    source.run(||lib.copy_d2h(&mut actual_projection,projected))?;
+                    source.run(||lib.copy_d2h_quiescent(&mut actual_projection,projected))?;
                     assert_eq!(actual_projection,expected_projection,"dual attention projection continuation differs");
                 }
                 // Repeated consumption of the same source must preserve its copy.
@@ -139,8 +139,8 @@ mod tests {
                         let slice=|buffer:CuteafdDeviceBuffer|CuteafdDeviceBuffer {
                             ptr:unsafe { buffer.ptr.cast::<u8>().add(offset).cast() },bytes,..buffer };
                         let mut left=vec![0;bytes];let mut right=left.clone();
-                        source.run(||lib.copy_d2h(&mut left,slice(a)))?;
-                        peer.run(||lib.copy_d2h(&mut right,slice(b)))?;
+                        source.run(||lib.copy_d2h_quiescent(&mut left,slice(a)))?;
+                        peer.run(||lib.copy_d2h_quiescent(&mut right,slice(b)))?;
                         assert_eq!(left,right);Ok(())
                     };
                     compare(a.values,b.values,0,5*512)?;compare(a.scales,b.scales,0,5*16)?;
@@ -279,7 +279,7 @@ mod shared_cache_tests {
         let bytes=(offset+(count-1)*step+1)*256;
         let saved=[Allocation::new(peer,bytes, crate::shared::memory::TEST)?,Allocation::new(peer,bytes, crate::shared::memory::TEST)?];
         let read=|buffer:CuteafdDeviceBuffer,device:Device<'_>|->Result<Vec<u8>> {
-            let mut raw=vec![0;bytes];device.run(||lib.copy_d2h(&mut raw,CuteafdDeviceBuffer {bytes,..buffer}))?;
+            let mut raw=vec![0;bytes];device.run(||lib.copy_d2h_quiescent(&mut raw,CuteafdDeviceBuffer {bytes,..buffer}))?;
             Ok((0..count).flat_map(|row|raw[(offset+row*step)*256..(offset+row*step+1)*256].iter().copied()).collect())
         };
         let expected=[read(originals[0].sources[0].kv_values,source)?,read(originals[1].sources[0].kv_values,source)?];

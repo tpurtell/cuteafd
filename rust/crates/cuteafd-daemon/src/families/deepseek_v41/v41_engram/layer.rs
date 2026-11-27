@@ -477,7 +477,7 @@ impl<'weights, 'library> EngramGate<'weights, 'library> {
         let lib = self.weights.library;
         let mut residual = residual; residual.bytes = gathered.rows * 40960;
         let read = |buffer: CuteafdDeviceBuffer| -> Result<Vec<u8>> {
-            let mut bytes = vec![0; buffer.bytes]; lib.copy_d2h(&mut bytes, buffer)?; Ok(bytes)
+            let mut bytes = vec![0; buffer.bytes]; lib.copy_d2h_quiescent(&mut bytes, buffer)?; Ok(bytes)
         };
         let original = read(residual)?;
         let expected = read(unsafe { self.execute_captured(residual, gathered)? })?;

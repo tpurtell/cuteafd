@@ -789,8 +789,7 @@ impl<'a> Exl3Worker<'a> {
         }
         let completed_us = started.map(|t| t.elapsed().as_micros() as u64).unwrap_or(0);
         if destination.is_none() {
-            self.library
-                .copy_d2h(&mut exchange.partials[..bytes], output)?;
+            self.stream.copy_d2h(&mut exchange.partials[..bytes], output)?;
         }
         if let (Some(started), Some([start, end])) = (started, &self.timing) {
             // This interval overlaps host enqueue/wait and includes all stream work,

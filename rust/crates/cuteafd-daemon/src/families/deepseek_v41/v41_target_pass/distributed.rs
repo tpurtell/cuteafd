@@ -1766,7 +1766,7 @@ mod tests {
                 for (index, lane) in [&mut pass, &mut other].into_iter().enumerate() {
                     let output = suffixes[index].output()?;
                     let mut bytes = vec![0; output.residual.bytes];
-                    devices[map.attention(19)?].run(|| lib.copy_d2h(&mut bytes, output.residual))?;
+                    devices[map.attention(19)?].run(|| lib.copy_d2h_quiescent(&mut bytes, output.residual))?;
                     if let Some(expected) = &reference[index] {
                         ensure!(&bytes == expected,
                             "independent encoder residual differs: concurrent={concurrent}, lane={index}");
@@ -1858,7 +1858,7 @@ mod tests {
                                 ptr: unsafe { buffer.ptr.cast::<u8>().add(offset).cast() }, bytes, ..buffer
                             };
                             let mut data = vec![0; bytes];
-                            devices[gpu].run(|| lib.copy_d2h(&mut data, source))?;
+                            devices[gpu].run(|| lib.copy_d2h_quiescent(&mut data, source))?;
                             trace.push((position, layer, data));
                         }
                     }

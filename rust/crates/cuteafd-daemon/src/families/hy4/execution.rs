@@ -2336,11 +2336,7 @@ impl<'a> Hy4Engine<'a> {
         let r0 = &self.ranks[0];
         r0.stream.drain()?;
         let mut raw = vec![0u8; elems * 2];
-        r0.device.run(|| {
-            r0.device
-                .library
-                .copy_d2h(&mut raw, slice_buf(buf, 0, elems * 2)?)
-        })?;
+        r0.stream.copy_d2h(&mut raw, slice_buf(buf, 0, elems * 2)?)?;
         let mut out = Vec::with_capacity(elems * 4);
         for chunk in raw.chunks_exact(2) {
             let bits = u16::from_le_bytes([chunk[0], chunk[1]]);
@@ -2358,11 +2354,7 @@ impl<'a> Hy4Engine<'a> {
         let r0 = &self.ranks[0];
         r0.stream.drain()?;
         let mut raw = vec![0u8; elems * 4];
-        r0.device.run(|| {
-            r0.device
-                .library
-                .copy_d2h(&mut raw, slice_buf(buf, 0, elems * 4)?)
-        })?;
+        r0.stream.copy_d2h(&mut raw, slice_buf(buf, 0, elems * 4)?)?;
         std::fs::write(dir.join(format!("{name}.f32")), raw)?;
         Ok(())
     }

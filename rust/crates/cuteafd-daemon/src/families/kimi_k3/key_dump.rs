@@ -400,8 +400,8 @@ pub(crate) fn record_keys(
     let (positions, table) = stream.device.run(|| {
         let mut positions = vec![0u8; pos_view.bytes];
         let mut table = vec![0u8; table_view.bytes];
-        stream.device.library.copy_d2h(&mut positions, pos_view)?;
-        stream.device.library.copy_d2h(&mut table, table_view)?;
+        stream.copy_d2h(&mut positions, pos_view)?;
+        stream.copy_d2h(&mut table, table_view)?;
         Ok((positions, table))
     })?;
     let planned = plan_readback(dump.from(), dump.tokens(), rows, per_row_table, table_width,
@@ -420,7 +420,7 @@ pub(crate) fn record_keys(
             let page_view = view(buffers.cache, bytes, PAGE_BYTES)
                 .with_context(|| format!("DSA key page {page} outside the index cache"))?;
             let mut image = vec![0u8; PAGE_BYTES];
-            stream.device.library.copy_d2h(&mut image, page_view)?;
+            stream.copy_d2h(&mut image, page_view)?;
             paged.push((page, image));
         }
         Ok(paged)

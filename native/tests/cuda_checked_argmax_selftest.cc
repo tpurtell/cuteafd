@@ -28,8 +28,8 @@ int main() {
      static_cast<uint32_t*>(indices.ptr), static_cast<float*>(scores.ptr), rows, vocab, stream));
   ok(cuteafd_cuda_stream_synchronize(stream));
   std::vector<uint32_t> actual(rows); std::vector<float> values(rows);
-  ok(cuteafd_copy_d2h(actual.data(), indices, rows*4));
-  ok(cuteafd_copy_d2h(values.data(), scores, rows*4));
+  ok(cuteafd_copy_d2h(actual.data(), indices, rows*4, stream));
+  ok(cuteafd_copy_d2h(values.data(), scores, rows*4, stream));
   check(actual[0] == 17 && values[0] == -2.f);
   check(actual[1] == vocab-1 && values[1] == 5.f);
   for (size_t row = 2; row <= 4; ++row) check(std::isnan(values[row]));

@@ -225,7 +225,7 @@ impl LocalEncoder {
                                 work.job.image_input().map_err(anyhow::Error::new)?;
                             let features = runtime.encode_patches(patches, grid, None)?;
                             let mut bytes = vec![0; features.bytes];
-                            lib.copy_d2h(&mut bytes, features)?;
+                            runtime.stream().copy_d2h(&mut bytes, features)?;
                             Ok(EncodeOutput {
                                 key: work.job.key,
                                 features: bytes.into(),
