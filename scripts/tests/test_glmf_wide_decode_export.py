@@ -1110,7 +1110,7 @@ def test_native_trellis_first_arithmetic_routes():
 
 
 @pytest.mark.parametrize("filename,functions", [
-    ("trellis_linear.py", {"compile_trellis_linear_aot"}),
+    ("trellis_linear.py", {"compile_trellis_linear_aot", "compile_trellis_linear_fused_aot"}),
     ("scaled_linear.py", {"compile_scaled_linear_aot"}),
     ("trellis_transform.py", {"compile_trellis_input_aot", "compile_trellis_output_aot"}),
     ("native_dense.py", {"compile_swiglu_split_aot", "compile_f32_narrow_pack_aot"}),

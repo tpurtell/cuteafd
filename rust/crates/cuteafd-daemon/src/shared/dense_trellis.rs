@@ -224,19 +224,28 @@ impl ProjectionLayout {
     fn with_workspace(input:usize,output:usize,rows:usize,w:cuteafd_ffi::dense_trellis::DenseTrellisWorkspace)->Result<Self> {
         let layout=ProjectionScratchLayout::new(input,output,rows)?;
         ensure!([("rotated",w.rotated),("table",w.pointer_table),("scales",w.block_scales),
-            ("accumulator",w.accumulator)].iter()
-            .all(|(name,bytes)|layout.extents.get(name)==Some(bytes))
-            && layout.extents["partial"]==w.partial,"K6 package/planner scratch mismatch");
+            ("partial",w.partial),("fused",w.fused),("accumulator",w.accumulator)].iter()
+            .all(|(name,bytes)|layout.extents.get(name)==Some(bytes)),
+            "K6 package/planner scratch mismatch");
         Ok(Self{extents:layout.extents,rows:layout.rows})
     }
     pub(crate) fn demand(&self,device:u8,name:&str)->Result<Demand> {
         Ok(Demand::new(device,Category::Workspace,name,self.bytes()? as u64,Basis::Exact))
     }
     pub(crate) fn allocate_packed<'a>(&self, device: Device<'a>, tag: Tag) -> Result<ProjectionScratch<'a>> {
-        let storage = ProjectionScratchLayout { extents: self.extents.clone(), rows: self.rows }.packed()?;
-        let backing = Allocation::new(device, storage.bytes, tag)?;
-        let buffers = self.extents.iter().zip(storage.regions).map(|((&name, &bytes), region)| {
-            Ok((name, crate::shared::prefix::view(backing.buffer, region.start, bytes)?))
+        let layout = ProjectionScratchLayout { extents: self.extents.clone(), rows: self.rows };
+        let storage = layout.storage()?;
+        let packed = layout.packed()?;
+        let backing = Allocation::new(device, packed.bytes, tag)?;
+        let owner_regions: BTreeMap<&'static str, _> = storage.owners.keys().copied().zip(packed.regions).collect();
+        let buffers = self.extents.iter().map(|(&name, &bytes)| {
+            let (owner, offset) = if let Some(&offset) = storage.route_offsets.get(name) {
+                ("route arena", offset)
+            } else {
+                (name, 0)
+            };
+            let region = &owner_regions[owner];
+            Ok((name, crate::shared::prefix::view(backing.buffer, region.start + offset, bytes)?))
         }).collect::<Result<BTreeMap<_, _>>>()?;
         if let Some(&table_bytes)=self.extents.get("table") {
             let pointer=if table_bytes>=GROUPS*8 {GroupedWorkspace::pointer_table(buffers["rotated"])?}
@@ -295,6 +304,7 @@ impl ProjectionScratch<'_> {
         let get=|name|self.buffers[name];
         DenseTrellisBuffers {input,payload:weights.payload.buffer,suh:weights.suh.buffer,svh:weights.svh.buffer,
             rotated:get("rotated"),pointer_table:get("table"),scales:get("scales"),partial:get("partial"),
+            fused:self.buffers.get("fused").copied().unwrap_or_else(||get("partial")),
             accumulator:get("accumulator")}
     }
 }
@@ -378,17 +388,21 @@ mod retained_tests {
             let scratch = projection.allocate_packed(device, Tag::workspace("step5/test-projection"))?;
             assert_eq!(fixture.events()?.matches('D').count() - before, 1);
             assert_eq!(scratch._owners.len(), 1);
-            let storage = layout.packed()?;
+            let storage = layout.storage()?;
+            let packed = layout.packed()?;
             let backing = scratch._owners["projection arena"].buffer;
             assert_eq!(backing.bytes, layout.packed_bytes()?);
-            for ((&name, &bytes), region) in layout.extents.iter().zip(&storage.regions) {
+            let owner_regions: BTreeMap<&'static str, _> = storage.owners.keys().copied().zip(&packed.regions).collect();
+            for (&name, &bytes) in &layout.extents {
+                let (owner, offset) = storage.route_offsets.get(name).map_or((name, 0), |&o| ("route arena", o));
+                let region = owner_regions[owner];
                 let view = scratch.buffers[name];
-                assert_eq!(view.ptr as usize - backing.ptr as usize, region.start);
+                assert_eq!(view.ptr as usize - backing.ptr as usize, region.start + offset);
                 assert_eq!(view.bytes, bytes);
                 assert_eq!(view.ptr as usize % 256, 0);
                 assert!(region.end <= backing.bytes);
             }
-            assert!(storage.regions.windows(2).all(|r| r[0].end <= r[1].start));
+            assert!(packed.regions.windows(2).all(|r| r[0].end <= r[1].start));
             let expected = if layout.extents["table"] >= GROUPS * 8 {
                 GroupedWorkspace::pointer_table(scratch.buffers["rotated"])?
             } else { (scratch.buffers["rotated"].ptr as u64).to_le_bytes().to_vec() };
@@ -399,7 +413,7 @@ mod retained_tests {
                 Lifetime::TARGET, Category::Workspace, "projection");
             scratch.allocation_receipts(&mut inventory, "core")?;
             assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(), 1);
-            assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), 5);
+            assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(), layout.extents.len());
             // Families that have not opted in still retain the original five owners.
             assert_eq!(projection.allocate(device, Tag::workspace("step5/test-projection"))?._owners.len(), 5);
         }
@@ -509,9 +523,16 @@ impl<'a> Projection<'a> {
     }
     pub(crate) fn local(&self,rows:usize,input:Buffer,weights:&CoreWeights<'_>,scratch:&ProjectionScratch<'_>,
         output:Buffer,stream:*mut c_void)->Result<()> {
-        ensure!(self.program.policy().side!=2,"K-split output requires F32 peer reduction before egress");
-        let core=self.core(rows,input,weights,scratch,stream)?;
-        self.program.output(rows,core,weights.svh.buffer,output,stream)?;Ok(())
+        ensure!(rows>0 && rows<=scratch.rows,"K6 scratch live-row ceiling");
+        let policy=self.program.policy();
+        let side=match weights.side {cuteafd_loader::formats::dense_trellis::TrellisSide::Output=>1,
+            cuteafd_loader::formats::dense_trellis::TrellisSide::Input=>2};
+        ensure!(policy.side!=2,"K-split output requires F32 peer reduction before egress");
+        ensure!(weights.shape==[policy.output,policy.input] && side==policy.side
+            && codebook(weights)==policy.codebook && weights.bits==policy.bits,
+            "trellis projection and resident weight geometry/width/codebook differ");
+        let b=scratch.buffers(input,weights);
+        self.program.local(rows,b,output,stream)?;Ok(())
     }
     pub(crate) fn reduced_f32(&self,add:&cuteafd_ffi::F32Add<'_>,rows:usize,rank0:Buffer,rank1:Buffer,reduced:Buffer,
         weights:&CoreWeights<'_>,output:Buffer,stream:*mut c_void)->Result<()> {
@@ -619,6 +640,118 @@ mod upload_tests {
             }
             assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_none()).count(),1);
             assert_eq!(inventory.receipts.iter().filter(|r| r.allocation.view.is_some()).count(),3);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_k8_routes_decode_rows_to_single_launch_and_prefill_to_three() -> Result<()> {
+        use cuteafd_ffi::{dense_trellis::fused_scratch_bytes, native_library_lifetime_fixture::Fixture};
+        use cuteafd_loader::formats::{dense_trellis::TrellisSide, exl3_storage::Exl3Codebook};
+        use serde_json::json;
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        fixture.strict_device_free(&library, true)?;
+        let (k, n, cap) = (128usize, 256usize, 129usize);
+        let mk_entries = |side: usize, out_dtype: &str, with_fused: bool| -> (serde_json::Value, Vec<serde_json::Value>, Vec<u8>) {
+            let fused_odt = if side == 2 { "raw_f32" } else { out_dtype };
+            let fused_ptrs: Vec<&str> = if side == 2 {
+                vec!["x", "payload", "suh", "scratch", "output"]
+            } else {
+                vec!["x", "payload", "suh", "svh", "scratch", "output"]
+            };
+            let mut entries = vec![
+                json!({"name":"dense_trellis_k6_in","capacity_rows":4096,
+                    "pointers":[{"name":"input"},{"name":"suh"},{"name":"rotated"},{"name":"input_block_scales"}],
+                    "scalars":[{"type":"int32"},{"type":"int32"}],"scratch_bytes_at_capacity":{},
+                    "geometry":{"features":k,"input_dtype":"bf16","output_dtype":"bf16","max_rows":4096}}),
+                json!({"name":"dense_trellis_k6_core","capacity_rows":4096,
+                    "pointers":[{"name":"rotated_inputs"},{"name":"payload"},{"name":"input_block_scales"},{"name":"partial"},{"name":"output"}],
+                    "scalars":[{"type":"int32"},{"type":"int32"},{"type":"int32"}],
+                    "scratch_bytes_at_capacity":{"partial":4096 * k.div_ceil(1024) * n * 4},
+                    "geometry":{"abi_version":1,"input_features":k,"output_features":n,"bits":8,"codebook":"mul1",
+                        "sharded_side":side,"rotation_count":1,"max_rows":4096,"split_k_blocks":8,
+                        "splits":k.div_ceil(1024),"input_dtype":"bf16","ctas_per_sm":4}}),
+                json!({"name":"dense_trellis_k6_out","capacity_rows":4096,
+                    "pointers":[{"name":"input"},{"name":"svh"},{"name":"output"}],
+                    "scalars":[{"type":"int32"},{"type":"int32"}],"scratch_bytes_at_capacity":{},
+                    "geometry":{"features":n,"output_dtype":out_dtype,"max_rows":4096}}),
+            ];
+            let mut tags = vec![b'I', b'C', b'O'];
+            let mut policy = json!({"shape":"fixture","input_features":k,"output_features":n,"sharded_side":side,
+                "bits":8,"codebook":"mul1","native_input":"in","native_program":"core","output_program":"out"});
+            if with_fused {
+                policy["fused_program"] = json!("fused");
+                entries.push(json!({"name":"dense_trellis_k6_fused","capacity_rows":cap,
+                    "pointers":fused_ptrs.iter().map(|p| json!({"name":p})).collect::<Vec<_>>(),
+                    "scalars":[{"type":"int32"},{"type":"int32"}],
+                    "scratch_bytes_at_capacity":{"scratch":fused_scratch_bytes(cap, k, n).unwrap()},
+                    "geometry":{"abi_version":1,"fused_transform":true,"input_features":k,"output_features":n,
+                        "bits":8,"codebook":"mul1","sharded_side":side,"max_rows":cap,"split_k_blocks":8,
+                        "splits":k.div_ceil(1024),"input_dtype":"bf16","output_dtype":fused_odt,"ctas_per_sm":4,
+                        "exact_row_cap":cap,"decode_route_thresholds":[]}}));
+                tags.push(b'F');
+            }
+            let manifest = json!({"families":{"dense_trellis_k6":{"abi_version":1,"row_policies":[policy]}},"programs":entries});
+            (manifest, entries, tags)
+        };
+        let device = Device { library: &library, id: 0 };
+        let live = 160usize;
+        let input = Allocation::new(device, live * k * 2, crate::shared::memory::TEST)?;
+        device.run(|| library.copy_h2d(input.buffer, &7u32.to_ne_bytes()))?;
+        let out_bf16 = Allocation::new(device, live * n * 2, crate::shared::memory::TEST)?;
+        let out_f32 = Allocation::new(device, live * n * 4, crate::shared::memory::TEST)?;
+        for (side, out_dtype, with_fused) in [(1, "bf16", true), (1, "f32", true), (2, "bf16", true), (1, "f32", false)] {
+            let (manifest, entries, tags) = mk_entries(side, out_dtype, with_fused);
+            fixture.register_programs(&library, &entries)?;
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("PROGRAMS.json");
+            std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
+            let programs = library.programs()?.with_manifest(&path)?;
+            let dtype = if out_dtype == "f32" { TrellisDType::F32 } else { TrellisDType::Bf16 };
+            let projection = Projection::load_geometry_bits(&programs, k, n, side, 8, "mul1", live, dtype)?;
+            assert_eq!(projection.program.has_fused(), with_fused);
+            let mut scratch = ProjectionLayout::new(&projection.program, live)?.allocate_packed(device, crate::shared::memory::TEST)?;
+            device.run(|| library.copy_h2d(scratch.buffers["accumulator"], &7u32.to_ne_bytes()))?;
+            let table_word = (scratch.buffers["rotated"].ptr as usize as u32).max(1);
+            for (idx, &tag) in tags.iter().enumerate() {
+                let ready = if tag == b'C' { table_word } else { 7 };
+                fixture.register_reply(&library, idx as u32, ready, tag)?;
+            }
+            for buf in scratch.buffers.values_mut() { buf.flags = 0; }
+            let mut weights = CoreWeights {
+                payload: Allocation::new(device, k * n, crate::shared::memory::TEST)?,
+                suh: Allocation::new(device, k * 2, crate::shared::memory::TEST)?,
+                svh: Allocation::new(device, n * 2, crate::shared::memory::TEST)?,
+                shape: [n, k],
+                side: if side == 2 { TrellisSide::Input } else { TrellisSide::Output },
+                bits: 8,
+                codebook: Exl3Codebook::Mul1,
+            };
+            let saved_flags = (weights.payload.buffer.flags, weights.suh.buffer.flags, weights.svh.buffer.flags);
+            weights.payload.buffer.flags = 0;
+            weights.suh.buffer.flags = 0;
+            weights.svh.buffer.flags = 0;
+            let clear = |b: Buffer| Buffer { flags: 0, ..b };
+            for (rows, expect) in [
+                (1usize, if !with_fused { "ICO" } else { "F" }),
+                (64, if !with_fused { "ICO" } else { "F" }),
+                (129, if !with_fused { "ICO" } else { "F" }),
+                (130, if side == 2 { "IC" } else { "ICO" }),
+            ] {
+                let before = fixture.events()?.len();
+                if side == 2 {
+                    projection.core_into(rows, clear(input.buffer), &weights, &scratch, clear(out_f32.buffer), std::ptr::null_mut())?;
+                } else {
+                    let dst = if dtype == TrellisDType::F32 { out_f32.buffer } else { out_bf16.buffer };
+                    projection.local(rows, clear(input.buffer), &weights, &scratch, clear(dst), std::ptr::null_mut())?;
+                }
+                let got: String = fixture.events()?[before..].chars().filter(|c| matches!(c, 'I'|'C'|'O'|'F')).collect();
+                assert_eq!(got, expect, "side={side} out={out_dtype} fused={with_fused} rows={rows}");
+            }
+            (weights.payload.buffer.flags, weights.suh.buffer.flags, weights.svh.buffer.flags) = saved_flags;
         }
         Ok(())
     }

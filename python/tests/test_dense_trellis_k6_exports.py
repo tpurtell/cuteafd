@@ -38,13 +38,14 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
     module = load_exporter(monkeypatch)
     fake = ModuleType("b12x.integration.cuteafd.trellis_linear")
     fake.compile_trellis_linear_aot = lambda **params: params
+    fake.compile_trellis_linear_fused_aot = lambda **params: params
     monkeypatch.setitem(sys.modules, fake.__name__, fake)
     transforms = ModuleType("b12x.integration.cuteafd.trellis_transform")
     transforms.compile_trellis_input_aot = lambda **params: params
     transforms.compile_trellis_output_aot = lambda **params: params
     monkeypatch.setitem(sys.modules, transforms.__name__, transforms)
     programs = module["programs"]()
-    assert len(programs) == 78
+    assert len(programs) == 78 + 2 * len(module["KIMI_SHAPES"])
     assert len({name for name, *_ in programs}) == len(programs)
     grouped = [item for item in programs if item[2].get("groups")]
     assert {name for name, *_ in grouped} == {
@@ -58,7 +59,17 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
             assert params["rotation_count"] == 4 and params["sharded_side"] == 1 and params["bits"] in (6, 8)
         elif op == "trellis_output":
             assert params["output_dtype"] == "bf16"
-    programs = [item for item in programs if not item[2].get("groups")]
+    fused = [item for item in programs if item[1] == "trellis_linear_fused"]
+    assert len(fused) == 2 * len(module["KIMI_SHAPES"])
+    for name, op, params, compile_program in fused:
+        assert name.endswith("_k8_fused") and params["bits"] == 8 and params["max_rows"] == 129
+        assert params["input_dtype"] == "bf16"
+        assert compile_program() == params
+        if params["sharded_side"] == 2:
+            assert params["output_dtype"] == "raw_f32"
+        else:
+            assert params["output_dtype"] == ("f32" if params["output_features"] == 163840 else "bf16")
+    programs = [item for item in programs if not item[2].get("groups") and item[1] != "trellis_linear_fused"]
     core = [item for item in programs if item[1] == "trellis_linear"]
     assert len(core) == 4 * len(module["KIMI_SHAPES"])
     for _, op, params, compile_program in core:
@@ -86,10 +97,14 @@ def test_only_shared_native_compiler_and_both_codebooks(monkeypatch):
             assert name == f"trellis_output_n{params['features']}_{dtype}"
     for _, op, params, compile_program in programs:
         assert compile_program() == params
-    names = {name for name, *_ in programs} | {name for name, *_ in grouped}
+    names = {name for name, *_ in programs} | {name for name, *_ in grouped} | {name for name, *_ in fused}
     for policy in module["row_policies"]():
         for field in ("native_program", "native_input", "output_program"):
             assert policy[field] in names
+        if policy.get("bits") == 8:
+            assert policy["fused_program"] in names
+        else:
+            assert "fused_program" not in policy
         if "grouped" in policy:
             assert policy["shape"] == "kda_qkvg_tp2"
             assert policy["grouped"]["native_program"] == f"trellis_kda_qkvg_tp2_{policy['codebook']}{'_k8' if policy.get('bits') == 8 else ''}_g4"
@@ -112,6 +127,7 @@ def test_k8_is_shipped_and_names_do_not_collide(monkeypatch):
     module = load_exporter(monkeypatch)
     fake = ModuleType("b12x.integration.cuteafd.trellis_linear")
     fake.compile_trellis_linear_aot = lambda **params: params
+    fake.compile_trellis_linear_fused_aot = lambda **params: params
     monkeypatch.setitem(sys.modules, fake.__name__, fake)
     transforms = ModuleType("b12x.integration.cuteafd.trellis_transform")
     transforms.compile_trellis_input_aot = lambda **params: params
@@ -121,6 +137,23 @@ def test_k8_is_shipped_and_names_do_not_collide(monkeypatch):
     assert {params["bits"] for _, op, params, _ in shipping if op == "trellis_linear"} == {4, 6, 8}
     assert all(params["bits"] == 6 for name, op, params, _ in shipping
                if op == "trellis_linear" and name.startswith("trellis_ml4_"))
+    # Every full program name must fit in cuteafd_dsv4_program_info_t.name[64] (<= 63 bytes + NUL).
+    assert all(len(f"dense_trellis_k6_{name}") < 64 for name, *_ in shipping), [
+        f"dense_trellis_k6_{name}" for name, *_ in shipping if len(f"dense_trellis_k6_{name}") >= 64
+    ]
+    # Hy4 LM head (6144x120832, F32) stays on the unfused 3-program path.
+    fused_by_name = {name: params for name, op, params, _ in shipping if op == "trellis_linear_fused"}
+    assert "trellis_hy4_lm_head_mul1_k8_fused" not in fused_by_name
+    hy4_policies = module["row_policies"](("hy4",))
+    hy4_head_k8 = next(p for p in hy4_policies if p["shape"] == "hy4_lm_head" and p.get("bits") == 8)
+    assert "fused_program" not in hy4_head_k8
+    # Inkling target side=1 body shapes ship both BF16 (drafter) and F32 (target) fused K8 programs.
+    inkling_policies = module["row_policies"](("inkling2",))
+    inkling_rel_k8 = next(p for p in inkling_policies if p["shape"] == "inkling_rel" and p.get("bits") == 8 and p["codebook"] == "mcg")
+    assert inkling_rel_k8["fused_program"] in fused_by_name
+    assert fused_by_name[inkling_rel_k8["fused_program"]]["output_dtype"] == "bf16"
+    assert inkling_rel_k8["fused_f32_program"] in fused_by_name
+    assert fused_by_name[inkling_rel_k8["fused_f32_program"]]["output_dtype"] == "f32"
     shapes = module["shapes_for"](("kimik3",))
     screen = module["programs_for_shapes"](shapes)
     assert len({name for name, *_ in screen}) == len(screen)
@@ -154,6 +187,7 @@ def test_bf16_diagnostic_specialization_preserves_stems_and_default(monkeypatch)
     module = load_exporter(monkeypatch)
     fake = ModuleType("b12x.integration.cuteafd.trellis_linear")
     fake.compile_trellis_linear_aot = lambda **params: params
+    fake.compile_trellis_linear_fused_aot = lambda **params: params
     monkeypatch.setitem(sys.modules, fake.__name__, fake)
     transforms = ModuleType("b12x.integration.cuteafd.trellis_transform")
     transforms.compile_trellis_input_aot = lambda **params: params
@@ -197,7 +231,7 @@ def test_glm_architecture_geometries_and_unique_policy_lookup(monkeypatch):
 def test_adding_glm_preserves_every_kimi_compile_input_and_order(monkeypatch):
     module = load_exporter(monkeypatch)
     for name, methods in (
-        ("b12x.integration.cuteafd.trellis_linear", ("compile_trellis_linear_aot",)),
+        ("b12x.integration.cuteafd.trellis_linear", ("compile_trellis_linear_aot", "compile_trellis_linear_fused_aot")),
         ("b12x.integration.cuteafd.trellis_transform", ("compile_trellis_input_aot", "compile_trellis_output_aot")),
     ):
         fake = ModuleType(name)
@@ -271,7 +305,7 @@ def test_glm_static_table_matches_installed_published_checkpoint_headers(monkeyp
 def test_muse_geometries_dtypes_and_existing_family_order(monkeypatch):
     module = load_exporter(monkeypatch)
     for name, methods in (
-        ("b12x.integration.cuteafd.trellis_linear", ("compile_trellis_linear_aot",)),
+        ("b12x.integration.cuteafd.trellis_linear", ("compile_trellis_linear_aot", "compile_trellis_linear_fused_aot")),
         ("b12x.integration.cuteafd.trellis_transform", ("compile_trellis_input_aot", "compile_trellis_output_aot")),
     ):
         fake = ModuleType(name)

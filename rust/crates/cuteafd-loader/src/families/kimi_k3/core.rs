@@ -753,7 +753,7 @@ mod scratch_admission_tests {
     use super::*;
     #[test]
     fn production_merged_scratch_includes_grouped_owners_once() -> Result<()> {
-        for (rows,expected) in [(2048,612_368_864),(4096,931_135_968)] {
+        for (rows,expected) in [(2048,612_368_864 + 64 * 7168 * 2),(4096,931_135_968 + 64 * 7168 * 2)] {
             let mut layout=ProjectionScratchLayout::grouped(7168,6144,rows,4)?;
             // Hook-local owners use the unit ceiling, not the in-flight wave span.
             assert_eq!(layout.extents["rotated"],rows*57_344);
@@ -768,7 +768,7 @@ mod scratch_admission_tests {
             head.rows=rows;
             layout.merge(&head)?;
             assert_eq!(layout.bytes()?,expected);
-            assert_eq!(layout.bytes()? - body,204_832_768);
+            assert_eq!(layout.bytes()? - body,204_832_768 + 64 * 7168 * 2);
             assert_eq!(layout.extents["partial"],293_601_280);
         }
         Ok(())
@@ -828,8 +828,9 @@ mod scratch_admission_tests {
         for rows in [1,8,16,63,64,129,130,4096] {
             let layout=ProjectionScratchLayout::new(7168,6144,rows)?;
             assert_eq!(layout.extents["partial"],rows.min(129)*7*6144*4);
-            assert_eq!(layout.extents.len(),5);
-            assert_eq!(layout.storage()?.owners["route arena"],layout.extents["partial"]);
+            assert_eq!(layout.extents["fused"],rows.min(129)*(7*6144*4 + 7168*2));
+            assert_eq!(layout.extents.len(),6);
+            assert_eq!(layout.storage()?.owners["route arena"],layout.extents["fused"]);
             assert_eq!(exchange_recv_bytes(rows)?,rows*7168*2);
         }
         assert!(ProjectionScratchLayout::new(7168,6144,0).is_err());
@@ -840,7 +841,7 @@ mod scratch_admission_tests {
         assert_eq!(grouped.extents["accumulator"],4*4096*6144*4);
         let mut merged=ProjectionScratchLayout::new(7168,6144,4096)?;
         merged.merge(&grouped)?;
-        assert_eq!(merged,grouped);
+        assert_eq!(merged.storage()?.owners,grouped.storage()?.owners);
         assert!(ProjectionScratchLayout::grouped(7168,6144,8,2).is_err());
         Ok(())
     }

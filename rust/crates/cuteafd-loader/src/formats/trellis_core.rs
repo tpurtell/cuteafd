@@ -133,9 +133,13 @@ impl ProjectionScratchLayout {
             "dense trellis scratch geometry");
         let product = |values: &[usize]| values.iter().try_fold(1usize, |a, b| a.checked_mul(*b))
             .context("dense trellis scratch overflow");
+        let partial_rows = rows.min(129);
+        let partial = product(&[partial_rows, k.div_ceil(1024), n, 4])?;
+        let fused = partial.checked_add(product(&[partial_rows, k, 2])?)
+            .context("dense trellis fused scratch overflow")?;
         let extents = BTreeMap::from([
             ("rotated", product(&[rows, k, 2])?), ("table", 8), ("scales", k / 128 * 2),
-            ("partial", product(&[rows.min(129), k.div_ceil(1024), n, 4])?),
+            ("partial", partial), ("fused", fused),
             ("accumulator", product(&[rows, n, 4])?),
         ]);
         let layout = Self { extents, rows };
@@ -175,14 +179,20 @@ impl ProjectionScratchLayout {
             return Ok(ProjectionStorageLayout { owners, route_offsets: BTreeMap::new() });
         }
         let partial = owners.remove("partial").context("dense trellis native partial absent")?;
-        let route_offsets = BTreeMap::from([("partial", 0)]);
-        owners.insert("route arena", partial);
+        let fused = owners.remove("fused");
+        let arena = fused.map_or(partial, |bytes| partial.max(bytes));
+        let mut route_offsets = BTreeMap::from([("partial", 0)]);
+        if fused.is_some() {
+            route_offsets.insert("fused", 0);
+        }
+        owners.insert("route arena", arena);
         Ok(ProjectionStorageLayout { owners, route_offsets })
     }
-    /// One backing with cudaMalloc-equivalent alignment for each live operand.
-    /// Separate from `storage`: families opt into packing without changing routes.
+    /// One backing with cudaMalloc-equivalent alignment for each live owner.
+    /// Mutually exclusive route buffers (partial/fused) share the route arena.
     pub fn packed(&self) -> Result<crate::serving_capacity::PackedWeightRegions> {
-        crate::serving_capacity::PackedWeightRegions::new(self.extents.values().copied())
+        let storage = self.storage()?;
+        crate::serving_capacity::PackedWeightRegions::new(storage.owners.values().copied())
     }
     pub fn packed_bytes(&self) -> Result<usize> { Ok(self.packed()?.bytes) }
 
@@ -414,12 +424,15 @@ mod tests {
         layout.merge(&ProjectionScratchLayout::new(2048, 16384, 4096)?)?;
         assert_eq!(layout.extents["rotated"], 4096 * 6144 * 2);
         assert_eq!(layout.extents["partial"], 129 * 2 * 16384 * 4);
+        assert_eq!(layout.extents["fused"], 129 * 2 * 16384 * 4 + 129 * 2048 * 2);
         assert_eq!(layout.extents["accumulator"], 4096 * 16384 * 4);
         let storage = layout.storage()?;
         assert!(!storage.owners.contains_key("partial"));
+        assert!(!storage.owners.contains_key("fused"));
         assert_eq!(storage.route_offsets["partial"], 0);
-        assert_eq!(storage.owners["route arena"], layout.extents["partial"]);
-        assert_eq!(layout.bytes()?, layout.extents.values().sum::<usize>());
+        assert_eq!(storage.route_offsets["fused"], 0);
+        assert_eq!(storage.owners["route arena"], layout.extents["fused"]);
+        assert_eq!(layout.bytes()?, storage.owners.values().sum::<usize>());
         assert!(layout.merge(&ProjectionScratchLayout::new(6144, 640, 64)?).is_err());
         Ok(())
     }

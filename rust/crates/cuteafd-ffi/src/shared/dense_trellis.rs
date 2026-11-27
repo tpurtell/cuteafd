@@ -11,6 +11,22 @@ pub const TRELLIS_PARTIAL_ROWS: usize = 129;
 const INPUT: &[&str] = &["input", "suh", "rotated", "input_block_scales"];
 const CORE: &[&str] = &["rotated_inputs", "payload", "input_block_scales", "partial", "output"];
 const OUTPUT: &[&str] = &["input", "svh", "output"];
+const FUSED_EGRESS: &[&str] = &["x", "payload", "suh", "svh", "scratch", "output"];
+const FUSED_RAW: &[&str] = &["x", "payload", "suh", "scratch", "output"];
+
+/// Single contiguous scratch extent for the fused K8 decode kernel:
+/// `partial[rows, splits, N]` F32 followed by `rotated[rows, K]` BF16.
+pub fn fused_scratch_bytes(rows: usize, input: usize, output: usize) -> Result<usize> {
+    let splits = input.div_ceil(1024);
+    let partial = rows.checked_mul(splits)
+        .and_then(|v| v.checked_mul(output))
+        .and_then(|v| v.checked_mul(4))
+        .ok_or(DenseTrellisError::Invalid("fused scratch overflow"))?;
+    let rotated = rows.checked_mul(input)
+        .and_then(|v| v.checked_mul(2))
+        .ok_or(DenseTrellisError::Invalid("fused scratch overflow"))?;
+    partial.checked_add(rotated).ok_or(DenseTrellisError::Invalid("fused scratch overflow"))
+}
 
 #[derive(Debug, Error)]
 pub enum DenseTrellisError {
@@ -45,7 +61,7 @@ pub struct DenseTrellisGeometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseTrellisWorkspace {
     pub rotated: usize, pub pointer_table: usize, pub block_scales: usize,
-    pub partial: usize, pub accumulator: usize,
+    pub partial: usize, pub fused: usize, pub accumulator: usize,
 }
 impl DenseTrellisGeometry {
     pub fn workspace(self) -> Result<DenseTrellisWorkspace> {
@@ -67,14 +83,24 @@ impl DenseTrellisGeometry {
         product(&[k, n, bits])?;
         product(&[rows, k, self.input_dtype.bytes()])?;
         product(&[rows, n, self.output_dtype.bytes()])?;
+        let partial_rows = rows.min(TRELLIS_PARTIAL_ROWS);
+        let partial = product(&[partial_rows, splits, n, 4])?;
+        let fused = fused_scratch_bytes(partial_rows, k, n)?;
         Ok(DenseTrellisWorkspace { rotated: product(&[rows, k, 2])?, pointer_table: 8,
-            block_scales: k / 128 * 2, partial: product(&[rows.min(TRELLIS_PARTIAL_ROWS), splits, n, 4])?,
+            block_scales: k / 128 * 2, partial, fused,
             accumulator: product(&[rows, n, 4])? })
     }
 }
 
+struct FusedProgram<'a> {
+    program: Program<'a>,
+    max_rows: usize,
+    raw_f32: bool,
+}
+
 pub struct DenseTrellis<'a> {
     input: Program<'a>, core: Program<'a>, output: Program<'a>,
+    fused: Option<FusedProgram<'a>>,
     geometry: DenseTrellisGeometry, workspace: DenseTrellisWorkspace, ctas: i32,
 }
 
@@ -83,16 +109,100 @@ impl<'a> DenseTrellis<'a> {
     /// Resolve all programs and query the runtime SM count before graph capture.
     pub fn load(programs: &'a Programs<'a>, names: [&str; 3], geometry: DenseTrellisGeometry,
         codebook: &str) -> Result<Self> {
+        Self::load_with_fused(programs, names, None, geometry, codebook)
+    }
+
+    /// Resolve the unfused 3-program chain and, when advertised for a K8 decode
+    /// geometry, the single fused K8 decode program.
+    pub fn load_with_fused(programs: &'a Programs<'a>, names: [&str; 3], fused_name: Option<&str>,
+        geometry: DenseTrellisGeometry, codebook: &str) -> Result<Self> {
         let workspace = geometry.workspace()?;
         validate_manifest([programs.spec(names[0])?, programs.spec(names[1])?, programs.spec(names[2])?],
             geometry, codebook, workspace)?;
+        let fused = match fused_name {
+            Some(name) => {
+                let spec = programs.spec(name)?;
+                let max_rows = validate_fused_manifest(spec, geometry, codebook)?;
+                let raw_f32 = geometry.side == 2;
+                let pointers = if raw_f32 { FUSED_RAW } else { FUSED_EGRESS };
+                Some(FusedProgram { program: programs.program(name, pointers)?, max_rows, raw_f32 })
+            }
+            None => None,
+        };
         let input = programs.program(names[0], INPUT)?;
         let core = programs.program(names[1], CORE)?;
         let output = programs.program(names[2], OUTPUT)?;
         let ctas = programs.library().sm_count()?.checked_mul(4)
             .and_then(|v| i32::try_from(v).ok()).filter(|&v| v > 0)
             .ok_or(DenseTrellisError::Invalid("runtime SM count"))?;
-        Ok(Self { input, core, output, geometry, workspace, ctas })
+        Ok(Self { input, core, output, fused, geometry, workspace, ctas })
+    }
+
+    pub fn has_fused(&self) -> bool { self.fused.is_some() }
+
+    fn can_fused_local(&self, rows: usize) -> bool {
+        self.fused.as_ref().is_some_and(|f| !f.raw_f32 && rows <= f.max_rows)
+    }
+
+    fn can_fused_raw(&self, rows: usize) -> bool {
+        self.fused.as_ref().is_some_and(|f| f.raw_f32 && rows <= f.max_rows)
+    }
+
+    /// Fused H128-ingress + K8 decode + split-K/H128-egress (side=1, single launch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_local(&self, rows: usize, input: Buffer, payload: Buffer, suh: Buffer, svh: Buffer,
+        scratch: Buffer, output: Buffer, stream: *mut c_void) -> Result<()> {
+        self.rows(rows)?;
+        let fused = self.fused.as_ref().filter(|f| !f.raw_f32 && rows <= f.max_rows)
+            .ok_or(DenseTrellisError::Invalid("fused local program unavailable for live rows"))?;
+        let g = self.geometry;
+        buffers("fused", &[
+            ("x", input, rows * g.input * g.input_dtype.bytes()),
+            ("payload", payload, g.input * g.output * g.bits / 8),
+            ("suh", suh, g.input * 2),
+            ("svh", svh, g.output * 2),
+            ("scratch", scratch, fused_scratch_bytes(rows, g.input, g.output)?),
+            ("output", output, rows * g.output * g.output_dtype.bytes()),
+        ])?;
+        disjoint(&[input, payload, suh, svh, scratch, output])?;
+        // SAFETY: shape/device/extents and nonaliasing checked; caller keeps
+        // every allocation and stream live through completion and graph replay.
+        unsafe {
+            fused.program.launch(
+                &[input.ptr, payload.ptr, suh.ptr, svh.ptr, scratch.ptr, output.ptr],
+                &[Scalar::I32(rows as i32), Scalar::I32(self.ctas)],
+                stream,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Fused H128-ingress + K8 decode + raw F32 split-K sum (TP2 K-split side=2).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_raw(&self, rows: usize, input: Buffer, payload: Buffer, suh: Buffer,
+        scratch: Buffer, output: Buffer, stream: *mut c_void) -> Result<()> {
+        self.rows(rows)?;
+        let fused = self.fused.as_ref().filter(|f| f.raw_f32 && rows <= f.max_rows)
+            .ok_or(DenseTrellisError::Invalid("fused raw_f32 program unavailable for live rows"))?;
+        let g = self.geometry;
+        buffers("fused_raw", &[
+            ("x", input, rows * g.input * g.input_dtype.bytes()),
+            ("payload", payload, g.input * g.output * g.bits / 8),
+            ("suh", suh, g.input * 2),
+            ("scratch", scratch, fused_scratch_bytes(rows, g.input, g.output)?),
+            ("output", output, rows * g.output * 4),
+        ])?;
+        disjoint(&[input, payload, suh, scratch, output])?;
+        // SAFETY: shape/device/extents and nonaliasing checked; caller keeps
+        // every allocation and stream live through completion and graph replay.
+        unsafe {
+            fused.program.launch(
+                &[input.ptr, payload.ptr, suh.ptr, scratch.ptr, output.ptr],
+                &[Scalar::I32(rows as i32), Scalar::I32(self.ctas)],
+                stream,
+            )?;
+        }
+        Ok(())
     }
 
     /// Charged at the caller's maximum live rows, not the package's prefill
@@ -190,52 +300,95 @@ fn validate_manifest(specs: [&ProgramSpec; 3], g: DenseTrellisGeometry, codebook
     Ok(())
 }
 
+fn validate_fused_manifest(spec: &ProgramSpec, g: DenseTrellisGeometry, codebook: &str) -> Result<usize> {
+    if g.bits != 8 || !matches!(codebook, "mcg" | "mul1") || g.input_dtype != TrellisDType::Bf16 {
+        return Err(DenseTrellisError::Invalid("fused K8 geometry/codebook"));
+    }
+    let compiled_rows = spec.capacity_rows as usize;
+    if !(1..=TRELLIS_PARTIAL_ROWS).contains(&compiled_rows) {
+        return Err(DenseTrellisError::Invalid("fused K8 capacity_rows"));
+    }
+    let expected_pointers = if g.side == 2 { FUSED_RAW } else { FUSED_EGRESS };
+    let expected_output = if g.side == 2 { "raw_f32" } else { g.output_dtype.name() };
+    let compiled_scratch = fused_scratch_bytes(compiled_rows, g.input, g.output)?;
+    let geom = &spec.geometry;
+    if spec.scalar_kinds.as_slice() != b"ii"
+        || spec.pointers.iter().map(String::as_str).ne(expected_pointers.iter().copied())
+        || geom["fused_transform"].as_bool() != Some(true)
+        || geom["input_dtype"].as_str() != Some("bf16")
+        || geom["output_dtype"].as_str() != Some(expected_output)
+        || geom["codebook"].as_str() != Some(codebook)
+        || geom["max_rows"].as_u64() != Some(compiled_rows as u64)
+        || geom["exact_row_cap"].as_u64() != Some(compiled_rows as u64)
+        || [("abi_version", 1), ("input_features", g.input), ("output_features", g.output),
+            ("bits", 8), ("sharded_side", g.side), ("split_k_blocks", 8),
+            ("splits", g.input.div_ceil(1024)), ("ctas_per_sm", 4)]
+            .iter().any(|&(key, value)| geom[key].as_u64() != Some(value as u64))
+        || spec.scratch.len() != 1
+        || spec.scratch.get("scratch").copied() != Some(compiled_scratch as u64)
+    {
+        return Err(DenseTrellisError::Invalid("fused K8 manifest geometry/dtype/scratch"));
+    }
+    Ok(compiled_rows)
+}
+
+fn parse_manifest_spec(entries: &[serde_json::Value], name: &str) -> Result<ProgramSpec> {
+    let mut matches = entries.iter().filter(|p| p["name"].as_str() == Some(name));
+    let entry = matches.next().ok_or(DenseTrellisError::Invalid("missing native program"))?;
+    if matches.next().is_some() { return Err(DenseTrellisError::Invalid("duplicate native program")); }
+    let pointers = entry["pointers"].as_array().ok_or(DenseTrellisError::Invalid("program pointers"))?
+        .iter().map(|p| p["name"].as_str().map(str::to_owned)
+            .ok_or(DenseTrellisError::Invalid("program pointer name"))).collect::<Result<Vec<_>>>()?;
+    let scalar_kinds = entry["scalars"].as_array().ok_or(DenseTrellisError::Invalid("program scalars"))?
+        .iter().map(|s| match s["type"].as_str() {
+            Some("int32") => Ok(b'i'), Some("int64") => Ok(b'l'), Some("float32") => Ok(b'f'),
+            _ => Err(DenseTrellisError::Invalid("program scalar type")),
+        }).collect::<Result<Vec<_>>>()?;
+    let scratch = entry["scratch_bytes_at_capacity"].as_object()
+        .ok_or(DenseTrellisError::Invalid("program scratch"))?.iter().map(|(name, n)|
+            n.as_u64().map(|n| (name.clone(), n)).ok_or(DenseTrellisError::Invalid("program scratch extent")))
+        .collect::<Result<_>>()?;
+    let capacity_rows = entry["capacity_rows"].as_u64().and_then(|n| u32::try_from(n).ok())
+        .ok_or(DenseTrellisError::Invalid("program capacity"))?;
+    Ok(ProgramSpec { name: name.to_owned(), pointers, scalar_kinds, scratch, capacity_rows,
+        geometry: entry["geometry"].clone() })
+}
+
 /// Validate the same native ABI for offline admission without loading CUDA.
 /// The runtime additionally verifies the compiled library's table at load.
 pub fn validate_package_geometry(manifest: &serde_json::Value, input: usize, output: usize,
-    side: usize, codebook: &str, rows: usize, output_dtype: TrellisDType) -> Result<[String; 3]> {
+    side: usize, codebook: &str, rows: usize, output_dtype: TrellisDType) -> Result<Vec<String>> {
     validate_package_geometry_bits(manifest, input, output, side, 6, codebook, rows, output_dtype)
 }
 
 /// As [`validate_package_geometry`] at an explicit trellis width (K4 MTP stages).
 pub fn validate_package_geometry_bits(manifest: &serde_json::Value, input: usize, output: usize,
-    side: usize, bits: usize, codebook: &str, rows: usize, output_dtype: TrellisDType) -> Result<[String; 3]> {
+    side: usize, bits: usize, codebook: &str, rows: usize, output_dtype: TrellisDType) -> Result<Vec<String>> {
     validate_package_geometry_bits_with_egress(manifest, input, output, side, bits, codebook, rows, output_dtype, None)
 }
 
 /// Validate an alternate egress for a shared compute geometry.
 pub fn validate_package_geometry_bits_with_egress(manifest: &serde_json::Value, input: usize, output: usize,
     side: usize, bits: usize, codebook: &str, rows: usize, output_dtype: TrellisDType,
-    egress: Option<&str>) -> Result<[String; 3]> {
+    egress: Option<&str>) -> Result<Vec<String>> {
     let policy = DenseTrellisPolicy::from_geometry_metadata(&manifest["families"]["dense_trellis_k6"],
         input, output, side, bits, codebook)?;
     policy.validate_rows(rows)?;
-    let names = [policy.native_input, policy.native, egress.map(str::to_owned).unwrap_or(policy.output_program)];
+    let mut names = vec![
+        policy.native_input.clone(),
+        policy.native.clone(),
+        egress.map(str::to_owned).unwrap_or_else(|| policy.output_program.clone()),
+    ];
     let entries = manifest["programs"].as_array().ok_or(DenseTrellisError::Invalid("program inventory"))?;
-    let specs = names.iter().map(|name| -> Result<ProgramSpec> {
-        let mut matches = entries.iter().filter(|p| p["name"].as_str() == Some(name));
-        let entry = matches.next().ok_or(DenseTrellisError::Invalid("missing native program"))?;
-        if matches.next().is_some() { return Err(DenseTrellisError::Invalid("duplicate native program")); }
-        let pointers = entry["pointers"].as_array().ok_or(DenseTrellisError::Invalid("program pointers"))?
-            .iter().map(|p| p["name"].as_str().map(str::to_owned)
-                .ok_or(DenseTrellisError::Invalid("program pointer name"))).collect::<Result<Vec<_>>>()?;
-        let scalar_kinds = entry["scalars"].as_array().ok_or(DenseTrellisError::Invalid("program scalars"))?
-            .iter().map(|s| match s["type"].as_str() {
-                Some("int32") => Ok(b'i'), Some("int64") => Ok(b'l'), Some("float32") => Ok(b'f'),
-                _ => Err(DenseTrellisError::Invalid("program scalar type")),
-            }).collect::<Result<Vec<_>>>()?;
-        let scratch = entry["scratch_bytes_at_capacity"].as_object()
-            .ok_or(DenseTrellisError::Invalid("program scratch"))?.iter().map(|(name, n)|
-                n.as_u64().map(|n| (name.clone(), n)).ok_or(DenseTrellisError::Invalid("program scratch extent")))
-            .collect::<Result<_>>()?;
-        let capacity_rows = entry["capacity_rows"].as_u64().and_then(|n| u32::try_from(n).ok())
-            .ok_or(DenseTrellisError::Invalid("program capacity"))?;
-        Ok(ProgramSpec { name: name.clone(), pointers, scalar_kinds, scratch, capacity_rows,
-            geometry: entry["geometry"].clone() })
-    }).collect::<Result<Vec<_>>>()?;
+    let specs = names.iter().map(|name| parse_manifest_spec(entries, name)).collect::<Result<Vec<_>>>()?;
     let geometry = DenseTrellisGeometry { input, output, bits, side, rows,
         input_dtype: TrellisDType::Bf16, output_dtype };
     validate_manifest([&specs[0], &specs[1], &specs[2]], geometry, codebook, geometry.workspace()?)?;
+    if let Some(fused_name) = policy.fused_program_for(output_dtype) {
+        let fused_spec = parse_manifest_spec(entries, fused_name)?;
+        validate_fused_manifest(&fused_spec, geometry, codebook)?;
+        names.push(fused_name.to_owned());
+    }
     Ok(names)
 }
 
@@ -309,11 +462,63 @@ mod tests {
         let g = geometry();
         let w = g.workspace().unwrap();
         assert_eq!(w, DenseTrellisWorkspace { rotated: 917504, pointer_table: 8,
-            block_scales: 112, partial: 11010048, accumulator: 1572864 });
+            block_scales: 112, partial: 11010048, fused: 11010048 + 917504, accumulator: 1572864 });
         let mut s = specs(g);
         validate_manifest([&s[0], &s[1], &s[2]], g, "mcg", w).unwrap();
         s[2].geometry["output_dtype"] = json!("bf16");
         assert!(validate_manifest([&s[0], &s[1], &s[2]], g, "mcg", w).is_err());
+    }
+    #[test]
+    fn fused_k8_manifest_and_policy_validation_cover_local_f32_and_raw_side2() {
+        for (side, out_dtype, expected_odt, expected_ptrs) in [
+            (1usize, TrellisDType::Bf16, "bf16", FUSED_EGRESS),
+            (1usize, TrellisDType::F32, "f32", FUSED_EGRESS),
+            (2usize, TrellisDType::Bf16, "raw_f32", FUSED_RAW),
+            (2usize, TrellisDType::F32, "raw_f32", FUSED_RAW),
+        ] {
+            let g = DenseTrellisGeometry { input: 4096, output: 512, bits: 8, side, rows: 64,
+                input_dtype: TrellisDType::Bf16, output_dtype: out_dtype };
+            let cap = TRELLIS_PARTIAL_ROWS;
+            let mut spec = ProgramSpec {
+                name: "dense_trellis_k6_trellis_fixture_mul1_k8_fused".into(),
+                pointers: expected_ptrs.iter().map(|s| s.to_string()).collect(),
+                scalar_kinds: b"ii".to_vec(),
+                scratch: HashMap::from([("scratch".into(), fused_scratch_bytes(cap, 4096, 512).unwrap() as u64)]),
+                capacity_rows: cap as u32,
+                geometry: json!({
+                    "abi_version": 1, "fused_transform": true,
+                    "input_features": 4096, "output_features": 512, "bits": 8,
+                    "codebook": "mul1", "sharded_side": side, "max_rows": cap,
+                    "split_k_blocks": 8, "splits": 4, "input_dtype": "bf16",
+                    "output_dtype": expected_odt, "ctas_per_sm": 4, "exact_row_cap": cap,
+                    "decode_route_thresholds": [],
+                }),
+            };
+            assert_eq!(validate_fused_manifest(&spec, g, "mul1").unwrap(), cap);
+            spec.scratch.insert("scratch".into(), 123);
+            assert!(validate_fused_manifest(&spec, g, "mul1").is_err());
+            spec.scratch.insert("scratch".into(), fused_scratch_bytes(cap, 4096, 512).unwrap() as u64);
+            spec.geometry["output_dtype"] = json!("f16");
+            assert!(validate_fused_manifest(&spec, g, "mul1").is_err());
+        }
+        // Policy selects fused_f32_program for F32 on side=1 and fused_program for BF16 or side=2.
+        let entry = json!({
+            "shape": "inkling_rel", "input_features": 4608, "output_features": 768,
+            "sharded_side": 1, "bits": 8, "codebook": "mcg",
+            "native_program": "trellis_inkling_rel_mcg_k8",
+            "native_input": "trellis_input_k4608_bf16",
+            "output_program": "trellis_output_n768_bf16",
+            "fused_program": "trellis_inkling_rel_mcg_k8_fused",
+            "fused_f32_program": "trellis_inkling_rel_mcg_k8_fused_f32",
+        });
+        let family = json!({"abi_version": 1, "row_policies": [entry]});
+        let p = DenseTrellisPolicy::from_geometry_metadata(&family, 4608, 768, 1, 8, "mcg").unwrap();
+        assert_eq!(p.fused_program_for(TrellisDType::Bf16), Some("dense_trellis_k6_trellis_inkling_rel_mcg_k8_fused"));
+        assert_eq!(p.fused_program_for(TrellisDType::F32), Some("dense_trellis_k6_trellis_inkling_rel_mcg_k8_fused_f32"));
+        // Reject fused_program on K6.
+        let mut bad_k6 = entry.clone();
+        bad_k6["bits"] = json!(6);
+        assert!(DenseTrellisPolicy::parse(&bad_k6).is_err());
     }
     #[test]
     fn prefill_workspace_bounds_narrow_split_k_storage() {
@@ -407,6 +612,8 @@ pub struct DenseTrellisPolicy {
     /// Trellis width; the K6 tables predate the key and omit it.
     pub bits: usize,
     pub codebook: String, pub native: String, pub native_input: String, pub output_program: String,
+    pub fused_program: Option<String>,
+    pub fused_f32_program: Option<String>,
 }
 impl DenseTrellisPolicy {
     pub fn parse(value: &serde_json::Value) -> Result<Self> {
@@ -414,10 +621,17 @@ impl DenseTrellisPolicy {
             .ok_or(DenseTrellisError::Invalid("row-policy integer"));
         let text = |key: &str| value[key].as_str().filter(|v| !v.is_empty()).map(str::to_owned)
             .ok_or(DenseTrellisError::Invalid("row-policy string"));
+        let opt_text = |key: &str| match value.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(v) => v.as_str().filter(|s| !s.is_empty()).map(|s| Some(s.to_owned()))
+                .ok_or(DenseTrellisError::Invalid("row-policy string")),
+        };
         let policy=Self { shape:text("shape")?, input:integer("input_features")?, output:integer("output_features")?,
             side:integer("sharded_side")?,
             bits:if value.get("bits").is_none() { 6 } else { integer("bits")? }, codebook:text("codebook")?, native:text("native_program")?,
-            native_input:text("native_input")?, output_program:text("output_program")? };
+            native_input:text("native_input")?, output_program:text("output_program")?,
+            fused_program: opt_text("fused_program")?,
+            fused_f32_program: opt_text("fused_f32_program")? };
         policy.validate()?;
         Ok(policy)
     }
@@ -425,10 +639,23 @@ impl DenseTrellisPolicy {
         if self.input==0 || self.input%128!=0 || self.output==0 || self.output%128!=0 || !matches!(self.side,1|2)
             || !matches!(self.bits,4 | 6 | 8)
             || !matches!(self.codebook.as_str(),"mcg"|"mul1")
-            || [&self.shape,&self.native,&self.native_input,&self.output_program].iter().any(|name|name.is_empty()) {
+            || [&self.shape,&self.native,&self.native_input,&self.output_program].iter().any(|name|name.is_empty())
+            || self.fused_program.as_deref().is_some_and(|n| n.is_empty() || self.bits != 8)
+            || self.fused_f32_program.as_deref().is_some_and(|n| n.is_empty() || self.bits != 8 || self.side != 1) {
             return Err(DenseTrellisError::Invalid("row-policy geometry/route/scratch"));
         }
         Ok(())
+    }
+    /// Fused K8 decode program matching this policy's sharded side and requested output dtype.
+    pub fn fused_program_for(&self, output_dtype: TrellisDType) -> Option<&str> {
+        if self.bits != 8 { return None; }
+        if self.side == 2 { return self.fused_program.as_deref(); }
+        if output_dtype == TrellisDType::F32 {
+            if let Some(name) = self.fused_f32_program.as_deref() {
+                return Some(name);
+            }
+        }
+        self.fused_program.as_deref()
     }
     pub fn from_package(programs: &Programs<'_>, shape: &str, codebook: &str) -> Result<Self> {
         Self::from_metadata(programs.family_metadata("dense_trellis_k6")?,shape,codebook)
@@ -468,6 +695,9 @@ impl DenseTrellisPolicy {
         for name in [&mut policy.native,&mut policy.native_input,&mut policy.output_program] {
             *name=format!("dense_trellis_k6_{name}");
         }
+        for name in [&mut policy.fused_program,&mut policy.fused_f32_program].into_iter().flatten() {
+            *name=format!("dense_trellis_k6_{name}");
+        }
         Ok(policy)
     }
     pub fn validate_rows(&self, rows: usize) -> Result<()> {
@@ -485,23 +715,29 @@ pub struct DenseTrellisDispatch<'a> {
 pub struct DenseTrellisBuffers {
     pub input: Buffer, pub payload: Buffer, pub suh: Buffer, pub svh: Buffer,
     pub rotated: Buffer, pub pointer_table: Buffer, pub scales: Buffer, pub partial: Buffer,
-    pub accumulator: Buffer,
+    pub fused: Buffer, pub accumulator: Buffer,
 }
 impl<'a> DenseTrellisDispatch<'a> {
     pub fn load(programs: &'a Programs<'a>, policy: DenseTrellisPolicy, rows: usize,
         output_dtype: TrellisDType) -> Result<Self> {
         policy.validate()?;
         policy.validate_rows(rows)?;
-        let native=DenseTrellis::load(programs,[&policy.native_input,&policy.native,&policy.output_program],
+        let fused_name = policy.fused_program_for(output_dtype);
+        let native=DenseTrellis::load_with_fused(programs,[&policy.native_input,&policy.native,&policy.output_program],
+            fused_name,
             DenseTrellisGeometry{input:policy.input,output:policy.output,bits:policy.bits,side:policy.side,rows,
                 input_dtype:TrellisDType::Bf16,output_dtype},&policy.codebook)?;
         Ok(Self {native,policy})
     }
     pub fn workspace(&self) -> DenseTrellisWorkspace { self.native.workspace() }
     pub fn policy(&self) -> &DenseTrellisPolicy { &self.policy }
+    pub fn has_fused(&self) -> bool { self.native.has_fused() }
     /// Emit only F32 core values. K-split callers must reduce these values before egress.
     pub fn core(&self, rows: usize, b: DenseTrellisBuffers, stream: *mut c_void) -> Result<()> {
         self.native.rows(rows)?;
+        if self.native.can_fused_raw(rows) {
+            return self.native.fused_raw(rows, b.input, b.payload, b.suh, b.fused, b.accumulator, stream);
+        }
         let p=&self.policy;
         buffers("dispatch core", &[("input", b.input,rows*p.input*2),("suh", b.suh,p.input*2),
             ("rotated", b.rotated,rows*p.input*2),("pointer_table", b.pointer_table,8),
@@ -511,6 +747,17 @@ impl<'a> DenseTrellisDispatch<'a> {
         disjoint(&[b.input,b.suh,b.rotated,b.pointer_table,b.payload,b.scales,b.partial,b.accumulator])?;
         self.native.input(rows,b.input,b.suh,b.rotated,b.scales,stream)?;
         self.native.core(rows,b.pointer_table,b.payload,b.scales,b.partial,b.accumulator,stream)
+    }
+    /// Full local projection (side=1): single fused K8 decode launch when available
+    /// and within fused row capacity, otherwise the 3-program chain.
+    pub fn local(&self, rows: usize, b: DenseTrellisBuffers, output: Buffer, stream: *mut c_void) -> Result<()> {
+        self.native.rows(rows)?;
+        if self.policy.side == 2 { return Err(DenseTrellisError::Invalid("K-split local egress")); }
+        if self.native.can_fused_local(rows) {
+            return self.native.fused_local(rows, b.input, b.payload, b.suh, b.svh, b.fused, output, stream);
+        }
+        self.core(rows, b, stream)?;
+        self.output(rows, b.accumulator, b.svh, output, stream)
     }
     pub fn output(&self, rows: usize, accumulator: Buffer, svh: Buffer, output: Buffer,
         stream: *mut c_void) -> Result<()> { self.native.output(rows,accumulator,svh,output,stream) }

@@ -621,7 +621,7 @@ impl CoreCharges {
 }
 
 fn policy_programs(weight: &crate::formats::trellis_core::CoreWeightLayout,
-    manifest: &serde_json::Value) -> Result<[String; 3]> {
+    manifest: &serde_json::Value) -> Result<Vec<String>> {
     use cuteafd_ffi::dense_trellis::{validate_package_geometry_bits, TrellisDType};
     let book = match weight.codebook { crate::formats::exl3_storage::Exl3Codebook::Mcg => "mcg",
         crate::formats::exl3_storage::Exl3Codebook::Mul1 => "mul1" };

@@ -176,7 +176,7 @@ mod tests {
             projection.merge(&ProjectionScratchLayout::new(k, n, unit)?)?;
         }
         let projection = projection.packed_bytes()? as u64;
-        assert_eq!(projection, 257_851_656);
+        assert_eq!(projection, 257_851_656 + 129 * 13824 * 2);
         let layer = native::layer_workspace(unit, span, true, 64)?;
         let head_planes = native::head_planes(span)?;
         let head = native::plane_bytes(&head_planes)?;

@@ -454,8 +454,8 @@ pub(super) mod tests {
             codebook: Exl3Codebook::Mcg };
         let norm = WeightOperand { name: "model.norm.weight".into(), sources: vec![], dtype: DType::F32,
             shape: vec![H], slice: WeightSlice::Replicated, allocation_bytes: (H * 4) as u64 };
-        for (unit, logits, private_scratch) in [(64, 64, 165511432), (256, 64, 400128264),
-            (256, 256, 400128264)] {
+        for (unit, logits, private_scratch) in [(64, 64, 165_511_432u64 + 64 * H as u64 * 2),
+            (256, 64, 400_128_264u64 + 129 * H as u64 * 2), (256, 256, 400_128_264u64 + 129 * H as u64 * 2)] {
             let planes = HeadPlan::plane_bytes(logits)?;
             let weights = vec![norm.clone()];
             let bytes = HeadPlan::owner_bytes(&weights, Some(&native), &planes, unit)?;

@@ -732,7 +732,7 @@ mod tests {
         assert!(arena.padding_bytes() > 0);
         for logits in [16, 64] {
             let admitted = rank_admission(&checkpoint, &ownership, 0, 64, 64, logits)?;
-            assert_eq!(admitted.immutable, 165511432);
+            assert_eq!(admitted.immutable, 165_511_432 + 64 * 4096 * 2);
             assert_eq!(admitted.resident_weights.0, weights);
             assert_eq!(admitted.weight_arenas[0].0, arena);
             let reusable = rank_attention_bytes(&cfg, &ownership, 0, 64)?

@@ -350,7 +350,8 @@ mod runtime_layout_tests {
                             let w=DenseTrellisGeometry{input:*k,output:*n,bits:*bits,side:*side,rows:live,
                                 input_dtype:TrellisDType::Bf16,output_dtype:TrellisDType::Bf16}.workspace()?;
                             let extents=BTreeMap::from([("rotated",w.rotated),("table",w.pointer_table),
-                                ("scales",w.block_scales),("partial",w.partial),("accumulator",w.accumulator)]);
+                                ("scales",w.block_scales),("partial",w.partial),("fused",w.fused),
+                                ("accumulator",w.accumulator)]);
                             let layout=ProjectionLayout{extents,rows:unit};
                             if let Some(runtime)=&mut runtime {runtime.merge(&layout)?;}else{runtime=Some(layout);}
                         }
