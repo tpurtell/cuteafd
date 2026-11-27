@@ -440,7 +440,8 @@ pub(crate) mod tests {
             runtime.native.encode_batch_observed(&rgb, &[grid], &lut, &mut output, &mut |stage, data, rows, width| {
                 let extent = rows * width * 2;
                 let mut bytes = vec![0u8; extent];
-                native.copy_d2h(&mut bytes, cuteafd_ffi::CuteafdDeviceBuffer { ptr: data as *mut _, bytes: extent,
+                // encode_batch_observed drains the vision stream before invoking the observer callback.
+                native.copy_d2h_quiescent(&mut bytes, cuteafd_ffi::CuteafdDeviceBuffer { ptr: data as *mut _, bytes: extent,
                     device_id: 0, flags: 0 }).map_err(|e| cuteafd_ffi::vision::VisionError::Runtime(e.to_string()))?;
                 let name = match stage { 0 => "0".to_string(), -1 => "pos".into(), s if s == depth + 1 => format!("{}", depth + 1),
                     s if s == depth + 2 => "out".into(), s => s.to_string() };
@@ -495,7 +496,8 @@ pub(crate) mod tests {
                 &mut |stage, data, rows, width| {
                     let extent = rows * width * 2;
                     let mut bytes = vec![0u8; extent];
-                    native.copy_d2h(&mut bytes, cuteafd_ffi::CuteafdDeviceBuffer { ptr: data as *mut _, bytes: extent,
+                    // encode_batch_teacher_observed delegates to encode_batch_observed, which drains before each callback.
+                    native.copy_d2h_quiescent(&mut bytes, cuteafd_ffi::CuteafdDeviceBuffer { ptr: data as *mut _, bytes: extent,
                         device_id: 0, flags: 0 }).map_err(|e| cuteafd_ffi::vision::VisionError::Runtime(e.to_string()))?;
                     let name = match stage { 0 => "0".to_string(), -1 => "pos".into(), s if s == depth + 1 => format!("{}", depth + 1),
                         s if s == depth + 2 => "out".into(), s => s.to_string() };

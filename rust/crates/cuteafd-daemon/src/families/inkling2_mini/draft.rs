@@ -716,8 +716,8 @@ mod gpu_tests {
             let lf_bytes = 64 * hidden * 2;
             let mut lf_serial = vec![0u8; lf_bytes];
             let mut lf_batched = vec![0u8; lf_bytes];
-            library.copy_d2h(&mut lf_serial, Buffer { bytes: lf_bytes, ..serial.lead.buffer("cache.last_features")? })?;
-            library.copy_d2h(&mut lf_batched, Buffer { bytes: lf_bytes, ..batched.lead.buffer("cache.last_features")? })?;
+            serial.lead.stream.copy_d2h(&mut lf_serial, Buffer { bytes: lf_bytes, ..serial.lead.buffer("cache.last_features")? })?;
+            batched.lead.stream.copy_d2h(&mut lf_batched, Buffer { bytes: lf_bytes, ..batched.lead.buffer("cache.last_features")? })?;
             ensure!(lf_serial == lf_batched, "kv={kv:?}: cache.last_features differs between serial and batched update");
 
             // Check bitwise equality of proposals, confidences, hidden states, and logits: serial vs batched.
@@ -740,8 +740,8 @@ mod gpu_tests {
             let logits_bytes = 64 * config.valid_vocab * 4;
             let mut logits_serial = vec![0u8; logits_bytes];
             let mut logits_batched = vec![0u8; logits_bytes];
-            library.copy_d2h(&mut logits_serial, Buffer { bytes: logits_bytes, ..serial.lead.buffer("head.logits")? })?;
-            library.copy_d2h(&mut logits_batched, Buffer { bytes: logits_bytes, ..batched.lead.buffer("head.logits")? })?;
+            serial.lead.stream.copy_d2h(&mut logits_serial, Buffer { bytes: logits_bytes, ..serial.lead.buffer("head.logits")? })?;
+            batched.lead.stream.copy_d2h(&mut logits_batched, Buffer { bytes: logits_bytes, ..batched.lead.buffer("head.logits")? })?;
             ensure!(logits_serial == logits_batched, "kv={kv:?}: head.logits differ between serial and batched context update");
             for slot in 0..64 {
                 ensure!(
@@ -766,8 +766,8 @@ mod gpu_tests {
                 let d = batched.draft(&seq, embed, embed_norm, |n, a| batched.lead.recurrent_tokens(n, a, unembed))?;
                 let mut h = vec![0u8; block_bytes];
                 let mut l = vec![0u8; row_logit_bytes];
-                library.copy_d2h(&mut h, Buffer { bytes: block_bytes, ..batched.lead.buffer("step.normalized")? })?;
-                library.copy_d2h(&mut l, Buffer { bytes: row_logit_bytes, ..batched.lead.buffer("head.logits")? })?;
+                batched.lead.stream.copy_d2h(&mut h, Buffer { bytes: block_bytes, ..batched.lead.buffer("step.normalized")? })?;
+                batched.lead.stream.copy_d2h(&mut l, Buffer { bytes: row_logit_bytes, ..batched.lead.buffer("head.logits")? })?;
                 let conf: Vec<u32> = d[0].confidence.iter().map(|v| v.to_bits()).collect();
                 solo_ref.insert(slot, (d[0].tokens.clone(), conf, h, l));
             }
@@ -792,8 +792,8 @@ mod gpu_tests {
                 let all_l_bytes = comp.len() * row_logit_bytes;
                 let mut all_h = vec![0u8; all_h_bytes];
                 let mut all_l = vec![0u8; all_l_bytes];
-                library.copy_d2h(&mut all_h, Buffer { bytes: all_h_bytes, ..batched.lead.buffer("step.normalized")? })?;
-                library.copy_d2h(&mut all_l, Buffer { bytes: all_l_bytes, ..batched.lead.buffer("head.logits")? })?;
+                batched.lead.stream.copy_d2h(&mut all_h, Buffer { bytes: all_h_bytes, ..batched.lead.buffer("step.normalized")? })?;
+                batched.lead.stream.copy_d2h(&mut all_l, Buffer { bytes: all_l_bytes, ..batched.lead.buffer("head.logits")? })?;
                 for (pos, &slot) in comp.iter().enumerate() {
                     let Some((exp_toks, exp_conf, exp_h, exp_l)) = solo_ref.get(&slot) else {
                         continue;

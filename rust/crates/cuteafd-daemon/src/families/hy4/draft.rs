@@ -1151,15 +1151,8 @@ impl<'a> Drafter<'a> {
             let len_bytes = self.batch_capacity * layers * 4;
             let mut own_raw = vec![0u8; len_bytes];
             let mut peer_raw = vec![0u8; len_bytes];
-            r0.device.run(|| {
-                s0.drain()?;
-                r0.device
-                    .library
-                    .copy_d2h(&mut own_raw, slice_buf(r0.b("tap_len_own"), 0, len_bytes)?)?;
-                r0.device
-                    .library
-                    .copy_d2h(&mut peer_raw, slice_buf(r0.b("tap_len_peer"), 0, len_bytes)?)
-            })?;
+            s0.copy_d2h(&mut own_raw, slice_buf(r0.b("tap_len_own"), 0, len_bytes)?)?;
+            s0.copy_d2h(&mut peer_raw, slice_buf(r0.b("tap_len_peer"), 0, len_bytes)?)?;
             let mut pairs = Vec::with_capacity(count * layers);
             for member in members {
                 for stage in 0..layers {
@@ -1511,11 +1504,7 @@ impl<'a> Drafter<'a> {
         }
         let mut ids = vec![0u8; depth * count * 4];
         let bytes = ids.len();
-        r0.device.run(|| {
-            r0.device
-                .library
-                .copy_d2h(&mut ids, slice_buf(r0.b("greedy_ids"), 0, bytes)?)
-        })?;
+        s0.copy_d2h(&mut ids, slice_buf(r0.b("greedy_ids"), 0, bytes)?)?;
         members
             .iter()
             .enumerate()
