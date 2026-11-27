@@ -319,6 +319,7 @@ fn reconcile_runtime_inventory(
             || id.starts_with("hy4.target.")
             || id.starts_with("hy4.peer.")
             || id.starts_with("hy4.context_exchange.")
+            || id.starts_with("hy4.context_staging.")
             || id.starts_with("expert-usage.gpu")
             || (id.starts_with("hy4/dfly2/") && !id.starts_with("hy4/dfly2/gpu"))
     };

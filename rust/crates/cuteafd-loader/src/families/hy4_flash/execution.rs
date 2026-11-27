@@ -49,23 +49,10 @@ pub fn hy4_dsa_partial_scratch_bytes(rows: usize) -> usize {
     part + lse
 }
 
-/// Maximum rows of the installed ContextSplit partial programs (internally
-/// tiled at 64 rows). The index score workspace is independently sub-tiled.
-pub const CONTEXT_PREFILL_ROWS: usize = 4096;
-
-/// Physical exchange and scratch width, shared by admission and execution.
-pub fn context_exchange_rows(max_rows: usize, decode_rows: usize) -> usize {
-    max_rows.min(CONTEXT_PREFILL_ROWS).max(decode_rows)
-}
-
-/// Decode and verify must remain a single exchange (and one graph shape).
-pub fn context_chunk_rows(max_rows: usize, decode_rows: usize, decode: bool) -> usize {
-    if decode { decode_rows } else { context_exchange_rows(max_rows, decode_rows) }
-}
-
 /// Shared `ContextExchange` buffer specification for Hy4-flash 2-GPU ContextSplit DSA layers
 /// (16 heads/GPU, 576-dim absorbed query, 512 scored group candidates, 2 alternating slots).
-pub fn hy4_context_buffers(cfg: &Hy4FlashConfig, max_rows: usize, decode_rows: usize) -> crate::placement::ContextBuffers {
+/// Prefill uses gathered staging (`ContextStagingLayout`), so ContextExchange stays decode-sized.
+pub fn hy4_context_buffers(cfg: &Hy4FlashConfig, decode_rows: usize) -> crate::placement::ContextBuffers {
     let half_heads = (cfg.sparse_heads / 2) as u64;
     let kv_a_dim = (cfg.kv_lora_rank + cfg.qk_rope_dim) as u64;
     let group_topk = cfg.indexer_group_topk as u64;
@@ -76,9 +63,71 @@ pub fn hy4_context_buffers(cfg: &Hy4FlashConfig, max_rows: usize, decode_rows: u
         partial_row_bytes: half_heads * (cfg.kv_lora_rank as u64 * 2 + 4),
         candidate_row_bytes: group_topk * 8,
         compiled_extent: 0,
-        decode_rows: context_exchange_rows(max_rows, decode_rows) as u64,
+        decode_rows: decode_rows as u64,
         lanes: 1,
         workspace_bytes: 0,
+    }
+}
+
+/// Maximum parity-owned pages one prefill member of up to `max_rows` can commit.
+pub fn context_commit_limit(max_rows: usize) -> usize {
+    (max_rows.div_ceil(PAGE_ROWS) + 2).div_ceil(2) + 1
+}
+
+/// Number of commit planes in Hy4-flash gathered ContextSplit prefill: KV records + group index records.
+pub const CONTEXT_COMMIT_PLANES: usize = 2;
+
+/// One packed staging arena per coordinator GPU for 2-GPU ContextSplit gathered prefill.
+/// Charged once per GPU by admission and aliased by runtime views (`kv`, `index`, `identity_pt`,
+/// plus DFly2 empty-half sentinels).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextStagingLayout {
+    pub arena: WeightArenaLayout,
+    pub pages: usize,
+    pub kv_page_bytes: usize,
+    pub index_page_bytes: usize,
+}
+
+impl ContextStagingLayout {
+    pub fn arena_id(gpu: usize) -> String {
+        format!("hy4_flash.context_staging.{gpu}")
+    }
+
+    pub fn new(
+        cfg: &Hy4FlashConfig,
+        kv_format: Hy4KvCache,
+        gpu: usize,
+        max_seq_pages: usize,
+    ) -> Result<Self> {
+        let pages = max_seq_pages.max(16);
+        let kv_page_bytes = PAGE_ROWS
+            .checked_mul(kv_format.record_bytes())
+            .context("Hy4-flash ContextStaging KV page overflow")?;
+        let index_page_bytes = (PAGE_ROWS / cfg.indexer_compress_ratio)
+            .checked_mul(INDEX_GROUP_RECORD_BYTES)
+            .context("Hy4-flash ContextStaging index page overflow")?;
+        let kv_bytes = pages
+            .checked_mul(kv_page_bytes)
+            .context("Hy4-flash ContextStaging KV overflow")?;
+        let index_bytes = pages
+            .checked_mul(index_page_bytes)
+            .context("Hy4-flash ContextStaging index overflow")?;
+        let arena = WeightArenaLayout::new(
+            Self::arena_id(gpu),
+            vec![
+                ("kv".into(), kv_bytes.max(256)),
+                ("index".into(), index_bytes.max(256)),
+                ("identity_pt".into(), (pages * 4).max(256)),
+                ("empty_cand_scores".into(), (cfg.indexer_group_topk * 4).max(256)),
+                ("empty_cand_indices".into(), (cfg.indexer_group_topk * 4).max(256)),
+            ],
+        )?;
+        Ok(Self {
+            arena,
+            pages,
+            kv_page_bytes,
+            index_page_bytes,
+        })
     }
 }
 
@@ -199,12 +248,25 @@ pub const WAVE_METADATA: [&str; 12] = [
     "swa_seqlens", "idx_limits", "idx_group_pos", "idx_group_slots",
 ];
 
+/// Wave metadata planes when `context_split == true` (adds gathered prefill tables).
+pub const WAVE_METADATA_CONTEXT: [&str; 14] = [
+    "positions_i64", "positions_i32", "dsa_slots_i64", "swa_slots_i64",
+    "dsa_page_table", "swa_page_table", "dsa_cu_seqlens", "swa_cu_seqlens",
+    "swa_seqlens", "idx_limits", "idx_group_pos", "idx_group_slots",
+    "ctx_gather_tables", "ctx_commit_tables",
+];
+
 pub fn wave_metadata_layout(slot: usize, wave: &WeightArenaLayout) -> Result<WeightArenaLayout> {
     wave_metadata_layout_for_rank(0, slot, wave)
 }
 
 pub fn wave_metadata_layout_for_rank(rank: usize, slot: usize, wave: &WeightArenaLayout) -> Result<WeightArenaLayout> {
-    let views = WAVE_METADATA.iter().map(|&name| {
+    let names: &[&str] = if wave.view("ctx_gather_tables").is_some() {
+        &WAVE_METADATA_CONTEXT
+    } else {
+        &WAVE_METADATA
+    };
+    let views = names.iter().map(|&name| {
         let bytes = wave.view(name).with_context(|| format!("Hy4 metadata view {name} missing"))?.bytes();
         Ok((name.to_owned(), bytes))
     }).collect::<Result<Vec<_>>>()?;
@@ -238,8 +300,22 @@ impl WaveScratchLayout {
         max_seq_pages: usize,
         max_sequences: usize,
     ) -> Result<Self> {
+        Self::new_with_context(cfg, gpu, slot, tp, max_rows, max_seq_pages, max_sequences, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_context(
+        cfg: &Hy4FlashConfig,
+        gpu: usize,
+        slot: usize,
+        tp: usize,
+        max_rows: usize,
+        max_seq_pages: usize,
+        max_sequences: usize,
+        context_split: bool,
+    ) -> Result<Self> {
         ensure!(
-            matches!(tp, 1 | 2) && max_rows > 0 && max_sequences > 0,
+            matches!(tp, 1 | 2) && max_rows > 0 && max_sequences > 0 && (!context_split || tp == 2),
             "invalid Hy4-flash WaveScratchLayout shape"
         );
         let h = cfg.hidden;
@@ -269,6 +345,13 @@ impl WaveScratchLayout {
             ("idx_group_pos".into(), (max_batch_groups * 24).max(256)),
             ("idx_group_slots".into(), (max_batch_groups * 8).max(256)),
         ];
+        if context_split {
+            let gather_per_member = 2 * pages.div_ceil(2) * 4;
+            let commit_limit = context_commit_limit(max_rows);
+            let commit_per_member = CONTEXT_COMMIT_PLANES * 3 * commit_limit * 8;
+            views.push(("ctx_gather_tables".into(), (max_sequences * gather_per_member).max(256)));
+            views.push(("ctx_commit_tables".into(), (max_sequences * commit_per_member).max(256)));
+        }
         for i in 0..cfg.engram_layers.len() {
             views.push((format!("engram_raw.{i}"), (max_rows * engram_concat * 2).max(256)));
             views.push((format!("engram_masked.{i}"), (max_rows.div_ceil(16) * 16).max(256)));
@@ -374,7 +457,7 @@ impl SharedScratchLayout {
             (
                 "attn_scratch".into(),
                 mla_split_scratch_bytes(decode_rows, tp)
-                    .max(if context_split { hy4_dsa_partial_scratch_bytes(context_exchange_rows(max_rows, decode_rows)) } else { 0 })
+                    .max(if context_split { hy4_dsa_partial_scratch_bytes(decode_rows) } else { 0 })
                     .max(ATTN_SCRATCH_BYTES)
                     .max(256),
             ),
@@ -406,14 +489,13 @@ impl SharedScratchLayout {
         ];
         if context_split {
             let half_dsa_heads = cfg.sparse_heads / 2;
-            let ctx_rows = context_exchange_rows(max_rows, decode_rows);
-            views.push(("ctx_cand_scores".into(), (ctx_rows * cfg.indexer_group_topk * 4).max(256)));
-            views.push(("ctx_cand_indices".into(), (ctx_rows * cfg.indexer_group_topk * 4).max(256)));
-            views.push(("ctx_partial_own".into(), (ctx_rows * half_dsa_heads * cfg.kv_lora_rank * 2).max(256)));
-            views.push(("ctx_lse_own".into(), (ctx_rows * half_dsa_heads * 4).max(256)));
-            views.push(("ctx_partial_peer".into(), (ctx_rows * half_dsa_heads * cfg.kv_lora_rank * 2).max(256)));
-            views.push(("ctx_lse_peer".into(), (ctx_rows * half_dsa_heads * 4).max(256)));
-            views.push(("ctx_draft_slots".into(), (ctx_rows * cfg.indexer_candidate_topk * 4).max(256)));
+            views.push(("ctx_cand_scores".into(), (decode_rows * cfg.indexer_group_topk * 4).max(256)));
+            views.push(("ctx_cand_indices".into(), (decode_rows * cfg.indexer_group_topk * 4).max(256)));
+            views.push(("ctx_partial_own".into(), (decode_rows * half_dsa_heads * cfg.kv_lora_rank * 2).max(256)));
+            views.push(("ctx_lse_own".into(), (decode_rows * half_dsa_heads * 4).max(256)));
+            views.push(("ctx_partial_peer".into(), (decode_rows * half_dsa_heads * cfg.kv_lora_rank * 2).max(256)));
+            views.push(("ctx_lse_peer".into(), (decode_rows * half_dsa_heads * 4).max(256)));
+            views.push(("ctx_draft_slots".into(), (decode_rows * cfg.indexer_candidate_topk * 4).max(256)));
         }
         if rank == 0 {
             views.push(("head_logits_f32".into(), (HEAD_TILE_ROWS * cfg.vocab_size * 4).max(256)));
@@ -659,24 +741,19 @@ mod tests {
             );
         }
 
-        let ex = hy4_context_buffers(&cfg, 2752, decode_rows);
-        let ex_bytes = crate::placement::ContextExchangeLayout::new(&ex)
-            .bytes()
-            .expect("ContextExchangeLayout bytes");
-        let old = crate::placement::ContextExchangeLayout::new(&hy4_context_buffers(&cfg, decode_rows, decode_rows));
-        let wide = crate::placement::ContextExchangeLayout::new(&ex);
-        assert_eq!(wide.rows, 2752);
-        assert_eq!(ex_bytes - old.bytes().unwrap(), (2752 - 64) * 123_008);
-        for live in [1, 64, 128, 2752, 4096, 8192] {
-            assert_eq!(context_chunk_rows(live.max(decode_rows), decode_rows, true), decode_rows);
-            assert_eq!(context_chunk_rows(live.max(decode_rows), decode_rows, false), live.clamp(decode_rows, 4096));
-        }
+        let ex = hy4_context_buffers(&cfg, decode_rows);
+        let layout = crate::placement::ContextExchangeLayout::new(&ex);
+        assert_eq!(layout.rows, decode_rows as u64);
+        assert!(layout.bytes().is_some());
         let narrow = SharedScratchLayout::new_with_context(&cfg, 0, 2, 64, 64, 64, 16, cfg.vocab_size / 2, true)?;
         let wide_scratch = SharedScratchLayout::new_with_context(&cfg, 0, 2, 2752, 64, 64, 16, cfg.vocab_size / 2, true)?;
         let ctx_bytes = |layout: &SharedScratchLayout| layout.arena.views().iter()
             .filter(|(name, _)| name.starts_with("ctx_")).map(|(_, v)| v.bytes()).sum::<usize>();
-        assert_eq!(ctx_bytes(&wide_scratch) - ctx_bytes(&narrow), (2752 - 64) * 45_184);
+        assert_eq!(ctx_bytes(&wide_scratch), ctx_bytes(&narrow));
         assert_eq!(wide_scratch.arena.view("attn_scratch").unwrap().bytes(), narrow.arena.view("attn_scratch").unwrap().bytes());
+        let staging = ContextStagingLayout::new(&cfg, Hy4KvCache::Fp8, 0, 4096)?;
+        assert_eq!(staging.arena.view("kv").unwrap().bytes(), 4096 * 64 * 656);
+        assert_eq!(staging.arena.view("index").unwrap().bytes(), 4096 * 16 * 132);
         Ok(())
     }
 }

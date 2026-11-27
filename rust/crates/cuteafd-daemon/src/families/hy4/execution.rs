@@ -33,7 +33,7 @@ use crate::shared::memory::receipts::Inventory;
 use crate::shared::memory::weight_arena::DeviceArena;
 use crate::shared::memory::{HostAllocation, Tag};
 use crate::shared::peer_split::{
-    context::{self, ContextExchange},
+    context::{self, commit_blocks, gathered_prefill_with, CommitPlane, ContextExchange, GatheredKernels},
     PeerExchange, RankDevice, DIRECT,
 };
 use crate::shared::prefill_pipeline::{run_prefill_units, FfnRoute, PrefillHooks, Unit, UnitSegment};
@@ -48,9 +48,11 @@ use cuteafd_ffi::peer_exchange::PeerPlane;
 use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, CuteafdDeviceBuffer, CuteafdHostBuffer, F32Add};
 use cuteafd_loader::families::hy4::execution::{
-    hy4_context_buffers, hy4_dsa_partial_scratch_bytes, hy4_peer_ffn_routed_offset,
-    hy4_peer_slot_sizes, mla_split_scratch_bytes, wave_metadata_layout_for_rank, IndexTopkScratch,
-    SharedScratchLayout, WaveScratchLayout, WAVE_METADATA,
+    context_commit_limit, hy4_context_buffers, hy4_dsa_partial_scratch_bytes,
+    hy4_peer_ffn_routed_offset, hy4_peer_slot_sizes, mla_split_scratch_bytes,
+    wave_metadata_layout_for_rank, ContextStagingLayout, IndexTopkScratch, SharedScratchLayout,
+    WaveScratchLayout, CONTEXT_COMMIT_PLANES, INDEX_PAGE_BYTES, WAVE_METADATA,
+    WAVE_METADATA_CONTEXT,
 };
 use cuteafd_loader::families::hy4::{Hy4Config, Hy4KvCache};
 use cuteafd_loader::families::hy4_common::PAGE_ROWS;
@@ -132,6 +134,8 @@ struct WaveScratch<'a> {
     idx_cache_lens: Allocation<'a>,
     idx_cand_slots: Allocation<'a>,
     idx_cand_lens: Allocation<'a>,
+    ctx_gather_tables: Option<Allocation<'a>>,
+    ctx_commit_tables: Option<Allocation<'a>>,
 }
 
 impl<'a> WaveScratch<'a> {
@@ -145,8 +149,18 @@ impl<'a> WaveScratch<'a> {
         max_rows: usize,
         max_seq_pages: usize,
         max_sequences: usize,
+        context_split: bool,
     ) -> Result<Self> {
-        let layout = WaveScratchLayout::new(cfg, rank, slot, tp, max_rows, max_seq_pages, max_sequences)?;
+        let layout = WaveScratchLayout::new_with_context(
+            cfg,
+            rank,
+            slot,
+            tp,
+            max_rows,
+            max_seq_pages,
+            max_sequences,
+            context_split,
+        )?;
         let arena = DeviceArena::new(
             device,
             layout.arena.clone(),
@@ -159,6 +173,11 @@ impl<'a> WaveScratch<'a> {
                 .with_context(|| format!("Hy4 wave scratch missing view {name}"))?
                 .bytes();
             arena.view(name, bytes)
+        };
+        let (ctx_gather_tables, ctx_commit_tables) = if context_split {
+            (Some(view("ctx_gather_tables")?), Some(view("ctx_commit_tables")?))
+        } else {
+            (None, None)
         };
         Ok(Self {
             positions_i64: view("positions_i64")?,
@@ -176,6 +195,8 @@ impl<'a> WaveScratch<'a> {
             idx_cache_lens: view("idx_cache_lens")?,
             idx_cand_slots: view("idx_cand_slots")?,
             idx_cand_lens: view("idx_cand_lens")?,
+            ctx_gather_tables,
+            ctx_commit_tables,
             _arena: arena,
         })
     }
@@ -200,6 +221,12 @@ impl<'a> WaveScratch<'a> {
             ("idx_cand_lens", &self.idx_cand_lens),
         ] {
             alloc.inventory(inventory, &format!("{prefix}.{name}"))?;
+        }
+        if let Some(alloc) = &self.ctx_gather_tables {
+            alloc.inventory(inventory, &format!("{prefix}.ctx_gather_tables"))?;
+        }
+        if let Some(alloc) = &self.ctx_commit_tables {
+            alloc.inventory(inventory, &format!("{prefix}.ctx_commit_tables"))?;
         }
         Ok(())
     }
@@ -232,16 +259,21 @@ impl<'a> MetadataUpload<'a> {
         &mut self,
         ranks: &[RankRuntime<'a>],
         slot: usize,
-        planes: [&[u8]; WAVE_METADATA.len()],
+        planes: [&[u8]; WAVE_METADATA_CONTEXT.len()],
     ) -> Result<()> {
         ensure!(!self.pending, "Hy4 wave metadata still in flight");
         ensure!(ranks.len() == self.completion.len(), "Hy4 metadata rank count changed");
-        let mut sources = [CuteafdHostBuffer::default(); WAVE_METADATA.len()];
-        let mut lengths = [0; WAVE_METADATA.len()];
+        let mut sources = [CuteafdHostBuffer::default(); WAVE_METADATA_CONTEXT.len()];
+        let mut lengths = [0; WAVE_METADATA_CONTEXT.len()];
         let source = self.backing.buffer;
         let bytes = self.backing.bytes_mut();
         let mut count = 0;
-        for (name, contents) in WAVE_METADATA.into_iter().zip(planes) {
+        let names: &[&str] = if self.layout.view("ctx_gather_tables").is_some() {
+            &WAVE_METADATA_CONTEXT
+        } else {
+            &WAVE_METADATA
+        };
+        for (&name, contents) in names.iter().zip(planes) {
             if contents.is_empty() {
                 continue;
             }
@@ -266,23 +298,27 @@ impl<'a> MetadataUpload<'a> {
         self.pending = true;
         for (r, event) in ranks.iter().zip(&mut self.completion) {
             let wave = &r.waves[slot];
-            let mut dst = [CuteafdDeviceBuffer::default(); WAVE_METADATA.len()];
+            let mut dst = [CuteafdDeviceBuffer::default(); WAVE_METADATA_CONTEXT.len()];
             let bufs = [
-                wave.positions_i64.buffer,
-                wave.positions_i32.buffer,
-                wave.dsa_slots_i64.buffer,
-                wave.dsa_page_table.buffer,
-                wave.dsa_cu_seqlens.buffer,
-                wave.idx_cache_lens.buffer,
-                wave.idx_seq_page_tables.buffer,
+                Some(wave.positions_i64.buffer),
+                Some(wave.positions_i32.buffer),
+                Some(wave.dsa_slots_i64.buffer),
+                Some(wave.dsa_page_table.buffer),
+                Some(wave.dsa_cu_seqlens.buffer),
+                Some(wave.idx_cache_lens.buffer),
+                Some(wave.idx_seq_page_tables.buffer),
+                wave.ctx_gather_tables.as_ref().map(|a| a.buffer),
+                wave.ctx_commit_tables.as_ref().map(|a| a.buffer),
             ];
-            for (target, buffer) in dst.iter_mut().zip(
-                bufs.into_iter()
-                    .zip(planes)
-                    .filter_map(|(buffer, plane)| (!plane.is_empty()).then_some(buffer)),
-            ) {
-                *target = buffer;
+            let mut dst_count = 0;
+            for (buf_opt, plane) in bufs.into_iter().take(names.len()).zip(planes) {
+                if plane.is_empty() {
+                    continue;
+                }
+                dst[dst_count] = buf_opt.context("Hy4 wave missing target metadata buffer")?;
+                dst_count += 1;
             }
+            ensure!(dst_count == count, "Hy4 metadata destination count mismatch");
             r.device.run(|| {
                 // SAFETY: pinned source is private to this slot and stays immutable until events complete.
                 unsafe {
@@ -323,6 +359,86 @@ struct ContextScratch<'a> {
     lse_own: Allocation<'a>,
     partial_peer: Allocation<'a>,
     lse_peer: Allocation<'a>,
+    draft_slots: Allocation<'a>,
+    draft_lens: Allocation<'a>,
+}
+
+/// Optional per-rank packed staging arena for 2-GPU ContextSplit gathered prefill.
+struct ContextStaging<'a> {
+    _arena: DeviceArena<'a, arena_class::ReadWrite>,
+    kv: Allocation<'a>,
+    index: Allocation<'a>,
+    identity_pt: Allocation<'a>,
+    empty_cand_scores: Allocation<'a>,
+    empty_cand_indices: Allocation<'a>,
+    pages: usize,
+}
+
+impl<'a> ContextStaging<'a> {
+    fn new(
+        device: Device<'a>,
+        cfg: &Hy4Config,
+        kv_format: Hy4KvCache,
+        rank: usize,
+        max_seq_pages: usize,
+    ) -> Result<Self> {
+        let layout = ContextStagingLayout::new(cfg, kv_format, rank, max_seq_pages)?;
+        let arena = DeviceArena::new(
+            device,
+            layout.arena.clone(),
+            ArenaTag::staging("hy4/context-staging"),
+        )?;
+        let view = |name: &str| -> Result<Allocation<'a>> {
+            let bytes = arena
+                .layout()
+                .view(name)
+                .with_context(|| format!("Hy4 context staging missing view {name}"))?
+                .bytes();
+            arena.view(name, bytes)
+        };
+        let kv = view("kv")?;
+        let index = view("index")?;
+        let identity_pt = view("identity_pt")?;
+        let empty_cand_scores = view("empty_cand_scores")?;
+        let empty_cand_indices = view("empty_cand_indices")?;
+        let id_bytes: Vec<u8> = (0..layout.pages as i32)
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        let neg_inf_bytes: Vec<u8> = (0..cfg.indexer_topk)
+            .flat_map(|_| f32::NEG_INFINITY.to_le_bytes())
+            .collect();
+        let neg_one_bytes: Vec<u8> = (0..cfg.indexer_topk)
+            .flat_map(|_| (-1i32).to_le_bytes())
+            .collect();
+        device.run(|| {
+            device.library.copy_h2d(slice_buf(identity_pt.buffer, 0, id_bytes.len())?, &id_bytes)?;
+            device.library.copy_h2d(slice_buf(empty_cand_scores.buffer, 0, neg_inf_bytes.len())?, &neg_inf_bytes)?;
+            device.library.copy_h2d(slice_buf(empty_cand_indices.buffer, 0, neg_one_bytes.len())?, &neg_one_bytes)
+        })?;
+        Ok(Self {
+            kv,
+            index,
+            identity_pt,
+            empty_cand_scores,
+            empty_cand_indices,
+            pages: layout.pages,
+            _arena: arena,
+        })
+    }
+
+    fn inventory(&self, inventory: &mut Inventory<'_>, rank: usize) -> Result<()> {
+        let prefix = ContextStagingLayout::arena_id(rank);
+        for (name, alloc) in [
+            ("kv", &self.kv),
+            ("index", &self.index),
+            ("identity_pt", &self.identity_pt),
+            ("empty_cand_scores", &self.empty_cand_scores),
+            ("empty_cand_indices", &self.empty_cand_indices),
+        ] {
+            alloc.inventory(inventory, &format!("{prefix}.{name}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// One packed hook-local scratch arena per coordinator GPU rank, shared across all wave slots.
@@ -431,6 +547,8 @@ impl<'a> SharedScratch<'a> {
                 lse_own: view("ctx_lse_own")?,
                 partial_peer: view("ctx_partial_peer")?,
                 lse_peer: view("ctx_lse_peer")?,
+                draft_slots: view("ctx_draft_slots")?,
+                draft_lens: view("ctx_draft_lens")?,
             })
         } else {
             None
@@ -540,6 +658,8 @@ impl<'a> SharedScratch<'a> {
                 ("ctx_lse_own", &ctx.lse_own),
                 ("ctx_partial_peer", &ctx.partial_peer),
                 ("ctx_lse_peer", &ctx.lse_peer),
+                ("ctx_draft_slots", &ctx.draft_slots),
+                ("ctx_draft_lens", &ctx.draft_lens),
             ] {
                 alloc.inventory(inventory, &format!("{prefix}.{name}"))?;
             }
@@ -694,6 +814,7 @@ struct RankRuntime<'a> {
     weights: Hy4RankWeights<'a>,
     cache: Rc<Hy4CacheRank<'a>>,
     shared: SharedScratch<'a>,
+    context_staging: Option<ContextStaging<'a>>,
     waves: Vec<WaveScratch<'a>>,
     bf16_add: Bf16Add<'a>,
     f32_add: F32Add<'a>,
@@ -859,6 +980,106 @@ impl<'a> RankRuntime<'a> {
                         self.shared.idx_q_fp8.buffer.ptr,
                         self.shared.idx_w_out.buffer.ptr,
                         idx_cache.ptr,
+                    ],
+                    &s_rows,
+                    self.stream.raw,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sequence-independent attention front for 2-GPU gathered ContextSplit prefill:
+    /// runs iHC pre (or fused previous-FFN iHC post+pre), `q_a_proj`, `kv_a_proj_with_mqa`,
+    /// `linear_gate`, and on full indexer layers `indexer.wk` + `indexer.weights_proj` once across
+    /// all `rows` before per-member `gathered_prefill_with`.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_pre_gathered_front(
+        &self,
+        p: &str,
+        full_idx: Option<usize>,
+        wave_slot: usize,
+        rows: usize,
+        use_a: bool,
+        fused_prev_post: Option<bool>,
+    ) -> Result<()> {
+        let w = &self.waves[wave_slot];
+        let r_cur = if use_a { w.r_a.buffer } else { w.r_b.buffer };
+        let s_rows = [Scalar::I32(rows as i32)];
+        // SAFETY: arena weights and scratch live through stream drain.
+        unsafe {
+            if let Some(prev_use_a) = fused_prev_post {
+                let r_in = if prev_use_a { w.r_a.buffer } else { w.r_b.buffer };
+                self.programs.ihc_post_pre.launch(
+                    &[
+                        self.shared.delta.buffer.ptr,
+                        r_in.ptr,
+                        w.post_ffn.buffer.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_fn"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_scale"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_base"))?.ptr,
+                        self.weights.buf(&format!("{p}.input_layernorm.weight"))?.ptr,
+                        r_cur.ptr,
+                        self.shared.post.buffer.ptr,
+                        w.y.buffer.ptr,
+                    ],
+                    &s_rows,
+                    self.stream.raw,
+                )?;
+            } else {
+                self.programs.ihc_pre.launch(
+                    &[
+                        r_cur.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_fn"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_scale"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_base"))?.ptr,
+                        self.weights.buf(&format!("{p}.input_layernorm.weight"))?.ptr,
+                        self.shared.post.buffer.ptr,
+                        w.y.buffer.ptr,
+                    ],
+                    &s_rows,
+                    self.stream.raw,
+                )?;
+            }
+            launch_proj_out(
+                self,
+                &format!("{p}.self_attn.q_a_proj"),
+                &self.programs.proj_q_a,
+                rows,
+                w.y.buffer,
+                self.shared.q_a.buffer,
+            )?;
+            launch_proj_kv_a(
+                self,
+                &format!("{p}.self_attn.kv_a_proj_with_mqa"),
+                rows,
+                w.y.buffer,
+                self.shared.kv_a.buffer,
+            )?;
+            launch_proj_out(
+                self,
+                &format!("{p}.self_attn.linear_gate"),
+                &self.programs.proj_linear_gate_dsa,
+                rows,
+                w.y.buffer,
+                self.shared.gate.buffer,
+            )?;
+            if full_idx.is_some() {
+                let ip = format!("{p}.self_attn.indexer");
+                self.programs.proj_indexer_wk.launch(
+                    &[
+                        w.y.buffer.ptr,
+                        self.weights.weight(&format!("{ip}.wk"))?.ptr,
+                        self.shared.idx_k_raw.buffer.ptr,
+                    ],
+                    &s_rows,
+                    self.stream.raw,
+                )?;
+                self.programs.proj_indexer_weights.launch(
+                    &[
+                        w.y.buffer.ptr,
+                        self.weights.weight(&format!("{ip}.weights_proj"))?.ptr,
+                        self.shared.idx_w_raw.buffer.ptr,
                     ],
                     &s_rows,
                     self.stream.raw,
@@ -1534,6 +1755,13 @@ impl<'a> RankRuntime<'a> {
     }
 }
 
+/// Per-member gathered ContextSplit prefill plan staged in `begin_batch`.
+#[derive(Clone, Copy, Debug)]
+struct GatheredMemberPlan {
+    shards: [usize; 2],
+    commit_counts: [[usize; CONTEXT_COMMIT_PLANES]; 2],
+}
+
 #[derive(Clone, Debug)]
 struct ActiveMember {
     sequence: usize,
@@ -1541,6 +1769,7 @@ struct ActiveMember {
     pos_start: usize,
     row_start: usize,
     row_len: usize,
+    gathered: Option<GatheredMemberPlan>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1556,6 +1785,7 @@ struct ActiveBatch {
     pt_stride: usize,
     ctx_pt_stride: usize,
     ctx_slot_counter: usize,
+    context_gathered: bool,
     graphed: bool,
     can_defer_ffn: bool,
     ffn_fused_layer: Option<usize>,
@@ -1731,7 +1961,7 @@ impl<'a> Hy4Engine<'a> {
                 .map(|rank| {
                     (0..prefill_waves)
                         .map(|slot| {
-                            let wave = WaveScratchLayout::new(
+                            let wave = WaveScratchLayout::new_with_context(
                                 &cfg,
                                 rank,
                                 slot,
@@ -1739,6 +1969,7 @@ impl<'a> Hy4Engine<'a> {
                                 max_rows,
                                 max_seq_pages,
                                 max_sequences,
+                                true,
                             )?;
                             MetadataUpload::new(
                                 &[devices[rank]],
@@ -1751,7 +1982,7 @@ impl<'a> Hy4Engine<'a> {
         } else {
             vec![(0..prefill_waves)
                 .map(|slot| {
-                    let wave = WaveScratchLayout::new(
+                    let wave = WaveScratchLayout::new_with_context(
                         &cfg,
                         0,
                         slot,
@@ -1759,6 +1990,7 @@ impl<'a> Hy4Engine<'a> {
                         max_rows,
                         max_seq_pages,
                         max_sequences,
+                        false,
                     )?;
                     MetadataUpload::new(devices, wave_metadata_layout_for_rank(0, slot, &wave.arena)?)
                 })
@@ -1801,6 +2033,11 @@ impl<'a> Hy4Engine<'a> {
                 native_layout.as_ref(),
                 native_head_layout.as_ref(),
             )?;
+            let context_staging = if context_split {
+                Some(ContextStaging::new(device, &cfg, kv_format, rank, max_seq_pages)?)
+            } else {
+                None
+            };
             let mut waves = Vec::with_capacity(prefill_waves);
             for slot in 0..prefill_waves {
                 waves.push(WaveScratch::new(
@@ -1812,6 +2049,7 @@ impl<'a> Hy4Engine<'a> {
                     max_rows,
                     max_seq_pages,
                     max_sequences,
+                    context_split,
                 )?);
             }
             let bf16_add = device.run(|| device.library.bf16_add())?;
@@ -1826,6 +2064,7 @@ impl<'a> Hy4Engine<'a> {
                 weights,
                 cache,
                 shared,
+                context_staging,
                 waves,
                 bf16_add,
                 f32_add,
@@ -2319,6 +2558,9 @@ impl<'a> Hy4Engine<'a> {
             r.weights.inventory(weights_inv, retained_inv)?;
             r.cache.inventory(retained_inv)?;
             r.shared.inventory(retained_inv, rank)?;
+            if let Some(staging) = &r.context_staging {
+                staging.inventory(retained_inv, rank)?;
+            }
             for (slot, wave) in r.waves.iter().enumerate() {
                 wave.inventory(retained_inv, rank, slot)?;
             }
@@ -2533,29 +2775,54 @@ impl<'a> Hy4Engine<'a> {
             uploads[wave_slot].retire()?;
         }
 
+        let usage_phase = match priority {
+            ReadPriority::Decode | ReadPriority::DecodeFirst => UsagePhase::Decode,
+            ReadPriority::Prefill | ReadPriority::PrefillFirst => UsagePhase::Prefill,
+        };
+        let context_gathered = self.context_split && usage_phase == UsagePhase::Prefill;
+        let context_decode = self.context_split && !context_gathered;
+        let kv_rec_bytes = self.ranks[0].cache.kv_format.record_bytes();
+        let kv_page_bytes = PAGE_ROWS * kv_rec_bytes;
+        let gather_half = self.max_seq_pages.div_ceil(2);
+        let commit_limit = context_commit_limit(self.max_rows);
+
         let mut flat_tokens = Vec::with_capacity(rows);
         let mut pos_i64 = Vec::with_capacity(rows * 24);
         let mut pos_i32 = Vec::with_capacity(rows * 4);
-        let mut dsa_slots_i64 = if self.context_split { Vec::new() } else { Vec::with_capacity(rows * 8) };
-        let mut dsa_slots_ctx: [Vec<u8>; 2] = if self.context_split {
+        let mut dsa_slots_i64 = if context_decode { Vec::new() } else { Vec::with_capacity(rows * 8) };
+        let mut dsa_slots_ctx: [Vec<u8>; 2] = if context_decode {
             [Vec::with_capacity(rows * 8), Vec::with_capacity(rows * 8)]
         } else {
             [Vec::new(), Vec::new()]
         };
-        let mut idx_cache_lens = if self.context_split { Vec::new() } else { Vec::with_capacity(rows * 4) };
-        let mut idx_cache_lens_ctx: [Vec<u8>; 2] = if self.context_split {
+        let mut idx_cache_lens = if context_decode { Vec::new() } else { Vec::with_capacity(rows * 4) };
+        let mut idx_cache_lens_ctx: [Vec<u8>; 2] = if context_decode {
             [Vec::with_capacity(rows * 4), Vec::with_capacity(rows * 4)]
         } else {
             [Vec::new(), Vec::new()]
         };
-        let mut idx_cand_lens_host = if self.context_split { Vec::new() } else { Vec::with_capacity(rows * 4) };
+        let mut idx_cand_lens_host = if context_decode { Vec::new() } else { Vec::with_capacity(rows * 4) };
+        let mut ctx_gather_bytes = if context_gathered {
+            vec![0u8; unit.segments.len() * 2 * gather_half * 4]
+        } else {
+            Vec::new()
+        };
+        let mut ctx_commit_bytes: [Vec<u8>; 2] = if context_gathered {
+            let per_member = CONTEXT_COMMIT_PLANES * 3 * commit_limit * 8;
+            [
+                Vec::with_capacity(unit.segments.len() * per_member),
+                Vec::with_capacity(unit.segments.len() * per_member),
+            ]
+        } else {
+            [Vec::new(), Vec::new()]
+        };
 
         let mut max_seq_end = 0usize;
         let mut members = Vec::with_capacity(unit.segments.len());
         let mut media_rows: Vec<(usize, usize, usize)> = Vec::new();
         let mut row_cursor = 0usize;
 
-        for seg in &unit.segments {
+        for (member_idx, seg) in unit.segments.iter().enumerate() {
             let p = placements
                 .get(seg.sequence)
                 .with_context(|| format!("Hy4 segment sequence {} out of range", seg.sequence))?;
@@ -2609,7 +2876,7 @@ impl<'a> Hy4Engine<'a> {
                     pos_i64.extend_from_slice(&axis.to_le_bytes());
                 }
                 pos_i32.extend_from_slice(&(pos as i32).to_le_bytes());
-                if self.context_split {
+                if context_decode {
                     let owner = context::page_owner(logical_page);
                     ensure!(
                         raw_page & 1 == owner,
@@ -2622,6 +2889,17 @@ impl<'a> Hy4Engine<'a> {
                         let vis = context::shard_rows(pos + 1, PAGE_ROWS, rank) as i32;
                         idx_cache_lens_ctx[rank].extend_from_slice(&vis.to_le_bytes());
                     }
+                } else if context_gathered {
+                    let owner = context::page_owner(logical_page);
+                    ensure!(
+                        raw_page & 1 == owner,
+                        "Hy4 ContextSplit logical page {logical_page} has wrong parity id {raw_page}"
+                    );
+                    // Logical staging coordinates: producers write directly into contiguous staging.
+                    dsa_slots_i64.extend_from_slice(&(pos as i64).to_le_bytes());
+                    let vis = (pos + 1) as i32;
+                    idx_cache_lens.extend_from_slice(&vis.to_le_bytes());
+                    idx_cand_lens_host.extend_from_slice(&vis.min(CANDIDATE_TOPK as i32).to_le_bytes());
                 } else {
                     let dsa_slot = raw_page * PAGE_ROWS + local_row;
                     dsa_slots_i64.extend_from_slice(&(dsa_slot as i64).to_le_bytes());
@@ -2631,12 +2909,72 @@ impl<'a> Hy4Engine<'a> {
                 }
             }
 
+            let gathered = if context_gathered {
+                let history_pages = pos_start.div_ceil(PAGE_ROWS);
+                ensure!(
+                    pos_end.div_ceil(PAGE_ROWS) <= self.max_seq_pages,
+                    "Hy4 gathered prefill extent {pos_end} exceeds staging pages {}",
+                    self.max_seq_pages
+                );
+                let mut shards = [0usize; 2];
+                for (owner, shard) in shards.iter_mut().enumerate() {
+                    let local = context::local_pages(&p.units[..history_pages], owner)?;
+                    *shard = local.len();
+                    let off = (member_idx * 2 + owner) * gather_half * 4;
+                    for (j, &lp) in local.iter().enumerate() {
+                        ctx_gather_bytes[off + j * 4..off + (j + 1) * 4]
+                            .copy_from_slice(&(lp as i32).to_le_bytes());
+                    }
+                }
+                let planes = [
+                    CommitPlane {
+                        first: pos_start,
+                        rows: n,
+                        rows_per_unit: PAGE_ROWS,
+                        row_bytes: kv_rec_bytes,
+                        base: 0,
+                        unit_bytes: kv_page_bytes,
+                    },
+                    CommitPlane {
+                        first: pos_start,
+                        rows: n,
+                        rows_per_unit: PAGE_ROWS,
+                        row_bytes: 128,
+                        base: 0,
+                        unit_bytes: INDEX_PAGE_BYTES,
+                    },
+                    CommitPlane {
+                        first: pos_start,
+                        rows: n,
+                        rows_per_unit: PAGE_ROWS,
+                        row_bytes: 4,
+                        base: PAGE_ROWS * 128,
+                        unit_bytes: INDEX_PAGE_BYTES,
+                    },
+                ];
+                let mut commit_counts = [[0usize; CONTEXT_COMMIT_PLANES]; 2];
+                for rank in 0..2 {
+                    let blocks = commit_blocks(rank, &p.units, &planes, commit_limit)?;
+                    commit_counts[rank] = [blocks.counts[0], blocks.counts[1], blocks.counts[2]];
+                    for word in &blocks.table {
+                        ctx_commit_bytes[rank].extend_from_slice(&word.to_le_bytes());
+                    }
+                }
+                Some(GatheredMemberPlan {
+                    shards,
+                    commit_counts,
+                })
+            } else {
+                None
+            };
+
             members.push(ActiveMember {
                 sequence: seg.sequence,
                 slot: p.slot,
                 pos_start,
                 row_start: row_cursor,
                 row_len: n,
+                gathered,
             });
             row_cursor += n;
         }
@@ -2670,10 +3008,16 @@ impl<'a> Hy4Engine<'a> {
         } else {
             Vec::with_capacity(members.len() * pt_stride * 4)
         };
-        let mut dsa_pt_ctx: [Vec<u8>; 2] = if self.context_split {
+        let mut dsa_pt_ctx: [Vec<u8>; 2] = if context_decode {
             [
                 Vec::with_capacity(rows * ctx_pt_stride * 4),
                 Vec::with_capacity(rows * ctx_pt_stride * 4),
+            ]
+        } else if context_gathered {
+            // One compact parity table row per member (read by `dsa_candidate_merge` for DFly2 recall).
+            [
+                Vec::with_capacity(members.len() * ctx_pt_stride * 4),
+                Vec::with_capacity(members.len() * ctx_pt_stride * 4),
             ]
         } else {
             [Vec::new(), Vec::new()]
@@ -2690,7 +3034,8 @@ impl<'a> Hy4Engine<'a> {
                         let phys = if lp < seq_pages { (p.units[lp] >> 1) as i32 } else { 0i32 };
                         row_pt.extend_from_slice(&phys.to_le_bytes());
                     }
-                    for _ in 0..m.row_len {
+                    let repeat = if context_gathered { 1 } else { m.row_len };
+                    for _ in 0..repeat {
                         dsa_pt_ctx[rank].extend_from_slice(&row_pt);
                     }
                 }
@@ -2708,7 +3053,33 @@ impl<'a> Hy4Engine<'a> {
         }
         let cu_singleton: Vec<u8> = (0..=rows).flat_map(|i| (i as i32).to_le_bytes()).collect();
 
-        if self.context_split {
+        if context_gathered {
+            for rank in 0..2 {
+                self.metadata_uploads[rank][wave_slot].upload(
+                    &self.ranks[rank..rank + 1],
+                    wave_slot,
+                    [
+                        &pos_i64,
+                        &pos_i32,
+                        &dsa_slots_i64,
+                        &dsa_pt_ctx[rank],
+                        &cu_singleton,
+                        &idx_cache_lens,
+                        &[],
+                        &ctx_gather_bytes,
+                        &ctx_commit_bytes[rank],
+                    ],
+                )?;
+            }
+            for r in &self.ranks {
+                let dst = r.waves[wave_slot].idx_cand_lens.buffer;
+                r.device.run(|| unsafe {
+                    r.device
+                        .library
+                        .copy_h2d_ordered(dst, &idx_cand_lens_host, r.stream.raw)
+                })?;
+            }
+        } else if context_decode {
             for rank in 0..2 {
                 self.metadata_uploads[rank][wave_slot].upload(
                     &self.ranks[rank..rank + 1],
@@ -2720,6 +3091,8 @@ impl<'a> Hy4Engine<'a> {
                         &dsa_pt_ctx[rank],
                         &cu_singleton,
                         &idx_cache_lens_ctx[rank],
+                        &[],
+                        &[],
                         &[],
                     ],
                 )?;
@@ -2736,6 +3109,8 @@ impl<'a> Hy4Engine<'a> {
                     &cu_singleton,
                     &idx_cache_lens,
                     &seq_pt_bytes,
+                    &[],
+                    &[],
                 ],
             )?;
             // Non-ContextSplit `idx_cand_lens` is `min(pos + 1, 2048)` for every layer.
@@ -2842,6 +3217,7 @@ impl<'a> Hy4Engine<'a> {
             pt_stride,
             ctx_pt_stride,
             ctx_slot_counter: 0,
+            context_gathered,
             graphed,
             can_defer_ffn,
             ffn_fused_layer: None,
@@ -2852,10 +3228,7 @@ impl<'a> Hy4Engine<'a> {
             final_layer,
             rank0_only_tail,
             decode_attention: priority == ReadPriority::Decode,
-            usage_phase: match priority {
-                ReadPriority::Decode | ReadPriority::DecodeFirst => UsagePhase::Decode,
-                ReadPriority::Prefill | ReadPriority::PrefillFirst => UsagePhase::Prefill,
-            },
+            usage_phase,
             dump_rows,
             use_a: true,
             members,
@@ -2948,6 +3321,571 @@ impl<'a> Hy4Engine<'a> {
                 Ok(())
             })
         }
+    }
+
+    /// 2-GPU gathered ContextSplit prefill body using the shared `gathered_prefill_with` protocol:
+    /// gathers history pages into rank-local staging, runs producers and local 32H MLA attention
+    /// over logical staging (with zero `ContextExchange`), commits rank-owned pages back to the
+    /// persistent parity pool, and computes `o_proj` partials.
+    fn run_dsa_gathered_prefill(
+        &self,
+        layer: usize,
+        full_idx: Option<usize>,
+        p: &str,
+        batch: &ActiveBatch,
+    ) -> Result<()> {
+        let wave_slot = batch.wave_slot;
+        let rows = batch.rows;
+        let local_heads = self.cfg.heads / 2;
+        let gather_half = self.max_seq_pages.div_ceil(2);
+        let commit_limit = context_commit_limit(self.max_rows);
+        let capture_draft = full_idx.is_some()
+            && self.draft.as_ref().is_some_and(|d| d.captures_layer(layer));
+        let ctx_ex = self
+            .context_exchange
+            .as_ref()
+            .context("Hy4 ContextSplit missing ContextExchange")?;
+        let kv_pools = [
+            self.ranks[0].cache.dsa_kv_layer(layer)?,
+            self.ranks[1].cache.dsa_kv_layer(layer)?,
+        ];
+        let idx_pools = match full_idx {
+            Some(fidx) => Some([
+                self.ranks[0].cache.dsa_index_layer(fidx)?,
+                self.ranks[1].cache.dsa_index_layer(fidx)?,
+            ]),
+            None => None,
+        };
+        let num_members = batch.members.len();
+
+        for rank in 0..2 {
+            let r = &self.ranks[rank];
+            let ctx_progs = r
+                .programs
+                .context
+                .as_ref()
+                .context("Hy4 ContextSplit programs missing")?;
+            let ctx = r
+                .shared
+                .ctx
+                .as_ref()
+                .context("Hy4 ContextSplit scratch missing")?;
+            let staging = r
+                .context_staging
+                .as_ref()
+                .context("Hy4 ContextSplit staging missing")?;
+            let w = &r.waves[wave_slot];
+            let gather_buf = w
+                .ctx_gather_tables
+                .as_ref()
+                .context("Hy4 wave missing ctx_gather_tables")?
+                .buffer;
+            let commit_buf = w
+                .ctx_commit_tables
+                .as_ref()
+                .context("Hy4 wave missing ctx_commit_tables")?
+                .buffer;
+            let ex_buf = ctx_ex.buffers(rank, 0)?;
+
+            for (member_idx, m) in batch.members.iter().enumerate() {
+                let plan = m
+                    .gathered
+                    .context("Hy4 gathered prefill member missing plan")?;
+                ensure!(
+                    (m.pos_start + m.row_len).div_ceil(PAGE_ROWS) <= staging.pages,
+                    "Hy4 gathered prefill extent {} exceeds staging pages {}",
+                    m.pos_start + m.row_len,
+                    staging.pages
+                );
+                struct Bindings<'e, 'a> {
+                    r: &'e RankRuntime<'a>,
+                    ctx_progs: &'e super::programs::Hy4ContextPrograms<'a>,
+                    ctx: &'e ContextScratch<'a>,
+                    staging: &'e ContextStaging<'a>,
+                    w: &'e WaveScratch<'a>,
+                    gather_buf: CuteafdDeviceBuffer,
+                    commit_buf: CuteafdDeviceBuffer,
+                    ex_buf: context::SlotBuffers,
+                    kv_pools: [CuteafdDeviceBuffer; 2],
+                    idx_pools: Option<[CuteafdDeviceBuffer; 2]>,
+                    p: &'e str,
+                    layer: usize,
+                    full_idx: Option<usize>,
+                    rank: usize,
+                    local_heads: usize,
+                    rows: usize,
+                    ctx_pt_stride: usize,
+                    gather_half: usize,
+                    commit_limit: usize,
+                    member_idx: usize,
+                    is_last_member: bool,
+                    capture_draft: bool,
+                    m: &'e ActiveMember,
+                    plan: GatheredMemberPlan,
+                }
+                impl GatheredKernels for Bindings<'_, '_> {
+                    fn gather(&mut self, owner: usize) -> Result<()> {
+                        let shard = self.plan.shards[owner];
+                        if shard == 0 {
+                            return Ok(());
+                        }
+                        let table_off = (self.member_idx * 2 + owner) * self.gather_half * 4;
+                        let table = slice_buf(self.gather_buf, table_off, shard * 4)?;
+                        let scalars = [
+                            Scalar::I32((shard * PAGE_ROWS) as i32),
+                            Scalar::I32(2),
+                            Scalar::I32(owner as i32),
+                        ];
+                        self.r.device.run(|| unsafe {
+                            self.ctx_progs.paged_staging_gather_kv.launch(
+                                &[self.kv_pools[owner].ptr, table.ptr, self.staging.kv.buffer.ptr],
+                                &scalars,
+                                self.r.stream.raw,
+                            )?;
+                            if let Some(pools) = self.idx_pools {
+                                self.ctx_progs.paged_staging_gather_index.launch(
+                                    &[pools[owner].ptr, table.ptr, self.staging.index.buffer.ptr],
+                                    &scalars,
+                                    self.r.stream.raw,
+                                )?;
+                            }
+                            Ok(())
+                        })
+                    }
+
+                    fn produce(&mut self) -> Result<()> {
+                        let r = self.r;
+                        let m = self.m;
+                        let n = m.row_len;
+                        let s_n = [Scalar::I32(n as i32)];
+                        let inv_freq = r.weights.inv_freq.buffer.ptr;
+                        let (w_uk, _) = r.weights.kv_b_absorbed(self.layer, self.local_heads)?;
+                        let q_a = slice_buf(r.shared.q_a.buffer, m.row_start * Q_LORA * 2, n * Q_LORA * 2)?;
+                        let kv_a = slice_buf(r.shared.kv_a.buffer, m.row_start * KV_A_DIM * 2, n * KV_A_DIM * 2)?;
+                        let slots = slice_buf(self.w.dsa_slots_i64.buffer, m.row_start * 8, n * 8)?;
+                        let pos64 = slice_buf(self.w.positions_i64.buffer, m.row_start * 24, n * 24)?;
+                        let q_resid = slice_buf(r.shared.q_resid.buffer, m.row_start * Q_LORA * 2, n * Q_LORA * 2)?;
+                        let q_raw = slice_buf(
+                            r.shared.q_raw.buffer,
+                            m.row_start * self.local_heads * 256 * 2,
+                            n * self.local_heads * 256 * 2,
+                        )?;
+                        let query = slice_buf(
+                            r.shared.query.buffer,
+                            m.row_start * self.local_heads * KV_A_DIM * 2,
+                            n * self.local_heads * KV_A_DIM * 2,
+                        )?;
+                        r.device.run(|| unsafe {
+                            r.programs.mla_rank_norm_pack.launch(
+                                &[
+                                    q_a.ptr,
+                                    kv_a.ptr,
+                                    r.weights.buf(&format!("{}.self_attn.q_a_layernorm.weight", self.p))?.ptr,
+                                    r.weights.buf(&format!("{}.self_attn.kv_a_layernorm.weight", self.p))?.ptr,
+                                    slots.ptr,
+                                    pos64.ptr,
+                                    inv_freq,
+                                    q_resid.ptr,
+                                    self.staging.kv.buffer.ptr,
+                                ],
+                                &s_n,
+                                r.stream.raw,
+                            )?;
+                            launch_proj_out(
+                                r,
+                                &format!("{}.self_attn.q_b_proj", self.p),
+                                &r.programs.proj_q_b_dsa,
+                                n,
+                                q_resid,
+                                q_raw,
+                            )?;
+                            r.programs.mla_q_absorb_dsa.launch(
+                                &[q_raw.ptr, w_uk, pos64.ptr, inv_freq, query.ptr],
+                                &s_n,
+                                r.stream.raw,
+                            )?;
+                            if self.full_idx.is_some() {
+                                let ip = format!("{}.self_attn.indexer", self.p);
+                                let idx_q_raw = slice_buf(
+                                    r.shared.idx_q_raw.buffer,
+                                    m.row_start * IDX_HEADS * IDX_DIM * 2,
+                                    n * IDX_HEADS * IDX_DIM * 2,
+                                )?;
+                                let idx_k_raw = slice_buf(
+                                    r.shared.idx_k_raw.buffer,
+                                    m.row_start * IDX_DIM * 2,
+                                    n * IDX_DIM * 2,
+                                )?;
+                                let idx_w_raw = slice_buf(
+                                    r.shared.idx_w_raw.buffer,
+                                    m.row_start * IDX_HEADS * 2,
+                                    n * IDX_HEADS * 2,
+                                )?;
+                                let idx_q_fp8 = slice_buf(
+                                    r.shared.idx_q_fp8.buffer,
+                                    m.row_start * IDX_HEADS * IDX_DIM,
+                                    n * IDX_HEADS * IDX_DIM,
+                                )?;
+                                let idx_w_out = slice_buf(
+                                    r.shared.idx_w_out.buffer,
+                                    m.row_start * IDX_HEADS * 4,
+                                    n * IDX_HEADS * 4,
+                                )?;
+                                r.programs.proj_indexer_wq_b.launch(
+                                    &[
+                                        q_resid.ptr,
+                                        r.weights.weight(&format!("{ip}.wq_b"))?.ptr,
+                                        idx_q_raw.ptr,
+                                    ],
+                                    &s_n,
+                                    r.stream.raw,
+                                )?;
+                                r.programs.index_post.launch(
+                                    &[
+                                        idx_q_raw.ptr,
+                                        idx_k_raw.ptr,
+                                        idx_w_raw.ptr,
+                                        pos64.ptr,
+                                        slots.ptr,
+                                        inv_freq,
+                                        r.weights.buf(&format!("{ip}.k_norm.weight"))?.ptr,
+                                        r.weights.buf(&format!("{ip}.k_norm.bias"))?.ptr,
+                                        idx_q_fp8.ptr,
+                                        idx_w_out.ptr,
+                                        self.staging.index.buffer.ptr,
+                                    ],
+                                    &s_n,
+                                    r.stream.raw,
+                                )?;
+                            }
+                            Ok(())
+                        })
+                    }
+
+                    fn attention(&mut self) -> Result<()> {
+                        let r = self.r;
+                        let m = self.m;
+                        let n = m.row_len;
+                        let seq_width = (m.pos_start + n).div_ceil(PAGE_ROWS).max(1);
+                        let slots_out = slice_buf(
+                            self.w.idx_cand_slots.buffer,
+                            m.row_start * CANDIDATE_TOPK * 4,
+                            n * CANDIDATE_TOPK * 4,
+                        )?;
+                        let lens_in = slice_buf(self.w.idx_cand_lens.buffer, m.row_start * 4, n * 4)?;
+                        let query = slice_buf(
+                            r.shared.query.buffer,
+                            m.row_start * self.local_heads * KV_A_DIM * 2,
+                            n * self.local_heads * KV_A_DIM * 2,
+                        )?;
+                        let attn_out = slice_buf(
+                            r.shared.attn_out.buffer,
+                            m.row_start * self.local_heads * 512 * 2,
+                            n * self.local_heads * 512 * 2,
+                        )?;
+                        let lse_out = slice_buf(
+                            r.shared.lse_out.buffer,
+                            m.row_start * self.local_heads * 4,
+                            n * self.local_heads * 4,
+                        )?;
+                        r.device.run(|| unsafe {
+                            if self.full_idx.is_some() {
+                                let q_ptr = r
+                                    .shared
+                                    .idx_q_fp8
+                                    .buffer
+                                    .ptr
+                                    .cast::<u8>()
+                                    .wrapping_add(m.row_start * IDX_HEADS * IDX_DIM)
+                                    .cast();
+                                let w_ptr = r
+                                    .shared
+                                    .idx_w_out
+                                    .buffer
+                                    .ptr
+                                    .cast::<u8>()
+                                    .wrapping_add(m.row_start * IDX_HEADS * 4)
+                                    .cast();
+                                let cache_lens_ptr = self
+                                    .w
+                                    .idx_cache_lens
+                                    .buffer
+                                    .ptr
+                                    .cast::<u8>()
+                                    .wrapping_add(m.row_start * 4)
+                                    .cast();
+                                r.programs.index_topk_prefill.launch(
+                                    &[
+                                        q_ptr,
+                                        w_ptr,
+                                        self.staging.index.buffer.ptr,
+                                        self.staging.identity_pt.buffer.ptr,
+                                        cache_lens_ptr,
+                                        slots_out.ptr,
+                                        r.shared.idx_topk_scratch.buffer.ptr,
+                                    ],
+                                    &[
+                                        Scalar::I32(n as i32),
+                                        Scalar::I32(seq_width as i32),
+                                        Scalar::I32(seq_width as i32),
+                                    ],
+                                    r.stream.raw,
+                                )?;
+                                if self.capture_draft {
+                                    // Produce exact parity-split physical DFly2 recall slots for the member's
+                                    // last row using `scored_index_topk_prefill` + `dsa_candidate_merge`
+                                    // with an empty second half (-inf, -1) — zero ContextExchange, zero sync.
+                                    let last = m.row_start + n - 1;
+                                    let q_last = r
+                                        .shared
+                                        .idx_q_fp8
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(last * IDX_HEADS * IDX_DIM)
+                                        .cast();
+                                    let w_last = r
+                                        .shared
+                                        .idx_w_out
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(last * IDX_HEADS * 4)
+                                        .cast();
+                                    let len_last = self
+                                        .w
+                                        .idx_cache_lens
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(last * 4)
+                                        .cast();
+                                    let half_bytes = CANDIDATE_TOPK * 4;
+                                    self.ctx_progs.scored_index_topk_prefill.launch(
+                                        &[
+                                            q_last,
+                                            w_last,
+                                            self.staging.index.buffer.ptr,
+                                            self.staging.identity_pt.buffer.ptr,
+                                            len_last,
+                                            self.ex_buf.indices,
+                                            self.ex_buf.scores,
+                                            r.shared.idx_topk_scratch.buffer.ptr,
+                                        ],
+                                        &[
+                                            Scalar::I32(1),
+                                            Scalar::I32(seq_width as i32),
+                                            Scalar::I32(seq_width as i32),
+                                            Scalar::I32(1),
+                                            Scalar::I32(0),
+                                        ],
+                                        r.stream.raw,
+                                    )?;
+                                    let dst_s_hi = CuteafdDeviceBuffer {
+                                        ptr: self.ex_buf.scores.cast::<u8>().wrapping_add(half_bytes).cast(),
+                                        bytes: half_bytes,
+                                        device_id: r.device.id,
+                                        flags: 0,
+                                    };
+                                    let dst_i_hi = CuteafdDeviceBuffer {
+                                        ptr: self.ex_buf.indices.cast::<u8>().wrapping_add(half_bytes).cast(),
+                                        bytes: half_bytes,
+                                        device_id: r.device.id,
+                                        flags: 0,
+                                    };
+                                    r.device.library.copy_d2d_async(
+                                        dst_s_hi,
+                                        self.staging.empty_cand_scores.buffer,
+                                        half_bytes,
+                                        r.stream.raw,
+                                    )?;
+                                    r.device.library.copy_d2d_async(
+                                        dst_i_hi,
+                                        self.staging.empty_cand_indices.buffer,
+                                        half_bytes,
+                                        r.stream.raw,
+                                    )?;
+                                    let pt_ptr = self
+                                        .w
+                                        .dsa_page_table
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(self.member_idx * self.ctx_pt_stride * 4)
+                                        .cast();
+                                    let dst_slots = self
+                                        .ctx
+                                        .draft_slots
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(self.member_idx * half_bytes)
+                                        .cast();
+                                    let dst_lens = self
+                                        .ctx
+                                        .draft_lens
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(self.member_idx * 4)
+                                        .cast();
+                                    self.ctx_progs.dsa_candidate_merge.launch(
+                                        &[
+                                            self.ex_buf.scores,
+                                            self.ex_buf.indices,
+                                            self.ctx.merged_scores.buffer.ptr,
+                                            self.ctx.merged_indices.buffer.ptr,
+                                            pt_ptr,
+                                            dst_slots,
+                                            dst_lens,
+                                        ],
+                                        &[
+                                            Scalar::I32(1),
+                                            Scalar::I32(self.ctx_pt_stride as i32),
+                                            Scalar::I32(self.rank as i32),
+                                        ],
+                                        r.stream.raw,
+                                    )?;
+                                }
+                            }
+                            r.programs.mla_dsa_decode.launch(
+                                &[
+                                    query.ptr,
+                                    self.staging.kv.buffer.ptr,
+                                    slots_out.ptr,
+                                    lens_in.ptr,
+                                    self.w.dsa_cu_seqlens.buffer.ptr,
+                                    attn_out.ptr,
+                                    lse_out.ptr,
+                                    r.shared.attn_scratch.buffer.ptr,
+                                ],
+                                &[
+                                    Scalar::I32(n as i32),
+                                    Scalar::I32(n as i32),
+                                    Scalar::I64(CANDIDATE_TOPK as i64),
+                                    Scalar::I32(1),
+                                ],
+                                r.stream.raw,
+                            )
+                        })
+                    }
+
+                    fn commit(&mut self) -> Result<()> {
+                        let counts = self.plan.commit_counts[self.rank];
+                        let member_base =
+                            self.member_idx * CONTEXT_COMMIT_PLANES * 3 * self.commit_limit * 8;
+                        let list = |plane: usize, part: usize| -> Result<*const std::ffi::c_void> {
+                            let off = member_base + (plane * 3 + part) * self.commit_limit * 8;
+                            Ok(slice_buf(self.commit_buf, off, counts[plane].max(1) * 8)?
+                                .ptr
+                                .cast_const())
+                        };
+                        self.r.device.run(|| unsafe {
+                            if counts[0] > 0 {
+                                self.r.device.library.cuda_kv_cache_write_blocks_async(
+                                    self.staging.kv.buffer.ptr,
+                                    self.kv_pools[self.rank].ptr,
+                                    list(0, 0)?,
+                                    list(0, 1)?,
+                                    list(0, 2)?,
+                                    counts[0],
+                                    self.r.stream.raw,
+                                )?;
+                            }
+                            if let Some(pools) = self.idx_pools {
+                                for plane in [1usize, 2usize] {
+                                    if counts[plane] > 0 {
+                                        self.r.device.library.cuda_kv_cache_write_blocks_async(
+                                            self.staging.index.buffer.ptr,
+                                            pools[self.rank].ptr,
+                                            list(plane, 0)?,
+                                            list(plane, 1)?,
+                                            list(plane, 2)?,
+                                            counts[plane],
+                                            self.r.stream.raw,
+                                        )?;
+                                    }
+                                }
+                            }
+                            Ok(())
+                        })
+                    }
+
+                    fn output(&mut self) -> Result<()> {
+                        if !self.is_last_member {
+                            return Ok(());
+                        }
+                        self.r.device.run(|| {
+                            self.r.attn_out(self.p, self.layer, 2, self.local_heads, self.rows)
+                        })
+                    }
+                }
+
+                let mut bindings = Bindings {
+                    r,
+                    ctx_progs,
+                    ctx,
+                    staging,
+                    w,
+                    gather_buf,
+                    commit_buf,
+                    ex_buf,
+                    kv_pools,
+                    idx_pools,
+                    p,
+                    layer,
+                    full_idx,
+                    rank,
+                    local_heads,
+                    rows,
+                    ctx_pt_stride: batch.ctx_pt_stride,
+                    gather_half,
+                    commit_limit,
+                    member_idx,
+                    is_last_member: member_idx + 1 == num_members,
+                    capture_draft,
+                    m,
+                    plan,
+                };
+                gathered_prefill_with(&mut bindings)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Capture DFly2 dual parity recall after `exchange_attn_tp2` has synchronized both GPUs'
+    /// `ctx.draft_slots` and `ctx.draft_lens` from gathered ContextSplit prefill.
+    fn capture_draft_recall_gathered(&self, layer: usize, batch: &ActiveBatch) -> Result<()> {
+        let Some(draft) = self.draft.as_ref().filter(|d| d.captures_layer(layer)) else {
+            return Ok(());
+        };
+        let row_bytes = CANDIDATE_TOPK * 4;
+        for rank in 0..draft.tp() {
+            let peer = 1 - rank;
+            let r = &self.ranks[rank];
+            let own_ctx = r
+                .shared
+                .ctx
+                .as_ref()
+                .context("Hy4 ContextSplit scratch missing")?;
+            let peer_ctx = self.ranks[peer]
+                .shared
+                .ctx
+                .as_ref()
+                .context("Hy4 peer ContextSplit scratch missing")?;
+            r.device.run(|| {
+                for (member_idx, m) in batch.members.iter().enumerate() {
+                    let own_slots = slice_buf(own_ctx.draft_slots.buffer, member_idx * row_bytes, row_bytes)?;
+                    let own_len = slice_buf(own_ctx.draft_lens.buffer, member_idx * 4, 4)?;
+                    let peer_slots = slice_buf(peer_ctx.draft_slots.buffer, member_idx * row_bytes, row_bytes)?;
+                    let peer_len = slice_buf(peer_ctx.draft_lens.buffer, member_idx * 4, 4)?;
+                    draft.capture_recall(rank, false, m.slot, layer, own_slots, Some(own_len), &r.stream)?;
+                    draft.capture_recall_peer(rank, false, m.slot, layer, peer_slots, peer_len, &r.stream)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     /// 2-GPU ContextSplit DSA body after `attn_pre` wrote parity-owned KV (and `index_post` on full layers).
@@ -3591,7 +4529,14 @@ impl<'a> Hy4Engine<'a> {
                 })?;
             }
         }
-        if self.context_split {
+        if batch.context_gathered {
+            for r in &self.ranks {
+                r.device.run(|| {
+                    r.attn_pre_gathered_front(&p, full_idx, wave_slot, rows, use_a, fused_prev_post)
+                })?;
+            }
+            self.run_dsa_gathered_prefill(layer, full_idx, &p, batch)?;
+        } else if self.context_split {
             for r in &self.ranks {
                 let kv_cache_buf = r.cache.dsa_kv_layer(layer)?;
                 r.device.run(|| {
@@ -3623,6 +4568,9 @@ impl<'a> Hy4Engine<'a> {
         }
         if gpus == 2 {
             self.exchange_attn_tp2(rows)?;
+            if batch.context_gathered && full_idx.is_some() {
+                self.capture_draft_recall_gathered(layer, batch)?;
+            }
             let attn_recv = [
                 self.peer_exchange()?.recv(0, PEER_SLOT_ATTN)?,
                 self.peer_exchange()?.recv(1, PEER_SLOT_ATTN)?,
@@ -4650,6 +5598,59 @@ impl<'a> Hy4Engine<'a> {
         }
         self.golden_placement = placements.into_iter().next().unwrap();
         Ok(logits)
+    }
+
+    pub(crate) fn verify_concurrent_two_seq_waves(
+        &mut self,
+        prompt_a: &[u32],
+        prompt_b: &[u32],
+        unit_rows: usize,
+        last_layer: usize,
+    ) -> Result<super::super::hy4_common::golden::TwoSeqWaveProof> {
+        super::super::hy4_common::golden::verify_concurrent_two_seq_waves(
+            self,
+            prompt_a,
+            prompt_b,
+            unit_rows,
+            last_layer,
+        )
+    }
+}
+
+impl super::super::hy4_common::golden::TwoSeqWaveEngine for Hy4Engine<'_> {
+    type Placement = Hy4Placement;
+
+    fn gpus(&self) -> usize { self.ranks.len() }
+    fn prefill_waves(&self) -> usize { self.prefill_waves }
+    fn max_sequences(&self) -> usize { self.max_sequences }
+    fn max_rows(&self) -> usize { self.max_rows }
+    fn max_pages(&self) -> usize { self.max_pages }
+    fn context_split(&self) -> bool { self.context_split }
+    fn layers(&self) -> usize { self.cfg.layers }
+    fn vocab_size(&self) -> usize { self.cfg.vocab_size }
+    fn reset_for_wave_proof(&mut self) -> Result<()> { self.reset_golden() }
+    fn make_wave_placement(&self, pages: Vec<u32>, slot: usize) -> Hy4Placement {
+        Hy4Placement::new(pages, slot)
+    }
+    fn run_wave_units(
+        &mut self,
+        placements: &mut [Hy4Placement],
+        sources: &[&[u32]],
+        units: &[Unit],
+        on_tile: &mut dyn FnMut(&Unit, usize, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let library = self.library();
+        self.run_units(
+            placements,
+            sources,
+            units,
+            ReadPriority::Prefill,
+            |_| HeadMode::Suffix(0),
+            &mut |u, row_off, logits| {
+                let tile = logits.to_host(library)?;
+                on_tile(u, row_off, &tile)
+            },
+        )
     }
 }
 

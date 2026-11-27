@@ -18,7 +18,7 @@ use crate::shared::memory::receipts::Inventory;
 use crate::shared::memory::{HostAllocation, Tag};
 use crate::shared::memory::weight_arena::DeviceArena;
 use crate::shared::peer_split::{
-    context::{self, ContextExchange},
+    context::{self, commit_blocks, gathered_prefill_with, CommitPlane, ContextExchange, GatheredKernels},
     PeerExchange, RankDevice, DIRECT,
 };
 use crate::shared::prefill_pipeline::{run_prefill_units, FfnRoute, PrefillHooks, Unit, UnitSegment};
@@ -35,9 +35,11 @@ use cuteafd_ffi::programs::{Program, Programs, Scalar};
 use cuteafd_ffi::{Bf16Add, Bf16F32Add, CuteafdDeviceBuffer, CuteafdHostBuffer, F32Add};
 use cuteafd_loader::families::hy4_flash::engram::advance_tail;
 use cuteafd_loader::families::hy4_flash::execution::{
-    context_chunk_rows, context_exchange_rows, hy4_context_buffers, hy4_dsa_partial_scratch_bytes, hy4_peer_ffn_routed_offset,
-    hy4_peer_slot_sizes, mla_split_scratch_bytes, wave_metadata_layout_for_rank,
-    SharedScratchLayout, WaveScratchLayout, PAGE_ROWS, WAVE_METADATA,
+    context_commit_limit, hy4_context_buffers, hy4_dsa_partial_scratch_bytes,
+    hy4_peer_ffn_routed_offset, hy4_peer_slot_sizes, mla_split_scratch_bytes,
+    wave_metadata_layout_for_rank, ContextStagingLayout, SharedScratchLayout, WaveScratchLayout,
+    CONTEXT_COMMIT_PLANES, INDEX_GROUP_RECORD_BYTES, PAGE_ROWS, WAVE_METADATA,
+    WAVE_METADATA_CONTEXT,
 };
 use cuteafd_loader::placement::AttentionPlacement;
 use cuteafd_loader::placement::families::hy4_flash::DECODE_ROWS;
@@ -133,6 +135,8 @@ struct WaveScratch<'a> {
     idx_limits: Allocation<'a>,
     idx_group_pos: Allocation<'a>,
     idx_group_slots: Allocation<'a>,
+    ctx_gather_tables: Option<Allocation<'a>>,
+    ctx_commit_tables: Option<Allocation<'a>>,
     engram_raw: Vec<Allocation<'a>>,
     engram_masked: Vec<Allocation<'a>>,
 }
@@ -148,8 +152,18 @@ impl<'a> WaveScratch<'a> {
         max_rows: usize,
         max_seq_pages: usize,
         max_sequences: usize,
+        context_split: bool,
     ) -> Result<Self> {
-        let layout = WaveScratchLayout::new(cfg, rank, slot, tp, max_rows, max_seq_pages, max_sequences)?;
+        let layout = WaveScratchLayout::new_with_context(
+            cfg,
+            rank,
+            slot,
+            tp,
+            max_rows,
+            max_seq_pages,
+            max_sequences,
+            context_split,
+        )?;
         let arena = DeviceArena::new(
             device,
             layout.arena.clone(),
@@ -162,6 +176,11 @@ impl<'a> WaveScratch<'a> {
                 .with_context(|| format!("Hy4 wave scratch missing view {name}"))?
                 .bytes();
             arena.view(name, bytes)
+        };
+        let (ctx_gather_tables, ctx_commit_tables) = if context_split {
+            (Some(view("ctx_gather_tables")?), Some(view("ctx_commit_tables")?))
+        } else {
+            (None, None)
         };
         let mut engram_raw = Vec::with_capacity(cfg.engram_layers.len());
         let mut engram_masked = Vec::with_capacity(cfg.engram_layers.len());
@@ -188,6 +207,8 @@ impl<'a> WaveScratch<'a> {
             idx_limits: view("idx_limits")?,
             idx_group_pos: view("idx_group_pos")?,
             idx_group_slots: view("idx_group_slots")?,
+            ctx_gather_tables,
+            ctx_commit_tables,
             engram_raw,
             engram_masked,
             _arena: arena,
@@ -218,6 +239,12 @@ impl<'a> WaveScratch<'a> {
         ] {
             alloc.inventory(inventory, &format!("{prefix}.{name}"))?;
         }
+        if let Some(alloc) = &self.ctx_gather_tables {
+            alloc.inventory(inventory, &format!("{prefix}.ctx_gather_tables"))?;
+        }
+        if let Some(alloc) = &self.ctx_commit_tables {
+            alloc.inventory(inventory, &format!("{prefix}.ctx_commit_tables"))?;
+        }
         for (i, alloc) in self.engram_raw.iter().enumerate() {
             alloc.inventory(inventory, &format!("{prefix}.engram_raw.{i}"))?;
         }
@@ -242,15 +269,20 @@ impl<'a> MetadataUpload<'a> {
         Ok(Self { backing, layout, completion, pending: false })
     }
 
-    fn upload(&mut self, ranks: &[RankRuntime<'a>], slot: usize, planes: [&[u8]; WAVE_METADATA.len()]) -> Result<()> {
+    fn upload(&mut self, ranks: &[RankRuntime<'a>], slot: usize, planes: [&[u8]; WAVE_METADATA_CONTEXT.len()]) -> Result<()> {
         ensure!(!self.pending, "Hy4 wave metadata still in flight");
         ensure!(ranks.len() == self.completion.len(), "Hy4 metadata rank count changed");
-        let mut sources = [CuteafdHostBuffer::default(); WAVE_METADATA.len()];
-        let mut lengths = [0; WAVE_METADATA.len()];
+        let mut sources = [CuteafdHostBuffer::default(); WAVE_METADATA_CONTEXT.len()];
+        let mut lengths = [0; WAVE_METADATA_CONTEXT.len()];
         let source = self.backing.buffer;
         let bytes = self.backing.bytes_mut();
         let mut count = 0;
-        for (name, contents) in WAVE_METADATA.into_iter().zip(planes) {
+        let names: &[&str] = if self.layout.view("ctx_gather_tables").is_some() {
+            &WAVE_METADATA_CONTEXT
+        } else {
+            &WAVE_METADATA
+        };
+        for (&name, contents) in names.iter().zip(planes) {
             if contents.is_empty() {
                 continue;
             }
@@ -265,16 +297,32 @@ impl<'a> MetadataUpload<'a> {
         self.pending = true;
         for (r, event) in ranks.iter().zip(&mut self.completion) {
             let wave = &r.waves[slot];
-            let mut dst = [CuteafdDeviceBuffer::default(); WAVE_METADATA.len()];
-            let bufs = [wave.positions_i64.buffer, wave.positions_i32.buffer, wave.dsa_slots_i64.buffer,
-                wave.swa_slots_i64.buffer, wave.dsa_page_table.buffer, wave.swa_page_table.buffer,
-                wave.dsa_cu_seqlens.buffer, wave.swa_cu_seqlens.buffer, wave.swa_seqlens.buffer,
-                wave.idx_limits.buffer, wave.idx_group_pos.buffer, wave.idx_group_slots.buffer];
-            for (target, buffer) in dst.iter_mut().zip(bufs.into_iter().zip(planes).filter_map(|(buffer, plane)| {
-                (!plane.is_empty()).then_some(buffer)
-            })) {
-                *target = buffer;
+            let mut dst = [CuteafdDeviceBuffer::default(); WAVE_METADATA_CONTEXT.len()];
+            let bufs = [
+                Some(wave.positions_i64.buffer),
+                Some(wave.positions_i32.buffer),
+                Some(wave.dsa_slots_i64.buffer),
+                Some(wave.swa_slots_i64.buffer),
+                Some(wave.dsa_page_table.buffer),
+                Some(wave.swa_page_table.buffer),
+                Some(wave.dsa_cu_seqlens.buffer),
+                Some(wave.swa_cu_seqlens.buffer),
+                Some(wave.swa_seqlens.buffer),
+                Some(wave.idx_limits.buffer),
+                Some(wave.idx_group_pos.buffer),
+                Some(wave.idx_group_slots.buffer),
+                wave.ctx_gather_tables.as_ref().map(|a| a.buffer),
+                wave.ctx_commit_tables.as_ref().map(|a| a.buffer),
+            ];
+            let mut dst_count = 0;
+            for (buf_opt, plane) in bufs.into_iter().take(names.len()).zip(planes) {
+                if plane.is_empty() {
+                    continue;
+                }
+                dst[dst_count] = buf_opt.context("Hy4 wave missing target metadata buffer")?;
+                dst_count += 1;
             }
+            ensure!(dst_count == count, "Hy4 metadata destination count mismatch");
             r.device.run(|| {
                 // SAFETY: the pinned source is private to this slot and stays immutable
                 // until both events complete (or terminal retirement drains the streams).
@@ -308,6 +356,82 @@ struct ContextScratch<'a> {
     partial_peer: Allocation<'a>,
     lse_peer: Allocation<'a>,
     draft_slots: Allocation<'a>,
+}
+
+/// Optional per-rank packed staging arena for 2-GPU ContextSplit gathered prefill.
+struct ContextStaging<'a> {
+    _arena: DeviceArena<'a, arena_class::ReadWrite>,
+    kv: Allocation<'a>,
+    index: Allocation<'a>,
+    identity_pt: Allocation<'a>,
+    empty_cand_scores: Allocation<'a>,
+    empty_cand_indices: Allocation<'a>,
+    pages: usize,
+}
+
+impl<'a> ContextStaging<'a> {
+    fn new(
+        device: Device<'a>,
+        cfg: &Hy4FlashConfig,
+        kv_format: Hy4KvCache,
+        rank: usize,
+        max_seq_pages: usize,
+    ) -> Result<Self> {
+        let layout = ContextStagingLayout::new(cfg, kv_format, rank, max_seq_pages)?;
+        let arena = DeviceArena::new(
+            device,
+            layout.arena.clone(),
+            ArenaTag::staging("hy4_flash/context-staging"),
+        )?;
+        let view = |name: &str| -> Result<Allocation<'a>> {
+            let bytes = arena
+                .layout()
+                .view(name)
+                .with_context(|| format!("Hy4-flash context staging missing view {name}"))?
+                .bytes();
+            arena.view(name, bytes)
+        };
+        let kv = view("kv")?;
+        let index = view("index")?;
+        let identity_pt = view("identity_pt")?;
+        let empty_cand_scores = view("empty_cand_scores")?;
+        let empty_cand_indices = view("empty_cand_indices")?;
+        let id_bytes: Vec<u8> = (0..layout.pages as i32).flat_map(i32::to_le_bytes).collect();
+        let neg_inf_bytes: Vec<u8> = (0..cfg.indexer_group_topk)
+            .flat_map(|_| f32::NEG_INFINITY.to_le_bytes())
+            .collect();
+        let neg_one_bytes: Vec<u8> = (0..cfg.indexer_group_topk)
+            .flat_map(|_| (-1i32).to_le_bytes())
+            .collect();
+        device.run(|| {
+            device.library.copy_h2d(slice_buf(identity_pt.buffer, 0, id_bytes.len())?, &id_bytes)?;
+            device.library.copy_h2d(slice_buf(empty_cand_scores.buffer, 0, neg_inf_bytes.len())?, &neg_inf_bytes)?;
+            device.library.copy_h2d(slice_buf(empty_cand_indices.buffer, 0, neg_one_bytes.len())?, &neg_one_bytes)
+        })?;
+        Ok(Self {
+            kv,
+            index,
+            identity_pt,
+            empty_cand_scores,
+            empty_cand_indices,
+            pages: layout.pages,
+            _arena: arena,
+        })
+    }
+
+    fn inventory(&self, inventory: &mut Inventory<'_>, rank: usize) -> Result<()> {
+        let prefix = ContextStagingLayout::arena_id(rank);
+        for (name, alloc) in [
+            ("kv", &self.kv),
+            ("index", &self.index),
+            ("identity_pt", &self.identity_pt),
+            ("empty_cand_scores", &self.empty_cand_scores),
+            ("empty_cand_indices", &self.empty_cand_indices),
+        ] {
+            alloc.inventory(inventory, &format!("{prefix}.{name}"))?;
+        }
+        Ok(())
+    }
 }
 
 /// One packed hook-local scratch arena per coordinator GPU rank, shared across all wave slots.
@@ -682,6 +806,7 @@ struct RankRuntime<'a> {
     weights: Hy4RankWeights<'a>,
     cache: Rc<Hy4CacheRank<'a>>,
     shared: SharedScratch<'a>,
+    context_staging: Option<ContextStaging<'a>>,
     waves: Vec<WaveScratch<'a>>,
     bf16_add: Bf16Add<'a>,
     f32_add: F32Add<'a>,
@@ -843,6 +968,83 @@ impl<'a> RankRuntime<'a> {
                 &s_rows, self.stream.raw,
             )
         }
+    }
+
+    /// Sequence-independent DSA attention front for 2-GPU gathered ContextSplit prefill:
+    /// runs iHC pre (or fused previous-FFN iHC post+pre), `q_a_proj`, `kv_a_proj_with_mqa`,
+    /// `linear_gate_dsa`, and `dsa_index_wk` once across all `rows` before per-member `gathered_prefill_with`.
+    #[allow(clippy::too_many_arguments)]
+    fn attn_pre_gathered_dsa_front(
+        &self,
+        p: &str,
+        wave_slot: usize,
+        rows: usize,
+        use_a: bool,
+        fused_prev_post: Option<bool>,
+    ) -> Result<()> {
+        let w = &self.waves[wave_slot];
+        let r_cur = if use_a { w.r_a.buffer } else { w.r_b.buffer };
+        let s_rows = [Scalar::I32(rows as i32)];
+        // SAFETY: arena weight views and scratch live through stream drain.
+        unsafe {
+            if let Some(prev_use_a) = fused_prev_post {
+                let r_in = if prev_use_a { w.r_a.buffer } else { w.r_b.buffer };
+                self.programs.ihc_post_pre.launch(
+                    &[
+                        self.shared.delta_norm.buffer.ptr,
+                        r_in.ptr,
+                        w.post_ffn.buffer.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_fn"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_scale"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_base"))?.ptr,
+                        self.weights.buf(&format!("{p}.input_layernorm.weight"))?.ptr,
+                        r_cur.ptr,
+                        self.shared.post.buffer.ptr,
+                        w.y.buffer.ptr,
+                    ],
+                    &s_rows,
+                    self.stream.raw,
+                )?;
+            } else {
+                self.programs.ihc_pre.launch(
+                    &[
+                        r_cur.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_fn"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_scale"))?.ptr,
+                        self.weights.buf(&format!("{p}.hc_attn_layer.hc_pre.hc_base"))?.ptr,
+                        self.weights.buf(&format!("{p}.input_layernorm.weight"))?.ptr,
+                        self.shared.post.buffer.ptr,
+                        w.y.buffer.ptr,
+                    ],
+                    &s_rows,
+                    self.stream.raw,
+                )?;
+            }
+            launch_proj_out(
+                self,
+                &format!("{p}.self_attn.q_a_proj"),
+                &self.programs.proj_q_a,
+                rows,
+                w.y.buffer,
+                self.shared.q_a.buffer,
+            )?;
+            launch_proj_kv_a(
+                self,
+                &format!("{p}.self_attn.kv_a_proj_with_mqa"),
+                rows,
+                w.y.buffer,
+                self.shared.kv_a.buffer,
+            )?;
+            launch_proj_out(
+                self,
+                &format!("{p}.self_attn.linear_gate"),
+                &self.programs.proj_linear_gate_dsa,
+                rows,
+                w.y.buffer,
+                self.shared.gate.buffer,
+            )?;
+        }
+        self.dsa_index_wk(p, wave_slot, rows)
     }
 
     fn dsa_index_wk(&self, p: &str, wave_slot: usize, rows: usize) -> Result<()> {
@@ -1631,6 +1833,15 @@ impl<'a> RankRuntime<'a> {
     }
 }
 
+/// Per-member gathered ContextSplit prefill plan staged in `begin_batch`.
+#[derive(Clone, Copy, Debug)]
+struct GatheredMemberPlan {
+    shards: [usize; 2],
+    commit_counts: [[usize; CONTEXT_COMMIT_PLANES]; 2],
+    group_start: usize,
+    complete_groups: usize,
+}
+
 /// Active batch metadata staged once per unit in `begin_batch` and consumed across layers.
 #[derive(Clone, Debug)]
 struct ActiveMember {
@@ -1640,6 +1851,7 @@ struct ActiveMember {
     row_start: usize,
     row_len: usize,
     next_engram_tail: [u32; 2],
+    gathered: Option<GatheredMemberPlan>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1657,6 +1869,7 @@ struct ActiveBatch {
     pt_stride: usize,
     ctx_pt_stride: usize,
     ctx_slot_counter: usize,
+    context_gathered: bool,
     swa_pt_stride: usize,
     all_single_row: bool,
     graphed: bool,
@@ -1830,7 +2043,9 @@ impl<'a> Hy4Engine<'a> {
                 .map(|rank| {
                     (0..prefill_waves)
                         .map(|slot| {
-                            let wave = WaveScratchLayout::new(&cfg, rank, slot, gpus, max_rows, max_seq_pages, max_sequences)?;
+                            let wave = WaveScratchLayout::new_with_context(
+                                &cfg, rank, slot, gpus, max_rows, max_seq_pages, max_sequences, true,
+                            )?;
                             MetadataUpload::new(&[devices[rank]], wave_metadata_layout_for_rank(rank, slot, &wave.arena)?)
                         })
                         .collect::<Result<Vec<_>>>()
@@ -1839,7 +2054,9 @@ impl<'a> Hy4Engine<'a> {
         } else {
             vec![(0..prefill_waves)
                 .map(|slot| {
-                    let wave = WaveScratchLayout::new(&cfg, 0, slot, gpus, max_rows, max_seq_pages, max_sequences)?;
+                    let wave = WaveScratchLayout::new_with_context(
+                        &cfg, 0, slot, gpus, max_rows, max_seq_pages, max_sequences, false,
+                    )?;
                     MetadataUpload::new(devices, wave_metadata_layout_for_rank(0, slot, &wave.arena)?)
                 })
                 .collect::<Result<Vec<_>>>()?]
@@ -1855,16 +2072,15 @@ impl<'a> Hy4Engine<'a> {
             let sms = device.run(|| device.library.sm_count())?;
             let mla_splits = MlaSplitPlan::new(&progs, max_context, decode_rows, sms)?;
             if let Some(ctx) = &progs.context {
-                let width = context_exchange_rows(max_rows, decode_rows);
                 for program in [&ctx.dsa_partial_h0, &ctx.dsa_partial_h16, &ctx.lse_combine2,
                     &ctx.indexer_scored_topk, &ctx.indexer_merge_expand_owned] {
-                    ensure!(width <= program.spec().capacity_rows as usize,
-                        "{} cannot cover admitted {width}-row context exchange", program.spec().name);
+                    ensure!(decode_rows <= program.spec().capacity_rows as usize,
+                        "{} cannot cover admitted {decode_rows}-row context exchange", program.spec().name);
                 }
             }
             // Split-capable launches never exceed the admitted decode/verify rows.
             let attn_scratch = mla_split_scratch_bytes(decode_rows, gpus)
-                .max(if context_split { hy4_dsa_partial_scratch_bytes(context_exchange_rows(max_rows, decode_rows)) } else { 0 });
+                .max(if context_split { hy4_dsa_partial_scratch_bytes(decode_rows) } else { 0 });
             let cache = Rc::new(Hy4CacheRank::new(
                 vec![stream.clone()],
                 &cfg,
@@ -1891,6 +2107,11 @@ impl<'a> Hy4Engine<'a> {
                 native_layout.as_ref(),
                 native_head_layout.as_ref(),
             )?;
+            let context_staging = if context_split {
+                Some(ContextStaging::new(device, &cfg, kv_format, rank, max_seq_pages)?)
+            } else {
+                None
+            };
             let mut waves = Vec::with_capacity(prefill_waves);
             for slot in 0..prefill_waves {
                 waves.push(WaveScratch::new(
@@ -1902,6 +2123,7 @@ impl<'a> Hy4Engine<'a> {
                     max_rows,
                     max_seq_pages,
                     max_sequences,
+                    context_split,
                 )?);
             }
             let bf16_add = device.run(|| device.library.bf16_add())?;
@@ -1917,6 +2139,7 @@ impl<'a> Hy4Engine<'a> {
                 weights,
                 cache,
                 shared,
+                context_staging,
                 waves,
                 bf16_add,
                 f32_add,
@@ -1953,7 +2176,7 @@ impl<'a> Hy4Engine<'a> {
                 peer.abort_word(0)?.context("Hy4 rank 0 exchange not abortable")?,
                 peer.abort_word(1)?.context("Hy4 rank 1 exchange not abortable")?,
             ];
-            let buffers = hy4_context_buffers(&cfg, max_rows, decode_rows);
+            let buffers = hy4_context_buffers(&cfg, decode_rows);
             Some(ContextExchange::new(
                 devices[0].library,
                 [
@@ -2432,6 +2655,9 @@ impl<'a> Hy4Engine<'a> {
             r.weights.inventory(weights_inv, retained_inv)?;
             r.cache.inventory(retained_inv)?;
             r.shared.inventory(retained_inv, rank)?;
+            if let Some(staging) = &r.context_staging {
+                staging.inventory(retained_inv, rank)?;
+            }
             for (slot, wave) in r.waves.iter().enumerate() {
                 wave.inventory(retained_inv, rank, slot)?;
             }
@@ -2670,6 +2896,19 @@ impl<'a> Hy4Engine<'a> {
         let swa_ring_pages = self.ranks[0].cache.swa_ring_pages;
         let swa_ring_rows = self.ranks[0].cache.swa_ring_rows;
 
+        let usage_phase = match priority {
+            ReadPriority::Decode | ReadPriority::DecodeFirst => UsagePhase::Decode,
+            ReadPriority::Prefill | ReadPriority::PrefillFirst => UsagePhase::Prefill,
+        };
+        let context_gathered = self.context_split && usage_phase == UsagePhase::Prefill;
+        let context_decode = self.context_split && !context_gathered;
+        let kv_rec_bytes = self.ranks[0].cache.kv_format.record_bytes();
+        let kv_page_bytes = PAGE_ROWS * kv_rec_bytes;
+        let groups_per_page = PAGE_ROWS / self.cfg.indexer_compress_ratio;
+        let idx_page_bytes = groups_per_page * INDEX_GROUP_RECORD_BYTES;
+        let gather_half = self.max_seq_pages.div_ceil(2);
+        let commit_limit = context_commit_limit(self.max_rows);
+
         let mut flat_tokens = Vec::with_capacity(rows);
         // Rope coordinates are [rows, 3] (T, H, W) interleaved M-RoPE; KV and SWA
         // slots, indexer limits and group ids stay slot-based (`pos`).
@@ -2677,14 +2916,14 @@ impl<'a> Hy4Engine<'a> {
         let mut media_rows: Vec<(usize, usize, usize)> = Vec::new();
         let mut pos_i32 = Vec::with_capacity(rows * 4);
         let mut dsa_slots_i64 = Vec::with_capacity(rows * 8);
-        let mut dsa_slots_ctx: [Vec<u8>; 2] = if self.context_split {
+        let mut dsa_slots_ctx: [Vec<u8>; 2] = if context_decode {
             [Vec::with_capacity(rows * 8), Vec::with_capacity(rows * 8)]
         } else {
             [Vec::new(), Vec::new()]
         };
         let mut swa_slots_i64 = Vec::with_capacity(rows * 8);
         let mut limits_bytes = Vec::with_capacity(rows * 4);
-        let mut limits_ctx: [Vec<u8>; 2] = if self.context_split {
+        let mut limits_ctx: [Vec<u8>; 2] = if context_decode {
             [Vec::with_capacity(rows * 4), Vec::with_capacity(rows * 4)]
         } else {
             [Vec::new(), Vec::new()]
@@ -2694,13 +2933,28 @@ impl<'a> Hy4Engine<'a> {
         let mut g_pos_bytes = Vec::new();
         let mut g_slots_bytes = Vec::new();
         let mut g_slots_ctx: [Vec<u8>; 2] = [Vec::new(), Vec::new()];
+        let mut ctx_gather_bytes = if context_gathered {
+            vec![0u8; unit.segments.len() * 2 * gather_half * 4]
+        } else {
+            Vec::new()
+        };
+        let mut ctx_commit_bytes: [Vec<u8>; 2] = if context_gathered {
+            let per_member = CONTEXT_COMMIT_PLANES * 3 * commit_limit * 8;
+            [
+                Vec::with_capacity(unit.segments.len() * per_member),
+                Vec::with_capacity(unit.segments.len() * per_member),
+            ]
+        } else {
+            [Vec::new(), Vec::new()]
+        };
         let mut engram_members: Vec<([u32; 2], &[u32])> = Vec::with_capacity(unit.segments.len());
 
         let mut max_seq_end = 0usize;
         let mut members = Vec::with_capacity(unit.segments.len());
         let mut row_cursor = 0usize;
+        let mut group_cursor = 0usize;
 
-        for seg in &unit.segments {
+        for (member_idx, seg) in unit.segments.iter().enumerate() {
             let p = placements
                 .get(seg.sequence)
                 .with_context(|| format!("Hy4 segment sequence {} out of range", seg.sequence))?;
@@ -2756,7 +3010,7 @@ impl<'a> Hy4Engine<'a> {
                 }
                 pos_i32.extend_from_slice(&(pos as i32).to_le_bytes());
                 swa_slots_i64.extend_from_slice(&(swa_slot as i64).to_le_bytes());
-                if self.context_split {
+                if context_decode {
                     let owner = context::page_owner(logical_page);
                     ensure!(raw_page & 1 == owner, "Hy4 ContextSplit logical page {logical_page} has wrong parity id {raw_page}");
                     let local_slot = ((raw_page >> 1) * PAGE_ROWS + local_row) as i64;
@@ -2765,6 +3019,12 @@ impl<'a> Hy4Engine<'a> {
                         dsa_slots_ctx[rank].extend_from_slice(&slot_val.to_le_bytes());
                         limits_ctx[rank].extend_from_slice(&(local_complete_groups(pos, rank) as i32).to_le_bytes());
                     }
+                } else if context_gathered {
+                    let owner = context::page_owner(logical_page);
+                    ensure!(raw_page & 1 == owner, "Hy4 ContextSplit logical page {logical_page} has wrong parity id {raw_page}");
+                    // Logical staging coordinates: producers write directly into contiguous staging.
+                    dsa_slots_i64.extend_from_slice(&(pos as i64).to_le_bytes());
+                    limits_bytes.extend_from_slice(&((pos / 4) as i32).to_le_bytes());
                 } else {
                     let dsa_slot = raw_page * PAGE_ROWS + local_row;
                     dsa_slots_i64.extend_from_slice(&(dsa_slot as i64).to_le_bytes());
@@ -2774,8 +3034,8 @@ impl<'a> Hy4Engine<'a> {
 
             let pending = pos_start % 4;
             let complete = (pending + n) / 4;
+            let first_gid = (pos_start - pending) / 4;
             if complete > 0 {
-                let first_gid = (pos_start - pending) / 4;
                 for g in 0..complete {
                     let gid = first_gid + g;
                     let logical_page = gid / (PAGE_ROWS / 4);
@@ -2785,7 +3045,7 @@ impl<'a> Hy4Engine<'a> {
                     for axis in p.rope_at(gid * 4)? {
                         g_pos_bytes.extend_from_slice(&axis.to_le_bytes());
                     }
-                    if self.context_split {
+                    if context_decode {
                         let owner = context::page_owner(logical_page);
                         ensure!(raw_page & 1 == owner, "Hy4 ContextSplit group {gid} page {logical_page} has wrong parity id {raw_page}");
                         let local_group_slot = ((raw_page >> 1) * (PAGE_ROWS / 4) + local_group) as i64;
@@ -2793,12 +3053,70 @@ impl<'a> Hy4Engine<'a> {
                             let val = if rank == owner { local_group_slot } else { -1i64 };
                             g_slots_ctx[rank].extend_from_slice(&val.to_le_bytes());
                         }
+                    } else if context_gathered {
+                        let owner = context::page_owner(logical_page);
+                        ensure!(raw_page & 1 == owner, "Hy4 ContextSplit group {gid} page {logical_page} has wrong parity id {raw_page}");
+                        g_slots_bytes.extend_from_slice(&(gid as i64).to_le_bytes());
                     } else {
                         let phys_group_slot = raw_page * (PAGE_ROWS / 4) + local_group;
                         g_slots_bytes.extend_from_slice(&(phys_group_slot as i64).to_le_bytes());
                     }
                 }
             }
+
+            let gathered = if context_gathered {
+                let history_pages = pos_start.div_ceil(PAGE_ROWS);
+                ensure!(
+                    pos_end.div_ceil(PAGE_ROWS) <= self.max_seq_pages,
+                    "Hy4-flash gathered prefill extent {pos_end} exceeds staging pages {}",
+                    self.max_seq_pages
+                );
+                let mut shards = [0usize; 2];
+                for (owner, shard) in shards.iter_mut().enumerate() {
+                    let local = context::local_pages(&p.units[..history_pages], owner)?;
+                    *shard = local.len();
+                    let off = (member_idx * 2 + owner) * gather_half * 4;
+                    for (j, &lp) in local.iter().enumerate() {
+                        ctx_gather_bytes[off + j * 4..off + (j + 1) * 4]
+                            .copy_from_slice(&(lp as i32).to_le_bytes());
+                    }
+                }
+                let planes = [
+                    CommitPlane {
+                        first: pos_start,
+                        rows: n,
+                        rows_per_unit: PAGE_ROWS,
+                        row_bytes: kv_rec_bytes,
+                        base: 0,
+                        unit_bytes: kv_page_bytes,
+                    },
+                    CommitPlane {
+                        first: first_gid,
+                        rows: complete,
+                        rows_per_unit: groups_per_page,
+                        row_bytes: INDEX_GROUP_RECORD_BYTES,
+                        base: 0,
+                        unit_bytes: idx_page_bytes,
+                    },
+                ];
+                let mut commit_counts = [[0usize; CONTEXT_COMMIT_PLANES]; 2];
+                for rank in 0..2 {
+                    let blocks = commit_blocks(rank, &p.units, &planes, commit_limit)?;
+                    commit_counts[rank] = [blocks.counts[0], blocks.counts[1]];
+                    for word in &blocks.table {
+                        ctx_commit_bytes[rank].extend_from_slice(&word.to_le_bytes());
+                    }
+                }
+                Some(GatheredMemberPlan {
+                    shards,
+                    commit_counts,
+                    group_start: group_cursor,
+                    complete_groups: complete,
+                })
+            } else {
+                None
+            };
+            group_cursor += complete;
 
             engram_members.push((cur_tail, tok_slice));
             members.push(ActiveMember {
@@ -2808,6 +3126,7 @@ impl<'a> Hy4Engine<'a> {
                 row_start: row_cursor,
                 row_len: n,
                 next_engram_tail: next_tail,
+                gathered,
             });
             row_cursor += n;
         }
@@ -2829,8 +3148,11 @@ impl<'a> Hy4Engine<'a> {
             pt_stride
         };
         let mut dsa_pt_bytes = if self.context_split { Vec::new() } else { Vec::with_capacity(rows * pt_stride * 4) };
-        let mut dsa_pt_ctx: [Vec<u8>; 2] = if self.context_split {
+        let mut dsa_pt_ctx: [Vec<u8>; 2] = if context_decode {
             [Vec::with_capacity(rows * ctx_pt_stride * 4), Vec::with_capacity(rows * ctx_pt_stride * 4)]
+        } else if context_gathered {
+            // One compact parity table row per member (read by `indexer_merge_expand_owned` for DFly2 recall).
+            [Vec::with_capacity(members.len() * ctx_pt_stride * 4), Vec::with_capacity(members.len() * ctx_pt_stride * 4)]
         } else {
             [Vec::new(), Vec::new()]
         };
@@ -2855,7 +3177,8 @@ impl<'a> Hy4Engine<'a> {
                             let phys = if lp < seq_pages { (p.units[lp] >> 1) as i32 } else { 0i32 };
                             row_pt.extend_from_slice(&phys.to_le_bytes());
                         }
-                        for _ in 0..m.row_len {
+                        let repeat = if context_gathered { 1 } else { m.row_len };
+                        for _ in 0..repeat {
                             dsa_pt_ctx[rank].extend_from_slice(&row_pt);
                         }
                     }
@@ -2891,7 +3214,8 @@ impl<'a> Hy4Engine<'a> {
                             let phys = if lp < seq_pages { (p.units[lp] >> 1) as i32 } else { 0i32 };
                             row_pt.extend_from_slice(&phys.to_le_bytes());
                         }
-                        for _ in 0..m.row_len {
+                        let repeat = if context_gathered { 1 } else { m.row_len };
+                        for _ in 0..repeat {
                             dsa_pt_ctx[rank].extend_from_slice(&row_pt);
                         }
                     }
@@ -2914,12 +3238,22 @@ impl<'a> Hy4Engine<'a> {
         // BEFORE launching embed/layer 0 so host I/O overlaps with GPU execution.
         let engram_wave = self.engram.begin_wave(&unit.layers, &engram_members, priority)?;
 
-        if self.context_split {
+        if context_gathered {
+            for rank in 0..2 {
+                self.metadata_uploads[rank][wave_slot].upload(&self.ranks[rank..rank + 1], wave_slot, [
+                    &pos_i64, &pos_i32, &dsa_slots_i64, &swa_slots_i64,
+                    &dsa_pt_ctx[rank], &swa_pt_slice_bytes, &cu_singleton, &swa_cu_bytes,
+                    &swa_seqlens_bytes, &limits_bytes, &g_pos_bytes, &g_slots_bytes,
+                    &ctx_gather_bytes, &ctx_commit_bytes[rank],
+                ])?;
+            }
+        } else if context_decode {
             for rank in 0..2 {
                 self.metadata_uploads[rank][wave_slot].upload(&self.ranks[rank..rank + 1], wave_slot, [
                     &pos_i64, &pos_i32, &dsa_slots_ctx[rank], &swa_slots_i64,
                     &dsa_pt_ctx[rank], &swa_pt_slice_bytes, &cu_singleton, &swa_cu_bytes,
                     &swa_seqlens_bytes, &limits_ctx[rank], &g_pos_bytes, &g_slots_ctx[rank],
+                    &[], &[],
                 ])?;
             }
         } else {
@@ -2927,6 +3261,7 @@ impl<'a> Hy4Engine<'a> {
                 &pos_i64, &pos_i32, &dsa_slots_i64, &swa_slots_i64,
                 &dsa_pt_bytes, &swa_pt_slice_bytes, &cu_singleton, &swa_cu_bytes,
                 &swa_seqlens_bytes, &limits_bytes, &g_pos_bytes, &g_slots_bytes,
+                &[], &[],
             ])?;
         }
 
@@ -2998,6 +3333,7 @@ impl<'a> Hy4Engine<'a> {
             pt_stride,
             ctx_pt_stride,
             ctx_slot_counter: 0,
+            context_gathered,
             swa_pt_stride,
             all_single_row,
             graphed,
@@ -3010,15 +3346,703 @@ impl<'a> Hy4Engine<'a> {
             final_layer,
             rank0_only_tail,
             decode_attention: priority == ReadPriority::Decode,
-            usage_phase: match priority {
-                ReadPriority::Decode | ReadPriority::DecodeFirst => UsagePhase::Decode,
-                ReadPriority::Prefill | ReadPriority::PrefillFirst => UsagePhase::Prefill,
-            },
+            usage_phase,
             dump_rows,
             use_a: true,
             members,
             engram_wave,
         })
+    }
+
+    /// 2-GPU gathered ContextSplit DSA prefill using the shared `gathered_prefill_with` protocol:
+    /// gathers history KV and compressed-indexer group pages into rank-local staging, runs producers
+    /// and local 16H MLA attention over logical staging (zero `ContextExchange`), commits rank-owned
+    /// pages back to the persistent parity pool, and computes `o_proj` partials.
+    fn run_dsa_gathered_prefill(
+        &self,
+        layer: usize,
+        dsa_idx: usize,
+        p: &str,
+        batch: &ActiveBatch,
+    ) -> Result<()> {
+        let wave_slot = batch.wave_slot;
+        let rows = batch.rows;
+        let local_heads = self.cfg.sparse_heads / 2;
+        let groups_per_page = PAGE_ROWS / self.cfg.indexer_compress_ratio;
+        let gather_half = self.max_seq_pages.div_ceil(2);
+        let commit_limit = context_commit_limit(self.max_rows);
+        let capture_draft = self.draft.as_ref().is_some_and(|d| d.captures_layer(layer));
+        let ctx_ex = self
+            .context_exchange
+            .as_ref()
+            .context("Hy4-flash ContextSplit missing ContextExchange")?;
+        let kv_pools = [
+            self.ranks[0].cache.dsa_kv_layer(dsa_idx)?,
+            self.ranks[1].cache.dsa_kv_layer(dsa_idx)?,
+        ];
+        let idx_pools = [
+            self.ranks[0].cache.dsa_index_layer(dsa_idx)?,
+            self.ranks[1].cache.dsa_index_layer(dsa_idx)?,
+        ];
+        let num_members = batch.members.len();
+
+        for rank in 0..2 {
+            let r = &self.ranks[rank];
+            let ctx_progs = r
+                .programs
+                .context
+                .as_ref()
+                .context("Hy4-flash ContextSplit programs missing")?;
+            let ctx = r
+                .shared
+                .ctx
+                .as_ref()
+                .context("Hy4-flash ContextSplit scratch missing")?;
+            let staging = r
+                .context_staging
+                .as_ref()
+                .context("Hy4-flash ContextSplit staging missing")?;
+            let w = &r.waves[wave_slot];
+            let gather_buf = w
+                .ctx_gather_tables
+                .as_ref()
+                .context("Hy4-flash wave missing ctx_gather_tables")?
+                .buffer;
+            let commit_buf = w
+                .ctx_commit_tables
+                .as_ref()
+                .context("Hy4-flash wave missing ctx_commit_tables")?
+                .buffer;
+            let ex_buf = ctx_ex.buffers(rank, 0)?;
+
+            for (member_idx, m) in batch.members.iter().enumerate() {
+                let plan = m
+                    .gathered
+                    .context("Hy4-flash gathered prefill member missing plan")?;
+                ensure!(
+                    (m.pos_start + m.row_len).div_ceil(PAGE_ROWS) <= staging.pages,
+                    "Hy4-flash gathered prefill extent {} exceeds staging pages {}",
+                    m.pos_start + m.row_len,
+                    staging.pages
+                );
+                struct Bindings<'e, 'a> {
+                    r: &'e RankRuntime<'a>,
+                    ctx_progs: &'e super::programs::Hy4ContextPrograms<'a>,
+                    ctx: &'e ContextScratch<'a>,
+                    staging: &'e ContextStaging<'a>,
+                    w: &'e WaveScratch<'a>,
+                    gather_buf: CuteafdDeviceBuffer,
+                    commit_buf: CuteafdDeviceBuffer,
+                    ex_buf: context::SlotBuffers,
+                    kv_pools: [CuteafdDeviceBuffer; 2],
+                    idx_pools: [CuteafdDeviceBuffer; 2],
+                    p: &'e str,
+                    layer: usize,
+                    dsa_idx: usize,
+                    rank: usize,
+                    local_heads: usize,
+                    rows: usize,
+                    groups_per_page: usize,
+                    ctx_pt_stride: usize,
+                    gather_half: usize,
+                    commit_limit: usize,
+                    member_idx: usize,
+                    is_last_member: bool,
+                    capture_draft: bool,
+                    m: &'e ActiveMember,
+                    plan: GatheredMemberPlan,
+                }
+                impl GatheredKernels for Bindings<'_, '_> {
+                    fn gather(&mut self, owner: usize) -> Result<()> {
+                        let shard = self.plan.shards[owner];
+                        if shard == 0 {
+                            return Ok(());
+                        }
+                        let table_off = (self.member_idx * 2 + owner) * self.gather_half * 4;
+                        let table = slice_buf(self.gather_buf, table_off, shard * 4)?;
+                        self.r.device.run(|| unsafe {
+                            self.ctx_progs.paged_staging_gather_kv.launch(
+                                &[self.kv_pools[owner].ptr, table.ptr, self.staging.kv.buffer.ptr],
+                                &[
+                                    Scalar::I32((shard * PAGE_ROWS) as i32),
+                                    Scalar::I32(2),
+                                    Scalar::I32(owner as i32),
+                                ],
+                                self.r.stream.raw,
+                            )?;
+                            self.ctx_progs.paged_staging_gather_index.launch(
+                                &[self.idx_pools[owner].ptr, table.ptr, self.staging.index.buffer.ptr],
+                                &[
+                                    Scalar::I32((shard * self.groups_per_page) as i32),
+                                    Scalar::I32(2),
+                                    Scalar::I32(owner as i32),
+                                ],
+                                self.r.stream.raw,
+                            )
+                        })
+                    }
+
+                    fn produce(&mut self) -> Result<()> {
+                        let r = self.r;
+                        let m = self.m;
+                        let n = m.row_len;
+                        let s_n = [Scalar::I32(n as i32)];
+                        let inv_freq = r.weights.inv_freq_dsa.buffer.ptr;
+                        let (w_uk, _) = r.weights.kv_b_absorbed(self.layer, self.local_heads)?;
+                        let ip = format!("{}.self_attn.compressed_indexer", self.p);
+                        let q_a = slice_buf(r.shared.q_a.buffer, m.row_start * Q_LORA * 2, n * Q_LORA * 2)?;
+                        let kv_a = slice_buf(r.shared.kv_a.buffer, m.row_start * KV_A_DIM * 2, n * KV_A_DIM * 2)?;
+                        let slots = slice_buf(self.w.dsa_slots_i64.buffer, m.row_start * 8, n * 8)?;
+                        let pos64 = slice_buf(self.w.positions_i64.buffer, m.row_start * 24, n * 24)?;
+                        let q_resid = slice_buf(r.shared.q_resid.buffer, m.row_start * Q_LORA * 2, n * Q_LORA * 2)?;
+                        let q_raw = slice_buf(
+                            r.shared.q_raw.buffer,
+                            m.row_start * self.local_heads * 256 * 2,
+                            n * self.local_heads * 256 * 2,
+                        )?;
+                        let query = slice_buf(
+                            r.shared.query.buffer,
+                            m.row_start * self.local_heads * KV_A_DIM * 2,
+                            n * self.local_heads * KV_A_DIM * 2,
+                        )?;
+                        let y_slice = slice_buf(self.w.y.buffer, m.row_start * H * 2, n * H * 2)?;
+
+                        r.device.run(|| unsafe {
+                            r.programs.mla_rank_norm_pack.launch(
+                                &[
+                                    q_a.ptr,
+                                    kv_a.ptr,
+                                    r.weights.buf(&format!("{}.self_attn.q_a_layernorm.weight", self.p))?.ptr,
+                                    r.weights.buf(&format!("{}.self_attn.kv_a_layernorm.weight", self.p))?.ptr,
+                                    slots.ptr,
+                                    pos64.ptr,
+                                    inv_freq,
+                                    q_resid.ptr,
+                                    self.staging.kv.buffer.ptr,
+                                ],
+                                &s_n,
+                                r.stream.raw,
+                            )?;
+                            launch_proj_out(
+                                r,
+                                &format!("{}.self_attn.q_b_proj", self.p),
+                                &r.programs.proj_q_b_dsa,
+                                n,
+                                q_resid,
+                                q_raw,
+                            )?;
+                            r.programs.mla_q_absorb_dsa.launch(
+                                &[q_raw.ptr, w_uk, pos64.ptr, inv_freq, query.ptr],
+                                &s_n,
+                                r.stream.raw,
+                            )?;
+
+                            // Pool completed 4-token groups into logical staging `staging.index`.
+                            let pending = r.cache.pending_counts.borrow()[m.slot][self.dsa_idx];
+                            ensure!(
+                                pending == m.pos_start % 4,
+                                "Hy4 DSA layer {} slot {} pending count {pending} != {}",
+                                self.layer,
+                                m.slot,
+                                m.pos_start % 4
+                            );
+                            let total_avail = pending + n;
+                            let complete = total_avail / 4;
+                            let new_pending = total_avail % 4;
+                            ensure!(
+                                complete == self.plan.complete_groups,
+                                "Hy4 gathered complete groups {complete} != staged {}",
+                                self.plan.complete_groups
+                            );
+                            let pending_buf = r.cache.pending_key_slot(m.slot, self.dsa_idx)?;
+                            let tok_src_base = m.row_start * IDX_DIM * 2;
+                            if complete > 0 {
+                                if pending > 0 {
+                                    let dst_p = slice_buf(r.shared.idx_group_tok.buffer, 0, pending * IDX_DIM * 2)?;
+                                    r.device.library.copy_d2d_async(
+                                        dst_p,
+                                        pending_buf,
+                                        pending * IDX_DIM * 2,
+                                        r.stream.raw,
+                                    )?;
+                                }
+                                let copy_from_cur = complete * 4 - pending;
+                                let dst_cur = slice_buf(
+                                    r.shared.idx_group_tok.buffer,
+                                    pending * IDX_DIM * 2,
+                                    copy_from_cur * IDX_DIM * 2,
+                                )?;
+                                let src_cur = slice_buf(
+                                    r.shared.idx_tk.buffer,
+                                    tok_src_base,
+                                    copy_from_cur * IDX_DIM * 2,
+                                )?;
+                                r.device.library.copy_d2d_async(
+                                    dst_cur,
+                                    src_cur,
+                                    copy_from_cur * IDX_DIM * 2,
+                                    r.stream.raw,
+                                )?;
+                                let g_pos = slice_buf(
+                                    self.w.idx_group_pos.buffer,
+                                    self.plan.group_start * 24,
+                                    complete * 24,
+                                )?;
+                                let g_slots = slice_buf(
+                                    self.w.idx_group_slots.buffer,
+                                    self.plan.group_start * 8,
+                                    complete * 8,
+                                )?;
+                                r.programs.indexer_pool_group.launch(
+                                    &[
+                                        r.shared.idx_group_tok.buffer.ptr,
+                                        r.weights.weight(&format!("{ip}.key_value_projection"))?.ptr,
+                                        r.weights.weight(&format!("{ip}.key_gate_projection"))?.ptr,
+                                        r.weights.buf(&format!("{ip}.intra_group_ape"))?.ptr,
+                                        r.weights.buf(&format!("{ip}.key_norm.weight"))?.ptr,
+                                        g_pos.ptr,
+                                        g_slots.ptr,
+                                        inv_freq,
+                                        self.staging.index.buffer.ptr,
+                                    ],
+                                    &[Scalar::I32(complete as i32)],
+                                    r.stream.raw,
+                                )?;
+                            }
+                            if new_pending > 0 {
+                                if complete == 0 {
+                                    let dst = slice_buf(pending_buf, pending * IDX_DIM * 2, n * IDX_DIM * 2)?;
+                                    let src = slice_buf(r.shared.idx_tk.buffer, tok_src_base, n * IDX_DIM * 2)?;
+                                    r.device.library.copy_d2d_async(dst, src, n * IDX_DIM * 2, r.stream.raw)?;
+                                } else {
+                                    let tail_off = tok_src_base + (complete * 4 - pending) * IDX_DIM * 2;
+                                    let src = slice_buf(r.shared.idx_tk.buffer, tail_off, new_pending * IDX_DIM * 2)?;
+                                    r.device.library.copy_d2d_async(
+                                        pending_buf,
+                                        src,
+                                        new_pending * IDX_DIM * 2,
+                                        r.stream.raw,
+                                    )?;
+                                }
+                            }
+                            r.cache.pending_counts.borrow_mut()[m.slot][self.dsa_idx] = new_pending;
+
+                            if m.pos_start + n > CANDIDATE_TOPK {
+                                r.programs.proj_indexer_wq_b.launch(
+                                    &[
+                                        q_resid.ptr,
+                                        r.weights.weight(&format!("{ip}.query_projection"))?.ptr,
+                                        r.shared.idx_q_raw.buffer.ptr,
+                                    ],
+                                    &s_n,
+                                    r.stream.raw,
+                                )?;
+                                r.programs.proj_indexer_weights.launch(
+                                    &[
+                                        y_slice.ptr,
+                                        r.weights.weight(&format!("{ip}.head_weight_projection"))?.ptr,
+                                        r.shared.idx_w_raw.buffer.ptr,
+                                    ],
+                                    &s_n,
+                                    r.stream.raw,
+                                )?;
+                                r.programs.indexer_query_rope.launch(
+                                    &[
+                                        r.shared.idx_q_raw.buffer.ptr,
+                                        r.shared.idx_w_raw.buffer.ptr,
+                                        pos64.ptr,
+                                        inv_freq,
+                                        r.shared.idx_q_rot.buffer.ptr,
+                                        r.shared.idx_w_out.buffer.ptr,
+                                    ],
+                                    &s_n,
+                                    r.stream.raw,
+                                )?;
+                            }
+                            Ok(())
+                        })
+                    }
+
+                    fn attention(&mut self) -> Result<()> {
+                        let r = self.r;
+                        let m = self.m;
+                        let n = m.row_len;
+                        let seq_end = m.pos_start + n;
+                        let need_score = seq_end > CANDIDATE_TOPK;
+                        let query = slice_buf(
+                            r.shared.query.buffer,
+                            m.row_start * self.local_heads * KV_A_DIM * 2,
+                            n * self.local_heads * KV_A_DIM * 2,
+                        )?;
+                        let attn_out = slice_buf(
+                            r.shared.attn_out.buffer,
+                            m.row_start * self.local_heads * 512 * 2,
+                            n * self.local_heads * 512 * 2,
+                        )?;
+                        let lse_out = slice_buf(
+                            r.shared.lse_out.buffer,
+                            m.row_start * self.local_heads * 4,
+                            n * self.local_heads * 4,
+                        )?;
+                        r.device.run(|| unsafe {
+                            if need_score {
+                                let max_groups = seq_end / 4;
+                                let tile_cap = (r.shared.idx_score_floats / max_groups.max(1)).max(1);
+                                for tile_start in (0..n).step_by(tile_cap) {
+                                    let tile_rows = (n - tile_start).min(tile_cap);
+                                    let abs_row = m.row_start + tile_start;
+                                    let q_rot_ptr = r
+                                        .shared
+                                        .idx_q_rot
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(tile_start * IDX_HEADS * IDX_DIM * 2)
+                                        .cast();
+                                    let w_out_ptr = r
+                                        .shared
+                                        .idx_w_out
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(tile_start * IDX_HEADS * 4)
+                                        .cast();
+                                    let lim_ptr = self
+                                        .w
+                                        .idx_limits
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(abs_row * 4)
+                                        .cast();
+                                    let pos_ptr = self
+                                        .w
+                                        .positions_i32
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(abs_row * 4)
+                                        .cast();
+                                    let slot_ptr = r
+                                        .shared
+                                        .idx_cand_slots
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(tile_start * CANDIDATE_TOPK * 4)
+                                        .cast();
+                                    let len_ptr = r
+                                        .shared
+                                        .idx_cand_lens
+                                        .buffer
+                                        .ptr
+                                        .cast::<u8>()
+                                        .wrapping_add(tile_start * 4)
+                                        .cast();
+                                    // `table_stride = 0`: every row reads shared `staging.identity_pt[0..]`.
+                                    r.programs.indexer_score_groups.launch(
+                                        &[
+                                            q_rot_ptr,
+                                            w_out_ptr,
+                                            self.staging.index.buffer.ptr,
+                                            self.staging.identity_pt.buffer.ptr,
+                                            lim_ptr,
+                                            r.shared.idx_scores.buffer.ptr,
+                                        ],
+                                        &[
+                                            Scalar::I32(tile_rows as i32),
+                                            Scalar::I32(max_groups as i32),
+                                            Scalar::I32(0),
+                                        ],
+                                        r.stream.raw,
+                                    )?;
+                                    r.programs.indexer_topk_expand.launch(
+                                        &[
+                                            r.shared.idx_scores.buffer.ptr,
+                                            pos_ptr,
+                                            self.staging.identity_pt.buffer.ptr,
+                                            slot_ptr,
+                                            len_ptr,
+                                        ],
+                                        &[
+                                            Scalar::I32(tile_rows as i32),
+                                            Scalar::I32(max_groups as i32),
+                                            Scalar::I32(0),
+                                        ],
+                                        r.stream.raw,
+                                    )?;
+                                    if self.capture_draft && tile_start + tile_rows == n {
+                                        let last_in_tile = tile_rows - 1;
+                                        let last_abs = m.row_start + n - 1;
+                                        let score_last = r
+                                            .shared
+                                            .idx_scores
+                                            .buffer
+                                            .ptr
+                                            .cast::<u8>()
+                                            .wrapping_add(last_in_tile * max_groups * 4)
+                                            .cast();
+                                        let pos_last = self
+                                            .w
+                                            .positions_i32
+                                            .buffer
+                                            .ptr
+                                            .cast::<u8>()
+                                            .wrapping_add(last_abs * 4)
+                                            .cast();
+                                        let lim_last = self
+                                            .w
+                                            .idx_limits
+                                            .buffer
+                                            .ptr
+                                            .cast::<u8>()
+                                            .wrapping_add(last_abs * 4)
+                                            .cast();
+                                        let half_bytes = GROUP_TOPK * 4;
+                                        self.ctx_progs.indexer_scored_topk.launch(
+                                            &[
+                                                score_last,
+                                                pos_last,
+                                                lim_last,
+                                                self.ex_buf.scores,
+                                                self.ex_buf.indices,
+                                            ],
+                                            &[
+                                                Scalar::I32(1),
+                                                Scalar::I32(max_groups as i32),
+                                                Scalar::I32(1),
+                                                Scalar::I32(0),
+                                            ],
+                                            r.stream.raw,
+                                        )?;
+                                        let dst_s_hi = CuteafdDeviceBuffer {
+                                            ptr: self.ex_buf.scores.cast::<u8>().wrapping_add(half_bytes).cast(),
+                                            bytes: half_bytes,
+                                            device_id: r.device.id,
+                                            flags: 0,
+                                        };
+                                        let dst_i_hi = CuteafdDeviceBuffer {
+                                            ptr: self.ex_buf.indices.cast::<u8>().wrapping_add(half_bytes).cast(),
+                                            bytes: half_bytes,
+                                            device_id: r.device.id,
+                                            flags: 0,
+                                        };
+                                        r.device.library.copy_d2d_async(
+                                            dst_s_hi,
+                                            self.staging.empty_cand_scores.buffer,
+                                            half_bytes,
+                                            r.stream.raw,
+                                        )?;
+                                        r.device.library.copy_d2d_async(
+                                            dst_i_hi,
+                                            self.staging.empty_cand_indices.buffer,
+                                            half_bytes,
+                                            r.stream.raw,
+                                        )?;
+                                    }
+                                }
+                            } else {
+                                let pos_ptr = self
+                                    .w
+                                    .positions_i32
+                                    .buffer
+                                    .ptr
+                                    .cast::<u8>()
+                                    .wrapping_add(m.row_start * 4)
+                                    .cast();
+                                r.programs.indexer_topk_expand.launch(
+                                    &[
+                                        r.shared.idx_scores.buffer.ptr,
+                                        pos_ptr,
+                                        self.staging.identity_pt.buffer.ptr,
+                                        r.shared.idx_cand_slots.buffer.ptr,
+                                        r.shared.idx_cand_lens.buffer.ptr,
+                                    ],
+                                    &[Scalar::I32(n as i32), Scalar::I32(1), Scalar::I32(0)],
+                                    r.stream.raw,
+                                )?;
+                            }
+                            r.programs.mla_dsa_decode.launch(
+                                &[
+                                    query.ptr,
+                                    self.staging.kv.buffer.ptr,
+                                    r.shared.idx_cand_slots.buffer.ptr,
+                                    r.shared.idx_cand_lens.buffer.ptr,
+                                    self.w.dsa_cu_seqlens.buffer.ptr,
+                                    attn_out.ptr,
+                                    lse_out.ptr,
+                                    r.shared.attn_scratch.buffer.ptr,
+                                ],
+                                &[
+                                    Scalar::I32(n as i32),
+                                    Scalar::I32(n as i32),
+                                    Scalar::I64(CANDIDATE_TOPK as i64),
+                                    Scalar::I32(1),
+                                ],
+                                r.stream.raw,
+                            )?;
+                            if self.capture_draft {
+                                // Emit parity-split physical DFly2 recall slots for the member's last row
+                                // after `mla_dsa_decode` has consumed `idx_cand_slots`/`idx_cand_lens`.
+                                let last_abs = m.row_start + n - 1;
+                                let pos_last = self
+                                    .w
+                                    .positions_i32
+                                    .buffer
+                                    .ptr
+                                    .cast::<u8>()
+                                    .wrapping_add(last_abs * 4)
+                                    .cast();
+                                let pt_ptr = self
+                                    .w
+                                    .dsa_page_table
+                                    .buffer
+                                    .ptr
+                                    .cast::<u8>()
+                                    .wrapping_add(self.member_idx * self.ctx_pt_stride * 4)
+                                    .cast();
+                                let dst_draft = self
+                                    .ctx
+                                    .draft_slots
+                                    .buffer
+                                    .ptr
+                                    .cast::<u8>()
+                                    .wrapping_add(self.member_idx * CANDIDATE_TOPK * 4)
+                                    .cast();
+                                self.ctx_progs.indexer_merge_expand_owned.launch(
+                                    &[
+                                        self.ex_buf.scores,
+                                        self.ex_buf.indices,
+                                        pos_last,
+                                        pt_ptr,
+                                        r.shared.idx_cand_slots.buffer.ptr,
+                                        r.shared.idx_cand_lens.buffer.ptr,
+                                        dst_draft,
+                                    ],
+                                    &[
+                                        Scalar::I32(1),
+                                        Scalar::I32(self.ctx_pt_stride as i32),
+                                        Scalar::I32(self.rank as i32),
+                                        Scalar::I32(1),
+                                    ],
+                                    r.stream.raw,
+                                )?;
+                            }
+                            Ok(())
+                        })
+                    }
+
+                    fn commit(&mut self) -> Result<()> {
+                        let counts = self.plan.commit_counts[self.rank];
+                        let member_base =
+                            self.member_idx * CONTEXT_COMMIT_PLANES * 3 * self.commit_limit * 8;
+                        let list = |plane: usize, part: usize| -> Result<*const std::ffi::c_void> {
+                            let off = member_base + (plane * 3 + part) * self.commit_limit * 8;
+                            Ok(slice_buf(self.commit_buf, off, counts[plane].max(1) * 8)?
+                                .ptr
+                                .cast_const())
+                        };
+                        self.r.device.run(|| unsafe {
+                            if counts[0] > 0 {
+                                self.r.device.library.cuda_kv_cache_write_blocks_async(
+                                    self.staging.kv.buffer.ptr,
+                                    self.kv_pools[self.rank].ptr,
+                                    list(0, 0)?,
+                                    list(0, 1)?,
+                                    list(0, 2)?,
+                                    counts[0],
+                                    self.r.stream.raw,
+                                )?;
+                            }
+                            if counts[1] > 0 {
+                                self.r.device.library.cuda_kv_cache_write_blocks_async(
+                                    self.staging.index.buffer.ptr,
+                                    self.idx_pools[self.rank].ptr,
+                                    list(1, 0)?,
+                                    list(1, 1)?,
+                                    list(1, 2)?,
+                                    counts[1],
+                                    self.r.stream.raw,
+                                )?;
+                            }
+                            Ok(())
+                        })
+                    }
+
+                    fn output(&mut self) -> Result<()> {
+                        if !self.is_last_member {
+                            return Ok(());
+                        }
+                        self.r.device.run(|| {
+                            self.r.attn_out(self.p, self.layer, true, 2, self.local_heads, self.rows)
+                        })
+                    }
+                }
+
+                let mut bindings = Bindings {
+                    r,
+                    ctx_progs,
+                    ctx,
+                    staging,
+                    w,
+                    gather_buf,
+                    commit_buf,
+                    ex_buf,
+                    kv_pools,
+                    idx_pools,
+                    p,
+                    layer,
+                    dsa_idx,
+                    rank,
+                    local_heads,
+                    rows,
+                    groups_per_page,
+                    ctx_pt_stride: batch.ctx_pt_stride,
+                    gather_half,
+                    commit_limit,
+                    member_idx,
+                    is_last_member: member_idx + 1 == num_members,
+                    capture_draft,
+                    m,
+                    plan,
+                };
+                gathered_prefill_with(&mut bindings)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Capture DFly2 dual parity recall after `PEER_SLOT_ATTN` has synchronized both GPUs'
+    /// `ctx.draft_slots` from gathered ContextSplit prefill.
+    fn capture_draft_recall_gathered(&self, layer: usize, batch: &ActiveBatch) -> Result<()> {
+        let Some(draft) = self.draft.as_ref().filter(|d| d.captures_layer(layer)) else {
+            return Ok(());
+        };
+        let row_bytes = CANDIDATE_TOPK * 4;
+        for rank in 0..draft.tp() {
+            let peer = 1 - rank;
+            let r = &self.ranks[rank];
+            let own_ctx = r
+                .shared
+                .ctx
+                .as_ref()
+                .context("Hy4-flash ContextSplit scratch missing")?;
+            let peer_ctx = self.ranks[peer]
+                .shared
+                .ctx
+                .as_ref()
+                .context("Hy4-flash peer ContextSplit scratch missing")?;
+            r.device.run(|| {
+                for (member_idx, m) in batch.members.iter().enumerate() {
+                    let own_slots = slice_buf(own_ctx.draft_slots.buffer, member_idx * row_bytes, row_bytes)?;
+                    let peer_slots = slice_buf(peer_ctx.draft_slots.buffer, member_idx * row_bytes, row_bytes)?;
+                    draft.capture_recall(rank, false, m.slot, layer, own_slots, &r.stream)?;
+                    draft.capture_recall_peer(rank, false, m.slot, layer, peer_slots, &r.stream)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     /// 2-GPU ContextSplit DSA body after `DsaPre` has written parity-owned KV rows,
@@ -3166,10 +4190,10 @@ impl<'a> Hy4Engine<'a> {
 
         let write_draft = i32::from(self.draft.as_ref().is_some_and(|d| d.captures_layer(layer)));
         let query_half_bytes = 16 * KV_A_DIM * 2;
-        let ctx_chunk = context_chunk_rows(self.max_rows, self.decode_rows, batch.usage_phase == UsagePhase::Decode);
+        let ctx_chunk = self.decode_rows;
 
-        // 3. Chunked ContextSplit exchange + dual partials + combine (1 pass on decode/verify,
-        // otherwise one pass per admitted prefill tile; MLA internally uses 64-row scratch).
+        // 3. Chunked ContextSplit exchange + dual partials + combine (decode/verify;
+        // prefill uses `run_dsa_gathered_prefill`).
         for chunk_start in (0..rows).step_by(ctx_chunk) {
             let c_rows = (rows - chunk_start).min(ctx_chunk);
             let slot = if batch.graphed {
@@ -4030,7 +5054,15 @@ impl<'a> Hy4Engine<'a> {
         } else {
             None
         };
-        if is_sparse && self.context_split {
+        if is_sparse && batch.context_gathered {
+            let dsa_idx = self.dsa_index_of[&layer];
+            for r in &self.ranks {
+                r.device.run(|| {
+                    r.attn_pre_gathered_dsa_front(&p, wave_slot, rows, use_a, fused_prev_post)
+                })?;
+            }
+            self.run_dsa_gathered_prefill(layer, dsa_idx, &p, batch)?;
+        } else if is_sparse && self.context_split {
             let dsa_idx = self.dsa_index_of[&layer];
             for r in &self.ranks {
                 let kv_cache_buf = r.cache.dsa_kv_layer(dsa_idx)?;
@@ -4077,6 +5109,9 @@ impl<'a> Hy4Engine<'a> {
                 exchange.wait(1, PEER_SLOT_ATTN)?;
             } else {
                 self.exchange_attn_tp2(rows)?;
+            }
+            if is_sparse && batch.context_gathered {
+                self.capture_draft_recall_gathered(layer, batch)?;
             }
             let attn_recv = [exchange.recv(0, PEER_SLOT_ATTN)?, exchange.recv(1, PEER_SLOT_ATTN)?];
             let o_stem = format!("{p}.self_attn.o_proj");
@@ -5126,224 +6161,14 @@ impl<'a> Hy4Engine<'a> {
         prompt_b: &[u32],
         unit_rows: usize,
         last_layer: usize,
-    ) -> Result<TwoSeqWaveProof> {
-        use crate::shared::prefill_pipeline::sequence_units;
-        ensure!(
-            self.prefill_waves >= 2 && self.max_sequences >= 2,
-            "verify_concurrent_two_seq_waves requires prefill_waves >= 2 and max_sequences >= 2"
-        );
-        ensure!(
-            !prompt_a.is_empty() && !prompt_b.is_empty() && unit_rows > 0 && unit_rows <= self.max_rows,
-            "invalid prompt or unit_rows for wave verification"
-        );
-        ensure!(last_layer + 1 == self.cfg.layers, "verify_concurrent_two_seq_waves requires full 42 layers");
-        self.assert_disjoint_wave_engram_buffers()?;
-        let buffer_summary = self.wave_engram_buffer_summary();
-
-        let pages_a = prompt_a.len().div_ceil(PAGE_ROWS);
-        let pages_b = prompt_b.len().div_ceil(PAGE_ROWS);
-        ensure!(
-            pages_a + pages_b <= self.max_pages,
-            "two-sequence wave proof needs {} pages, engine has {}",
-            pages_a + pages_b,
-            self.max_pages
-        );
-        let vocab = self.cfg.vocab_size;
-        let pad_id = self.cfg.engram_pad_id;
-        let layers = self.cfg.layers;
-        let library = self.library();
-
-        let make_solo_units = |len: usize, waves: usize| -> Result<Vec<Unit>> {
-            let mut units = sequence_units(len, unit_rows, waves, layers)?;
-            let last_idx = units.len() - 1;
-            for (i, u) in units.iter_mut().enumerate() {
-                let span = u.rows.clone();
-                u.segments = vec![UnitSegment {
-                    sequence: 0,
-                    rows: 0..span.len(),
-                    tokens: span,
-                    prompt_end: i == last_idx,
-                    snapshot: false,
-                    head: true,
-                }];
-            }
-            Ok(units)
-        };
-
-        // 1. Prompt A solo at waves=1 (one unit per run_units call = strictly 1 wave in flight).
-        self.reset()?;
-        let units_a1 = make_solo_units(prompt_a.len(), 1)?;
-        let mut p_a1 = [Hy4Placement::new((0..pages_a as u32).collect(), 0, pad_id)];
-        let mut logits_a_solo = vec![0f32; prompt_a.len() * vocab];
-        for mut unit in units_a1 {
-            unit.index = 0;
-            unit.slot = 0;
-            let src = &prompt_a[unit.rows.clone()];
-            self.run_units(
-                &mut p_a1,
-                &[src],
-                &[unit],
-                ReadPriority::Prefill,
-                |_| HeadMode::Suffix(0),
-                &mut |u, row_off, logits| {
-                    let tile = logits.to_host(library)?;
-                    let dst = (u.rows.start + row_off) * vocab;
-                    logits_a_solo[dst..dst + tile.len()].copy_from_slice(&tile);
-                    Ok(())
-                },
-            )?;
-        }
-        let tail_a_solo = p_a1[0].engram_tail;
-
-        // 2. Prompt B solo at waves=1 (one unit per run_units call = strictly 1 wave in flight).
-        self.reset()?;
-        let units_b1 = make_solo_units(prompt_b.len(), 1)?;
-        let mut p_b1 = [Hy4Placement::new((pages_a as u32..(pages_a + pages_b) as u32).collect(), 1, pad_id)];
-        let mut logits_b_solo = vec![0f32; prompt_b.len() * vocab];
-        for mut unit in units_b1 {
-            unit.index = 0;
-            unit.slot = 0;
-            let src = &prompt_b[unit.rows.clone()];
-            self.run_units(
-                &mut p_b1,
-                &[src],
-                &[unit],
-                ReadPriority::Prefill,
-                |_| HeadMode::Suffix(0),
-                &mut |u, row_off, logits| {
-                    let tile = logits.to_host(library)?;
-                    let dst = (u.rows.start + row_off) * vocab;
-                    logits_b_solo[dst..dst + tile.len()].copy_from_slice(&tile);
-                    Ok(())
-                },
-            )?;
-        }
-        let tail_b_solo = p_b1[0].engram_tail;
-
-        // 3. Prompt A solo at waves=W (cross-wave boundary tail + logits check).
-        self.reset()?;
-        let units_aw = make_solo_units(prompt_a.len(), self.prefill_waves)?;
-        ensure!(units_aw.len() >= 2, "prompt A must span >= 2 units at unit_rows={unit_rows} to cross wave boundary");
-        let mut p_aw = [Hy4Placement::new((0..pages_a as u32).collect(), 0, pad_id)];
-        let mut logits_a_mw = vec![0f32; prompt_a.len() * vocab];
-        self.run_units(
-            &mut p_aw,
-            &[prompt_a],
-            &units_aw,
-            ReadPriority::Prefill,
-            |_| HeadMode::Suffix(0),
-            &mut |u, row_off, logits| {
-                let tile = logits.to_host(library)?;
-                let dst = (u.rows.start + row_off) * vocab;
-                logits_a_mw[dst..dst + tile.len()].copy_from_slice(&tile);
-                Ok(())
-            },
-        )?;
-        let tail_a_mw = p_aw[0].engram_tail;
-        let diff_a_mw = count_f32_bit_diffs(&logits_a_solo, &logits_a_mw);
-        ensure!(
-            diff_a_mw == 0 && tail_a_mw == tail_a_solo,
-            "single-sequence multi-wave (waves={}) diverged from waves=1: diff_elems={diff_a_mw} tail={tail_a_mw:?} != {tail_a_solo:?}",
-            self.prefill_waves
-        );
-
-        // 4. Prompt A and Prompt B concurrently in interleaved waves (A in wave k, B in wave k+1).
-        self.reset()?;
-        let a_ranges = crate::shared::prefill_pipeline::prefill_units(prompt_a.len(), unit_rows, self.prefill_waves, 256)?;
-        let b_ranges = crate::shared::prefill_pipeline::prefill_units(prompt_b.len(), unit_rows, self.prefill_waves, 256)?;
-        let mut interleaved = Vec::with_capacity(a_ranges.len() + b_ranges.len());
-        let max_len = a_ranges.len().max(b_ranges.len());
-        let mut idx = 0usize;
-        for step in 0..max_len {
-            if let Some(span) = a_ranges.get(step).cloned() {
-                interleaved.push(Unit {
-                    index: idx,
-                    sequence: 0,
-                    segments: vec![UnitSegment {
-                        sequence: 0,
-                        rows: 0..span.len(),
-                        tokens: span.clone(),
-                        prompt_end: step + 1 == a_ranges.len(),
-                        snapshot: false,
-                        head: true,
-                    }],
-                    rows: span,
-                    layers: 0..layers,
-                    slot: idx % self.prefill_waves,
-                    barrier: false,
-                });
-                idx += 1;
-            }
-            if let Some(span) = b_ranges.get(step).cloned() {
-                interleaved.push(Unit {
-                    index: idx,
-                    sequence: 1,
-                    segments: vec![UnitSegment {
-                        sequence: 1,
-                        rows: 0..span.len(),
-                        tokens: span.clone(),
-                        prompt_end: step + 1 == b_ranges.len(),
-                        snapshot: false,
-                        head: true,
-                    }],
-                    rows: span,
-                    layers: 0..layers,
-                    slot: idx % self.prefill_waves,
-                    barrier: false,
-                });
-                idx += 1;
-            }
-        }
-        let mut placements = [
-            Hy4Placement::new((0..pages_a as u32).collect(), 0, pad_id),
-            Hy4Placement::new((pages_a as u32..(pages_a + pages_b) as u32).collect(), 1, pad_id),
-        ];
-        let mut logits_a_conc = vec![0f32; prompt_a.len() * vocab];
-        let mut logits_b_conc = vec![0f32; prompt_b.len() * vocab];
-        self.run_units(
-            &mut placements,
-            &[prompt_a, prompt_b],
-            &interleaved,
-            ReadPriority::Prefill,
-            |_| HeadMode::Suffix(0),
-            &mut |u, row_off, logits| {
-                let tile = logits.to_host(library)?;
-                let dst = (u.rows.start + row_off) * vocab;
-                if u.sequence == 0 {
-                    logits_a_conc[dst..dst + tile.len()].copy_from_slice(&tile);
-                } else {
-                    logits_b_conc[dst..dst + tile.len()].copy_from_slice(&tile);
-                }
-                Ok(())
-            },
-        )?;
-        let tail_a_conc = placements[0].engram_tail;
-        let tail_b_conc = placements[1].engram_tail;
-        let diff_a_conc = count_f32_bit_diffs(&logits_a_solo, &logits_a_conc);
-        let diff_b_conc = count_f32_bit_diffs(&logits_b_solo, &logits_b_conc);
-        ensure!(
-            diff_a_conc == 0 && tail_a_conc == tail_a_solo,
-            "concurrent 2-seq multi-wave prompt A diverged: diff_elems={diff_a_conc} tail={tail_a_conc:?} != {tail_a_solo:?}"
-        );
-        ensure!(
-            diff_b_conc == 0 && tail_b_conc == tail_b_solo,
-            "concurrent 2-seq multi-wave prompt B diverged: diff_elems={diff_b_conc} tail={tail_b_conc:?} != {tail_b_solo:?}"
-        );
-
-        Ok(TwoSeqWaveProof {
-            gpus: self.ranks.len(),
-            waves: self.prefill_waves,
+    ) -> Result<super::super::hy4_common::golden::TwoSeqWaveProof> {
+        super::super::hy4_common::golden::verify_concurrent_two_seq_waves(
+            self,
+            prompt_a,
+            prompt_b,
             unit_rows,
-            prompt_a_len: prompt_a.len(),
-            prompt_b_len: prompt_b.len(),
-            units_a: a_ranges.len(),
-            units_b: b_ranges.len(),
-            logits_a_solo,
-            logits_b_solo,
-            tail_a: tail_a_solo,
-            tail_b: tail_b_solo,
-            buffer_summary,
-        })
+            last_layer,
+        )
     }
 
     /// Return the active 4-stream residual `[rows, 4, H]` F32 from rank 0 (for layer-0 boundary checks).
@@ -5360,29 +6185,52 @@ impl<'a> Hy4Engine<'a> {
     }
 }
 
+impl super::super::hy4_common::golden::TwoSeqWaveEngine for Hy4Engine<'_> {
+    type Placement = Hy4Placement;
+
+    fn gpus(&self) -> usize { self.ranks.len() }
+    fn prefill_waves(&self) -> usize { self.prefill_waves }
+    fn max_sequences(&self) -> usize { self.max_sequences }
+    fn max_rows(&self) -> usize { self.max_rows }
+    fn max_pages(&self) -> usize { self.max_pages }
+    fn context_split(&self) -> bool { self.context_split }
+    fn layers(&self) -> usize { self.cfg.layers }
+    fn vocab_size(&self) -> usize { self.cfg.vocab_size }
+    fn check_wave_buffers(&self) -> Result<Vec<String>> {
+        self.assert_disjoint_wave_engram_buffers()?;
+        Ok(self.wave_engram_buffer_summary())
+    }
+    fn reset_for_wave_proof(&mut self) -> Result<()> { self.reset() }
+    fn make_wave_placement(&self, pages: Vec<u32>, slot: usize) -> Hy4Placement {
+        Hy4Placement::new(pages, slot, self.cfg.engram_pad_id)
+    }
+    fn placement_tail(&self, placement: &Hy4Placement) -> [u32; 2] { placement.engram_tail }
+    fn run_wave_units(
+        &mut self,
+        placements: &mut [Hy4Placement],
+        sources: &[&[u32]],
+        units: &[Unit],
+        on_tile: &mut dyn FnMut(&Unit, usize, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let library = self.library();
+        self.run_units(
+            placements,
+            sources,
+            units,
+            ReadPriority::Prefill,
+            |_| HeadMode::Suffix(0),
+            &mut |u, row_off, logits| {
+                let tile = logits.to_host(library)?;
+                on_tile(u, row_off, &tile)
+            },
+        )
+    }
+}
+
 impl Drop for Hy4Engine<'_> {
     fn drop(&mut self) {
         self.terminate();
     }
-}
-
-pub(crate) struct TwoSeqWaveProof {
-    pub(crate) gpus: usize,
-    pub(crate) waves: usize,
-    pub(crate) unit_rows: usize,
-    pub(crate) prompt_a_len: usize,
-    pub(crate) prompt_b_len: usize,
-    pub(crate) units_a: usize,
-    pub(crate) units_b: usize,
-    pub(crate) logits_a_solo: Vec<f32>,
-    pub(crate) logits_b_solo: Vec<f32>,
-    pub(crate) tail_a: [u32; 2],
-    pub(crate) tail_b: [u32; 2],
-    pub(crate) buffer_summary: Vec<String>,
-}
-
-fn count_f32_bit_diffs(a: &[f32], b: &[f32]) -> usize {
-    a.iter().zip(b.iter()).filter(|(x, y)| x.to_bits() != y.to_bits()).count() + a.len().abs_diff(b.len())
 }
 
 /// Advance staged frontier and rolling Engram tail on `begin_unit` before any predecessor wave commits.

@@ -162,6 +162,12 @@ def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096
                 ),
                 "lse_combine2": lambda: cs.compile_lse_combine2_aot(heads=16, has_sink=True),
                 "mla_gate_uv_dsa": lambda: mla.compile_hy4_mla_gate_uv_aot(dsa_bf16),
+                "paged_staging_gather_kv_bf16": lambda: cs.compile_paged_staging_gather_aot(
+                    row_bytes=dsa32_bf16.record_bytes, page_rows=64
+                ),
+                "paged_staging_gather_kv_fp8": lambda: cs.compile_paged_staging_gather_aot(
+                    row_bytes=dsa32_fp8.record_bytes, page_rows=64
+                ),
             })
         return entries
 
@@ -175,9 +181,14 @@ def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096
             "indexer_topk_expand": lambda: idx.compile_hy4_indexer_topk_expand_aot(idx.HY4_FLASH_INDEXER),
         }
         if tp == 2:
+            from b12x.integration.cuteafd import context_split as cs
+
             entries.update({
                 "indexer_scored_topk": lambda: idx.compile_hy4_indexer_scored_topk_aot(idx.HY4_FLASH_INDEXER),
                 "indexer_merge_expand_owned": lambda: idx.compile_hy4_indexer_merge_expand_owned_aot(idx.HY4_FLASH_INDEXER),
+                "paged_staging_gather_index": lambda: cs.compile_paged_staging_gather_aot(
+                    row_bytes=132, page_rows=16
+                ),
             })
         return entries
 
@@ -355,6 +366,12 @@ def hy4_builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 
                 ),
                 "lse_combine2": lambda: cs.compile_lse_combine2_aot(heads=32, has_sink=True),
                 "mla_gate_uv_dsa": lambda: mla.compile_hy4_mla_gate_uv_aot(dsa_bf16),
+                "paged_staging_gather_kv_bf16": lambda: cs.compile_paged_staging_gather_aot(
+                    row_bytes=dsa64_bf16.record_bytes, page_rows=64
+                ),
+                "paged_staging_gather_kv_fp8": lambda: cs.compile_paged_staging_gather_aot(
+                    row_bytes=dsa64_fp8.record_bytes, page_rows=64
+                ),
             })
         return entries
 
@@ -381,6 +398,9 @@ def hy4_builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 
                     GLM53, max_rows=max_rows, max_pages=pages, mode="prefill"
                 ),
                 "dsa_candidate_merge": lambda: cs.compile_dsa_candidate_merge_aot(topk=2048, unit_rows=64),
+                "paged_staging_gather_index": lambda: cs.compile_paged_staging_gather_aot(
+                    row_bytes=128, page_rows=64, page_bytes=8448
+                ),
             })
         return entries
 
