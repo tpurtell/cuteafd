@@ -380,11 +380,11 @@ impl<'a> DenseEngine<'a> {
 
     pub(super) fn verify_rows(&mut self, plan: rows::Rows, rows: usize, layers: &[TapSite], speculative: bool) -> Result<()> {
         ensure!(layers.iter().all(|site| matches!(site, TapSite::LayerExit(_))), "dense target does not bind entry/final-norm sites yet");
+        self.begin_graph_cycle()?;
         let result = self.enqueue_verify_rows(plan, rows, layers, speculative);
-        // Failed captures can still grow driver storage. Observe only after
-        // the whole single-rank submission, on successful and failed paths.
-        let completed = self.graph_completed();
-        result.and(completed)
+        if result.is_ok() { self.graph_completed()?; }
+        else if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() { cycles.abandon(); }
+        result
     }
 
     fn enqueue_verify_rows(&mut self, mut plan: rows::Rows, rows: usize, layers: &[TapSite], speculative: bool) -> Result<()> {

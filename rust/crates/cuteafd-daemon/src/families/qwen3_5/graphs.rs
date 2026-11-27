@@ -178,23 +178,31 @@ impl DenseEngine<'_> {
         unsafe { crate::shared::decode_graph::launch(&library, raw, stream.raw, graphs.bank.borrow().launch_tally()) }
     }
 
-    pub(super) fn graph_completed(&self) -> Result<()> {
-        let mut banks = vec![(self.stream.device.id, &self.graphs)];
-        banks.extend(self.peer.iter().map(|peer| (peer.stream.device.id, &peer.graphs)));
-        if !banks.iter().any(|(_, graphs)| graphs.bank.borrow().cache_needs_boundary()) {
-            for (_, graphs) in banks { graphs.bank.borrow_mut().cache_tick(); }
-            return Ok(());
-        }
-        let wait = std::time::Instant::now();
-        self.drain()?;
-        device::record_boundary_drain(banks.iter().map(|(device, _)| *device), wait.elapsed());
-        // SAFETY: both streams are drained; all banks retain rank-local resources.
-        unsafe { device::observe_completed(self.stream.device.library, |visit| {
-            for (device, graphs) in &banks {
-                visit(*device, "qwen3_5.segment", false, &mut *graphs.bank.borrow_mut())?;
-            }
+    pub(super) fn begin_graph_cycle(&self) -> Result<()> {
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        // SAFETY: rank-local graph operands are persistent engine storage.
+        unsafe { cycles.begin_persistent(|visit| {
+            visit(self.stream.device.id, "qwen3_5.segment", false, &mut *self.graphs.bank.borrow_mut())?;
+            if let Some(peer) = &self.peer { visit(peer.stream.device.id, "qwen3_5.segment", false, &mut *peer.graphs.bank.borrow_mut())?; }
             Ok(())
         }) }
+    }
+    pub(super) fn graph_completed(&self) -> Result<()> {
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        self.graphs.bank.borrow_mut().cache_tick();
+        if let Some(peer) = &self.peer { peer.graphs.bank.borrow_mut().cache_tick(); }
+        // SAFETY: all rank launches for the successful verify have been submitted.
+        unsafe { cycles.complete()?; }
+        if self.graphs.warming.get() {
+            // Startup resets scratch state and samples capture growth between shapes.
+            let wait = std::time::Instant::now();
+            self.drain()?;
+            cycles.record_drain(wait.elapsed());
+            cycles.poll()?;
+        }
+        Ok(())
     }
 
     /// Qualification only: compare identical decode shapes without changing the
