@@ -1065,11 +1065,8 @@ def git_head(repo):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def resolve_launchers(arms, arm_repos, builds, global_repo, state, task, dry):
-    """Gives every arm the launcher checkout that serves it (recorded in the plan as
-    arm['repo'] and arm['repo_commit']): a --build arm its own <builds>/<task>/source-<arm>
-    (which must be at the built revision), any other arm its --arm-repo ARM=PATH, else the
-    global --repo. Explicit and built launchers must be git checkouts holding run.sh."""
+def explicit_launchers(arms, arm_repos):
+    """The --arm-repo ARM=PATH mappings, validated."""
     explicit = {}
     for item in arm_repos:
         name, _, path = item.partition('=')
@@ -1078,6 +1075,72 @@ def resolve_launchers(arms, arm_repos, builds, global_repo, state, task, dry):
         if name in explicit:
             raise ValueError('duplicate --arm-repo mapping: ' + name)
         explicit[name] = Path(path).expanduser()
+    return explicit
+
+
+def submodule_problems(repo):
+    """How a launcher checkout's submodules differ from what run.sh verifies: every
+    submodule (recursively) initialized at the commit its superproject records, and
+    each third_party/<name> at the revision third_party/<name>.lock.json pins."""
+    try:
+        status = run(['git', '-C', str(repo), 'submodule', 'status', '--recursive']).stdout
+    except subprocess.CalledProcessError as error:
+        return ['git submodule status failed: ' + (error.stderr or error.stdout or str(error)).strip()]
+    except subprocess.TimeoutExpired:
+        return ['git submodule status timed out']
+    problems, commits = [], {}
+    for line in status.splitlines():
+        if not line.strip():
+            continue
+        flag, (commit, path, *_rest) = line[0], line[1:].split()
+        if flag == '-':
+            problems.append(f'{path} is not initialized')
+        elif flag == '+':
+            problems.append(f'{path} is checked out at {commit[:12]}, not the commit the superproject records')
+        elif flag == 'U':
+            problems.append(f'{path} has merge conflicts')
+        else:
+            commits[path] = commit
+    for lock in sorted(Path(repo).glob('third_party/*.lock.json')):
+        path = 'third_party/' + lock.name.removesuffix('.lock.json')
+        try:
+            pinned = json.loads(lock.read_text())['revision']
+        except (OSError, ValueError, KeyError, TypeError):
+            problems.append(f'{lock} has no readable revision')
+            continue
+        if path in commits and commits[path] != pinned:
+            problems.append(f'{path} is at {commits[path][:12]}, not {pinned[:12]} pinned by {lock.name}')
+    return problems
+
+
+def check_launcher_submodules(arms, arm_repos, builds, global_repo):
+    """Refuses, before any build, seed lease or hardware ticket, an arm whose launcher
+    checkout run.sh would reject at launch (#2722): run.sh verifies the live arm
+    worktree's SparkInfer source, not the sealed build copy. --build arms serve from
+    the source checkout wip-source-checkout.sh creates and verifies against the locks.
+    Refuses rather than initializing: the worktree belongs to its owner."""
+    explicit = explicit_launchers(arms, arm_repos)
+    problems = []
+    for repo, names in itertools.groupby(sorted((str(explicit.get(name, global_repo)), name) for name in arms if name not in builds),
+                                         key=lambda item: item[0]):
+        found = submodule_problems(repo)
+        if not found:
+            continue
+        script = Path(repo) / 'scripts/dev/submodule-init-local'
+        fix = shlex.quote(str(script)) if script.is_file() else f'git -C {shlex.quote(repo)} submodule update --init --recursive'
+        problems.append(f"arm {', '.join(name for _repo, name in names)}: launcher worktree {repo}: {'; '.join(found)}; "
+                        f'fix with {fix} (wip-cards does not change an arm worktree)')
+    if problems:
+        raise ValueError('launcher submodules are not at their pinned commits, refused before taking any lock:\n  '
+                         + '\n  '.join(problems))
+
+
+def resolve_launchers(arms, arm_repos, builds, global_repo, state, task, dry):
+    """Gives every arm the launcher checkout that serves it (recorded in the plan as
+    arm['repo'] and arm['repo_commit']): a --build arm its own <builds>/<task>/source-<arm>
+    (which must be at the built revision), any other arm its --arm-repo ARM=PATH, else the
+    global --repo. Explicit and built launchers must be git checkouts holding run.sh."""
+    explicit = explicit_launchers(arms, arm_repos)
     if set(explicit) & set(builds):
         raise ValueError('--arm-repo refuses --build arms (their source checkout is the launcher): ' + ', '.join(sorted(set(explicit) & set(builds))))
     for name, arm in arms.items():
@@ -3977,6 +4040,8 @@ def main():
             variant = resolved_card(card, {**arm_overrides.get(name, {}).get(card['name'], {}),
                 **arm_config.get(name, {})}, arm_unsets.get(name, set()))
             build_cards.append(variant)
+    if not args.build_only:
+        check_launcher_submodules(arms, args.arm_repo, builds, args.repo)
     install_stop_handlers()
     try:
         build_arms(builds, arms, build_cards, state, args.task, args.dry_run, args.seed_host)
