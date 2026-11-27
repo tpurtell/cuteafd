@@ -24,10 +24,19 @@ impl Hy4GraphLayout {
 }
 
 /// Short and 32K C1 physical graph-arena censuses on the reference cards.
-/// All measured cards use DFly2. The single-GPU Spark C1 census is the maximum
-/// across 1/4 Sparks with zero and auto expert onboarding (K8 compact):
-/// zero-onboard W1 130 MiB on both, auto W1 90/78 MiB; target verify
-/// width growth <= 24 MiB, draft growth <= 2 MiB, single capture <= 4 MiB.
+/// All measured cards use DFly2. The single-GPU Spark C1 census (`Exl3MinSpark`)
+/// is the maximum across zero and auto expert onboarding under C1 short+32K,
+/// DFly2 on, `CORE_VIEW=k8-compact`, measurement-only `GPU_GRAPH_RESERVE=1536MiB`,
+/// `GRAPH_DONOR_ALWAYS=off`, `GRAPH_PREWARM=off`: after fusing TP1 Spark-routed
+/// sections (#2838), zero-onboarding measures `76.00 MiB` (491 execs, 10,823 nodes,
+/// 66 decode / 425 verify misses, 0 evictions/donor/eager) identically on 1x RTX + 1
+/// and 1x RTX + 4 Sparks (`v3-flash-census-{1,4}spark-cand.device-0.json`), while
+/// auto-onboarding (1x RTX + 4 Sparks, onboarding layers 1..=37) measures `86.00 MiB`
+/// (491 execs, 15,152 nodes, 66 decode / 425 verify misses, 0 evictions/donor/eager;
+/// `v4-flash-census-4spark-auto-bf.device-0.json`). Local-expert segments carry more
+/// nodes than fused Spark segments, so auto now dominates zero (`max(76, 86) = 86 MiB`,
+/// resolving to 182 MiB soft / 190 MiB hard; shipping-card candidate peak is 164 MiB).
+/// Target verify width growth <= 24 MiB, draft growth <= 2 MiB, single capture <= 4 MiB.
 /// The TP2 Spark C1 census (116/108 MiB) and wider census (1130/1058 MiB)
 /// are intentionally not defaults: both graph reserves slowed matched decode
 /// versus eager. TP1 retains its C1-derived cap; the wider 1340 MiB working
@@ -36,7 +45,7 @@ const CENSUS: &[(Hy4GraphLayout, usize, WorkingSet)] = &[
     (Hy4GraphLayout::Exl3Min, 0, WorkingSet { w1: 88 << 20, step_growth: 18 << 20, capture_growth: 4 << 20 }),
     (Hy4GraphLayout::Exl3Max, 0, WorkingSet { w1: 100 << 20, step_growth: 20 << 20, capture_growth: 4 << 20 }),
     (Hy4GraphLayout::Exl3Max, 1, WorkingSet { w1: 98 << 20, step_growth: 18 << 20, capture_growth: 4 << 20 }),
-    (Hy4GraphLayout::Exl3MinSpark, 0, WorkingSet { w1: 130 << 20, step_growth: 26 << 20, capture_growth: 4 << 20 }),
+    (Hy4GraphLayout::Exl3MinSpark, 0, WorkingSet { w1: 86 << 20, step_growth: 26 << 20, capture_growth: 4 << 20 }),
 ];
 
 #[cfg(test)]
@@ -81,7 +90,7 @@ mod tests {
             (Exl3Min, 0, 88, 18, 4, 184, 192),
             (Exl3Max, 0, 100, 20, 4, 196, 204),
             (Exl3Max, 1, 98, 18, 4, 194, 202),
-            (Exl3MinSpark, 0, 130, 26, 4, 226, 234),
+            (Exl3MinSpark, 0, 86, 26, 4, 182, 190),
         ] {
             let census = working_set(Some(layout), rank).unwrap();
             assert_eq!(census.w1, w1 << 20);
