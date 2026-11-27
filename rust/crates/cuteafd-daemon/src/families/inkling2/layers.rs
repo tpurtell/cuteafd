@@ -507,7 +507,7 @@ fn attention_cache<'a>(k: &Kernels<'a>, owner: &impl UnitBuffers<'a>, cfg: &Inkl
         let attention=if decode{&k.global_decode}else{&k.global};
         attention.global(batch, Global {
             pages: b("global_cache")?.bytes/(64*k.kv_format.record_bytes(cfg.kv_heads / k.head_parts, cfg.head_dim)), page_table: b("page_table")?,
-            table_width, tables, table_indices: b("table_indices")?, first: b("first")?, splits: 1 }, owner.stream().raw)
+            table_width, tables, table_indices: b("table_indices")?, first: b("first")? }, owner.stream().raw)
     }
 }
 
