@@ -572,6 +572,26 @@ mod device_tests {
     use super::*;
     use super::super::device::{Cycle, Miss, Preference, ReleaseMeasurement, Site};
     fn site() -> Site { Site { name: "bank-test", cycle: Cycle::Decode, preference: Preference::Capture, bootstrap: 10, basis: super::super::device::Basis::Bytes, spans_devices: false } }
+
+    /// `GPU_GRAPH_RESERVE=0` runs decode eagerly (#2586): a bank attached to a
+    /// zero reserve never issues a capture ticket, so callers such as GLM
+    /// Flash's `replay_on` run every segment eagerly and capture nothing.
+    #[test]
+    fn zero_reserve_never_issues_a_capture_ticket() -> anyhow::Result<()> {
+        let mut bank: GraphBank<u32, u32> = GraphBank::new();
+        bank.attach_device_for_test(-164_420, 0, site())?;
+        for step in 0..4 {
+            for key in 0..8 {
+                assert!(matches!(bank.cache_miss(&key, false, None), Miss::Eager), "step {step} key {key}");
+                assert!(bank.cache_ticket(&key, false, None).is_none(), "step {step} key {key}");
+                assert!(bank.cached_launch(&key).is_none());
+            }
+            bank.cache_tick();
+        }
+        let row = super::super::device::snapshots().into_iter().find(|row| row.device == -164_420).unwrap();
+        assert_eq!((row.reserve, row.charged, row.hard_stopped), (0, 0, true));
+        Ok(())
+    }
     #[test]
     fn cross_bank_native_update_invalidates_old_key_and_survives_donor_drop() -> anyhow::Result<()> {
         use super::super::GraphOwner;

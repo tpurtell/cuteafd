@@ -792,6 +792,47 @@ pub(crate) mod tests {
         assert!(admission::packed_head_owners(&real, 606).unwrap_err().to_string().contains("head workspace"));
     }
 
+    /// `GPU_GRAPH_RESERVE=0` (#2586): the pool-first planner admits the launch,
+    /// charges exactly zero and registers no `glmf.graphs.{gpu}` owner, so its
+    /// planned and sampled admissions agree and decode runs eagerly. Run in a
+    /// child process: the key is read from the environment.
+    #[test]
+    fn zero_graph_reserve_admits_with_no_graph_owner_and_plan_equals_runtime() {
+        const CHILD: &str = "CUTEAFD_GLMF_ZERO_GRAPH_RESERVE_TEST";
+        let test = "placement::families::glm5_flash::tests::zero_graph_reserve_admits_with_no_graph_owner_and_plan_equals_runtime";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([test, "--exact", "--nocapture"]).env(CHILD, "1").env("CUTEAFD_GPU_GRAPH_RESERVE", "0")
+                .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA").env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP")
+                .output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed"), "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let cfg = GlmNextConfig::from_hf(&crate::plan::testing::glm5_flash_config(45)).unwrap();
+        for ranks in [1, 2] {
+            // The min card shape: RTX plus two Sparks, original view, C1.
+            let mut input = inputs(&cfg, ranks, inventory::PRO_TOTAL_BYTES);
+            input.spark_ranks = 2;
+            input.sequences = 1;
+            let admitted = contract(&input).unwrap_or_else(|refusal| panic!("{ranks} RTX: {refusal:?}"));
+            assert_eq!(admitted.solved.phases,
+                planner::evaluate(&admitted.solved.facts, &admitted.solved.budgets).unwrap());
+            assert_eq!(admitted.graphs.charges(), vec![0; ranks]);
+            for policy in &admitted.graphs.policies {
+                assert_eq!((policy.source, policy.base_bytes), ("user total", 0));
+            }
+            assert!(!admitted.solved.facts.allowances.iter().any(|owner| owner.source.contains("glmf.graphs.")),
+                "{:?}", admitted.solved.facts.allowances);
+            assert!(!admitted.placement.items.iter().flatten().any(|item| item.group.contains("glmf.graphs.")));
+            let (planned, planned_graphs, planned_working) = admitted_case(&input, false, 188, true, None).unwrap();
+            let (runtime, runtime_graphs, runtime_working) = admitted_case(&sampled(&input), false, 188, true, None).unwrap();
+            assert_sampled_parity(&planned, &runtime);
+            assert_eq!((planned_graphs, planned_working), (runtime_graphs, runtime_working));
+        }
+    }
+
     /// Every coordinator device charges the launch's whole graph reserve as
     /// one fixed opaque owner, before KV sizing, with the launch's own
     /// lag-8 working set plus its reserve margin behind it.
