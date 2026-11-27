@@ -132,6 +132,7 @@ pub(super) fn layout(
         manifest,
         coordinator: Coordinator::Planned { card },
         prefill: shape,
+        decode_rows: opts.decode_rows,
         context_tokens: opts.context_tokens,
         pool_tokens: opts.pool_tokens,
         target_pool_tokens: opts.target_pool_tokens,

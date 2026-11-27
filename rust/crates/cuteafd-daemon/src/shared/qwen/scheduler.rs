@@ -111,6 +111,11 @@ pub(crate) trait Backend<'a> {
     type Prefix: PrefixFamily<Self::Meta, Placement = Self::Placement>;
 
     fn geometry(&self) -> Geometry;
+    /// Maximum single-request teacher-forced decode-scoring append chunk.
+    /// Defaults to `self.geometry().decode_rows`; families whose per-sequence
+    /// SWA rollback ring allows fewer rows than the batched `decode_rows`
+    /// budget override this without reducing batched `decode_rows`.
+    fn scoring_verify_capacity(&self) -> usize { self.geometry().decode_rows }
     fn message_starts(&self) -> &[&str] { &MESSAGE_STARTS }
     fn library(&self) -> &'a NativeLibrary;
     fn profile(&self) -> &RefCell<[f64; 2]>;
@@ -1131,7 +1136,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
             if let Some(from) = probe::scoring(&job.probe) {
                 // Teacher-forced scoring: every row's logits, no generation, nothing retained.
                 let scored = probe::score(engine.library(), &job.probe, &tokens, from, geometry.prefill_rows,
-                    geometry.decode_rows, probe::verify_rows(&job.probe),
+                    engine.scoring_verify_capacity().min(geometry.decode_rows), probe::verify_rows(&job.probe),
                     streamed_scoring, &mut placement,
                     |placement, chunk, rows, position| {
                         offer()?;

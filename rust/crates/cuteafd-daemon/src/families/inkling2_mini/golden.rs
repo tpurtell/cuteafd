@@ -60,6 +60,8 @@ pub(crate) struct GoldenArgs {
     pub pool_tokens: Option<u64>,
     #[arg(long, default_value_t = 4)]
     pub max_sequences: usize,
+    #[arg(long, default_value_t = 64)]
+    pub decode_rows: u32,
     #[arg(long, default_value_t = 2048)]
     pub prefill_rows: usize,
     #[arg(long, default_value_t = 2)]
@@ -155,6 +157,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
                 rows: args.prefill_rows as u64,
                 waves: args.prefill_waves,
             },
+            decode_rows: args.decode_rows,
             sequences: args.max_sequences as u64,
             context_tokens: tokens.len().max(4096) as u64,
             pool_tokens: args.pool_tokens,
@@ -417,8 +420,8 @@ fn run(mut args: GoldenArgs) -> Result<()> {
         let total_rows = args.slot_parity_rows;
         let max_slots = *args.slot_parity_slots.iter().max().unwrap();
         ensure!(
-            total_rows <= 64 && max_slots >= 1 && max_slots <= args.max_sequences,
-            "Mini slot parity requires rows<=64 and slots<=max_sequences"
+            total_rows <= args.decode_rows as usize && max_slots >= 1 && max_slots <= args.max_sequences,
+            "Mini slot parity requires rows<=decode_rows and slots<=max_sequences"
         );
         ensure!(
             pages_needed * (max_slots as u32 + 1) <= pool_pages,

@@ -15,6 +15,71 @@ import _pinned_sparkinfer
 
 GROUPS = ("ihc", "engram", "attention", "indexer", "pointwise", "projections", "draft")
 HY4_GROUPS = ("ihc", "attention", "indexer", "pointwise", "projections", "draft")
+ROUTER_SKINNY_MAX_ROWS = 64
+
+
+def compile_hy4_router_scores_aot(experts: int, hidden: int):
+    """Export FP32 router scores: skinny GEMV (<=64 rows) + TMA projection (>64 rows).
+
+    Uses ``RoutedBf16Projection`` with ``ROUTER_TILES_BY_ROWS[(experts, hidden)]`` when present
+    (Hy4 ``(256, 6144)`` keeps tuned row-tiled skinny tiles) and generic skinny GEMV otherwise
+    (Hy4-flash ``(512, 3072)``), while rows > 64 stay on ``TmaBf16Projection`` instead of
+    ``_V41RouterScores`` so prefill-width router latency stays at TMA parity.
+    """
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    import torch
+    from cutlass import Int32
+    from b12x.gemm.bf16_gemv._skinny import ROUTER_TILES_BY_ROWS, RoutedBf16Projection
+    from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
+
+    skinny_tiles = ROUTER_TILES_BY_ROWS.get((experts, hidden), ())
+    proj = RoutedBf16Projection(
+        experts,
+        hidden,
+        out_dtype=cutlass.Float32,
+        max_skinny_rows=ROUTER_SKINNY_MAX_ROWS,
+        skinny_tiles_by_rows=skinny_tiles,
+    )
+
+    def _call(self, x, w, logits, rows, stream):
+        self.proj(x, w, logits, rows, stream)
+
+    _call.__annotations__ = {
+        "x": cute.Pointer,
+        "w": cute.Pointer,
+        "logits": cute.Pointer,
+        "rows": Int32,
+        "stream": cuda.CUstream,
+    }
+    _call.__name__ = "__call__"
+
+    class _Hy4RouterScores:
+        def __init__(self, inner):
+            self.proj = inner
+
+        __call__ = cute.jit(_call)
+
+    launch = _Hy4RouterScores(proj)
+    return compile_program(
+        launch,
+        name="hy4_router_scores",
+        operands=(
+            Operand("x", torch.bfloat16, f"[rows,{hidden}]"),
+            Operand("w", torch.bfloat16, f"[{experts},{hidden}]", note="mlp.gate.weight"),
+            Operand("logits", torch.float32, f"[rows,{experts}]", "out"),
+        ),
+        scalars=(Scalar("rows"),),
+        key=(experts, hidden, ROUTER_SKINNY_MAX_ROWS, proj.key()),
+        geometry={
+            "hidden": hidden,
+            "experts": experts,
+            "skinny_max_rows": ROUTER_SKINNY_MAX_ROWS,
+            "exact_row_cap": proj.exact_row_cap,
+        },
+        doc=__doc__,
+    )
 
 
 def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096, max_context: int = 262144):
@@ -153,7 +218,6 @@ def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096
             "indexer_weights": (3072, 16, torch.bfloat16),
             "engram_value": (1536, 3072, torch.bfloat16),
             "engram_key": (1536, 12288, torch.bfloat16),
-            "router": (3072, 512, torch.float32),
             "latent_down": (3072, 1536, torch.bfloat16),
             "latent_up": (1536, 3072, torch.bfloat16),
             "dense_gate_up": (3072, dense_inter, torch.bfloat16),
@@ -161,7 +225,7 @@ def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096
             "shared_gate_up": (3072, shared_inter, torch.bfloat16),
             "shared_down": (shared_inter, 3072, reduce_dtype),
         }
-        return {
+        entries = {
             name: (
                 lambda width=width, outputs=outputs, dtype=dtype: p.compile_bf16_projection_aot(
                     width=width, outputs=outputs, output_dtype=dtype
@@ -169,6 +233,8 @@ def builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 4096
             )
             for name, (width, outputs, dtype) in shapes.items()
         }
+        entries["router"] = lambda: compile_hy4_router_scores_aot(experts=512, hidden=3072)
+        return entries
 
     if group == "draft":
         from b12x.integration.cuteafd import hy4_mla as mla
@@ -347,13 +413,12 @@ def hy4_builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 
             "indexer_wq_b": (2048, 4096, torch.bfloat16),
             "indexer_wk": (6144, 128, torch.bfloat16),
             "indexer_weights": (6144, 32, torch.bfloat16),
-            "router": (6144, 256, torch.float32),
             "dense_gate_up": (6144, dense_inter, torch.bfloat16),
             "dense_down": (dense_inter, 6144, reduce_dtype),
             "shared_gate_up": (6144, shared_inter, torch.bfloat16),
             "shared_down": (shared_inter, 6144, reduce_dtype),
         }
-        return {
+        entries = {
             name: (
                 lambda width=width, outputs=outputs, dtype=dtype: p.compile_bf16_projection_aot(
                     width=width, outputs=outputs, output_dtype=dtype
@@ -361,6 +426,8 @@ def hy4_builders(tp: int, group: str, *, decode_rows: int = 64, max_rows: int = 
             )
             for name, (width, outputs, dtype) in shapes.items()
         }
+        entries["router"] = lambda: compile_hy4_router_scores_aot(experts=256, hidden=6144)
+        return entries
 
     if group == "draft":
         from b12x.integration.cuteafd import hy4_mla as mla

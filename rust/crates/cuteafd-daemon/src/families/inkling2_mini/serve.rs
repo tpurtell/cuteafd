@@ -39,6 +39,8 @@ pub(crate) struct ServeArgs {
     pub max_context: Option<usize>,
     #[arg(long, default_value_t = 16)]
     pub max_sequences: usize,
+    #[arg(long, default_value_t = cuteafd_loader::plan::decode_rows::DecodeRowsSetting::AUTO)]
+    pub decode_rows: cuteafd_loader::plan::decode_rows::DecodeRowsSetting,
     #[arg(long, default_value = "0.0.0.0:8000")]
     pub listen: String,
     #[arg(long)]
@@ -89,6 +91,16 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
     use cuteafd_api::openai::{chat::inkling2::InklingEncoding, ModelEncoding, ModelProfile, NativeRequest};
 
     cuteafd_core::concurrency::validate("inkling2_mini", args.max_sequences as u64)?;
+    let decode_rows = cuteafd_loader::plan::decode_rows::resolve(
+        &cuteafd_loader::plan::families::inkling2_mini::INKLING2_MINI,
+        cuteafd_loader::plan::decode_rows::DecodeRowsRequest {
+            requested: args.decode_rows.as_option(),
+            concurrency: args.max_sequences as u64,
+            decode_lanes: 1,
+            rtx_gpus: 1,
+            draft_length: args.draft_length.draft_length.map(|n| n as u32),
+        },
+    )?;
     args.prefill_packing.require_unrestricted("Inkling 2 Mini")?;
     ensure!(
         args.token_io.embed_placement == crate::shared::token_io::EmbedPlacement::Gpu
@@ -148,6 +160,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                         rows: prefill.unit_rows,
                         waves: prefill.waves,
                     },
+                    decode_rows,
                     sequences: worker_args.max_sequences as u64,
                     context_tokens: worker_args.max_context.unwrap_or(0) as u64,
                     pool_tokens: worker_args.pool_tokens,
@@ -321,9 +334,16 @@ mod tests {
             cuteafd_bench::context::ResolvedSettings::prefill(prefill)
                 .value("max-context-tokens", 262_144)
                 .value("pool-tokens", 2_097_152)
+                .value("decode-rows", 64)
                 .publish();
             Ok(())
         })?;
+        let mut wide = argv.to_vec();
+        wide.extend(["--decode-rows", "128"]);
+        let crate::cli::Commands::ServeInkling2Mini(wide) = crate::cli::Cli::try_parse_from(wide)?.command else {
+            anyhow::bail!("Inkling 2 Mini command not parsed")
+        };
+        assert_eq!(wide.decode_rows.as_option(), Some(128));
         for invalid in ["0", "01", "1048577"] {
             let mut bad = argv.to_vec();
             let at = bad.iter().position(|value| *value == "--max-context-tokens").unwrap();

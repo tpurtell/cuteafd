@@ -34,20 +34,27 @@ impl Layout {
     }
 }
 
-pub struct Commit<'a>{program:Program<'a>,layout:Layout}
+pub struct Commit<'a>{program:Program<'a>,layout:Layout,capacity:usize}
 impl<'a> Commit<'a>{
     pub fn load(programs:&'a Programs<'a>,layout:Layout)->Result<Self>{
-        let name=if layout.replay_rows==64{"fir_history_commit"}else{"fir_history_commit_m128"};
+        Self::load_capacity(programs,layout,layout.replay_rows)
+    }
+    pub fn load_capacity(programs:&'a Programs<'a>,layout:Layout,capacity:usize)->Result<Self>{
+        ensure!(matches!(capacity,64|128) && capacity<=layout.replay_rows
+            && layout.replay_layer_stride>=capacity.checked_mul(layout.replay_row_stride).context("FIR commit stride overflow")?,
+            "FIR commit capacity differs from replay layout");
+        let name=if capacity==64{"fir_history_commit"}else{"fir_history_commit_m128"};
         let program=programs.program(name,&["checkpoint","replay","table","live"])?;
         let spec=program.spec();
-        ensure!(spec.capacity_rows as usize==layout.replay_rows && spec.scalar_kinds==b"iiilllll" && spec.scratch.is_empty(),
+        ensure!(spec.capacity_rows as usize==capacity && spec.scalar_kinds==b"iiilllll" && spec.scratch.is_empty(),
             "FIR commit manifest ABI/capacity differs");
-        Ok(Self{program,layout})
+        Ok(Self{program,layout,capacity})
     }
+    pub fn capacity(&self)->usize{self.capacity}
     /// Metadata validation precedes upload and every mutation. Segments and
     /// destination slots are unique and contain only actually verified inputs.
     pub fn table(&self,entries:&[(usize,usize,usize)],available:&[(usize,usize)])->Result<Vec<i32>>{
-        let cap=self.layout.replay_rows;
+        let cap=self.capacity;
         ensure!(!entries.is_empty() && entries.len()<=cap && entries.len()==available.len(),"FIR commit sequence inventory differs");
         let mut slots=std::collections::BTreeSet::new();
         let mut table=vec![0;entries.len()*3];
@@ -66,7 +73,7 @@ impl<'a> Commit<'a>{
     pub unsafe fn launch(&self,checkpoint:Buffer,replay:Buffer,table:Buffer,live:Buffer,
         sequences:usize,stream:*mut c_void)->Result<()> {
         let l=self.layout;
-        ensure!((1..=l.replay_rows).contains(&sequences),"FIR commit live sequence count");
+        ensure!((1..=self.capacity).contains(&sequences),"FIR commit live sequence count");
         let spans=[(checkpoint,l.history_bytes()?),(replay,l.replay_bytes()?),(table,sequences*12),(live,l.history_bytes()?)];
         for (buffer,bytes) in spans {
             ensure!(!buffer.ptr.is_null() && buffer.device_id==live.device_id && buffer.bytes>=bytes
@@ -83,5 +90,22 @@ impl<'a> Commit<'a>{
         // SAFETY: validated exact physical planes; caller retains initialized
         // checked metadata and all storage through ordered stream completion.
         unsafe{self.program.launch(&[checkpoint.ptr,replay.ptr,table.ptr,live.ptr],&scalars,stream)}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_128_layout_supports_64_and_128_row_commit_strides() -> Result<()> {
+        let layout = Layout::contiguous_rows(64, 6656, 128)?;
+        assert_eq!(layout.replay_rows, 128);
+        assert_eq!(layout.replay_row_stride, 6656);
+        assert_eq!(layout.replay_layer_stride, 128 * 6656);
+        assert!(layout.replay_layer_stride >= 64 * layout.replay_row_stride);
+        assert!(layout.replay_layer_stride >= 128 * layout.replay_row_stride);
+        assert_eq!(layout.replay_bytes()?, 48 * 128 * 6656 * 4);
+        Ok(())
     }
 }

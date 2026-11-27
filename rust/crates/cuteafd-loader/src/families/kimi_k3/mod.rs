@@ -43,10 +43,19 @@ pub fn spark_executions_for_rows(waves: u64, unit_rows: u64, decode_rows: u64) -
     crate::plan::spark_executions::admit_family("kimi_k3", &exports, Some(u32::try_from(decode_rows)?), unit_rows, waves)
 }
 
-/// One Kimi owner's bytes (the shared EXL3 owner census at latent width).
+/// One Kimi owner's bytes (the shared EXL3 owner census at latent width, without
+/// world-specific merged-wave segments).
 pub fn spark_owner_bytes(extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cuteafd_core::OwnerBytes> {
-    // Kimi layouts ship no merged-wave segments program (GLM families only).
     crate::plan::layout::spark_slots::exl3_owner_bytes("kimi_k3", cuteafd_core::ExpertGeometry::KIMI_K3, extent, None)
+}
+
+/// One Kimi owner's bytes on a concrete Spark world: noncompact worlds (TP6
+/// width 512, TP8 width 384, ...) add the merged-wave segments arena and staging
+/// once on the prefill owner; compact worlds (TP7) stay singleton.
+pub fn spark_owner_bytes_for_world(world: usize, extent: cuteafd_core::OwnerExtent) -> anyhow::Result<cuteafd_core::OwnerBytes> {
+    let geometry = cuteafd_core::ExpertGeometry::KIMI_K3;
+    let segment_width = crate::plan::layout::spark_slots::exl3_segment_width("kimi_k3", geometry, world);
+    crate::plan::layout::spark_slots::exl3_owner_bytes("kimi_k3", geometry, extent, segment_width)
 }
 
 /// The Spark execution reserve used before placement and in its ledger: the

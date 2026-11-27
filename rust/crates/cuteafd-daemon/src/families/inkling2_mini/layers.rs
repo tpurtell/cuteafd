@@ -39,11 +39,14 @@ pub(crate) struct MiniKernels<'a> {
     pub local: Attention<'a>,
     pub global: Attention<'a>,
     local_decode: Attention<'a>,
+    local_decode_128: Option<Attention<'a>>,
     global_decode: Attention<'a>,
+    global_decode_128: Option<Attention<'a>>,
     kv_format: InklingKvCache,
     producers: BTreeMap<String, Producer<'a>>,
     strided: BTreeMap<(usize, bool), cuteafd_ffi::fir_strided::Convolution<'a>>,
     replay: BTreeMap<(usize, bool), cuteafd_ffi::fir_replay::Convolution<'a>>,
+    replay_128: Option<BTreeMap<(usize, bool), cuteafd_ffi::fir_replay::Convolution<'a>>>,
     pub add: cuteafd_ffi::F32Add<'a>,
     pub narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
     copy: cuteafd_ffi::DeviceRowCopy<'a>,
@@ -52,8 +55,18 @@ pub(crate) struct MiniKernels<'a> {
     sms: usize,
 }
 
+/// Deterministic export capacity for runtime decode/verify kernels (`<= 64 -> m64`, `> 64 -> m128`).
+pub(crate) fn select_decode_capacity(rows: usize) -> usize {
+    cuteafd_loader::families::inkling2_mini::execution::replay_capacity(rows)
+}
+
 impl<'a> MiniKernels<'a> {
     pub fn bind(programs: &'a Programs<'a>, kv_format: InklingKvCache) -> Result<Self> {
+        Self::bind_rows(programs, kv_format, 64)
+    }
+
+    pub fn bind_rows(programs: &'a Programs<'a>, kv_format: InklingKvCache, decode_rows: usize) -> Result<Self> {
+        let load_128 = select_decode_capacity(decode_rows) == 128;
         let fir = [(HIDDEN, false), (KV_WIDTH, false), (KV_WIDTH, true)];
         let mut ops = Vec::new();
         for precision in [Precision::Bf16, Precision::F32] {
@@ -163,8 +176,17 @@ impl<'a> MiniKernels<'a> {
             .collect::<Result<BTreeMap<_, _>>>()?;
         let replay = fir
             .into_iter()
-            .map(|g| Ok((g, cuteafd_ffi::fir_replay::Convolution::load(programs, g.0, g.1)?)))
+            .map(|g| Ok((g, cuteafd_ffi::fir_replay::Convolution::load_rows(programs, g.0, g.1, 64)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let replay_128 = if load_128 {
+            Some(
+                fir.into_iter()
+                    .map(|g| Ok((g, cuteafd_ffi::fir_replay::Convolution::load_rows(programs, g.0, g.1, 128)?)))
+                    .collect::<Result<BTreeMap<_, _>>>()?,
+            )
+        } else {
+            None
+        };
 
         let projections_bf16 = DraftProjections::load_with_output(
             programs,
@@ -195,12 +217,23 @@ impl<'a> MiniKernels<'a> {
             projections_f32,
             local: Attention::load(programs, Kind::Local, Route::Prefill, false)?,
             global: Attention::load(programs, Kind::Global, Route::Prefill, fp8)?,
-            local_decode: Attention::load(programs, Kind::Local, Route::Decode, false)?,
-            global_decode: Attention::load(programs, Kind::Global, Route::Decode, fp8)?,
+            local_decode: Attention::load_rows(programs, Kind::Local, Route::Decode, false, 64)?,
+            local_decode_128: if load_128 {
+                Some(Attention::load_rows(programs, Kind::Local, Route::Decode, false, 128)?)
+            } else {
+                None
+            },
+            global_decode: Attention::load_rows(programs, Kind::Global, Route::Decode, fp8, 64)?,
+            global_decode_128: if load_128 {
+                Some(Attention::load_rows(programs, Kind::Global, Route::Decode, fp8, 128)?)
+            } else {
+                None
+            },
             kv_format,
             producers,
             strided,
             replay,
+            replay_128,
             add: programs.library().f32_add()?,
             narrow: programs.library().f32_bf16_narrow()?,
             copy: programs.library().device_row_copy()?,
@@ -208,6 +241,33 @@ impl<'a> MiniKernels<'a> {
             quant,
             sms: programs.library().sm_count()? as usize,
         })
+    }
+
+    fn decode_attention(&self, local: bool, rows: usize) -> Result<&Attention<'a>> {
+        if select_decode_capacity(rows) == 128 {
+            let attn = if local {
+                self.local_decode_128.as_ref()
+            } else {
+                self.global_decode_128.as_ref()
+            };
+            attn.context("Mini 128-row decode attention not bound")
+        } else {
+            Ok(if local { &self.local_decode } else { &self.global_decode })
+        }
+    }
+
+    fn decode_replay(
+        &self,
+        width: usize,
+        global: bool,
+        rows: usize,
+    ) -> Result<&cuteafd_ffi::fir_replay::Convolution<'a>> {
+        let map = if select_decode_capacity(rows) == 128 {
+            self.replay_128.as_ref().context("Mini 128-row replay conv not bound")?
+        } else {
+            &self.replay
+        };
+        map.get(&(width, global)).context("Mini replay conv not bound")
     }
 
     fn producer(&self, op: Op) -> Result<&Producer<'a>> {
@@ -320,12 +380,9 @@ impl<'a> MiniKernels<'a> {
     ) -> Result<()> {
         if let Some((slot_stride, lag_stride, slots)) = owner.convolution_strides() {
             if let Some((replay, replay_stride)) = owner.convolution_replay(history)? {
-                // SAFETY: retained verify replay owner covers packed rows.
+                // SAFETY: retained verify replay owner covers packed rows; capacity selects m64 <= 64, m128 > 64.
                 return unsafe {
-                    self.replay
-                        .get(&(width, global))
-                        .context("Mini replay conv not bound")?
-                        .launch(
+                    self.decode_replay(width, global, rows)?.launch(
                             [
                                 input,
                                 weight,
@@ -812,7 +869,7 @@ pub(crate) fn begin_visit<'a>(
         scratch: b("attention_scratch")?,
     };
     if local {
-        let attention = if decode { &k.local_decode } else { &k.local };
+        let attention = if decode { k.decode_attention(true, rows)? } else { &k.local };
         attention.local(
             batch,
             Local {
@@ -824,7 +881,7 @@ pub(crate) fn begin_visit<'a>(
             owner.stream().raw,
         )?;
     } else {
-        let attention = if decode { &k.global_decode } else { &k.global };
+        let attention = if decode { k.decode_attention(false, rows)? } else { &k.global };
         attention.global(
             batch,
             Global {
@@ -1137,4 +1194,19 @@ pub(crate) fn join_visit<'a>(
         k.copy_residual(owner, slice(arena, stride, row_bytes)?, b("pre_core_partial")?, row_bytes)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_decode_capacity_selects_64_at_8_rows_and_128_at_80_rows() {
+        for rows in [1usize, 8, 16, 64] {
+            assert_eq!(select_decode_capacity(rows), 64, "rows={rows} must select m64");
+        }
+        for rows in [65usize, 80, 96, 128] {
+            assert_eq!(select_decode_capacity(rows), 128, "rows={rows} must select m128");
+        }
+    }
 }

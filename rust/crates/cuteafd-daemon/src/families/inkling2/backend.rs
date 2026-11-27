@@ -211,6 +211,10 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
             slots: self.concurrency, prefill_rows: self.unit_rows*self.waves,
             decode_rows: self.execution.borrow().requests.decode.layout.rows }
     }
+    fn scoring_verify_capacity(&self) -> usize {
+        let execution = self.execution.borrow();
+        scoring_verify_capacity(execution.requests.decode.layout.rows, &execution.cfg)
+    }
     fn message_starts(&self) -> &[&str] { &["<|message_system|>", "<|message_user|>", "<|message_model|>", "<|message_tool|>"] }
     fn library(&self) -> &'a cuteafd_ffi::NativeLibrary { self.library }
     fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
@@ -446,9 +450,53 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
 
 }
 
+fn scoring_verify_capacity(
+    decode_rows: usize,
+    cfg: &cuteafd_loader::families::inkling2::Inkling2Config,
+) -> usize {
+    let ring = cuteafd_loader::families::inkling2::execution::SequenceLayout::new(cfg, true, 1)
+        .map(|layout| layout.ring_rows.saturating_sub(cfg.window))
+        .unwrap_or(cuteafd_loader::placement::families::inkling2::DECODE_ROWS as usize);
+    decode_rows.min(ring)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_decode_rows_chunks_inkling_scoring_within_swa_ring_allowance() -> Result<()> {
+        use crate::shared::probe::{score_plan, ScorePath};
+        let cfg = cuteafd_loader::families::inkling2::Inkling2Config {
+            vocab_size: 201024, unpadded_vocab_size: 200058, hidden: 5120, layers: 64,
+            heads: 40, kv_heads: 8, head_dim: 128, d_rel: 16, rel_extent: 1024,
+            local: (0..64).map(|l| (l + 1) % 4 != 0).collect(), window: 1024, sconv_kernel: 4,
+            rms_norm_eps: 1e-6, qk_l2_clip: 12.0, rel_l2_clip: 12.0, log_scaling: Some((1024, 0.2)),
+            res_block: 8, experts: 128, topk: 8, intermediate: 1536,
+            gate_softcap: 15.0, up_softcap: 15.0, route_scale: 1.0, final_softcap: 30.0,
+            max_position: 131_072, eos: vec![200_006],
+        };
+        let ring = cuteafd_loader::families::inkling2::execution::SequenceLayout::new(&cfg, true, 1)?.ring_rows;
+        assert_eq!(ring - cfg.window, 64);
+
+        let capacity = scoring_verify_capacity(128, &cfg);
+        assert_eq!(capacity, 64);
+        assert_eq!(scoring_verify_capacity(32, &cfg), 32);
+
+        let steps = score_plan(583, 64, 4096, capacity, None, ScorePath::Decode, false)?;
+        let decode_steps: Vec<_> = steps.iter().filter(|step| step.path == ScorePath::Decode).collect();
+        assert!(!decode_steps.is_empty());
+        for step in decode_steps {
+            assert!(step.tokens.len() <= 64, "scoring chunk {} exceeds 64-row ring step", step.tokens.len());
+            cuteafd_loader::families::inkling2::verify::verify_ring(cfg.window, ring, step.tokens.len())?;
+        }
+
+        let err = score_plan(583, 64, 4096, capacity, Some(65), ScorePath::Decode, false).unwrap_err();
+        assert!(err.to_string().contains("1..=64"), "{err:#}");
+        let err = score_plan(583, 64, 4096, capacity, Some(128), ScorePath::Decode, false).unwrap_err();
+        assert!(err.to_string().contains("1..=64"), "{err:#}");
+        Ok(())
+    }
 
     /// Vocabulary projections a call issues: one per projected 64-row span.
     fn projections(units: &[Unit], heads: HeadRows) -> Result<usize> {

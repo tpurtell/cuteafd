@@ -39,8 +39,9 @@ pub fn mark_bytes(cfg: &GlmDflashConfig, kv: Qwen4KvCache) -> usize {
 }
 
 impl Layout {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(snapshot: &Path, target: &Inkling2MiniConfig, slots: usize, prefill: usize,
-        waves: usize, sms: usize, kv_cache: Qwen4KvCache, manifest: Option<&serde_json::Value>) -> Result<Self> {
+        waves: usize, decode_rows: usize, sms: usize, kv_cache: Qwen4KvCache, manifest: Option<&serde_json::Value>) -> Result<Self> {
         let config = config(snapshot, target)?;
         // Scored DFlash2 plans every eligible active sequence before head-score
         // settling trims to the verify row budget; admit up to DECODE_ROWS / 2
@@ -56,7 +57,7 @@ impl Layout {
             }
         }
         let (target, _) = crate::families::inkling2::draft::target_owners(config.hidden, config.taps.len(),
-            slots, prefill, waves, super::execution::DECODE_ROWS, 1)?;
+            slots, prefill, waves, decode_rows, 1)?;
         let mark_bytes = mark_bytes(&config, kv_cache);
         Ok(Self { snapshot: snapshot.into(), config, capacity, physical, arena, target, mark_bytes, kv_cache })
     }

@@ -50,6 +50,7 @@ mod readiness_tests {
             include_str!("../families/muse_spark/serve.rs"), include_str!("../families/qwen3_5/serve.rs"),
             include_str!("../families/qwen4/serve.rs"), include_str!("../families/step5/serve.rs"),
             include_str!("../families/hy4_flash/serve.rs"),
+            include_str!("../families/hy4/serve.rs"),
             include_str!("../families/deepseek_v41/v41_native_serve.rs"),
             include_str!("../families/deepseek_v41/v41_vision_encoder.rs"),
         ] { assert!(source.contains("shared::serve::forward_initialization(")); }

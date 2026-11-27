@@ -957,7 +957,14 @@ mod tests {
                 let bytes = kimi_k3::spark::owner_bytes(6, extent)?;
                 Ok((bytes.scratch as usize, bytes.io as usize, bytes.pinned_staging as usize))
             })?.total().context("workspace overflow")? as usize;
-            assert_eq!(workspace, 253_875_296);
+            let prefill_extent = executions.owners().last().unwrap();
+            let segment_arena = cuteafd_core::spark_executions::Exl3SegmentGeometry::for_spark(
+                geometry.hidden, 512, geometry.topk, geometry.experts).layout(prefill_extent.segment_rows().unwrap()).unwrap().1 as usize;
+            let expected_waves = segment_arena
+                + prefill_extent.staged_rows().unwrap() as usize * (geometry.hidden as usize + geometry.hidden as usize / 32)
+                + prefill_extent.segment_rows().unwrap() as usize * (16 + 8 * geometry.topk as usize)
+                + 3 * prefill_extent.staging_rows as usize * 16;
+            assert_eq!(workspace, 253_875_296 + expected_waves);
             let resident = 117_692_170_240;
             let budget = spark_admission_budget_for_geometry(&config, geometry, resident,
                 0, 44_826_624, 268_435_456, workspace)?;
@@ -1006,9 +1013,12 @@ mod tests {
             set_model(&mut config, 1024, false, 1);
             config.model_admission.as_mut().unwrap().executions = kimi_k3::spark_executions(3, 1024)?;
             let directory = package.join(format!("tp6-rank{rank}"));
-            let workspace = spark_execution_workspace(&config, |capacity, _, rows, _| {
+            let segments = Exl3Worker::segments_directory(&directory, Exl3Epilogue::Sum);
+            let workspace = spark_execution_workspace(&config, |capacity, _, rows, extent| {
+                let waves = Exl3Worker::wave_bytes(segments.as_deref(), extent)?;
+                let descriptors = if waves > 0 { crate::shared::experts::execution::waves::WaveStaging::pinned_bytes(extent) } else { 0 };
                 Ok((Exl3Worker::plan(&directory, capacity, Default::default(), Exl3Epilogue::Sum)?,
-                    0, rows as usize * 16 * 8))
+                    waves, rows as usize * 16 * 8 + descriptors))
             })?.total().context("workspace overflow")? as usize;
             let plans = (1..93).map(|layer| Exl3Weights::plan(&catalog, config.exl3_selection(layer)?))
                 .collect::<Result<Vec<_>>>()?;

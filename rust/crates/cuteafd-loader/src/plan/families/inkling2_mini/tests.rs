@@ -135,6 +135,31 @@ fn mini_plan_detects_classifies_and_accepts_every_tensor() {
     let layout = report.memory_layout.as_ref().expect("TP1 memory layout");
     assert_eq!(layout.devices.len(), 1, "hints={:?} notes={:?}", report.hints, layout.notes);
     assert!(layout.pool_tokens >= 262_144, "pool_tokens={}", layout.pool_tokens);
+
+    // Explicit DECODE_ROWS=128 plans cleanly and charges decode scratch, head logits, and graph reserve once.
+    let mut wide_opts = PlanOptions::default();
+    wide_opts.placement = ExpertPlacement::Local;
+    wide_opts.vision = crate::plan::MediaMode::Off;
+    let mut wide_layout_opts = crate::plan::layout::LayoutOptions::default();
+    wide_layout_opts.decode_rows = 128;
+    wide_opts.layout = Some(wide_layout_opts);
+    let wide_report = input.plan(&wide_opts).unwrap();
+    assert!(wide_report.config_error.is_none(), "{:?}", wide_report.config_error);
+    let wide_layout = wide_report.memory_layout.as_ref().expect("TP1 128-row layout");
+    assert_eq!(wide_layout.devices.len(), 1, "hints={:?} notes={:?}", wide_report.hints, wide_layout.notes);
+    assert!(wide_layout.pool_tokens >= 262_144, "pool_tokens={}", wide_layout.pool_tokens);
+    let group_bytes = |layout: &cuteafd_core::memory_layout::MemoryLayout, group: &str| -> u64 {
+        layout.devices[0]
+            .items
+            .iter()
+            .filter(|i| i.group == group)
+            .map(|i| i.bytes)
+            .sum()
+    };
+    let base_head = group_bytes(layout, "Inkling 2 Mini bounded vocabulary head rows");
+    let wide_head = group_bytes(wide_layout, "Inkling 2 Mini bounded vocabulary head rows");
+    assert!(base_head > 0);
+    assert_eq!(wide_head - base_head, 64 * (4 + 2304 * 2 + 200_058 * 4));
 }
 
 #[test]
@@ -144,12 +169,13 @@ fn mini_plan_charges_key_space_scaled_graph_reserve_once() {
 
     let (_cfg, dir, _checkpoint) = mini_test_checkpoint().unwrap();
     let input = PlanInput::open(dir.path()).unwrap();
-    let charge = |concurrency: u64| -> (u64, usize) {
+    let charge = |concurrency: u64, decode_rows: u32| -> (u64, usize) {
         let mut opts = PlanOptions::default();
         opts.placement = ExpertPlacement::Local;
         opts.vision = crate::plan::MediaMode::Off;
         let mut layout = crate::plan::layout::LayoutOptions::default();
         layout.concurrency = concurrency;
+        layout.decode_rows = decode_rows;
         layout.inkling_dspark = false;
         opts.layout = Some(layout);
         let report = input.plan(&opts).unwrap();
@@ -162,12 +188,13 @@ fn mini_plan_charges_key_space_scaled_graph_reserve_once() {
         (graph_items.iter().map(|i| i.bytes).sum(), graph_items.len())
     };
     for concurrency in [1u64, 16, 64] {
-        let (bytes, count) = charge(concurrency);
+        let (bytes, count) = charge(concurrency, DECODE_ROWS as u32);
         let expected = inkling2_mini_graphs::policy(0, KeySpace::for_config(concurrency, DECODE_ROWS, false))
             .unwrap()
             .bytes;
         assert_eq!(count, 1, "graph reserve must be charged exactly once at C{concurrency}");
         assert_eq!(bytes, expected, "graph reserve mismatch at C{concurrency}");
     }
-    assert!(charge(64).0 > charge(16).0 && charge(16).0 > charge(1).0);
+    assert_eq!(charge(64, 128), charge(64, DECODE_ROWS as u32));
+    assert!(charge(64, 64).0 > charge(16, 64).0 && charge(16, 64).0 > charge(1, 64).0);
 }

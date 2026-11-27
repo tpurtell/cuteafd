@@ -153,6 +153,13 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 <td width="20%" valign="top">pending</td>
 <td width="20%" valign="top">pending</td>
 </tr>
+<tr>
+<td width="20%" valign="top"><b>wrldsuksgo2mars/Hy4-EXL3-K4-MC</b><br><sub>2× RTX</sub></td>
+<td width="20%" valign="top">pending</td>
+<td width="20%" valign="top">pending</td>
+<td width="20%" valign="top">pending</td>
+<td width="20%" valign="top">pending</td>
+</tr>
 </table>
 
 <table>
@@ -246,6 +253,11 @@ Each multi-core checkpoint shares one set of routed experts across four core pre
 <td width="19%" valign="top"><a href="docs/models/hy4_flash.md"><b>Hy4-flash</b></a><br><sub>wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC</sub><br><sub>exl3-k4</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-1rtx-hy4-flash-exl3-min/card.svg"><img src="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-1rtx-hy4-flash-exl3-min/card.svg" alt="wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC on 1× RTX PRO 6000 @ gpu-powerd 490 W (425–600)"></a><br><sub>1× RTX</sub></td>
 <td width="27%" valign="top"><a href="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-2rtx-hy4-flash-exl3-max/card.svg"><img src="benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-2rtx-hy4-flash-exl3-max/card.svg" alt="wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC on 2× RTX PRO 6000 @ gpu-powerd 425/425 W (250–520)"></a><br><sub>2× RTX</sub></td>
+</tr>
+<tr>
+<td width="19%" valign="top"><a href="docs/models/hy4.md"><b>Hy4</b></a><br><sub>wrldsuksgo2mars/Hy4-EXL3-K4-MC</sub><br><sub></sub></td>
+<td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact, 1x RTX + 4 Sparks)</sub></td>
+<td width="27%" valign="top">pending<br><sub>Pending v7 Release smoke (K8 compact, 2x RTX + 6 Sparks)</sub></td>
 </tr>
 </table>
 

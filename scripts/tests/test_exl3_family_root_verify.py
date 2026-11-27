@@ -247,21 +247,29 @@ def test_sm121_object_requires_actual_cuda_target(tmp_path):
         tool.verify_object_target(path, (12, 1))
 
 
-@pytest.mark.parametrize('geometry', ['glm', 'glmf', 'kimik3', 'step5', 'ml4', 'muse', 'qwen4', 'dsv4p'])
+@pytest.mark.parametrize('geometry', ['glm', 'glmf', 'kimik3', 'step5', 'ml4', 'muse', 'qwen4', 'dsv4p', 'inkling2', 'hy4f', 'hy4'])
 def test_segments_follow_shipping_spark_layouts_and_native_ingress(geometry):
     tool = load_tool()
+    codebook = 'mul1' if geometry in tool.MUL1_ONLY_GEOMETRIES else 'mcg'
     for profile, width, *_ in tool.build_profiles('spark', geometry):
-        options = tool.segment_export_options(geometry, 'spark', width)
-        if geometry not in ('glm', 'glmf'):
+        options = tool.segment_export_options(geometry, 'spark', width, codebook=codebook)
+        if geometry in tool.PARTIAL_REPLY_GEOMETRIES:
             assert options is None
             continue
         assert options['row_addresses'] and options['warp_specialized']
         assert options.get('wire_input', False) == (tool.GEOMETRIES[geometry][0] % 512 == 0)
         assert options['hidden'] == tool.GEOMETRIES[geometry][0]
-        assert options['route_block'] >= 16
+        assert options['route_block'] == 64
         assert width % options['tile'][1] == 0
-        assert tool.segment_export_options(geometry, 'spark', width, compact=True) is None
-        assert tool.segment_export_options(geometry, 'coordinator', width) is None
+        assert options['tile'][3] == 256 and tool.GEOMETRIES[geometry][0] % 256 == 0
+        if codebook == 'mul1':
+            assert options['codebook'] == 'mul1'
+            with pytest.raises(ValueError, match='requires --codebook mul1'):
+                tool.segment_export_options(geometry, 'spark', width, codebook='mcg')
+        else:
+            assert 'codebook' not in options
+        assert tool.segment_export_options(geometry, 'spark', width, compact=True, codebook=codebook) is None
+        assert tool.segment_export_options(geometry, 'coordinator', width, codebook=codebook) is None
     assert tool.SEGMENT_MAX_ROWS == 8192
 
 

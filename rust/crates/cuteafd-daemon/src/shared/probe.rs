@@ -617,14 +617,14 @@ impl ScoreLogits {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct ScoreStep {
-    tokens: std::ops::Range<usize>,
-    path: ScorePath,
-    logit_rows: usize,
-    position: usize,
+pub(crate) struct ScoreStep {
+    pub(crate) tokens: std::ops::Range<usize>,
+    pub(crate) path: ScorePath,
+    pub(crate) logit_rows: usize,
+    pub(crate) position: usize,
 }
 
-fn score_plan(len: usize, from: usize, prefill_rows: usize, verify_capacity: usize,
+pub(crate) fn score_plan(len: usize, from: usize, prefill_rows: usize, verify_capacity: usize,
     requested_verify_rows: Option<usize>, path: ScorePath, prefill_scoring: bool) -> Result<Vec<ScoreStep>> {
     anyhow::ensure!(len >= 2, "scoring needs at least two tokens");
     let rows = match path {
