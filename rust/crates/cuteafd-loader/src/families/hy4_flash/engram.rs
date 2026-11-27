@@ -592,6 +592,14 @@ impl Hy4EngramLookahead {
         Ok(Self { planner, hashers })
     }
 
+    /// The look-ahead over arbitrary tables: tests wrap the real token tables to
+    /// decide when each read lands.
+    #[cfg(test)]
+    fn over(tables: Vec<Arc<dyn LookaheadTable>>, hashers: Vec<Arc<Hy4EngramHasher>>) -> Result<Self> {
+        ensure!(!tables.is_empty() && tables.len() == hashers.len(), "Hy4 Engram look-ahead table/hasher count mismatch");
+        Ok(Self { planner: Lookahead::new("hy4_engram", tables, 1)?, hashers })
+    }
+
     pub fn remote(&self) -> bool { self.planner.remote() }
 
     /// Start reading all Engram layers' rows for `tokens` (starting at absolute position
@@ -686,6 +694,8 @@ pub fn mapped_engram_bytes(checkpoint: &Checkpoint, cfg: &Hy4FlashConfig) -> Res
 mod tests {
     use super::*;
     use crate::formats::mapped_table::row_cache::{Lookup, RowClass};
+    use crate::formats::mapped_table::lookahead::RowLanding;
+    use crate::formats::mapped_table::TableStats;
     use std::os::unix::fs::FileExt;
 
     #[test]
@@ -753,9 +763,13 @@ mod tests {
         assert_eq!(advance_tail(start, &[30], 5), [20, 30]);
     }
 
+    /// Rows per head in the toy tables: the 128-token prompt reaches only part of
+    /// each head's range, so decode candidates can be chosen off the prompt's rows.
+    const TOY_HEAD_ROWS: u64 = 256;
+
     fn toy_hasher(layer: usize) -> Arc<Hy4EngramHasher> {
-        let sizes = vec![16u64; ENGRAM_HEADS];
-        let offsets = (0..ENGRAM_HEADS).map(|h| (h * 16) as u64).collect();
+        let sizes = vec![TOY_HEAD_ROWS; ENGRAM_HEADS];
+        let offsets = (0..ENGRAM_HEADS).map(|h| h as u64 * TOY_HEAD_ROWS).collect();
         Arc::new(Hy4EngramHasher {
             layer,
             lookup: (0..256i32).collect(),
@@ -794,6 +808,72 @@ mod tests {
         Ok((file, TokenTable::new(mapped, shares, ENGRAM_HEADS)?))
     }
 
+    /// The test's clock for look-ahead reads: one shared record of every read the
+    /// planner starts, in order, and one gate per table. A read lands (its poll
+    /// returns true) only after its table's gate opens, so the test decides the
+    /// landing order instead of the scheduler and the disk.
+    #[derive(Default)]
+    struct ReadLog {
+        started: std::sync::Mutex<Vec<(usize, ReadPriority, Vec<u64>)>>,
+        gates: Vec<std::sync::atomic::AtomicBool>,
+    }
+
+    impl ReadLog {
+        fn new(tables: usize) -> Arc<Self> {
+            Arc::new(Self { started: Default::default(), gates: (0..tables).map(|_| Default::default()).collect() })
+        }
+        fn open(&self, table: usize) { self.gates[table].store(true, std::sync::atomic::Ordering::Release); }
+        fn reads(&self) -> Vec<(usize, ReadPriority, Vec<u64>)> { self.started.lock().unwrap().clone() }
+        /// Block until the planner has started `count` reads; it cannot start more
+        /// than the deadline order allows, so this is the order, not a timeout.
+        fn await_reads(&self, count: usize) -> Vec<(usize, ReadPriority, Vec<u64>)> {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                let reads = self.reads();
+                if reads.len() >= count { return reads; }
+                assert!(std::time::Instant::now() < deadline, "the planner started {} of {count} reads: {reads:?}", reads.len());
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    struct GatedTable { table: Arc<TokenTable>, index: usize, log: Arc<ReadLog> }
+    struct GatedLanding { inner: Box<dyn RowLanding>, index: usize, log: Arc<ReadLog> }
+
+    impl LookaheadTable for GatedTable {
+        fn cache(&self) -> &Arc<RowCache> { self.table.cache() }
+        fn start_read(&self, rows: &[u64], priority: ReadPriority) -> Result<Box<dyn RowLanding>> {
+            self.log.started.lock().unwrap().push((self.index, priority, rows.to_vec()));
+            Ok(Box::new(GatedLanding { inner: self.table.start_read(rows, priority)?, index: self.index, log: Arc::clone(&self.log) }))
+        }
+        fn stats(&self) -> &TableStats { LookaheadTable::stats(self.table.as_ref()) }
+        fn rows_per_token(&self) -> usize { LookaheadTable::rows_per_token(self.table.as_ref()) }
+        fn placement(&self) -> crate::formats::mapped_table::placement::Placement { self.table.placement() }
+    }
+
+    impl RowLanding for GatedLanding {
+        fn poll(&mut self) -> Result<bool> {
+            // The real read keeps landing underneath; only its publication waits for the gate.
+            let landed = self.inner.poll()?;
+            Ok(landed && self.log.gates[self.index].load(std::sync::atomic::Ordering::Acquire))
+        }
+        fn row(&self, index: usize) -> [&[u8]; 2] { self.inner.row(index) }
+    }
+
+    fn distinct_rows(hasher: &Hy4EngramHasher, tail: [u32; 2], tokens: &[u32]) -> Result<Vec<u64>> {
+        let mut rows = Vec::new();
+        hasher.hash(&mut Hy4EngramHistory(tail.to_vec()), tokens, &mut rows)?;
+        rows.sort_unstable();
+        rows.dedup();
+        Ok(rows)
+    }
+
+    /// Deterministic (#2723): every read lands only when the test opens its table,
+    /// so the asserted order is the planner's deadline order, never wall-clock
+    /// scheduling. Table k + 1 of the prompt starts only after table k landed; once
+    /// all four landed, every layer's demand gather hits with no fallback read; a
+    /// decode round reads every layer's candidate rows at decode priority (layer 0
+    /// first), and the verify gathers then hit them.
     #[test]
     fn four_layer_lookahead_fills_caches_in_deadline_order_and_decode_prefetch_hits() -> Result<()> {
         let layers = [1usize, 11, 21, 31];
@@ -801,17 +881,48 @@ mod tests {
         let mut files = Vec::new();
         let mut tables = Vec::new();
         for &l in &layers {
-            let (f, t) = toy_table(l, 256)?;
+            let (f, t) = toy_table(l, ENGRAM_HEADS as u64 * TOY_HEAD_ROWS)?;
             files.push(f);
             tables.push(t);
         }
-        let ahead = Hy4EngramLookahead::new(tables.clone(), hashers.clone())?;
+        let log = ReadLog::new(layers.len());
+        let gated = tables.iter().enumerate().map(|(index, table)|
+            Arc::new(GatedTable { table: Arc::clone(table), index, log: Arc::clone(&log) }) as Arc<dyn LookaheadTable>).collect();
+        let ahead = Hy4EngramLookahead::over(gated, hashers.clone())?;
         let tokens: Vec<u32> = (3..131).collect();
+        let prompt: Vec<Vec<u64>> = hashers.iter().map(|h| distinct_rows(h, [0, 0], &tokens)).collect::<Result<_>>()?;
+        // One piece covers the 128-token unit, so each table reads its rows in one batch.
+        assert!(prompt.iter().all(|rows| !rows.is_empty() && rows.len() <= 2048));
         let handle = ahead.start(1, 0, [0, 0], tokens.clone(), UnitPlan::new(vec![128], 1));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while tables.iter().any(|t| t.table().stats().snapshot().lookahead_pieces < 1) {
-            assert!(std::time::Instant::now() < deadline, "4-layer Hy4 look-ahead did not finish");
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        let rows_read = |reads: &[(usize, ReadPriority, Vec<u64>)], table: usize| {
+            let mut rows: Vec<u64> = reads.iter().filter(|read| read.0 == table).flat_map(|read| read.2.iter().copied()).collect();
+            rows.sort_unstable();
+            rows
+        };
+
+        // Deadline order: with nothing landed only table 0 may read; table k + 1
+        // starts only after table k landed. Each table's reads (one per piece, rows
+        // another piece already holds are not read twice) cover exactly its prompt rows.
+        for table in 0..layers.len() {
+            let wait = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while rows_read(&log.reads(), table) != prompt[table] {
+                assert!(std::time::Instant::now() < wait, "table {table} read {:?}", rows_read(&log.reads(), table));
+                std::thread::yield_now();
+            }
+            // Shut gates hold the planner here: give it time to misbehave.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let reads = log.reads();
+            assert!(reads.iter().all(|read| read.0 <= table), "a later table read before table {table} landed: {reads:?}");
+            assert!(reads.windows(2).all(|pair| pair[0].0 <= pair[1].0), "reads out of table order: {reads:?}");
+            assert!(reads.iter().all(|read| read.1 == ReadPriority::Prefill), "{reads:?}");
+            assert_eq!(rows_read(&reads, table), prompt[table], "table {table} read its rows twice");
+            log.open(table);
+        }
+        // Every prompt row is published once the gates are open.
+        let wait = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while tables.iter().zip(&prompt).any(|(t, rows)| t.table().stats().snapshot().lookahead_rows < rows.len() as u64) {
+            assert!(std::time::Instant::now() < wait, "opened look-ahead reads did not publish");
+            std::thread::yield_now();
         }
 
         // Every layer's demand gather over the prefetched prompt hits RowCache with 0 fallback misses.
@@ -824,34 +935,50 @@ mod tests {
             let prio = if idx == 0 { ReadPriority::PrefillFirst } else { ReadPriority::Prefill };
             table.gather_at_priority(&row_ids, &mut out, prio)?;
             let delta = table.table().stats().snapshot().since(&before);
-            assert_eq!(delta.stall_prefill_fallback_rows, 0, "layer {} fell back on prefetched rows", layers[idx]);
-            assert!(delta.cache_hit_rows > 0);
+            assert_eq!((delta.stall_prefill_fallback_rows, delta.stall_prefill_pending_rows), (0, 0),
+                "layer {} did not find its prefetched rows", layers[idx]);
+            assert_eq!(delta.cache_hit_rows, prompt[idx].len() as u64, "layer {}", layers[idx]);
         }
         assert!(!handle.commit(128));
         drop(handle);
 
-        // Decode prefetch populates all 4 layers' decode shares without mutating committed tail.
+        // A decode candidate with rows the prompt never read in every layer; the
+        // prompt's rows stay cached, so a decode round reads only the new ones.
         let committed_tail = [129u32, 130];
-        let cand = [200u32];
-        ahead.decode(&[(committed_tail, &cand)])?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let mut all_cached = true;
-            for (hasher, table) in hashers.iter().zip(&tables) {
-                let mut h = Hy4EngramHistory(committed_tail.to_vec());
-                let mut ids = Vec::new();
-                hasher.hash(&mut h, &cand, &mut ids)?;
-                let (_pins, lookups) = table.cache().acquire(&ids[..1], RowClass::Decode);
-                if !matches!(lookups[0], Lookup::Ready(_)) {
-                    all_cached = false;
-                    break;
+        let fresh = |hasher: &Hy4EngramHasher, prompt: &[u64], token: u32| -> Vec<u64> {
+            distinct_rows(hasher, committed_tail, &[token]).unwrap().into_iter().filter(|row| prompt.binary_search(row).is_err()).collect()
+        };
+        let cand = (131..256u32).find(|&token| hashers.iter().zip(&prompt).all(|(h, rows)| !fresh(h, rows, token).is_empty()))
+            .expect("a decode candidate with new rows in every layer");
+        let decode: Vec<Vec<u64>> = hashers.iter().map(|h| distinct_rows(h, committed_tail, &[cand])).collect::<Result<_>>()?;
+        let prefill_reads = log.reads().len();
+        ahead.decode(&[(committed_tail, &[cand])])?;
+        // One decode round starts every layer's read at once, layer 0 first, at decode priority.
+        let round = log.await_reads(prefill_reads + layers.len())[prefill_reads..].to_vec();
+        assert_eq!(round.len(), layers.len(), "{round:?}");
+        for (table, read) in round.iter().enumerate() {
+            assert_eq!((read.0, read.1), (table, if table == 0 { ReadPriority::DecodeFirst } else { ReadPriority::Decode }));
+            assert_eq!(read.2, fresh(&hashers[table], &prompt[table], cand), "layer {} decode rows", layers[table]);
+        }
+        // The planner holds every decode row's fill (or it is cached): the verify gathers find them landed.
+        let pins: Vec<_> = tables.iter().zip(&decode).map(|(table, rows)| table.cache().acquire(rows, RowClass::Decode)).collect();
+        for (table, (pins, lookups)) in pins.iter().enumerate() {
+            for lookup in lookups {
+                match *lookup {
+                    Lookup::Ready(_) => {}
+                    Lookup::Wait(slot) => assert!(pins.wait(slot), "layer {}: a decode prefetch read failed", layers[table]),
+                    other => panic!("layer {}: a decode row nobody prefetched: {other:?}", layers[table]),
                 }
             }
-            if all_cached {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "decode prefetch did not land in all 4 layers");
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        drop(pins);
+        for (idx, (table, rows)) in tables.iter().zip(&decode).enumerate() {
+            let before = table.table().stats().snapshot();
+            let mut out = vec![0u8; rows.len() * ENGRAM_FP8_ROW_BYTES];
+            let prio = if idx == 0 { ReadPriority::DecodeFirst } else { ReadPriority::Decode };
+            table.gather_at_priority(rows, &mut out, prio)?;
+            let delta = table.table().stats().snapshot().since(&before);
+            assert_eq!((delta.stall_decode_fallback_rows, delta.cache_hit_rows), (0, rows.len() as u64), "layer {}", layers[idx]);
         }
         drop(ahead);
         drop(files);
