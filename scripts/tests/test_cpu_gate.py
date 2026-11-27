@@ -1251,6 +1251,8 @@ def test_placement_unpublished_exporter_edit_fails_fast_before_compiling(tmp_pat
     monkeypatch.setattr(gate, 'placement_inputs', REAL_PLACEMENT_INPUTS)
     monkeypatch.setattr(gate, 'BUILDS', tmp_path / 'builds')
     monkeypatch.setenv('HOME', str(home))
+    for variable in gate.PLACEMENT_VARIABLES.values():  # a surrounding gate exports these
+        monkeypatch.delenv(variable, raising=False)
     monkeypatch.setattr(gate, 'gate_lease', lambda *a, **k: pytest.fail('took a gate lease'))
     monkeypatch.setattr(gate, 'cargo', lambda *a, **k: pytest.fail('compiled'))
     monkeypatch.setattr(sys, 'argv', ['cpu-gate', '--task', 't', '--source', str(ROOT)])
