@@ -155,7 +155,8 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
     // K=2 bounds our two simultaneously in-flight decode/prefill operations.
     // Their live cycles protect all possible launches: no free before kernels
     // finish, and no donor update can change an executable a live lane may use.
-    let mut graph_cycles = crate::shared::decode_graph::device::LaneCycles::register(lane, 2, |visit| {
+    // Each lane cycle is proven by an event on every stream its banks launched on.
+    let mut graph_cycles = crate::shared::decode_graph::device::LaneCycles::register(pass.graph_library()?, lane, 2, |visit| {
         pass.visit_lane_graphs(visit)?;
         if let Some(draft) = draft.borrow_mut().as_deref_mut() { draft.visit_lane_graphs(lane, visit)?; }
         Ok(())
@@ -446,8 +447,9 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
             stopped_capture?;
             discarded?;
             operation?;
-            // Commit/discard settled this lane; no bank traversal on hit-only rounds.
-            graph_cycles.complete();
+            // Commit/discard settled this lane's host state; its graphs complete
+            // by event on every stream they launched on (no host drain here).
+            graph_cycles.complete()?;
             // Give already-ready remote completions an opportunity to run before
             // queuing another draft on the shared RTX.
             tokio::task::yield_now().await;
@@ -455,8 +457,10 @@ async fn lane<'a, P: VerificationTarget<'a>, C: DraftChain<'a>>(lease: LaneLease
     }.await;
     // Do not manufacture a completed frontier from an early validation/draft
     // error; the existing submission guards still own device drainage.
-    if result.is_ok() { graph_cycles.complete(); } else { graph_cycles.abandon(); }
-    result
+    match result {
+        Ok(()) => graph_cycles.complete(),
+        Err(error) => { graph_cycles.abandon(); Err(error) }
+    }
 }
 
 async fn retire<'a, C: DraftChain<'a>>(lane: usize, mut request: Active<'a>, requests: &RefCell<&mut Requests<'a>>,
@@ -764,5 +768,59 @@ mod graph_cycle_contract_tests {
         assert!(independent.contains("runtime.block_on(drive_lanes("));
         let lanes = include_str!("../../../../shared/serve/lanes.rs");
         assert!(lanes.contains("tokio::join!(first, second)"));
+    }
+
+    /// Every production V4.1 graph launch goes through the shared wrapper, so
+    /// lane cycles record its stream; raw launches would escape the proof.
+    /// Raw `cuda_graph_launch` stays only inside `#[cfg(test)]` items, found by
+    /// brace depth from each `#[cfg(test)]` attribute.
+    #[test]
+    fn production_graph_launches_record_their_lane_stream() {
+        fn test_spans(source: &str) -> Vec<(usize, usize)> {
+            let mut spans = Vec::new();
+            let bytes = source.as_bytes();
+            let mut at = 0;
+            while let Some(found) = source[at..].find("#[cfg(test)]") {
+                let start = at + found;
+                let Some(open) = source[start..].find('{').map(|o| start + o) else { break };
+                let (mut depth, mut end) = (0i32, open);
+                for (i, &c) in bytes.iter().enumerate().skip(open) {
+                    if c == b'{' { depth += 1 } else if c == b'}' { depth -= 1; if depth == 0 { end = i; break } }
+                }
+                spans.push((start, end));
+                at = end.max(start + 1);
+            }
+            spans
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/families/deepseek_v41");
+        let mut raw = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { stack.push(path); continue }
+                if path.extension().is_none_or(|e| e != "rs") { continue }
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if name.ends_with("_tests.rs") || name == "tests.rs" { continue }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let spans = test_spans(&source);
+                let mut at = 0;
+                while let Some(found) = source[at..].find("cuda_graph_launch(") {
+                    let pos = at + found;
+                    if !spans.iter().any(|&(s, e)| s <= pos && pos <= e) {
+                        raw.push(format!("{}:{}", path.display(), source[..pos].lines().count()));
+                    }
+                    at = pos + 1;
+                }
+            }
+        }
+        assert!(raw.is_empty(), "raw production graph launches bypass lane stream recording: {raw:?}");
+        let scheduler = include_str!("independent.rs");
+        assert!(scheduler.contains("LaneCycles::register(pass.graph_library()?"), "lane cycles prove completion by event");
+        assert!(scheduler.contains("graph_cycles.complete()?"));
+        let prefill = include_str!("../prefill_target.rs");
+        let execute = prefill.split("    fn execute(&mut self, cursor").nth(1).unwrap().split("    fn observe(").next().unwrap();
+        assert!(execute.find("PrefillScope::open(").unwrap() < execute.find("self.execute_unit(").unwrap());
+        assert!(execute.contains("scope.close()"));
     }
 }

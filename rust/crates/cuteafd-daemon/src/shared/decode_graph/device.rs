@@ -24,16 +24,26 @@ pub(crate) struct BankLaunches {
     site: &'static str,
     cycle: AtomicU8,
     counts: [AtomicU64; 5],
+    /// Physical device of the owning bank and its registered graph lane, so a
+    /// launch can be attributed to its lane cycle's completion scope.
+    device: i32,
+    lane: AtomicU8,
+    clocks: Arc<[EpochClock; 2]>,
 }
 
 impl BankLaunches {
-    fn new(site: &'static str, cycle: Cycle) -> Self {
+    fn new(site: &'static str, cycle: Cycle, device: i32, lane: usize, clocks: Arc<[EpochClock; 2]>) -> Self {
         Self {
             site,
             cycle: AtomicU8::new(cycle as u8),
             counts: std::array::from_fn(|_| AtomicU64::new(0)),
+            device,
+            lane: AtomicU8::new(lane as u8),
+            clocks,
         }
     }
+
+    pub(super) fn set_lane(&self, lane: usize) { self.lane.store(lane as u8, Ordering::Release); }
 
     #[inline]
     pub(crate) fn record(&self) {
@@ -241,9 +251,86 @@ struct LaneEpoch {
 #[derive(Default)]
 pub(super) struct EpochClock {
     pub(super) index: AtomicU64,
-    completed: AtomicU64,
+    pub(super) completed: AtomicU64,
     active: AtomicBool,
     pending: AtomicUsize,
+    /// Bank graph launches attributed to this lane since its cycle began, on
+    /// any thread: a cycle with launches but no recorded stream is refused.
+    launched: AtomicU64,
+    /// Outstanding completion proofs for this device's lane, oldest first:
+    /// (cycle, events recorded on this device's launched streams). Shared by
+    /// every scope on the lane (lane cycles and drained-path prefill scopes),
+    /// so proofs outlive any one `LaneCycles` instance.
+    proofs: Mutex<std::collections::VecDeque<(u64, Vec<(StreamKey, *mut std::ffi::c_void)>)>>,
+    /// Recycled ordering events of this device, by stream.
+    spare_events: Mutex<Vec<(StreamKey, *mut std::ffi::c_void)>>,
+}
+
+// SAFETY: the raw event/stream handles are owned by the proof pool and only
+// passed back to the FFI under its mutex; CUDA events are process-global.
+unsafe impl Send for EpochClock {}
+unsafe impl Sync for EpochClock {}
+
+impl EpochClock {
+    /// Credit `completed` up to the newest proof whose predecessors are all
+    /// done on this device. Never skips an unfinished older proof.
+    fn poll_proofs(&self, library: &cuteafd_ffi::NativeLibrary, device: i32) -> anyhow::Result<()> {
+        let mut proofs = self.proofs.lock().unwrap_or_else(|p| p.into_inner());
+        let mut done = None;
+        while let Some((cycle, events)) = proofs.front() {
+            let owner = crate::shared::memory::device::Device { library, id: device };
+            let mut ready = true;
+            for &(_, event) in events {
+                // SAFETY: the pool owns this live event on `device`.
+                if !owner.run(|| unsafe { library.cuda_event_query(event) })? { ready = false; break }
+            }
+            if !ready { break }
+            done = Some(*cycle);
+            let (_, events) = proofs.pop_front().unwrap();
+            self.spare_events.lock().unwrap_or_else(|p| p.into_inner()).extend(events);
+        }
+        if let Some(done) = done { self.completed.fetch_max(done, Ordering::AcqRel); }
+        Ok(())
+    }
+
+    /// Record one event per launched stream of this device for `cycle`.
+    fn prove(&self, library: &cuteafd_ffi::NativeLibrary, device: i32, cycle: u64,
+        streams: impl Iterator<Item = StreamKey>) -> anyhow::Result<()> {
+        let owner = crate::shared::memory::device::Device { library, id: device };
+        let mut events = Vec::new();
+        let result = (|| {
+            for stream in streams {
+                let event = {
+                    let mut spare = self.spare_events.lock().unwrap_or_else(|p| p.into_inner());
+                    match spare.iter().position(|&(s, _)| s == stream) {
+                        Some(at) => Some(spare.swap_remove(at).1),
+                        None => None,
+                    }
+                };
+                let event = match event { Some(event) => event, None => owner.run(|| library.cuda_event_create_ordering())? };
+                // SAFETY: the scope owner's live stream; no stream waits on this query-only event.
+                if let Err(error) = owner.run(|| unsafe { library.cuda_event_record(event, stream.0) }) {
+                    self.spare_events.lock().unwrap_or_else(|p| p.into_inner()).push((stream, event));
+                    return Err(error);
+                }
+                events.push((stream, event));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.spare_events.lock().unwrap_or_else(|p| p.into_inner()).extend(events);
+            return Err(error);
+        }
+        self.proofs.lock().unwrap_or_else(|p| p.into_inner()).push_back((cycle, events));
+        Ok(())
+    }
+
+    /// A host synchronize covered every stream: proofs up to now are moot.
+    fn drop_proofs(&self) {
+        let mut proofs = self.proofs.lock().unwrap_or_else(|p| p.into_inner());
+        let mut spare = self.spare_events.lock().unwrap_or_else(|p| p.into_inner());
+        for (_, events) in proofs.drain(..) { spare.extend(events); }
+    }
 }
 
 struct LaggedCredit {
@@ -797,6 +884,27 @@ pub(crate) unsafe fn observe_completed(library: &cuteafd_ffi::NativeLibrary,
     Ok(())
 }
 
+/// `observe_completed` for a boundary the caller has already host-drained on
+/// every device the visitor's banks live on. Unlike `observe_completed`, it
+/// credits lane clocks under event completion: the synchronize is the proof.
+/// # Safety
+/// Every stream that can hold a visited bank's launches has been synchronized.
+pub(crate) unsafe fn observe_drained(library: &cuteafd_ffi::NativeLibrary,
+    mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    let mut devices = std::collections::BTreeSet::new();
+    visit(&mut |device, _, _, bank| { bank.tick(); devices.insert(device); Ok(()) })?;
+    for &device in &devices {
+        observe_device(library, device)?;
+        if let Some(cache) = existing_cache(device) { cache.lock().unwrap_or_else(|p| p.into_inner()).drained_boundary(); }
+    }
+    visit(&mut |_, _, _, bank| {
+        // SAFETY: forwarded drained persistent-storage contract.
+        unsafe { bank.evict_persistent(); }
+        Ok(())
+    })?;
+    Ok(())
+}
+
 /// Fixed-capacity event slots. If all slots are occupied, re-record the newest
 /// marker: the later FIFO marker covers the previous one. Keep older markers
 /// available for incremental progress, without allocating or waiting.
@@ -1033,14 +1141,113 @@ fn hit_epoch(device: i32, lane: usize, fallback: u64) -> u64 {
     HIT_EPOCHS.with(|epochs| epochs.borrow().get(&device).map_or(fallback, |epochs| epochs[lane].max(fallback)))
 }
 
-pub(crate) struct LaneCycles {
+/// One lane cycle's launch scope on the lane executor's thread: the streams
+/// its banks launched on. V4.1 polls both lanes from one task (`tokio::join!`),
+/// so launches route by their bank's registered lane, never by a "current"
+/// lane. The scope lives on the thread that opened it; see `LaneCycles`.
+struct LaneScope {
+    thread: std::thread::ThreadId,
+    streams: Vec<(i32, StreamKey)>,
+}
+
+/// Raw CUDA stream identity. Only compared and handed back to the FFI on the
+/// thread that recorded it; never dereferenced here.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StreamKey(*mut std::ffi::c_void);
+
+thread_local! {
+    static LANE_SCOPES: std::cell::RefCell<[Option<LaneScope>; 2]> = const { std::cell::RefCell::new([None, None]) };
+}
+
+/// Attribute one bank graph launch to its lane's open cycle. One TLS borrow
+/// per launch; the stream list only grows on the first launch per stream.
+pub(crate) fn note_lane_launch(tally: &BankLaunches, stream: *mut std::ffi::c_void) {
+    let lane = (tally.lane.load(Ordering::Relaxed) as usize) & 1;
+    let clock = &tally.clocks[lane];
+    // Families without lane cycles never open one: one relaxed load, no TLS.
+    if !clock.active.load(Ordering::Relaxed) { return }
+    clock.launched.fetch_add(1, Ordering::Relaxed);
+    LANE_SCOPES.with(|scopes| {
+        let mut scopes = scopes.borrow_mut();
+        let Some(scope) = scopes.get_mut(lane).and_then(Option::as_mut) else { return };
+        let key = (tally.device, StreamKey(stream));
+        if !scope.streams.contains(&key) { scope.streams.push(key); }
+    });
+}
+
+pub(crate) struct LaneCycles<'a> {
     lane: usize,
     devices: Vec<i32>,
     clocks: Vec<Arc<[EpochClock; 2]>>,
+    /// Event proofs. `None` only for policy-only test fixtures, which credit on
+    /// `complete()` as the host-epoch clock always did.
+    library: Option<&'a cuteafd_ffi::NativeLibrary>,
 }
 
-impl LaneCycles {
-    pub fn register(lane: usize, concurrent_cycles: usize,
+/// Open/close one lane scope on `clocks` (shared by `LaneCycles` and
+/// `PrefillScope`). Credit is per device and never skips an unfinished proof.
+fn open_scope(lane: usize, clocks: &[Arc<[EpochClock; 2]>]) {
+    for clocks in clocks { clocks[lane].launched.store(0, Ordering::Relaxed); }
+    let thread = std::thread::current().id();
+    LANE_SCOPES.with(|scopes| {
+        let mut scopes = scopes.borrow_mut();
+        let streams = scopes[lane].take().map(|scope| { let mut s = scope.streams; s.clear(); s }).unwrap_or_default();
+        scopes[lane] = Some(LaneScope { thread, streams });
+    });
+}
+
+fn poll_scopes(library: &cuteafd_ffi::NativeLibrary, lane: usize, devices: &[i32],
+    clocks: &[Arc<[EpochClock; 2]>]) -> anyhow::Result<()> {
+    for (&device, clocks) in devices.iter().zip(clocks) { clocks[lane].poll_proofs(library, device)?; }
+    Ok(())
+}
+
+/// Record this scope's proofs: one event per launched stream, on its device.
+/// A launch counted on the shared clocks but recorded in no scope on this
+/// thread (a lane moved across threads) refuses credit instead of guessing.
+fn close_scope(library: &cuteafd_ffi::NativeLibrary, lane: usize, devices: &[i32],
+    clocks: &[Arc<[EpochClock; 2]>]) -> anyhow::Result<()> {
+    let launched: u64 = clocks.iter().map(|clocks| clocks[lane].launched.swap(0, Ordering::AcqRel)).sum();
+    let scope = LANE_SCOPES.with(|scopes| scopes.borrow_mut()[lane].take());
+    let Some(mut scope) = scope else {
+        anyhow::ensure!(launched == 0, "graph lane {lane} cycle closed without its launch scope");
+        return Ok(());
+    };
+    debug_assert_eq!(scope.thread, std::thread::current().id(),
+        "graph lane cycle must begin and complete on one executor thread");
+    anyhow::ensure!(scope.thread == std::thread::current().id(), "graph lane {lane} cycle completed on another thread");
+    let recorded = scope.streams.len();
+    anyhow::ensure!(launched == 0 || recorded > 0,
+        "graph lane {lane} cycle launched {launched} graphs without a recorded stream");
+    for (&device, clocks) in devices.iter().zip(clocks) {
+        let mine: Vec<_> = scope.streams.iter().filter(|(d, _)| *d == device).map(|&(_, s)| s).collect();
+        if mine.is_empty() { continue }
+        let cycle = clocks[lane].index.load(Ordering::Acquire);
+        clocks[lane].prove(library, device, cycle, mine.into_iter())?;
+    }
+    anyhow::ensure!(scope.streams.iter().all(|(d, _)| devices.contains(d)),
+        "graph lane {lane} launched on a device outside its registered banks");
+    scope.streams.clear();
+    LANE_SCOPES.with(|scopes| scopes.borrow_mut()[lane] = Some(LaneScope { thread: scope.thread, streams: scope.streams }));
+    Ok(())
+}
+
+impl<'a> LaneCycles<'a> {
+    /// Ordinary production registration: completion is proven by events on
+    /// every stream the lane launches graphs on.
+    pub fn register(library: &'a cuteafd_ffi::NativeLibrary, lane: usize, concurrent_cycles: usize,
+        visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<Self> {
+        let mut cycles = Self::register_clocks(lane, concurrent_cycles, visit)?;
+        for &device in &cycles.devices {
+            if let Some(cache) = existing_cache(device) {
+                cache.lock().unwrap_or_else(|p| p.into_inner()).event_completion = true;
+            }
+        }
+        cycles.library = Some(library);
+        Ok(cycles)
+    }
+
+    fn register_clocks(lane: usize, concurrent_cycles: usize,
         mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<Self> {
         // K bounds simultaneously in-flight decode/prefill operations (V4.1's
         // dual lane = 2). In-flight cycles protect every graph they may launch:
@@ -1049,7 +1256,7 @@ impl LaneCycles {
             "invalid graph lane/concurrent cycle count");
         let mut devices = std::collections::BTreeSet::new();
         visit(&mut |device, _, _, bank| { bank.lane_owner(lane); devices.insert(device); Ok(()) })?;
-        let devices: Vec<_> = devices.into_iter().collect();
+        let devices: Vec<_> = devices.into_iter().filter(|&device| existing_cache(device).is_some()).collect();
         let clocks = devices.iter().filter_map(|&device| existing_cache(device))
             .map(|cache| {
                 let mut cache = cache.lock().unwrap_or_else(|p| p.into_inner());
@@ -1058,14 +1265,27 @@ impl LaneCycles {
                     cache.clocks.as_ref().each_ref().map(|clock| clock.index.load(Ordering::Acquire))); });
                 cache.clocks.clone()
             }).collect();
-        Ok(Self { lane, devices, clocks })
+        Ok(Self { lane, devices, clocks, library: None })
+    }
+
+    /// Policy-only registration for allocation-free fixtures: host-epoch credit.
+    #[cfg(test)]
+    pub(crate) fn register_policy(lane: usize, concurrent_cycles: usize,
+        visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<Self> {
+        Self::register_clocks(lane, concurrent_cycles, visit)
+    }
+
+    #[cfg(test)]
+    fn policy(lane: usize, devices: Vec<i32>, clocks: Vec<Arc<[EpochClock; 2]>>) -> Self {
+        Self { lane, devices, clocks, library: None }
     }
 
     /// # Safety
-    /// Every previous-round consumer has completed. The visitor contains only
-    /// this registered lane's persistent-storage banks.
+    /// The visitor contains only this registered lane's persistent-storage
+    /// banks. Earlier cycles are credited only by their completion events.
     pub unsafe fn begin(&mut self,
         mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        if let Some(library) = self.library { poll_scopes(library, self.lane, &self.devices, &self.clocks)?; }
         let mut pending = false;
         for (&device, clocks) in self.devices.iter().zip(&self.clocks) {
             let clock = &clocks[self.lane];
@@ -1081,6 +1301,7 @@ impl LaneCycles {
             });
             pending |= clock.pending.load(Ordering::Acquire) > 0;
         }
+        if self.library.is_some() { open_scope(self.lane, &self.clocks); }
         if pending {
             visit(&mut |_, _, _, bank| {
                 // SAFETY: forwarded lane-local persistent-storage contract.
@@ -1091,19 +1312,102 @@ impl LaneCycles {
         Ok(())
     }
 
-    pub fn complete(&mut self) {
-        for clocks in &self.clocks {
-            let clock = &clocks[self.lane];
-            clock.completed.store(clock.index.load(Ordering::Acquire), Ordering::Release);
-            clock.active.store(false, Ordering::Release);
-        }
+    /// Record this cycle's completion events on every stream its banks
+    /// launched on (per device). Credit arrives at a later poll once all of a
+    /// device's older proofs are done, even across `LaneCycles` instances.
+    ///
+    /// The scope must close on the thread that opened it: V4.1 lanes are
+    /// polled by one current-thread task. A lane moved across threads would
+    /// leave launches unrecorded here; that is a hard error (never credit), and
+    /// debug builds assert the thread identity.
+    pub fn complete(&mut self) -> anyhow::Result<()> {
+        let result = match self.library {
+            None => {
+                for clocks in &self.clocks {
+                    let clock = &clocks[self.lane];
+                    clock.completed.store(clock.index.load(Ordering::Acquire), Ordering::Release);
+                }
+                Ok(())
+            }
+            Some(library) => close_scope(library, self.lane, &self.devices, &self.clocks),
+        };
+        for clocks in &self.clocks { clocks[self.lane].active.store(false, Ordering::Release); }
+        result
     }
 
     pub fn abandon(&mut self) {
         // An error is not a completed-cycle proof. A later successful cycle,
         // or the scheduler's fail_round + reset_connections drained boundary,
         // can release credit; clearing active alone cannot.
+        for clocks in &self.clocks { clocks[self.lane].launched.store(0, Ordering::Relaxed); }
+        LANE_SCOPES.with(|scopes| { if let Some(scope) = scopes.borrow_mut()[self.lane].as_mut() { scope.streams.clear(); } });
         for clocks in &self.clocks { clocks[self.lane].active.store(false, Ordering::Release); }
+    }
+}
+
+impl Drop for LaneCycles<'_> {
+    fn drop(&mut self) {
+        // Outstanding proofs stay on the shared device clocks: the next lane
+        // instance (or a prefill scope) polls and credits them.
+        if self.library.is_some() { LANE_SCOPES.with(|scopes| scopes.borrow_mut()[self.lane] = None); }
+    }
+}
+
+/// Lane-0 event scope for graph launches outside any lane cycle (V4.1's
+/// serial prefill units). Same proofs and polling as a lane cycle, on the
+/// same shared clocks; open only while no lane cycle is active.
+pub(crate) struct PrefillScope<'a> {
+    library: &'a cuteafd_ffi::NativeLibrary,
+    devices: Vec<i32>,
+    clocks: Vec<Arc<[EpochClock; 2]>>,
+}
+
+impl<'a> PrefillScope<'a> {
+    pub fn open(library: &'a cuteafd_ffi::NativeLibrary,
+        mut visit: impl FnMut(&mut GraphVisitor<'_>) -> anyhow::Result<()>) -> anyhow::Result<Self> {
+        let mut devices = std::collections::BTreeSet::new();
+        visit(&mut |device, _, _, _| { devices.insert(device); Ok(()) })?;
+        let mut kept = Vec::new();
+        let mut clocks = Vec::new();
+        for device in devices {
+            let Some(cache) = existing_cache(device) else { continue };
+            let cache = cache.lock().unwrap_or_else(|p| p.into_inner());
+            // An already-open lane 0 cycle owns these launches: its own scope
+            // records and proves them, so this scope stays out of its way.
+            if !cache.event_completion || cache.clocks[0].active.load(Ordering::Acquire) { continue }
+            kept.push(device);
+            clocks.push(cache.clocks.clone());
+        }
+        poll_scopes(library, 0, &kept, &clocks)?;
+        if clocks.is_empty() { return Ok(Self { library, devices: kept, clocks }) }
+        for clocks in &clocks {
+            clocks[0].index.fetch_add(1, Ordering::AcqRel);
+            clocks[0].active.store(true, Ordering::Release);
+        }
+        open_scope(0, &clocks);
+        Ok(Self { library, devices: kept, clocks })
+    }
+
+    /// Record proofs for the scope's launches; credit arrives at a later poll.
+    pub fn close(mut self) -> anyhow::Result<()> {
+        let devices = std::mem::take(&mut self.devices);
+        let clocks = std::mem::take(&mut self.clocks);
+        if clocks.is_empty() { return Ok(()) }
+        let result = close_scope(self.library, 0, &devices, &clocks);
+        for clocks in &clocks { clocks[0].active.store(false, Ordering::Release); }
+        result
+    }
+}
+
+impl Drop for PrefillScope<'_> {
+    fn drop(&mut self) {
+        if self.clocks.is_empty() { return }
+        // Not closed (error path): credit nothing, like an abandoned cycle.
+        for clocks in &self.clocks {
+            clocks[0].launched.store(0, Ordering::Relaxed);
+            clocks[0].active.store(false, Ordering::Release);
+        }
+        LANE_SCOPES.with(|scopes| scopes.borrow_mut()[0] = None);
     }
 }
 
@@ -1232,7 +1536,7 @@ impl DeviceCache {
     }
 
     pub(super) fn register_bank_launches(&mut self, bank: u64, site: &'static str, cycle: Cycle) -> Arc<BankLaunches> {
-        let launches = Arc::new(BankLaunches::new(site, cycle));
+        let launches = Arc::new(BankLaunches::new(site, cycle, self.device, self.bank_lane(bank), self.clocks.clone()));
         self.bank_launches.insert(bank, Arc::clone(&launches));
         launches
     }
@@ -1377,11 +1681,19 @@ impl DeviceCache {
     // fail_round + reset_connections first). The current-thread LaneSet polls
     // begin/complete and these boundaries serially; not a multi-thread barrier.
     pub(super) fn serial_boundary(&mut self) {
+        if self.event_completion { self.refresh_cycles(); return }
+        self.drained_boundary();
+    }
+
+    /// The caller has synchronized every stream that can hold this device's
+    /// graph launches: credit every lane clock even under event completion.
+    pub(super) fn drained_boundary(&mut self) {
         self.refresh_cycles();
-        if self.event_completion || self.lanes.iter().any(|lane| lane.active) { return }
+        if self.lanes.iter().any(|lane| lane.active) { return }
         for clock in self.clocks.iter() {
             let next = clock.index.fetch_add(1, Ordering::AcqRel) + 1;
             clock.completed.store(next, Ordering::Release);
+            clock.drop_proofs();
         }
         self.refresh_cycles();
         HIT_EPOCHS.with(|epochs| {
@@ -3618,14 +3930,14 @@ mod tests {
     #[test]
     #[ignore = "CPU lane boundary microbenchmark; run explicitly with --nocapture"]
     fn cycle_hit_only_boundary_microseconds() -> anyhow::Result<()> {
-        let mut cycles = LaneCycles { lane: 0, devices: vec![-1020],
-            clocks: vec![Arc::new(std::array::from_fn(|_| EpochClock::default()))] };
+        let mut cycles = LaneCycles::policy(0, vec![-1020],
+            vec![Arc::new(std::array::from_fn(|_| EpochClock::default()))]);
         let iterations = 1_000_000;
         let started = Instant::now();
         for _ in 0..iterations {
             // SAFETY: this clock-only fixture has no captured storage or native work.
             unsafe { cycles.begin(|_| unreachable!("no pending banks")) }?;
-            cycles.complete();
+            cycles.complete()?;
         }
         let ns = started.elapsed().as_nanos() as f64 / f64::from(iterations);
         println!("cycle_hit_only_boundary: {ns:.1} ns/round, 1 device, {iterations} rounds");
@@ -3848,7 +4160,7 @@ mod tests {
     #[test]
     fn cycle_abandon_is_not_completion_and_cannot_release_peer_credit() -> anyhow::Result<()> {
         let mut cache = epoch_fixture();
-        let mut cycles = LaneCycles { lane: 0, devices: vec![-1020], clocks: vec![cache.clocks.clone()] };
+        let mut cycles = LaneCycles::policy(0, vec![-1020], vec![cache.clocks.clone()]);
         // SAFETY: no native work in this policy fixture.
         unsafe { cycles.begin(|_| Ok(())) }?;
         cycles.abandon();
@@ -3866,7 +4178,7 @@ mod tests {
     fn cycle_peer_selected_after_abandon_waits_until_serial_drain() -> anyhow::Result<()> {
         let mut cache = epoch_fixture();
         cache.assign_bank_lane(1, 1);
-        let mut abandoned = LaneCycles { lane: 0, devices: vec![-1020], clocks: vec![cache.clocks.clone()] };
+        let mut abandoned = LaneCycles::policy(0, vec![-1020], vec![cache.clocks.clone()]);
         // SAFETY: synthetic policy clocks contain no native work.
         unsafe { abandoned.begin(|_| Ok(())) }?;
         abandoned.abandon();
