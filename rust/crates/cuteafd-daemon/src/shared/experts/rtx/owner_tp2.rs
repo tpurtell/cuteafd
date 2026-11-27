@@ -67,7 +67,7 @@ impl<'a> OwnerTp2<'a> {
     pub(crate) fn new(library: &'a NativeLibrary, ranks: [crate::shared::peer_split::RankDevice; 2],
         experts: [Box<dyn crate::shared::experts::rtx::RtxExpertLayer + 'a>; 2],
         hidden: usize, topk: usize, max_rows: usize, decode_rows: usize, wire: bool, tag_prefix: &str) -> Result<Self> {
-        use crate::shared::experts::rtx::{PartialDtype, RtxShard};
+        use crate::shared::experts::rtx::RtxShard;
         ensure!(!tag_prefix.is_empty() && decode_rows > 0 && decode_rows <= max_rows,
             "invalid owner TP2 tag or decode extent");
         ensure!(experts.iter().all(|expert| expert.uses_fp8_input() == wire),
@@ -109,8 +109,6 @@ impl<'a> OwnerTp2<'a> {
             let input = tp2.input(tp2.send[rank].buffer.ptr);
             let routes = tp2.routes(tp2.send[rank].buffer.ptr, layout);
             let stream = tp2.exchange.stream(rank);
-            let dtype = match tp2.experts[rank].partial() { PartialDtype::F32 => cuteafd_ffi::RtxPartialDtype::F32,
-                PartialDtype::Bf16 => cuteafd_ffi::RtxPartialDtype::Bf16 };
             devices[rank].run(|| {
                 // SAFETY: zeroed input/routes cover max_rows, and no peer waits exist yet.
                 unsafe { tp2.experts[rank].prime(input, routes, stream)?; }
@@ -119,10 +117,10 @@ impl<'a> OwnerTp2<'a> {
                 library.cuda_zero_bytes(partial, partial.bytes)?;
                 // Before waits exist, an admitted receive slot is idle scratch.
                 let shared = tp2.exchange.recv(rank, 0)?;
-                // SAFETY: initialize geometry-generic sum/add on disjoint retained buffers.
+                // SAFETY: initialize geometry-generic BF16->F32 sum and add on disjoint retained buffers.
                 unsafe {
-                    tp2.combine[rank].sum(partial.ptr, partial.ptr, tp2.reduced[rank].buffer.ptr.cast(),
-                        max_rows * hidden, dtype, stream)?;
+                    tp2.combine[rank].sum(shared, shared, tp2.reduced[rank].buffer.ptr.cast(),
+                        max_rows * hidden, cuteafd_ffi::RtxPartialDtype::Bf16, stream)?;
                     library.peer_add_bf16(tp2.reduced[rank].buffer.ptr, tp2.reduced[rank].buffer.ptr,
                         shared, max_rows * hidden, stream)?;
                     library.cuda_stream_synchronize(stream)?;
@@ -168,6 +166,7 @@ impl<'a> OwnerTp2<'a> {
     /// # Safety
     /// Input/routes/shared/output belong to owner, cover rows, are disjoint
     /// except the read-only operands, and stay live until both streams drain.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn enqueue(&mut self, owner: usize, layer: usize, rows: usize, input: *const c_void,
         routes: crate::shared::experts::rtx::Routes, shared: *const c_void, output: *mut c_void) -> Result<()> {
         // SAFETY: forwards the retained input/output and ordering contract.
@@ -186,6 +185,7 @@ impl<'a> OwnerTp2<'a> {
         unsafe { self.enqueue_destination(owner, layer, rows, input, routes, Destination::Routed(output)) }
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn enqueue_destination(&mut self, owner: usize, layer: usize, rows: usize, input: *const c_void,
         routes: crate::shared::experts::rtx::Routes, destination: Destination) -> Result<()> {
         self.exchange.require_live()?;
@@ -198,6 +198,7 @@ impl<'a> OwnerTp2<'a> {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn enqueue_live(&mut self, owner: usize, layer: usize, rows: usize, input: *const c_void,
         routes: crate::shared::experts::rtx::Routes, destination: Destination) -> Result<()> {
         use crate::shared::experts::rtx::PartialDtype;
@@ -235,20 +236,49 @@ impl<'a> OwnerTp2<'a> {
             self.experts[owner].enqueue(layer, rows, local_input, local_routes, stream, &mut abort)?;
             self.experts[peer].enqueue(layer, rows, peer_input, peer_routes, exchange.stream(peer), &mut abort)?;
         }
-        self.exchange.push(peer, 1, self.experts[peer].output(), extent.partial_bytes)?;
+        let elems = rows * self.hidden;
+        let f32_producer = self.experts[owner].partial() == PartialDtype::F32;
+        if f32_producer {
+            let peer_f32 = cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: self.experts[peer].output(),
+                bytes: extent.partial_bytes,
+                device_id: self.ranks[peer].id,
+                flags: 0,
+            };
+            self.exchange.push_partial(peer, 1, peer_f32, self.reduced[peer].buffer, elems)?;
+        } else {
+            self.exchange.push(peer, 1, self.experts[peer].output(), extent.partial_bytes)?;
+        }
         self.exchange.wait(owner, 1)?;
-        let mine = self.experts[owner].output();
+        let mine = if f32_producer {
+            let owner_f32 = cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: self.experts[owner].output(),
+                bytes: extent.partial_bytes,
+                device_id: self.ranks[owner].id,
+                flags: 0,
+            };
+            // Slot 0 on `owner` is idle once `peer` consumed its broadcast and published slot 1.
+            let owner_bf16 = cuteafd_ffi::CuteafdDeviceBuffer {
+                ptr: self.exchange.recv(owner, 0)?,
+                bytes: elems * 2,
+                device_id: self.ranks[owner].id,
+                flags: 0,
+            };
+            self.exchange.narrow_partial(owner, owner_f32, owner_bf16, elems)?;
+            owner_bf16.ptr
+        } else {
+            self.experts[owner].output()
+        };
         let theirs = self.exchange.recv(owner, 1)?;
         let [rank0, rank1] = if owner == 0 { [mine, theirs] } else { [theirs, mine] };
-        let dtype = match self.experts[owner].partial() { PartialDtype::F32 => cuteafd_ffi::RtxPartialDtype::F32,
-            PartialDtype::Bf16 => cuteafd_ffi::RtxPartialDtype::Bf16 };
         self.ranks[owner].run(|| {
-            // SAFETY: rank partials arrived on owner; reduction/output storage is disjoint and retained.
+            // SAFETY: rank BF16 partials arrived on owner; reduction/output storage is disjoint and retained.
             unsafe {
                 let reduced = destination.reduction(self.reduced[owner].buffer.ptr);
-                self.combine[owner].sum(rank0, rank1, reduced.cast(), rows * self.hidden, dtype, stream)?;
+                self.combine[owner].sum(rank0, rank1, reduced.cast(), elems,
+                    cuteafd_ffi::RtxPartialDtype::Bf16, stream)?;
                 if let Some((shared, output)) = destination.shared_add() {
-                    self.library.peer_add_bf16(reduced, shared, output, rows * self.hidden, stream)?;
+                    self.library.peer_add_bf16(reduced, shared, output, elems, stream)?;
                 }
                 Ok(())
             }

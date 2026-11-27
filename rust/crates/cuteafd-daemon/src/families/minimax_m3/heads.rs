@@ -126,12 +126,13 @@ impl<'a> Heads<'a> {
         impl HeadKernels for Kernels<'_, '_> {
             fn project(&mut self, rank: usize) -> Result<HeadProjection> {
                 self.ordering.project(rank, Publication { ordinal: self.ordinal, tag: self.tags[rank] })?;
-                Ok(HeadProjection { partial: self.units[rank].plane("reduction")?, rounded: None })
+                Ok(HeadProjection { partial: self.units[rank].plane("reduction")?,
+                    rounded: Some(self.units[rank].plane("ffn")?) })
             }
             fn merge(&mut self, rank: usize, values: HeadMerge) -> Result<()> {
                 let tag = self.tags[rank];
                 self.ordering.merge(rank, Publication { ordinal: self.ordinal, tag })?;
-                let HeadMerge::F32(values) = values else { anyhow::bail!("MiniMax Heads requires FP32 native partials") };
+                let HeadMerge::F32(values) = values else { anyhow::bail!("MiniMax Heads requires BF16-wire F32 partials") };
                 // SAFETY: shared head_partials ordered both producers/publications
                 // before either wait; the global FIFO sequence retains the views.
                 unsafe { self.units[rank].merge_heads(&self.ranks[rank].kernels, values, tag.rows,

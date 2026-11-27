@@ -74,7 +74,6 @@ pub(crate) struct Kernels<'a> {
     split_add: Option<cuteafd_ffi::Bf16F32Add<'a>>,
     narrow: Option<cuteafd_ffi::F32Bf16Narrow<'a>>,
     heads: bool,
-    f32_add: Option<cuteafd_ffi::F32Add<'a>>,
 }
 impl<'a> Kernels<'a> {
     pub fn bind(device: Device<'a>, programs: &'a Programs<'a>, manifest: &serde_json::Value,
@@ -130,7 +129,7 @@ impl<'a> Kernels<'a> {
             add: device.library.bf16_add()?,
             split_add: split.then(|| device.library.bf16_f32_add()).transpose()?,
             narrow: split.then(|| device.library.f32_bf16_narrow()).transpose()?,
-            heads, f32_add: heads.then(|| device.library.f32_add()).transpose()?,
+            heads,
         }))
     }
 }
@@ -733,21 +732,22 @@ impl<'a> UnitOwner<'a> {
         self.accumulate_from(if self.split.is_some() || kernels.heads { "ffn" } else { "combined" }, rows)
     }
     /// # Safety
-    /// Both ordered FP32 partials are local peer-exchange views, completed before
-    /// this stream consumes them; their lease survives narrowing/residual update.
+    /// Both ordered BF16 wire partials are local peer-exchange views, completed
+    /// before this stream consumes them; their lease survives F32 accumulation,
+    /// narrowing, and residual update.
     pub(crate) unsafe fn merge_heads(&self, kernels: &Kernels<'_>, values: [*const std::ffi::c_void; 2],
         rows: usize, attention: bool, shared: bool) -> Result<()> {
         self.check(kernels, rows)?;
         ensure!(kernels.heads && self.heads(), "MiniMax head merge requires narrow owners");
         let count = rows.checked_mul(6144).context("MiniMax head merge extent overflow")?;
-        let buffer = |ptr: *const std::ffi::c_void| Buffer { ptr: ptr.cast_mut(), bytes: count * 4,
-            device_id: self.stream.device.id, flags: 0 };
+        let buffer = |ptr: *const std::ffi::c_void| Buffer { ptr: ptr.cast_mut(),
+            bytes: count * 2, device_id: self.stream.device.id, flags: 0 };
         let meeting = self.dense.workspace.output.buffer;
         self.stream.device.run(|| {
-            // SAFETY: ordered live partial views and disjoint serial temporary;
-            // no subsequent projection reuses it before this narrowing completes.
+            // SAFETY: ordered live BF16 wire partial views and disjoint serial F32
+            // temporary; no subsequent projection reuses it before narrowing completes.
             unsafe {
-                kernels.f32_add.as_ref().context("MiniMax Heads add missing")?.launch(
+                kernels.split_add.as_ref().context("MiniMax Heads BF16 add missing")?.launch(
                     buffer(values[0]), buffer(values[1]), meeting, count, self.stream.raw)?;
                 kernels.narrow.as_ref().context("MiniMax Heads narrow missing")?.launch(
                     meeting.ptr, self.plane("ffn")?.ptr, count, self.stream.raw)

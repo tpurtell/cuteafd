@@ -150,6 +150,7 @@ impl<'a> TokenOwnerReduce<'a> {
     /// consumers and all other users of the borrowed slot follow those streams;
     /// the binding outlives graph replay and is dropped only after terminal abort
     /// on failure. No caller may enqueue a competing use between these operations.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn reduce(&mut self, scope: &super::pair::SubmissionScope<'_>,
         exchange: &crate::shared::peer_split::PeerExchange<'a>, owner: usize,
         rows: usize, partials: [CuteafdDeviceBuffer; 2], output: CuteafdDeviceBuffer,
@@ -186,8 +187,9 @@ trait TokenOwnerProtocol {
     fn require_live(&self) -> Result<()>;
     fn device(&self, rank: usize) -> i32;
     fn capacity(&self) -> usize;
-    fn received(&self, owner: usize) -> Result<*mut c_void>;
+    fn received(&self, rank: usize) -> Result<*mut c_void>;
     fn producers(&mut self) -> Result<()>;
+    fn narrow(&self, rank: usize, src_f32: CuteafdDeviceBuffer, dst_bf16: CuteafdDeviceBuffer, count: usize) -> Result<()>;
     fn publish(&self, remote: usize, source: *const c_void, bytes: usize) -> Result<()>;
     fn land(&self, owner: usize) -> Result<()>;
     fn sum(&self, owner: usize, ranks: [*const c_void; 2], output: *mut u16, count: usize) -> Result<()>;
@@ -198,7 +200,7 @@ impl TokenOwnerProtocol for TokenOwnerBinding<'_, '_> {
     fn require_live(&self) -> Result<()> { self.exchange.require_live() }
     fn device(&self, rank: usize) -> i32 { self.exchange.device(rank) }
     fn capacity(&self) -> usize { self.exchange.slot_bytes() }
-    fn received(&self, owner: usize) -> Result<*mut c_void> { self.exchange.recv(owner, self.reducer.slot) }
+    fn received(&self, rank: usize) -> Result<*mut c_void> { self.exchange.recv(rank, self.reducer.slot) }
     fn producers(&mut self) -> Result<()> {
         for rank in 0..2 { self.reducer.produced[rank].record(&self.reducer.streams[rank])?; }
         // Both exact lane streams include their previous slot consumers. Join
@@ -213,16 +215,19 @@ impl TokenOwnerProtocol for TokenOwnerBinding<'_, '_> {
         }
         Ok(())
     }
+    fn narrow(&self, rank: usize, src_f32: CuteafdDeviceBuffer, dst_bf16: CuteafdDeviceBuffer, count: usize) -> Result<()> {
+        self.exchange.narrow_partial(rank, src_f32, dst_bf16, count)
+    }
     fn publish(&self, remote: usize, source: *const c_void, bytes: usize) -> Result<()> {
         self.exchange.push(remote, self.reducer.slot, source, bytes)
     }
     fn land(&self, owner: usize) -> Result<()> { self.exchange.wait(owner, self.reducer.slot) }
     fn sum(&self, owner: usize, ranks: [*const c_void; 2], output: *mut u16, count: usize) -> Result<()> {
         self.exchange.on(owner, || {
-            // SAFETY: validated disjoint token planes; producer joins and peer
-            // landing precede the native fixed-rank FP32 sum on this stream.
+            // SAFETY: validated disjoint BF16 wire planes; producer joins, narrowing
+            // and peer landing precede the rank-ordered BF16->F32 sum on this stream.
             unsafe { self.reducer.kernels.sum(ranks[0], ranks[1], output, count,
-                RtxPartialDtype::F32, self.exchange.stream(owner)) }
+                RtxPartialDtype::Bf16, self.exchange.stream(owner)) }
         })
     }
     fn consumers(&mut self, owner: usize) -> Result<()> {
@@ -263,6 +268,7 @@ fn token_disjoint(a: (usize, usize), b: (usize, usize)) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn token_owner_with(_scope: &super::pair::SubmissionScope<'_>, protocol: &mut impl TokenOwnerProtocol,
     owner: usize, rows: usize, width: usize, partials: [CuteafdDeviceBuffer; 2],
     output: CuteafdDeviceBuffer, dtype: PartialDtype, layout: PartialLayout) -> Result<()> {
@@ -270,22 +276,39 @@ fn token_owner_with(_scope: &super::pair::SubmissionScope<'_>, protocol: &mut im
     ensure!(owner < 2 && dtype == PartialDtype::F32 && layout == PartialLayout::Tokens,
         "token owner reduction requires FP32 token sums and a valid owner");
     ensure!(protocol.device(0) != protocol.device(1), "token owner reduction needs distinct devices");
-    let (count, bytes) = token_extent(rows, width)?;
-    ensure!(bytes <= protocol.capacity(), "token owner reduction exceeds receive slot");
-    let local = token_range(partials[owner], bytes, protocol.device(owner), 16)?;
-    token_range(partials[1 - owner], bytes, protocol.device(1 - owner), 16)?;
-    let out = token_range(output, count * 2, protocol.device(owner), 2)?;
+    let (count, f32_bytes) = token_extent(rows, width)?;
+    let bf16_bytes = count * 2;
+    ensure!(bf16_bytes % 16 == 0, "token BF16 partial extent violates native ABI");
+    ensure!(f32_bytes <= protocol.capacity(), "token owner reduction exceeds receive slot");
+    let local = token_range(partials[owner], f32_bytes, protocol.device(owner), 16)?;
+    let remote = 1 - owner;
+    let remote_range = token_range(partials[remote], f32_bytes, protocol.device(remote), 16)?;
+    let out = token_range(output, bf16_bytes, protocol.device(owner), 2)?;
     let received = protocol.received(owner)?;
     let staging = token_range(CuteafdDeviceBuffer { ptr: received, bytes: protocol.capacity(),
-        device_id: protocol.device(owner), flags: 0 }, bytes, protocol.device(owner), 16)?;
+        device_id: protocol.device(owner), flags: 0 }, f32_bytes, protocol.device(owner), 16)?;
     token_disjoint(local, out)?;
     token_disjoint(local, staging)?;
     token_disjoint(out, staging)?;
+    let remote_ptr = protocol.received(remote)?;
+    let remote_bf16 = CuteafdDeviceBuffer { ptr: remote_ptr, bytes: bf16_bytes,
+        device_id: protocol.device(remote), flags: 0 };
+    let remote_staging = token_range(remote_bf16, bf16_bytes, protocol.device(remote), 16)?;
+    token_disjoint(remote_range, remote_staging)?;
     protocol.producers()?;
-    protocol.publish(1 - owner, partials[1 - owner].ptr, bytes)?;
+    protocol.narrow(remote, partials[remote], remote_bf16, count)?;
+    protocol.publish(remote, remote_bf16.ptr, bf16_bytes)?;
     protocol.land(owner)?;
-    let mut ranks = partials.map(|buffer| buffer.ptr.cast_const());
-    ranks[1 - owner] = received.cast_const();
+    let owner_bf16 = CuteafdDeviceBuffer {
+        ptr: received.wrapping_byte_add(bf16_bytes),
+        bytes: bf16_bytes,
+        device_id: protocol.device(owner),
+        flags: 0,
+    };
+    protocol.narrow(owner, partials[owner], owner_bf16, count)?;
+    let mut ranks = [std::ptr::null(); 2];
+    ranks[owner] = owner_bf16.ptr.cast_const();
+    ranks[remote] = received.cast_const();
     protocol.sum(owner, ranks, output.ptr.cast(), count)?;
     protocol.consumers(owner)
 }
@@ -474,7 +497,11 @@ mod token_owner_tests {
     impl Protocol {
         fn new(owner: usize) -> Self {
             Self { owner, capacity: 64, calls: RefCell::new(Vec::new()), fail: None,
-                retired: Cell::new(false), operands: [vec![1.00390625, -2.0, 3.0, -0.5], vec![0.00390625, 0.5, -1.0, 0.25]],
+                retired: Cell::new(false),
+                operands: [
+                    vec![1.00390625, -2.0, 3.0, -0.5, 0.25, -4.0, 1.5, 0.125],
+                    vec![0.00390625, 0.5, -1.0, 0.25, 0.75, 2.0, -0.5, 0.375],
+                ],
                 result: RefCell::new(Vec::new()) }
         }
         fn call(&self, name: &'static str) -> Result<()> {
@@ -497,15 +524,20 @@ mod token_owner_tests {
         fn require_live(&self) -> Result<()> { ensure!(!self.retired.get(), "retired reducer"); Ok(()) }
         fn device(&self, rank: usize) -> i32 { [3, 7][rank] }
         fn capacity(&self) -> usize { self.capacity }
-        fn received(&self, owner: usize) -> Result<*mut c_void> {
-            assert_eq!(owner, self.owner);
-            Ok(0x3000usize as *mut c_void)
+        fn received(&self, rank: usize) -> Result<*mut c_void> {
+            Ok((0x3000 + rank * 0x100) as *mut c_void)
         }
         fn producers(&mut self) -> Result<()> { self.call("join both exact lane producers") }
+        fn narrow(&self, rank: usize, src: CuteafdDeviceBuffer, dst: CuteafdDeviceBuffer, count: usize) -> Result<()> {
+            assert_eq!(src.device_id, self.device(rank));
+            assert_eq!(dst.device_id, self.device(rank));
+            assert!(src.bytes >= count * 4 && dst.bytes >= count * 2);
+            self.call("narrow partial to BF16")
+        }
         fn publish(&self, remote: usize, source: *const c_void, bytes: usize) -> Result<()> {
             assert_eq!(remote, 1 - self.owner);
-            assert_eq!(source, self.inputs()[remote].ptr.cast_const());
-            assert!(bytes <= self.capacity);
+            assert_eq!(source, (0x3000 + remote * 0x100) as *const c_void);
+            assert_eq!(bytes, self.operands[remote].len() * 2);
             self.call("remote-only push")
         }
         fn land(&self, owner: usize) -> Result<()> {
@@ -514,12 +546,18 @@ mod token_owner_tests {
         }
         fn sum(&self, owner: usize, ranks: [*const c_void; 2], output: *mut u16, count: usize) -> Result<()> {
             assert_eq!(owner, self.owner);
-            let mut expected = self.inputs().map(|buffer| buffer.ptr.cast_const());
-            expected[1 - owner] = 0x3000usize as *const c_void;
-            assert_eq!(ranks, expected, "native operands must remain rank0 then rank1");
             assert_eq!(output, self.output().ptr.cast());
-            self.call("rank-ordered FP32 sum")?;
-            self.result.replace((0..count).map(|i| bf16(self.operands[0][i] + self.operands[1][i])).collect());
+            let recv_owner = 0x3000 + owner * 0x100;
+            let mut expected = [std::ptr::null(); 2];
+            expected[owner] = (recv_owner + count * 2) as *const c_void;
+            expected[1 - owner] = recv_owner as *const c_void;
+            assert_eq!(ranks, expected, "BF16 wire operands must remain rank0 then rank1");
+            self.call("rank-ordered BF16->FP32 sum")?;
+            self.result.replace((0..count).map(|i| {
+                let a = f32::from_bits((bf16(self.operands[0][i]) as u32) << 16);
+                let b = f32::from_bits((bf16(self.operands[1][i]) as u32) << 16);
+                bf16(a + b)
+            }).collect());
             Ok(())
         }
         fn consumers(&mut self, owner: usize) -> Result<()> {
@@ -538,20 +576,30 @@ mod token_owner_tests {
         let output = protocol.output();
         let owner = protocol.owner;
         submit_scoped(|| Ok(()), || Ok(()), |scope|
-            token_owner_with(scope, protocol, owner, 1, 4, inputs, output,
+            token_owner_with(scope, protocol, owner, 1, 8, inputs, output,
                 PartialDtype::F32, PartialLayout::Tokens))
     }
 
     #[test]
-    fn token_sum_is_one_way_fixed_rank_and_rounds_only_after_adding() -> Result<()> {
+    fn token_sum_is_one_way_fixed_rank_bf16_wire_with_f32_accumulation() -> Result<()> {
         for owner in 0..2 {
             let mut protocol = Protocol::new(owner);
             reduce(&mut protocol)?;
-            assert_eq!(*protocol.calls.borrow(), ["join both exact lane producers", "remote-only push",
-                "owner wait", "rank-ordered FP32 sum", "join both exact lane consumers"]);
-            assert_eq!(*protocol.result.borrow(), [bf16(1.0078125), bf16(-1.5), bf16(2.0), bf16(-0.25)]);
-            let rounded_first = f32::from_bits((bf16(1.00390625) as u32) << 16) + 0.00390625;
-            assert_ne!(bf16(1.0078125), bf16(rounded_first), "fixture distinguishes premature BF16 narrowing");
+            assert_eq!(*protocol.calls.borrow(), [
+                "join both exact lane producers",
+                "narrow partial to BF16",
+                "remote-only push",
+                "owner wait",
+                "narrow partial to BF16",
+                "rank-ordered BF16->FP32 sum",
+                "join both exact lane consumers",
+            ]);
+            let expected: Vec<u16> = (0..8).map(|i| {
+                let a = f32::from_bits((bf16(protocol.operands[0][i]) as u32) << 16);
+                let b = f32::from_bits((bf16(protocol.operands[1][i]) as u32) << 16);
+                bf16(a + b)
+            }).collect();
+            assert_eq!(*protocol.result.borrow(), expected);
         }
         assert_eq!(token_extent(4096, 3584)?.1, 4096 * 7168 * 2,
             "Kimi FP32 latent payload borrows the existing BF16 hidden slot exactly");
@@ -560,11 +608,11 @@ mod token_owner_tests {
 
     #[test]
     fn token_reduction_rejects_invalid_planes_before_any_enqueue() {
-        for case in 0..19 {
+        for case in 0..20 {
             let mut protocol = Protocol::new(0);
             let mut inputs = protocol.inputs();
             let mut output = protocol.output();
-            let (mut owner, mut rows, mut width) = (0, 1, 4);
+            let (mut owner, mut rows, mut width) = (0, 1, 8);
             let (mut dtype, mut layout) = (PartialDtype::F32, PartialLayout::Tokens);
             match case {
                 0 => owner = 2,
@@ -573,22 +621,24 @@ mod token_owner_tests {
                 3 => width = usize::MAX,
                 4 => dtype = PartialDtype::Bf16,
                 5 => layout = PartialLayout::Routes { topk: 16 },
-                6 => inputs[0].bytes = 15,
+                6 => inputs[0].bytes = 31,
                 7 => inputs[1].device_id = 3,
                 8 => inputs[1].ptr = std::ptr::null_mut(),
                 9 => output.ptr = inputs[0].ptr,
                 10 => output.ptr = 0x3000usize as *mut c_void,
-                11 => output.bytes = 3,
-                12 => protocol.capacity = 15,
+                11 => output.bytes = 15,
+                12 => protocol.capacity = 31,
                 13 => inputs[0].ptr = (usize::MAX - 15) as *mut c_void,
                 14 => inputs[1].ptr = 0x2004usize as *mut c_void,
                 15 => width = 2,
-                16 => { width = 4096 * 16384 + 4; protocol.capacity = usize::MAX; },
+                16 => { width = 4096 * 16384 + 8; protocol.capacity = usize::MAX; },
                 17 => inputs[0].ptr = 0x1004usize as *mut c_void,
+                18 => width = 4, // bf16_bytes = 8 violates 16-byte wire ABI
                 _ => output.ptr = 0x4001usize as *mut c_void,
             }
             let result = submit_scoped(|| Ok(()), || Ok(()), |scope|
-                token_owner_with(scope, &mut protocol, owner, rows, width, inputs, output, dtype, layout));
+                token_owner_with(scope, &mut protocol, owner, rows, width, inputs, output,
+                    dtype, layout));
             assert!(result.is_err(), "case {case}");
             assert!(protocol.calls.borrow().is_empty(), "case {case} queued work");
         }
@@ -677,7 +727,7 @@ mod token_owner_tests {
     #[test]
     fn token_reduction_enqueue_failures_and_cancellation_use_submission_teardown() {
         for owner in 0..2 {
-            for failure in 0..5 {
+            for failure in 0..7 {
                 for cancel in [false, true] {
                     let protocol = RefCell::new(Protocol::new(owner));
                     protocol.borrow_mut().fail = Some(failure);
@@ -689,7 +739,7 @@ mod token_owner_tests {
                             let mut protocol = protocol.borrow_mut();
                             let inputs = protocol.inputs();
                             let output = protocol.output();
-                            let result = token_owner_with(scope, &mut *protocol, owner, 1, 4,
+                            let result = token_owner_with(scope, &mut *protocol, owner, 1, 8,
                                 inputs, output, PartialDtype::F32, PartialLayout::Tokens);
                             if cancel { panic!("injected cancellation after enqueue prefix"); }
                             result

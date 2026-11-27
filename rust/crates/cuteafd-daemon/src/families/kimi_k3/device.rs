@@ -780,7 +780,7 @@ impl<'a> LocalLane<'a> {
         self.layers.get(layer).map(Rc::as_ref).ok_or_else(|| anyhow::anyhow!("Kimi local layer outside inventory"))
     }
 
-    fn plane(&self, name: &str, rows: usize, width: usize) -> Result<CuteafdDeviceBuffer> {
+    pub(crate) fn plane(&self, name: &str, rows: usize, width: usize) -> Result<CuteafdDeviceBuffer> {
         ensure!((1..=self.lane.rows()).contains(&rows), "Kimi local rows exceed admitted lane");
         view(self.lane.buffer(name)?, 0, rows * width * 2)
     }
@@ -2072,24 +2072,22 @@ impl<'a> LocalLane<'a> {
         })
     }
 
-    /// Native outputs add unrotated F32 partials and narrow once. K6 retains
-    /// its BF16 transformed-basis meet and exactly one H128 egress.
+    /// Native outputs narrow to BF16 on the wire, accumulate in F32 in rank
+    /// order, and narrow once. K6 retains its BF16 transformed-basis meet and
+    /// exactly one H128 egress.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reduce_core(&self,layer:usize,ffn:bool,rows:usize,peer:CorePartial,
+        exchange:&crate::shared::peer_split::PeerExchange<'_>,
         destination:&str,stream:*mut std::ffi::c_void)->Result<()> {
         let programs=self.programs.core.as_ref().context("Kimi core programs not resolved")?;
         let local=self.core_partial(layer,ffn,rows)?;
         let reduced=self.lane.buffer("K6 reduced")?;
         let output=self.plane(destination,rows,7168)?;
         match (local,peer) {
-            (CorePartial::NativeF32(local),CorePartial::NativeF32(peer)) => {
-                let (rank0,rank1)=if self.rank==0 {(local,peer)}else{(peer,local)};
-                // SAFETY: persistent disjoint F32 producers and reduced plane are
-                // ordered on the peer stream; all owners survive graph replay.
-                unsafe {
-                    programs.native_add.launch(rank0,rank1,reduced,rows*7168,stream)?;
-                    programs.narrow.launch(reduced.ptr,output.ptr,rows*7168,stream)?;
-                }
-                Ok(())
+            (CorePartial::NativeF32(_),CorePartial::NativeF32(peer)) => {
+                let local_bf16 = self.plane(if ffn { "ffn output" } else { "attention output" }, rows, 7168)?;
+                exchange.reduce_partial_narrow_on(self.rank, local_bf16, peer.ptr, reduced, output,
+                    rows * 7168, stream)
             }
             (CorePartial::K6Bf16(local),CorePartial::K6Bf16(peer)) => {
                 let weights=self.layer(layer)?;

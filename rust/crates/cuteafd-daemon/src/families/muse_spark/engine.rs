@@ -149,7 +149,7 @@ impl<'a> RankResources<'a> {
         let rope = rotary.get(recipe)?;
         let lane = Lane::allocate(device, &LanePlanes::with_format(cfg, ranks, unit_rows, waves, built.kv_cache)?)?;
         let tp2 = (ranks == 2).then(|| -> Result<Tp2Ops<'a>> {
-            Ok(Tp2Ops { add: library.f32_add()?, narrow: library.f32_bf16_narrow()? })
+            Ok(Tp2Ops { narrow: library.f32_bf16_narrow()? })
         }).transpose()?;
         let step = StepStorage::allocate(device, tables)?;
         let global_layout = cuteafd_loader::families::muse_spark::weight_layout::GlobalLayout::new(cfg, &actual_core)?;

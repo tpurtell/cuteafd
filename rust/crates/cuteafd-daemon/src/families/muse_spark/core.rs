@@ -215,12 +215,12 @@ impl<'a> CorePrograms<'a> {
         self.projection(weights, ProjectionOutput::F32)?.core(rows, input, weights, self.scratch()?, stream)
     }
 
-    /// The K-split egress (shared rule): `rank0 + rank1` F32 cores
-    /// added in rank order (`reduced`), then the one H128/svh egress.
+    /// K-split egress: widen BF16 wire partials `rank0 + rank1` in F32 in rank
+    /// order (`reduced`), then apply the one H128/svh egress.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn reduced(&self, add: &cuteafd_ffi::F32Add<'_>, rows: usize, rank0: Buffer, rank1: Buffer,
+    pub(crate) fn reduced(&self, add: &cuteafd_ffi::Bf16F32Add<'_>, rows: usize, rank0: Buffer, rank1: Buffer,
         reduced: Buffer, weights: &CoreWeights<'_>, output: Buffer, stream: *mut c_void) -> Result<()> {
-        self.projection(weights, ProjectionOutput::F32)?.reduced_f32(add, rows, rank0, rank1, reduced, weights, output, stream)
+        self.projection(weights, ProjectionOutput::F32)?.reduced(add, rows, rank0, rank1, reduced, weights, output, stream)
     }
 
 }
