@@ -5,7 +5,7 @@
 //! - 5 dense absorbed-MLA layers tapping `[61, 65, 69, 73, 77]` (all full IndexCache layers)
 //! - `hidden=6144`, `heads=64`, `q_lora_rank=2048`, `kv_lora_rank=512`, `mlp=18432`
 //! - `block_size=7` (1 anchor/bonus token + 6 speculative masks), `topk=2048`
-//! - No `post_proj_norm` (matches Hy4 target); K8 MUL1 views reuse target dense/MLA trellis exports.
+//! - No `post_proj_norm` (matches Hy4 target); K6/K8 MUL1 views reuse target dense/MLA trellis exports.
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{ensure, Context, Result};
@@ -126,9 +126,9 @@ pub struct DraftWeights {
     pub rank: usize,
     pub tp: usize,
     pub arena: WeightArenaLayout,
-    /// K8 MUL1 projections retained in their native trellis storage format.
+    /// K6/K8 MUL1 projections retained in their native trellis storage format.
     pub native: BTreeMap<String, CoreWeightLayout>,
-    /// K8 sources for load-time conversion into the arena's absorbed BF16 views.
+    /// K6/K8 sources for load-time conversion into the arena's absorbed BF16 views.
     pub absorbed: BTreeMap<String, CoreProjection>,
 }
 
@@ -172,9 +172,11 @@ impl DraftWeights {
                     };
                     ensure!(
                         (projection.shape == shape || projection.shape == expected_shape)
-                            && projection.bits == 8
+                            && matches!(projection.bits, 6 | 8)
                             && projection.codebook == Exl3Codebook::Mul1,
-                        "{stem}: Hy4 DFly2 expects K8 MUL1 at {shape:?} (or {expected_shape:?}), found {:?}",
+                        "{stem}: Hy4 DFly2 expects K6/K8 MUL1 at {shape:?} (or {expected_shape:?}), found K{} {:?} {:?}",
+                        projection.bits,
+                        projection.codebook,
                         projection.shape
                     );
                     if suffix == "self_attn.kv_b_proj" {

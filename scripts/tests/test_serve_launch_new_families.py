@@ -231,6 +231,68 @@ def test_hy4_bundled_drafter_matches_plan_and_serve(tmp_path: Path, mode: str, s
     assert _flag(serve_line, "--tp2-dflash") == _flag(plan, "--tp2-dflash") == "false"
 
 
+@pytest.mark.parametrize("mode,selected", [("off", "off"), ("dfly2", "dfly2"), ("auto", "dfly2"), ("", "dfly2")])
+def test_hy4_full_bundled_drafter_matches_plan_and_serve(tmp_path: Path, mode: str, selected: str) -> None:
+    config = {
+        "model_type": "hy_v4_vl",
+        "dfly_num_hidden_layers": 5,
+        "text_config": {
+            "model_type": "hy_v4_vl_text",
+            "num_hidden_layers": 78,
+            "mlp_layer_types": ["dense"] + ["sparse"] * 77,
+        },
+        "vision_config": {"num_hidden_layers": 40},
+    }
+    four = "".join(f"SPARK_{i}_HOST=h{i}\nSPARK_{i}_LANE_A=10.0.0.{i + 1}\n" for i in range(4))
+    keys = f"SPARK_COUNT=4\nRTX_GPUS=1\nEXPERT_BACKEND=spark\nSPECULATOR={mode}\nVISION=auto\nAUDIO=off\n" + four
+    result = _family_launch_result(
+        tmp_path, config, "wrldsuksgo2mars/Hy4-EXL3-K4-MC", keys,
+        physical_gpus=(0,), extra_args=("--wip", "hy4"),
+        encoder_plan={**PLANNED, "spark_ranks": 4, "encoder": {"kind": {"kind": "spark", "rank": 0}, "replicas": []}},
+        deployment_overrides={"prefill_unit_rows": 2752, "prefill_waves": 3},
+    )
+    plan = _line(result, "cuteafd plan")
+    serve_line = _line(result, "serve-hy4 --snapshot")
+    assert _flag(plan, "--speculator") == selected
+    assert ("--dfly2" if selected == "dfly2" else "--dfly2=false") in shlex.split(serve_line)
+    assert _flag(serve_line, "--vision") == "spark:0"
+
+
+def test_hy4_example_configs_and_gate_cards_enable_dfly2_and_vision(tmp_path: Path) -> None:
+    expected = {
+        "hy4-exl3-k4-mc-min.config": ("k8-compact", "1", "4"),
+        "hy4-exl3-k4-mc-k8-max.config": ("k8-compact", "2", "6"),
+        "hy4-exl3-k4-mc-max.config": ("original", "2", "6"),
+        "hy4-exl3-k4-mc-k6-max.config": ("k6-compact", "2", "6"),
+        "hy4-exl3-k4-mc-fp8-max.config": ("fp8-compact", "2", "6"),
+    }
+    for name, (view, gpus, sparks) in expected.items():
+        path = ROOT / "examples/configs" / name
+        values = _keys(path)
+        assert values["MODEL_ID"] == "wrldsuksgo2mars/Hy4-EXL3-K4-MC"
+        assert values["MODEL_REVISION"] == "67346c4bdee2d8694606b4b4db9a96442e8667b7"
+        assert (values["CORE_VIEW"], values["RTX_GPUS"], values["SPARK_COUNT"]) == (view, gpus, sparks)
+        assert (values["SPECULATOR"], values["VISION"], values["AUDIO"], values["POOL_TOKENS"]) == (
+            "auto", "auto", "off", "auto"
+        )
+        assert not any(needle in path.read_text().lower() for needle in PRIVATE)
+    key = tmp_path / "key"
+    key.write_text("k" * 64 + "\n")
+    key.chmod(0o600)
+    for name, gpus, sparks in (
+        ("hy4-exl3-min", [1], ["ostrich", "dodo", "emu", "kiwi"]),
+        ("hy4-exl3-max", [0, 1], ["ostrich", "dodo", "emu", "kiwi", "rhea", "moa"]),
+    ):
+        card = cards.load_cards(ROOT / "scripts/bench/kits/gate", [name])[0]
+        assert card["family"] == "hy4" and card["gpus"] == gpus and card["sparks"] == sparks
+        assert cards.slot_needs(card)["spark"] == ["exl3/exl3-hy4-k45-mul1"]
+        job = cards.generate(card, "cand", {"instance": "t", "slot": "s"}, tmp_path / name, key, {}, {"fabric"}, None, 1)
+        values = cards.config(Path(job["entry"]["config"]))
+        assert (values["SPECULATOR"], values["VISION"], values["CORE_VIEW"]) == ("auto", "auto", "k8-compact")
+        assert (values["RTX_GPUS"], values["SPARK_COUNT"]) == (str(len(gpus)), str(len(sparks)))
+        assert values["COORDINATOR_GPUS"] == ",".join(map(str, gpus))
+
+
 @pytest.mark.parametrize(("speculator", "setting", "expected"), [
     ("dfly2", None, "true"),
     ("auto", None, "true"),
