@@ -20,6 +20,13 @@ gate = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(gate)
 
 BUILD_OK = '{"reason":"build-finished","success":true}\n'
+REAL_PLACEMENT_INPUTS = gate.placement_inputs
+
+
+@pytest.fixture(autouse=True)
+def matched_placement_inputs(monkeypatch):
+    """Suites under test here are not about placement inputs; test_placement_* use the real resolver."""
+    monkeypatch.setattr(gate, 'placement_inputs', lambda source, env, args: ({'stub': True}, None))
 
 ARGS = SimpleNamespace(cargo_build_timeout=60, cargo_timeout=60, scripts_timeout=60, skip_live_planners=False, cargo_jobs=4, pytest_jobs=4)
 
@@ -1039,7 +1046,8 @@ def test_cpu_gate_terminated_in_lease_queue_writes_nonzero_receipt(tmp_path):
     locks.mkdir(parents=True)
     with gate.gate_lease(locks, slots=2, timeout=0):
         with gate.gate_lease(locks, slots=2, timeout=0):
-            process = subprocess.Popen([sys.executable, str(ROOT / 'scripts/dev/cpu-gate'), '--task', 'terminated-lease'],
+            process = subprocess.Popen([sys.executable, str(ROOT / 'scripts/dev/cpu-gate'), '--task', 'terminated-lease',
+                                        '--skip-live-planners'],
                                        env={**os.environ, 'HOME': str(tmp_path)}, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True, start_new_session=True)
             try:
@@ -1167,3 +1175,121 @@ def test_build_channel_waits_for_remote_descendants_to_stop(tmp_path):
         finally:
             if process.poll() is None:
                 process.kill()
+
+
+# Placement-input resolution: a checkout validates against the publication that records its own key.
+
+def _publication_tree(tmp_path, edit=None):
+    """A copy of this checkout's exporter sources and a store holding its publication."""
+    import placement_publications as publications
+    checkout = tmp_path / 'checkout'
+    for relative in ('scripts/build', 'scripts/lib', 'python/tools', 'examples/configs'):
+        shutil.copytree(ROOT / relative, checkout / relative, ignore=shutil.ignore_patterns('__pycache__'))
+    for relative in ('third_party/sparkinfer.lock.json', 'benchmarks/current-matrix.json',
+                     'native/cmake/shared/fp8_moe.cmake',
+                     'rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json',
+                     'rust/crates/cuteafd-core/src/dspark_verify.rs', 'rust/crates/cuteafd-core/src/serving_capacity.rs'):
+        (checkout / relative).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, checkout / relative)
+    fingerprints = publications.checkout_fingerprints(checkout)
+    home = tmp_path / 'home'
+    builds = home / '.cache/cuteafd/builds'
+    for kind, store in publications.STORES.items():
+        for name, fingerprint in (('a' * 40, {**fingerprints[kind], 'source_tree_sha256': 'old'}),
+                                  ('b' * 40, fingerprints[kind])):
+            publication = builds / store / name
+            (publication / 'share').mkdir(parents=True)
+            (publication / 'share/PROGRAMS.json').write_text('{}')
+            (publication / 'INPUTS.json').write_text(json.dumps(
+                {'schema': 1, 'engine_commit': name, **fingerprint, 'exports': [], 'files': {}}, indent=2))
+        (builds / store / 'current').symlink_to('a' * 40)  # current is newer dev; this branch is on an older base
+    if edit:
+        (checkout / edit).write_text((checkout / edit).read_text() + '\n# unpublished edit\n')
+    return checkout, home
+
+
+@pytest.fixture
+def placement_lib(monkeypatch):
+    monkeypatch.syspath_prepend(str(ROOT / 'scripts/lib'))
+
+
+def _placement_args(**overrides):
+    return SimpleNamespace(**{'cargo': True, 'skip_live_planners': False, 'cargo_filter': None, 'full': True, **overrides})
+
+
+def test_placement_branch_on_an_older_base_resolves_its_own_publication(tmp_path, placement_lib):
+    checkout, home = _publication_tree(tmp_path)
+    record, error = REAL_PLACEMENT_INPUTS(checkout, {'HOME': str(home)}, _placement_args())
+    assert error is None
+    store = home / '.cache/cuteafd/builds'
+    assert record['all']['path'] == str(store / 'placement-inputs' / ('b' * 40) / 'share/PROGRAMS.json')
+    assert record['v4']['path'] == str(store / 'v4-placement-inputs' / ('b' * 40))
+    assert record['all']['how'] == 'matching publication' and record['all']['engine_commit'] == 'b' * 40
+    env = gate.apply_placement_inputs({}, record)
+    assert env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] == record['all']['path']
+    assert env['CUTEAFD_V4_PLACEMENT_INPUTS'] == record['v4']['path']
+    # When current matches it is preferred.
+    for kind in ('placement-inputs', 'v4-placement-inputs'):
+        (store / kind / 'current').unlink()
+        (store / kind / 'current').symlink_to('b' * 40)
+    record, error = REAL_PLACEMENT_INPUTS(checkout, {'HOME': str(home)}, _placement_args())
+    assert error is None and record['all']['how'] == record['v4']['how'] == 'current'
+
+
+def test_placement_unpublished_exporter_edit_fails_fast_before_compiling(tmp_path, placement_lib, monkeypatch):
+    checkout, home = _publication_tree(tmp_path, edit='python/tools/aot/package_exl3_aot.py')
+    started = time.monotonic()
+    record, error = REAL_PLACEMENT_INPUTS(checkout, {'HOME': str(home)}, _placement_args())
+    assert time.monotonic() - started < 5
+    assert 'no placement-inputs publication records' in error and 'python/tools/aot/package_exl3_aot.py' in error
+    assert 'no v4-placement-inputs publication' in error and 'export-placement-inputs.py --output' in error
+    assert record['all']['path'] is None
+    # The default tier does not run live V4 planners: only the all-family inventory is required.
+    _, error = REAL_PLACEMENT_INPUTS(checkout, {'HOME': str(home)}, _placement_args(full=False))
+    assert 'v4-placement-inputs' not in error and 'placement-inputs publication' in error
+    # main() fails with a receipt before any lease or Cargo work.
+    monkeypatch.setattr(gate, 'placement_inputs', REAL_PLACEMENT_INPUTS)
+    monkeypatch.setattr(gate, 'BUILDS', tmp_path / 'builds')
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setattr(gate, 'gate_lease', lambda *a, **k: pytest.fail('took a gate lease'))
+    monkeypatch.setattr(gate, 'cargo', lambda *a, **k: pytest.fail('compiled'))
+    monkeypatch.setattr(sys, 'argv', ['cpu-gate', '--task', 't', '--source', str(ROOT)])
+    monkeypatch.setattr(gate, '_placement_publications', lambda source: __import__('placement_publications'))
+    monkeypatch.setattr(gate, 'placement_inputs', lambda source, env, args: REAL_PLACEMENT_INPUTS(checkout, env, args))
+    assert gate.main() == 1
+    receipt = json.loads((tmp_path / 'builds/t/cpu-gate.json').read_text())
+    assert receipt['verdict'] == 'failed' and 'placement inputs: no placement-inputs publication' in receipt['error']
+
+
+def test_placement_explicit_override_is_kept_only_when_it_matches(tmp_path, placement_lib):
+    checkout, home = _publication_tree(tmp_path)
+    store = home / '.cache/cuteafd/builds/placement-inputs'
+    stale = str(store / ('a' * 40) / 'share/PROGRAMS.json')
+    record, error = REAL_PLACEMENT_INPUTS(checkout, {'HOME': str(home), 'CUTEAFD_DEPLOYMENT_TEST_PROGRAMS': stale},
+                                          _placement_args(full=False))
+    assert 'explicit CUTEAFD_DEPLOYMENT_TEST_PROGRAMS' in error and 'source_tree_sha256' in error
+    good = str(store / ('b' * 40) / 'share/PROGRAMS.json')
+    record, error = REAL_PLACEMENT_INPUTS(checkout, {'HOME': str(home), 'CUTEAFD_DEPLOYMENT_TEST_PROGRAMS': good},
+                                          _placement_args(full=False))
+    assert error is None and record['all'] == dict(path=good, how='explicit CUTEAFD_DEPLOYMENT_TEST_PROGRAMS',
+                                                    key=record['all']['key'], matches=True)
+    assert gate.apply_placement_inputs({'CUTEAFD_DEPLOYMENT_TEST_PROGRAMS': good}, record)[
+        'CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'] == good
+
+
+def test_placement_resolution_is_skipped_without_installed_planners(tmp_path, placement_lib):
+    checkout, home = _publication_tree(tmp_path, edit='python/tools/aot/package_exl3_aot.py')
+    for args in (_placement_args(skip_live_planners=True), _placement_args(cargo=False)):
+        record, error = REAL_PLACEMENT_INPUTS(checkout, {'HOME': str(home)}, args)
+        assert error is None and 'skipped' in record
+    record, error = REAL_PLACEMENT_INPUTS(checkout, {'HOME': str(home)}, _placement_args(cargo_filter='some_test'))
+    assert error is None and record['all']['path'] is None  # focused runs: resolve when possible, never refuse
+
+
+def test_placement_key_matches_the_real_checkout_and_its_current_publication():
+    sys.path.insert(0, str(ROOT / 'scripts/lib'))
+    import placement_publications as publications
+    fingerprints = publications.checkout_fingerprints(ROOT)
+    assert set(fingerprints) == {'all', 'v4'}
+    assert set(fingerprints['v4']['engine_sources_sha256']) <= set(fingerprints['all']['engine_sources_sha256'])
+    assert publications.inputs_key(fingerprints['all']) == publications.inputs_key(json.loads(json.dumps(fingerprints['all'])))

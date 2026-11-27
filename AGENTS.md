@@ -216,11 +216,12 @@ Writing a quantization brief: start from [docs/quantization/brief-template.md](d
   release cuts only, to restore every nonignored test, including installed
   example plans through the launcher's `release_prefill_shape`. That sweep uses
   `HF_HOME` (or `~/.cache/huggingface`); override with
-  `CUTEAFD_DEPLOYMENT_TEST_HF_HOME` and optionally supply the matching
-  `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` manifest and adjacent exports (default
-  `~/.cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json`). The gate
-  supplies this single manifest variable to all installed planner tests on
-  every host, including the default tier's installed GLM physical test. Missing
+  `CUTEAFD_DEPLOYMENT_TEST_HF_HOME`. The gate resolves the publication that records
+  the checkout's own inputs key (`current` when it matches, else a matching
+  `placement-inputs/<sha>`; an explicit `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` must match too),
+  fails before compiling when none does, records the choice in the receipt, and
+  supplies that manifest to all installed planner tests on every host,
+  including the default tier's installed GLM physical test. Missing
   checkpoints/revisions or missing/stale exports fail; only the explicitly
   recorded `--skip-live-planners` opts out. Installed inventories exclude
   retired example configs and read live cells from `benchmarks/current-matrix.json`.

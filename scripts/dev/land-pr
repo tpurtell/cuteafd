@@ -229,20 +229,6 @@ def fetch(number):
     return git('rev-parse', f'refs/remotes/origin/{BASE}'), git('rev-parse', f'refs/land-pr/{number}')
 
 
-FINGERPRINT_CODE = r'''
-import importlib.util, json, sys
-from pathlib import Path
-root = Path(sys.argv[1])
-spec = importlib.util.spec_from_file_location("land_pr_publisher", root / "scripts/build/export-placement-inputs.py")
-publisher = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(publisher)
-lock = json.loads((root / "third_party/sparkinfer.lock.json").read_text())
-pin = {"sparkinfer_revision": lock["revision"], "source_tree_sha256": lock["source_tree_sha256"]}
-print(json.dumps({"all": {**pin, "engine_sources_sha256": publisher.source_hashes()},
-                  "v4": {**pin, "engine_sources_sha256": publisher.compare.v4_placement_sources()}}))
-'''
-
-
 def head_fingerprints(head):
     """SHA's placement fingerprints as SHA's own exporters compute them (no submodules needed)."""
     scratch = BUILDS / 'land-pr'
@@ -253,7 +239,10 @@ def head_fingerprints(head):
         archive.stdout.close()
         if archive.wait() or extracted.returncode:
             raise Refused(f'could not extract {head}')
-        result = subprocess.run([sys.executable, '-I', '-c', FINGERPRINT_CODE, directory],
+        # The shared resolver (this checkout's) runs SHA's own exporter hashing code against SHA's tree.
+        code = ('import json, sys; sys.path.insert(0, sys.argv[1]); import placement_publications as p; '
+                'print(json.dumps(p.checkout_fingerprints(sys.argv[2])))')
+        result = subprocess.run([sys.executable, '-I', '-c', code, str(REPO / 'scripts/lib'), directory],
                                 capture_output=True, text=True, timeout=600, cwd=directory)
         if result.returncode:
             raise Refused(f'computing {head[:12]} fingerprints failed: {result.stderr.strip()[-400:]}')
