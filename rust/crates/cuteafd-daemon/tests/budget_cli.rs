@@ -1243,7 +1243,7 @@ fn installed_release_and_example_families_match_dev_d6aecfcb7() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(installed, expected_installed);
     assert_eq!(tested, expected_installed.len(), "installed checkpoint revision set changed");
-    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC, Kimi K3.1 MC, repaired MC, three live Inkling entries, Hy4-flash MC and Inkling 2 Mini: {tested} installed checkpoint revisions verified");
+    eprintln!("family detection baseline d6aecfcb7 plus deliberate MiniMax (#2081), Muse MC, Kimi K3.1 MC, repaired MC, three live Inkling entries, Hy4-flash MC, Hy4 MC and Inkling 2 Mini: {tested} installed checkpoint revisions verified");
 }
 
 fn retired_configs(matrix: &serde_json::Value) -> std::collections::BTreeSet<String> {
