@@ -26,6 +26,7 @@ struct Variant {
   uint32_t plan_sms = 0;
   uint32_t expected_rows = 0;
   uint32_t all_rows = 0;
+  uint32_t decode_only = 0;
   int device = -1;
   int device_sms = 0;
 };
@@ -44,15 +45,19 @@ int device_slot(int device) {
   for (int slot=0; slot<2; ++slot) if (owner_device[slot] < 0) { owner_device[slot]=device; return slot; }
   return -1;
 }
-Variant* capacity(int rows, int k, int n, int slot, int sms) {
+Variant* capacity(int rows, int k, int n, int slot, int sms, bool decode = false) {
   auto* table = slot == 0 ? variants : peer_variants;
   const uint32_t plan_sms = sms >= 188 ? 188 : 170;
+  Variant* fallback = nullptr;
   for (size_t i=0; i<sizeof(variants)/sizeof(variants[0]); ++i) {
     auto& v=table[i];
     if (int(v.info.capacity_rows)==rows && int(v.info.input_dim)==k && int(v.info.output_dim)==n &&
-        (!v.plan_sms || v.plan_sms == plan_sms)) return &v;
+        (!v.plan_sms || v.plan_sms == plan_sms)) {
+      if (decode && v.decode_only) return &v;
+      if (!v.decode_only && !fallback) fallback = &v;
+    }
   }
-  return nullptr;
+  return fallback;
 }
 Variant* handle(void* p) {
   for (auto& v : variants) if (&v == p) return &v;
@@ -94,27 +99,28 @@ int device_matches(Variant* v) {
 extern "C" int32_t cuteafd_v41_fp8_grouped_output(const uint16_t*, uint16_t*, int32_t, void*);
 extern "C" int32_t cuteafd_v41_fp8_reduce_splits(const float*, uint16_t*, int32_t, int32_t, int32_t, void*);
 extern "C" int32_t cuteafd_v41_fp8_initialize_storage(void*, uint64_t, float*, void*);
-extern "C" int32_t cuteafd_v41_fp8_matrix_info(int32_t rows, int32_t k, int32_t n, cuteafd_v41_fp8_info_t* out) {
+namespace {
+int32_t matrix_info_impl(int32_t rows, int32_t k, int32_t n, bool decode, cuteafd_v41_fp8_info_t* out) {
   if (!out) return cudaErrorInvalidValue;
   int device = -1, sms = 0;
   auto status = cudaGetDevice(&device); if (status) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
   if (sms <= 0) return cudaErrorInvalidDevice;
-  auto* v = capacity(rows, k, n, 0, sms); if (!v) return cudaErrorInvalidValue;
+  auto* v = capacity(rows, k, n, 0, sms, decode); if (!v) return cudaErrorInvalidValue;
   *out = v->info; return 0;
 }
-extern "C" int32_t cuteafd_v41_fp8_matrix_reduction_info(int32_t rows, int32_t k, int32_t n,
+int32_t matrix_reduction_info_impl(int32_t rows, int32_t k, int32_t n, bool decode,
     cuteafd_v41_fp8_reduction_info_t* out) {
   if (!out) return cudaErrorInvalidValue;
   int device = -1, sms = 0;
   auto status = cudaGetDevice(&device); if (status) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
   if (sms <= 0) return cudaErrorInvalidDevice;
-  auto* v = capacity(rows, k, n, 0, sms); if (!v) return cudaErrorInvalidValue;
+  auto* v = capacity(rows, k, n, 0, sms, decode); if (!v) return cudaErrorInvalidValue;
   *out = {1, v->info.capacity_rows, v->expected_rows, v->split_slices, v->all_rows};
   return 0;
 }
-extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, int32_t n, void** out) {
+int32_t matrix_initialize_impl(int32_t rows, int32_t k, int32_t n, bool decode, void** out) {
   if (!out) return cudaErrorInvalidValue; *out = nullptr;
   int device, major, minor, sms;
   auto status = cudaGetDevice(&device); if (status) return status;
@@ -122,12 +128,12 @@ extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, in
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device); if (status) return status;
   status = cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device); if (status) return status;
   if (major != 12 || minor != 0 || sms <= 0) return reject_device(device, major, minor, sms);
-  auto* modules = capacity(rows,k,n,0,sms);
+  auto* modules = capacity(rows,k,n,0,sms,decode);
   if (!modules) return cudaErrorInvalidValue;
   std::lock_guard<std::mutex> lock(mutex);
   const int slot=device_slot(device);
   if (slot<0) return cudaErrorInvalidDevice;
-  auto* v=slot == 0 ? modules : capacity(rows,k,n,slot,sms);
+  auto* v=slot == 0 ? modules : capacity(rows,k,n,slot,sms,decode);
   if (!v) return cudaErrorInvalidValue;
   if (v->device >= 0) {
     if (v->device != device) return cudaErrorInvalidDevice;
@@ -144,6 +150,27 @@ extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, in
     v->device = device;
   }
   *out = v; return 0;
+}
+}
+extern "C" int32_t cuteafd_v41_fp8_matrix_info(int32_t rows, int32_t k, int32_t n, cuteafd_v41_fp8_info_t* out) {
+  return matrix_info_impl(rows, k, n, false, out);
+}
+extern "C" int32_t cuteafd_v41_fp8_decode_matrix_info(int32_t rows, int32_t k, int32_t n, cuteafd_v41_fp8_info_t* out) {
+  return matrix_info_impl(rows, k, n, true, out);
+}
+extern "C" int32_t cuteafd_v41_fp8_matrix_reduction_info(int32_t rows, int32_t k, int32_t n,
+    cuteafd_v41_fp8_reduction_info_t* out) {
+  return matrix_reduction_info_impl(rows, k, n, false, out);
+}
+extern "C" int32_t cuteafd_v41_fp8_decode_matrix_reduction_info(int32_t rows, int32_t k, int32_t n,
+    cuteafd_v41_fp8_reduction_info_t* out) {
+  return matrix_reduction_info_impl(rows, k, n, true, out);
+}
+extern "C" int32_t cuteafd_v41_fp8_matrix_initialize(int32_t rows, int32_t k, int32_t n, void** out) {
+  return matrix_initialize_impl(rows, k, n, false, out);
+}
+extern "C" int32_t cuteafd_v41_fp8_decode_matrix_initialize(int32_t rows, int32_t k, int32_t n, void** out) {
+  return matrix_initialize_impl(rows, k, n, true, out);
 }
 extern "C" int32_t cuteafd_v41_fp8_initialize_scratch(void* kernel, void* scratch, uint64_t bytes, float* alpha, void* stream) {
   auto* v = handle(kernel); int status = device_matches(v); if (status) return status;
@@ -247,7 +274,7 @@ extern "C" int32_t cuteafd_v41_hc_begin(const void* residual, const void* fn,
     const void* scale, const void* bias, const void* incoming, const void* norm,
     void* predicted, void* post, void* comb, void* normalized, void* scratch,
     uint64_t scratch_bytes, int32_t rows, void* stream) {
-  if(rows<1 || rows>80 || scratch_bytes<uint64_t(rows)*8000) return cudaErrorInvalidValue;
+  if(rows<1 || rows>256 || scratch_bytes<uint64_t(rows)*8000) return cudaErrorInvalidValue;
   const void* pointers[]={residual,fn,scale,bias,incoming,norm,predicted,post,comb,normalized,scratch};
   const uint64_t sizes[]={uint64_t(rows)*40960,24*20480*4,12,96,uint64_t(rows)*16,10240,
     uint64_t(rows)*16,uint64_t(rows)*16,uint64_t(rows)*64,uint64_t(rows)*10240,uint64_t(rows)*8000};

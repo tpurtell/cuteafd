@@ -309,7 +309,7 @@ impl<'a> WindowWeights<'a> {
             "window wave exceeds budget"
         );
         let rows = capacity as usize;
-        self.on_storage(WindowStorage::new(self.library, rows, rows, &[self.layer])?)
+        self.on_storage(WindowStorage::new_decode(self.library, rows, rows, &[self.layer])?)
     }
     /// This layer's wave on `storage` (same device): its proposal plane is the
     /// storage's plane for this layer, windowed by `select_window`.
@@ -458,25 +458,48 @@ pub(crate) struct WindowStorage<'a> {
 impl<'a> WindowStorage<'a> {
     /// Plain scratch bytes for units of up to `unit` rows.
     pub fn scratch_bytes(library: &NativeLibrary, unit: u32) -> Result<usize> {
-        let scratch = library.v41_fp8_matrix_plan_info(unit, 5120, 512)?.scratch_bytes as usize;
+        let scratch = library.v41_fp8_decode_matrix_plan_info(unit, 5120, 512)?.scratch_bytes as usize;
         let layout = cuteafd_loader::serving_capacity::v41_workspace::window(unit as usize, unit as usize, &[0], scratch)?;
         Ok(layout.view("layer0.values").context("window proposal boundary")?.offset())
     }
     /// One layer's planes over `rows` rows.
     pub fn plane_bytes(rows: usize) -> usize { rows * (512 + 16 + 8) }
     pub fn device_bytes(library: &NativeLibrary, rows: usize, unit: u32, layers: usize) -> Result<usize> {
+        Self::device_bytes_with_mode(library, rows, unit, layers, false)
+    }
+    pub fn decode_device_bytes(library: &NativeLibrary, rows: usize, unit: u32, layers: usize) -> Result<usize> {
+        Self::device_bytes_with_mode(library, rows, unit, layers, true)
+    }
+    fn device_bytes_with_mode(library: &NativeLibrary, rows: usize, unit: u32, layers: usize, decode: bool) -> Result<usize> {
         ensure!(unit >= 1 && unit as usize <= rows, "window unit {unit} outside {rows} rows");
-        let scratch = library.v41_fp8_matrix_plan_info(unit, 5120, 512)?.scratch_bytes as usize;
+        let scratch = if decode {
+            library.v41_fp8_decode_matrix_plan_info(unit, 5120, 512)?.scratch_bytes as usize
+        } else {
+            library.v41_fp8_matrix_plan_info(unit, 5120, 512)?.scratch_bytes as usize
+        };
         Ok(cuteafd_loader::serving_capacity::v41_workspace::window(rows, unit as usize,
             &(0..layers).collect::<Vec<_>>(), scratch)?.bytes())
     }
     /// Planes for `layers` over `rows` reserve rows, scratch for units of up to
-    /// `unit` rows. Every wave on this storage issues on its one stream.
+    /// `unit` rows. Prefill slots use the unsplit prefill FP8 plan.
     pub fn new(library: &'a NativeLibrary, rows: usize, unit: usize, layers: &[usize])
+        -> Result<std::rc::Rc<Self>> {
+        Self::new_with_mode(library, rows, unit, layers, false)
+    }
+    /// Decode-lane window storage using the row-invariant split-K decode plan.
+    pub fn new_decode(library: &'a NativeLibrary, rows: usize, unit: usize, layers: &[usize])
+        -> Result<std::rc::Rc<Self>> {
+        Self::new_with_mode(library, rows, unit, layers, true)
+    }
+    fn new_with_mode(library: &'a NativeLibrary, rows: usize, unit: usize, layers: &[usize], decode: bool)
         -> Result<std::rc::Rc<Self>> {
         ensure!(unit >= 1 && unit <= rows && rows <= crate::shared::memory::row_window::MAX_RESERVE_ROWS.max(4096)
             && layers.iter().all(|&l| l < 40), "invalid window storage of {rows} rows, {unit}-row units, layers {layers:?}");
-        let fp8 = library.v41_fp8_matrix_plan(unit as u32, 5120, 512)?;
+        let fp8 = if decode {
+            library.v41_fp8_decode_matrix_plan(unit as u32, 5120, 512)?
+        } else {
+            library.v41_fp8_matrix_plan(unit as u32, 5120, 512)?
+        };
         let arena = crate::shared::memory::weight_arena::workspace_arena(library,
             cuteafd_loader::serving_capacity::v41_workspace::window(rows, unit, layers, fp8.info().scratch_bytes as usize)?,
             cuteafd_core::memory_layout::ArenaTag::workspace("v41/window-proposal"))?;
@@ -570,7 +593,7 @@ impl<'a> WindowWave<'_, 'a> {
 impl WindowWave<'_, '_> {
     /// A wave with its own storage.
     pub fn device_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
-        WindowStorage::device_bytes(library, capacity as usize, capacity, 1)
+        WindowStorage::decode_device_bytes(library, capacity as usize, capacity, 1)
     }
     pub fn input(&self) -> CuteafdDeviceBuffer {
         self.storage.input.buffer

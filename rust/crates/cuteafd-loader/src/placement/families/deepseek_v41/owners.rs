@@ -277,6 +277,12 @@ impl<'a> NativePrograms<'a> {
                 .context("V4.1 projection arena overflow"))
     }
 
+    pub fn decode_scratch(&self, rows: u64, k: u64, n: u64) -> Result<u64> {
+        ProgramSet::v41_fp8_decode(self.manifest, &[(k, n)], rows, self.sms)?.scratch
+            .into_iter().try_fold(0u64, |sum, (_, bytes)| sum.checked_add(bytes)
+                .context("V4.1 decode projection arena overflow"))
+    }
+
     /// Selected native projection modules, not the all-family PROGRAMS.json.
     /// Each selected variant loads quantization and GEMM; grouped queries also
     /// load their RoPE quantizer. The shared module formula includes fixed CUDA
@@ -288,8 +294,12 @@ impl<'a> NativePrograms<'a> {
             (8192, 5120), (5120, 512), (1280, 4096)];
         (0..ranks).map(|rank| {
             let mut selected = std::collections::BTreeSet::new();
-            let mut add = |rows, matrices: &[(u64, u64)]| -> Result<()> {
-                let plans = ProgramSet::v41_fp8(self.manifest, matrices, rows, self.sms)?;
+            let mut add = |rows, matrices: &[(u64, u64)], decode: bool| -> Result<()> {
+                let plans = if decode {
+                    ProgramSet::v41_fp8_decode(self.manifest, matrices, rows, self.sms)?
+                } else {
+                    ProgramSet::v41_fp8(self.manifest, matrices, rows, self.sms)?
+                };
                 for label in plans.names {
                     selected.insert(format!("{label}/quant"));
                     selected.insert(format!("{label}/gemm"));
@@ -302,16 +312,16 @@ impl<'a> NativePrograms<'a> {
                 }
                 Ok(())
             };
-            for rows in [decode_rows, unit] {
-                add(rows, &target)?;
-                if rank == 0 { add(rows, &[(6144, 25600)])?; }
+            for (rows, decode) in [(decode_rows, true), (unit, false)] {
+                add(rows, &target, decode)?;
+                if rank == 0 { add(rows, &[(6144, 25600)], decode)?; }
                 add(rows, if ranks == 1 { &[(5120, 2304), (2304, 5120)] }
-                    else { &[(5120, 1152), (1152, 5120)] })?;
+                    else { &[(5120, 1152), (1152, 5120)] }, decode)?;
             }
             if rank == ranks - 1 {
                 if let Some(rows) = draft_rows {
-                    add(rows, &target)?;
-                    add(rows, &[(15360, 5120), (5120, 2304), (2304, 5120)])?;
+                    add(rows, &target, false)?;
+                    add(rows, &[(15360, 5120), (5120, 2304), (2304, 5120)], false)?;
                 }
             }
             Ok(ProgramSet { families: vec!["v41".into()],
@@ -483,7 +493,7 @@ impl<'a> NativePrograms<'a> {
                 let add = |out: &mut Vec<Demand>, group: &str, bytes| out.push(Demand::new(
                     rank as u8, Category::Workspace, format!("lane {lane} {group}"), bytes, Basis::Formula));
                 let query = 4 + rows * (10240 + 2560 + 2560 + 65536 + 8 + 256)
-                    + self.scratch(rows, 5120, 1280)? + self.scratch(rows, 1280, 32768)?;
+                    + self.decode_scratch(rows, 5120, 1280)? + self.scratch(rows, 1280, 32768)?;
                 let output = 4 + rows * (65536 + 16384 + 10240 + 8 + 256)
                     + self.scratch(rows, 32768, 8192)? + self.scratch(rows, 8192, 5120)?;
                 let sparse = rows * (64 * 2048 + 88)
@@ -497,7 +507,7 @@ impl<'a> NativePrograms<'a> {
                 // destinations until the accepted rows commit.
                 let window = crate::serving_capacity::v41_workspace::window(rows as usize, rows as usize,
                     &(0..if ranks == 1 { 40 } else { 20 }).collect::<Vec<_>>(),
-                    self.scratch(rows, 5120, 512)? as usize)?.bytes() as u64;
+                    self.decode_scratch(rows, 5120, 512)? as usize)?.bytes() as u64;
                 let compressor = |ratio2| BLAS + rows * if ratio2 {
                     10240 + 2048 + 2048 + 8 + 1024 + 264 + 512 + 68 + 8 + 288
                 } else { 10240 + 1024 + 1024 + 264 + 512 + 68 + 8 + 288 };
@@ -641,14 +651,29 @@ mod tests {
         let matrices = [(5120, 1280), (1280, 32768), (32768, 8192), (8192, 5120),
             (5120, 2304), (2304, 5120), (5120, 512), (1280, 4096),
             (6144, 25600), (15360, 5120), (5120, 1152), (1152, 5120)];
-        let variants = matrices.into_iter().flat_map(|(k, n)| {
-            [1, 16, 64, 80, 256, 1024, 4096].map(move |rows| json!({
-                "capacity": rows, "input_dim": k, "output_dim": n,
-                "label": format!("matrix_{k}_{n}_{rows}"), "scratch_bytes": rows + 1,
-                "expected_m": if rows <= 80 { 16 } else { rows },
-                "split_k_slices": 1, "all_rows": rows <= 80,
-            }))
-        }).collect::<Vec<_>>();
+        let mut variants = Vec::new();
+        for (k, n) in matrices {
+            let narrow = k == 5120 && matches!(n, 1280 | 512);
+            for rows in [1, 16, 64, 80, 256, 1024, 4096] {
+                let single_decode = narrow && matches!(rows, 1 | 16 | 80);
+                variants.push(json!({
+                    "capacity": rows, "input_dim": k, "output_dim": n,
+                    "label": format!("matrix_{k}_{n}_{rows}"), "scratch_bytes": rows + 1,
+                    "expected_m": if single_decode || (!narrow && rows <= 80) { 16 } else { rows },
+                    "split_k_slices": if single_decode { 4 } else { 1 },
+                    "all_rows": single_decode || (!narrow && rows <= 80),
+                    "decode_only": false,
+                }));
+                if narrow && matches!(rows, 64 | 256) {
+                    variants.push(json!({
+                        "capacity": rows, "input_dim": k, "output_dim": n,
+                        "label": format!("matrix_{k}_{n}_{rows}_decode"), "scratch_bytes": rows + 257,
+                        "expected_m": 16, "split_k_slices": 4, "all_rows": true,
+                        "decode_only": true,
+                    }));
+                }
+            }
+        }
         json!({"variants": variants})
     }
 

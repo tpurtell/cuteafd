@@ -339,11 +339,31 @@ impl ProgramSet {
         Self { families: families.iter().map(|f| f.to_string()).collect(), names, scratch }
     }
 
+    /// Admitted decode/verify width ceiling for uniform narrow `q_a`/`kv`
+    /// split-K reduction. Derived directly from V4.1 decode admission
+    /// (`V41_VOCAB_ROWS = 256`); prefill buckets remain unsplit (`decode = false`).
+    pub const V41_DECODE_REDUCTION_CEILING: u64 = cuteafd_core::V41_VOCAB_ROWS as u64;
+
     /// Native V4.1 projection plans retain a separate aligned arena for each
     /// small-row specialization and the first compiled capacity holding `rows`.
     /// These exports live in V41_FP8_AOT.json, not PROGRAMS.json. Module residency
     /// is charged separately; `scratch` here describes allocation owners.
+    /// Prefill/general callers select the non-decode (`decode_only = false`)
+    /// variants so prefill buckets (`64, 256, 1024, 4096`) remain untouched.
     pub fn v41_fp8(manifest: &Value, matrices: &[(u64, u64)], rows: u64, sms: u32)
+        -> anyhow::Result<Self> {
+        Self::v41_fp8_with_mode(manifest, matrices, rows, sms, false)
+    }
+
+    /// Decode-lane native V4.1 projection plans prefer `decode_only` variants
+    /// and enforce immutable reduction across every retained capacity up to
+    /// [`Self::V41_DECODE_REDUCTION_CEILING`] (`256`) for narrow `q_a`/`kv`.
+    pub fn v41_fp8_decode(manifest: &Value, matrices: &[(u64, u64)], rows: u64, sms: u32)
+        -> anyhow::Result<Self> {
+        Self::v41_fp8_with_mode(manifest, matrices, rows, sms, true)
+    }
+
+    fn v41_fp8_with_mode(manifest: &Value, matrices: &[(u64, u64)], rows: u64, sms: u32, decode: bool)
         -> anyhow::Result<Self> {
         use anyhow::{ensure, Context};
         ensure!((1..=4096).contains(&rows) && sms > 0, "invalid V4.1 FP8 plan geometry");
@@ -352,30 +372,41 @@ impl ProgramSet {
         let capacities: Vec<_> = covers[..3].iter().copied().filter(|&n| n < compiled).chain([compiled]).collect();
         let variants = manifest["variants"].as_array().context("missing V4.1 FP8 variants")?;
         let card = if sms >= 188 { 188 } else { 170 };
+        let select_variant = |capacity: u64, k: u64, n: u64, require_plan0: bool| -> Vec<&Value> {
+            let candidates: Vec<_> = variants.iter().filter(|v| {
+                let plan = v["plan_sms"].as_u64().unwrap_or(0);
+                let plan_ok = if require_plan0 { plan == 0 } else { plan == 0 || plan == card };
+                v["capacity"].as_u64() == Some(capacity)
+                    && v["input_dim"].as_u64() == Some(k)
+                    && v["output_dim"].as_u64() == Some(n)
+                    && plan_ok
+            }).collect();
+            if decode {
+                let dedicated: Vec<_> = candidates.iter().copied()
+                    .filter(|v| v["decode_only"].as_bool() == Some(true)).collect();
+                if !dedicated.is_empty() { return dedicated; }
+            }
+            candidates.into_iter()
+                .filter(|v| !v["decode_only"].as_bool().unwrap_or(false))
+                .collect()
+        };
         let mut names = Vec::new();
         let mut scratch = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for &(k, n) in matrices {
             ensure!(seen.insert((k, n)), "duplicate V4.1 FP8 matrix owner");
-            if k == 8192 && matches!(n, 5120 | 2560) {
-                let canonical: Vec<_> = variants.iter().filter(|v|
-                    v["capacity"].as_u64() == Some(16)
-                        && v["input_dim"].as_u64() == Some(k)
-                        && v["output_dim"].as_u64() == Some(n)
-                        && matches!(v["plan_sms"].as_u64(), None | Some(0))
-                ).collect();
+            let fixed_output = k == 8192 && matches!(n, 5120 | 2560);
+            let fixed_narrow = decode && k == 5120 && matches!(n, 1280 | 512);
+            if fixed_output || fixed_narrow {
+                let limit = if fixed_narrow { Self::V41_DECODE_REDUCTION_CEILING } else { 80 };
+                let canonical = select_variant(16, k, n, true);
                 ensure!(canonical.len() == 1, "missing or duplicate V4.1 output reduction recipe");
                 let expected = canonical[0]["expected_m"].as_u64().context("missing output reduction rows")?;
                 let slices = canonical[0]["split_k_slices"].as_u64().context("missing output reduction slices")?;
                 let plan = cuteafd_core::coordinator_programs::OutputReductionPlan::new(
                     1, usize::try_from(expected)?, usize::try_from(slices)?)?;
-                for &capacity in capacities.iter().filter(|&&capacity| capacity <= 80) {
-                    let recipe: Vec<_> = variants.iter().filter(|v|
-                        v["capacity"].as_u64() == Some(capacity)
-                            && v["input_dim"].as_u64() == Some(k)
-                            && v["output_dim"].as_u64() == Some(n)
-                            && matches!(v["plan_sms"].as_u64(), None | Some(0))
-                    ).collect();
+                for &capacity in capacities.iter().filter(|&&capacity| capacity <= limit) {
+                    let recipe = select_variant(capacity, k, n, true);
                     ensure!(recipe.len() == 1, "missing or duplicate V4.1 output reduction capacity");
                     plan.validate(usize::try_from(capacity)?,
                         usize::try_from(recipe[0]["expected_m"].as_u64().context("missing output reduction rows")?)?,
@@ -384,13 +415,7 @@ impl ProgramSet {
                 }
             }
             for &capacity in &capacities {
-                let matching: Vec<_> = variants.iter().filter(|v| {
-                    let plan = v["plan_sms"].as_u64().unwrap_or(0);
-                    v["capacity"].as_u64() == Some(capacity)
-                        && v["input_dim"].as_u64() == Some(k)
-                        && v["output_dim"].as_u64() == Some(n)
-                        && (plan == 0 || plan == card)
-                }).collect();
+                let matching = select_variant(capacity, k, n, false);
                 ensure!(matching.len() == 1,
                     "missing or duplicate V4.1 FP8 projection {k}x{n} m{capacity} sm{card}");
                 let variant = matching[0];
@@ -1334,8 +1359,8 @@ mod tests {
         let variants = [1, 16, 64, 80, 256, 1024, 4096].into_iter().flat_map(|capacity| {
             let plans: &[u64] = if capacity <= 16 { &[170, 188] } else { &[0] };
             plans.iter().map(move |&sms| json!({"capacity": capacity, "plan_sms": sms,
-                "input_dim": 5120, "output_dim": 1280,
-                "label": format!("v41_query_m{capacity}_sm{sms}"),
+                "input_dim": 5120, "output_dim": 2304,
+                "label": format!("v41_ffn_up_m{capacity}_sm{sms}"),
                 "scratch_bytes": capacity * 257 + sms})).collect::<Vec<_>>()
         }).collect::<Vec<_>>();
         let manifest = json!({"variants": variants});
@@ -1348,7 +1373,7 @@ mod tests {
         };
         for rows in [1,2,16,17,40,80,81,256,257,1024,1025,4096] {
             for sms in [170,188] {
-                let set = ProgramSet::v41_fp8(&manifest, &[(5120,1280)], rows, sms).unwrap();
+                let set = ProgramSet::v41_fp8(&manifest, &[(5120,2304)], rows, sms).unwrap();
                 assert_eq!(set.scratch.iter().map(|(_,n)| n).sum::<u64>(), expected(rows, sms as u64));
                 assert!(set.scratch.iter().all(|(_,n)| n % 256 == 0));
                 assert!(set.names.iter().filter(|name| !name.ends_with("sm0"))
@@ -1359,45 +1384,132 @@ mod tests {
                 }
             }
         }
-        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,1280)], 0,188).is_err());
-        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,1280)], 4097,188).is_err());
-        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,1280)], 1,0).is_err());
-        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,1280);2], 1,188).is_err());
+        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,2304)], 0,188).is_err());
+        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,2304)], 4097,188).is_err());
+        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,2304)], 1,0).is_err());
+        assert!(ProgramSet::v41_fp8(&manifest, &[(5120,2304);2], 1,188).is_err());
         let mut missing = manifest.clone();
         missing["variants"].as_array_mut().unwrap().remove(0);
-        assert!(ProgramSet::v41_fp8(&missing, &[(5120,1280)], 80,170).is_err());
+        assert!(ProgramSet::v41_fp8(&missing, &[(5120,2304)], 80,170).is_err());
         let mut duplicate = manifest.clone();
         duplicate["variants"].as_array_mut().unwrap().push(manifest["variants"][0].clone());
-        assert!(ProgramSet::v41_fp8(&duplicate, &[(5120,1280)], 80,170).is_err());
+        assert!(ProgramSet::v41_fp8(&duplicate, &[(5120,2304)], 80,170).is_err());
         let mut overflow = manifest.clone();
         overflow["variants"][0]["scratch_bytes"] = u64::MAX.into();
-        assert!(ProgramSet::v41_fp8(&overflow, &[(5120,1280)], 1,170).is_err());
+        assert!(ProgramSet::v41_fp8(&overflow, &[(5120,2304)], 1,170).is_err());
     }
 
     #[test]
     fn v41_output_reduction_is_immutable_across_retained_capacities() {
-        for n in [2560, 5120] {
+        for (k, n) in [(8192, 2560), (8192, 5120)] {
             let variants = [1,16,64,80,256,1024,4096].into_iter().map(|capacity|
-                json!({"capacity":capacity, "plan_sms":0, "input_dim":8192, "output_dim":n,
-                    "label":format!("v41_output_{n}_m{capacity}"), "scratch_bytes":capacity * 257,
+                json!({"capacity":capacity, "plan_sms":0, "input_dim":k, "output_dim":n,
+                    "label":format!("v41_fixed_{k}_{n}_m{capacity}"), "scratch_bytes":capacity * 257,
                     "expected_m":if capacity <= 80 {16} else {capacity},
-                    "split_k_slices":1, "all_rows":capacity <= 80})
+                    "split_k_slices":1, "all_rows":capacity <= 80, "decode_only":false})
             ).collect::<Vec<_>>();
             let manifest = json!({"variants":variants});
-            for rows in [1,16,40,80,81,256,4096] {
-                assert!(ProgramSet::v41_fp8(&manifest, &[(8192,n)], rows,188).is_ok());
+            for sms in [170, 188] {
+                for rows in [1,16,40,80,81,256,4096] {
+                    assert!(ProgramSet::v41_fp8(&manifest, &[(k,n)], rows, sms).is_ok());
+                    assert!(ProgramSet::v41_fp8_decode(&manifest, &[(k,n)], rows, sms).is_ok());
+                }
             }
-            for (field, value) in [("expected_m", json!(80)), ("split_k_slices", json!(2)),
-                ("all_rows", json!(false))] {
+            for (field, value) in [("expected_m", json!(80)),
+                ("split_k_slices", json!(2)),
+                ("all_rows", json!(false)), ("plan_sms", json!(188))] {
                 let mut changed = manifest.clone();
                 changed["variants"][2][field] = value.clone();
                 changed["variants"][3][field] = value;
-                assert!(ProgramSet::v41_fp8(&changed, &[(8192,n)], 80,188).is_err(), "{field}");
-                assert!(ProgramSet::v41_fp8(&changed, &[(8192,n)], 4096,188).is_err(), "{field}");
+                assert!(ProgramSet::v41_fp8(&changed, &[(k,n)], 80, 188).is_err(), "{k}x{n} {field}");
+                assert!(ProgramSet::v41_fp8(&changed, &[(k,n)], 4096, 188).is_err(), "{k}x{n} {field}");
             }
             let mut missing_canonical = manifest.clone();
             missing_canonical["variants"].as_array_mut().unwrap().remove(1);
-            assert!(ProgramSet::v41_fp8(&missing_canonical, &[(8192,n)], 1,188).is_err());
+            assert!(ProgramSet::v41_fp8(&missing_canonical, &[(k,n)], 1, 188).is_err());
+        }
+    }
+
+    #[test]
+    fn v41_decode_reduction_ceiling_matches_admitted_decode_rows_and_leaves_prefill_untouched() {
+        use crate::plan::family::Family;
+        let support = crate::plan::families::deepseek::DEEPSEEK_V41.decode_rows();
+        let max_1gpu = u64::from(support.max_for_gpus(1));
+        let max_2gpu = u64::from(support.max_for_gpus(2));
+        // The uniform split-K coverage ceiling must never drift below the true
+        // V4.1 admitted decode/verify row maximum on either 1x or 2x RTX.
+        assert_eq!(ProgramSet::V41_DECODE_REDUCTION_CEILING, max_1gpu);
+        assert_eq!(ProgramSet::V41_DECODE_REDUCTION_CEILING, max_2gpu);
+        assert_eq!(ProgramSet::V41_DECODE_REDUCTION_CEILING, cuteafd_core::V41_VOCAB_ROWS as u64);
+        let top_cover = cuteafd_core::V41_TARGET_CAPACITIES.into_iter()
+            .find(|&cap| cap >= max_1gpu.max(max_2gpu))
+            .expect("target capacities must cover admitted decode max");
+        assert!(top_cover <= ProgramSet::V41_DECODE_REDUCTION_CEILING,
+            "covering capacity {top_cover} exceeds V41_DECODE_REDUCTION_CEILING");
+
+        for (k, n) in [(5120u64, 1280u64), (5120, 512)] {
+            let mut variants = Vec::new();
+            for capacity in [1u64, 16, 64, 80, 256, 1024, 4096] {
+                let is_decode_only_pair = matches!(capacity, 64 | 256);
+                let is_single_decode = matches!(capacity, 1 | 16 | 80);
+                variants.push(json!({
+                    "capacity": capacity, "plan_sms": 0, "input_dim": k, "output_dim": n,
+                    "label": format!("v41_narrow_{k}_{n}_m{capacity}"),
+                    "scratch_bytes": capacity * 257,
+                    "expected_m": if is_single_decode { 16 } else { capacity },
+                    "split_k_slices": if is_single_decode { 4 } else { 1 },
+                    "all_rows": is_single_decode,
+                    "decode_only": false,
+                }));
+                if is_decode_only_pair {
+                    variants.push(json!({
+                        "capacity": capacity, "plan_sms": 0, "input_dim": k, "output_dim": n,
+                        "label": format!("v41_narrow_{k}_{n}_m{capacity}_decode"),
+                        "scratch_bytes": capacity * 257 + 4096,
+                        "expected_m": 16, "split_k_slices": 4, "all_rows": true,
+                        "decode_only": true,
+                    }));
+                }
+            }
+            let manifest = json!({"variants": variants});
+            for sms in [170, 188] {
+                // Every admitted decode width up to max_1gpu/max_2gpu uses the
+                // uniform split-K decode variants and validates cleanly.
+                for rows in [1, 16, 40, 64, 80, 128, max_1gpu, max_2gpu] {
+                    let dec = ProgramSet::v41_fp8_decode(&manifest, &[(k, n)], rows, sms).unwrap();
+                    if rows > 16 && rows != 40 && rows != 80 {
+                        assert!(dec.names.iter().any(|name| name.ends_with("_decode")),
+                            "{k}x{n} rows={rows} must select decode_only variant: {:?}", dec.names);
+                    }
+                    if rows > 64 && rows != 80 {
+                        assert!(dec.names.iter().any(|name| name.ends_with("m256_decode")),
+                            "{k}x{n} rows={rows} must cover top bucket with m256_decode: {:?}", dec.names);
+                    }
+                }
+                // Prefill keeps the untouched unsplit m64/m256 variants.
+                for prefill_rows in [64, 256, 1024, 4096] {
+                    let pre = ProgramSet::v41_fp8(&manifest, &[(k, n)], prefill_rows, sms).unwrap();
+                    assert!(pre.names.iter().all(|name| !name.ends_with("_decode")),
+                        "prefill rows={prefill_rows} must never select decode_only variants: {:?}", pre.names);
+                }
+            }
+            // Any drift on m64_decode or m256_decode is rejected by decode admission.
+            for target_label in [format!("v41_narrow_{k}_{n}_m64_decode"), format!("v41_narrow_{k}_{n}_m256_decode")] {
+                for (field, value) in [("expected_m", json!(64)), ("split_k_slices", json!(1)),
+                    ("all_rows", json!(false)), ("plan_sms", json!(188))] {
+                    let mut drifted = manifest.clone();
+                    let entry = drifted["variants"].as_array_mut().unwrap().iter_mut()
+                        .find(|v| v["label"].as_str() == Some(target_label.as_str())).unwrap();
+                    entry[field] = value;
+                    assert!(ProgramSet::v41_fp8_decode(&drifted, &[(k, n)], max_1gpu, 188).is_err(),
+                        "{target_label} {field} drift must fail");
+                }
+            }
+            // Removing m256_decode falls back to unsplit prefill m256 and MUST fail decode validation.
+            let mut missing_decode = manifest.clone();
+            missing_decode["variants"].as_array_mut().unwrap()
+                .retain(|v| v["label"].as_str() != Some(&format!("v41_narrow_{k}_{n}_m256_decode")));
+            assert!(ProgramSet::v41_fp8_decode(&missing_decode, &[(k, n)], max_1gpu, 188).is_err());
         }
     }
 

@@ -537,7 +537,7 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
     }
     pub fn workspace_bytes(library: &NativeLibrary, capacity: u32) -> Result<usize> {
         // One window storage: shared producer scratch, each layer's proposal plane.
-        let mut total = crate::families::deepseek_v41::v41_window::WindowStorage::device_bytes(
+        let mut total = crate::families::deepseek_v41::v41_window::WindowStorage::decode_device_bytes(
             library, capacity as usize, capacity, 40)?;
         for layer in SOURCES {
             total = total
@@ -561,7 +561,7 @@ impl<'w, 'a> BackboneExecution<'w, 'a> {
             "cache producer workspace exceeds budget"
         );
         // A private pass: its layers share scratch and one producer stream.
-        let windows = crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.library,
+        let windows = crate::families::deepseek_v41::v41_window::WindowStorage::new_decode(weights.library,
             capacity as usize, capacity as usize, &(0..40).collect::<Vec<_>>())?;
         let sources = SOURCES.iter().map(|&layer| crate::families::deepseek_v41::v41_compressor::CompressorStorage::new(
             weights.library, capacity as usize, capacity as usize, &[layer])).collect::<Result<Vec<_>>>()?;

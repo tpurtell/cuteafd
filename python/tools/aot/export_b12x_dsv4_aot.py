@@ -662,6 +662,11 @@ def inkling2_mini_producer_programs(prefill_rows: int):
         compile_inkling2_mini_post_mlp_conv_residual_aot,
         compile_inkling2_mini_fast_router_aot,
     )
+    from b12x.integration.cuteafd.inkling2_mini_projections import (
+        compile_inkling2_mini_attn_in_proj_global_aot,
+        compile_inkling2_mini_attn_in_proj_local_aot,
+        compile_inkling2_mini_router_proj_aot,
+    )
 
     result = []
     def add(stem, op, compiler, **params):
@@ -750,6 +755,9 @@ def inkling2_mini_producer_programs(prefill_rows: int):
         rep_tag = "replay" if replay else "strided"
         add64(f"post_mlp_conv_residual_{rep_tag}", "post_mlp_conv_residual",
               compile_inkling2_mini_post_mlp_conv_residual_aot, replay=replay)
+    add("attn_in_proj_local", "attn_in_proj_local", compile_inkling2_mini_attn_in_proj_local_aot)
+    add("attn_in_proj_global", "attn_in_proj_global", compile_inkling2_mini_attn_in_proj_global_aot)
+    add("router_proj", "router_proj", compile_inkling2_mini_router_proj_aot)
     return result
 
 

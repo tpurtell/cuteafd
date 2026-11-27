@@ -89,10 +89,8 @@ impl<'a> Attention<'a> {
     pub fn global(&self, b: Batch, global: Global, stream: *mut c_void) -> Result<()> {
         ensure!(self.kind == Kind::Global, "Inkling 2 Mini global launch bound to local attention");
         ensure!(global.table_width > 0 && global.table_width <= i32::MAX as usize
-            && global.pages > 0 && global.pages <= i32::MAX as usize
-            && (1..=32).contains(&global.splits)
-            && (self.route == Route::Decode || global.splits == 1),
-            "Inkling 2 Mini page/split geometry differs");
+            && global.pages > 0 && global.pages <= i32::MAX as usize,
+            "Inkling 2 Mini page geometry differs");
         let mut buffers = self.common(b)?;
         let record_bytes = if self.fp8 { FP8_RECORD_BYTES } else { RECORD_BYTES };
         let cache = global.pages.checked_mul(PAGE_ROWS)
@@ -109,16 +107,15 @@ impl<'a> Attention<'a> {
             (global.first, b.rows * 4, 4),
         ]);
         validate_buffers(&buffers, &[b.output, b.scratch])?;
-        let mut scalars = vec![
+        let scalars = [
             Scalar::I32(b.rows as i32),
             Scalar::I32(global.table_width as i32),
             Scalar::I32(b.tiles as i32),
         ];
-        if self.route == Route::Decode {
-            scalars.push(Scalar::I32(global.splits as i32));
-        }
         // SAFETY: checked extents, device, alignment and writer aliases;
         // owner validates table contents and retains all operands until drain.
+        // For global decode, dsv4_programs.cc injects device_sm_count from
+        // cudaDevAttrMultiProcessorCount for the trailing 's' scalar slot.
         unsafe {
             self.program.launch(
                 &[b.q.ptr, b.kv.ptr, b.positions.ptr, global.page_table.ptr, global.table_indices.ptr,
@@ -147,16 +144,18 @@ impl<'a> Attention<'a> {
 
 fn validate_manifest(spec: &ProgramSpec, kind: Kind, route: Route, fp8: bool, capacity: usize) -> Result<usize> {
     let pointers = if kind == Kind::Local { LOCAL } else { GLOBAL };
-    let scalars: &[u8] = match (kind, route) {
-        (Kind::Local, _) => b"ii",
-        (Kind::Global, Route::Prefill) => b"iii",
-        (Kind::Global, Route::Decode) => b"iiii",
+    // Global decode exports kinds="iiis" (device_sm_count injected by dsv4_programs.cc);
+    // cuteafd_dsv4_program_info exposes the 3 public scalars b"iii".
+    let scalars: &[u8] = match kind {
+        Kind::Local => b"ii",
+        Kind::Global => b"iii",
     };
     ensure!(spec.pointers.iter().map(String::as_str).eq(pointers.iter().copied())
         && spec.scalar_kinds == scalars
         && spec.capacity_rows as usize == capacity,
         "Inkling 2 Mini attention export ABI/capacity differs");
     let g = &spec.geometry;
+    let global_decode = kind == Kind::Global && route == Route::Decode;
     for (key, value) in [
         ("heads", HEADS),
         ("kv_heads", KV_HEADS),
@@ -170,17 +169,20 @@ fn validate_manifest(spec: &ProgramSpec, kind: Kind, route: Route, fp8: bool, ca
         ("extent", 1024),
         ("max_rows", capacity),
         ("window", if kind == Kind::Local { 1024 } else { 0 }),
-        ("max_splits", if kind == Kind::Global && route == Route::Decode { 32 } else { 1 }),
+        ("max_splits", if global_decode { 32 } else { 1 }),
+        ("split_chunk", if global_decode { 512 } else { 0 }),
         ("rows_per_cta", if route == Route::Decode { 1 } else { PREFILL_TOKENS }),
     ] {
         ensure!(g[key].as_u64() == Some(value as u64), "Inkling 2 Mini attention geometry {key} differs");
     }
+    ensure!(g["runtime_sm_count"].as_bool() == Some(global_decode),
+        "Inkling 2 Mini attention runtime_sm_count differs");
     ensure!(g["kv_format"] == if fp8 { "fp8" } else { "bf16" }
         && g["kind"] == kind_name(kind)
         && g["route"] == route_name(route)
         && g["sinks"] == "per_row_head",
         "Inkling 2 Mini attention bias/sink convention differs");
-    let expected = if kind == Kind::Global && route == Route::Decode {
+    let expected = if global_decode {
         capacity * 32 * HEADS * (HEAD_DIM * 4 + 4)
     } else {
         1024
@@ -218,12 +220,8 @@ mod tests {
 
     fn spec(kind: Kind, route: Route, fp8: bool, capacity: usize) -> ProgramSpec {
         let pointers = if kind == Kind::Local { LOCAL } else { GLOBAL };
-        let scalar_kinds = match (kind, route) {
-            (Kind::Local, _) => b"ii".to_vec(),
-            (Kind::Global, Route::Prefill) => b"iii".to_vec(),
-            (Kind::Global, Route::Decode) => b"iiii".to_vec(),
-        };
-        let scratch = if kind == Kind::Global && route == Route::Decode {
+        let global_decode = kind == Kind::Global && route == Route::Decode;
+        let scratch = if global_decode {
             capacity * 32 * HEADS * (HEAD_DIM * 4 + 4)
         } else {
             1024
@@ -236,7 +234,10 @@ mod tests {
                 if fp8 { "fp8" } else { "bf16" },
             ),
             pointers: pointers.iter().map(|s| (*s).into()).collect(),
-            scalar_kinds,
+            scalar_kinds: match kind {
+                Kind::Local => b"ii".to_vec(),
+                Kind::Global => b"iii".to_vec(),
+            },
             capacity_rows: capacity as u32,
             scratch: [("scratch".into(), scratch as u64)].into(),
             geometry: serde_json::json!({
@@ -253,7 +254,9 @@ mod tests {
                 "extent": 1024,
                 "max_rows": capacity,
                 "window": if kind == Kind::Local { 1024 } else { 0 },
-                "max_splits": if kind == Kind::Global && route == Route::Decode { 32 } else { 1 },
+                "max_splits": if global_decode { 32 } else { 1 },
+                "split_chunk": if global_decode { 512 } else { 0 },
+                "runtime_sm_count": global_decode,
                 "rows_per_cta": if route == Route::Decode { 1 } else { PREFILL_TOKENS },
                 "kind": kind_name(kind),
                 "route": route_name(route),
@@ -275,6 +278,27 @@ mod tests {
                 assert_eq!(validate_manifest(&s, kind, Route::Decode, fp8, cap).unwrap(), expected);
                 let other = if cap == 64 { 128 } else { 64 };
                 assert!(validate_manifest(&s, kind, Route::Decode, fp8, other).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn manifest_validates_runtime_sm_count_and_split_chunk() {
+        for (kind, fp8) in [(Kind::Local, false), (Kind::Global, false), (Kind::Global, true)] {
+            for route in [Route::Decode, Route::Prefill] {
+                let cap = route_capacity(route);
+                let good = spec(kind, route, fp8, cap);
+                validate_manifest(&good, kind, route, fp8, cap).unwrap();
+                let mut bad_chunk = good.clone();
+                bad_chunk.geometry["split_chunk"] = serde_json::json!(256);
+                assert!(validate_manifest(&bad_chunk, kind, route, fp8, cap).is_err());
+                let mut bad_runtime = good.clone();
+                bad_runtime.geometry["runtime_sm_count"] =
+                    serde_json::json!(!(kind == Kind::Global && route == Route::Decode));
+                assert!(validate_manifest(&bad_runtime, kind, route, fp8, cap).is_err());
+                let mut bad_scalars = good.clone();
+                bad_scalars.scalar_kinds.push(b'i');
+                assert!(validate_manifest(&bad_scalars, kind, route, fp8, cap).is_err());
             }
         }
     }

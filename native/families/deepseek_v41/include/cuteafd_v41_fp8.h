@@ -18,10 +18,16 @@ typedef struct {
 } cuteafd_v41_fp8_reduction_info_t;
 int32_t cuteafd_v41_fp8_matrix_reduction_info(int32_t capacity, int32_t k, int32_t n,
     cuteafd_v41_fp8_reduction_info_t* out);
+int32_t cuteafd_v41_fp8_decode_matrix_reduction_info(int32_t capacity, int32_t k, int32_t n,
+    cuteafd_v41_fp8_reduction_info_t* out);
 /* Matrix entry points cover engram, shared FFN, dSpark main and attention FP8 shapes.
- * Shapes are explicit (K input, N output); only compiled capacities are admitted. */
+ * Shapes are explicit (K input, N output); only compiled capacities are admitted.
+ * Decode matrix entry points select the row-invariant decode/verify split-K recipe
+ * for narrow q_a/kv shapes up to V41_VOCAB_ROWS while leaving prefill untouched. */
 int32_t cuteafd_v41_fp8_matrix_info(int32_t capacity, int32_t k, int32_t n, cuteafd_v41_fp8_info_t* out);
 int32_t cuteafd_v41_fp8_matrix_initialize(int32_t capacity, int32_t k, int32_t n, void** out);
+int32_t cuteafd_v41_fp8_decode_matrix_info(int32_t capacity, int32_t k, int32_t n, cuteafd_v41_fp8_info_t* out);
+int32_t cuteafd_v41_fp8_decode_matrix_initialize(int32_t capacity, int32_t k, int32_t n, void** out);
 int32_t cuteafd_v41_fp8_matrix_pack_scales(const uint8_t* source, uint8_t* destination,
     int32_t k, int32_t n, void* stream);
 /* BF16 [rows,2304] inputs/output; FP32 asymmetric limit-10 SwiGLU, BF16 RNE output. */

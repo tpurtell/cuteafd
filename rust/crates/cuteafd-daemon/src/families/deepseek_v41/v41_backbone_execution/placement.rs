@@ -299,7 +299,7 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
         for (gpu, layers) in Self::window_layers(placement)?.iter().enumerate() {
             if layers.is_empty() { continue; }
             bytes[gpu] = bytes[gpu]
-                .checked_add(crate::families::deepseek_v41::v41_window::WindowStorage::device_bytes(
+                .checked_add(crate::families::deepseek_v41::v41_window::WindowStorage::decode_device_bytes(
                     library, capacity as usize, capacity, layers.len())?)
                 .context("placed SWA workspace overflow")?;
         }
@@ -386,7 +386,7 @@ impl<'w, 'a> PlacedProducerWaves<'w, 'a> {
                     let gpu = usize::try_from(weights.device.id)?.min(1);
                     let shared = match &storage[gpu] {
                         Some(shared) => shared.clone(),
-                        None => crate::families::deepseek_v41::v41_window::WindowStorage::new(weights.device.library,
+                        None => crate::families::deepseek_v41::v41_window::WindowStorage::new_decode(weights.device.library,
                             capacity as usize, capacity as usize, &layers[gpu])?,
                     };
                     storage[gpu] = Some(shared.clone());
