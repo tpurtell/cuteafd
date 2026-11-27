@@ -247,6 +247,7 @@ pub(super) struct Execution<'e, 'a> {
 struct MainExecution<'e, 'a> {
     graphs: Vec<super::graphs::Graphs<'a>>,
     graph_enabled: Cell<bool>,
+    graph_cycles: RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
     checkpoint: &'a Checkpoint,
     ownership: ExecutionOwnership,
     native: NativeOwners<'a>,
@@ -779,7 +780,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
             }
         };
         let execution = Self { graphs: (0..devices.len()).map(|_| super::graphs::Graphs::new()).collect(),
-            graph_enabled: Cell::new(false), checkpoint, ownership, native, caches, stages, exchange,
+            graph_enabled: Cell::new(false), graph_cycles: RefCell::new(None), checkpoint, ownership, native, caches, stages, exchange,
             sequence: RefCell::new(HeadSequence::new(0)?), pending_wave: RefCell::new(std::collections::VecDeque::new()), transport: RefCell::new(transport), routed_reply, tp2, rows, inventory, requests: Cell::new(0), placement_version,
             terminal_output: Cell::new(None), poison_scratch: Cell::new(false),
             diagnostic_outputs: RefCell::new(std::collections::BTreeMap::new()) };
@@ -949,6 +950,10 @@ impl<'e, 'a> Execution<'e, 'a> {
                 self.main.graphs[rank].attach(device.library, device.id, rank, layout, self.main.rows)?;
             }
         }
+        if enabled {
+            let streams = self.main.stages.iter().map(|stage| (stage.stream.device.id, stage.stream.raw)).collect::<Vec<_>>();
+            *self.main.graph_cycles.borrow_mut() = Some(crate::shared::decode_graph::device::EventCycles::new(self.main.device(0)?.library, &streams)?);
+        }
         self.main.graph_enabled.set(enabled);
         Ok(())
     }
@@ -994,23 +999,31 @@ impl<'e, 'a> Execution<'e, 'a> {
         for bank in &self.main.graphs { bank.cycle(cycle); }
     }
 
-    fn graph_completed(&self) -> Result<()> {
-        if !self.main.graph_enabled.get() { return Ok(()); }
-        if !self.main.graphs.iter().any(|bank| bank.needs_boundary()) {
-            for bank in &self.main.graphs { bank.tick(); }
-            return Ok(());
+    fn begin_graph_cycle(&self) -> Result<()> {
+        if !self.main.graph_enabled.get() { return Ok(()) }
+        if let Some(cycles) = self.main.graph_cycles.borrow_mut().as_mut() {
+            // SAFETY: all graph operands are persistent staging/engine owners.
+            unsafe { cycles.begin_persistent(|visit| { for bank in &self.main.graphs { bank.visit(visit)?; } Ok(()) })?; }
         }
-        // First touch and cache maintenance need a quiescent sample; ordinary
-        // replays only tick above and leave the head ordered on its lane stream.
-        let wait = std::time::Instant::now();
-        collect_lane_results(self.main.stages.iter().map(|stage| stage.stream.drain()))?;
-        crate::shared::decode_graph::device::record_boundary_drain(self.main.stages.iter().map(|stage| stage.stream.device.id), wait.elapsed());
-        self.main.require_live()?;
-        // SAFETY: graph owners hold no allocations; native, cache and staging storage
-        // stays live in this execution and its borrowed owners until terminal drainage.
-        unsafe { crate::shared::decode_graph::device::observe_completed(self.main.device(0)?.library,
-            |visit| { for bank in &self.main.graphs { bank.visit(visit)?; } Ok(()) }) }?;
-        for bank in &self.main.graphs { bank.observed(); }
+        Ok(())
+    }
+
+    fn graph_completed(&self) -> Result<()> {
+        if !self.main.graph_enabled.get() { return Ok(()) }
+        let mut cycles = self.main.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        for bank in &self.main.graphs { bank.tick(); }
+        // SAFETY: all rank submissions are queued.
+        unsafe { cycles.complete()?; }
+        if self.main.graphs.iter().any(|bank| bank.first_touch_pending() || bank.is_warming()) {
+            // Startup/prewarm and lazy module initialization require a settled baseline.
+            let wait = std::time::Instant::now();
+            collect_lane_results(self.main.stages.iter().map(|stage| stage.stream.drain()))?;
+            cycles.record_drain(wait.elapsed());
+            self.main.require_live()?;
+            cycles.poll()?;
+            for bank in &self.main.graphs { bank.observed(); }
+        }
         Ok(())
     }
 
@@ -1075,6 +1088,7 @@ impl<'e, 'a> Execution<'e, 'a> {
             && input.buffer.device_id == main.device(main.ownership.execution().spec().entry_gpu as usize)?.id
             && input.buffer.bytes >= step.rows() * H * 4, "Step-5 live input allocation");
         pair::submit_scoped(|| main.require_live(), || main.shutdown(), |scope| step.in_submission(scope, |step| {
+            self.begin_graph_cycle()?;
             step.compose(main.ownership.execution().spec().entry_gpu as usize, input, |_, _| Ok(()))?;
             let mut binding = Bindings { execution: main, step, scope, current: vec![None; main.ownership.ranks()],
                 input: input.buffer, kind, layer: 0, diagnostic: None, units: false, lane: 0 };
