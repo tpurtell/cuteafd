@@ -322,7 +322,7 @@ impl<'a> GlmfEngine<'a> {
             // 3. Post-attention + FFN + FFN pushes (Rank 1 first so GPU 1 stays ahead of GPU 0).
             let att_slot = slot(index, false, 0);
             let ffn_slot = slot(index, true, 0);
-            let split_core_ffn = core::native_ffn(layer0) && layer0.split;
+            let split_core_ffn = core::split_trellis_ffn(layer0);
             if layer0.dense {
                 // Rank 1 dense FFN (strictly rank-local capture) -> push!
                 if output_shard_ptrs.is_none() {
