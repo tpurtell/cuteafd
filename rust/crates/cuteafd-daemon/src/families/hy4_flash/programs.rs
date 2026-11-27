@@ -177,6 +177,8 @@ impl<'a> Hy4Programs<'a> {
         ];
         let norm_ptrs = &["x", "weight", "bias", "cos", "sin", "positions", "out"];
         let proj_ptrs = &["x", "w", "out"];
+        let proj_router = load("router", &["x", "w", "logits"])?;
+        crate::families::hy4_common::validate_router_spec(proj_router.spec(), 3072, 512)?;
 
         Ok(Self {
             tp,
@@ -253,7 +255,7 @@ impl<'a> Hy4Programs<'a> {
             proj_indexer_weights: load("indexer_weights", proj_ptrs)?,
             proj_engram_value: load("engram_value", proj_ptrs)?,
             proj_engram_key: load("engram_key", proj_ptrs)?,
-            proj_router: load("router", proj_ptrs)?,
+            proj_router,
             proj_latent_down: load("latent_down", proj_ptrs)?,
             proj_latent_up: load("latent_up", proj_ptrs)?,
             proj_dense_gate_up: load("dense_gate_up", proj_ptrs)?,

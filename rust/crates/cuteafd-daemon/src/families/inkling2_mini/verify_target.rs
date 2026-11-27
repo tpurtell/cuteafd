@@ -63,7 +63,7 @@ impl<'a> BlockVerifyTarget for Target<'_, 'a> {
         let draft = self.execution.draft.as_ref().context("Mini drafter missing")?.clone();
         ensure!(
             request.tap_sites == draft.sites
-                && request.rows.len() <= 64
+                && request.rows.len() <= self.execution.requests.decode.layout.rows
                 && request.rows.iter().all(|row| row.token.is_some()),
             "Inkling 2 Mini verify requires admitted native sites and active packed rows"
         );

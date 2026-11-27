@@ -192,6 +192,11 @@
       "family": "hy4_flash"
     },
     {
+      "model": "wrldsuksgo2mars/Hy4-EXL3-K4-MC",
+      "revision": "67346c4bdee2d8694606b4b4db9a96442e8667b7",
+      "family": "hy4"
+    },
+    {
       "model": "thinkingmachines/Inkling-2-Mini",
       "revision": "7a67ae2314b44ef05c87fd1d4d311c58aaeb18f6",
       "family": "inkling2_mini"

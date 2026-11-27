@@ -156,7 +156,10 @@ pub(crate) fn catalog_owner_bytes(catalog: &crate::OfficialV41Catalog, family: &
     let rows = RECORDED.get_or_init(|| serde_json::from_str(include_str!("spark_slot_census.json"))
         .expect("bundled Spark owner census is valid JSON"));
     if !rows.iter().any(|row| row["family"] == family && row["format"] == "exl3" && row["width"].is_number()) {
-        return exl3_owner_bytes(family, geometry, extent, None);
+        let segment_width = working.selected_ranks().contains(&rank)
+            .then(|| exl3_segment_width(family, geometry, working.spark_ranks))
+            .flatten();
+        return exl3_owner_bytes(family, geometry, extent, segment_width);
     }
     anyhow::ensure!(!working.spark_layers.is_empty(), "EXL3 worker has no retained layers");
     let package_family = match family {
@@ -195,8 +198,14 @@ fn recorded_exl3_owner_bytes(rows: &[serde_json::Value], family: &str,
     let scratch = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?;
     let io = u64::from(extent.capacity).checked_mul(u64::from(geometry.hidden) * 33 / 32
         + u64::from(geometry.topk) * 8).context("EXL3 owner I/O overflow")?;
-    Ok(cuteafd_core::OwnerBytes { scratch, io,
-        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
+    let mut bytes = cuteafd_core::OwnerBytes { scratch, io,
+        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 };
+    if !compact && family != "muse_spark" && geometry.hidden % 512 == 0 {
+        let waves = exl3_wave_bytes(geometry, width, extent).context("EXL3 merged-wave extent overflow")?;
+        bytes.io += waves.0;
+        bytes.pinned_staging += waves.1;
+    }
+    Ok(bytes)
 }
 
 /// One native NVFP4 owner on the shared FP8-family worker: the installed
@@ -259,6 +268,17 @@ pub(crate) fn exl3_owner_bytes(family: &str, geometry: cuteafd_core::ExpertGeome
         bytes.pinned_staging += waves.1;
     }
     Ok(bytes)
+}
+
+/// Stored intermediate width of an EXL3 Spark layout that ships a merged-wave
+/// segments program (`package_exl3_aot.segment_export_options`): noncompact
+/// worlds (whole 128-row blocks split evenly over `world`) with `hidden % 512 == 0`
+/// and the weighted-sum epilogue (Muse replies per-expert partials and never merges).
+pub(crate) fn exl3_segment_width(family: &str, geometry: cuteafd_core::ExpertGeometry, world: usize) -> Option<u32> {
+    if family == "muse_spark" || world == 0 || geometry.hidden % 512 != 0 || geometry.intermediate % 128 != 0 {
+        return None;
+    }
+    ((geometry.intermediate / 128) % world as u32 == 0).then(|| geometry.intermediate / world as u32)
 }
 
 /// A prefill owner's merged EXL3 waves on a layout that ships a segments
@@ -327,8 +347,14 @@ pub(crate) fn ml4_owner_bytes(world: usize, extent: cuteafd_core::OwnerExtent)
         .collect::<anyhow::Result<Vec<_>>>()?;
     let retained = crate::serving_capacity::exl3_workspace_bytes(&manifests, true, Exl3Epilogue::Sum)?;
     let wire_routes = u64::from(geometry.hidden) * 33 / 32 + u64::from(geometry.topk) * 8;
-    Ok(cuteafd_core::OwnerBytes { scratch: retained, io: u64::from(extent.capacity) * wire_routes,
-        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 })
+    let mut bytes = cuteafd_core::OwnerBytes { scratch: retained, io: u64::from(extent.capacity) * wire_routes,
+        pinned_staging: u64::from(extent.staging_rows) * u64::from(geometry.topk) * 8 };
+    if let Some(width) = exl3_segment_width("mistral_large4", geometry, world) {
+        let waves = exl3_wave_bytes(geometry, width, extent).context("EXL3 merged-wave extent overflow")?;
+        bytes.io += waves.0;
+        bytes.pinned_staging += waves.1;
+    }
+    Ok(bytes)
 }
 
 /// Native width states coexist, while their stream and live I/O are shared.
@@ -399,15 +425,11 @@ pub(crate) fn owner_bytes(input: &super::super::PlanInput, working: &SparkWorkin
         Some(mxfp4_rank_artifacts(catalog, working, rank)?)
     } else { None };
     let coded = catalog.mxfp4_scale_codes();
-    // GLM 5.3 and GLM Flash Spark layouts ship a merged-wave segments program
+    // Every sum-epilogue EXL3 Spark family ships a merged-wave segments program
     // on every noncompact layout (`package_exl3_aot.segment_export_options`).
-    let segment_width = match (backend, family) {
-        // Noncompact exactly when whole 128-row blocks split evenly over the
-        // world (`balanced_residency`); each rank then stores intermediate/world.
-        (SparkBackend::Exl3(_), "glm5" | "glm5_flash") if working.selected_ranks().contains(&rank) && world > 0 => {
-            let intermediate = geometry.intermediate;
-            (intermediate % 128 == 0 && (intermediate / 128) % world as u32 == 0).then(|| intermediate / world as u32)
-        }
+    let segment_width = match backend {
+        SparkBackend::Exl3(_) if working.selected_ranks().contains(&rank) =>
+            exl3_segment_width(family, geometry, world),
         _ => None,
     };
     let family = family.to_owned();
@@ -663,8 +685,14 @@ mod tests {
                 assert_eq!(owner.scratch, retained, "TP{world} m{compiled}");
                 assert_eq!(owner.io, u64::from(capacity) * (6144 + 192 + 32));
                 assert_eq!(owner.pinned_staging, u64::from(capacity) * 32);
-                assert_eq!(owner, ml4_owner_bytes(world, cuteafd_core::OwnerExtent {
-                    buffered_units: 3, ..extent(capacity, compiled) })?, "retained arenas are not per wave");
+                let buffered_extent = cuteafd_core::OwnerExtent { buffered_units: 3, ..extent(capacity, compiled) };
+                let buffered = ml4_owner_bytes(world, buffered_extent)?;
+                assert_eq!(buffered.scratch, owner.scratch, "retained arenas are not per wave");
+                let geometry = cuteafd_core::ExpertGeometry::MISTRAL_LARGE4;
+                let (wave_dev, wave_pin) = exl3_segment_width("mistral_large4", geometry, world)
+                    .map_or((0, 0), |w| exl3_wave_bytes(geometry, w, buffered_extent).unwrap());
+                assert_eq!(buffered.io, owner.io + wave_dev);
+                assert_eq!(buffered.pinned_staging, owner.pinned_staging + wave_pin);
             }
             let decode = ml4_owner_bytes(world, extent(64, 80))?;
             for capacity in [2, 16, 32, 64, 80] {
@@ -958,13 +986,16 @@ mod tests {
         let exports = crate::plan::spark_executions::SparkBackend::for_catalog(input.expert_catalog()?)?.exports();
         let row = 7168 + 7168 / 32 + 6 * 8;
         let decode = 51 * (1 << 20) + 64 * row;
+        let geometry = cuteafd_core::ExpertGeometry::DEEPSEEK_V4_PRO;
         for (unit, waves) in [(4096, 1), (4096, 2), (2752, 3), (2048, 4), (256, 3)] {
             let executions = crate::plan::spark_executions::admit_family("deepseek_v4", &exports, None, unit, waves)?;
             assert_eq!(executions.decode.len(), 1);
             charge_executions(&mut device, &input, &working, "deepseek_v4", &executions)?;
+            let prefill = executions.owners().last().unwrap();
+            let (wave_dev, wave_pin) = exl3_wave_bytes(geometry, 768, prefill).unwrap();
             let find = |group| device.items.iter().find(|item| item.group == group).unwrap().bytes;
-            assert_eq!(find("execution owners"), 810 * (1 << 20) - (4096 - unit) * row + decode);
-            assert_eq!(find("execution staging"), 64 * 6 * 8 + unit * waves * 6 * 8);
+            assert_eq!(find("execution owners"), 810 * (1 << 20) - (4096 - unit) * row + decode + wave_dev);
+            assert_eq!(find("execution staging"), 64 * 6 * 8 + unit * waves * 6 * 8 + waves * wave_pin);
         }
         Ok(())
     }
@@ -1037,6 +1068,55 @@ mod tests {
                 assert_eq!(retained - without_wire, rows * 4096 * 2);
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn every_sum_epilogue_exl3_family_charges_merged_waves_on_noncompact_worlds_only() -> anyhow::Result<()> {
+        use cuteafd_core::{ExecutionOwner, ExpertGeometry, OwnerExtent};
+        let prefill = OwnerExtent { owner: ExecutionOwner::Prefill, capacity: 2752, compiled: 2752,
+            staging_rows: 2752, buffered_units: 3 };
+        let singleton = OwnerExtent { buffered_units: 1, ..prefill };
+        let decode = OwnerExtent { owner: ExecutionOwner::Decode(0), capacity: 64, compiled: 80,
+            staging_rows: 64, buffered_units: 1 };
+        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!("spark_slot_census.json"))?;
+
+        for (family, geometry, noncompact_world, compact_world) in [
+            ("glm5", ExpertGeometry::GLM5, 4usize, 6usize),
+            ("glm5_flash", ExpertGeometry::GLM5_FLASH, 4, 3),
+            ("deepseek_v4", ExpertGeometry::DEEPSEEK_V4_PRO, 4, 5),
+            ("qwen4", ExpertGeometry::QWEN4, 1, 2),
+            ("kimi_k3", ExpertGeometry::KIMI_K3, 6, 7),
+            ("mistral_large4", ExpertGeometry::MISTRAL_LARGE4, 6, 5),
+            ("step5", ExpertGeometry::STEP5, 4, 5),
+            ("inkling2", ExpertGeometry::INKLING2, 6, 4),
+            ("hy4_flash", ExpertGeometry::HY4_FLASH, 4, 5),
+            ("hy4", ExpertGeometry::HY4, 4, 6),
+        ] {
+            let width = exl3_segment_width(family, geometry, noncompact_world)
+                .with_context(|| format!("{family} TP{noncompact_world} should ship segments"))?;
+            assert_eq!(width, geometry.intermediate / noncompact_world as u32);
+            assert_eq!(exl3_segment_width(family, geometry, compact_world), None,
+                "{family} TP{compact_world} is compact and must not charge segments");
+            let (dev, pin) = exl3_wave_bytes(geometry, width, prefill).unwrap();
+            assert!(dev > 0 && pin == 2752 * 16, "{family}: positive merged-wave charge");
+            assert_eq!(exl3_wave_bytes(geometry, width, singleton), Some((0, 0)));
+            assert_eq!(exl3_wave_bytes(geometry, width, decode), Some((0, 0)));
+            if matches!(family, "inkling2" | "hy4_flash") {
+                let nc_single = recorded_exl3_owner_bytes(&rows, family, geometry, width, false, singleton)?;
+                let nc_waves = recorded_exl3_owner_bytes(&rows, family, geometry, width, false, prefill)?;
+                assert_eq!(nc_waves.scratch, nc_single.scratch);
+                assert_eq!(nc_waves.io - nc_single.io, dev);
+                assert_eq!(nc_waves.pinned_staging - nc_single.pinned_staging, pin);
+                let compact_width = (geometry.intermediate / 128).div_ceil(compact_world as u32) * 128;
+                let c_single = recorded_exl3_owner_bytes(&rows, family, geometry, compact_width, true, singleton)?;
+                let c_waves = recorded_exl3_owner_bytes(&rows, family, geometry, compact_width, true, prefill)?;
+                assert_eq!(c_waves, c_single, "{family} compact layout must not add segments");
+            }
+        }
+        // Muse Spark uses PartialReplies and never loads m8192-segments.
+        assert_eq!(exl3_segment_width("muse_spark", ExpertGeometry::MUSE_SPARK, 4), None);
+        assert_eq!(exl3_segment_width("muse_spark", ExpertGeometry::MUSE_SPARK, 8), None);
         Ok(())
     }
 

@@ -340,6 +340,9 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         scheduler::Geometry { family: "muse_spark", vocab_size: self.cfg.vocab_size, max_context: self.context,
             slots: self.slots, prefill_rows: self.unit_rows * self.waves, decode_rows: self.decode_rows }
     }
+    fn scoring_verify_capacity(&self) -> usize {
+        scoring_verify_capacity(self.decode_rows)
+    }
     /// Every Muse message opens with `<|start|>` (turn boundaries for prefix marks).
     fn message_starts(&self) -> &[&str] { &[cuteafd_api::openai::chat::muse::START] }
     fn library(&self) -> &'a NativeLibrary { self.library }
@@ -566,8 +569,41 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
     }
 }
 
+fn scoring_verify_capacity(decode_rows: usize) -> usize {
+    decode_rows.min(cuteafd_loader::families::muse_spark::cache::SWA_RING_STEP as usize)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wide_decode_rows_chunks_muse_scoring_within_swa_ring_step() -> anyhow::Result<()> {
+        use crate::shared::probe::{score_plan, ScorePath};
+        let capacity = super::scoring_verify_capacity(128);
+        assert_eq!(capacity, 64);
+        assert_eq!(super::scoring_verify_capacity(32), 32);
+
+        let steps = score_plan(583, 64, 4096, capacity, None, ScorePath::Decode, false)?;
+        let decode_steps: Vec<_> = steps.iter().filter(|step| step.path == ScorePath::Decode).collect();
+        assert!(!decode_steps.is_empty());
+        let pages: Vec<u32> = (0..16).collect();
+        let ring_rows = 2048 + cuteafd_loader::families::muse_spark::cache::SWA_RING_STEP as usize;
+        for step in decode_steps {
+            assert!(step.tokens.len() <= 64, "Muse scoring chunk {} exceeds SWA_RING_STEP", step.tokens.len());
+            super::StepMetadata::build(
+                &[super::StepSequence { slot: 0, start: step.tokens.start, rows: step.tokens.len(), pages: &pages }],
+                ring_rows,
+                1,
+                128,
+                false,
+            )?;
+        }
+
+        let err = score_plan(583, 64, 4096, capacity, Some(65), ScorePath::Decode, false).unwrap_err();
+        assert!(err.to_string().contains("1..=64"), "{err:#}");
+        let err = score_plan(583, 64, 4096, capacity, Some(128), ScorePath::Decode, false).unwrap_err();
+        assert!(err.to_string().contains("1..=64"), "{err:#}");
+        Ok(())
+    }
     /// Prefix turn marks key on the checkpoint's `<|start|>` (not Qwen's
     /// `<|im_start|>`), resolved from the served snapshot when present.
     #[test]

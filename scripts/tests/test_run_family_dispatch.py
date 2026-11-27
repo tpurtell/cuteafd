@@ -1216,11 +1216,13 @@ if family == "minimax_m3" and decode_rows > 128:
     sys.exit("minimax_m3 supports DECODE_ROWS up to 128 (missing minimax_m3_*_m256)")
 if family == "inkling2" and decode_rows > 128:
     sys.exit("inkling2 supports DECODE_ROWS up to 128 (missing inkling2_*_m256)")
+if family == "inkling2_mini" and decode_rows > 128:
+    sys.exit("inkling2_mini supports DECODE_ROWS up to 128 (missing inkling2_mini_*_m256)")
 if family == "qwen4" and decode_rows > 128:
     sys.exit("qwen4 supports DECODE_ROWS up to 128 (missing qwen4_*_m256)")
 if family == "muse_spark" and decode_rows > 128:
     sys.exit("muse_spark supports DECODE_ROWS up to 128 (missing wider decode admission)")
-if family not in ("deepseek_v41", "glm5_flash", "minimax_m3", "inkling2", "kimi_k3", "qwen4", "muse_spark") and decode_rows > 64:
+if family not in ("deepseek_v41", "glm5_flash", "minimax_m3", "inkling2", "inkling2_mini", "kimi_k3", "qwen4", "muse_spark") and decode_rows > 64:
     sys.exit(f"{family} supports DECODE_ROWS up to 64 (missing {family}_*_m128)")
 if family == "kimi_k3" and decode_rows > 128:
     sys.exit("kimi_k3 supports DECODE_ROWS up to 128 (missing kimi_k3_*_m256)")
@@ -6210,3 +6212,35 @@ def test_inkling2_mini_external_dflash_dispatch(tmp_path):
     assert result.returncode == 0, result.stderr
     serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-inkling2-mini" in line)
     assert "--dspark=false" in serve and "--draft " in serve and "--draft-kv-cache bf16" in serve
+
+
+@pytest.mark.parametrize("keys,expected_flag", [
+    ("", None),
+    ("DECODE_ROWS=auto\n", None),
+    ("DECODE_ROWS=64\n", "--decode-rows 64"),
+    ("DECODE_ROWS=128\n", "--decode-rows 128"),
+])
+def test_inkling2_mini_decode_rows_are_forwarded_from_global_key(tmp_path, keys, expected_flag):
+    config = {"model_type": "inkling2_loop", "text_config": {"num_hidden_layers": 24}}
+    result = _family_launch_result(
+        tmp_path, config, "thinkingmachines/Inkling-2-Mini",
+        "RTX_GPUS=1\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nVISION=off\nAUDIO=off\n" + keys,
+        extra_args=("--wip", "inkmini-test"),
+    )
+    assert result.returncode == 0, result.stderr
+    serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-inkling2-mini" in line)
+    if expected_flag is None:
+        assert "--decode-rows" not in serve, serve
+    else:
+        assert expected_flag in serve and serve.count("--decode-rows") == 1, serve
+
+
+def test_inkling2_mini_refuses_decode_rows_above_128(tmp_path):
+    config = {"model_type": "inkling2_loop", "text_config": {"num_hidden_layers": 24}}
+    result = _family_launch_result(
+        tmp_path, config, "thinkingmachines/Inkling-2-Mini",
+        "RTX_GPUS=1\nSPARK_COUNT=0\nEXPERT_BACKEND=local\nVISION=off\nAUDIO=off\nCONCURRENCY=32\nDECODE_ROWS=256\n",
+        extra_args=("--wip", "inkmini-test"),
+    )
+    assert result.returncode != 0
+    assert "inkling2_mini_*_m256" in result.stderr

@@ -35,6 +35,9 @@ QUALIFICATION = {"inkling2-mxfp8-min.config", "inkling2-mxfp8-max.config",
                  "hy4-flash-exl3-k4-mc-k8-max.config", "hy4-flash-exl3-k4-mc-k6-max.config",
                  "hy4-flash-exl3-k4-mc-fp8-max.config", "hy4-flash-exl3-k4-mc-1rtx-1spark.config",
                  "hy4-flash-exl3-k4-mc-1rtx-4spark.config",
+                 "hy4-exl3-k4-mc-min.config", "hy4-exl3-k4-mc-max.config",
+                 "hy4-exl3-k4-mc-k8-max.config", "hy4-exl3-k4-mc-k6-max.config",
+                 "hy4-exl3-k4-mc-fp8-max.config",
                  "kimi-k31-exl3-k2-mc-min.config", "kimi-k31-exl3-k2-mc-max.config", "minimax-m31-flash-nvfp4-min.config", "minimax-m31-flash-nvfp4-max.config", "kimi-k3-exl3-max.config", "kimi-k3-exl3-k6-min.config", "kimi-k3-exl3-k6-max.config", "step5-fp8-max.config", "step5-nvfp4-min.config",
                  "muse-spark-exl3-min.config", "muse-spark-exl3-max.config",
                  "step5-exl3-k6core-min.config", "step5-exl3-k6core-max.config",
@@ -794,6 +797,7 @@ V7_RETIREMENTS = {
     "qwen35-9b-bf16-min", "qwen38-27b-bf16-min", "qwen38-27b-fp8-min",
 }
 HY4_MC = "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC"
+HY4_FULL_MC = "wrldsuksgo2mars/Hy4-EXL3-K4-MC"
 
 
 def test_v7_release_cards_match_live_and_retired_inventory():
@@ -827,7 +831,7 @@ def test_v7_release_cards_match_live_and_retired_inventory():
             if key in entry["set"]:
                 assert (key, values[key]) not in endpoints
                 endpoints.add((key, values[key]))
-        if values["MODEL_ID"] in MC_CHECKPOINTS | {HY4_MC}:
+        if values["MODEL_ID"] in MC_CHECKPOINTS | {HY4_MC, HY4_FULL_MC}:
             assert values["CORE_VIEW"] == "k8-compact"
         identity = (entry["family"], values["MODEL_ID"], len(entry["gpus"]), len(entry["sparks"]))
         assert identity not in cards
@@ -838,6 +842,8 @@ def test_v7_release_cards_match_live_and_retired_inventory():
         ("inkling2_mini", "thinkingmachines/Inkling-2-Mini", 1, 0),
         ("glm5_flash", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1", 1, 2),
         ("glm5_flash", "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1", 2, 0),
+        ("hy4", HY4_FULL_MC, 1, 4),
+        ("hy4", HY4_FULL_MC, 2, 6),
     }
     primary = {(f, m, g) for f, m, g, n in cards if m != HY4_MC or n == 0}
     assert primary == {(row["family"], row["checkpoint"], g) for row in published["cells"]
@@ -846,9 +852,11 @@ def test_v7_release_cards_match_live_and_retired_inventory():
             for row in published["supplemental"]} == {("hy4_flash", HY4_MC, n, "current") for n in (1, 4)}
     hy4, = [row for row in published["cells"] if row["checkpoint"] == HY4_MC]
     assert hy4["1rtx"]["status"] == hy4["2rtx"]["status"] == "current"
+    hy4_full, = [row for row in published["cells"] if row["checkpoint"] == HY4_FULL_MC]
+    assert hy4_full["1rtx"]["status"] == hy4_full["2rtx"]["status"] == "pending"
     # #2675 / #2782: the K8-compact v7 smoke cards are published, each on its own report.
     for row in published["cells"] + published["supplemental"]:
-        if row["checkpoint"] in MC_CHECKPOINTS | {HY4_MC}:
+        if row["checkpoint"] in MC_CHECKPOINTS | {HY4_MC, HY4_FULL_MC}:
             for key in ("1rtx", "2rtx"):
                 cell = row.get(key)
                 if cell and cell["status"] == "current":
@@ -883,7 +891,7 @@ def test_v7_comparisons_change_only_view_and_endpoints_from_the_k8_max():
         assert (*identity, view) not in compared
         compared.add((*identity, view))
     assert compared == {(*identity, view) for identity in bases for view in compare}
-    assert {model for _, model in bases} == MC_CHECKPOINTS | {HY4_MC}
+    assert {model for _, model in bases} == MC_CHECKPOINTS | {HY4_MC, HY4_FULL_MC}
     assert {(study["family"], study["checkpoint"]) for study in published["mc_views"]} == set(bases)
     for study in published["mc_views"]:
         assert set(study["views"]) == compare | {"k8-compact"}
@@ -899,6 +907,8 @@ def test_v7_comparisons_change_only_view_and_endpoints_from_the_k8_max():
         if study["checkpoint"] == HY4_MC:
             # #2675: Hy4-flash has only its K8 main card (2x+0); compare views are unmeasured.
             assert {v for v, d in study["views"].items() if d} == {"k8-compact"}
+        if study["checkpoint"] == HY4_FULL_MC:
+            assert not any(study["views"].values())
 
 
 @pytest.mark.parametrize("path", starting_configs(), ids=lambda p: p.name)

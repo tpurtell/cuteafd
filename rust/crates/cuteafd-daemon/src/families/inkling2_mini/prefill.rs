@@ -58,6 +58,7 @@ struct EndSpanAction {
 
 fn plan_end_actions(
     unit_rows: usize,
+    head_rows: usize,
     members: &[UnitSegment],
     projection: HeadProjection,
     has_draft: bool,
@@ -67,7 +68,7 @@ fn plan_end_actions(
         return Ok(Vec::new());
     }
     let mut actions = Vec::new();
-    for span in crate::shared::probe::head_spans(unit_rows, 64)? {
+    for span in crate::shared::probe::head_spans(unit_rows, head_rows)? {
         let mut projections = Vec::new();
         for (member_index, member) in members.iter().enumerate() {
             if !member.head || member.rows.is_empty() {
@@ -170,7 +171,13 @@ impl<'a> UnitIo<'a> for TokenIo<'_, 'a> {
 
     fn end(&mut self, unit: &Unit, owner: &UnitOwner<'a>) -> Result<()> {
         let members = members(unit);
-        let actions = plan_end_actions(unit.rows.len(), &members, self.head_projection, self.draft.is_some())?;
+        let actions = plan_end_actions(
+            unit.rows.len(),
+            self.head.rows(),
+            &members,
+            self.head_projection,
+            self.draft.is_some(),
+        )?;
         if actions.is_empty() && !(self.publish_draft && self.draft.is_some()) {
             return Ok(());
         }
@@ -928,8 +935,8 @@ mod tests {
         }];
 
         // Without drafter: unit 0 does zero work; unit 1 normalizes & projects only the final row (4095..4096).
-        let u0_off = plan_end_actions(4096, &unit0, HeadProjection::MemberLastRow, false)?;
-        let u1_off = plan_end_actions(4096, &unit1, HeadProjection::MemberLastRow, false)?;
+        let u0_off = plan_end_actions(4096, 64, &unit0, HeadProjection::MemberLastRow, false)?;
+        let u1_off = plan_end_actions(4096, 64, &unit1, HeadProjection::MemberLastRow, false)?;
         assert!(u0_off.is_empty());
         assert_eq!(u1_off.len(), 1);
         assert_eq!(u1_off[0].normalize, 4095..4096);
@@ -938,8 +945,8 @@ mod tests {
 
         // With drafter (`dspark`): EVERY row of BOTH units (8192 total) is normalized & tapped for
         // `draft.taps().final_norm`, while ONLY the single final row (4095..4096 of unit 1) is projected!
-        let u0_draft = plan_end_actions(4096, &unit0, HeadProjection::MemberLastRow, true)?;
-        let u1_draft = plan_end_actions(4096, &unit1, HeadProjection::MemberLastRow, true)?;
+        let u0_draft = plan_end_actions(4096, 64, &unit0, HeadProjection::MemberLastRow, true)?;
+        let u1_draft = plan_end_actions(4096, 64, &unit1, HeadProjection::MemberLastRow, true)?;
         let norm_rows = |actions: &[EndSpanAction]| -> usize { actions.iter().map(|a| a.normalize.len()).sum() };
         let tap_rows = |actions: &[EndSpanAction]| -> usize {
             actions.iter().filter(|a| a.tap_final_norm).map(|a| a.normalize.len()).sum()
@@ -981,7 +988,7 @@ mod tests {
                 head: true,
             },
         ];
-        let packed_actions = plan_end_actions(100, &packed, HeadProjection::MemberLastRow, true)?;
+        let packed_actions = plan_end_actions(100, 64, &packed, HeadProjection::MemberLastRow, true)?;
         assert_eq!(norm_rows(&packed_actions), 100);
         assert_eq!(tap_rows(&packed_actions), 100);
         assert_eq!(proj_rows(&packed_actions), 2);
@@ -989,13 +996,13 @@ mod tests {
         assert_eq!(packed_actions[1].projections, vec![HeadEmit { member_index: 1, rows: 99..100 }]);
 
         // Scoring suffix (`FromPosition`) projects only positions >= first_pos while normalizing all rows for drafter.
-        let score_actions = plan_end_actions(4096, &unit1, HeadProjection::FromPosition(8180), true)?;
+        let score_actions = plan_end_actions(4096, 64, &unit1, HeadProjection::FromPosition(8180), true)?;
         assert_eq!(norm_rows(&score_actions), 4096);
         assert_eq!(tap_rows(&score_actions), 4096);
         assert_eq!(proj_rows(&score_actions), 13); // 1-based positions 8180..=8192 -> rows 4083..4096
 
-        // Decode / golden (`AllHeadRows`) still projects all rows.
-        let all_actions = plan_end_actions(8, &[UnitSegment {
+        // Decode / golden (`AllHeadRows`) still projects all rows, including 128-row decode heads in one span.
+        let all_actions = plan_end_actions(8, 64, &[UnitSegment {
             sequence: 0,
             rows: 0..8,
             tokens: 100..108,
@@ -1005,6 +1012,17 @@ mod tests {
         }], HeadProjection::AllHeadRows, true)?;
         assert_eq!(norm_rows(&all_actions), 8);
         assert_eq!(proj_rows(&all_actions), 8);
+        let wide_actions = plan_end_actions(128, 128, &[UnitSegment {
+            sequence: 0,
+            rows: 0..128,
+            tokens: 100..228,
+            prompt_end: false,
+            snapshot: false,
+            head: true,
+        }], HeadProjection::AllHeadRows, true)?;
+        assert_eq!(wide_actions.len(), 1);
+        assert_eq!(norm_rows(&wide_actions), 128);
+        assert_eq!(proj_rows(&wide_actions), 128);
         Ok(())
     }
 

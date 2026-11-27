@@ -68,6 +68,7 @@ impl<'a> Binding<'a> {
         self.drafter.iter().map(|d| &d.lead)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         programs: &'a Programs<'a>,
         stream: Rc<Stream<'a>>,
@@ -77,6 +78,7 @@ impl<'a> Binding<'a> {
         unembed_weight: Buffer,
         prefill_rows: usize,
         waves: usize,
+        decode_rows: usize,
         mark_slots: usize,
     ) -> Result<Self> {
         ensure!(
@@ -133,11 +135,11 @@ impl<'a> Binding<'a> {
         };
         let verify = stream
             .device
-            .run(|| Verify::new(programs, Rc::clone(&stream), runtime.slots, 6656))?;
+            .run(|| Verify::new(programs, Rc::clone(&stream), runtime.slots, 6656, decode_rows))?;
         let prefill = (0..waves)
             .map(|_| TapBuffer::new(Rc::clone(&stream), layout.config.transformer.hidden, &layout.config.taps, prefill_rows))
             .collect::<Result<Vec<_>>>()?;
-        let decode = TapBuffer::new(Rc::clone(&stream), layout.config.transformer.hidden, &layout.config.taps, 64)?;
+        let decode = TapBuffer::new(Rc::clone(&stream), layout.config.transformer.hidden, &layout.config.taps, decode_rows)?;
         stream.drain()?;
         Ok(Self {
             drafter: Some(drafter),
@@ -152,9 +154,10 @@ impl<'a> Binding<'a> {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_dflash(programs: &'a Programs<'a>, stream: Rc<Stream<'a>>,
         layout: &cuteafd_loader::families::inkling2_mini::dflash::Layout, admitted: &ResolvedPlan,
-        embed: Buffer, valid_vocab: usize, embed_eps: f32, prefill_rows: usize, waves: usize, mark_slots: usize) -> Result<Self> {
+        embed: Buffer, valid_vocab: usize, embed_eps: f32, prefill_rows: usize, waves: usize, decode_rows: usize, mark_slots: usize) -> Result<Self> {
         use crate::shared::{memory::weight_arena::DeviceWeightArena, fp8_linear::{Fp8Rows, Fp8Scales}};
         use cuteafd_core::memory_layout::ArenaTag;
         use cuteafd_loader::families::glm5::draft_representation::GlmDraftRepresentation;
@@ -214,9 +217,9 @@ impl<'a> Binding<'a> {
         };
         let sites = cfg.taps.iter().map(|&id| if id == 48 { cuteafd_core::TapSite::FinalNorm }
             else { cuteafd_core::TapSite::LayerEntry(id) }).collect::<Vec<_>>();
-        let verify = d.run(|| Verify::new(programs, stream.clone(), slots, 6656))?;
+        let verify = d.run(|| Verify::new(programs, stream.clone(), slots, 6656, decode_rows))?;
         let prefill = (0..waves).map(|_| TapBuffer::new(stream.clone(), cfg.hidden, &sites, prefill_rows)).collect::<Result<Vec<_>>>()?;
-        let decode = TapBuffer::new(stream.clone(), cfg.hidden, &sites, 64)?;
+        let decode = TapBuffer::new(stream.clone(), cfg.hidden, &sites, decode_rows)?;
         stream.drain()?;
         Ok(Self { drafter: None, dflash: Some(Gqa { body, marks, frontier: RefCell::new(vec![0;slots]), embed_eps, stream }), marks: Vec::new(), verify, prefill, decode, sites,
             sequences, block: cfg.block, hidden: cfg.hidden, context_rows: 2048 })

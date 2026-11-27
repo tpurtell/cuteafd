@@ -216,6 +216,18 @@
         "status": "current",
         "report": "benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-2rtx-hy4-flash-exl3-max"
       }
+    },
+    {
+      "family": "hy4",
+      "checkpoint": "wrldsuksgo2mars/Hy4-EXL3-K4-MC",
+      "1rtx": {
+        "status": "pending",
+        "reason": "Pending v7 Release smoke (K8 compact, 1x RTX + 4 Sparks)"
+      },
+      "2rtx": {
+        "status": "pending",
+        "reason": "Pending v7 Release smoke (K8 compact, 2x RTX + 6 Sparks)"
+      }
     }
   ],
   "mc_views": [
@@ -294,6 +306,16 @@
       "checkpoint": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
       "views": {
         "k8-compact": "benchmarks/hy4_flash/2026-11-25-smoke-hy4-flash-exl3-k4-mc-2rtx-hy4-flash-exl3-max",
+        "original": null,
+        "k6-compact": null,
+        "fp8-compact": null
+      }
+    },
+    {
+      "family": "hy4",
+      "checkpoint": "wrldsuksgo2mars/Hy4-EXL3-K4-MC",
+      "views": {
+        "k8-compact": null,
         "original": null,
         "k6-compact": null,
         "fp8-compact": null
