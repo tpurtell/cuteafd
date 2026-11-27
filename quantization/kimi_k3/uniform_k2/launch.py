@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import time
@@ -72,9 +73,13 @@ def main():
                            if args.publish else None)
     # GPU ownership ends when the quantizer process exits. Uploading runs in a
     # separate process with no CUDA device visible and no hardware lock held.
-    hardware_lock = Path.home() / ".cache/cuteafd/gpu1.lock"
-    hardware_lock.parent.mkdir(parents=True, exist_ok=True)
-    command = ["flock", "--wait", "60", str(hardware_lock), "timeout", "--foreground", "--signal=TERM", "30d", *command]
+    # The hardware lock is taken through the fair queue (scripts/hw/hwlock.py), never
+    # a direct flock that would overtake older gpu1 tickets (#2596). The read-only
+    # plan admission runs once the lock is granted, before the quantizer starts.
+    admission = shlex.join([*command, "--plan-only"])
+    command = [command[0], str(REPO / "scripts/hw/hwlock.py"), "--locks", "gpu1", "--wait", "60",
+               "--preflight", admission, "--preflight-at-grant", "--preflight-timeout", "300", "--",
+               "timeout", "--foreground", "--signal=TERM", "30d", *command]
     # Persist only execution settings; credentials stay in the existing HF
     # credential store and never appear in launch data or commands.
     environment = {name: os.environ[name] for name in
