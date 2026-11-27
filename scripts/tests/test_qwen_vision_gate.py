@@ -334,10 +334,10 @@ def test_qwen_verify_histogram_uses_existing_timer_and_exact_rows():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     family = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
     timer = serve[serve.index("    let elapsed = timer.elapsed().as_secs_f64();"):]
-    assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("policy.observe_timed(&outcomes,")
+    assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec)") < timer.index("policy.observe_timed(&outcomes,")
     assert '"verify": verify.snapshot()' in serve
     assert serve.count("&cache, media, preparer, &lane.stats,\n") == 2
-    assert "fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize {\n        rows\n    }" in family
+    assert "fn verify_bucket_rows(&self, rows: usize, _speculative: bool) -> usize {\n        rows\n    }" in family
     assert "fn verify_explore_bucket(" not in family
     assert '"by_real_rows"' in serve and '"by_bucket"' in serve
 
