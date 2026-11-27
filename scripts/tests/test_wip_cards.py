@@ -446,7 +446,7 @@ def test_build_stages_union_identical_scopes_and_no_outer_gpu_lock(entry, tmp_pa
         assert cards.DEFAULT_SEED not in hosts
     output = capsys.readouterr().out
     assert output.count('identical build scopes') == 2
-    assert 'build.lock' in output and 'gpu1.lock' not in output
+    assert 'resource exec --locks build' in output and 'gpu1.lock' not in output
     scopes = cards.build_scopes([entry])
     assert scopes['CUTEAFD_WIP_SPARK_TP_ROLES'] == 'tp3'
     assert 'CUTEAFD_WIP_EXPORT_LOCKS' not in scopes
@@ -513,7 +513,7 @@ def test_legacy_build_lock_is_coarse_and_recorded(entry, tmp_path, monkeypatch, 
     cards.build_arms({'base': 'old'}, arms, [entry], tmp_path, 'task', True)
     text = capsys.readouterr().out
     assert 'legacy arm: GPU lock held for the full build' in text
-    assert 'hwlock.py --locks gpu1 --wait 1800' in text
+    assert 'resource exec --locks gpu1 --wait 1800' in text
     assert arms['base']['build_lock_mode'] == 'legacy-full-build'
     assert 'source-base' in text and 'cp ' not in text
 
@@ -2865,10 +2865,7 @@ def test_one_serving_turn_covers_all_arms_repeats_and_teardown(entry, tmp_path, 
     assert events == ['grant', *[event for arm in expected for event in ('prelaunch-' + arm, 'teardown-' + arm)], 'release']
     assert all(env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0' for env in smoke_envs)
     assert not held
-    locks = cards.hwlock._try_flocks(['sparks', 'gpu0'])
-    assert locks is not None
-    for handle in locks:
-        handle.close()
+    assert cards.hwlock.is_free(['sparks', 'gpu0'])
 
 
 @pytest.mark.parametrize('mode', ['legacy-full-build', 'native-phase'])
@@ -2997,19 +2994,16 @@ def test_real_stopped_smoke_tears_down_before_parent_unlocks(entry, tmp_path, mo
             while not (tmp_path / 'ready').exists():
                 assert time.monotonic() < deadline and process.poll() is None
                 time.sleep(0.01)
-            assert cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1']) is None
+            assert not cards.hwlock.is_free(['sparks', 'gpu0', 'gpu1'])
             cards.forward_stop(signum)
             assert cards.wait_detached(process, grace=5) == 128 + signum
             assert (tmp_path / 'torn-down').exists()
-            assert cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1']) is None
+            assert not cards.hwlock.is_free(['sparks', 'gpu0', 'gpu1'])
         finally:
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=5)
-    held = cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1'])
-    assert held is not None
-    for handle in held:
-        handle.close()
+    assert cards.hwlock.is_free(['sparks', 'gpu0', 'gpu1'])
 
 
 def test_failed_teardown_prevents_next_arm(entry, tmp_path, monkeypatch):
@@ -3094,23 +3088,27 @@ def test_resume_with_every_job_kept_never_queues(entry, tmp_path, monkeypatch):
 
 
 def test_serving_turn_wait_is_bounded(entry, tmp_path, monkeypatch):
-    monkeypatch.setattr(cards.hwlock, 'POLL_S', 0.005)
     job = make(entry, tmp_path)
     locks = cards.hwlock.LOCK_DIR
     marker = tmp_path / 'holding'
-    # Another job (not an ancestor: hwlock refuses to nest inside one) holds gpu0.
-    other = subprocess.Popen([sys.executable, str(ROOT / 'scripts/hw/hwlock.py'), '--locks', 'gpu0', '--wait', '10', '--',
-                              sys.executable, '-c', f'import pathlib,time; pathlib.Path({str(marker)!r}).touch(); time.sleep(30)'],
-                             env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks)})
+    # Another job holds gpu0 via PeerSwarm SQLite lease.
+    other = subprocess.Popen(
+        cards.hwlock.exec_argv(
+            ['gpu0'],
+            [sys.executable, '-c', f'import pathlib,time; pathlib.Path({str(marker)!r}).touch(); time.sleep(30)'],
+            wait=10,
+            owner='test-other',
+        ),
+        env={**os.environ, 'PEERSWARM_STATE_DIR': str(locks), 'PEERSWARM_ROOT': str(ROOT)},
+    )
     try:
         end = time.time() + 10
         while not marker.exists():
             assert time.time() < end, 'the other holder never started'
             time.sleep(0.02)
-        with pytest.raises(TimeoutError, match='no turn'):
-            with cards.serving_turn([job], {}, 0.02):
+        with pytest.raises(TimeoutError, match='timed out'):
+            with cards.serving_turn([job], {}, 1):
                 pytest.fail('a conflicting turn cannot be granted')
-        assert not list((locks / 'hwq').glob('*.ticket'))
     finally:
         other.terminate()
         other.wait(timeout=30)
@@ -3131,7 +3129,7 @@ def test_grouped_smoke_inherits_union_turn(entry, tmp_path, monkeypatch):
     monkeypatch.setattr(cards, 'binary_supports', lambda *args: None)
     def detached(cmd, log, exit_file, env):
         assert env['CUTEAFD_HW_LOCKS_HELD'] == 'sparks,gpu0,gpu1,rhea,moa'
-        assert cards.hwlock._try_flocks(['sparks', 'gpu0', 'gpu1', 'rhea', 'moa']) is None
+        assert not cards.hwlock.is_free(['sparks', 'gpu0', 'gpu1', 'rhea', 'moa'])
         seen.append('launch')
         exit_file.write_text('0\n')
         return SimpleNamespace(wait=lambda timeout=None: 0, pid=0)

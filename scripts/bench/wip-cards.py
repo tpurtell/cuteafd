@@ -60,7 +60,7 @@ _cdi_spec.loader.exec_module(_cdi)
 cdi_gpu_args = _cdi.cdi_gpu_args
 sys.path.insert(0, str(REPO / 'scripts/lib'))
 from wip_aot_scopes import exl3_spark_layouts, family_scopes
-_hw_spec = importlib.util.spec_from_file_location('hwlock', REPO / 'scripts/hw/hwlock.py')
+_hw_spec = importlib.util.spec_from_file_location('hwlock', REPO / 'scripts/hw/peerswarm_resource.py')
 hwlock = importlib.util.module_from_spec(_hw_spec)
 _hw_spec.loader.exec_module(hwlock)
 # Profilers that wrap a serving process (PROFILE on the coordinator, PROFILE_SPARK
@@ -3542,7 +3542,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
             print('# legacy arm: GPU lock held for the full build')
             # hwlock refuses to nest inside an enclosing hold (exit 77); one that covers gpu1 already holds it for us.
             if 'gpu1' not in held_by_ancestor():
-                build_cmd = [sys.executable, str(REPO / 'scripts/hw/hwlock.py'), '--locks', 'gpu1', '--wait', '1800', '--', *build_cmd]
+                build_cmd = hwlock.exec_argv(['gpu1'], build_cmd, wait=1800, owner='wip-cards-legacy-build')
         print('# build locking ' + name + ': ' + arm['build_lock_mode'])
         # Seed on an out-of-pool host; stage the sealed slot to the whole serving union.
         # The seed is wip.sh's own parameter (WIP_SEED_HOST), never a SPARK_* rank,
@@ -3609,7 +3609,7 @@ def build_arms(builds, arms, cards, state, task, dry, seed=DEFAULT_SEED):
         commands = [
             *prepare,
             [sys.executable, str(REPO / 'scripts/build/assert-build-filesystem.py'), str(root), str(source)],
-            build_cmd if arm['build_slot'] else ['flock', '-w', '1800', str(Path.home() / '.cache/cuteafd/build.lock'), *build_cmd],
+            build_cmd if arm['build_slot'] else hwlock.exec_argv(['build'], build_cmd, wait=1800, owner='wip-cards-build'),
         ]
         for cmd in commands:
             print(shlex.join(cmd))

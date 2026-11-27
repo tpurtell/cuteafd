@@ -19,7 +19,7 @@ def _load(name, path):
 
 
 cards = _load('wip_cards_seed', ROOT / 'scripts/bench/wip-cards.py')
-hwlock = _load('hwlock_seed', ROOT / 'scripts/hw/hwlock.py')
+hwlock = _load('hwlock_seed', ROOT / 'scripts/hw/peerswarm_resource.py')
 transfer = _load('seed_transfer', ROOT / 'scripts/build/seed-transfer.py')
 WIP = (ROOT / 'wip.sh').read_text()
 
@@ -41,8 +41,7 @@ def test_lan_seeds_are_seed_choices_but_never_serving_hosts():
 def test_lan_seed_set_is_one_list_everywhere():
     common = (ROOT / 'scripts/lib/release-common.sh').read_text()
     assert 'release_lan_seed_hosts=(kakapo cassowary)' in common
-    resource = _load('build_resource_seeds', ROOT / 'scripts/build/build-resource.py')
-    assert cards.SEED_HOSTS == resource.LAN_SEEDS == hwlock.LAN_SEEDS == ('kakapo', 'cassowary')
+    assert cards.SEED_HOSTS == hwlock.LAN_SEEDS == ('kakapo', 'cassowary')
     golden = (ROOT / 'scripts/bench/golden-run.py').read_text()
     assert "'cassowary':" in golden and "'kakapo':" in golden
 
@@ -408,13 +407,14 @@ release_host_has_rdma {host}
 def test_wip_seed_lease_balances_only_automatic_lan_seeds():
     acquire = WIP[WIP.index('wip_build_resource_acquire() {'):WIP.index('\ndocker info >/dev/null')]
     assert 'if release_is_lan_seed "$seed_host" && ((seed_explicit == 0)); then' in acquire
-    assert 'resource_args+=(--balance --fallback "${CUTEAFD_WIP_SEED_FALLBACK:-rhea,moa}")' in acquire
-    assert 'if ! release_is_lan_seed "$seed_host"; then resource_args+=(--slots 1)' in acquire
+    assert 'resource_args+=(--pool lan_seeds --prefer "$seed_host" --fallback "${CUTEAFD_WIP_SEED_FALLBACK:-rhea,moa}" --probe-ssh)' in acquire
+    assert 'if ! release_is_lan_seed "$seed_host" || [[ "${CUTEAFD_SEED_BUILD_SLOTS:-}" == 1 ]]; then' in acquire
+    assert 'resource_args+=(--exclusive)' in acquire
     # A granted seed other than the one picked early re-resolves its transport.
     moved = acquire[acquire.index('if [[ "$seed_host" != "$original_seed" ]]; then'):]
     assert 'seed-transfer.py" lan-addr "$seed_host"' in moved and 'wip_seed_rdma=0' in moved
     early = WIP[WIP.index('# Probe only after dry-run exits'):WIP.index('wip_build_resource_release() {')]
-    assert 'build-resource.py" --pick --balance' in early and '((seed_explicit == 0))' in early
+    assert 'resource pick' in early and '((seed_explicit == 0))' in early
     assert 'kakapo' not in early
 
 

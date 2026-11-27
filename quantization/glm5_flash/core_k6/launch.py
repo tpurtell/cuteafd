@@ -31,17 +31,7 @@ def ssh(host, command):
 
 
 def stage_lock_helper():
-    source = (REPO / "scripts/hw/hwlock.py").read_bytes()
-    digest = hashlib.sha256(source).hexdigest()
-    path = Path.home() / ".cache/cuteafd/quantization/glm53-flash-k4-core-k6" / f"hwlock-{digest}.py"
-    # Stage the unmodified shared helper, rather than depending on raptor's
-    # currently checked out source tree or changing its shared infrastructure.
-    setup = "from pathlib import Path; import sys,hashlib; p=Path(sys.argv[1]); " \
-        "b=sys.stdin.buffer.read(); assert hashlib.sha256(b).hexdigest()==sys.argv[2]; " \
-        "p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(b)"
-    subprocess.run(ssh("raptor", ["python3", "-c", setup, path, digest]), input=source,
-                   check=True, timeout=60)
-    return str(path)
+    return str(REPO / "peerswarm/target/release/peerswarm")
 
 
 def gpu_command(common, *, container, lock_helper, pilot=False, qualification_report=None):
@@ -58,7 +48,7 @@ def gpu_command(common, *, container, lock_helper, pilot=False, qualification_re
                  str(runner), *common]
     guarded = [python, str(REPO / "quantization/kimi_k3/core_k6/run_guard.py"),
                "--container", container, "--", *numerical]
-    return ssh("raptor", ["python3", lock_helper, "--locks", "maxq", "--wait", "21600",
+    return ssh("raptor", [lock_helper, "--root", str(REPO), "resource", "exec", "--locks", "maxq", "--wait", "21600",
         "--preflight", shlex.join(ssh("maxq", admission)), "--preflight-timeout", "600", "--",
         "timeout", "--foreground", "--signal=TERM", "--kill-after=70",
         "25m" if pilot else "30d", *ssh("maxq", guarded)])

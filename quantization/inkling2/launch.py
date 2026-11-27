@@ -31,16 +31,18 @@ def worker(mode, output_io='legacy'):
             '--root', str(TASK/'production'), '--output', str(TASK/'output')]
     elif mode == 'build':
         code = 'from inkling2.numerical import fork_module; fork_module("exllamav3.ext").prewarm_exllamav3_extension()'
-        # Build-slot owns only compilation; pilot/runtime do not retain it.
+        # PeerSwarm build slot owns only compilation; pilot/runtime do not retain it.
+        ps_bin = str(REPO/'peerswarm/target/release/peerswarm')
         arguments = ['-c', 'import subprocess,sys; subprocess.run(['+
-            repr(str(REPO/'scripts/build/build-slot.sh'))+',sys.executable,"-c",'+repr(code)+'],check=True)']
+            repr(ps_bin)+',"--root",'+repr(str(REPO))+',"resource","exec","--locks","build","--nice","19","--",sys.executable,"-c",'+repr(code)+'],check=True)']
     elif mode != 'pilot':
         raise ValueError('unknown worker mode')
     if mode == 'production':
         prewarm = 'from inkling2.numerical import fork_module; fork_module("exllamav3.ext").prewarm_exllamav3_extension()'
         run_arguments = repr(arguments)
+        ps_bin = str(REPO/'peerswarm/target/release/peerswarm')
         arguments = ['-c', 'import subprocess,sys,runpy; subprocess.run(['+
-            repr(str(REPO/'scripts/build/build-slot.sh'))+',sys.executable,"-c",'+repr(prewarm)+
+            repr(ps_bin)+',"--root",'+repr(str(REPO))+',"resource","exec","--locks","build","--nice","19","--",sys.executable,"-c",'+repr(prewarm)+
             '],check=True);sys.argv='+run_arguments+'[1:];runpy.run_module('+repr(module)+',run_name="__main__")']
     argv = command(arguments, name=name, fork=Path.home()/'Developer/GPTQModel' if mode != 'production' else None)
     child = None
@@ -81,8 +83,8 @@ def main():
                               *(['--production'] if args.mode == 'production' else [])])
     wait = 1800 if args.mode == 'production' else 300
     runtime = 30*24*3600 if args.mode == 'production' else (900 if args.mode == 'build' else 660)
-    remote = ['timeout', '--signal=TERM', '--kill-after=90', str(wait+runtime+900), 'python3',
-        '/home/tj/Developer/cuteafd/scripts/hw/hwlock.py', '--locks', 'maxq', '--wait', str(wait),
+    remote = ['timeout', '--signal=TERM', '--kill-after=90', str(wait+runtime+900),
+        str(REPO/'peerswarm/target/release/peerswarm'), '--root', str(REPO), 'resource', 'exec', '--locks', 'maxq', '--wait', str(wait),
         '--preflight', shlex.join(preflight), '--preflight-timeout', '180', '--',
         *maxq_command(['timeout', '--signal=TERM', '--kill-after=60', str(runtime),
             PYTHON, '-m', 'inkling2.launch', '--worker', '--mode', args.mode,

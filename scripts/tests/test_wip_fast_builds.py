@@ -400,7 +400,7 @@ def test_capable_builds_hold_no_outer_build_lock_or_seed_gate(tmp_path, monkeypa
     # No pre-build seed wait: wip.sh queues each seed and Spark step itself (#2724).
     assert 'CUTEAFD_WIP_SEED_WAIT_S' not in source and "'--', 'true'" not in source
     wip = (ROOT / 'wip.sh').read_text()
-    assert 'build-slot.sh" python3 "$repo_root/scripts/build/build-process.py" --pipe' in wip
+    assert 'resource exec --locks build --nice 19 --stop-grace 25' in wip
 
 
 def test_zero_spark_card_sets_build_coordinator_only(tmp_path, monkeypatch, capsys):

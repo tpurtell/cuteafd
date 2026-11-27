@@ -55,7 +55,15 @@ cuteafd_kache_setup() {
         "${CC:-cc}" == *[[:space:]]* || "${CXX:-c++}" == *[[:space:]]* ]]; then
     cuteafd_compiler_cache_warn 'an existing compiler wrapper is configured'; return 0
   fi
-  cache="${CUTEAFD_KACHE_CACHE_DIR:-$HOME/.cache/cuteafd/builds/compiler-cache/kache}/$(uname -m)"
+  local default_cache_root="$HOME/.cache/cuteafd"
+  if [[ -n "${CUTEAFD_CACHE_ROOT:-}" ]]; then
+    default_cache_root="$CUTEAFD_CACHE_ROOT"
+  elif [[ -n "${PEERSWARM_CACHES:-}" ]]; then
+    default_cache_root="$PEERSWARM_CACHES"
+  elif [[ -f "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)/peerswarm.toml" ]]; then
+    default_cache_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)/peerswarm.state/caches"
+  fi
+  cache="${CUTEAFD_KACHE_CACHE_DIR:-$default_cache_root/kache}/$(uname -m)"
   # Local index/runtime must stay on a build-safe local filesystem, never the remote.
   if ! cuteafd_compiler_cache_local_fs "$cache" >/dev/null 2>&1 ||
      ! python3 "$(dirname "${BASH_SOURCE[0]}")/assert-build-filesystem.py" "$cache" > /dev/null 2>&1 ||

@@ -213,7 +213,7 @@ if ((dry_run)); then
   echo "  config: $RELEASE_CONFIG"
   echo "  slot: $slot (role $role)"
   echo "  containers: $(release_wip_container coordinator), $(release_wip_container spark-expert)"
-  echo "  WIP root: ${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
+  echo "  WIP root: ${WIP_ROOT:-$(cuteafd_cache_root)/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
   echo "  Spark leg: $( ((wip_spark_leg)) && echo on || echo off)"
   echo "  Spark hosts (${#wip_hosts[@]}): $(IFS=,; echo "${wip_hosts[*]}")"
   echo "  seed host: $seed_host ($( ((wip_seed_serves)) && echo serving || echo build-only), transfer ${CUTEAFD_WIP_SEED_TRANSFER:-auto}${WIP_SEED_ADDR:+ via $WIP_SEED_ADDR})"
@@ -224,15 +224,15 @@ if ((dry_run)); then
   echo "  Audio AOT: $audio_aot"
   echo "  FP8 BF16-input siblings: ${bf16_families:-<none>}"
   echo "  EXLR8 AOT: ${CUTEAFD_WIP_EXLR8_AOT:-OFF}"
-  cuteafd_build_cache_docker_args "${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}" /wip/home "$wip_toolchain_hash" dry >/dev/null
+  cuteafd_build_cache_docker_args "${WIP_ROOT:-$(cuteafd_cache_root)/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}" /wip/home "$wip_toolchain_hash" dry >/dev/null
   echo "  Spark cache plan (host HOME template; states/admission and uid rechecked on each Spark, no SSH):"
-  cuteafd_build_cache_docker_args "${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}" /wip/home "$wip_toolchain_hash" dry aarch64 >/dev/null
+  cuteafd_build_cache_docker_args "${WIP_ROOT:-$(cuteafd_cache_root)/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}" /wip/home "$wip_toolchain_hash" dry aarch64 >/dev/null
   exit 0
 fi
 
 # wip-from-slot-seed:start
 wip_resolve_from_slot_seed() {
-  local record_root="${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
+  local record_root="${WIP_ROOT:-$(cuteafd_cache_root)/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
   local record="$record_root/slots/$from_slot/seed-host" recorded="" host resolved=""
   local container path="/wip/slots/$from_slot/spark-expert"
   container="$(release_wip_container spark-expert)"
@@ -284,9 +284,15 @@ fi
 # An automatic LAN-only seed starts on the less-loaded reachable LAN seed (held
 # build slots), else a reachable rhea/moa; the lease re-balances at grant time.
 if release_is_lan_seed "$seed_host" && [[ "$role" != coordinator ]] && ((seed_explicit == 0)); then
-  wip_picked_seed="$(timeout 120 python3 "$repo_root/scripts/build/build-resource.py" --pick --balance \
-    --host "$seed_host" --fallback "${CUTEAFD_WIP_SEED_FALLBACK:-rhea,moa}" --lease-dir /nonexistent)" ||
+  wip_ps_bin="$(peerswarm_bin 2>/dev/null || true)"
+  if [[ -n "$wip_ps_bin" ]]; then
+    wip_picked_seed="$(timeout 120 "$wip_ps_bin" --root "$(peerswarm_repo_root)" resource pick \
+      --pool lan_seeds --prefer "$seed_host" \
+      --fallback "${CUTEAFD_WIP_SEED_FALLBACK:-rhea,moa}" --probe-ssh)" ||
+      wip_picked_seed="$seed_host"
+  else
     wip_picked_seed="$seed_host"
+  fi
   if [[ "$wip_picked_seed" != "$seed_host" ]]; then
     echo "WIP seed: automatic $seed_host -> $wip_picked_seed (least loaded or reachable)"
     seed_host="$wip_picked_seed"
@@ -311,30 +317,33 @@ wip_build_resource_release() {
     unset wip_transport_image
   fi
   [[ -n "${wip_build_resource_pid:-}" ]] || return 0
-  if [[ "${wip_resource_complete:-0}" == 1 ]]; then
-    printf x >"$wip_build_resource_dir/release"
-  else
-    kill "$wip_build_resource_pid" 2>/dev/null || true
-  fi
+  kill -TERM "$wip_build_resource_pid" 2>/dev/null || true
   wait "$wip_build_resource_pid" 2>/dev/null || true
   rm -rf "$wip_build_resource_dir"
   unset wip_build_resource_pid
 }
 wip_build_resource_acquire() {
   # Multiple instances have disjoint containers, source trees and Cargo targets.
-  # The unsuffixed legacy container can use slot zero but not multiple leases.
+  # The unsuffixed legacy container takes an exclusive seed lease.
   [[ -n "${WIP_INSTANCE:-}" ]] || CUTEAFD_SEED_BUILD_SLOTS=1
   wip_build_resource_dir="$(mktemp -d "${TMPDIR:-/tmp}/wip-build-resource.XXXXXXXX")"
-  mkfifo "$wip_build_resource_dir/release"
-  resource_args=(--host "$seed_host" --lock-host "$(wip_seed_lock "$seed_host")" --owner "$BASHPID" --container "$spark_container" --lease-dir "$wip_build_resource_dir" --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}")
-  if ! release_is_lan_seed "$seed_host"; then resource_args+=(--slots 1)
-  elif [[ -n "${CUTEAFD_SEED_BUILD_SLOTS:-}" ]]; then resource_args+=(--slots "$CUTEAFD_SEED_BUILD_SLOTS"); fi
+  local ps_bin
+  ps_bin="$(peerswarm_bin)" || release_die "peerswarm binary unavailable"
+  resource_args=(--root "$(peerswarm_repo_root)" resource hold
+    --owner "wip-$BASHPID" --container "$spark_container"
+    --ready-file "$wip_build_resource_dir/granted"
+    --wait "${CUTEAFD_WIP_EXPORT_WAIT_S:-14400}")
+  if ! release_is_lan_seed "$seed_host" || [[ "${CUTEAFD_SEED_BUILD_SLOTS:-}" == 1 ]]; then
+    resource_args+=(--exclusive)
+  fi
   # Explicit --seed is a placement request; automatic/environment seeds balance
   # across the LAN-only seeds and may fall back.
   if release_is_lan_seed "$seed_host" && ((seed_explicit == 0)); then
-    resource_args+=(--balance --fallback "${CUTEAFD_WIP_SEED_FALLBACK:-rhea,moa}")
+    resource_args+=(--pool lan_seeds --prefer "$seed_host" --fallback "${CUTEAFD_WIP_SEED_FALLBACK:-rhea,moa}" --probe-ssh)
+  else
+    resource_args+=(--locks "$(wip_seed_lock "$seed_host")")
   fi
-  python3 "$repo_root/scripts/build/build-resource.py" "${resource_args[@]}" &
+  "$ps_bin" "${resource_args[@]}" &
   wip_build_resource_pid=$!
   trap wip_build_resource_release EXIT
   while [[ ! -s "$wip_build_resource_dir/granted" ]]; do
@@ -342,7 +351,7 @@ wip_build_resource_acquire() {
     sleep 1
   done
   local original_seed="$seed_host"
-  seed_host="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["host"])' "$wip_build_resource_dir/granted")"
+  seed_host="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("host") or d["resources"][0])' "$wip_build_resource_dir/granted")"
   [[ "$seed_host" == "$original_seed" ]] || unset WIP_SEED_ADDR
   wip_seed_serves=0
   wip_target_hosts=()
@@ -378,7 +387,8 @@ release_resolve_coordinator_gpus "$COORDINATOR_GPUS" auto
 
 coordinator_container="$(release_wip_container coordinator)"
 spark_container="$(release_wip_container spark-expert)"
-state_dir="${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
+wip_builds_parent="$(cuteafd_cache_root)/builds"
+state_dir="${WIP_ROOT:-$wip_builds_parent/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
 wip_mount_root="$state_dir"
 python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$state_dir"
 if [[ -n "${WIP_ROOT:-}" ]]; then
@@ -386,11 +396,11 @@ if [[ -n "${WIP_ROOT:-}" ]]; then
 fi
 staging_dir="$state_dir/source-staging"
 hf_home="${HF_HOME:-$HOME/.cache/huggingface}"
-mkdir -p "$state_dir" "$hf_home"
+mkdir -p "$state_dir" "$hf_home" "$wip_builds_parent"
 
 # The persistent source, build and output paths are shared by all slots in
 # this instance. Serialize their writers, not independent WIP instances.
-exec {wip_instance_lock}>"$HOME/.cache/cuteafd/builds/.${coordinator_container}.lock"
+exec {wip_instance_lock}>"$wip_builds_parent/.${coordinator_container}.lock"
 flock -w 14400 "$wip_instance_lock" || release_die "timed out waiting for $coordinator_container build lock"
 exec {wip_root_lock}>"$state_dir/.build.lock"
 flock -w 14400 "$wip_root_lock" || release_die "timed out waiting for $state_dir build lock"
@@ -429,7 +439,8 @@ snapshot_args=(
   --exclude .pytest_cache/ --exclude .ruff_cache/ --exclude __pycache__/
   --exclude '*.pyc' --exclude '*.pyo' --exclude .cuteafd-cache/
   --exclude .cuteafd-release/ --exclude .cuteafd-release-image/
-  --exclude '.cuteafd-wip*' --exclude dist/ --exclude rust/target/
+  --exclude '.cuteafd-wip*' --exclude peerswarm.state/ --exclude peerswarm/target/
+  --exclude dist/ --exclude rust/target/
   --exclude 'native/build*/'
   --filter 'P .cuteafd-source-revision'
 )
@@ -880,9 +891,9 @@ image="$2"
 instance="${7:-__none__}"
 [[ "$instance" != __none__ ]] || instance=
 root="${8:-__none__}"
-[[ "$root" != __none__ ]] || root="$HOME/.cache/cuteafd/builds/wip${instance:+-$instance}"
+[[ "$root" != __none__ ]] || root="$HOME/Developer/cuteafd/peerswarm.state/caches/builds/wip${instance:+-$instance}"
 if [[ -n "$root" ]]; then
-  [[ "$root" == "$HOME/.cache/cuteafd/builds/"* ]] || { echo "WIP_ROOT outside host build root" >&2; exit 2; }
+  [[ "$root" == "$HOME/.cache/cuteafd/builds/"* || "$root" == "$HOME/Developer/"*"/peerswarm.state/caches/builds/"* ]] || { echo "WIP_ROOT outside host build root" >&2; exit 2; }
   printf '%s' "$9" | base64 -d | python3 - "$root"
   mkdir -p "$root"
 fi
@@ -1362,7 +1373,8 @@ build_coordinator() {
     for attempt in 1 2; do
       rust_status=0
       if [[ "${CUTEAFD_WIP_BUILD_SLOT:-off}" == on ]]; then
-        CUTEAFD_BUILD_STOP_GRACE=25 "$repo_root/scripts/build/build-slot.sh" python3 "$repo_root/scripts/build/build-process.py" --pipe --grace 15 -- "${coordinator_build[@]:0:2}" -i "${coordinator_build[@]:2}" rust || rust_status=$?
+        "$(peerswarm_bin)" --root "$(peerswarm_repo_root)" resource exec --locks build --nice 19 --stop-grace 25 --owner "wip-rust" -- \
+          python3 "$repo_root/scripts/build/build-process.py" --pipe --grace 15 -- "${coordinator_build[@]:0:2}" -i "${coordinator_build[@]:2}" rust || rust_status=$?
       else
         wip_exec "${coordinator_build[@]}" rust || rust_status=$?
       fi
@@ -1381,7 +1393,8 @@ build_coordinator() {
       release_die "coordinator WIP native restore failed"
   elif [[ "${CUTEAFD_WIP_BUILD_SLOT:-off}" == on ]]; then
     echo "WIP coordinator export: CPU export inside a build slot"
-    CUTEAFD_BUILD_STOP_GRACE=25 "$repo_root/scripts/build/build-slot.sh" python3 "$repo_root/scripts/build/build-process.py" --pipe --grace 15 -- "${coordinator_build[@]:0:2}" -i "${coordinator_build[@]:2}" native ||
+    "$(peerswarm_bin)" --root "$(peerswarm_repo_root)" resource exec --locks build --nice 19 --stop-grace 25 --owner "wip-native" -- \
+      python3 "$repo_root/scripts/build/build-process.py" --pipe --grace 15 -- "${coordinator_build[@]:0:2}" -i "${coordinator_build[@]:2}" native ||
       release_die "coordinator WIP CPU export failed"
   else
     echo "WIP coordinator export: CPU export"
@@ -1695,8 +1708,8 @@ wip_distribute_sealed_expert() (
   wip_write_distribute_job "$wip_distribute_job"
   echo "WIP Spark distribution: waiting for a fair turn on $missing (wait ${wait_seconds}s; hold bounded at ${bound}s for ${bytes:-unknown} bytes)"
   # build-process.py owns the transfer's process group, so the bound's SIGTERM
-  # stops every SSH stream before hwlock releases the locks.
-  python3 "$repo_root/scripts/hw/hwlock.py" --locks "$missing" --wait "$wait_seconds" --max-run "$bound" -- \
+  # stops every SSH stream before peerswarm releases the locks.
+  "$(peerswarm_bin)" --root "$(peerswarm_repo_root)" resource exec --locks "$missing" --wait "$wait_seconds" --max-run "$bound" --owner "wip-distribute" -- \
     python3 "$repo_root/scripts/build/build-process.py" --grace 60 -- bash "$wip_distribute_job" || status=$?
   case "$status" in
     0) ;;

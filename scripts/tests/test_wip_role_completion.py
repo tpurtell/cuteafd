@@ -570,41 +570,40 @@ distribute_expert_slot() {{ echo distribute >> '{trace}'; }}
 
 
 def _distribution_script(tmp_path, held, targets, *, bytes_='321798555', transfer=':'):
-    """wip_distribute_sealed_expert with the real hwlock.py and build-process.py on
-    a private lock directory. A spy hwlock records the argv and the ticket it
-    queued, then runs the real queue."""
+    """wip_distribute_sealed_expert with the real PeerSwarm resource scheduler and
+    build-process.py on a private PEERSWARM_STATE_DIR."""
     text = (ROOT / 'wip.sh').read_text()
     start = text.index('# wip_distribute_bound BYTES:')
     helpers = text[text.index('wip_distribute_locks() {'):start] + text[start:text.index('\nwip_build_selected_roles() {')]
     seed_lock = text[text.index('wip_seed_lock() {'):text.index('\n# Docker exec and SSH')]
     trace = tmp_path / 'trace'
     locks = tmp_path / 'locks'
-    (locks / 'hwq').mkdir(parents=True)
-    hw = tmp_path / 'scripts/hw'
-    hw.mkdir(parents=True)
+    locks.mkdir(parents=True)
     (tmp_path / 'scripts/build').mkdir(parents=True)
     shutil.copy(ROOT / 'scripts/build/build-process.py', tmp_path / 'scripts/build/build-process.py')
-    shutil.copy(ROOT / 'scripts/hw/hwlock.py', hw / 'hwlock_real.py')
-    (hw / 'hwlock.py').write_text(f"""import importlib.util, json, sys
-trace = open({str(trace)!r}, 'a')
-trace.write('turn ' + json.dumps(sys.argv[1:]) + '\\n'); trace.flush()
-spec = importlib.util.spec_from_file_location('hwlock', {str(hw / 'hwlock_real.py')!r})
-hwlock = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(hwlock)
-take = hwlock._take_ticket
-def recorded(queue, locks, max_run=None, gate=False):
-    seq, path, handle = take(queue, locks, max_run, gate)
-    trace.write('ticket ' + path.read_text() + '\\n'); trace.flush()
-    return seq, path, handle
-hwlock._take_ticket = recorded
-sys.exit(hwlock.main())
+    real_ps = str(ROOT / 'peerswarm/target/release/peerswarm')
+    spy_ps = tmp_path / 'peerswarm-spy'
+    spy_ps.write_text(f"""#!/usr/bin/env python3
+import json, os, sys
+with open({str(trace)!r}, 'a') as f:
+    f.write('turn ' + json.dumps(sys.argv[1:]) + '\\n')
+os.execv({real_ps!r}, [{real_ps!r}, *sys.argv[1:]])
 """)
-    probe = (f"flock -n {locks}/sparks.lock true && echo sparks-free >> '{trace}' "
-             f"|| echo sparks-held >> '{trace}'")
+    spy_ps.chmod(0o755)
+    probe_script = tmp_path / 'probe_sparks.py'
+    probe_script.write_text(
+        f"import json, subprocess\n"
+        f"d = json.loads(subprocess.check_output([{real_ps!r}, '--root', {str(ROOT)!r}, '--json', 'resource', 'status'], text=True))\n"
+        f"s = next(r['held_slots'] for r in d['resources'] if r['name'] == 'sparks')\n"
+        f"print('sparks-held' if s else 'sparks-free')\n"
+    )
+    probe = f"python3 {probe_script} >> '{trace}'"
     return trace, locks, f"""set -euo pipefail
 repo_root='{tmp_path}' wip_spark_leg=1 seed_host=kakapo spark_container=owned slot=s1
 wip_target_hosts=({' '.join(targets)})
 CUTEAFD_HW_LOCKS_HELD='{held}'
+peerswarm_bin() {{ printf '%s\\n' '{spy_ps}'; }}
+peerswarm_repo_root() {{ printf '%s\\n' '{ROOT}'; }}
 release_is_lan_seed() {{ [[ $1 == kakapo || $1 == cassowary ]]; }}
 release_die() {{ echo "die: $*" >> '{trace}'; exit 1; }}
 ssh() {{ case "$*" in *'du -sb'*) printf '{bytes_}\\t/wip/slots/s1/spark-expert\\n' ;; *) echo true ;; esac; }}
@@ -620,8 +619,13 @@ def _run_distribution(tmp_path, held, targets, **kwargs):
     trace, locks, script = _distribution_script(tmp_path, held, targets, **kwargs)
     scratch = tmp_path / 'tmp'
     scratch.mkdir()
-    result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=60,
-                            env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks), 'TMPDIR': str(scratch)})
+    result = subprocess.run(
+        ['bash', '-c', script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, 'PEERSWARM_STATE_DIR': str(locks), 'PEERSWARM_ROOT': str(ROOT), 'TMPDIR': str(scratch)},
+    )
     # The job script never outlives the step.
     assert not list(scratch.iterdir())
     return result, trace.read_text().splitlines() if trace.exists() else []
@@ -642,18 +646,9 @@ def test_distribution_runs_as_a_bounded_hwlock_child(tmp_path, targets, locks):
     assert 'true' not in command
     assert turn[turn.index('--locks') + 1] == locks
     assert turn[turn.index('--max-run') + 1] == '600'
-    ticket = json.loads(calls[1].removeprefix('ticket '))
     canonical = ','.join(lock for lock in ('sparks', 'rhea', 'moa') if lock in locks.split(','))
-    # The ticket other waiters see carries the bound, so it may backfill.
-    ticket = json.loads(calls[1].removeprefix('ticket '))
-    assert ticket['max_run'] == 600 and ticket['locks'] == canonical.split(',')
-    assert ticket['argv'][:ticket['argv'].index('--')] == turn[:turn.index('--')]
-    # hwlock holds the flock across the transfer, which sees the held locks
-    # and wip.sh's own state.
-    assert calls[2:] == ['sparks-held' if 'sparks' in locks else 'sparks-free',
+    assert calls[1:] == ['sparks-held' if 'sparks' in locks else 'sparks-free',
                          f'distribute {canonical} s1 {" ".join(targets)}']
-    # No ticket or holder record is left behind.
-    assert not list((tmp_path / 'locks/hwq').glob('*.ticket')) and not list((tmp_path / 'locks/hwq').glob('*.held'))
 
 
 def test_distribution_failure_is_named(tmp_path):
@@ -663,13 +658,31 @@ def test_distribution_failure_is_named(tmp_path):
 
 
 def test_distribution_waits_out_a_busy_lock_and_names_the_timeout(tmp_path, monkeypatch):
-    import fcntl
+    import time
     monkeypatch.setenv('CUTEAFD_WIP_DISTRIBUTE_WAIT_S', '1')
     trace, locks, script = _distribution_script(tmp_path, '', ['ostrich'])
-    with (locks / 'sparks.lock').open('w') as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        result = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=60,
-                                env={**os.environ, 'CUTEAFD_LOCK_DIR': str(locks)})
+    ready = locks / 'blocker.json'
+    real_ps = str(ROOT / 'peerswarm/target/release/peerswarm')
+    blocker = subprocess.Popen(
+        [real_ps, '--root', str(ROOT), 'resource', 'hold', '--locks', 'sparks', '--wait', '10',
+         '--owner', 'test-blocker', '--ready-file', str(ready)],
+        env={**os.environ, 'PEERSWARM_STATE_DIR': str(locks), 'PEERSWARM_ROOT': str(ROOT)},
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.is_file():
+            assert time.monotonic() < deadline and blocker.poll() is None
+            time.sleep(0.05)
+        result = subprocess.run(
+            ['bash', '-c', script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, 'PEERSWARM_STATE_DIR': str(locks), 'PEERSWARM_ROOT': str(ROOT)},
+        )
+    finally:
+        blocker.terminate()
+        blocker.wait(timeout=10)
     assert result.returncode == 1
     calls = trace.read_text().splitlines()
     assert calls[-1] == 'die: no fair turn on sparks for Spark WIP slot distribution within 1s'

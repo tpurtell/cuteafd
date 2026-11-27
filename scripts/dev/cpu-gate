@@ -77,7 +77,16 @@ import time
 import uuid
 
 REPO = Path(__file__).resolve().parents[2]
-BUILDS = Path.home() / '.cache/cuteafd/builds'
+_default_cache_root = (
+    Path(os.environ['CUTEAFD_CACHE_ROOT']).expanduser()
+    if os.environ.get('CUTEAFD_CACHE_ROOT')
+    else (REPO / 'peerswarm.state' / 'caches' if (REPO / 'peerswarm.toml').is_file() else Path.home() / '.cache/cuteafd')
+)
+BUILDS = (
+    Path(os.environ['CUTEAFD_BUILD_ROOT']).expanduser()
+    if os.environ.get('CUTEAFD_BUILD_ROOT')
+    else _default_cache_root / 'builds'
+)
 GATE_REQUIREMENTS = REPO / 'scripts/dev/gate-requirements.txt'
 # Real-checkpoint V4 placement tests: minutes each, need sparknest snapshots.
 LIVE_PLANNERS = ('families::deepseek_v4::placement_tests::planner_equals_runtime_deepseek_v4',
@@ -607,8 +616,8 @@ def compiler_cache_receipt(env, target):
 
 
 def _load_hwlock():
-    """scripts/hw/hwlock.py's ticket queue: numbered, flocked SEQ.PID.ticket entries."""
-    spec = importlib.util.spec_from_file_location('cuteafd_hwlock', REPO / 'scripts/hw/hwlock.py')
+    """PeerSwarm SQLite resource/lease client replacing scripts/hw/hwlock.py."""
+    spec = importlib.util.spec_from_file_location('cuteafd_hwlock', REPO / 'scripts/hw/peerswarm_resource.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -617,73 +626,36 @@ def _load_hwlock():
 HWLOCK = _load_hwlock()
 
 
-def _claim_slot(directory, slots, ahead):
-    """Flock the (ahead+1)-th free slot, leaving the first `ahead` to the older
-    waiters: (slot, handle, free slots seen), or (None, None, free) when too few
-    are free. Probes release at once, so no waiter sees a slot falsely busy."""
-    free = 0
-    for slot in range(slots):
-        lock = (directory / f'cpu-gate.{slot}.lock').open('a')
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock.close()
-            continue
-        free += 1
-        if free > ahead:
-            return slot, lock, free
-        lock.close()
-    return None, None, free
-
-
 @contextmanager
 def gate_lease(directory=None, slots=None, timeout=GATE_LEASE_WAIT):
-    """Count whole gates, including pytest and base comparisons, on this host.
-
-    First come, first served (hwlock's ticket queue): each waiter publishes a
-    flocked SEQ.PID.ticket in cpu-gate-q/ holding its PID and start time, and
-    takes a free slot only when fewer older live tickets wait than slots are
-    free, so a later waiter never overtakes an earlier one. A ticket whose flock
-    is free belongs to a dead process and is removed. The slot locks are flocks,
-    so a killed holder releases its slot; the ticket goes once the lease is
-    taken, the wait times out or the gate is stopped."""
-    directory = directory or Path.home() / '.cache/cuteafd'
-    slots = slots if slots is not None else (1 if platform.node().split('.')[0] == 'maxq' else 3)
-    directory.mkdir(parents=True, exist_ok=True)
-    queue = directory / 'cpu-gate-q'
-    queue.mkdir(exist_ok=True)
+    """Acquire a counting `cpu-gate` slot via PeerSwarm's SQLite FIFO resource scheduler."""
     started = time.monotonic()
-    log(f'waiting for gate lease ({slots} slots, timeout {timeout}s)')
-    lease, ticket, handle, position = None, None, None, None
+    effective_slots = slots if slots is not None else (1 if platform.node().split('.')[0] == 'maxq' else 3)
+    log(f'waiting for peerswarm cpu-gate lease ({effective_slots} slots, timeout {timeout}s)')
+    prev_state = os.environ.get('PEERSWARM_STATE_DIR')
+    if directory is not None:
+        os.environ['PEERSWARM_STATE_DIR'] = str(directory)
     try:
-        seq = HWLOCK._next_seq(queue)
-        ticket, handle = HWLOCK._publish(queue, seq, 'ticket', dict(pid=os.getpid(), created=time.time(),
-                                                                    host=platform.node(), argv=sys.argv[1:][:8]))
-        while True:
-            ahead = sum(1 for other, _, _ in HWLOCK._live_entries(queue, 'ticket') if other < seq)
-            slot, lease, free = _claim_slot(directory, slots, ahead)
-            if lease is not None:
-                break
-            if ahead + 1 != position:
-                position = ahead + 1
-                log(f'gate lease queue position {position} ({ahead} older waiting, {free}/{slots} slots free)')
-            if time.monotonic() - started >= timeout:
-                raise TimeoutError(f'no gate lease free after {timeout}s')
-            if STOPPING.wait(min(GATE_LEASE_POLL, max(0, timeout - (time.monotonic() - started)))):
-                raise KeyboardInterrupt('terminated while waiting for gate lease')
-    except BaseException:
-        if lease is not None:
-            lease.close()
-        raise
+        with HWLOCK.hold(
+            ['cpu-gate'],
+            wait=timeout,
+            owner=f'cpu-gate:{platform.node()}',
+            cancelled=lambda: STOPPING.is_set(),
+            exclusive=(effective_slots == 1),
+        ) as grant:
+            wait_s = round(time.monotonic() - started, 3)
+            allocated = (grant or {}).get('slots', {}).get('cpu-gate', [0])
+            slot = allocated[0] if allocated else 0
+            log(f'gate lease {slot}/{effective_slots} acquired after {wait_s:.1f}s (ticket #{(grant or {}).get("ticket_seq")})')
+            yield dict(slot=slot, slots=effective_slots, ticket=(grant or {}).get('ticket_seq', 0), wait_s=wait_s)
+    except HWLOCK.Cancelled as exc:
+        raise KeyboardInterrupt('terminated while waiting for gate lease') from exc
     finally:
-        if ticket is not None:
-            ticket.unlink(missing_ok=True)
-            handle.close()
-    try:
-        log(f'gate lease {slot}/{slots} acquired after {time.monotonic() - started:.1f}s')
-        yield dict(slot=slot, slots=slots, ticket=seq, wait_s=round(time.monotonic() - started, 3))
-    finally:
-        lease.close()
+        if directory is not None:
+            if prev_state is None:
+                os.environ.pop('PEERSWARM_STATE_DIR', None)
+            else:
+                os.environ['PEERSWARM_STATE_DIR'] = prev_state
 
 
 def validate_full_test_ids(source, root, args, env):
@@ -717,8 +689,18 @@ def cargo(source, root, args, env):
                    str(Path(env.get('HOME', str(Path.home()))) / '.cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json'))
     log('cargo: compiling tests (build slot held while compiling)')
     build_log = root / 'logs/cargo-build.log'
-    code, build_s = run_logged(['nice', '-n', '19', str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
-                                '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust', args.cargo_build_timeout)
+    code, build_s = run_logged(
+        HWLOCK.exec_argv(
+            ['build'],
+            ['cargo', 'test', '--workspace', '--locked', '--no-run', '--message-format=json-render-diagnostics'],
+            nice=19,
+            owner='cpu-gate-cargo',
+        ),
+        build_log,
+        env,
+        source / 'rust',
+        args.cargo_build_timeout,
+    )
     complete = cargo_build_succeeded(build_log)
     result = dict(suite='cargo', build_exit=code, build_complete=complete, build_s=round(build_s), build_log=str(build_log),
                   compiler_cache=compiler_cache_receipt(env, target),
@@ -858,9 +840,18 @@ def benches(source, root, args, env):
     for crate, test, test_target, test_name, bounds in BENCHES:
         log(f'benches: compiling {crate}/{test} (release, build slot held while compiling)')
         build_log = root / f'logs/bench-{test}-build.log'
-        code, seconds = run_logged([str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--release', '--locked',
-                                    '-p', crate, '--test', test_target, '--no-run', '--message-format=json-render-diagnostics'], build_log, env, source / 'rust',
-                                   args.cargo_build_timeout)
+        code, seconds = run_logged(
+            HWLOCK.exec_argv(
+                ['build'],
+                ['cargo', 'test', '--release', '--locked', '-p', crate, '--test', test_target, '--no-run', '--message-format=json-render-diagnostics'],
+                nice=19,
+                owner='cpu-gate-bench',
+            ),
+            build_log,
+            env,
+            source / 'rust',
+            args.cargo_build_timeout,
+        )
         build_s += seconds
         if code or not cargo_build_succeeded(build_log):
             result['failed'] += 1

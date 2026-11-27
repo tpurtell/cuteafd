@@ -1,0 +1,202 @@
+# PeerSwarm configuration for CuteAFD
+# Runtime state, peer worktrees, build caches, and SQLite DB live under peerswarm.state/ (gitignored).
+
+[project]
+name = "cuteafd"
+integration_branch = "dev"
+state_dir = "peerswarm.state"
+master = "agy"
+
+[tmux]
+layout = "windows"
+session_name = "cuteafd-swarm"
+remain_on_exit = true
+post_start_delay_ms = 5000
+
+[health]
+nudge_cooldown_secs = 120
+max_unacked_depth = 8
+max_unacked_age_secs = 1800
+auto_nudge_on_mail = true
+
+[github]
+enabled = true
+repo = "tpurtell/cuteafd"
+issue_kinds = ["feature"]
+pr_on_merge = true
+
+[worktrees]
+post_create_hook = "scripts/dev/submodule-init-local"
+# Monitor legacy worktree folder in `peerswarm disk` / `peerswarm gc`
+extra_roots = ["~/Developer/cute-worktrees"]
+
+[caches]
+subdir = "caches"
+# Surface legacy escaping cache directories in `peerswarm disk`
+extra_paths = ["~/.cache/cuteafd/builds"]
+
+# ---------------------------------------------------------------------------
+# Coordinator Peers
+# ---------------------------------------------------------------------------
+
+[peers.agy]
+cli = "agy"
+vendor = "google"
+model = "gemini-4-neon-high"
+yolo = true
+remote_control = true
+add_dirs = [
+  "/home/tj/Developer/sparkinfer-glmrt",
+  "/home/tj/Developer/GPTQModel",
+]
+post_start_commands = []
+
+[peers.agy.tiers]
+fast = "gemini-4-hydrogen-high"
+standard = "gemini-4-neon-high"
+premium = "gemini-4-carbon-high"
+
+[peers.claude]
+cli = "claude"
+vendor = "anthropic"
+model = "opus"
+yolo = true
+remote_control = true
+remote_control_name = "cuteafd-claude"
+add_dirs = [
+  "/home/tj/Developer/sparkinfer-glmrt",
+  "/home/tj/Developer/GPTQModel",
+]
+# Native --remote-control is enabled above. If your Claude session ever needs
+# slash-command activation instead, set remote_control = false and uncomment:
+# post_start_commands = ["/remote-control"]
+post_start_commands = []
+
+[peers.claude.tiers]
+fast = "sonnet"
+standard = "opus"
+premium = "fable"
+
+[peers.codex]
+cli = "codex"
+vendor = "openai"
+model = "gpt-6.2-sol"
+effort = "high"
+yolo = true
+add_dirs = [
+  "/home/tj/Developer/sparkinfer-glmrt",
+  "/home/tj/Developer/GPTQModel",
+]
+post_start_commands = []
+
+[peers.codex.tiers]
+fast = "gpt-6.2-sol"
+standard = "gpt-6.2-sol"
+premium = "gpt-6.2-astra"
+
+# ---------------------------------------------------------------------------
+# Cluster Hardware, Build Seed & CPU Slot Resources (SQLite FIFO + Backfill)
+# ---------------------------------------------------------------------------
+
+[resources]
+# Canonical lock order prevents AB/BA deadlocks across serving GPUs, Sparks, seeds, and host builds.
+order = ["sparks", "gpu0", "gpu1", "rhea", "moa", "kakapo", "cassowary", "maxq", "build", "cpu-gate"]
+compat_env_prefix = "CUTEAFD_HW"
+
+[resources.definitions.sparks]
+capacity = 1
+description = "Serving Spark pool (ostrich, dodo, emu, kiwi, plus rhea/moa when serving)"
+
+[resources.definitions.gpu0]
+capacity = 1
+description = "raptor RTX PRO 6000 GPU 0"
+
+[resources.definitions.gpu1]
+capacity = 1
+description = "raptor RTX PRO 6000 GPU 1"
+
+[resources.definitions.rhea]
+capacity = 1
+description = "Spark rank 4 (rhea, serving + fallback build seed)"
+ssh_host = "rhea"
+
+[resources.definitions.moa]
+capacity = 1
+description = "Spark rank 5 (moa, serving + fallback build seed)"
+ssh_host = "moa"
+
+[resources.definitions.kakapo]
+capacity = 3
+description = "LAN-only GB10 build seed (3 counting build slots; --exclusive for umbrella)"
+ssh_host = "kakapo"
+
+[resources.definitions.cassowary]
+capacity = 3
+description = "LAN-only GB10 build seed (3 counting build slots; --exclusive for umbrella)"
+ssh_host = "cassowary"
+
+[resources.definitions.maxq]
+capacity = 1
+description = "maxq WSL2 SM120 host (quants, CPU gates, single-GPU correctness)"
+ssh_host = "maxq"
+
+[resources.definitions.build]
+capacity = 5
+description = "raptor concurrent CPU compile slots (niced -j16)"
+
+[resources.definitions.cpu-gate]
+capacity = 3
+description = "raptor concurrent full CPU gate leases"
+
+[resources.pools.lan_seeds]
+members = ["kakapo", "cassowary"]
+fallback = ["rhea", "moa"]
+
+# ---------------------------------------------------------------------------
+# Remote Build / Cluster Hosts (monitored by `peerswarm disk --remotes` & `gc`)
+# ---------------------------------------------------------------------------
+
+[[remote_hosts]]
+host = "maxq"
+role = "quant-and-cpu-gate"
+watch_paths = ["~/Developer/cuteafd/peerswarm.state", "~/.cache/cuteafd/builds"]
+
+[[remote_hosts]]
+host = "kakapo"
+role = "lan-build-seed"
+watch_paths = ["~/Developer/cuteafd/peerswarm.state", "~/.cache/cuteafd/builds"]
+
+[[remote_hosts]]
+host = "cassowary"
+role = "lan-build-seed"
+watch_paths = ["~/Developer/cuteafd/peerswarm.state", "~/.cache/cuteafd/builds"]
+
+[[remote_hosts]]
+host = "ostrich"
+role = "spark-rank-0"
+watch_paths = ["~/.cache/cuteafd/builds"]
+
+[[remote_hosts]]
+host = "dodo"
+role = "spark-rank-1"
+watch_paths = ["~/.cache/cuteafd/builds"]
+
+[[remote_hosts]]
+host = "emu"
+role = "spark-rank-2"
+watch_paths = ["~/.cache/cuteafd/builds"]
+
+[[remote_hosts]]
+host = "kiwi"
+role = "spark-rank-3"
+watch_paths = ["~/.cache/cuteafd/builds"]
+
+[[remote_hosts]]
+host = "rhea"
+role = "spark-rank-4"
+watch_paths = ["~/.cache/cuteafd/builds"]
+
+[[remote_hosts]]
+host = "moa"
+role = "spark-rank-5"
+watch_paths = ["~/.cache/cuteafd/builds"]

@@ -83,7 +83,7 @@ def main():
         guarded=[python,str(REPO/"quantization/kimi_k3/core_k6/run_guard.py"),"--container",container,"--",*numerical]
         command=["timeout","--foreground","--signal=TERM","--kill-after=120","30d",*guarded]
         if not args.use_held_lock:
-            command=[python,str(REPO/"scripts/hw/hwlock.py"),"--locks","gpu1","--wait","60",
+            command=[str(REPO/"peerswarm/target/release/peerswarm"),"--root",str(REPO),"resource","exec","--locks","gpu1","--wait","60",
                 "--preflight",shlex.join(preflight),"--preflight-timeout","300","--",*command]
     environment={key:os.environ[key] for key in
         ("PATH","HOME","USER","LOGNAME","LANG","LC_ALL","LD_LIBRARY_PATH","HF_HOME") if key in os.environ}

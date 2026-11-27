@@ -32,7 +32,15 @@ if [ -z "$root" ]; then
 fi
 cd "$root"
 
-mirrors="${CUTEAFD_GIT_MIRRORS:-$HOME/.cache/cuteafd/git-mirrors}"
+if [ -n "${CUTEAFD_GIT_MIRRORS:-}" ]; then
+  mirrors="$CUTEAFD_GIT_MIRRORS"
+elif [ -d "$HOME/.cache/cuteafd/git-mirrors" ]; then
+  mirrors="$HOME/.cache/cuteafd/git-mirrors"
+elif [ -f "$root/peerswarm.toml" ]; then
+  mirrors="$root/peerswarm.state/caches/git-mirrors"
+else
+  mirrors="$HOME/.cache/cuteafd/git-mirrors"
+fi
 store_ready=0
 if [ "$mirrors" = off ]; then
   warn "CUTEAFD_GIT_MIRRORS=off: using upstream URLs"

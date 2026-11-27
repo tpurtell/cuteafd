@@ -27,6 +27,7 @@ IGNORED_DIRECTORY_NAMES = frozenset(
         ".cuteafd-release",
         ".cuteafd-release-image",
         ".cuteafd-wip",
+        "peerswarm.state",
         "dist",
     }
 )
@@ -49,7 +50,7 @@ def ignored_directory(relative: PurePosixPath) -> bool:
     parts = relative.parts
     if any(part in IGNORED_DIRECTORY_NAMES for part in parts):
         return True
-    if len(parts) >= 2 and parts[:2] == ("rust", "target"):
+    if len(parts) >= 2 and parts[:2] in (("rust", "target"), ("peerswarm", "target")):
         return True
     return len(parts) >= 2 and parts[0] == "native" and parts[1].startswith(
         "build"

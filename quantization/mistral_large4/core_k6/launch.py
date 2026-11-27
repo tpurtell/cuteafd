@@ -137,7 +137,7 @@ def main():
         numerical=[python,str(here/'container.py'),'--name',container,'--',
                    str(here/('pilot.py' if args.pilot else 'run.py')),*common]
         guarded=[python,str(REPO/'quantization/kimi_k3/core_k6/run_guard.py'),'--container',container,'--',*numerical]
-        command=[python,str(REPO/'scripts/hw/hwlock.py'),'--locks','gpu1','--wait','21600',
+        command=[str(REPO/'peerswarm/target/release/peerswarm'),'--root',str(REPO),'resource','exec','--locks','gpu1','--wait','21600',
                  '--preflight',shlex.join(admission),'--preflight-timeout','600','--',
                  'timeout','--foreground','--signal=TERM','--kill-after=120','1h' if args.pilot else '30d',*guarded]
     environment={key:os.environ[key] for key in ('PATH','HOME','USER','LOGNAME','LANG','LC_ALL','HF_HOME') if key in os.environ}

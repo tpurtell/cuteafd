@@ -165,6 +165,8 @@ tar \
   --exclude=.cuteafd-release \
   --exclude=.cuteafd-release-image \
   --exclude=.cuteafd-wip \
+  --exclude=peerswarm.state \
+  --exclude=peerswarm/target \
   --exclude=dist \
   --exclude=rust/target \
   --exclude='native/build*' \

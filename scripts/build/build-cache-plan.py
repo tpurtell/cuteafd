@@ -49,8 +49,15 @@ def main() -> int:
         parser.error("toolchain must be a hexadecimal hash")
     enabled = os.environ.get("CUTEAFD_BUILD_CACHES", "on") != "off"
     print(f"build caches: {'on' if enabled else 'off (cold per-build inputs, plain compilers)'}", file=sys.stderr)
-    home = Path.home()
-    root = home / ".cache/cuteafd"
+    home = Path.home().resolve()
+    repo = Path(__file__).resolve().parents[2].resolve()
+    env_cache = os.environ.get("CUTEAFD_CACHE_ROOT") or os.environ.get("PEERSWARM_CACHES")
+    if env_cache:
+        root = Path(env_cache).expanduser()
+    elif (repo / "peerswarm.toml").is_file() and repo.is_relative_to(home):
+        root = repo / "peerswarm.state" / "caches"
+    else:
+        root = home / ".cache/cuteafd"
     fallback = Path(args.build_root) / "cache"
     if not enabled:
         fallback /= f"cold-{os.getpid()}"

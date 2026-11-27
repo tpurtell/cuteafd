@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import signal
 import socket
 import subprocess
@@ -393,10 +394,20 @@ def execute(record):
             raise RuntimeError("owned container remains after cleanup")
 
 
+def _peerswarm_bin():
+    env_bin = os.environ.get("PEERSWARM_BIN")
+    if env_bin and os.access(env_bin, os.X_OK):
+        return env_bin
+    candidate = REPO / "peerswarm" / "target" / "release" / "peerswarm"
+    if candidate.is_file() and os.access(candidate, os.X_OK):
+        return str(candidate)
+    return shutil.which("peerswarm") or str(candidate)
+
+
 def seed_lease_command(record, directory):
-    return [sys.executable, str(REPO / "scripts/build/build-resource.py"),
-            "--host", record["host"], "--lease-dir", str(directory),
-            "--owner", str(os.getpid()), "--wait", str(WAIT_SECONDS),
+    return [_peerswarm_bin(), "--root", str(REPO), "resource", "hold",
+            "--locks", record["host"], "--ready-file", str(directory / "granted"),
+            "--owner", f"quant-{os.getpid()}", "--wait", str(WAIT_SECONDS),
             "--container", record["container"]]
 
 
@@ -425,8 +436,6 @@ def stop_owned_remote(record):
 def supervise_seed(path, record, check, execute_command, log):
     directory = path.with_suffix(".lease")
     directory.mkdir()
-    os.mkfifo(directory / "release", 0o600)
-    release = os.open(directory / "release", os.O_RDWR | os.O_NONBLOCK)
     process = subprocess.Popen(seed_lease_command(record, directory), stdout=log, stderr=subprocess.STDOUT)
     # Signal handlers keep teardown ordered even while waiting for a counting slot.
     def cancelled(signum, _frame):
@@ -436,7 +445,8 @@ def supervise_seed(path, record, check, execute_command, log):
     active = False
     try:
         grant = wait_lease_marker(process, directory, "granted", WAIT_SECONDS + 60)
-        if grant["host"] != record["host"]:
+        granted_host = grant.get("host") or (grant.get("resources") or [None])[0]
+        if granted_host != record["host"]:
             raise ValueError("seed lease granted the wrong host")
         # Long-running encodes share LAN seeds with WIP builds, not their export turn.
         subprocess.run(check, check=True, timeout=900, stdout=log, stderr=subprocess.STDOUT)
@@ -456,10 +466,9 @@ def supervise_seed(path, record, check, execute_command, log):
             if active:
                 stop_owned_remote(record)
                 (directory / "active").unlink(missing_ok=True)
-            os.write(release, b"1")
+            process.terminate()
             process.wait(timeout=90)
         finally:
-            os.close(release)
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
 
@@ -473,9 +482,11 @@ def supervise(path):
             if record["host"] in SEEDS:
                 code = supervise_seed(path, record, check, execute_command, log)
             else:
-                command = [sys.executable, str(REPO / "scripts/hw/hwlock.py"), "--locks", locks_for(record["host"]),
+                command = [_peerswarm_bin(), "--root", str(REPO), "resource", "exec",
+                           "--locks", locks_for(record["host"]),
                            "--wait", str(WAIT_SECONDS), "--preflight", shlex.join(check),
-                           "--preflight-timeout", "900", "--", *execute_command]
+                           "--preflight-timeout", "900", "--owner", "quant-supervise",
+                           "--", *execute_command]
                 code = forwarding(command, stdout=log, stderr=subprocess.STDOUT)
     except BaseException as error:
         atomic_json(path.with_suffix(".exit.json"), dict(returncode=1, error=repr(error),

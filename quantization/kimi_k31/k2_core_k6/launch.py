@@ -19,15 +19,7 @@ from kimi_k31.k2_core_k6.container import RUNTIME
 
 
 def stage_lock_helper():
-    source = (REPO / 'scripts/hw/hwlock.py').read_bytes()
-    digest = hashlib.sha256(source).hexdigest()
-    path = Path.home() / '.cache/cuteafd/quantization/kimi-k31-k2-core-k6' / f'hwlock-{digest}.py'
-    setup = ('from pathlib import Path; import sys,hashlib; p=Path(sys.argv[1]); '
-             'b=sys.stdin.buffer.read(); assert hashlib.sha256(b).hexdigest()==sys.argv[2]; '
-             'p.parent.mkdir(parents=True,exist_ok=True); p.write_bytes(b)')
-    subprocess.run(ssh('raptor', ['python3', '-c', setup, path, digest]), input=source,
-                   check=True, timeout=60)
-    return str(path)
+    return str(REPO / 'peerswarm/target/release/peerswarm')
 
 
 def gpu_command(common, *, container, helper, pilot=False, qualification=None):
@@ -42,7 +34,7 @@ def gpu_command(common, *, container, helper, pilot=False, qualification=None):
     command = [str(RUNTIME), str(here / 'container.py'), '--name', container, '--', str(runner), *common]
     guarded = [str(RUNTIME), str(REPO / 'quantization/kimi_k3/core_k6/run_guard.py'),
                '--container', container, '--', *command]
-    return ssh('raptor', ['python3', helper, '--locks', 'maxq', '--wait', '21600',
+    return ssh('raptor', [helper, '--root', str(REPO), 'resource', 'exec', '--locks', 'maxq', '--wait', '21600',
         '--preflight', shlex.join(ssh('maxq', admission)), '--preflight-timeout', '900', '--',
         'timeout', '--foreground', '--signal=TERM', '--kill-after=90',
         '25m' if pilot else '30d', *ssh('maxq', guarded)])

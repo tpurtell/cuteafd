@@ -185,7 +185,7 @@ def _load(name, path):
     return module
 
 
-hwlock = _load('hwlock', REPO / 'scripts/hw/hwlock.py')
+hwlock = _load('hwlock', REPO / 'scripts/hw/peerswarm_resource.py')
 cards = _load('wip_cards', REPO / 'scripts/bench/wip-cards.py')
 
 

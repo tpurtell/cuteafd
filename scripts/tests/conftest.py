@@ -68,6 +68,7 @@ def isolated_lock_dir(tmp_path_factory):
     lock_dir = tmp_path_factory.mktemp("hardware-locks")
     patch = pytest.MonkeyPatch()
     patch.setenv("CUTEAFD_LOCK_DIR", str(lock_dir))
+    patch.setenv("PEERSWARM_STATE_DIR", str(lock_dir))
     for module in list(sys.modules.values()):
         source = getattr(module, "__file__", None)
         if not source or not any(hasattr(module, name) for name in LOCK_DIR_ATTRIBUTES):
@@ -200,6 +201,7 @@ def no_live_cache(tmp_path_factory):
     patch = pytest.MonkeyPatch()
     patch.setenv("HOME", str(root))
     patch.setenv("XDG_CACHE_HOME", str(root / ".cache"))
+    patch.setenv("CUTEAFD_CACHE_ROOT", str(root / ".cache/cuteafd"))
     patch.setenv("CUTEAFD_BUILD_ROOT", str(root / "builds"))
     patch.setenv("CUTEAFD_TEST_BUILD_ROOT", str(root / "builds"))
     from launcher_sandbox import SimCluster, seed_checkpoint_metadata

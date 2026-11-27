@@ -15,3 +15,6 @@
 [submodule "third_party/tool-eval-bench"]
 	path = third_party/tool-eval-bench
 	url = https://github.com/SeraphimSerapis/tool-eval-bench.git
+[submodule "peerswarm"]
+	path = peerswarm
+	url = https://github.com/tpurtell/peerswarm.git

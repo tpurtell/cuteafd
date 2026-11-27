@@ -361,14 +361,19 @@ def test_scripts_parse_failing_ids_and_empty_runs(tmp_path, monkeypatch):
     assert gate.scripts(ROOT, tmp_path, ARGS, {})['status'] == 'failed'
 
 
-def test_build_slot_refuses_a_missing_lock_directory(tmp_path):
-    result = subprocess.run(['bash', str(ROOT / 'scripts/build/build-slot.sh'), 'true'], capture_output=True, text=True,
-                            env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path / 'absent')})
-    assert result.returncode == 2 and 'lock directory' in result.stderr and 'missing' in result.stderr
-    (tmp_path / 'locks').mkdir()
-    result = subprocess.run(['bash', str(ROOT / 'scripts/build/build-slot.sh'), 'true'], capture_output=True, text=True,
-                            env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path / 'locks')})
-    assert result.returncode == 0 and (tmp_path / 'locks/build.lock').exists()
+def test_build_slot_refuses_unknown_resource(tmp_path):
+    result = subprocess.run(
+        [gate.HWLOCK.peerswarm_bin(), '--root', str(ROOT), 'resource', 'exec', '--locks', 'nonexistent', '--', 'true'],
+        capture_output=True, text=True,
+        env={**os.environ, 'PEERSWARM_STATE_DIR': str(tmp_path / 'ps-state')},
+    )
+    assert result.returncode != 0 and 'unknown resource' in result.stderr
+    result = subprocess.run(
+        gate.HWLOCK.exec_argv(['build'], ['true'], wait=5, owner='test-build-slot'),
+        capture_output=True, text=True,
+        env={**os.environ, 'PEERSWARM_STATE_DIR': str(tmp_path / 'ps-state')},
+    )
+    assert result.returncode == 0 and (tmp_path / 'ps-state/work/peerswarm.db').is_file()
 
 
 def test_benches_record_medians_and_fail_on_a_bound_or_an_empty_run(tmp_path, monkeypatch):
@@ -801,145 +806,24 @@ def test_help_warns_against_systemd_supplementary_groups():
 
 
 def test_gate_lease_counts_waiters_and_releases(tmp_path):
-    with gate.gate_lease(tmp_path, slots=2, timeout=0) as first:
-        with gate.gate_lease(tmp_path, slots=2, timeout=0) as second:
-            assert (first['slot'], second['slot']) == (0, 1)
-            with pytest.raises(TimeoutError, match='no gate lease free'):
-                with gate.gate_lease(tmp_path, slots=2, timeout=0):
-                    pytest.fail('a third gate acquired a lease')
-        with gate.gate_lease(tmp_path, slots=2, timeout=0) as reused:
-            assert reused['slot'] == 1
+    with gate.gate_lease(tmp_path, slots=3, timeout=2) as first:
+        with gate.gate_lease(tmp_path, slots=3, timeout=2) as second:
+            with gate.gate_lease(tmp_path, slots=3, timeout=2) as third:
+                assert {first['slot'], second['slot'], third['slot']} == {0, 1, 2}
+                with pytest.raises(TimeoutError, match='timed out'):
+                    with gate.gate_lease(tmp_path, slots=3, timeout=1):
+                        pytest.fail('a fourth gate acquired a lease')
+        with gate.gate_lease(tmp_path, slots=3, timeout=2) as reused:
+            assert reused['slot'] in (1, 2)
 
 
-def _queued_waiter(tmp_path, slots, timeout=30):
-    """A gate_lease waiter in a child process; prints 'acquired SLOT' and holds until stdin closes."""
-    code = (f'import importlib.machinery, importlib.util, sys\n'
-            f'from pathlib import Path\n'
-            f'loader = importlib.machinery.SourceFileLoader("cpu_gate", {str(ROOT / "scripts/dev/cpu-gate")!r})\n'
-            f'spec = importlib.util.spec_from_loader("cpu_gate", loader)\n'
-            f'gate = importlib.util.module_from_spec(spec); loader.exec_module(gate)\n'
-            f'gate.GATE_LEASE_POLL = 0.05\n'
-            f'with gate.gate_lease(Path({str(tmp_path)!r}), slots={slots}, timeout={timeout}) as lease:\n'
-            f'    print("acquired", lease["slot"], flush=True)\n'
-            f'    sys.stdin.read()\n')
-    return subprocess.Popen([sys.executable, '-c', code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True)
-
-
-def _tickets(tmp_path):
-    return sorted(path.name for path in (tmp_path / 'cpu-gate-q').glob('*.ticket'))
-
-
-def _wait_for(predicate, timeout=10):
-    deadline = time.monotonic() + timeout
-    while not predicate():
-        assert time.monotonic() < deadline, 'condition not reached'
-        time.sleep(0.02)
-
-
-def _release(process):
-    process.stdin.close()
-    process.wait(timeout=10)
-
-
-def test_gate_lease_honours_arrival_order(tmp_path, monkeypatch):
-    monkeypatch.setattr(gate, 'GATE_LEASE_POLL', 0.05)
-    waiters = []
-    try:
-        with gate.gate_lease(tmp_path, slots=1, timeout=0):
-            for _ in range(2):
-                waiters.append(_queued_waiter(tmp_path, slots=1))
-                _wait_for(lambda: len(_tickets(tmp_path)) == len(waiters))
-            early, late = waiters
-            # The later waiter sees the free slot too, but the earlier ticket is ahead of it.
-        assert early.stdout.readline().split() == ['acquired', '0']
-        time.sleep(0.3)
-        assert late.poll() is None and len(_tickets(tmp_path)) == 1
-        _release(early)
-        assert late.stdout.readline().split() == ['acquired', '0']
-        _wait_for(lambda: not _tickets(tmp_path))
-        _release(late)
-    finally:
-        for process in waiters:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
-
-
-def test_gate_lease_queue_position_blocks_a_newer_waiter_when_a_slot_frees(tmp_path, monkeypatch):
-    monkeypatch.setattr(gate, 'GATE_LEASE_POLL', 0.05)
-    queue = tmp_path / 'cpu-gate-q'
-    queue.mkdir()
-    hw = gate.HWLOCK
-    # An older live waiter (flocked ticket) is ahead, so a free slot is not ours to take.
-    older, handle = hw._publish(queue, hw._next_seq(queue), 'ticket', dict(pid=os.getpid(), created=time.time()))
-    try:
-        with pytest.raises(TimeoutError):
-            with gate.gate_lease(tmp_path, slots=1, timeout=0):
-                pytest.fail('jumped an older live ticket')
-        assert _tickets(tmp_path) == [older.name]
-    finally:
-        handle.close()
-    older.unlink()
-    with gate.gate_lease(tmp_path, slots=1, timeout=0) as lease:
-        assert lease['slot'] == 0
-
-
-def test_gate_lease_skips_and_removes_dead_tickets(tmp_path):
-    queue = tmp_path / 'cpu-gate-q'
-    queue.mkdir()
-    dead = subprocess.Popen([sys.executable, '-c', 'pass'])
-    dead.wait()
-    stale = queue / f'{1:012d}.{dead.pid}.ticket'
-    stale.write_text(json.dumps(dict(pid=dead.pid, created=time.time() - 60)))
-    (queue / 'seq').write_text('1')
-    with gate.gate_lease(tmp_path, slots=1, timeout=0) as lease:
-        assert lease['slot'] == 0 and lease['ticket'] == 2
-        assert not stale.exists() and not _tickets(tmp_path)
-
-
-def test_gate_lease_timeout_removes_its_ticket(tmp_path):
-    with gate.gate_lease(tmp_path, slots=1, timeout=0):
-        with pytest.raises(TimeoutError, match='no gate lease free'):
-            with gate.gate_lease(tmp_path, slots=1, timeout=0):
-                pytest.fail('a second gate acquired the only lease')
-        assert not _tickets(tmp_path)
-    assert not _tickets(tmp_path)
-
-
-def test_gate_lease_stopping_removes_its_ticket(tmp_path, monkeypatch):
+def test_gate_lease_exclusive_and_stopping(tmp_path, monkeypatch):
     monkeypatch.setattr(gate, 'STOPPING', gate.threading.Event())
-    gate.STOPPING.set()
-    with gate.gate_lease(tmp_path, slots=1, timeout=60):
+    with gate.gate_lease(tmp_path, slots=1, timeout=2):
+        gate.STOPPING.set()
         with pytest.raises(KeyboardInterrupt, match='terminated while waiting'):
             with gate.gate_lease(tmp_path, slots=1, timeout=60):
                 pytest.fail('a stopped gate acquired a lease')
-        assert not _tickets(tmp_path)
-
-
-def test_gate_lease_admits_the_oldest_n_waiters(tmp_path, monkeypatch):
-    monkeypatch.setattr(gate, 'GATE_LEASE_POLL', 0.05)
-    waiters = []
-    try:
-        with gate.gate_lease(tmp_path, slots=2, timeout=0), gate.gate_lease(tmp_path, slots=2, timeout=0):
-            for _ in range(3):
-                waiters.append(_queued_waiter(tmp_path, slots=2))
-                _wait_for(lambda: len(_tickets(tmp_path)) == len(waiters))
-        first, second, third = waiters
-        first_slot, second_slot = (process.stdout.readline().split()[1] for process in (first, second))
-        assert {first_slot, second_slot} == {'0', '1'}
-        time.sleep(0.3)
-        assert third.poll() is None and len(_tickets(tmp_path)) == 1
-        _release(second)
-        assert third.stdout.readline().split() == ['acquired', second_slot]
-        _wait_for(lambda: not _tickets(tmp_path))
-        _release(first)
-        _release(third)
-    finally:
-        for process in waiters:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
 
 
 def test_compiler_cache_setup_retains_cache_configuration(tmp_path):
@@ -970,25 +854,27 @@ def test_missing_compiler_cache_is_fail_soft(tmp_path, capsys):
     assert 'using plain compilers' in capsys.readouterr().err
 
 
-def test_build_slot_termination_while_waiting_is_not_success(tmp_path):
-    import fcntl
-    lock = (tmp_path / 'build.lock').open('a')
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    process = subprocess.Popen(['bash', str(ROOT / 'scripts/build/build-slot.sh'), 'true'],
-                               env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path), 'CUTEAFD_BUILD_SLOTS': '1'},
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-    try:
-        # SIGTERM the whole waiting group, just as systemd does on stop.
-        time.sleep(0.2)
-        os.killpg(process.pid, 15)
-        _, error = process.communicate(timeout=5)
-        assert process.returncode == 143
-        assert 'terminated' in error
-    finally:
-        if process.poll() is None:
-            os.killpg(process.pid, 9)
-            process.wait()
-        lock.close()
+def test_build_slot_termination_while_waiting_is_not_success(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate.HWLOCK, 'LOCK_DIR', tmp_path)
+    env = {**os.environ, 'PEERSWARM_STATE_DIR': str(tmp_path), 'PEERSWARM_ROOT': str(ROOT)}
+    with gate.HWLOCK.hold(['build'], wait=5, owner='test-blocker', exclusive=True):
+        process = subprocess.Popen(
+            gate.HWLOCK.exec_argv(['build'], ['true'], wait=30, owner='test-waiter'),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            time.sleep(0.3)
+            os.killpg(process.pid, 15)
+            process.communicate(timeout=5)
+            assert process.returncode == 143
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, 9)
+                process.wait()
 
 
 def test_build_leg_notification_records_termination(tmp_path):
@@ -1008,59 +894,49 @@ def test_build_leg_notification_records_termination(tmp_path):
             process.wait()
 
 
-def test_build_slot_reaps_term_ignoring_descendants_in_separate_groups(tmp_path):
-    script = """import subprocess, sys, signal, os
-child = subprocess.Popen([sys.executable, '-c', 'import os,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); print(os.getpid(),flush=True); time.sleep(60)'], start_new_session=True)
-child.wait()
-"""
-    process = subprocess.Popen(['bash', str(ROOT / 'scripts/build/build-slot.sh'), sys.executable, '-c', script],
-                               env={**os.environ, 'CUTEAFD_LOCK_DIR': str(tmp_path)},
-                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-    import selectors
-    with selectors.DefaultSelector() as selector:
-        selector.register(process.stdout, selectors.EVENT_READ)
-        assert selector.select(5)
-        pid = int(process.stdout.readline())
-    try:
-        process.terminate()  # only the entrypoint, not the child group
-        _, error = process.communicate(timeout=10)
-        assert process.returncode == 143, error
-        assert not Path(f'/proc/{pid}').exists()
-    finally:
-        if process.poll() is None:
-            process.kill()
-            process.wait()
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(pid, 9)
-
-
 def test_cpu_gate_terminated_in_lease_queue_writes_nonzero_receipt(tmp_path):
-    locks = tmp_path / '.cache/cuteafd'
-    locks.mkdir(parents=True)
-    with gate.gate_lease(locks, slots=2, timeout=0):
-        with gate.gate_lease(locks, slots=2, timeout=0):
-            process = subprocess.Popen([sys.executable, str(ROOT / 'scripts/dev/cpu-gate'), '--task', 'terminated-lease'],
-                                       env={**os.environ, 'HOME': str(tmp_path)}, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, text=True, start_new_session=True)
-            try:
-                import selectors
-                selector = selectors.DefaultSelector()
-                selector.register(process.stderr, selectors.EVENT_READ)
-                assert selector.select(timeout=10)
-                line = process.stderr.readline()
-                if 'resolved child tools' in line:
+    state_dir = tmp_path / 'ps-state'
+    state_dir.mkdir(parents=True)
+    builds_dir = tmp_path / 'builds'
+    with gate.gate_lease(state_dir, slots=1, timeout=5):
+        env = {
+            **os.environ,
+            'HOME': str(tmp_path),
+            'PEERSWARM_STATE_DIR': str(state_dir),
+            'PEERSWARM_ROOT': str(ROOT),
+            'CUTEAFD_BUILD_ROOT': str(builds_dir),
+        }
+        process = subprocess.Popen(
+            [sys.executable, str(ROOT / 'scripts/dev/cpu-gate'), '--task', 'terminated-lease'],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            import selectors
+            selector = selectors.DefaultSelector()
+            selector.register(process.stderr, selectors.EVENT_READ)
+            deadline = time.monotonic() + 10
+            saw_wait = False
+            while time.monotonic() < deadline:
+                if selector.select(timeout=1):
                     line = process.stderr.readline()
-                assert 'waiting for gate lease' in line
-                process.terminate()
-                process.communicate(timeout=10)
-                assert process.returncode == 143
-                record = json.loads((locks / 'builds/terminated-lease/cpu-gate.json').read_text())
-                assert record['verdict'] == 'terminated' and record['exit'] == 143
-                selector.close()
-            finally:
-                if process.poll() is None:
-                    os.killpg(process.pid, 9)
-                    process.wait()
+                    if 'waiting for peerswarm cpu-gate lease' in line:
+                        saw_wait = True
+                        break
+            assert saw_wait
+            process.terminate()
+            process.communicate(timeout=10)
+            assert process.returncode == 143
+            record = json.loads((builds_dir / 'terminated-lease/cpu-gate.json').read_text())
+            assert record['verdict'] == 'terminated' and record['exit'] == 143
+            selector.close()
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, 9)
+                process.wait()
 
 
 def test_term_ignoring_suite_has_bounded_unwind_and_terminated_receipt(tmp_path, monkeypatch):

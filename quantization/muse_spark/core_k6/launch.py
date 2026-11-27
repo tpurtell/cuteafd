@@ -79,7 +79,7 @@ def main():
     admission+=['--',*common]
     numerical=[python,str(here/'container.py'),'--name',container,'--',str(here/('pilot.py' if args.pilot else 'run.py')),*common]
     guarded=[python,str(REPO/'quantization/kimi_k3/core_k6/run_guard.py'),'--container',container,'--',*numerical]
-    command=[python,str(REPO/'scripts/hw/hwlock.py'),'--locks','gpu0','--wait','21600',
+    command=[str(REPO/'peerswarm/target/release/peerswarm'),'--root',str(REPO),'resource','exec','--locks','gpu0','--wait','21600',
         '--preflight',shlex.join(admission),'--preflight-timeout','600','--',
         'timeout','--foreground','--signal=TERM','--kill-after=90','1h' if args.pilot else '30d',*guarded]
     # Publication validates CPU-side receipts/provenance directly; it never

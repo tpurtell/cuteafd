@@ -335,11 +335,11 @@ if ((dry_run)); then
   echo "  release build root: ${release_build_root:-<container /tmp>}"
   echo "  build container user: $(id -un) ($(id -u):$(id -g))"
   echo "  build container home: $(release_build_container_home "$release_build_root")"
-  echo "  build lock: $HOME/.cache/cuteafd/build.lock (waited up to ${release_build_lock_timeout}s; no hardware lock is taken)"
+  echo "  build lock: peerswarm resource build (--exclusive, waited up to ${release_build_lock_timeout}s; no hardware lock is taken)"
   echo "  AOT exports: CPU-only (CUDA_VISIBLE_DEVICES empty; no GPU or hardware lock required)"
-  cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry >/dev/null
+  cuteafd_build_cache_docker_args "${release_build_root:-$(cuteafd_cache_root)/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry >/dev/null
   echo "  Spark cache plan (host HOME shown as template; states/admission rechecked on Spark, no SSH):"
-  cuteafd_build_cache_docker_args "${release_build_root:-$HOME/.cache/cuteafd/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry aarch64 >/dev/null
+  cuteafd_build_cache_docker_args "${release_build_root:-$(cuteafd_cache_root)/builds/release-cache-fallback}" "$(release_build_container_home "$release_build_root")" "$release_toolchain_hash" dry aarch64 >/dev/null
   exit 0
 fi
 
@@ -350,6 +350,11 @@ COORDINATOR_DOCKER_INFERENCE+="-pending-$$"
 SPARK_EXPERT_DOCKER_INFERENCE+="-pending-$$"
 # Keep a single parent EXIT cleanup through export, verification and promotion.
 release_pending_cleanup() {
+  if [[ -n "${release_build_lock_pid:-}" ]]; then
+    kill "$release_build_lock_pid" 2>/dev/null || true
+    wait "$release_build_lock_pid" 2>/dev/null || true
+  fi
+  [[ -z "${release_build_lock_dir:-}" ]] || rm -rf "$release_build_lock_dir" 2>/dev/null || true
   [[ -z "${coordinator_container:-}" ]] || docker rm -f "$coordinator_container" >/dev/null 2>&1 || true
   docker image rm "$COORDINATOR_DOCKER_INFERENCE" >/dev/null 2>&1 || true
   local host
@@ -389,23 +394,23 @@ prepare_pinned_source_dependencies() {
     release_die "XGrammar DLPack source is missing; initialize third_party/xgrammar/3rdparty/dlpack"
 }
 
-release_need flock
 release_need timeout
 release_need mkfifo
 
-# One build at a time, and never a hardware lock: a build is CPU work plus
-# CPU-only AOT exports. Holding sparks.lock/gpu1.lock across a compile, crate
-# download or image assembly would block serving for no reason, so the build
-# takes ~/.cache/cuteafd/build.lock instead. It is acquired before the submodule
-# refresh so two builds cannot stage over each other's checkout, and held
-# through image assembly and distribution: the slot isolation that keeps
-# artifacts apart does not cover the shared checkout or the docker daemon.
-release_build_lock_dir="$HOME/.cache/cuteafd"
-mkdir -p "$release_build_lock_dir"
-exec 9>"$release_build_lock_dir/build.lock"
-echo "== waiting for the release build lock (${release_build_lock_timeout}s): $release_build_lock_dir/build.lock =="
-flock -w "$release_build_lock_timeout" 9 ||
-  release_die "timed out waiting for $release_build_lock_dir/build.lock; another release build is running"
+# One release build at a time via PeerSwarm's SQLite `build` resource (--exclusive),
+# never taking GPU/Spark hardware locks across compile, crate download, or image assembly.
+release_peerswarm_bin="$(peerswarm_bin)" || release_die "peerswarm binary unavailable"
+release_build_lock_dir="$(mktemp -d "${TMPDIR:-/tmp}/cuteafd-release-lock.XXXXXXXX")"
+echo "== waiting for the release build lock (${release_build_lock_timeout}s): peerswarm resource build --exclusive =="
+"$release_peerswarm_bin" --root "$(peerswarm_repo_root)" resource hold \
+  --locks build --exclusive --wait "$release_build_lock_timeout" \
+  --owner "release-build" --ready-file "$release_build_lock_dir/granted.json" &
+release_build_lock_pid=$!
+while [[ ! -s "$release_build_lock_dir/granted.json" ]]; do
+  kill -0 "$release_build_lock_pid" 2>/dev/null ||
+    release_die "timed out or failed waiting for peerswarm build lock; another build is running"
+  sleep 0.5
+done
 echo "== release build lock held ($(date -Is)) =="
 
 prepare_pinned_source_dependencies
@@ -739,6 +744,8 @@ release_sync --delete \
   --exclude '.cuteafd-release/' \
   --exclude '.cuteafd-release-image/' \
   --exclude '.cuteafd-wip/' \
+  --exclude 'peerswarm.state/' \
+  --exclude 'peerswarm/target/' \
   --exclude 'dist/' \
   --exclude 'rust/target/' \
   --exclude 'native/build*/' \

@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+if [[ -f "$(dirname "${BASH_SOURCE[0]}")/peerswarm.sh" ]]; then
+  source "$(dirname "${BASH_SOURCE[0]}")/peerswarm.sh"
+else
+  cuteafd_cache_root() { printf '%s\n' "${CUTEAFD_CACHE_ROOT:-$HOME/.cache/cuteafd}"; }
+fi
+
 RELEASE_COORDINATOR_CONTAINER_NAME=cuteafd-coordinator
 RELEASE_SPARK_CONTAINER_PREFIX=cuteafd-spark-expert
 
@@ -218,10 +224,17 @@ release_validate_wip_instance() {
 release_validate_wip_root() {
   [[ -n "${WIP_ROOT:-}" ]] || return 0
   release_validate_path_setting WIP_ROOT "$WIP_ROOT"
-  local parent="$HOME/.cache/cuteafd/builds"
-  [[ "$WIP_ROOT" == "$parent/"* ]] || release_die "WIP_ROOT must be under $parent/"
-  [[ "$(realpath -m "$WIP_ROOT")" == "$(realpath -m "$parent")/"* ]] ||
-    release_die "WIP_ROOT resolves outside $parent/"
+  local parent legacy_parent resolved
+  parent="$(cuteafd_cache_root)/builds"
+  legacy_parent="$HOME/.cache/cuteafd/builds"
+  resolved="$(realpath -m "$WIP_ROOT")"
+  if [[ "$WIP_ROOT" == "$parent/"* && "$resolved" == "$(realpath -m "$parent")/"* ]]; then
+    return 0
+  fi
+  if [[ "$WIP_ROOT" == "$legacy_parent/"* && "$resolved" == "$(realpath -m "$legacy_parent")/"* ]]; then
+    return 0
+  fi
+  release_die "WIP_ROOT must be under $parent/ (or $legacy_parent/)"
 }
 
 release_wip_container() {
@@ -2249,7 +2262,7 @@ REMOTE
 # A sealed slot is files under the WIP root (the persistent container only bind-mounts
 # it at /wip), so staging reads the root directly when the builder container is gone.
 release_wip_host_root() {
-  printf '%s' "${WIP_ROOT:-$HOME/.cache/cuteafd/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
+  printf '%s' "${WIP_ROOT:-$(cuteafd_cache_root)/builds/wip${WIP_INSTANCE:+-$WIP_INSTANCE}}"
 }
 
 # release_wip_cp CONTAINER HOST_ROOT PATH_UNDER_/wip DEST: docker cp while the builder

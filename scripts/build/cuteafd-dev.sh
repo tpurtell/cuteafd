@@ -75,23 +75,18 @@ docker_args+=(
   -e "CARGO_HOME=$container_home/cargo"
 )
 
-# Host build slots (scripts/build/build-slot.sh) exclude through these lock
-# files; mount them at the same path so a compile inside takes the real slot.
-# Only the slot files are shared (created first, so the container never makes
-# a private copy); the hardware locks and the fair queue stay host-only.
-lock_dir="$HOME/.cache/cuteafd"
-mkdir -p "$lock_dir"
-# The slot files live in a private, writable directory at the same path inside
-# (a bind-mounted file under an unmounted parent is not writable for flock's
-# open in a uid container); each slot file is the host's real lock inode.
-container_lock_dir="/tmp/cuteafd-build-locks"
-docker_args+=(-e "CUTEAFD_LOCK_DIR=$container_lock_dir" --tmpfs "$container_lock_dir:mode=1777")
-for ((slot = 0; slot < ${CUTEAFD_BUILD_SLOTS:-5}; slot++)); do
-  slot_name="build.lock"
-  ((slot == 0)) || slot_name="build.lock.$slot"
-  touch "$lock_dir/$slot_name"
-  docker_args+=(-v "$lock_dir/$slot_name:$container_lock_dir/$slot_name")
-done
+source "$repo_root/scripts/lib/peerswarm.sh"
+cache_root="$(cuteafd_cache_root)"
+ps_root="$(peerswarm_repo_root)"
+# Mount peerswarm.state/work when present so container commands share PeerSwarm's
+# SQLite resource/build-slot scheduler instead of legacy flock files.
+if [[ -d "$ps_root/peerswarm.state/work" ]]; then
+  docker_args+=(
+    -e "PEERSWARM_ROOT=$ps_root"
+    -e "CUTEAFD_CACHE_ROOT=$cache_root"
+    --mount "type=bind,src=$ps_root/peerswarm.state/work,dst=$ps_root/peerswarm.state/work"
+  )
+fi
 if [[ -n "${CUTEAFD_DEV_TARGET_DIR:-}" ]]; then
   python3 "$repo_root/scripts/build/assert-build-filesystem.py" "$CUTEAFD_DEV_TARGET_DIR"
   mkdir -p "$CUTEAFD_DEV_TARGET_DIR"
@@ -137,7 +132,7 @@ source "$repo_root/scripts/build/build-caches.sh"
 export CUTEAFD_KACHE="${CUTEAFD_KACHE-}" CUTEAFD_SCCACHE_CUDA="${CUTEAFD_SCCACHE_CUDA-0}"
 cuteafd_build_cache_defaults
 compiler_cache_args=()
-cache_plan="$(cuteafd_build_cache_docker_args "${CUTEAFD_DEV_TARGET_DIR:-$HOME/.cache/cuteafd/builds/dev-cache-fallback}" "$container_home" "$(python3 "$repo_root/scripts/build/dev-toolchain.py")")" || exit 2
+cache_plan="$(cuteafd_build_cache_docker_args "${CUTEAFD_DEV_TARGET_DIR:-$cache_root/builds/dev-cache-fallback}" "$container_home" "$(python3 "$repo_root/scripts/build/dev-toolchain.py")")" || exit 2
 mapfile -t compiler_cache_args <<<"$cache_plan"
 docker_args+=("${compiler_cache_args[@]}")
 

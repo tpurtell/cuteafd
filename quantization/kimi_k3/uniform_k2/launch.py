@@ -77,7 +77,7 @@ def main():
     # a direct flock that would overtake older gpu1 tickets (#2596). The read-only
     # plan admission runs once the lock is granted, before the quantizer starts.
     admission = shlex.join([*command, "--plan-only"])
-    command = [command[0], str(REPO / "scripts/hw/hwlock.py"), "--locks", "gpu1", "--wait", "60",
+    command = [str(REPO / "peerswarm/target/release/peerswarm"), "--root", str(REPO), "resource", "exec", "--locks", "gpu1", "--wait", "60",
                "--preflight", admission, "--preflight-at-grant", "--preflight-timeout", "300", "--",
                "timeout", "--foreground", "--signal=TERM", "30d", *command]
     # Persist only execution settings; credentials stay in the existing HF

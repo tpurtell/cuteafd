@@ -1699,10 +1699,24 @@ def test_raptor_default_gpus_unchanged(env, capsys):
 
 
 def test_sm121_lock_wait_expiry_runs_nothing(sm121_env, capsys):
-    with open(sm121_env['locks'] / 'kakapo.lock', 'a') as held:
-        fcntl.flock(held, fcntl.LOCK_EX)
-        assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', '--wait', '0.5', '--', 'true']) == 75
-    assert 'no turn for kakapo' in capsys.readouterr().err
+    import time
+    ready = sm121_env['locks'] / 'blocker.json'
+    blocker = subprocess.Popen(
+        [golden.hwlock.peerswarm_bin(), '--root', str(ROOT), 'resource', 'hold',
+         '--locks', 'kakapo', '--exclusive', '--wait', '10', '--owner', 'test-blocker',
+         '--ready-file', str(ready)],
+        env={**os.environ, 'PEERSWARM_STATE_DIR': str(sm121_env['locks']), 'PEERSWARM_ROOT': str(ROOT)},
+    )
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.is_file():
+            assert time.monotonic() < deadline and blocker.poll() is None
+            time.sleep(0.05)
+        assert golden.main(SM121_BASE + ['--sm121-host', 'kakapo', '--command', '--wait', '1', '--', 'true']) == 75
+    finally:
+        blocker.terminate()
+        blocker.wait(timeout=10)
+    assert 'kakapo' in capsys.readouterr().err
     assert sm121_run(sm121_env) == (None, None)
 
 

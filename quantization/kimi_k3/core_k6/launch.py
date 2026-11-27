@@ -90,7 +90,7 @@ def main():
     # on every exit; uploading starts only after this wrapper releases it.
     guarded = [python, str(Path(__file__).with_name("run_guard.py")),
         "--container", container, "--", *gpu_command]
-    command = [python, str(REPO / "scripts/hw/hwlock.py"), "--locks", "gpu1", "--wait", "60",
+    command = [str(REPO / "peerswarm/target/release/peerswarm"), "--root", str(REPO), "resource", "exec", "--locks", "gpu1", "--wait", "60",
         "--preflight", preflight, "--preflight-timeout", "300", "--",
         "timeout", "--foreground", "--signal=TERM", "--kill-after=120", "30d", *guarded]
     environment = {key: os.environ[key] for key in

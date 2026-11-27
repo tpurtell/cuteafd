@@ -873,9 +873,9 @@ fn check_nested_holds(entries: &[Entry]) -> Result<()> {
     let missing = uncovered_locks(entries, &held);
     if !missing.is_empty() {
         let wanted: Vec<&str> = run_locks(entries).iter().map(|lock| lock.trim_end_matches(".lock")).collect();
-        bail!("nested hwlock: this run needs {missing:?} beyond CUTEAFD_HW_LOCKS_HELD={}; \
+        bail!("nested resource lock: this run needs {missing:?} beyond CUTEAFD_HW_LOCKS_HELD={}; \
                an inner ticket cannot be granted while the outer hold waits; \
-               rerun under `hwlock.py --locks {}`", held.join(","), wanted.join(","));
+               rerun under `peerswarm resource exec --locks {} -- ...`", held.join(","), wanted.join(","));
     }
     Ok(())
 }
@@ -889,46 +889,125 @@ fn disjoint(a: &Entry, b: &Entry, base: &HashMap<String, String>) -> bool {
     !ga.iter().any(|g| gb.contains(g)) && !sa.iter().any(|s| sb.contains(s))
 }
 
-/// Lock files this process holds, with how many running entries need each.
+/// Locate the PeerSwarm binary & repo root when running inside a PeerSwarm-configured checkout.
+fn discover_peerswarm() -> Option<(PathBuf, PathBuf)> {
+    let start = std::env::var_os("PEERSWARM_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())?;
+    let mut cur = start.as_path();
+    let repo_root = loop {
+        if cur.join("peerswarm.toml").is_file() {
+            break cur.to_path_buf();
+        }
+        cur = cur.parent()?;
+    };
+    let bin = std::env::var_os("PEERSWARM_BIN")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| {
+            let local = repo_root.join("peerswarm/target/release/peerswarm");
+            local.is_file().then_some(local)
+        })
+        .or_else(|| {
+            Command::new("which").arg("peerswarm").output().ok()
+                .filter(|o| o.status.success())
+                .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+                .filter(|p| p.is_file())
+        })?;
+    Some((bin, repo_root))
+}
+
+/// Resource leases this process holds, backed by PeerSwarm SQLite holds when
+/// available (falling back to flock files in isolated containers/tests).
 #[derive(Default)]
 struct Locks {
     held: HashMap<&'static str, (File, usize)>,
+    ps_holders: HashMap<&'static str, (std::process::Child, PathBuf, usize)>,
+}
+
+impl Drop for Locks {
+    fn drop(&mut self) {
+        for (_, (mut child, ready_dir, _)) in self.ps_holders.drain() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_dir_all(ready_dir);
+        }
+    }
 }
 
 impl Locks {
-    /// Takes `names`, waiting in line like every other agent (flock), when
-    /// nothing of ours runs; with entries running, only what is free now.
+    /// Takes `names`, waiting in line via PeerSwarm's SQLite FIFO queue when
+    /// available (or flock fallback), when nothing of ours runs; with entries
+    /// running, only what is free now.
     fn take(&mut self, names: &[&'static str], wait: bool, cancelled: &dyn Fn() -> Option<i32>) -> Result<bool> {
         if !wait {
             return self.try_take(names);
         }
-        let dir = expand("~/.cache/cuteafd");
-        std::fs::create_dir_all(&dir)?;
         let mut ordered: Vec<&'static str> = names.to_vec();
         ordered.sort_by_key(|n| match *n {
             "sparks.lock" => 0, "gpu0.lock" => 1, "gpu1.lock" => 2,
             "rhea.lock" => 3, "moa.lock" => 4, _ => 5,
         });
-        // A deep shared queue holds the pool for hours, and a fair-queue ticket holds no
-        // lock while it waits: default to the same 6 h bound as golden-run and hwlock.py.
-        // CUTEAFD_SMOKE_LOCK_WAIT_S, then CUTEAFD_HW_LOCK_WAIT_S, override it.
-        let wait = ["CUTEAFD_SMOKE_LOCK_WAIT_S", "CUTEAFD_HW_LOCK_WAIT_S"].iter()
-            .find_map(|k| std::env::var(k).ok().and_then(|s| s.parse().ok())).unwrap_or(21600);
-        let deadline = Instant::now() + Duration::from_secs(wait);
-        // A parent `hwlock.py` already holding a lock for us names it here; taking it
-        // again would deadlock on our own parent.
-        let parent: Vec<String> = std::env::var("CUTEAFD_HW_LOCKS_HELD").unwrap_or_default()
+        let wait_secs = ["CUTEAFD_SMOKE_LOCK_WAIT_S", "CUTEAFD_HW_LOCK_WAIT_S"].iter()
+            .find_map(|k| std::env::var(k).ok().and_then(|s| s.parse().ok())).unwrap_or(21600u64);
+        let parent: Vec<String> = std::env::var("CUTEAFD_HW_LOCKS_HELD")
+            .or_else(|_| std::env::var("PEERSWARM_LOCKS_HELD"))
+            .unwrap_or_default()
             .split(',').filter(|s| !s.is_empty()).map(|s| format!("{}.lock", s.trim_end_matches(".lock"))).collect();
         let wanted: Vec<&'static str> = ordered.iter().copied()
-            .filter(|n| !self.held.contains_key(n) && !parent.iter().any(|p| p == n)).collect();
+            .filter(|n| !self.held.contains_key(n) && !self.ps_holders.contains_key(n) && !parent.iter().any(|p| p == n))
+            .collect();
         if wanted.is_empty() {
+            for name in names {
+                if let Some((_, count)) = self.held.get_mut(name) { *count += 1; }
+                if let Some((_, _, count)) = self.ps_holders.get_mut(name) { *count += 1; }
+            }
             return Ok(true);
         }
-        // Fair turn order shared with scripts/hw/hwlock.py: a waiter takes its
-        // locks only when no older live ticket wants any of them. Inside an
-        // `hwlock.py --gate`, the gate already won this job's turn: a new,
-        // younger ticket would queue behind jobs that themselves wait on the
-        // gate (a deadlock), so a gated child only waits for the flocks.
+        if let Some((ps_bin, ps_root)) = discover_peerswarm() {
+            let lock_csv: String = wanted.iter().map(|n| n.trim_end_matches(".lock")).collect::<Vec<_>>().join(",");
+            let ready_dir = std::env::temp_dir().join(format!("cuteafd-smoke-lock-{}-{}", std::process::id(), Instant::now().elapsed().as_nanos()));
+            std::fs::create_dir_all(&ready_dir)?;
+            let ready_file = ready_dir.join("granted.json");
+            let mut child = Command::new(&ps_bin)
+                .args(["--root", &ps_root.display().to_string(), "resource", "hold",
+                       "--locks", &lock_csv, "--wait", &wait_secs.to_string(),
+                       "--owner", "cuteafd-bench-smoke",
+                       "--ready-file", &ready_file.display().to_string()])
+                .spawn()
+                .with_context(|| format!("spawning {} resource hold", ps_bin.display()))?;
+            let deadline = Instant::now() + Duration::from_secs(wait_secs + 5);
+            loop {
+                if ready_file.is_file() {
+                    break;
+                }
+                if let Some(sig) = cancelled() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_dir_all(&ready_dir);
+                    return Err(Cancelled(sig).into());
+                }
+                if let Some(status) = child.try_wait()? {
+                    let _ = std::fs::remove_dir_all(&ready_dir);
+                    bail!("peerswarm resource hold for {lock_csv} exited early ({status})");
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_dir_all(&ready_dir);
+                    bail!("timed out after {wait_secs} s waiting for peerswarm locks {lock_csv}");
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            // Anchor the child handle on the first lock name; remaining locks share its lifetime.
+            if let Some(&first) = wanted.first() {
+                self.ps_holders.insert(first, (child, ready_dir, names.len()));
+            }
+            return Ok(true);
+        }
+        let dir = expand("~/.cache/cuteafd");
+        std::fs::create_dir_all(&dir)?;
+        let deadline = Instant::now() + Duration::from_secs(wait_secs);
         let ticket = if fair::inside_gate(&dir) { None } else { Some(fair::Ticket::take(&dir, &wanted)?) };
         loop {
             if !ticket.as_ref().map_or(Ok(false), |t| t.older_conflict())? {
@@ -952,7 +1031,7 @@ impl Locks {
                 return Err(Cancelled(signal).into());
             }
             if Instant::now() >= deadline {
-                bail!("timed out after {wait} s waiting for a fair turn on {}", wanted.join(","));
+                bail!("timed out after {wait_secs} s waiting for a fair turn on {}", wanted.join(","));
             }
             std::thread::sleep(Duration::from_secs(2));
         }
@@ -1012,6 +1091,20 @@ impl Locks {
             if drop_it {
                 if let Some((file, _)) = self.held.remove(name) {
                     let _ = file.unlock();
+                }
+            }
+            let drop_ps = match self.ps_holders.get_mut(name) {
+                Some((_, _, count)) => {
+                    *count = count.saturating_sub(1);
+                    *count == 0
+                }
+                None => false,
+            };
+            if drop_ps {
+                if let Some((mut child, ready_dir, _)) = self.ps_holders.remove(name) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_dir_all(ready_dir);
                 }
             }
         }
