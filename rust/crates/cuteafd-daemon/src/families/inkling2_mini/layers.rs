@@ -895,7 +895,6 @@ pub(crate) fn begin_visit<'a>(
                 tables,
                 table_indices: b("table_indices")?,
                 first: b("first")?,
-                splits: 1,
             },
             owner.stream().raw,
         )?;
