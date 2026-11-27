@@ -4,11 +4,12 @@ use crate::shared::decode_graph::sites::{Scope, Table};
 pub(super) const SITES: &Table = &[(
     "hy4.section",
     Scope::Local,
-    "execution.rs: rank-local decode sections (including ContextSplit DsaPartial and \
-     DsaAttnOut combine+gate_uv+o_proj) captured on each rank's exclusive stream; \
-     DSA index_topk/scored_index_topk/dsa_candidate_merge, TP2 PeerExchange & \
-     ContextExchange push/wait, Spark waves send/land/reduce, and TP2 head_handoff \
-     stay outside capture",
+    "execution.rs: rank-local decode sections (including TP1 Spark-routed DsaSpark \
+     with bucketed index_topk_decode, Tail, and ContextSplit DsaPartial / DsaAttnOut \
+     combine+gate_uv+o_proj) captured on each rank's exclusive stream; TP2/local \
+     index_topk, ContextSplit scored_index_topk/dsa_candidate_merge, TP2 PeerExchange \
+     & ContextExchange push/wait, Spark waves send/land/reduce and TP1 shared_ffn \
+     overlap, and TP2 head_handoff stay outside capture",
 )];
 
 pub(super) fn spans(name: &str, declared: bool) -> bool {

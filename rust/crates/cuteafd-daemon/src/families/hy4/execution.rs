@@ -59,6 +59,7 @@ use cuteafd_loader::formats::trellis_core::ProjectionScratchLayout;
 use cuteafd_loader::placement::families::hy4::DECODE_ROWS;
 use cuteafd_loader::placement::AttentionPlacement;
 use cuteafd_loader::plan::checkpoint::Checkpoint;
+use cuteafd_loader::serving_capacity::decode_graph_key::decode_page_stride;
 use cuteafd_loader::serving_capacity::WeightArenaLayout;
 use cuteafd_transport::{
     expert::EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16, ExpertProtocolV2Request,
@@ -1558,6 +1559,7 @@ struct ActiveBatch {
     graphed: bool,
     can_defer_ffn: bool,
     ffn_fused_layer: Option<usize>,
+    router_fused_layer: Option<usize>,
     post_attn_deferred: bool,
     reduce_attn_pending: bool,
     prev_ffn_deferred: Option<DeferredFfn>,
@@ -1581,6 +1583,7 @@ pub(crate) struct Hy4Engine<'a> {
     pub(crate) max_context: usize,
     pub(crate) skip_routed_experts: bool,
     pub(crate) dump_dir: Option<std::path::PathBuf>,
+    max_seq_pages: usize,
     context_split: bool,
     admitted_pages: usize,
     graphs_enabled: Cell<bool>,
@@ -1916,6 +1919,7 @@ impl<'a> Hy4Engine<'a> {
             max_context,
             skip_routed_experts,
             dump_dir: None,
+            max_seq_pages: max_seq_pages.max(16),
             context_split,
             admitted_pages: index_topk.admitted_pages,
             graphs_enabled: Cell::new(false),
@@ -2645,7 +2649,20 @@ impl<'a> Hy4Engine<'a> {
             row_cursor += n;
         }
 
-        let pt_stride = max_seq_end.div_ceil(PAGE_ROWS).max(1);
+        let graphed = priority == ReadPriority::Decode
+            && wave_slot == 0
+            && rows <= self.decode_rows
+            && single_wave
+            && self.graphs_active()
+            && !self.skip_routed_experts
+            && self.dump_dir.is_none();
+
+        let needed_pages = max_seq_end.div_ceil(PAGE_ROWS).max(1);
+        let pt_stride = if graphed && !self.context_split {
+            decode_page_stride(needed_pages, self.max_pages, self.max_seq_pages)
+        } else {
+            needed_pages
+        };
         let ctx_pt_stride = if self.context_split {
             pt_stride.div_ceil(2).max(1)
         } else {
@@ -2797,14 +2814,6 @@ impl<'a> Hy4Engine<'a> {
             exchange.wait(1, DIRECT)?;
         }
 
-        let graphed = priority == ReadPriority::Decode
-            && wave_slot == 0
-            && rows <= self.decode_rows
-            && single_wave
-            && self.graphs_active()
-            && !self.skip_routed_experts
-            && self.dump_dir.is_none();
-
         let dump_rows = if self.dump_dir.is_some()
             && members.len() == 1
             && (members[0].pos_start == 0 || priority == ReadPriority::Decode)
@@ -2844,6 +2853,7 @@ impl<'a> Hy4Engine<'a> {
             graphed,
             can_defer_ffn,
             ffn_fused_layer: None,
+            router_fused_layer: None,
             post_attn_deferred: false,
             reduce_attn_pending: false,
             prev_ffn_deferred: None,
@@ -3150,11 +3160,7 @@ impl<'a> Hy4Engine<'a> {
                 let decode_attn = batch.decode_attention;
                 if batch.graphed {
                     r.graphs.run(
-                        GraphKey {
-                            layer,
-                            rows,
-                            section: GraphSection::DsaPartial,
-                        },
+                        GraphKey::new(layer, rows, GraphSection::DsaPartial),
                         &r.stream,
                         || {
                             r.device.run(|| {
@@ -3212,11 +3218,7 @@ impl<'a> Hy4Engine<'a> {
                 let rl = recv_l[rank];
                 if batch.graphed {
                     r.graphs.run(
-                        GraphKey {
-                            layer,
-                            rows,
-                            section: GraphSection::DsaAttnOut,
-                        },
+                        GraphKey::new(layer, rows, GraphSection::DsaAttnOut),
                         &r.stream,
                         || {
                             r.device.run(|| {
@@ -3390,6 +3392,7 @@ impl<'a> Hy4Engine<'a> {
         let fused_prev_post = prev_ffn.map(|_| prev_use_a);
 
         if batch.graphed {
+            let has_prev_ffn = prev_ffn.is_some();
             let pre_section = if full_idx.is_some() {
                 GraphSection::DsaFullPre
             } else {
@@ -3401,7 +3404,7 @@ impl<'a> Hy4Engine<'a> {
                 let kv_cache_buf = r.cache.dsa_kv_layer(layer)?;
                 if let Some(fidx) = full_idx {
                     r.graphs.run(
-                        GraphKey { layer, rows, section: pre_section },
+                        GraphKey::with_prev_ffn(layer, rows, pre_section, has_prev_ffn),
                         &r.stream,
                         || {
                             r.device.run(|| {
@@ -3421,7 +3424,7 @@ impl<'a> Hy4Engine<'a> {
                     Self::run_full_indexer_topk(r, fidx, batch)?;
                     self.capture_draft_recall_rank(0, layer, batch)?;
                     r.graphs.run(
-                        GraphKey { layer, rows, section: GraphSection::DsaLocalPost },
+                        GraphKey::new(layer, rows, GraphSection::DsaLocalPost),
                         &r.stream,
                         || {
                             r.device.run(|| {
@@ -3444,7 +3447,7 @@ impl<'a> Hy4Engine<'a> {
                 } else {
                     // Shared IndexCache layer: fuse entire layer into ONE graph (zero host joins!).
                     r.graphs.run(
-                        GraphKey { layer, rows, section: GraphSection::DsaLocalPost },
+                        GraphKey::with_prev_ffn(layer, rows, GraphSection::DsaLocalPost, has_prev_ffn),
                         &r.stream,
                         || {
                             r.device.run(|| {
@@ -3485,12 +3488,59 @@ impl<'a> Hy4Engine<'a> {
                 return Ok(());
             }
 
-            // Case 2: TP2 or Spark-routed layer.
+            // Case 2A: TP1 Spark-routed layer — fuse prev FFN finish + attention + bucketed full-indexer
+            // top-k (when full) + post-attn iHC + router into ONE `DsaSpark` graph segment per layer.
+            if gpus == 1 {
+                let r = &self.ranks[0];
+                let can_capture_topk = full_idx.is_none()
+                    || (decode_attention
+                        && rows <= r.programs.index_topk_decode.spec().capacity_rows as usize);
+                if can_capture_topk {
+                    let kv_cache_buf = r.cache.dsa_kv_layer(layer)?;
+                    let table_width = if full_idx.is_some() { batch.pt_stride } else { 0 };
+                    r.graphs.run(
+                        GraphKey::with_table(layer, rows, GraphSection::DsaSpark, table_width, has_prev_ffn),
+                        &r.stream,
+                        || {
+                            r.device.run(|| {
+                                if let Some(prev) = prev_ffn {
+                                    r.prepare_deferred_ffn_delta(
+                                        0, 1, prev, wave_slot, rows, skip_routed,
+                                        std::ptr::null_mut(), routed_recv_offset,
+                                    )?;
+                                }
+                                r.attn_pre(
+                                    &p, layer, full_idx, local_heads, wave_slot, rows, use_a,
+                                    fused_prev_post, kv_cache_buf,
+                                )?;
+                                if let Some(fidx) = full_idx {
+                                    Self::run_full_indexer_topk(r, fidx, batch)?;
+                                }
+                                r.dsa_attn(kv_cache_buf, wave_slot, rows, decode_attention)?;
+                                r.attn_out(&p, layer, 1, local_heads, rows)?;
+                                r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
+                                r.moe_router(&p, wave_slot, rows, routed_scale)?;
+                                r.record_expert_usage_local(
+                                    usage, count_usage, skip_routed, false, layer, usage_phase, rows,
+                                )
+                            })
+                        },
+                    )?;
+                    if full_idx.is_some() {
+                        self.capture_draft_recall_rank(0, layer, batch)?;
+                    }
+                    batch.use_a = !batch.use_a;
+                    batch.router_fused_layer = Some(layer);
+                    return Ok(());
+                }
+            }
+
+            // Case 2B: TP2 layer (or fallback when decode rows exceed index_topk_decode capacity).
             for (rank, r) in self.ranks.iter().enumerate() {
                 let kv_cache_buf = r.cache.dsa_kv_layer(layer)?;
                 let ffn_recv = ffn_recv_ptrs[rank];
                 r.graphs.run(
-                    GraphKey { layer, rows, section: pre_section },
+                    GraphKey::with_prev_ffn(layer, rows, pre_section, has_prev_ffn),
                     &r.stream,
                     || {
                         r.device.run(|| {
@@ -3520,7 +3570,7 @@ impl<'a> Hy4Engine<'a> {
                 for r in &self.ranks {
                     let kv_cache_buf = r.cache.dsa_kv_layer(layer)?;
                     r.graphs.run(
-                        GraphKey { layer, rows, section: GraphSection::DsaAttnOut },
+                        GraphKey::new(layer, rows, GraphSection::DsaAttnOut),
                         &r.stream,
                         || {
                             r.device.run(|| {
@@ -3626,6 +3676,10 @@ impl<'a> Hy4Engine<'a> {
         batch: &mut ActiveBatch,
         local_experts: bool,
     ) -> Result<()> {
+        if !local_experts && batch.router_fused_layer == Some(layer) {
+            batch.router_fused_layer = None;
+            return Ok(());
+        }
         let p = format!("model.layers.{layer}");
         let o_stem = format!("{p}.self_attn.o_proj");
         let gpus = self.ranks.len();
@@ -3649,7 +3703,7 @@ impl<'a> Hy4Engine<'a> {
             for (rank, r) in self.ranks.iter().enumerate() {
                 let recv_ptr = attn_recv[rank];
                 r.graphs.run(
-                    GraphKey { layer, rows, section: if local_experts { GraphSection::FfnFrontend } else { GraphSection::SparkRouter } },
+                    GraphKey::new(layer, rows, if local_experts { GraphSection::FfnFrontend } else { GraphSection::SparkRouter }),
                     &r.stream,
                     || {
                         r.device.run(|| {
@@ -3713,14 +3767,17 @@ impl<'a> Hy4Engine<'a> {
     }
 
     /// Enqueue the shared FFN after the Spark request has been staged, before landing its reply.
+    ///
+    /// On TP1 graphed decode, launches eagerly in the Spark RDMA round-trip shadow (matching GLM 5.3's
+    /// `moe_exchange`) to eliminate a separate per-layer executable while keeping full overlap.
     fn run_spark_shared_ffn(&self, layer: usize, batch: &ActiveBatch) -> Result<()> {
         let p = format!("model.layers.{layer}");
         let rows = batch.rows;
         let gpus = self.ranks.len();
         for r in &self.ranks {
             let work = || r.device.run(|| r.shared_ffn(&p, gpus, batch.wave_slot, rows));
-            if batch.graphed {
-                r.graphs.run(GraphKey { layer, rows, section: GraphSection::SparkShared }, &r.stream, work)?;
+            if batch.graphed && gpus == 2 {
+                r.graphs.run(GraphKey::new(layer, rows, GraphSection::SparkShared), &r.stream, work)?;
             } else {
                 work()?;
             }
@@ -3770,7 +3827,7 @@ impl<'a> Hy4Engine<'a> {
             let recv_ptr = ffn_recv[rank];
             if batch.graphed {
                 r.graphs.run(
-                    GraphKey { layer, rows, section: GraphSection::FfnFinish },
+                    GraphKey::new(layer, rows, GraphSection::FfnFinish),
                     &r.stream,
                     || {
                         r.device.run(|| {
@@ -3840,7 +3897,7 @@ impl<'a> Hy4Engine<'a> {
                 let recv_ptr = attn_recv[rank];
                 if batch.graphed {
                     r.graphs.run(
-                        GraphKey { layer, rows, section: GraphSection::FfnFrontend },
+                        GraphKey::new(layer, rows, GraphSection::FfnFrontend),
                         &r.stream,
                         || {
                             r.device.run(|| {
@@ -3884,7 +3941,7 @@ impl<'a> Hy4Engine<'a> {
             for (rank, r) in self.ranks.iter().enumerate() {
                 let recv_ptr = attn_recv[rank];
                 r.graphs.run(
-                    GraphKey { layer, rows, section: GraphSection::FfnFrontend },
+                    GraphKey::new(layer, rows, GraphSection::FfnFrontend),
                     &r.stream,
                     || {
                         r.device.run(|| {
@@ -4048,11 +4105,7 @@ impl<'a> Hy4Engine<'a> {
                 let rows = batch.rows;
                 let r_cur = if batch.use_a { w0.r_a.buffer } else { w0.r_b.buffer };
                 r0.graphs.run(
-                    GraphKey {
-                        layer: prev.layer,
-                        rows,
-                        section: GraphSection::Tail,
-                    },
+                    GraphKey::with_prev_ffn(prev.layer, rows, GraphSection::Tail, true),
                     &r0.stream,
                     || {
                         r0.device.run(|| {
@@ -4707,7 +4760,43 @@ mod tests {
         let send = hook.find("waves.send(").unwrap();
         let shared = hook.find("run_spark_shared_ffn(layer, batch)").unwrap();
         assert!(router < send && send < shared);
-        assert!(prod.contains("section: GraphSection::SparkShared"));
+        assert!(prod.contains("GraphSection::SparkShared"));
+    }
+
+    #[test]
+    fn tp1_spark_decode_uses_one_segment_per_layer() {
+        let prod = include_str!("execution.rs").split("#[cfg(test)]").next().unwrap();
+        let attn = prod.split("fn run_layer_attention(").nth(1).unwrap()
+            .split("fn run_moe_frontend(").next().unwrap();
+        let tp1_spark = attn.split("// Case 2A: TP1 Spark-routed layer").nth(1).unwrap()
+            .split("// Case 2B: TP2 layer").next().unwrap();
+        assert!(tp1_spark.contains("GraphSection::DsaSpark"));
+        assert!(tp1_spark.contains("r.prepare_deferred_ffn_delta("));
+        assert!(tp1_spark.contains("fused_prev_post"));
+        assert!(tp1_spark.contains("Self::run_full_indexer_topk(r, fidx, batch)?"));
+        assert!(tp1_spark.contains("self.capture_draft_recall_rank(0, layer, batch)?"));
+        assert!(tp1_spark.contains("batch.router_fused_layer = Some(layer)"));
+        assert!(!tp1_spark.contains("GraphSection::DsaFullPre"));
+        assert!(!tp1_spark.contains("GraphSection::DsaSharedPre"));
+        assert!(!tp1_spark.contains("GraphSection::DsaAttnOut"));
+        assert!(!tp1_spark.contains("GraphSection::SparkRouter"));
+
+        let shared = prod.split("fn run_spark_shared_ffn(").nth(1).unwrap()
+            .split("fn finish_ffn_combine_and_post(").next().unwrap();
+        assert!(shared.contains("if batch.graphed && gpus == 2"));
+
+        let finish = prod.split("fn finish_ffn_combine_and_post(").nth(1).unwrap()
+            .split("fn run_layer_local_ffn(").next().unwrap();
+        assert!(finish.contains("if batch.can_defer_ffn {\n            batch.prev_ffn_deferred = Some(deferred_ffn);"));
+
+        assert_eq!(
+            super::super::graphs::tp1_spark_layer_sections(true, true),
+            &[super::GraphSection::DsaSpark]
+        );
+        assert_eq!(
+            super::super::graphs::tp1_spark_layer_sections(true, false),
+            &[super::GraphSection::DsaSpark]
+        );
     }
 
 }
