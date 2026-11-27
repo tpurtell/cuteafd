@@ -17,6 +17,12 @@ fn ffn_key(layer: &GlmfLayer<'_>, projection: &str) -> String {
     format!("mlp.{}{projection}_proj", if layer.dense { "" } else { "shared_experts." })
 }
 pub(super) fn native_ffn(layer: &GlmfLayer<'_>) -> bool { layer.core.contains_key(&ffn_key(layer, "down")) || layer.attention_native.contains_key(&ffn_key(layer, "down")) }
+/// Split trellis FFN down-projections carry a post-reduction `svh` Hadamard
+/// egress and must reduce rank 0 + rank 1 before egress. Linear native
+/// BF16/FP8 FFN down-projections (`attention_native`) have no egress transform,
+/// so each rank writes its BF16 partial directly into `w.delta` / `w.shared`
+/// and lets the regular FFN exchange (`meet_ffn` / `tp2_publish`) sum once.
+pub(super) fn split_trellis_ffn(layer: &GlmfLayer<'_>) -> bool { layer.split && layer.core.contains_key(&ffn_key(layer, "down")) }
 pub(super) fn stage_attention(layer: &GlmfLayer<'_>) -> bool {
     layer.attention_native.keys().any(|name| name.starts_with("self_attn.")) || layer.core.contains_key(match layer.attention {
         GlmNextAttention::Kda => "self_attn.q_proj", GlmNextAttention::Mla => "self_attn.q_a_proj",
@@ -207,8 +213,8 @@ impl<'a> GlmfEngine<'a> {
         if let Some(weights) = layer.attention_native.get(name) {
             let [n,k] = weights.layout.shape;
             ensure!(input.bytes >= rows*k*2 && output.bytes >= rows*n*2, "Flash native projection operand extent");
-            let output = if weights.layout.ranks > 1 && weights.layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input {
-                ensure!(plane < 2 && n == self.cfg.hidden, "Flash native retained projection extent");
+            let output = if plane == 0 && weights.layout.ranks > 1 && weights.layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input {
+                ensure!(n == self.cfg.hidden, "Flash native retained projection extent");
                 let retained = w.core.as_ref().context("Flash native retained slot")?.retained[plane].buffer;
                 ensure!(retained.bytes >= retained_bytes(rows, self.cfg.hidden)?, "Flash native retained rows exceed slot");
                 retained
@@ -368,7 +374,7 @@ impl<'a> GlmfEngine<'a> {
         let output = Self::core_buffer(output, rows * self.cfg.hidden * 2, w.x.buffer.device_id);
         let key = ffn_key(layer, "down");
         self.core_linear(rank, w, layer, &key, hidden, output, rows, 1, cap)?;
-        if layer.split {
+        if split_trellis_ffn(layer) {
             // The suffix is disjoint from the following BF16 routed/dense publication.
             let index = self.weights.layers.iter().position(|l| std::ptr::eq(l, layer))
                 .or_else(|| self.peer.as_ref().and_then(|p| p.layers.iter().position(|l| std::ptr::eq(l, layer))))
@@ -478,6 +484,20 @@ mod tests {
         let ffn = source.split("fn core_ffn(").nth(1).unwrap().split("fn core_kda(").next().unwrap();
         assert!(ffn.contains("if rank == 0 { self.core_reduce") && ffn.contains("cuda_zero_bytes_async"));
         assert!(ffn.find("self.core_publish(").unwrap() < ffn.find("self.exchange_wait(").unwrap());
+    }
+
+    #[test]
+    fn linear_native_ffn_skips_pre_egress_core_exchange() {
+        let source = include_str!("core.rs");
+        let linear = source.split("fn core_linear(").nth(1).unwrap().split("fn core_stage(").next().unwrap();
+        assert!(linear.contains("if plane == 0 && weights.layout.ranks > 1"),
+            "attention_native FFN down_proj must write directly to output instead of retained[1]");
+        let ffn = source.split("fn core_ffn(").nth(1).unwrap().split("fn core_kda(").next().unwrap();
+        assert!(ffn.contains("if split_trellis_ffn(layer)"),
+            "only trellis core FFN down_proj needs pre-egress core exchange");
+        let local_graph = include_str!("local_graph.rs");
+        assert!(local_graph.contains("let split_core_ffn = core::split_trellis_ffn(layer0);"),
+            "local decode graph must skip core_publish_ffn for linear attention_native FFNs");
     }
 
     #[test]
