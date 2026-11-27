@@ -454,7 +454,7 @@ def test_optional_levers_are_default_off_and_documented():
                 assert 'kimi_draft_fp8(args.draft_fp8, args.speculator == "dflash2")' in (
                     ROOT / "rust/crates/cuteafd-daemon/src/commands/plan.rs").read_text()
             elif key == "DECODE_ROWS":
-                assert lever["families"] == ["V4.1", "GLM Flash", "MiniMax", "Inkling", "Kimi K3", "Qwen4", "Muse"]
+                assert lever["families"] == ["V4.1", "GLM Flash", "MiniMax", "Inkling", "Inkling Mini", "Kimi K3", "Qwen4", "Muse"]
                 assert default == "auto"
                 assert "`DECODE_ROWS=128`" in lever["enable"]
             else:

@@ -55,7 +55,8 @@ impl<'a> UnitBuffers<'a> for PackedVisitUnit<'_, 'a> {
             return Ok(None);
         };
         let (range, _) = self.cache.layout.conv.field(0, 0, field)?;
-        let offset = (self.cache_slot * 64 * width + range.start / 4) * 4;
+        let replay_rows = cuteafd_loader::families::inkling2_mini::execution::replay_capacity(self.unit.layout.rows);
+        let offset = (self.cache_slot * replay_rows * width + range.start / 4) * 4;
         Ok(Some((super::cache::view(backing, offset, backing.bytes - offset)?, width)))
     }
 
@@ -171,9 +172,10 @@ impl<'a> UnitOwner<'a> {
     }
 
     pub fn set_replay(&self, replay: Option<(Buffer, usize)>) -> Result<()> {
+        let replay_rows = cuteafd_loader::families::inkling2_mini::execution::replay_capacity(self.layout.rows);
         ensure!(
             replay.is_none_or(|(buffer, width)| {
-                width == 6656 && buffer.device_id == self.stream.device.id && buffer.bytes >= 48 * 64 * width * 4
+                width == 6656 && buffer.device_id == self.stream.device.id && buffer.bytes >= 48 * replay_rows * width * 4
             }),
             "Inkling 2 Mini FIR replay backing differs from admitted 48-slot width 6656"
         );
@@ -456,7 +458,8 @@ impl<'a> RequestOwners<'a> {
         let pages = usize::try_from(admitted.solved.pool_tokens.div_ceil(64))?;
         let cache_layout = MiniCacheLayout::with_format(cfg, sequences, pages, inputs.kv_format)?;
         let mark_slots = inputs.prefix_mark_slots;
-        let decode_layout = MiniUnitLayout::serving_decode(cfg, context, inputs.kv_format, sequences)?;
+        let decode_layout =
+            MiniUnitLayout::serving_decode_rows(cfg, inputs.decode_rows as usize, context, inputs.kv_format, sequences)?;
         let prefill_layout =
             MiniUnitLayout::serving(cfg, usize::try_from(inputs.prefill.rows)?, context, inputs.kv_format, sequences)?;
         let owner = |id: &str, bytes: usize, location| -> Result<()> {

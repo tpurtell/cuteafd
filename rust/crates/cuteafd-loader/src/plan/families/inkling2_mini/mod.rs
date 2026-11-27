@@ -515,9 +515,9 @@ impl Family for Inkling2Mini {
 
     fn decode_rows(&self) -> crate::plan::decode_rows::DecodeRowSupport {
         crate::plan::decode_rows::DecodeRowSupport::fixed(
-            64,
+            128,
             7,
-            "Inkling 2 Mini decode programs cover up to 64 rows (block_size=8, up to C8 verify or C64 unspec)",
+            "Inkling 2 Mini coordinator decode programs cover 128 rows (missing inkling2_mini_*_m256 export)",
         )
     }
 
