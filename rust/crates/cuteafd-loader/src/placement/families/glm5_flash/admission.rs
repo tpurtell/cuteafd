@@ -377,8 +377,12 @@ fn graph_reserve(i: &GlmfInputs<'_>, split_draft: bool) -> Result<GlmfGraphs, p:
     Ok(GlmfGraphs { policies, executables, bootstraps })
 }
 
+/// One fixed owner per GPU with a nonzero reserve. `GPU_GRAPH_RESERVE=0` charges
+/// nothing and registers no owner (as GLM 5.3 does; the contract drops zero-byte
+/// allowances anyway): decode then runs eagerly, the graph cache issuing no
+/// capture ticket against a zero reserve.
 fn graph_components(graphs: &GlmfGraphs, maximum: u64) -> Result<Vec<p::Component>, p::Refusal> {
-    graphs.policies.iter().enumerate().map(|(gpu, resolved)| {
+    graphs.policies.iter().enumerate().filter(|(_, resolved)| resolved.bytes != 0).map(|(gpu, resolved)| {
         let id = format!("glmf.graphs.{gpu}");
         let mut component = p::serving::startup_graph_component(&id, p::Location::coordinator(gpu as u8),
             crate::placement::GraphRank::estimated(graphs.executables[gpu], resolved.bytes), maximum)?;
@@ -1087,9 +1091,15 @@ impl PreparedGlmf<'_> {
         let graphs = self.graphs;
         for (gpu, policy) in graphs.policies.iter().enumerate() {
             let source = crate::placement::graph_reserve::source(&format!("glmf.graphs.{gpu}"));
-            let owner = solved.facts.allowances.iter().find(|owner| owner.source == source)
-                .ok_or_else(|| invalid("missing admitted graph reserve owner"))?;
-            if policy.bytes != owner.bytes { return Err(invalid("solved graph reserve differs from the charge")); }
+            let owner = solved.facts.allowances.iter().find(|owner| owner.source == source);
+            match (policy.bytes, owner) {
+                (0, None) => {}
+                (0, Some(_)) => return Err(invalid("a zero graph reserve has an admitted owner")),
+                (_, None) => return Err(invalid("missing admitted graph reserve owner")),
+                (bytes, Some(owner)) if bytes != owner.bytes =>
+                    return Err(invalid("solved graph reserve differs from the charge")),
+                _ => {}
+            }
         }
         let modes = &solved.decisions.attention;
         let layers = modes.iter().enumerate().map(|(layer, &mode)| LayerAssignment { mode,
