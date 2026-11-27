@@ -444,9 +444,19 @@ and keeps the FP8 IndexCache default (21 full layers, 57 shared layers).
 (ContextSplit, parity-owned DSA KV/index pages with zero KV replication) on two
 RTX GPUs; explicit `ATTENTION_PLACEMENT=heads` opts into replicated-KV
 head-split (`layers` refuses in `serve-hy4`). `EMBEDDING=gpu` is required
-(`host` refuses). Current serving is text-only (`VISION=auto|off` and
-`AUDIO=auto|off` start no tower) and runs with `SPECULATOR=off` while bundled
-DFly2 and 40-layer ViT wiring complete (#2550).
+(`host` refuses). `VISION=auto` (default) serves the checkpoint's bundled
+40-layer ViT (`vit.*`, 649 BF16 tensors, 2.30 GiB packed arena plus 0.33 GiB
+admitted scratch) from the jointly admitted owner (Spark-first on `spark:0` in
+the 4- and 6-Spark layouts, costing zero coordinator KV tokens);
+`VISION=rtx[:gpu]|spark[:rank]|off`, `VISION_REPLICAS` and `MEDIA_CACHE_BYTES`
+use the shared media options. `AUDIO` accepts `auto` or `off` and starts none.
+`SPECULATOR=auto` (default) enables the checkpoint's bundled 5-layer DFly2
+drafter (taps `[61, 65, 69, 73, 77]`, block size 7) on every layout, including
+1× RTX + Sparks and 2× RTX + Sparks (with automatic TP2 drafter splitting).
+`SPECULATOR=dfly2` names it explicitly; `SPECULATOR=off` admits no drafter
+storage. Stored K8/K6 views load the bundled K8/K6 MUL1 linears, except KV-B,
+which converts to the target's absorbed-BF16 layout at load. `SPECULATION_TRACE`
+uses the shared speculation trace.
 
 `RTX_EXPERT_LAYERS=auto|all|N`, `PREFILL_ROWS`, `PREFILL_WAVES` (1–3),
 `PREFILL_PACKING=unrestricted` (`exact` refuses at startup), `POOL_TOKENS`,
@@ -1279,11 +1289,11 @@ Speculator (`SPECULATOR`):
 
 | Value | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Inkling Mini | Hy4-flash | Hy4 | MiniMax |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `off` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) | ✓ | ✓ (default) | ✓ (default) | ✓ |
+| `off` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ (default) | ✓ | ✓ (default) | ✓ | ✓ |
 | `dflash2` | ✗ | ✗ | ✓ (default) | ✓ (default) | ✓ | ✗ | ✗ | ✓ (default) | ✗ | ✓ (default) | ✗ | ✓ (default) | ✗ | ✗ | ✗ |
 | `dspark` | ✓ (default) | ✓ (default) | ✓ (Mistral Large 4 only) | ✓ | ✗ | ✗ | ✓ (default unless hidden is 5120) | ✓ (content-paired K3.1 default in every view/layout; otherwise opt-in) | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ | ✓ (default) |
 | `mtp` | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✓ (local EXL3/NVFP4 default, depth 3) | ✗ | ✓ (default) | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `dfly2` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✗ | ✗ |
+| `dfly2` | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✓ | ✓ (default) | ✗ |
 
 Drafter tensor parallelism (`TP2_DFLASH`) on active two-RTX DFlash2 / Hy4-flash DFly2 layouts:
 
@@ -1334,7 +1344,7 @@ Media:
 
 | Key | V4.1 | V4 | GLM 5.3 / ML4 | GLM Flash | MiMo | Qwen4 | Qwen dense | Kimi K3 | Step-5 | Muse | Inkling | Inkling Mini | Hy4-flash | Hy4 | MiniMax |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `VISION` | ✓ (`rtx`/`spark`; local is `rtx:0`) | ✓ | ✓ | ✓ (`auto` needs a template that can mark images) | ✓ | ✓ | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ | `auto`/`off` (auto starts none) | ✓ (`auto`/`rtx`/`off`; bundled PE-Lang) | ✓ | `auto`/`off` (auto starts none) | ✓ (`auto`/`off`; auto starts none) |
+| `VISION` | ✓ (`rtx`/`spark`; local is `rtx:0`) | ✓ | ✓ | ✓ (`auto` needs a template that can mark images) | ✓ | ✓ | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ (`auto`/`off`; auto starts none) | ✓ | `auto`/`off` (auto starts none) | ✓ (`auto`/`rtx`/`off`; bundled PE-Lang) | ✓ | ✓ | ✓ (`auto`/`off`; auto starts none) |
 | `AUDIO` | `off` (default; no tower) | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) | `auto`/`off` (auto starts none) |
 
 Native EXLR8 (`EXLR8_MANIFEST`): GLM 5.3/ML4 and GLM Flash, the only
