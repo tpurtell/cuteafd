@@ -995,6 +995,18 @@ def worker(payload):
     if torch.cuda.is_initialized():
         raise RuntimeError("SM comparison initialized CUDA")
     (Path(payload["output"]) / "comparison-plans.json").write_text(json.dumps(plans, indent=2) + "\n")
+    # Fingerprint every exporter as provenance without recording them as this
+    # job's source reads: a read here would make every job depend on every
+    # exporter and defeat Stage-0 skipping (#2885).
+    active = recorder.active if recorder is not None else False
+    if recorder is not None:
+        recorder.active = False
+    try:
+        export_sources = {str(source.relative_to(ROOT)): sha(source.read_bytes())
+                          for source in sorted((ROOT / "python/tools/aot").glob("*.py"))}
+    finally:
+        if recorder is not None:
+            recorder.active = active
     summary = {"sms": payload["sms"], "capability": list(capability), "cuda_initialized": False,
                "sparkinfer_revision": _pinned_sparkinfer.REVISION,
                "source_tree_sha256": _pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
@@ -1002,8 +1014,7 @@ def worker(payload):
                "build_kind": os.environ.get("CUTEAFD_BUILD_KIND", "development"),
                "environment": {key: os.environ[key] for key in ("CUTEAFD_EXPORT_NARROW_AOT", "CUTEAFD_EXPORT_HC_LAGGED")},
                "exporter_sha256": sha(path.read_bytes()), "comparison_script_sha256": sha(Path(__file__).read_bytes()),
-               "export_sources_sha256": {str(source.relative_to(ROOT)): sha(source.read_bytes())
-                   for source in sorted((ROOT / "python/tools/aot").glob("*.py"))},
+               "export_sources_sha256": export_sources,
                "max_shared_memory_per_block": 101376, "max_shared_memory_per_multiprocessor": 102400,
                "seconds": time.monotonic() - start}
     if recorder is not None:
@@ -1326,9 +1337,6 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
                 target = destination / f"{model}-{rtx}-{context}"
                 target.mkdir()
                 programs = json.loads((staging / str(context) / "dsv4_programs.json").read_text())
-                if records:
-                    programs["kernel_records"] = {name: record for name, record in records.items()
-                                                  if name.startswith(str(context) + "/")}
                 (target / "PROGRAMS.json").write_text(json.dumps(programs, indent=2) + "\n")
                 if model == "pro":
                     package = target / "exl3/exl3-dsv4p-k23"
@@ -1336,13 +1344,7 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
                         copied = package / source.relative_to(staging / "exl3")
                         copied.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(source, copied)
-    for name, _, _ in exports:
-        for source in (staging / name).rglob("*.json"):
-            if source.name == "program-timings.json":
-                continue
-            target = destination / ".workers" / name / source.relative_to(staging / name)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+    publisher.copy_replay_metadata(staging, destination, exports)
     files = {str(path.relative_to(destination)): sha(path.read_bytes())
              for path in sorted(destination.rglob("*.json"))}
     provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],

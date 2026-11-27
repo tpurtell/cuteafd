@@ -19,6 +19,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -258,7 +259,28 @@ def compile_program_shards(job, staging, previous, lock, timeout, backend_cache,
     return summary
 
 
+# Fields publication_records adds to a worker's raw program-records.json entries.
+DERIVED_RECORD_FIELDS = ("family", "planner_metadata", "scratch_bytes_at_capacity", "group")
+WORKER_RECORDS = "program-records.json"
+
+
+def worker_records(program_records, name):
+    """A job's raw worker program-records.json, rebuilt from the publication's program_records.
+
+    Publications keep the records once (INPUTS.json program_records); the raw
+    per-job file is the same entries for that group minus the derived fields.
+    """
+    prefix = name + "/"
+    return {path[len(prefix):]: {key: value for key, value in record.items() if key not in DERIVED_RECORD_FIELDS}
+            for path, record in program_records.items() if path.startswith(prefix)}
+
+
+def worker_records_bytes(records):
+    return (json.dumps(records, indent=2, sort_keys=True) + "\n").encode()
+
+
 def verified_job_files(previous, name):
+    """(directory, {relative: checksum}, rebuilt program records or None) for one replayable job."""
     metadata = json.loads((previous / "INPUTS.json").read_text())
     prefix = ".workers/" + name + "/"
     files = {path[len(prefix):]: checksum for path, checksum in metadata["files"].items()
@@ -270,7 +292,11 @@ def verified_job_files(previous, name):
         path = Path(relative)
         if path.is_absolute() or ".." in path.parts or compare.sha((directory / path).read_bytes()) != checksum:
             raise ValueError(f"invalid or corrupt replay file: {name}/{relative}")
-    return directory, files
+    rebuilt = None
+    if WORKER_RECORDS not in files:
+        records = worker_records(metadata.get("program_records") or {}, name)
+        rebuilt = worker_records_bytes(records) if records else None
+    return directory, files, rebuilt
 
 
 def refresh_replay_provenance(directory, lock):
@@ -309,12 +335,16 @@ def verified_metadata_bytes(path, lock):
     return json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
 
 
-def verify_job_metadata(previous, current, lock, name):
+def verify_job_metadata(previous, current, lock, name, prior_records=None):
     old = {path.relative_to(previous): path for path in previous.rglob("*.json") if path.name != "program-timings.json"}
     new = {path.relative_to(current): path for path in current.rglob("*.json") if path.name != "program-timings.json"}
-    changed = sorted(str(path) for path in old.keys() | new.keys()
-                     if path not in old or path not in new
-                     or verified_metadata_bytes(old[path], lock) != verified_metadata_bytes(new[path], lock))
+    with tempfile.TemporaryDirectory() as scratch:
+        if prior_records is not None and Path(WORKER_RECORDS) not in old:
+            old[Path(WORKER_RECORDS)] = Path(scratch) / WORKER_RECORDS
+            old[Path(WORKER_RECORDS)].write_bytes(prior_records)
+        changed = sorted(str(path) for path in old.keys() | new.keys()
+                         if path not in old or path not in new
+                         or verified_metadata_bytes(old[path], lock) != verified_metadata_bytes(new[path], lock))
     if changed:
         raise ValueError(f"--verify-skips changed IR or placement metadata in skipped job {name}: {changed}")
 
@@ -369,7 +399,7 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
     prior = verified_job_files(previous, name) if previous else None
     skipped = False
     if prior:
-        prior_directory, prior_files = prior
+        prior_directory, prior_files, prior_records = prior
         prior_context = json.loads((prior_directory / "comparison-context.json").read_text())
         current_inputs = kernel_records.stage0_inputs(ROOT, payload, (12, 0))
         triggers = kernel_records.job_candidates(ROOT, prior_context, current_inputs)
@@ -380,6 +410,8 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
                 target = output / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(prior_directory / relative, target)
+            if prior_records is not None:
+                (output / WORKER_RECORDS).write_bytes(prior_records)
             refresh_replay_provenance(output, lock)
             summary = json.loads((output / "comparison-context.json").read_text())
             summary["execution_stats"] = {"stage0_skipped": True, "verified_skip": False,
@@ -389,7 +421,7 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
         summary = compile_program_shards(job, staging, previous, lock, timeout, backend_cache,
                                          verify_skips, program_pool, workers)
         if skipped:
-            verify_job_metadata(prior_directory, output, lock, name)
+            verify_job_metadata(prior_directory, output, lock, name, prior_records)
         return summary
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT),
                CUTEAFD_SPARKINFER_SOURCE_DIR=str(ROOT / "third_party/sparkinfer"),
@@ -399,7 +431,7 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
         subprocess.run(worker_command(payload, staging), env=env, stdout=log,
                        stderr=subprocess.STDOUT, check=True, timeout=timeout)
     if skipped:
-        verify_job_metadata(prior_directory, output, lock, name)
+        verify_job_metadata(prior_directory, output, lock, name, prior_records)
     summary = json.loads((output / "comparison-context.json").read_text())
     reuse = summary.get("backend_reuse", {})
     sm170 = check_job_sm170(job, staging, previous, timeout, env, verify_all=verify_skips)
@@ -490,20 +522,8 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
             for layout in layouts:
                 (target / layout).mkdir()
             (target / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    # Preserve only the exact metadata needed to replay a job, not heavy objects.
-    for name, _, _ in jobs:
-        for source in (staging / name).rglob("*.json"):
-            if source.name in ("export.log", "program-timings.json"):
-                continue
-            target = destination / ".workers" / name / source.relative_to(staging / name)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+    copy_replay_metadata(staging, destination, jobs)
     records = publication_records(staging, jobs)
-    if records:
-        programs_path = share / "PROGRAMS.json"
-        programs = json.loads(programs_path.read_text())
-        programs["kernel_records"] = records
-        programs_path.write_text(json.dumps(programs, indent=2) + "\n")
     files = {str(path.relative_to(destination)): compare.sha(path.read_bytes())
              for path in sorted(destination.rglob("*.json"))}
     provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],
@@ -531,6 +551,20 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
     print(f"Published placement inputs: {destination}; {provenance['wall_seconds']} s; "
           f"{sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())} bytes; "
           f"INPUTS.json sha256 {compare.sha((destination / 'INPUTS.json').read_bytes())}", flush=True)
+
+
+def copy_replay_metadata(staging, destination, jobs):
+    """Preserve the exact metadata needed to replay each job, not heavy objects.
+
+    Program records are kept once, in INPUTS.json program_records; replay rebuilds
+    each job's raw program-records.json from them (verified_job_files)."""
+    for name, _, _ in jobs:
+        for source in (staging / name).rglob("*.json"):
+            if source.name in ("export.log", "program-timings.json") or source == staging / name / WORKER_RECORDS:
+                continue
+            target = destination / ".workers" / name / source.relative_to(staging / name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
 
 
 def publication_records(staging, jobs):
