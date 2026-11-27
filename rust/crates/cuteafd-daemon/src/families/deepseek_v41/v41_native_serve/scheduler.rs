@@ -439,7 +439,9 @@ fn packing_limits(mode: crate::shared::prefill_packing::PackingMode, rows: usize
 
 fn packing_probe_allowed(probe: &crate::shared::probe::ProbeRef) -> bool {
     crate::shared::probe::scoring(probe).is_none()
-        && probe.as_ref().is_none_or(|p| p.spec.cold_steps.is_empty())
+        && probe.as_ref().is_none_or(|p| {
+            p.spec.cold_steps.is_empty() && p.spec.record_rows == 0 && !p.spec.record_first
+        })
 }
 
 fn packing_group_fits(chunks: &[(usize, usize)], limits: &crate::shared::prefill_packing::Limits,
@@ -3085,6 +3087,10 @@ mod sampling_tests {
         let replay = Probe::new(ProbeSpec { cold: true,
             cold_steps: vec![ProbeColdStep { end: 4, decode: false }], ..Default::default() });
         assert!(!packing_probe_allowed(&Some(replay)));
+        let lossless = Probe::new(ProbeSpec { cold: true, record_rows: 128, top_k: 2, ..Default::default() });
+        assert!(!packing_probe_allowed(&Some(lossless)));
+        let first_row = Probe::new(ProbeSpec { cold: true, record_first: true, ..Default::default() });
+        assert!(!packing_probe_allowed(&Some(first_row)));
         assert!(pending_prefix_hit(&[1, 2, 3], &[1, 2]));
         assert!(pending_prefix_hit(&[1, 2], &[1, 2]));
         assert!(!pending_prefix_hit(&[1, 3], &[1, 2]));

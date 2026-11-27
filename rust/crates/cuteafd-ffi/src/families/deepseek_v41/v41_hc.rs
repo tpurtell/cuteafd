@@ -120,7 +120,7 @@ impl V41Hc<'_> {
         let Some(begin) = self.begin else {
             return Ok(false);
         };
-        if rows > 80 {
+        if rows > 256 {
             return Ok(false);
         }
         buffers(

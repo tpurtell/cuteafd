@@ -76,6 +76,18 @@ def _parse_engine_v41_router_skinny_cap(source: str) -> int:
     return int(matches[0])
 
 
+def test_v41_skinny_activation_is_fused_before_selection():
+    source = (ROOT / "native/shared/cuda/expert_router.cu").read_text()
+    router = source[source.index('extern "C" int32_t cuteafd_v41_router('):
+                    source.index('extern "C" int32_t cuteafd_v41_router_select_logits(')]
+    assert "if(rows<=256)" in router
+    assert "select_fast_kernel<false>" in router
+    assert "select_fast_kernel<true>" in router
+    exporter = (ROOT / "python/tools/aot/export_b12x_v41_router_aot.py").read_text()
+    assert "compile_v41_router_scores_aot(experts=experts, activated=True)" in exporter
+    assert "V41_ROUTER_SKINNY_MAX_ROWS" in exporter
+
+
 def test_v41_router_skinny_cap_matches_fork_constant():
     """Drift guard: engine activation threshold in native/shared/cuda/expert_router.cu
     must match V41_ROUTER_SKINNY_MAX_ROWS in third_party/sparkinfer/b12x/moe/_shared/v41_router.py.
@@ -90,15 +102,16 @@ def test_v41_router_skinny_cap_matches_fork_constant():
     )
 
 
-def test_v41_skinny_activation_is_fused_before_selection():
-    source = (ROOT / "native/shared/cuda/expert_router.cu").read_text()
-    router = source[source.index('extern "C" int32_t cuteafd_v41_router('):
-                    source.index('extern "C" int32_t cuteafd_v41_router_select_logits(')]
-    assert "if(rows<=256)" in router
-    assert "select_fast_kernel<false>" in router
-    assert "select_fast_kernel<true>" in router
-    exporter = (ROOT / "python/tools/aot/export_b12x_v41_router_aot.py").read_text()
-    assert "compile_v41_router_scores_aot(experts=experts, activated=True)" in exporter
+def test_v41_hc_lagged_cap_matches_decode_ceiling():
+    """Drift guard: hc_lagged max rows in v41_fp8.cc, v41_hc.rs and export_b12x_v41_fp8_aot.py
+    must cover the full V4.1 decode/verify ceiling (256) so verify waves 81..256 never fall
+    back to non-row-invariant hc_mixes_workspace."""
+    fp8_cc = (ROOT / "native/families/deepseek_v41/src/v41_fp8.cc").read_text()
+    hc_rs = (ROOT / "rust/crates/cuteafd-ffi/src/families/deepseek_v41/v41_hc.rs").read_text()
+    exporter = (ROOT / "python/tools/aot/export_b12x_v41_fp8_aot.py").read_text()
+    assert "if(rows<1 || rows>256 || scratch_bytes<uint64_t(rows)*8000)" in fp8_cc
+    assert "if rows > 256 {" in hc_rs
+    assert "'max_rows': 256" in exporter
 
 
 def test_native_wide_dispatch_and_reducer_width():

@@ -128,12 +128,16 @@ impl<'a> AttentionQueryWeights<'a> {
             AttentionQueryWave::device_bytes_with_split(self.library, capacity,self.split_query_b)? <= budget,
             "attention query wave exceeds budget"
         );
-        self.on_storage(self.storage(capacity, &[self.library.cuda_get_device()?])?)
+        self.on_storage(self.storage_with_mode(capacity, &[self.library.cuda_get_device()?], true)?)
     }
     /// Shared storage for units of up to `unit` rows; `readers` are the
     /// devices whose streams read the outputs (fork readers; both GPUs on two
-    /// RTX), where a joined chain head may sit.
+    /// RTX), where a joined chain head may sit. Prefill slots use the unsplit
+    /// prefill FP8 plan (`decode = false`).
     pub fn storage(&self, unit: u32, readers: &[i32]) -> Result<std::rc::Rc<AttentionQueryStorage<'a>>> {
+        self.storage_with_mode(unit, readers, false)
+    }
+    fn storage_with_mode(&self, unit: u32, readers: &[i32], decode: bool) -> Result<std::rc::Rc<AttentionQueryStorage<'a>>> {
         ensure!((1..=4096).contains(&unit), "invalid attention query unit {unit}");
         let stream = LoadStream {
             library: self.library,
@@ -141,7 +145,11 @@ impl<'a> AttentionQueryWeights<'a> {
         };
         let kernels = MATRICES
             .into_iter().take(if self.split_query_b {1} else {2})
-            .map(|(k, n)| self.library.v41_fp8_matrix_plan(unit, k, n))
+            .map(|(k, n)| if decode {
+                self.library.v41_fp8_decode_matrix_plan(unit, k, n)
+            } else {
+                self.library.v41_fp8_matrix_plan(unit, k, n)
+            })
             .collect::<Result<Vec<_>>>()?;
         let scratch = kernels
             .iter()
@@ -294,10 +302,21 @@ impl AttentionQueryWave<'_, '_> {
         Self::device_bytes_with_split(library,capacity,false)
     }
     pub fn device_bytes_with_split(library:&NativeLibrary,capacity:u32,split_query_b:bool)->Result<usize> {
+        Self::bytes_with_mode(library, capacity, split_query_b, true)
+    }
+    pub fn storage_bytes_with_split(library:&NativeLibrary,capacity:u32,split_query_b:bool)->Result<usize> {
+        Self::bytes_with_mode(library, capacity, split_query_b, false)
+    }
+    fn bytes_with_mode(library:&NativeLibrary,capacity:u32,split_query_b:bool,decode:bool)->Result<usize> {
         let mut bytes = 4 + capacity as usize * ROW_BYTES.iter().enumerate()
             .filter(|(i, _)| *i != 4 || cfg!(test)).map(|(_, bytes)| bytes).sum::<usize>();
         for (k, n) in MATRICES.into_iter().take(if split_query_b {1} else {2}) {
-            bytes += library.v41_fp8_matrix_plan_info(capacity, k, n)?.scratch_bytes as usize;
+            let plan = if decode {
+                library.v41_fp8_decode_matrix_plan_info(capacity, k, n)?
+            } else {
+                library.v41_fp8_matrix_plan_info(capacity, k, n)?
+            };
+            bytes += plan.scratch_bytes as usize;
         }
         Ok(bytes)
     }
