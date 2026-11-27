@@ -6177,11 +6177,21 @@ impl<'a> Hy4Engine<'a> {
 
         let pages_a = prompt_a.len().div_ceil(PAGE_ROWS);
         let pages_b = prompt_b.len().div_ceil(PAGE_ROWS);
-        ensure!(
-            pages_a + pages_b <= self.max_pages,
-            "two-sequence wave proof needs {} pages, engine has {}",
-            pages_a + pages_b,
+        let base_b = if self.context_split {
+            (pages_a + 1) & !1
+        } else {
+            pages_a
+        };
+        let pool_pages = if self.context_split {
+            self.max_pages * 2
+        } else {
             self.max_pages
+        };
+        ensure!(
+            base_b + pages_b <= pool_pages,
+            "two-sequence wave proof needs {} pages, engine has {}",
+            base_b + pages_b,
+            pool_pages
         );
         let vocab = self.cfg.vocab_size;
         let pad_id = self.cfg.engram_pad_id;
@@ -6233,7 +6243,7 @@ impl<'a> Hy4Engine<'a> {
         // 2. Prompt B solo at waves=1 (one unit per run_units call = strictly 1 wave in flight).
         self.reset()?;
         let units_b1 = make_solo_units(prompt_b.len(), 1)?;
-        let mut p_b1 = [Hy4Placement::new((pages_a as u32..(pages_a + pages_b) as u32).collect(), 1, pad_id)];
+        let mut p_b1 = [Hy4Placement::new((base_b as u32..(base_b + pages_b) as u32).collect(), 1, pad_id)];
         let mut logits_b_solo = vec![0f32; prompt_b.len() * vocab];
         for mut unit in units_b1 {
             unit.index = 0;
@@ -6331,7 +6341,7 @@ impl<'a> Hy4Engine<'a> {
         }
         let mut placements = [
             Hy4Placement::new((0..pages_a as u32).collect(), 0, pad_id),
-            Hy4Placement::new((pages_a as u32..(pages_a + pages_b) as u32).collect(), 1, pad_id),
+            Hy4Placement::new((base_b as u32..(base_b + pages_b) as u32).collect(), 1, pad_id),
         ];
         let mut logits_a_conc = vec![0f32; prompt_a.len() * vocab];
         let mut logits_b_conc = vec![0f32; prompt_b.len() * vocab];
