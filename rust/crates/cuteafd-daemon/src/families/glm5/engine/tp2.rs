@@ -262,16 +262,7 @@ impl<'a> GlmEngine<'a> {
                 } else {
                     "m64"
                 };
-                if Self::core_split(layer, "down") {
-                    self.ffn_on(rank, w, layer, self.cfg.moe_intermediate, cap,
-                        w.shared.buffer.ptr, Scalar::I32(w.rows as i32))?;
-                    // SAFETY: prime uses zero x, hence zero SwiGLU/down output.
-                    // Do not queue a peer wait before the other rank is primed.
-                    unsafe { self.library.cuda_zero_bytes_async(w.shared.buffer,
-                        w.rows * self.cfg.hidden * 2, self.stream_of(rank))?; }
-                } else {
-                    self.shared_on(rank, pair.layers[0], w, layer, Scalar::I32(w.rows as i32), cap)?;
-                }
+                self.shared_on(rank, pair.layers[0], w, layer, Scalar::I32(w.rows as i32), cap)?;
                 let input = if pair.uses_fp8_input() {
                     ExpertInput::Fp8K32(w.wire.buffer.ptr)
                 } else {

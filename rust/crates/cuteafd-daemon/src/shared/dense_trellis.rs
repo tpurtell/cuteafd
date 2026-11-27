@@ -536,6 +536,14 @@ impl<'a> Projection<'a> {
         let b=scratch.buffers(input,weights);
         self.program.local(rows,b,output,stream)?;Ok(())
     }
+    /// Rank-local core + `H128/svh` egress for an input-split projection whose
+    /// caller sums each rank's BF16 partial through a later FFN exchange.
+    /// Keeps the pre-egress accumulator in F32 without a pre-H128 BF16 narrow.
+    pub(crate) fn local_partial(&self,rows:usize,input:Buffer,weights:&CoreWeights<'_>,scratch:&ProjectionScratch<'_>,
+        output:Buffer,stream:*mut c_void)->Result<()> {
+        let core=self.core(rows,input,weights,scratch,stream)?;
+        self.program.output(rows,core,weights.svh.buffer,output,stream)?;Ok(())
+    }
     pub(crate) fn reduced_f32(&self,add:&cuteafd_ffi::F32Add<'_>,rows:usize,rank0:Buffer,rank1:Buffer,reduced:Buffer,
         weights:&CoreWeights<'_>,output:Buffer,stream:*mut c_void)->Result<()> {
         self.program.reduce_f32_output(add,rows,rank0,rank1,reduced,weights.svh.buffer,output,stream)?;Ok(())

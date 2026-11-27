@@ -226,17 +226,19 @@ impl<'a> GlmEngine<'a> {
             .with_context(|| format!("GLM missing staged projection {key}"))
     }
 
+    /// True when an input-split projection requires a dedicated core exchange
+    /// before the next norm (`o` and dense `down`). MoE `shared_experts.down`
+    /// (`!layer.dense`) writes each rank's BF16 partial directly into `w.shared`
+    /// so the regular FFN exchange (`tp2_publish` / Spark `ffn_norm`) sums once
+    /// without a redundant mid-FFN transfer, barrier, or pre-egress narrowing.
     pub(super) fn core_split(layer: &GlmLayer<'_>, key: &str) -> bool {
+        if !layer.dense && key == "down" {
+            return false;
+        }
         layer.core.get(key).is_some_and(|weight|
             weight.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input)
             || layer.attention_native.get(key).is_some_and(|w| w.layout.ranks > 1
                 && w.layout.split == cuteafd_loader::formats::trellis_core::CoreSplit::Input)
-    }
-
-    /// Remote routed output already includes the complete shared down-core
-    /// egress on rank 0. Rank 1 has no second BF16 contribution in this case.
-    pub(super) fn shared_zero_elided(&self, index: usize, layer: &GlmLayer<'_>) -> bool {
-        !layer.dense && Self::core_split(layer, "down") && !self.tp2_layer(index)
     }
 
     /// Native cores occupy a disjoint partition of each existing receive slot:
@@ -256,9 +258,12 @@ impl<'a> GlmEngine<'a> {
         let at = slot(index, key == "down", lane);
         if Self::core_split(layer, key) {
             let core = &w.core_rows.as_ref().context("GLM K6 retained core rows")?[usize::from(key == "down")];
-            let element_bytes = if layer.attention_native.contains_key(key) { 4 } else { 2 };
-            self.exchange()?.push_to(rank, at, core.buffer.ptr,
-                self.core_received(1 - rank, at, rows, element_bytes)?.ptr, rows * self.cfg.hidden * element_bytes)
+            let dst = self.core_received(1 - rank, at, rows, 2)?;
+            if layer.attention_native.contains_key(key) {
+                self.exchange()?.push_partial_to(rank, at, core.buffer, w.delta.buffer, dst.ptr, rows * self.cfg.hidden)
+            } else {
+                self.exchange()?.push_to(rank, at, core.buffer.ptr, dst.ptr, rows * self.cfg.hidden * 2)
+            }
         } else {
             self.exchange()?.push(rank, at, w.delta.buffer.ptr, rows * self.cfg.hidden * 2)
         }
@@ -269,19 +274,14 @@ impl<'a> GlmEngine<'a> {
         let programs = self.core_programs(rank)?;
         let retained = w.core_rows.as_ref().context("GLM K6 retained core rows")?;
         let local = retained[usize::from(key == "down")].buffer;
-        let native = layer.attention_native.contains_key(key);
-        let peer = self.core_received(rank, slot(index, key == "down", lane), rows, if native { 4 } else { 2 })?;
-        // Native projections retain F32 partials; trellis projections widen
-        // retained BF16 cores before the complete H128/svh egress.
-        let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
-        if native {
-            // SAFETY: both rank-ordered F32 partials have completed their exchange;
-            // distinct admitted reduction/output owners survive stream completion.
-            return self.on(rank, || unsafe {
-                programs.f32_add.launch(first, second, retained[2].buffer, rows * self.cfg.hidden, self.stream_of(rank))?;
-                programs.narrow.launch(retained[2].buffer.ptr, output.ptr, rows * self.cfg.hidden, self.stream_of(rank))
-            });
+        let peer = self.core_received(rank, slot(index, key == "down", lane), rows, 2)?;
+        if layer.attention_native.contains_key(key) {
+            return self.exchange()?.reduce_partial_narrow_on(
+                rank, w.delta.buffer, peer.ptr, retained[2].buffer, output, rows * self.cfg.hidden, self.stream_of(rank),
+            );
         }
+        // Trellis projections widen retained BF16 cores before the complete H128/svh egress.
+        let (first, second) = if rank == 0 { (local, peer) } else { (peer, local) };
         let weights = layer.core.get(key).context("GLM K6 split weights")?;
         self.on(rank, || programs.projection(weights)?.reduced(&programs.add, rows,
             first, second, retained[2].buffer, weights, output, self.stream_of(rank)))
@@ -307,77 +307,20 @@ impl<'a> GlmEngine<'a> {
         layer: &GlmLayer<'_>, weight: *mut c_void, rows: Scalar,
         first: *mut c_void, second: *mut c_void) -> Result<()> {
         if layer.dense { self.projection_norm(rank, index, lane, w, layer, "down", weight, rows, first, second) }
-        else {
-            // A BF16 delta plus +0 is redundant on real model data. Elision
-            // preserves -0 instead of canonicalizing it and can preserve NaN
-            // payloads differently; native goldens gate byte-exact real data.
-            let deltas = if self.shared_zero_elided(index, layer) { 1 } else { 2 };
-            self.norm_full(rank, w, weight, deltas, rows, first, second)
-        }
+        else { self.norm_full(rank, w, weight, 2, rows, first, second) }
     }
 
-    pub(super) fn meet_shared_core(&self, rank: usize, index: usize, w: &Workspace<'_>,
-        layer: &GlmLayer<'_>, rows: usize) -> Result<()> {
-        if !Self::core_split(layer, "down") { return Ok(()); }
-        ensure!(!layer.dense, "GLM shared meet used for a dense FFN");
-        self.publish_projection(rank, index, w.lane, w, layer, "down", rows)?;
-        self.exchange()?.wait(rank, slot(index, true, w.lane))?;
-        if rank == 0 {
-            self.reduce_projection(rank, index, w.lane, w, layer, "down", rows, w.shared.buffer)
-        } else if self.shared_zero_elided(index, layer) {
-            // The later routed-result wait (also on the terminal layer) orders
-            // retained-core reuse after rank 0's reader. No zero buffer is read.
-            Ok(())
-        } else {
-            // SAFETY: only rank 0 contributes shared; this rank's combine reads
-            // its zeroed BF16 buffer after this operation on the same stream.
-            self.on(rank, || unsafe { self.library.cuda_zero_bytes_async(w.shared.buffer,
-                rows * self.cfg.hidden * 2, self.stream_of(rank)) })
-        }
-    }
-
-    /// Zero rank 1's shared FFN output buffer locally (capture-safe): only rank 0
-    /// contributes the reduced split-core shared partial.
-    pub(super) fn core_zero_shared(&self, rank: usize, w: &Workspace<'_>, rows: usize) -> Result<()> {
-        ensure!(rank == 1, "core_zero_shared is rank-1 only");
-        // SAFETY: only rank 0 contributes the reduced shared partial; rank 1's TP2
-        // combine reads its zeroed BF16 shared buffer after this on the same stream.
-        self.on(rank, || unsafe {
-            self.library.cuda_zero_bytes_async(w.shared.buffer, rows * self.cfg.hidden * 2, self.stream_of(rank))
-        })
-    }
-
-    /// Rank-local shared FFN without peer meet (capture-safe). For split-core `down`
-    /// projections, rank 1 publishes its retained core one-way (1->0) outside capture
-    /// and rank 0 reduces into `w.shared` after waiting outside capture.
+    /// Rank-local shared FFN without peer meet (capture-safe). Each rank writes
+    /// its BF16 partial into `w.shared`; TP2 combine or Spark `ffn_norm` sums
+    /// both ranks' contributions in the regular FFN exchange.
     pub(super) fn shared_on_local(&self, rank: usize, index: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>,
         rows: Scalar, cap: &str) -> Result<()> {
-        if let Some(native) = self.native_experts.get(rank) {
-            let Scalar::I32(rows) = rows else { anyhow::bail!("EXLR8 shared rows must be I32"); };
-            let execution = w.native_shared.as_ref().context("EXLR8 lane shared workspace")?;
-            self.on(rank, || native.shared(self.library, index, execution, w.x.buffer,
-                w.shared.buffer, rows as usize, self.stream_of(rank)))
-        } else {
-            self.ffn_on(rank, w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)
-        }
+        self.shared_on(rank, index, w, layer, rows, cap)
     }
 
-    /// Rank 0's one-way shared FFN completion on a 2-GPU Spark MoE layer: runs the
-    /// local shared FFN, and when `core_split(down)` is active waits for rank 1's
-    /// one-way 1->0 core partial and reduces both halves into `w.shared`.
-    pub(super) fn shared_on_rank0_one_way(&self, index: usize, lane: usize, w: &Workspace<'_>,
-        layer: &GlmLayer<'_>, rows: Scalar, cap: &str) -> Result<()> {
-        self.shared_on_local(0, index, w, layer, rows, cap)?;
-        if Self::core_split(layer, "down") {
-            let count = scalar_rows(rows)?;
-            self.exchange()?.wait(0, slot(index, true, lane))?;
-            self.reduce_projection(0, index, lane, w, layer, "down", count, w.shared.buffer)?;
-        }
-        Ok(())
-    }
-
-    /// Input-side native projections retain F32 partials, while trellis cores
-    /// retain BF16. Their caller owns the meet before either storage is reused.
+    /// Input-side split projections (`o` and dense `down`) retain partials for
+    /// their caller's meet (F32 for native, BF16 for trellis). MoE shared
+    /// `down` writes each rank's BF16 partial directly into `output` (`w.shared`).
     fn core_linear(&self, rank: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>, key: &str,
         input: Buffer, output: Buffer, rows: usize, retained: Option<Buffer>) -> Result<()> {
         if let Some(weights) = layer.attention_native.get(key) {
@@ -392,13 +335,18 @@ impl<'a> GlmEngine<'a> {
         let scratch = self.core_scratch(w)?;
         let projection = programs.projection(weights)?;
         let stream = self.stream_of(rank);
+        let trellis_scratch = scratch.projection.as_ref().context("GLM trellis scratch missing")?;
         self.on(rank, || {
-            if weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input {
-                let core = projection.core(rows, input, weights, scratch.projection.as_ref().context("GLM trellis scratch missing")?, stream)?;
+            if Self::core_split(layer, key) {
+                let core = projection.core(rows, input, weights, trellis_scratch, stream)?;
                 let retained = retained.context("GLM K6 split core has no retained row storage")?;
                 crate::shared::dense_trellis::retain_partial(&programs.narrow, core, retained,
                     rows * weights.shape[0], stream)
-            } else { projection.local(rows, input, weights, scratch.projection.as_ref().context("GLM trellis scratch missing")?, output, stream) }
+            } else if weights.side == cuteafd_loader::formats::dense_trellis::TrellisSide::Input {
+                projection.local_partial(rows, input, weights, trellis_scratch, output, stream)
+            } else {
+                projection.local(rows, input, weights, trellis_scratch, output, stream)
+            }
         })
     }
 
