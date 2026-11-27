@@ -22,7 +22,7 @@ use super::super::{
 };
 use crate::families::hy4::execution::{
     hy4_context_buffers, hy4_peer_slot_sizes, wave_metadata_layout_for_rank, CacheLayout,
-    IndexTopkScratch, SharedScratchLayout, WaveScratchLayout,
+    ContextStagingLayout, IndexTopkScratch, SharedScratchLayout, WaveScratchLayout,
 };
 use crate::families::hy4::weight_layout::CoordinatorWeights;
 use crate::families::hy4::{Hy4Config, Hy4KvCache};
@@ -740,7 +740,7 @@ impl Hy4Inputs {
         for slot in 0..usize::try_from(self.prefill.waves)
             .map_err(|_| Refusal::Overflow("Hy4 waves"))?
         {
-            let wave = WaveScratchLayout::new(
+            let wave = WaveScratchLayout::new_with_context(
                 cfg,
                 gpu,
                 slot,
@@ -748,6 +748,7 @@ impl Hy4Inputs {
                 capacity_rows,
                 max_seq_pages,
                 self.sequences as usize,
+                context_split,
             )
             .map_err(refusal)?;
             out.extend(buffer(
@@ -819,6 +820,17 @@ impl Hy4Inputs {
                     Lifetime::TARGET,
                     Category::Transport,
                     "Hy4 ContextSplit exchange",
+                    maximum,
+                ));
+                let staging = ContextStagingLayout::new(cfg, self.kv_format, gpu, max_seq_pages)
+                    .map_err(refusal)?;
+                out.extend(buffer(
+                    ContextStagingLayout::arena_id(gpu),
+                    location,
+                    staging.arena.bytes() as u64,
+                    Lifetime::TARGET,
+                    Category::Workspace,
+                    "Hy4 ContextSplit prefill staging",
                     maximum,
                 ));
             }

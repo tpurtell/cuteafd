@@ -78,7 +78,10 @@ pub(crate) struct Hy4ContextPrograms<'a> {
     pub(crate) lse_combine2: Program<'a>,
     pub(crate) mla_gate_uv_dsa: Program<'a>,
     pub(crate) scored_index_topk_decode: Program<'a>,
+    pub(crate) scored_index_topk_prefill: Program<'a>,
     pub(crate) dsa_candidate_merge: Program<'a>,
+    pub(crate) paged_staging_gather_kv: Program<'a>,
+    pub(crate) paged_staging_gather_index: Program<'a>,
 }
 
 /// Resolved, ABI-validated Hy4 coordinator AOT programs for one GPU rank.
@@ -236,15 +239,15 @@ impl<'a> Hy4Programs<'a> {
             proj_shared_gate_up: load("shared_gate_up", proj_ptrs)?,
             proj_shared_down: load("shared_down", proj_ptrs)?,
             context: if context_split {
+                let scored_ptrs = &["q", "weights", "cache", "table", "lengths", "indices", "scores", "scratch"];
+                let gather_ptrs = &["pool", "table", "staging"];
                 Some(Hy4ContextPrograms {
                     dsa_partial_h0: load(&format!("mla_dsa_partial_{kv}_h0"), attn_ptrs)?,
                     dsa_partial_h32: load(&format!("mla_dsa_partial_{kv}_h32"), attn_ptrs)?,
                     lse_combine2: load("lse_combine2", &["o0", "l0", "o1", "l1", "sink", "out"])?,
                     mla_gate_uv_dsa: load("mla_gate_uv_dsa", &["attn", "w_uv", "gate", "out"])?,
-                    scored_index_topk_decode: load(
-                        "scored_index_topk_decode",
-                        &["q", "weights", "cache", "table", "lengths", "indices", "scores", "scratch"],
-                    )?,
+                    scored_index_topk_decode: load("scored_index_topk_decode", scored_ptrs)?,
+                    scored_index_topk_prefill: load("scored_index_topk_prefill", scored_ptrs)?,
                     dsa_candidate_merge: load(
                         "dsa_candidate_merge",
                         &[
@@ -257,6 +260,8 @@ impl<'a> Hy4Programs<'a> {
                             "local_lengths",
                         ],
                     )?,
+                    paged_staging_gather_kv: load(&format!("paged_staging_gather_kv_{kv}"), gather_ptrs)?,
+                    paged_staging_gather_index: load("paged_staging_gather_index", gather_ptrs)?,
                 })
             } else {
                 None

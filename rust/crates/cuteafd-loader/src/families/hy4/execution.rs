@@ -149,6 +149,13 @@ impl IndexTopkScratch {
             PAGE_ROWS as u64,
         );
         if context_split {
+            let pre_name = format!("{prefix}_index_topk_prefill");
+            let scored_pre_name = format!("{prefix}_scored_index_topk_prefill");
+            let pre = scratch_of(&[&pre_name, "glm_index_topk_prefill_m4096"], DEFAULT_INDEX_TOPK_PREFILL_SCRATCH);
+            let scored_pre = scratch_of(
+                &[&scored_pre_name, "glm_scored_index_topk_prefill_m4096"],
+                DEFAULT_INDEX_TOPK_PREFILL_SCRATCH,
+            );
             let scored_prog = find(&["hy42_scored_index_topk_decode", "glm_scored_index_topk_decode_m64"]);
             let scored_bytes = if let Some(prog) = scored_prog {
                 if let Some(tile) =
@@ -175,7 +182,7 @@ impl IndexTopkScratch {
                 usize::try_from(bytes)?
             };
             Ok(Self {
-                topk_bytes: 0,
+                topk_bytes: pre.max(scored_pre).max(256),
                 scored_bytes: scored_bytes.max(256),
                 admitted_pages: usize::try_from(admitted_pages)?,
             })
@@ -231,6 +238,66 @@ impl CacheLayout {
     }
 }
 
+/// Maximum parity-owned pages one prefill member of up to `max_rows` can commit.
+pub fn context_commit_limit(max_rows: usize) -> usize {
+    (max_rows.div_ceil(PAGE_ROWS) + 2).div_ceil(2) + 1
+}
+
+/// Number of commit planes in Hy4 gathered ContextSplit prefill: KV records, index keys, index scales.
+pub const CONTEXT_COMMIT_PLANES: usize = 3;
+
+/// One packed staging arena per coordinator GPU for 2-GPU ContextSplit gathered prefill.
+/// Charged once per GPU by admission and aliased by runtime views (`kv`, `index`, `identity_pt`,
+/// plus DFly2 empty-half sentinels).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextStagingLayout {
+    pub arena: WeightArenaLayout,
+    pub pages: usize,
+    pub kv_page_bytes: usize,
+    pub index_page_bytes: usize,
+}
+
+impl ContextStagingLayout {
+    pub fn arena_id(gpu: usize) -> String {
+        format!("hy4.context_staging.{gpu}")
+    }
+
+    pub fn new(
+        cfg: &Hy4Config,
+        kv_format: Hy4KvCache,
+        gpu: usize,
+        max_seq_pages: usize,
+    ) -> Result<Self> {
+        let pages = max_seq_pages.max(16);
+        let kv_page_bytes = PAGE_ROWS
+            .checked_mul(kv_format.record_bytes())
+            .context("Hy4 ContextStaging KV page overflow")?;
+        let index_page_bytes = INDEX_PAGE_BYTES;
+        let kv_bytes = pages
+            .checked_mul(kv_page_bytes)
+            .context("Hy4 ContextStaging KV overflow")?;
+        let index_bytes = pages
+            .checked_mul(index_page_bytes)
+            .context("Hy4 ContextStaging index overflow")?;
+        let arena = WeightArenaLayout::new(
+            Self::arena_id(gpu),
+            vec![
+                ("kv".into(), kv_bytes.max(256)),
+                ("index".into(), index_bytes.max(256)),
+                ("identity_pt".into(), (pages * 4).max(256)),
+                ("empty_cand_scores".into(), (cfg.indexer_topk * 4).max(256)),
+                ("empty_cand_indices".into(), (cfg.indexer_topk * 4).max(256)),
+            ],
+        )?;
+        Ok(Self {
+            arena,
+            pages,
+            kv_page_bytes,
+            index_page_bytes,
+        })
+    }
+}
+
 /// Metadata uploaded to each rank before it consumes a wave.
 pub const WAVE_METADATA: [&str; 7] = [
     "positions_i64",
@@ -242,6 +309,19 @@ pub const WAVE_METADATA: [&str; 7] = [
     "idx_seq_page_tables",
 ];
 
+/// Additional wave metadata planes uploaded when `context_split == true` (gathered prefill).
+pub const WAVE_METADATA_CONTEXT: [&str; 9] = [
+    "positions_i64",
+    "positions_i32",
+    "dsa_slots_i64",
+    "dsa_page_table",
+    "dsa_cu_seqlens",
+    "idx_cache_lens",
+    "idx_seq_page_tables",
+    "ctx_gather_tables",
+    "ctx_commit_tables",
+];
+
 pub fn wave_metadata_layout(slot: usize, wave: &WeightArenaLayout) -> Result<WeightArenaLayout> {
     wave_metadata_layout_for_rank(0, slot, wave)
 }
@@ -251,7 +331,12 @@ pub fn wave_metadata_layout_for_rank(
     slot: usize,
     wave: &WeightArenaLayout,
 ) -> Result<WeightArenaLayout> {
-    let views = WAVE_METADATA
+    let names: &[&str] = if wave.view("ctx_gather_tables").is_some() {
+        &WAVE_METADATA_CONTEXT
+    } else {
+        &WAVE_METADATA
+    };
+    let views = names
         .iter()
         .map(|&name| {
             let bytes = wave
@@ -294,8 +379,22 @@ impl WaveScratchLayout {
         max_seq_pages: usize,
         max_sequences: usize,
     ) -> Result<Self> {
+        Self::new_with_context(cfg, gpu, slot, tp, max_rows, max_seq_pages, max_sequences, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_context(
+        cfg: &Hy4Config,
+        gpu: usize,
+        slot: usize,
+        tp: usize,
+        max_rows: usize,
+        max_seq_pages: usize,
+        max_sequences: usize,
+        context_split: bool,
+    ) -> Result<Self> {
         ensure!(
-            matches!(tp, 1 | 2) && max_rows > 0 && max_sequences > 0,
+            matches!(tp, 1 | 2) && max_rows > 0 && max_sequences > 0 && (!context_split || tp == 2),
             "invalid Hy4 WaveScratchLayout shape"
         );
         let h = cfg.hidden;
@@ -303,7 +402,7 @@ impl WaveScratchLayout {
         let pages = max_seq_pages.max(16);
         let tp2_f32_bytes = if tp == 2 { max_rows * h * 4 } else { 256 };
 
-        let views: Vec<(String, usize)> = vec![
+        let mut views: Vec<(String, usize)> = vec![
             ("positions_i64".into(), (max_rows * 24).max(256)),
             ("positions_i32".into(), (max_rows * 4).max(256)),
             ("dsa_slots_i64".into(), (max_rows * 8).max(256)),
@@ -323,6 +422,13 @@ impl WaveScratchLayout {
             ("idx_cand_slots".into(), (max_rows * cfg.indexer_topk * 4).max(256)),
             ("idx_cand_lens".into(), (max_rows * 4).max(256)),
         ];
+        if context_split {
+            let gather_per_member = 2 * pages.div_ceil(2) * 4;
+            let commit_limit = context_commit_limit(max_rows);
+            let commit_per_member = CONTEXT_COMMIT_PLANES * 3 * commit_limit * 8;
+            views.push(("ctx_gather_tables".into(), (max_sequences * gather_per_member).max(256)));
+            views.push(("ctx_commit_tables".into(), (max_sequences * commit_per_member).max(256)));
+        }
         let arena = WeightArenaLayout::new(Self::arena_id(gpu, slot), views)?;
         Ok(Self { arena })
     }
@@ -426,6 +532,8 @@ impl SharedScratchLayout {
             views.push(("ctx_lse_own".into(), (decode_rows * half_heads * 4).max(256)));
             views.push(("ctx_partial_peer".into(), (decode_rows * half_heads * cfg.kv_lora_rank * 2).max(256)));
             views.push(("ctx_lse_peer".into(), (decode_rows * half_heads * 4).max(256)));
+            views.push(("ctx_draft_slots".into(), (decode_rows * cfg.indexer_topk * 4).max(256)));
+            views.push(("ctx_draft_lens".into(), (decode_rows * 4).max(256)));
         }
         if rank == 0 {
             views.push(("head_logits_f32".into(), (HEAD_TILE_ROWS * cfg.vocab_size * 4).max(256)));
@@ -573,5 +681,39 @@ mod tests {
         let [attn, ffn] = hy4_peer_slot_sizes(&cfg, 64);
         assert_eq!(attn, 64 * 6144 * 4);
         assert_eq!(ffn, hy4_peer_ffn_routed_offset(&cfg, 64) + 64 * 6144 * 4);
+    }
+
+    #[test]
+    fn context_split_staging_and_index_topk_scratch_match_gathered_prefill() -> Result<()> {
+        let cfg = test_cfg();
+        let manifest = serde_json::json!({
+            "programs": [
+                {"name": "hy42_index_topk_prefill", "scratch_bytes_at_capacity": {"scratch": 4_194_304}},
+                {"name": "hy42_scored_index_topk_prefill", "scratch_bytes_at_capacity": {"scratch": 8_388_608}},
+                {"name": "hy42_scored_index_topk_decode", "scratch_bytes_at_capacity": {"scratch": 1_048_576}}
+            ]
+        });
+        let topk = IndexTopkScratch::from_manifest_value(Some(&manifest), 2, true, 131_072)?;
+        assert_eq!(topk.topk_bytes, 8_388_608);
+        assert_eq!(topk.scored_bytes, 1_048_576);
+        assert_eq!(topk.topk_bytes.max(topk.scored_bytes), 8_388_608);
+
+        let staging = ContextStagingLayout::new(&cfg, Hy4KvCache::Fp8, 0, 2048)?;
+        assert_eq!(staging.arena.id(), "hy4.context_staging.0");
+        for name in ["kv", "index", "identity_pt", "empty_cand_scores", "empty_cand_indices"] {
+            let v = staging.arena.view(name).expect(name);
+            assert_eq!(v.offset() % 256, 0, "staging {name} unaligned");
+            assert!(v.bytes() >= 256);
+        }
+
+        let wave = WaveScratchLayout::new_with_context(&cfg, 0, 0, 2, 4096, 2048, 16, true)?;
+        assert!(wave.arena.view("ctx_gather_tables").is_some());
+        assert!(wave.arena.view("ctx_commit_tables").is_some());
+        let host = wave_metadata_layout_for_rank(0, 0, &wave.arena)?;
+        assert_eq!(host.views().len(), WAVE_METADATA_CONTEXT.len());
+        for name in WAVE_METADATA_CONTEXT {
+            assert_eq!(host.view(name).unwrap().bytes(), wave.arena.view(name).unwrap().bytes());
+        }
+        Ok(())
     }
 }

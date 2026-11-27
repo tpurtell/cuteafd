@@ -84,6 +84,8 @@ pub(crate) struct Hy4ContextPrograms<'a> {
     pub(crate) mla_gate_uv_dsa: Program<'a>,
     pub(crate) indexer_scored_topk: Program<'a>,
     pub(crate) indexer_merge_expand_owned: Program<'a>,
+    pub(crate) paged_staging_gather_kv: Program<'a>,
+    pub(crate) paged_staging_gather_index: Program<'a>,
 }
 
 /// Resolved, ABI-validated Hy4-flash coordinator AOT programs for one GPU rank.
@@ -273,6 +275,7 @@ impl<'a> Hy4Programs<'a> {
                     "lse",
                     "scratch",
                 ];
+                let gather_ptrs = &["pool", "table", "staging"];
                 Some(Hy4ContextPrograms {
                     dsa_partial_h0: load(&format!("mla_dsa_partial_{kv}_h0"), partial_ptrs)?,
                     dsa_partial_h16: load(&format!("mla_dsa_partial_{kv}_h16"), partial_ptrs)?,
@@ -286,6 +289,8 @@ impl<'a> Hy4Programs<'a> {
                         "indexer_merge_expand_owned",
                         &["scores", "indices", "positions", "page_table", "local_slots", "local_lengths", "draft_slots"],
                     )?,
+                    paged_staging_gather_kv: load(&format!("paged_staging_gather_kv_{kv}"), gather_ptrs)?,
+                    paged_staging_gather_index: load("paged_staging_gather_index", gather_ptrs)?,
                 })
             } else {
                 None
