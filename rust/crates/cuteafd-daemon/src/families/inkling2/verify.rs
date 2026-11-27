@@ -48,7 +48,7 @@ impl<'a> Verify<'a>{
   self.validate(mark)?;ensure!(self.pending.borrow().is_none() && rows.len()==mark.slots.len(),"Inkling pending verify inventory differs");
   let mut total=0;
   for (row,&(slot,start)) in rows.iter().zip(&mark.slots){
-   ensure!(row.slot==slot && row.start==start && row.first==total && (1..=8).contains(&row.rows),"Inkling verified receipt differs from marked slots");
+   ensure!(row.slot==slot && row.start==start && row.first==total && (1..=self.decode_rows).contains(&row.rows),"Inkling verified receipt differs from marked slots");
    total+=row.rows;
   }ensure!(total<=self.decode_rows,"Inkling verified rows exceed bounded replay");
   *self.pending.borrow_mut()=Some(rows);Ok(())

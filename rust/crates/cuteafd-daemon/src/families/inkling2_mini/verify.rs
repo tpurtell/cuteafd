@@ -163,7 +163,7 @@ impl<'a> Verify<'a> {
         let mut total = 0;
         for (row, &(slot, start)) in rows.iter().zip(&mark.slots) {
             ensure!(
-                row.slot == slot && row.start == start && row.first == total && (1..=8).contains(&row.rows),
+                row.slot == slot && row.start == start && row.first == total && (1..=self.decode_rows).contains(&row.rows),
                 "Mini verified receipt differs from marked slots"
             );
             total += row.rows;

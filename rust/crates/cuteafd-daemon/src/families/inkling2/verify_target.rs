@@ -35,9 +35,10 @@ impl<'a> BlockVerifyTarget for Target<'_,'a>{
             && request.rows.iter().all(|row|row.token.is_some()),"Inkling verify requires admitted native sites and active packed rows");
         let mut tokens=Vec::<Vec<u32>>::new();let mut submitted=Vec::new();let mut segments=Vec::new();
         let mut first=0;
+        let decode_rows=self.execution.requests.decode.layout.rows;
         for (index,p) in mark.placements.iter().enumerate(){
             let rows=request.rows.iter().filter(|row|row.slot==p.slot).collect::<Vec<_>>();
-            ensure!((1..=8).contains(&rows.len()),"Inkling verify member exceeds bundled block");
+            ensure!((1..=decode_rows).contains(&rows.len()),"Inkling verify member exceeds decode rows");
             let source=rows.iter().map(|row|row.token.unwrap()).collect::<Vec<_>>();
             ensure!(request.rows[first..first+rows.len()].iter().all(|row|row.slot==p.slot),"Inkling verify members must be contiguous");
             segments.push(UnitSegment{sequence:index,rows:first..first+rows.len(),tokens:p.len..p.len+rows.len(),
