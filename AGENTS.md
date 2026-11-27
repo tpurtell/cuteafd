@@ -180,8 +180,9 @@ Writing a quantization brief: start from [docs/quantization/brief-template.md](d
   Kernel changes go to `~/Developer/sparkinfer-glmrt` master, quantizer changes to
   `~/Developer/GPTQModel` main; push there first, then bump pin and lock here.
   A fork or export-source bump regenerates and publishes V4 and all-family placement inputs (`scripts/build/export-placement-inputs.py`, `~/.cache/cuteafd/builds/placement-inputs/<sha>/` plus `current`)
-  at the merged dev SHA, validated beforehand through
+  from the PR head, validated beforehand through
   `CUTEAFD_V4_PLACEMENT_INPUTS` / `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` without switching `current`.
+  Only the coordinator's `scripts/dev/land-pr` flips `current`: it merges and promotes on raptor and maxq in one step.
   Dev images are toolchain-only and pin-independent: a SparkInfer bump
   needs only a new WIP slot build. Rebuild them with
   `scripts/build/build-dev-images.sh` only when the toolchain changes;

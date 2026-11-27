@@ -244,8 +244,9 @@ CUTEAFD_DEV_TARGET_DIR="$root" CUTEAFD_DEV_MEMORY=32g \
   scripts/build/build-slot.sh python3 scripts/build/compare-sm-exports.py \
   --v4-placement-inputs "/opt/cuteafd-target/$sha" \
   --output-dir "/opt/cuteafd-target/staging-$sha" --workers 1 --timeout 7200
-ln -sfn "$sha" "$root/current"
 rm -rf "$root/staging-$sha"
+# The coordinator promotes it with the merge:
+# scripts/dev/land-pr PR --match-head-commit "$sha" --v4-publication "$sha" --v4-inputs-sha256 <printed>
 ```
 
 The exporter compiles Flash/Pro and their split-head programs at both 131072

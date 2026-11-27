@@ -2,8 +2,10 @@
 """Publish CPU-compiled planner inputs for the live installed checkpoint inventory.
 
 Run through scripts/build/cuteafd-dev.sh cpu, with --output and --staging on
-NVMe. Publication never switches current; validate the candidate with
-CUTEAFD_DEPLOYMENT_TEST_PROGRAMS=<output>/share/PROGRAMS.json before promoting it.
+NVMe. Publication never switches current, and refuses an output or staging
+path that is or resolves through a store's current link: validate the candidate
+with CUTEAFD_DEPLOYMENT_TEST_PROGRAMS=<output>/share/PROGRAMS.json, and let the
+coordinator's scripts/dev/land-pr merge and promote it on every host.
 """
 from __future__ import annotations
 
@@ -17,7 +19,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -408,8 +409,21 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
     return summary
 
 
+def refuse_current(*paths):
+    """Only scripts/dev/land-pr flips a store's current link (after the merge)."""
+    for path in paths:
+        path = Path(path)
+        for part in (path, *path.parents):
+            link = part.parent / "current"
+            if part.name == "current" or (link.is_symlink() and part.parent != part
+                                          and os.path.realpath(link) == os.path.realpath(part)):
+                raise ValueError(f"refusing {path}: publications never write a store's current link or its "
+                                 "target; publish into <store>/<sha> and promote with scripts/dev/land-pr")
+
+
 def publish(destination, staging, timeout, workers, previous=None, expect=None,
-            backend_cache=None, verify_skips=False, rsync_hosts=()):
+            backend_cache=None, verify_skips=False):
+    refuse_current(destination, staging)
     filesystem = compare.load_file("placement_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
     if backend_cache:
         filesystem.check_path(str(backend_cache))
@@ -515,28 +529,8 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
         if report["leaks"]:
             raise ValueError(f"UNEXPECTED KERNEL CHANGES outside --expect: {report['leaks']}")
     print(f"Published placement inputs: {destination}; {provenance['wall_seconds']} s; "
-          f"{sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())} bytes", flush=True)
-    if rsync_hosts:
-        rsync_publication(destination, rsync_hosts, timeout)
-
-
-def rsync_publication(destination, hosts, timeout=7200):
-    resolved = Path(destination).expanduser().resolve()
-    for required in ("INPUTS.json", "share/PROGRAMS.json"):
-        if not (resolved / required).is_file():
-            raise ValueError(f"missing published placement input {resolved / required}")
-    cleaned = [host.strip() for host in hosts if host and host.strip()]
-    if not cleaned:
-        return
-    with tempfile.TemporaryDirectory() as tmp:
-        current = Path(tmp) / "current"
-        current.symlink_to(resolved.name)
-        for host in cleaned:
-            subprocess.run(["rsync", "-a", "--delete", "--mkpath", f"{resolved}/", f"{host}:{resolved}/"],
-                           check=True, timeout=timeout)
-            subprocess.run(["rsync", "-a", "--mkpath", str(current), f"{host}:{resolved.parent}/"],
-                           check=True, timeout=timeout)
-            print(f"Synced placement inputs to {host}:{resolved} (current -> {resolved.name})", flush=True)
+          f"{sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())} bytes; "
+          f"INPUTS.json sha256 {compare.sha((destination / 'INPUTS.json').read_bytes())}", flush=True)
 
 
 def publication_records(staging, jobs):
@@ -595,7 +589,7 @@ def publication_records(staging, jobs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--staging", type=Path, help="staging directory on NVMe (required unless syncing an existing publication with --rsync-host)")
+    parser.add_argument("--staging", type=Path, required=True, help="staging directory on NVMe")
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument("--workers", type=int, default=default_workers(),
                         help="CPU export workers (default: host-admitted export jobs)")
@@ -603,25 +597,21 @@ def main():
     parser.add_argument("--expect", type=Path, help="JSON list of export job groups expected to change")
     parser.add_argument("--backend-cache", type=Path, help="content-addressed lowered-MLIR cache on NVMe")
     parser.add_argument("--verify-skips", action="store_true", help="run skipped frontends and reject changed IR")
-    parser.add_argument("--rsync-host", action="append", default=[],
-                        help="remote host(s) to receive the published directory and current symlink via rsync")
     args = parser.parse_args()
-    hosts = [host.strip() for raw in args.rsync_host for host in raw.split(",") if host.strip()]
     if args.expect and not args.previous:
         parser.error("--expect requires --previous")
     if args.workers < 1 or args.timeout < 1:
         parser.error("--workers and --timeout must be positive")
+    try:
+        refuse_current(args.output.expanduser().absolute(), args.staging.expanduser().absolute())
+    except ValueError as error:
+        parser.error(str(error))
     output = args.output.expanduser().resolve()
-    if args.staging is None:
-        if not hosts:
-            parser.error("--staging is required unless syncing an existing publication with --rsync-host")
-        rsync_publication(output, hosts, args.timeout)
-        return
     publish(output, args.staging.expanduser().resolve(), args.timeout, args.workers,
             args.previous.expanduser().resolve() if args.previous else None,
             args.expect.expanduser().resolve() if args.expect else None,
             args.backend_cache.expanduser().resolve() if args.backend_cache else None,
-            args.verify_skips, rsync_hosts=hosts)
+            args.verify_skips)
 
 
 if __name__ == "__main__":

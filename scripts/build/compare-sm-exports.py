@@ -1289,6 +1289,8 @@ def v4_export_jobs():
 def v4_placement_inputs(destination, staging, timeout, workers, previous=None, backend_cache=None,
                         verify_skips=False, expect=None):
     """Publish compiler-produced planner metadata, never inferred scratch sizes."""
+    publisher = load_file("v4_publication_records", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher.refuse_current(destination, staging)  # only scripts/dev/land-pr flips current
     filesystem = load_file("cuteafd_build_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
     for path in (destination, staging):
         filesystem.check_path(str(path))
@@ -1300,7 +1302,6 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
     sources = v4_placement_sources()
     exports = v4_export_jobs()
 
-    publisher = load_file("v4_publication_records", ROOT / "scripts/build/export-placement-inputs.py")
     if backend_cache:
         filesystem.check_path(str(backend_cache))
     verify_skips = verify_skips or os.environ.get("CUTEAFD_BUILD_KIND") == "release"
@@ -1365,7 +1366,8 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
         records_module.write_report(destination, report)
         if report["leaks"]:
             raise ValueError(f"UNEXPECTED V4 KERNEL CHANGES outside --expect: {report['leaks']}")
-    print(f"Published V4 placement inputs: {destination}", flush=True)
+    print(f"Published V4 placement inputs: {destination}; INPUTS.json sha256 "
+          f"{sha((destination / 'INPUTS.json').read_bytes())}", flush=True)
 
 
 def main():
@@ -1409,6 +1411,8 @@ def main():
             parser.error("--workers and --timeout must be positive")
         if args.expect and not args.previous:
             parser.error("--expect requires --previous")
+        load_file("v4_current_guard", ROOT / "scripts/build/export-placement-inputs.py").refuse_current(
+            args.v4_placement_inputs.expanduser().absolute(), args.output_dir.expanduser().absolute())
         v4_placement_inputs(args.v4_placement_inputs.expanduser().resolve(),
                             args.output_dir.expanduser().resolve(), args.timeout, args.workers,
                             args.previous.expanduser().resolve() if args.previous else None,
