@@ -179,7 +179,7 @@ def test_remove_handles_read_only_directories(tmp_path):
 
 def run_script(cache, *args, path=None):
     env = {**os.environ, 'PATH': path if path is not None else os.environ['PATH']}
-    return subprocess.run([sys.executable, str(SCRIPT), '--root', str(cache), '--no-docker-prune', *args],
+    return subprocess.run([sys.executable, str(SCRIPT), '--root', str(cache), '--no-docker-prune', '--no-placement-prune', *args],
                           capture_output=True, text=True, env=env, timeout=120)
 
 

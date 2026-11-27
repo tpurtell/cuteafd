@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Prune unreferenced placement-input publications (dry run unless --delete).
+
+  scripts/dev/prune-placement-inputs [--delete] [--keep-newest 10] [--root DIR]
+
+Stores: ROOT/builds/placement-inputs and ROOT/builds/v4-placement-inputs. A
+publication is a real directory directly in a store that holds INPUTS.json;
+every other entry (staging, logs, expect files, caches) is left alone, and
+symlinks are never followed or removed, so `current` itself is never touched.
+
+A publication is kept when any of these holds:
+
+- it is the target of a symlink in the store (`current`, and by-key/ links);
+- its INPUTS.json engine_commit is the head SHA of an open PR;
+- its engine_commit is the source commit of a sealed WIP slot
+  (builds/*/slots/<slot>/<role>/META.json beside workspace/BUILD_IDENTITY.json);
+- a Docker container (running or stopped) mounts it, inside it or a parent
+  of it, or a process uses it (cwd, open or mapped file, a path in its command
+  line or environment: a gate pointing CUTEAFD_DEPLOYMENT_TEST_PROGRAMS at it);
+- it is among the --keep-newest newest publications of its store by mtime.
+
+If the open PRs or the Docker containers cannot be listed, nothing is deleted.
+Each deletion re-checks the rules first. Sizes are allocated bytes with
+hard links counted once; the stores are btrfs reflink farms, so a delete can
+free less than that (the --delete summary reports df).
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import time
+
+STORES = ('placement-inputs', 'v4-placement-inputs')
+LINK_DIRECTORIES = ('', 'by-key')
+REPOSITORY = 'tpurtell/cuteafd'
+HERE = Path(__file__).resolve().parent
+
+
+def _cache_gc():
+    loader = importlib.machinery.SourceFileLoader('cuteafd_cache_gc', str(HERE / 'cache-gc'))
+    spec = importlib.util.spec_from_loader('cuteafd_cache_gc', loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault('cuteafd_cache_gc', module)
+    loader.exec_module(module)
+    return module
+
+
+GC = _cache_gc()
+
+
+@dataclass
+class Publication:
+    path: Path
+    store: str
+    commit: str | None
+    mtime: float
+    allocated: int = 0
+    reason: str = ''
+
+
+def log(message):
+    print(f'prune-placement-inputs: {message}', file=sys.stderr, flush=True)
+
+
+def engine_commit(path):
+    try:
+        with open(path / 'INPUTS.json', 'rb') as stream:
+            head = stream.read(4096).decode(errors='replace')
+    except OSError:
+        return None
+    # INPUTS.json is up to ~100 MB; engine_commit is the second key it writes.
+    marker = '"engine_commit": "'
+    start = head.find(marker)
+    if start < 0:
+        return None
+    value = head[start + len(marker):start + len(marker) + 40]
+    return value if len(value) == 40 and all(c in '0123456789abcdef' for c in value) else None
+
+
+def publications(store):
+    """Real directories directly in the store that hold a regular INPUTS.json."""
+    found = []
+    try:
+        entries = sorted(store.iterdir())
+    except OSError:
+        return found
+    for entry in entries:
+        try:
+            info = entry.lstat()
+            inputs = (entry / 'INPUTS.json').lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode) or not stat.S_ISREG(inputs.st_mode):
+            continue
+        found.append(Publication(entry, store.name, engine_commit(entry), max(info.st_mtime, inputs.st_mtime)))
+    return found
+
+
+def link_targets(store):
+    """Store directories named by symlinks in the store or its by-key/ index, resolved in the store only."""
+    targets = {}
+    real_store = Path(os.path.realpath(store))
+    for name in LINK_DIRECTORIES:
+        directory = store / name if name else store
+        if name and (directory.is_symlink() or not directory.is_dir()):
+            continue
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_symlink():
+                continue
+            target = Path(os.path.realpath(entry))
+            if target.parent == real_store:
+                targets.setdefault(target.name, str(entry.relative_to(store)))
+    return targets
+
+
+def open_pr_heads(repository=REPOSITORY):
+    """Head SHAs of open PRs, or None when GitHub cannot be asked."""
+    try:
+        result = subprocess.run(['gh', 'pr', 'list', '--repo', repository, '--state', 'open', '--limit', '1000',
+                                 '--json', 'number,headRefOid'], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    try:
+        return {pr['headRefOid']: pr['number'] for pr in json.loads(result.stdout)}
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def sealed_slot_commits(builds):
+    """Source commit -> one sealed WIP slot built from it."""
+    commits = {}
+    for meta in sorted(builds.glob('*/slots/*/*/META.json')):
+        identity = meta.parent / 'workspace/BUILD_IDENTITY.json'
+        try:
+            commit = json.loads(identity.read_text()).get('commit')
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(commit, str) and len(commit) == 40:
+            commits.setdefault(commit, str(meta.parent.relative_to(builds)))
+    return commits
+
+
+@dataclass
+class References:
+    heads: dict
+    slots: dict
+    gc: object  # cache-gc Environment: mounts, busy paths, held lock inodes
+
+
+def gather(root):
+    heads = open_pr_heads()
+    if heads is None:
+        return None, 'open PRs could not be listed (gh)'
+    mounts = GC.docker_mounts()
+    if mounts is None:
+        return None, 'docker is installed but its containers could not be listed'
+    busy, _ = GC.process_paths(root / 'builds', ignore_own_cmdline=True)
+    env = GC.Environment(mounts=mounts, busy=busy, held_inodes=GC.held_lock_inodes())
+    return References(heads=heads, slots=sealed_slot_commits(root / 'builds'), gc=env), ''
+
+
+def protection(publication, links, references):
+    if publication.path.name in links:
+        return f'target of {links[publication.path.name]}'
+    if publication.commit in references.heads:
+        return f'head of open PR #{references.heads[publication.commit]}'
+    if publication.commit in references.slots:
+        return f'source of sealed WIP slot {references.slots[publication.commit]}'
+    target = Path(os.path.realpath(publication.path))
+    for source in references.gc.mounts:
+        if GC.related(target, source):
+            return f'mounted by a Docker container: {source}'
+    for path in references.gc.busy:
+        if GC.inside(path, target):
+            return f'in use by a process: {path}'
+    return ''
+
+
+def plan(root, keep_newest, references):
+    """(to delete, kept) across both stores."""
+    chosen, kept = [], []
+    for name in STORES:
+        store = root / 'builds' / name
+        if store.is_symlink() or not store.is_dir():
+            continue
+        links = link_targets(store)
+        found = sorted(publications(store), key=lambda p: p.mtime, reverse=True)
+        for index, publication in enumerate(found):
+            publication.reason = protection(publication, links, references) or (
+                f'among the {keep_newest} newest' if index < keep_newest else '')
+            if not publication.reason:
+                candidate = GC.Candidate(publication.path, 'placement')
+                GC.scan(candidate, float('inf'), stop_early=False)
+                publication.allocated = candidate.allocated
+                if candidate.reason:  # unreadable or foreign: a partial delete is worse than none
+                    publication.reason = candidate.reason
+            (kept if publication.reason else chosen).append(publication)
+    return chosen, kept
+
+
+def remove(publication, store):
+    path = publication.path
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or Path(os.path.realpath(path)).parent != Path(os.path.realpath(store)):
+        raise OSError(f'refusing a path outside the store or a symlink: {path}')
+    GC.remove(path)  # rmtree: never follows symlinks inside
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--delete', action='store_true', help='delete the listed publications (default: dry run)')
+    parser.add_argument('--keep-newest', type=int, default=10, help='newest publications kept per store (default 10)')
+    parser.add_argument('--root', type=Path, default=Path.home() / '.cache/cuteafd')
+    parser.add_argument('--verbose', action='store_true', help='also list kept publications and why')
+    args = parser.parse_args(argv)
+    if args.keep_newest < 0:
+        parser.error('--keep-newest must be non-negative')
+    root = args.root.expanduser().resolve()
+    if not (root / 'builds').is_dir():
+        log(f'{root / "builds"} does not exist; nothing to do')
+        return 0
+    with open(root / 'prune-placement-inputs.lock', 'a') as guard:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log('another prune is running')
+            return 0
+        return run(root, args)
+
+
+def run(root, args):
+    references, error = gather(root)
+    gathered = time.time()
+    if references is None:
+        log(f'{error}; deleting nothing')
+        return 2
+    chosen, kept = plan(root, args.keep_newest, references)
+    before = GC.free_bytes(root)
+    deleted, errors = 0, []
+    for publication in chosen:
+        line = f'{publication.store:20} {GC.gib(publication.allocated):>10}  {publication.commit or "-":40}  {publication.path}'
+        if not args.delete:
+            print('would delete ' + line)
+            continue
+        # An open PR, a link or a gate may have appeared since the plan: refresh each minute.
+        if time.time() - gathered > 60:
+            references, problem = gather(root)
+            gathered = time.time()
+            if references is None:
+                log(f'{problem}; deleting nothing more')
+                errors.append(problem)
+                break
+        reason = protection(publication, link_targets(publication.path.parent), references)
+        if reason:
+            kept.append(Publication(publication.path, publication.store, publication.commit, publication.mtime,
+                                    reason=f'rechecked: {reason}'))
+            continue
+        try:
+            remove(publication, publication.path.parent)
+            deleted += 1
+            print('deleted ' + line)
+        except OSError as failure:
+            errors.append(str(failure))
+            log(f'could not delete {publication.path}: {failure}')
+    if args.verbose:
+        for publication in kept:
+            print(f'kept         {publication.store:20} {publication.path.name}: {publication.reason}')
+    allocated = sum(p.allocated for p in chosen)
+    by_store = {name: sum(1 for p in chosen if p.store == name) for name in STORES}
+    summary = (f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} placement publications: "
+               + (f'would delete {len(chosen)} ({GC.gib(allocated)} allocated)' if not args.delete
+                  else f'deleted {deleted}/{len(chosen)} freed {GC.gib(GC.free_bytes(root) - before)} (df)')
+               + ' [' + ', '.join(f'{name} {count}' for name, count in by_store.items()) + ']'
+               + f' kept {len(kept)} errors {len(errors)}')
+    print(summary)
+    if args.delete:
+        with open(root / 'cache-gc.log', 'a') as stream:
+            stream.write(summary + '\n')
+    return 1 if errors else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
