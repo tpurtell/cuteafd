@@ -19,6 +19,15 @@ max_unacked_depth = 8
 max_unacked_age_secs = 1800
 auto_nudge_on_mail = true
 
+[watchdog]
+# Watchdog auto-recovers crashed/unexpectedly exited coordinators (e.g. Claude random full exits)
+# with `--resume`, crash-loop backoff, and a recovery kickoff prompt; `peerswarm stop` sets desired_state="stopped".
+auto_restart = true
+max_restarts_per_window = 4
+restart_window_secs = 900
+base_backoff_secs = 15
+ready_timeout_secs = 25
+
 [budget]
 # Moderate vendor load only when its LAST available account drops <= 20% remaining
 moderate_below_pct = 20.0
@@ -64,6 +73,7 @@ cli = "agy"
 vendor = "google"
 model = "gemini-4-neon-high"
 plan_usd = 200
+affinity_kinds = ["perf", "duel", "research"]
 yolo = true
 remote_control = true
 add_dirs = [
@@ -81,6 +91,9 @@ premium = "gemini-4-neon-xhigh"
 cli = "claude"
 vendor = "anthropic"
 model = "opus"
+# SIGKILL on managed restart avoids Claude's clean-exit handler marking async subagents cancelled
+stop_signal = "SIGKILL"
+affinity_kinds = ["feature", "bug", "task"]
 yolo = true
 remote_control = true
 remote_control_name = "cuteafd-claude"
@@ -117,6 +130,7 @@ vendor = "openai"
 model = "gpt-6.2-sol"
 effort = "high"
 plan_usd = 500
+affinity_kinds = ["feature", "bug", "infra", "perf"]
 yolo = true
 add_dirs = [
   "/home/tj/Developer/sparkinfer-glmrt",
