@@ -19,6 +19,7 @@ OBSERVER_GPU_UUIDS = cards.observer_gpu_uuids
 
 
 REAL_LISTENING_PORTS = cards.listening_ports
+REAL_CHECK_LAUNCHER_SUBMODULES = cards.check_launcher_submodules
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +34,9 @@ def no_stop_handlers(monkeypatch, tmp_path):
     # Nor read the live host's listening sockets: a real card serving a kit's fixed
     # ADDR port would fail every grant-time preflight. Guard tests stub `run` directly.
     monkeypatch.setattr(cards, 'listening_ports', lambda: set())
+    # Nor inspect the launcher checkouts' submodules: most tests name placeholder
+    # repos. test_uninitialized_arm_submodule_refuses_before_any_lock runs the real check.
+    monkeypatch.setattr(cards, 'check_launcher_submodules', lambda *args: None)
     monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
     monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
     cards.bench_panels.cache_clear()
@@ -2639,6 +2643,63 @@ def test_build_ref_is_pinned_once_across_build_and_launcher(entry, tmp_path, mon
         assert arm['build_revision'] == first and arm['repo_commit'] == first
     finally:
         git('update-ref', '-d', ref)
+
+
+def _git(path, *args):
+    return subprocess.run(['git', '-C', str(path), '-c', 'user.name=t', '-c', 'user.email=t@t',
+                           '-c', 'protocol.file.allow=always', *args],
+                          capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _checkout_with_submodule(tmp_path, name):
+    """A launcher checkout whose third_party/sparkinfer submodule is pinned by
+    third_party/sparkinfer.lock.json, plus a clone of it with the submodule never
+    initialized (a fresh `git worktree add`)."""
+    upstream = tmp_path / 'sparkinfer-upstream'
+    if not upstream.exists():
+        _checkout(upstream, run_sh=False)
+    pinned = _real_head(upstream)
+    repo = tmp_path / name
+    _checkout(repo)
+    _git(repo, 'submodule', '-q', 'add', str(upstream), 'third_party/sparkinfer')
+    (repo / 'third_party/sparkinfer.lock.json').write_text(json.dumps(dict(schema=1, revision=pinned)))
+    (repo / 'scripts/dev').mkdir(parents=True)
+    (repo / 'scripts/dev/submodule-init-local').write_text('#!/bin/sh\n')
+    _git(repo, 'add', '-A')
+    _git(repo, 'commit', '-qm', 'pin sparkinfer')
+    fresh = tmp_path / (name + '-fresh')
+    _git(tmp_path, 'clone', '-q', str(repo), str(fresh))
+    return repo, fresh, pinned
+
+
+def test_uninitialized_arm_submodule_refuses_before_any_lock(entry, tmp_path, monkeypatch, capsys):
+    # #2722: the seal checks the build copy, but run.sh verifies the live arm worktree's
+    # SparkInfer source; an uninitialized one must refuse before any build, seed lease
+    # or hardware ticket, naming the worktree and its own submodule-init-local.
+    monkeypatch.setattr(cards, 'check_launcher_submodules', REAL_CHECK_LAUNCHER_SUBMODULES)
+    good, fresh, pinned = _checkout_with_submodule(tmp_path, 'launcher')
+    assert cards.submodule_problems(good) == []
+    assert cards.submodule_problems(fresh) == ['third_party/sparkinfer is not initialized']
+    def forbidden(*args, **kwargs):
+        raise AssertionError('took a build, seed or hardware step before refusing')
+    monkeypatch.setattr(cards, 'build_arms', forbidden)
+    monkeypatch.setattr(cards.hwlock, 'hold', forbidden)
+    with pytest.raises(ValueError) as refused:
+        _per_arm_dry_run(entry, tmp_path, monkeypatch, capsys,
+                         ['--arm', 'a=a:s', '--arm', 'b=b:s2', '--arm-repo', f'a={fresh}', '--repo', str(good)])
+    message = str(refused.value)
+    assert 'refused before taking any lock' in message
+    assert f'arm a: launcher worktree {fresh}: third_party/sparkinfer is not initialized' in message
+    assert f"fix with {fresh / 'scripts/dev/submodule-init-local'}" in message
+    assert 'arm b' not in message
+    assert not (fresh / 'third_party/sparkinfer/.git').exists()  # refused, never initialized for its owner
+    # A submodule checked out away from the recorded commit, and a lock that disagrees
+    # with the gitlink, refuse too.
+    _git(good / 'third_party/sparkinfer', 'commit', '-q', '--allow-empty', '-m', 'local edit')
+    assert cards.submodule_problems(good)[0].startswith('third_party/sparkinfer is checked out at ')
+    _git(good / 'third_party/sparkinfer', 'checkout', '-q', pinned)
+    (good / 'third_party/sparkinfer.lock.json').write_text(json.dumps(dict(schema=1, revision='0' * 40)))
+    assert cards.submodule_problems(good) == [f'third_party/sparkinfer is at {pinned[:12]}, not 000000000000 pinned by sparkinfer.lock.json']
 
 
 def test_per_arm_repo_preflight_refusals(tmp_path, monkeypatch):
