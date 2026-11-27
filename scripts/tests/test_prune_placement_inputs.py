@@ -182,3 +182,18 @@ def test_open_pr_rule_covers_branch_commits_and_force_pushed_heads(monkeypatch):
     assert prune.open_pr_commits() is None
     monkeypatch.setattr(prune.subprocess, 'run', lambda command, **kwargs: subprocess.CompletedProcess(command, 1, '', 'x'))
     assert prune.open_pr_commits() is None
+
+
+def test_store_ancestor_mounts_do_not_protect_but_store_and_inside_mounts_do(cache):
+    store = cache / 'builds/placement-inputs'
+    for ancestor in (cache.parent, cache, cache / 'builds'):
+        chosen, _ = prune.plan(cache, 2, references(cache, mounts=[ancestor]))
+        assert names(chosen) == {sha(3), sha(4), sha(8)}, ancestor
+    chosen, kept = prune.plan(cache, 2, references(cache, mounts=[store]))
+    assert not names(chosen) and all(p.reason for p in kept)
+    chosen, kept = prune.plan(cache, 2, references(cache, mounts=[store / sha(3), store / sha(8) / 'share']))
+    assert names(chosen) == {sha(4)}
+    chosen, _ = prune.plan(cache, 2, references(cache, mounts=[store / 'staging-x']))  # not a publication
+    assert names(chosen) == {sha(3), sha(4), sha(8)}
+    chosen, _ = prune.plan(cache, 2, references(cache, mounts=[store / 'current']))  # resolves to its target
+    assert sha(6) not in names(chosen)

@@ -15,8 +15,9 @@ A publication is kept when any of these holds:
   force-pushed away (a candidate is often one rebase behind its PR head);
 - its engine_commit is the source commit of a sealed WIP slot
   (builds/*/slots/<slot>/<role>/META.json beside workspace/BUILD_IDENTITY.json);
-- a Docker container (running or stopped) mounts it, inside it or a parent
-  of it, or a process uses it (cwd, open or mapped file, a path in its command
+- a Docker container (running or stopped) mounts it, a path inside it or the
+  whole store (a mount of an ancestor of the store, such as a home directory,
+  does not count), or a process uses it (cwd, open or mapped file, a path in its command
   line or environment: a gate pointing CUTEAFD_DEPLOYMENT_TEST_PROGRAMS at it);
 - it is among the --keep-newest newest publications of its store by mtime.
 
@@ -217,8 +218,13 @@ def protection(publication, links, references):
     if publication.commit in references.slots:
         return f'source of sealed WIP slot {references.slots[publication.commit]}'
     target = Path(os.path.realpath(publication.path))
+    store = target.parent
     for source in references.gc.mounts:
-        if GC.related(target, source):
+        # A mount of the store or of (something inside) this publication names it.
+        # A mount of an ancestor of the store (a whole home directory) names
+        # nothing in particular: deleting below it cannot make Docker recreate
+        # a root-owned source, and in-container use shows in the process scan.
+        if source == store or GC.inside(source, target):
             return f'mounted by a Docker container: {source}'
     for path in references.gc.busy:
         if GC.inside(path, target):
