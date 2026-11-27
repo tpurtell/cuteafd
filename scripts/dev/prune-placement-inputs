@@ -11,7 +11,8 @@ symlinks are never followed or removed, so `current` itself is never touched.
 A publication is kept when any of these holds:
 
 - it is the target of a symlink in the store (`current`, and by-key/ links);
-- its INPUTS.json engine_commit is the head SHA of an open PR;
+- its INPUTS.json engine_commit is any commit on an open PR branch, current or
+  force-pushed away (a candidate is often one rebase behind its PR head);
 - its engine_commit is the source commit of a sealed WIP slot
   (builds/*/slots/<slot>/<role>/META.json beside workspace/BUILD_IDENTITY.json);
 - a Docker container (running or stopped) mounts it, inside it or a parent
@@ -126,19 +127,53 @@ def link_targets(store):
     return targets
 
 
-def open_pr_heads(repository=REPOSITORY):
-    """Head SHAs of open PRs, or None when GitHub cannot be asked."""
-    try:
-        result = subprocess.run(['gh', 'pr', 'list', '--repo', repository, '--state', 'open', '--limit', '1000',
-                                 '--json', 'number,headRefOid'], capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode:
-        return None
-    try:
-        return {pr['headRefOid']: pr['number'] for pr in json.loads(result.stdout)}
-    except (ValueError, KeyError, TypeError):
-        return None
+OPEN_PR_COMMITS = """
+query($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, first: 50, after: $after) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number headRefOid
+        commits(last: 250) { totalCount nodes { commit { oid } } }
+        timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT], last: 100) {
+          nodes { ... on HeadRefForcePushedEvent { beforeCommit { oid } afterCommit { oid } } }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def open_pr_commits(repository=REPOSITORY):
+    """Commit -> open PR number, for every commit on an open PR branch and both
+    sides of its force-pushes: a candidate's engine_commit is often a head the
+    branch has since rebased away from. None when GitHub cannot be asked."""
+    owner, name = repository.split('/')
+    commits, after = {}, None
+    while True:
+        command = ['gh', 'api', 'graphql', '-F', f'owner={owner}', '-F', f'name={name}',
+                   '-f', f'query={OPEN_PR_COMMITS}', *(['-F', f'after={after}'] if after else [])]
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+            page = json.loads(result.stdout)['data']['repository']['pullRequests'] if not result.returncode else None
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
+            page = None
+        if page is None:
+            return None
+        for pr in page['nodes']:
+            number = pr['number']
+            history = pr['commits']
+            if history['totalCount'] > len(history['nodes']):
+                return None  # truncated history: refuse rather than miss a commit
+            oids = [pr['headRefOid'], *(item['commit']['oid'] for item in history['nodes'])]
+            for event in pr['timelineItems']['nodes']:
+                oids += [event[side]['oid'] for side in ('beforeCommit', 'afterCommit') if event.get(side)]
+            for oid in oids:
+                commits.setdefault(oid, number)
+        if not page['pageInfo']['hasNextPage']:
+            return commits
+        after = page['pageInfo']['endCursor']
 
 
 def sealed_slot_commits(builds):
@@ -163,7 +198,7 @@ class References:
 
 
 def gather(root):
-    heads = open_pr_heads()
+    heads = open_pr_commits()
     if heads is None:
         return None, 'open PRs could not be listed (gh)'
     mounts = GC.docker_mounts()
@@ -178,7 +213,7 @@ def protection(publication, links, references):
     if publication.path.name in links:
         return f'target of {links[publication.path.name]}'
     if publication.commit in references.heads:
-        return f'head of open PR #{references.heads[publication.commit]}'
+        return f'commit on open PR #{references.heads[publication.commit]}'
     if publication.commit in references.slots:
         return f'source of sealed WIP slot {references.slots[publication.commit]}'
     target = Path(os.path.realpath(publication.path))
