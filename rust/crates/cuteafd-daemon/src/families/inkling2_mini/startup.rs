@@ -46,6 +46,8 @@ pub(crate) struct Options<'a> {
     pub expert_usage: bool,
     pub prewarm_graphs: bool,
     pub vision: &'a crate::shared::vision::still::Options,
+    /// `--decode-graphs` (default on): off charges no graph reserve and never captures.
+    pub decode_graphs: bool,
 }
 
 pub(crate) struct Prepared<'a> {
@@ -158,6 +160,7 @@ pub(crate) fn prepare<'a>(
             loaded_code: 0,
         },
         prefill: options.prefill,
+        decode_graphs: options.decode_graphs,
         decode_rows: options.decode_rows,
         context_tokens: options.context_tokens,
         pool_tokens: options.pool_tokens,
@@ -214,6 +217,7 @@ pub(crate) fn whole<'a>(
     let total_start = std::time::Instant::now();
     let phase = crate::shared::memory::load_timing::Split::start();
     let t_admit = std::time::Instant::now();
+    let decode_graphs = options.decode_graphs;
     let prepared = prepare(library, programs, checkpoint, cfg, options)?;
     let admit_secs = t_admit.elapsed().as_secs_f64();
     phase.log("inkling2_mini code and admission");
@@ -380,7 +384,7 @@ pub(crate) fn whole<'a>(
         decode_rows,
         inputs.drafter.is_some() || inputs.dflash.is_some(),
     );
-    let graph_policy = cuteafd_loader::serving_capacity::inkling2_mini_graphs::policy(0, graph_keys)?;
+    let graph_policy = cuteafd_loader::serving_capacity::inkling2_mini_graphs::policy(0, graph_keys, decode_graphs)?;
     ensure!(
         inputs.graph_reserve == graph_policy.bytes,
         "Mini graph cache disagrees with admission"

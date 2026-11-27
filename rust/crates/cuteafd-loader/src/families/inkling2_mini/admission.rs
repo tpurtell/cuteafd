@@ -65,6 +65,8 @@ pub struct FactsRequest<'a> {
     pub manifest: Option<Arc<serde_json::Value>>,
     pub coordinator: Coordinator,
     pub prefill: PrefillShape,
+    /// `--decode-graphs` (default on): off charges no graph reserve.
+    pub decode_graphs: bool,
     /// Admitted per-lane decode/verify row budget (`DECODE_ROWS`, 1..=128).
     pub decode_rows: u32,
     pub context_tokens: u64,
@@ -246,7 +248,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
         decode_rows as usize,
         request.drafter.is_some() || request.dflash.is_some(),
     );
-    let graph_reserve = crate::serving_capacity::inkling2_mini_graphs::policy(0, graph_keys)
+    let graph_reserve = crate::serving_capacity::inkling2_mini_graphs::policy(0, graph_keys, request.decode_graphs)
         .map_err(|error| refused(format!("Inkling 2 Mini graph reserve refused: {error}"), "Fix GPU_GRAPH_RESERVE."))?
         .bytes;
 

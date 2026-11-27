@@ -74,15 +74,15 @@ fn resolve(
     extra: Option<&str>,
     cap: Option<&str>,
 ) -> Result<Resolved, Error> {
-    if !enabled {
-        return graph_reserve::resolve(Some("0"), rank, false, 0, 0);
-    }
+    if !enabled { return Ok(graph_reserve::disabled(rank)); }
     graph_reserve::resolve_working_set(total, extra, cap, rank, working_set(keys))
 }
 
-pub fn policy(rank: usize, keys: KeySpace) -> Result<Resolved, Error> {
-    let enabled = !std::env::var_os("CUTEAFD_INKLING2_MINI_GRAPHS").is_some_and(|on| on == "0");
-    if !enabled {
+/// `decode_graphs` is `--decode-graphs` (default on); off charges nothing. The
+/// key-space formula covers every admitted concurrency and speculator input
+/// (`KeySpace::for_config` clamps to at least one key), so it never yields 0.
+pub fn policy(rank: usize, keys: KeySpace, decode_graphs: bool) -> Result<Resolved, Error> {
+    if !decode_graphs {
         return resolve(rank, keys, false, None, None, None);
     }
     let read = |key: &'static str| match std::env::var(format!("CUTEAFD_{key}")) {

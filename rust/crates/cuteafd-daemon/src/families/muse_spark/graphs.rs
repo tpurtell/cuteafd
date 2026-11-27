@@ -26,7 +26,7 @@ pub(crate) struct Graphs<'a> {
 
 impl<'a> Graphs<'a> {
     pub(crate) fn new(device: Device<'a>, rank: usize, ranks: usize, onboard_layers: usize) -> Result<Self> {
-        let reserve = cuteafd_loader::serving_capacity::muse_graphs::policy(ranks, onboard_layers, rank)?;
+        let reserve = cuteafd_loader::serving_capacity::muse_graphs::policy(ranks, onboard_layers, rank, true)?;
         let mut bank = GraphBank::new();
         bank.attach_device(device.library, device.id, reserve.bytes, Site {
             name: "muse_spark.segment", cycle: Cycle::Decode, preference: Preference::Adaptive,

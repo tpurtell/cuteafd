@@ -1,6 +1,6 @@
 //! Muse decode prewarm: exact live rows, with a fixed admitted page-table pitch.
-//! An untraced layout has no startup graphs or pins; explicit reserve permits
-//! bounded lazy capture while the layout's own trace is being collected.
+//! A layout without its own trace has no startup graphs or pins and charges the
+//! family × ranks envelope, so its decode graphs still capture lazily.
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 
@@ -50,11 +50,16 @@ pub fn layout(ranks: usize, onboard_layers: usize) -> Option<&'static Layout> {
     list.layouts.iter().find(|layout| layout.ranks == ranks && layout.onboard_layers == onboard_layers)
 }
 
-pub fn policy(ranks: usize, onboard_layers: usize, rank: usize) -> Result<crate::placement::graph_reserve::Resolved,
-    crate::placement::graph_reserve::Error> {
-    let (base, tail) = layout(ranks, onboard_layers).map_or((0, 0), |layout|
-        (layout.reserve_base_bytes[rank], layout.reserve_extra_bytes[rank]));
-    crate::placement::graph_reserve::current(rank, false, base, tail)
+/// The traced layout's arena plus the shared extra, else the Muse × ranks
+/// envelope; `decode_graphs = false` charges nothing.
+pub fn policy(ranks: usize, onboard_layers: usize, rank: usize, decode_graphs: bool)
+    -> Result<crate::placement::graph_reserve::Resolved, crate::placement::graph_reserve::Error> {
+    use crate::placement::graph_reserve::{self, GraphFamily};
+    if !decode_graphs { return Ok(graph_reserve::disabled(rank)); }
+    match layout(ranks, onboard_layers) {
+        Some(layout) => graph_reserve::current(rank, false, layout.reserve_base_bytes[rank], layout.reserve_extra_bytes[rank]),
+        None => graph_reserve::current_envelope(GraphFamily::Muse, ranks, rank),
+    }
 }
 
 pub fn selected<'a>(layout: &'a Layout, bases: &[u64]) -> Vec<&'a Entry> {
@@ -71,6 +76,21 @@ pub fn selected<'a>(layout: &'a Layout, bases: &[u64]) -> Vec<&'a Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_without_trace_charges_the_envelope_and_off_charges_nothing() {
+        cuteafd_core::memory_policy::MemoryPolicy::default().scoped(|| {
+            for (ranks, onboard) in [(1, 0), (1, 5), (2, 2), (2, 62)] {
+                for rank in 0..ranks {
+                    let charged = policy(ranks, onboard, rank, true).unwrap();
+                    assert_eq!(charged.bytes, crate::placement::graph_reserve::envelope_bytes(
+                        crate::placement::graph_reserve::GraphFamily::Muse, ranks, rank));
+                    assert_eq!(policy(ranks, onboard, rank, false).unwrap().bytes, 0);
+                }
+            }
+            assert_eq!(policy(1, 2, 0, true).unwrap().bytes, 1_559_061_760);
+        });
+    }
 
     #[test]
     fn untraced_layout_borrows_no_inventory_and_pins_nothing() {

@@ -101,9 +101,20 @@ pub fn prewarm(layout: Option<Step5GraphLayout>) -> Option<&'static Step5GraphTr
         list
     }).layouts.iter().find(|trace| trace.layout == layout)
 }
-pub fn reserve(layout: Option<Step5GraphLayout>, rank: usize) -> (u64, u64) {
+pub fn reserve(layout: Option<Step5GraphLayout>, rank: usize) -> Option<(u64, u64)> {
     prewarm(layout).and_then(|trace| trace.ranks.get(rank))
-        .map_or((0, 0), |data| (data.reserve_base_bytes, data.reserve_extra_bytes))
+        .map(|data| (data.reserve_base_bytes, data.reserve_extra_bytes))
+}
+
+/// The traced layout's arena plus the shared extra, else the Step-5 × ranks
+/// envelope (the shipping MC checkpoints have no own trace, #2896).
+pub fn policy(layout: Option<Step5GraphLayout>, ranks: usize, rank: usize)
+    -> Result<crate::placement::graph_reserve::Resolved, crate::placement::graph_reserve::Error> {
+    use crate::placement::graph_reserve::{self, GraphFamily};
+    match reserve(layout, rank) {
+        Some((base, tail)) => graph_reserve::current(rank, false, base, tail),
+        None => graph_reserve::current_envelope(GraphFamily::Step5, ranks, rank),
+    }
 }
 /// Select complete rows against all devices; never borrow an untraced layout.
 pub fn selected_rows(layout: Option<Step5GraphLayout>, max_rows: usize) -> anyhow::Result<Vec<(usize, bool)>> {
@@ -166,7 +177,7 @@ mod tests {
             ] {
                 let trace = prewarm(Some(layout)).unwrap();
                 for (rank, base) in bases.into_iter().enumerate() {
-                    assert_eq!(reserve(Some(layout), rank), (base, 2 << 20));
+                    assert_eq!(reserve(Some(layout), rank), Some((base, 2 << 20)));
                     assert_eq!(trace.ranks[rank].entries.len(), rows);
                 }
                 let selected = selected_rows(Some(layout), 64).unwrap();
@@ -176,14 +187,22 @@ mod tests {
             }
             for layout in [Step5GraphLayout::Fp8Max, Step5GraphLayout::Nvfp4Min] {
                 assert!(prewarm(Some(layout)).is_none());
-                assert_eq!(reserve(Some(layout), 0), (0, 0));
+                assert_eq!(reserve(Some(layout), 0), None);
             }
         });
     }
     #[test]
-    fn untraced_layout_has_no_pins_no_charge_and_no_borrowed_rows() {
+    fn layout_without_trace_has_no_pins_or_rows_and_charges_the_envelope() {
+        use crate::placement::graph_reserve::{envelope_bytes, GraphFamily};
         assert!(prewarm(None).is_none());
-        assert_eq!(reserve(None, 0), (0, 0));
+        assert_eq!(reserve(None, 0), None);
         assert!(selected_rows(None, 4096).unwrap().is_empty());
+        cuteafd_core::memory_policy::MemoryPolicy::default().scoped(|| {
+            for ranks in [1, 2] {
+                for rank in 0..ranks {
+                    assert_eq!(policy(None, ranks, rank).unwrap().bytes, envelope_bytes(GraphFamily::Step5, ranks, rank));
+                }
+            }
+        });
     }
 }

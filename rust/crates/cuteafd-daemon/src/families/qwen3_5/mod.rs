@@ -16,6 +16,9 @@ use cuteafd_loader::families::qwen3_5::Qwen35Checkpoint;
 pub(crate) struct GoldenArgs {
     #[arg(long, default_value = "bf16")]
     pub(crate) attention_precision: cuteafd_core::attention::AttentionPrecision,
+    /// Bounded rank-local decode/verify graph replay (serving's default).
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     #[arg(long)]
     pub snapshot: PathBuf,
     /// Hugging Face identity for a snapshot outside the standard hub layout.
@@ -94,7 +97,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     ensure!(args.nll_tolerance.is_finite() && args.nll_tolerance >= 0.0, "invalid NLL tolerance");
     let golden = args.golden.as_ref().context("dense golden requires --golden reference directory")?;
     let published = if golden.join("manifest.json").is_file() {
-        ensure!(args.packed_check.is_some() || (cuteafd_loader::serving_capacity::qwen35_graphs::enabled()
+        ensure!(args.packed_check.is_some() || (args.decode_graphs
             && args.spec_decode.is_none() && args.draft.is_none() && args.mtp_golden.is_none()
             && args.save_logits.is_none()),
             "compact dense graph oracle requires graphs enabled and no draft/MTP or full-logits output; use the standard card for external quality");
@@ -157,7 +160,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let mtp_admission = args.packed_mtp.then(|| engine::mtp::Admission::new(&reader, cfg, &programs)).transpose()?;
     let mut engine = engine::DenseEngine::with_owners(&library, &programs, &checkpoint, cfg.clone(),
         args.pool_tokens, mtp_admission.as_ref().map(|a| a.bytes.clone()), slots, marks, args.kv_cache, None, args.verify_check,
-        peer_device.zip(peer_programs.as_ref()))?;
+        args.decode_graphs, peer_device.zip(peer_programs.as_ref()))?;
     engine.warm_decode_graphs()?;
     if args.verify_check {
         engine.verify_check(&tokens)?;

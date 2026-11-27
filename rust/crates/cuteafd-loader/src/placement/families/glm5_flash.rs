@@ -195,6 +195,8 @@ pub struct GlmfInputs<'a> {
     pub sequences: u64,
     /// Served graph policy, independent of whether DFlash weights are resident.
     pub speculation: bool,
+    /// `--decode-graphs` (default on): off charges no graph reserve.
+    pub decode_graphs: bool,
     pub state_slots: u64,
     pub mark_slots: u64,
     pub pool_marks: bool,
@@ -608,7 +610,7 @@ pub(crate) mod tests {
 
     pub(crate) fn inputs(cfg: &GlmNextConfig, ranks: usize, capacity: u64) -> GlmfInputs<'_> {
         let context = ArchContext::coordinator(capacity, None).context_bytes;
-        GlmfInputs { target_pool_tokens: None, resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(262_144),
+        GlmfInputs { decode_graphs: true, target_pool_tokens: None, resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(262_144),
             attention: Default::default(), cfg, layers: cfg.layers,
             gpus: (0..ranks).map(|rank| (capacity, Baseline::Planned {
                 context_bytes: context + inventory::loaded_code_allowance("glmf", "exl3", ranks == 2,

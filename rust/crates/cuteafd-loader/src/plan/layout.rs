@@ -165,10 +165,9 @@ pub struct LayoutOptions {
     pub draft_context_window: usize,
     /// Explicit MiMo DFlash context arena; does not widen its draft batch.
     pub draft_context_slots: Option<u64>,
-    /// MiMo segmented decode graphs (runtime default: on).
-    pub mimo_decode_graphs: bool,
-    pub step5_decode_graphs: bool,
-    pub glm_decode_graphs: bool,
+    /// Coordinator decode/verify CUDA graphs (`--decode-graphs`, `DECODE_GRAPHS`;
+    /// engine default on for every family). Off charges no graph reserve.
+    pub decode_graphs: bool,
     /// Physical SM count for scratch when simulating a smaller memory budget.
     pub physical_sms: Option<u32>,
     /// MiMo bundled drafter representation; launch cards select single-copy FP8.
@@ -361,9 +360,7 @@ impl Default for LayoutOptions {
             draft_kv_cache: crate::families::qwen4::Qwen4KvCache::Fp8,
             draft_context_window: 0,
             draft_context_slots: None,
-            mimo_decode_graphs: true,
-            step5_decode_graphs: true,
-            glm_decode_graphs: true,
+            decode_graphs: true,
             physical_sms: None,
             mimo_draft_bf16: false,
             mimo_drafter_disabled: false,

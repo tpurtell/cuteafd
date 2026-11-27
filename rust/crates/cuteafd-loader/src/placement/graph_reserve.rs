@@ -46,12 +46,144 @@ pub fn v41_working_set(ranks: usize, rank: usize, lanes: u8, decode_rows: u32) -
 }
 
 /// Resolve V4.1's reserve through the shared `current_working_set` rule for
-/// measured layouts, or `current(rank, false, 0, 0)` for unknown layouts.
+/// measured layouts, or the family × ranks envelope for any other rank count.
 pub fn v41_current(ranks: usize, rank: usize, lanes: u8, decode_rows: u32) -> Result<Resolved, Error> {
     match v41_working_set(ranks, rank, lanes, decode_rows) {
         Some(measured) => current_working_set(rank, measured),
-        None => current(rank, false, 0, 0),
+        None => current_envelope(GraphFamily::V41, ranks, rank),
     }
+}
+
+/// A coordinator decode-graph family, as the family × ranks reserve envelope keys it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GraphFamily {
+    Muse, Kimi, Mimo, Qwen35, Step5, V4, V41, MiniMax, Glm5, Ml4, GlmFlash, Qwen4, Hy4Flash, Hy4,
+    Inkling2, Inkling2Mini,
+}
+
+impl GraphFamily {
+    pub const ALL: [Self; 16] = [Self::Muse, Self::Kimi, Self::Mimo, Self::Qwen35, Self::Step5, Self::V4,
+        Self::V41, Self::MiniMax, Self::Glm5, Self::Ml4, Self::GlmFlash, Self::Qwen4, Self::Hy4Flash, Self::Hy4,
+        Self::Inkling2, Self::Inkling2Mini];
+}
+
+const MIB: u64 = 1 << 20;
+
+/// The fallback reserve when a family's specialized resolver has no entry for a
+/// combination: the largest default charge across that family's measured points
+/// at that coordinator rank count, per rank (views, onboarding counts,
+/// checkpoints, attention placements, concurrencies). Specialized entries stay
+/// the first choice; this only replaces what used to resolve to a 0 reserve.
+/// Values are charged bytes with no environment override, recomputed from each
+/// family's checked-in census by `coverage_tests::envelopes_equal_measured_maxima`
+/// (sources at `ef8db1f393`):
+/// - Muse `muse_prewarm.json` (1, onboard 2) base+tail+500 MB extra; (2, onboard 0).
+/// - Kimi `kimi_prewarm.json`: K6 1x; K6 2x (larger than BF16 2x and the provisional census).
+/// - MiMo `mimo_prewarm.json`: Flash `mimof-48` 1x (extra capped at base); Pro `mimop-70` 2x.
+/// - Qwen 3.5 `qwen35_prewarm.json` 27B BF16/FP8-KV 1x; no 2x census, so 2x
+///   borrows the 1x value on each rank (an upper bound: each rank owns half the layers).
+/// - Step-5 `step5_prewarm.json` EXL3 K4+Core-K6 1x+3 / 2x+6 traces.
+/// - V4 `v4_prewarm.json` traced `rtx1-spark`; `rtx2-spark` (larger than `rtx2-local`).
+/// - V4.1 `v41_working_set`: 1x one lane at 128 rows; 2x one lane at 128 rows (the
+///   formula covers every lane/row input at 1 or 2 ranks; this only serves other rank counts).
+/// - MiniMax `measured_graph_base`: 1x C16 heads; 2x C16 heads (larger than layers/F32).
+/// - GLM 5.3 / ML4 `glm_working_set` (ML4 1x is the scaled 88/78 entry).
+/// - GLM Flash `glmf_graphs::working_set`: 1x; 2x split DFlash (both ranks 94 MiB W1).
+/// - Qwen4 `qwen_working_set`; Hy4-flash `hy4_graphs` census (1x max of local and
+///   Spark onboarding; 2x local TP2); Hy4 `hy4::graph_reserve` full-card census.
+/// - Inkling 2 lag-8 working sets plus margin; Inkling 2 Mini at its measured
+///   boot-C64 speculating key space (128 keys).
+pub const ENVELOPES: &[(GraphFamily, usize, &[u64])] = &[
+    (GraphFamily::Muse, 1, &[1_559_061_760]),
+    (GraphFamily::Muse, 2, &[1_789_748_480, 1_804_428_544]),
+    (GraphFamily::Kimi, 1, &[2_332_910_848]),
+    (GraphFamily::Kimi, 2, &[2_039_309_568, 2_043_503_872]),
+    (GraphFamily::Mimo, 1, &[847_249_408]),
+    (GraphFamily::Mimo, 2, &[1_148_019_968, 1_091_396_864]),
+    (GraphFamily::Qwen35, 1, &[1_101_882_624]),
+    (GraphFamily::Step5, 1, &[3_909_969_152]),
+    (GraphFamily::Step5, 2, &[3_337_446_656, 3_131_925_760]),
+    (GraphFamily::V4, 1, &[1_171_088_640]),
+    (GraphFamily::V4, 2, &[1_454_204_160, 1_454_204_160]),
+    (GraphFamily::V41, 1, &[3_952 * MIB]),
+    (GraphFamily::V41, 2, &[1_626 * MIB, 1_636 * MIB]),
+    (GraphFamily::MiniMax, 1, &[84 * MIB]),
+    (GraphFamily::MiniMax, 2, &[168 * MIB, 132 * MIB]),
+    (GraphFamily::Glm5, 1, &[278 * MIB]),
+    (GraphFamily::Glm5, 2, &[454 * MIB, 458 * MIB]),
+    (GraphFamily::Ml4, 1, &[300 * MIB]),
+    (GraphFamily::Ml4, 2, &[396 * MIB, 394 * MIB]),
+    (GraphFamily::GlmFlash, 1, &[178 * MIB]),
+    (GraphFamily::GlmFlash, 2, &[198 * MIB, 198 * MIB]),
+    (GraphFamily::Qwen4, 1, &[134 * MIB]),
+    (GraphFamily::Qwen4, 2, &[116 * MIB, 120 * MIB]),
+    (GraphFamily::Hy4Flash, 1, &[192 * MIB]),
+    (GraphFamily::Hy4Flash, 2, &[204 * MIB, 202 * MIB]),
+    (GraphFamily::Hy4, 1, &[324 * MIB]),
+    (GraphFamily::Hy4, 2, &[344 * MIB, 334 * MIB]),
+    (GraphFamily::Inkling2, 1, &[398 * MIB]),
+    (GraphFamily::Inkling2, 2, &[454 * MIB, 240 * MIB]),
+    (GraphFamily::Inkling2Mini, 1, &[1_238 * MIB]),
+];
+
+/// Layouts whose default is eager decode by measurement, not by a missing
+/// census: `(family, coordinator ranks, Sparks attached)`. Hy4-flash 2x RTX +
+/// Sparks measured slower with either C1 (116/108 MiB) or wide (1130/1058 MiB)
+/// graph reserves than eager (`hy4_graphs::CENSUS`), so its default reserve is 0;
+/// an explicit `GPU_GRAPH_RESERVE` still enables capture.
+pub const EAGER_DEFAULTS: &[(GraphFamily, usize, bool)] = &[(GraphFamily::Hy4Flash, 2, true)];
+
+/// The envelope for `rank` of a `ranks`-GPU layout: the same rank count's row,
+/// else the largest value of the family's other rows (Qwen 3.5 2x borrows 1x;
+/// an unknown rank count takes the family's largest). Every family has a row.
+pub fn envelope_bytes(family: GraphFamily, ranks: usize, rank: usize) -> u64 {
+    let rows = || ENVELOPES.iter().filter(move |(f, _, _)| *f == family);
+    rows().find(|(_, r, _)| *r == ranks).and_then(|(_, _, bytes)| bytes.get(rank).copied())
+        .or_else(|| rows().flat_map(|(_, _, bytes)| bytes.iter().copied()).max())
+        .expect("every graph family has an envelope row")
+}
+
+/// Charge an envelope: an explicit `GPU_GRAPH_RESERVE` total is exact (and
+/// conflicts with either extra key); an explicit `GPU_GRAPH_RESERVE_EXTRA` adds
+/// to the envelope, bounded by an explicit cap. No implicit extra: the envelope
+/// is already a charged total.
+pub fn resolve_envelope(text: Option<&str>, extra_text: Option<&str>, cap_text: Option<&str>,
+    rank: usize, bytes: u64) -> Result<Resolved, Error> {
+    if select(text, rank, false, "GPU_GRAPH_RESERVE", false)?.is_some() {
+        return resolve_with_extra(text, extra_text, cap_text, rank, false, 0, 0);
+    }
+    let extra = select(extra_text, rank, false, "GPU_GRAPH_RESERVE_EXTRA", true)?;
+    let cap = select(cap_text, rank, false, "GPU_GRAPH_RESERVE_EXTRA_CAP", true)?;
+    let extra_bytes = extra.map_or(Ok(0), |value| value.bytes("GPU_GRAPH_RESERVE_EXTRA", bytes))?;
+    let cap_bytes = cap.map(|value| value.bytes("GPU_GRAPH_RESERVE_EXTRA_CAP", bytes)).transpose()?;
+    let effective_extra_bytes = cap_bytes.map_or(extra_bytes, |cap| extra_bytes.min(cap));
+    Ok(Resolved {
+        bytes: bytes.checked_add(effective_extra_bytes).ok_or(Error::Overflow { key: "GPU_GRAPH_RESERVE" })?,
+        source: "family × ranks envelope", base_bytes: bytes, base_source: FAMILY,
+        extra_bytes, extra_source: if extra.is_some() { USER } else { FAMILY },
+        cap_bytes, cap_source: if cap.is_some() { USER } else { FAMILY }, effective_extra_bytes,
+        growth_headroom: None,
+    })
+}
+
+/// The envelope fallback under the process's reserve keys.
+pub fn current_envelope(family: GraphFamily, ranks: usize, rank: usize) -> Result<Resolved, Error> {
+    let text = read("GPU_GRAPH_RESERVE")?;
+    let extra = read("GPU_GRAPH_RESERVE_EXTRA")?;
+    let cap = read("GPU_GRAPH_RESERVE_EXTRA_CAP")?;
+    resolve_envelope(text.as_deref(), extra.as_deref(), cap.as_deref(), rank, envelope_bytes(family, ranks, rank))
+}
+
+/// A measured-eager default (`EAGER_DEFAULTS`): 0 unless the operator sets a reserve.
+pub fn current_eager(rank: usize) -> Result<Resolved, Error> {
+    let mut policy = current(rank, false, 0, 0)?;
+    if policy.bytes == 0 { policy.source = "eager by measurement"; }
+    Ok(policy)
+}
+
+/// The graphs-off policy: nothing charged, no device cache.
+pub fn disabled(rank: usize) -> Resolved {
+    resolve(Some("0"), rank, false, 0, 0).expect("a zero reserve always resolves")
 }
 
 /// Kimi K3 selects its arena by checkpoint core format and coordinator rank count: TP2 captures a
@@ -247,12 +379,13 @@ pub fn current_working_set(rank: usize, measured: WorkingSet) -> Result<Resolved
     resolve_working_set(text.as_deref(), extra.as_deref(), cap.as_deref(), rank, measured)
 }
 
-/// Look up a coordinator census by its exact family-defined layout and rank.
-/// Unknown rows retain the unmeasured zero-base policy and explicit overrides.
-pub fn current_census<K: PartialEq>(rank: usize, layout: Option<K>, table: &[(K, usize, WorkingSet)]) -> Result<Resolved, Error> {
+/// Look up a coordinator census by its exact family-defined layout and rank;
+/// any other combination charges the family × ranks envelope, never 0.
+pub fn current_census<K: PartialEq>(rank: usize, layout: Option<K>, table: &[(K, usize, WorkingSet)],
+    family: GraphFamily, ranks: usize) -> Result<Resolved, Error> {
     match census_working_set(rank, layout, table) {
         Some(measured) => current_working_set(rank, measured),
-        None => current(rank, false, 0, 0),
+        None => current_envelope(family, ranks, rank),
     }
 }
 
@@ -303,8 +436,38 @@ pub fn prewarm_selection(pinned: &[bool], bases: &[u64],
 }
 
 #[cfg(test)]
+#[path = "graph_reserve_coverage_tests.rs"]
+mod coverage_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn envelope_is_a_charged_total_with_exact_user_overrides() {
+        let bytes = 300 << 20;
+        let policy = resolve_envelope(None, None, None, 0, bytes).unwrap();
+        assert_eq!((policy.bytes, policy.source, policy.effective_extra_bytes), (bytes, "family × ranks envelope", 0));
+        assert_eq!(resolve_envelope(Some("0"), None, None, 0, bytes).unwrap().bytes, 0);
+        assert_eq!(resolve_envelope(Some("gpu1=64MiB"), None, None, 1, bytes).unwrap().bytes, 64 << 20);
+        assert_eq!(resolve_envelope(Some("gpu1=64MiB"), None, None, 0, bytes).unwrap().bytes, bytes);
+        assert_eq!(resolve_envelope(None, Some("10MiB"), None, 0, bytes).unwrap().bytes, bytes + (10 << 20));
+        assert_eq!(resolve_envelope(None, Some("10MiB"), Some("4MiB"), 0, bytes).unwrap().bytes, bytes + (4 << 20));
+        assert!(resolve_envelope(Some("1GiB"), Some("10MiB"), None, 0, bytes).is_err());
+    }
+
+    #[test]
+    fn envelope_borrows_another_rank_count_only_when_its_own_is_missing() {
+        assert_eq!(envelope_bytes(GraphFamily::Muse, 2, 1), 1_804_428_544);
+        assert_eq!(envelope_bytes(GraphFamily::Qwen35, 2, 0), envelope_bytes(GraphFamily::Qwen35, 1, 0));
+        assert_eq!(envelope_bytes(GraphFamily::Qwen35, 2, 1), envelope_bytes(GraphFamily::Qwen35, 1, 0));
+        assert_eq!(envelope_bytes(GraphFamily::Inkling2, 3, 2), 454 << 20);
+        for family in GraphFamily::ALL {
+            for ranks in 0..=3 {
+                for rank in 0..ranks.max(1) { assert!(envelope_bytes(family, ranks, rank) > 0, "{family:?} {ranks}"); }
+            }
+        }
+    }
 
     #[test]
     fn census_lookup_never_borrows_another_layout_or_rank() {

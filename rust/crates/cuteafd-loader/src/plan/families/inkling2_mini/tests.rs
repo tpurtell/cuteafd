@@ -189,7 +189,7 @@ fn mini_plan_charges_key_space_scaled_graph_reserve_once() {
     };
     for concurrency in [1u64, 16, 64] {
         let (bytes, count) = charge(concurrency, DECODE_ROWS as u32);
-        let expected = inkling2_mini_graphs::policy(0, KeySpace::for_config(concurrency, DECODE_ROWS, false))
+        let expected = inkling2_mini_graphs::policy(0, KeySpace::for_config(concurrency, DECODE_ROWS, false), true)
             .unwrap()
             .bytes;
         assert_eq!(count, 1, "graph reserve must be charged exactly once at C{concurrency}");

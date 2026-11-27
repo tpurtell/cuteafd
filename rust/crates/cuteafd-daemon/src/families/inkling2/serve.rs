@@ -6,6 +6,9 @@ use std::{net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    /// Bounded rank-local decode/verify graph replay; prefill and peer exchanges stay eager.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     #[command(flatten)] pub vision: crate::shared::vision::still::Options,
     #[command(flatten)] pub attention: crate::cli::CoreViewArgs,
     #[arg(long)] pub snapshot: PathBuf,
@@ -107,7 +110,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     sequences: worker_args.max_sequences as u64, context_tokens: worker_args.max_context.unwrap_or(0) as u64,
                     pool_tokens: worker_args.pool_tokens, kv_format: worker_args.kv_format, drafter:worker_args.dspark.then_some(worker_args.draft_kv_cache), onboard: worker_args.rtx_expert_layers.resolve(cfg.layers),
                     prefix: &worker_args.prefix, resident_weights: crate::shared::memory::budget::resident_weight_limit(),
-                    expert_usage: false, vision: &worker_args.vision })?;
+                    expert_usage: false, vision: &worker_args.vision, decode_graphs: worker_args.decode_graphs })?;
             let context = usize::try_from(admitted.solved.served_context())?;
             let family = super::cache::InklingPrefix::for_execution(&execution);
             let host = (inputs.host_prefix.quota_bytes > 0).then(|| {

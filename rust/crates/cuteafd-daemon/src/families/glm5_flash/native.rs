@@ -238,7 +238,7 @@ mod tests {
                     let resident = cuteafd_loader::families::glm5_flash::resident::native_resident(
                         &facts.selection, cfg.layers, &facts.plans(&owners)?, &facts.shared_bytes)?;
                     // Only the target recipe fields participate in this header-only check.
-                    let input = GlmfInputs { target_pool_tokens: None, cfg: &cfg, layers: cfg.layers, attention, resident: resident.clone(),
+                    let input = GlmfInputs { decode_graphs: true, target_pool_tokens: None, cfg: &cfg, layers: cfg.layers, attention, resident: resident.clone(),
                         gpus: vec![(96 << 30, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 }); ranks],
                         ..native_test_inputs(&cfg, ranks) };
                     let mut process = ProcessOwners::new((512 << 30, 512 << 30), 8 << 30).with_spark_capacities(cuteafd_loader::serving_capacity::spark_memory::serving_bytes());
@@ -273,7 +273,7 @@ mod tests {
 
     fn native_test_inputs(cfg: &GlmNextConfig, ranks: usize) -> cuteafd_loader::placement::families::glm5_flash::GlmfInputs<'_> {
         use cuteafd_loader::placement::{families::glm5_flash::GlmfInputs, planner, Onboard};
-        GlmfInputs { target_pool_tokens: None, blas_head: cuteafd_loader::placement::planner::serving::BlasHead::Native, cfg, layers: cfg.layers, attention: Default::default(), resident: vec![], gpus: vec![],
+        GlmfInputs { decode_graphs: true, target_pool_tokens: None, blas_head: cuteafd_loader::placement::planner::serving::BlasHead::Native, cfg, layers: cfg.layers, attention: Default::default(), resident: vec![], gpus: vec![],
             context: planner::Context::pinned(262_144), resident_weight_limit: None,
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, pending_code: vec![0; ranks],
             local_tp2_exl3: false, headroom_bytes: 0, spark_ranks: 4, prefill_lanes: 2, prefill_rows: 4096,

@@ -96,7 +96,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let request = FactsRequest { target_pool_tokens: opts.target_pool_tokens, vision: report.vision, vision_replicas: opts.vision_replicas,
         media_cache_bytes: opts.media_cache_bytes, checkpoint: input.checkpoint(), catalog, cfg, kv_format: opts.inkling_kv, drafter, manifest_path: manifest_path.as_deref(),
         manifest, coordinator: Coordinator::Planned { cards: cards.clone() }, attention, spark_ranks: ranks,
-        spark_bytes, prefill: shape, decode_rows: opts.decode_rows, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
+        spark_bytes, prefill: shape, decode_graphs: opts.decode_graphs, decode_rows: opts.decode_rows, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("inkling2"),
         prefix_mark_budget: opts.mimo_prefix_mark_bytes,
         replies: opts.spark_reply_formats, head: opts.bf16_target_head, expert_usage: opts.expert_usage,

@@ -368,12 +368,14 @@ impl GlmfGraphs {
 
 fn graph_reserve(i: &GlmfInputs<'_>, split_draft: bool) -> Result<GlmfGraphs, p::Refusal> {
     let gpus = i.gpus.len();
-    let policies: Vec<_> = (0..gpus).map(|gpu| {
+    let policies: Vec<_> = (0..gpus).map(|gpu| if !i.decode_graphs {
+        Ok(crate::placement::graph_reserve::disabled(gpu))
+    } else {
         crate::placement::graph_reserve::current_working_set(gpu, glmf_graphs::working_set(gpus, split_draft, gpu))
             .map_err(invalid)
     }).collect::<Result<_, _>>()?;
     let bootstraps: Vec<_> = (0..gpus).map(|gpu| glmf_graphs::bootstrap_bytes(gpus, i.spark_ranks > 0, gpu)).collect();
-    let executables = policies.iter().zip(&bootstraps).map(|(policy, &boot)| policy.base_bytes.div_ceil(boot)).collect();
+    let executables = policies.iter().zip(&bootstraps).map(|(policy, &boot)| policy.base_bytes.div_ceil(boot.max(1))).collect();
     Ok(GlmfGraphs { policies, executables, bootstraps })
 }
 

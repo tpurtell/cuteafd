@@ -81,7 +81,7 @@ impl Opened {
         } else { 0 };
         let host = admission::host_owners(args, &self.cfg, layers, mtp, 2, sparks, self.checkpoint.spark_input_is_bf16(),
             ple_info.map(|(row_bytes, _)| row_bytes), host_embedding)?;
-        let (placement, solved) = qwen4::dual_admitted(&qwen4::QwenDualInputs { target_pool: None,
+        let (placement, solved) = qwen4::dual_admitted(&qwen4::QwenDualInputs { decode_graphs: args.decode_graphs, target_pool: None,
         experts: Some(experts.clone()), blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!args.mtp_fp8_head),
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), context,
             owner_manifests: manifests.each_ref().map(Some),
@@ -177,6 +177,7 @@ impl Opened {
         let engine_ranks = [(devices[0], &programs[0], std::rc::Rc::clone(&streams[0])), (devices[1], &programs[1], std::rc::Rc::clone(&streams[1]))];
         let mut engine = engine::Qwen4Engine::new_placed_with_decode_rows(&self.library, self.cfg.clone(), model, ple, &owners,
             &engine_ranks, context, args.prefill_rows, pool.div_ceil(engine::PAGE_ROWS), args.slots, decode_rows, args.kv_format, embedding)?;
+        engine.use_graphs = args.decode_graphs;
         engine.prefill_shape = args.prefill_shape()?;
         engine.attention_plan = plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();

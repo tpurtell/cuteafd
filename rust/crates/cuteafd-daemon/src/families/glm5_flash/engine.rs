@@ -1467,7 +1467,7 @@ pub(crate) struct GlmfEngine<'a> {
     /// for the routes and wire rows), the Spark exchanges, and the head (final
     /// norm, vocabulary projection, logits download).
     pub profile: RefCell<[f64; 3]>,
-    /// Captured decode segments (CUTEAFD_GLMF_GRAPHS=0 runs decode eagerly), within the graph
+    /// Captured decode segments (`--decode-graphs false` runs decode eagerly), within the graph
     /// budget when one is set.
     graphs: RefCell<GraphBank<GraphKey, GraphExec<'a>>>,
     use_graphs: bool,
@@ -1718,7 +1718,7 @@ impl<'a> GlmfEngine<'a> {
             table_pages, table_pool_pages, decode_workspace: RefCell::new(None),
             prefill_slots: RefCell::new(Vec::new()),
             experts: None, packed_row_cap: Cell::new(None), packed_programs: Default::default(), tp2: None, local: None, expert_routing: None, dense_nvfp4: None, profile: RefCell::new([0.0; 3]), graphs: RefCell::new(GraphBank::with_family("glm5_flash")),
-            use_graphs: Self::graphs_enabled(),
+            use_graphs: true,
             graph_cycles: RefCell::new(None),
             graphs_ready: std::cell::Cell::new(false),
             split_audit: std::env::var("CUTEAFD_GLMF_SPLIT_AUDIT").is_ok_and(|v| v == "1"),
@@ -1744,10 +1744,8 @@ impl<'a> GlmfEngine<'a> {
         self.synchronize()
     }
 
-    /// `CUTEAFD_GLMF_GRAPHS=0` keeps the eager oracle available.
-    pub(crate) fn graphs_enabled() -> bool {
-        std::env::var("CUTEAFD_GLMF_GRAPHS").map_or(true, |v| v != "0")
-    }
+    /// `--decode-graphs false` keeps the eager oracle available.
+    pub(crate) fn set_decode_graphs(&mut self, enabled: bool) { self.use_graphs = enabled; }
 
     /// Attach the admitted rank-local sites before any first-use capture. No
     /// observed shape used at least half the cycles of a band, so none pin.
@@ -3157,7 +3155,7 @@ impl<'a> GlmfEngine<'a> {
     }
 
     /// Attaches the selection dump before startup graphs: decode then runs
-    /// eagerly (no capture, like `CUTEAFD_GLMF_GRAPHS=0`), heads or whole
+    /// eagerly (no capture, like `--decode-graphs false`), heads or whole
     /// placement with every MLA layer present on rank 0.
     pub(crate) fn attach_selection_dump(&mut self, dump: std::sync::Arc<crate::shared::selection_dump::SelectionDump>) -> Result<()> {
         use crate::shared::selection_dump::ENV_DIR;

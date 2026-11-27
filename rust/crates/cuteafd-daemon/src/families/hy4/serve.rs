@@ -640,7 +640,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 gpus, worker_args.peers.len(), attention_placement,
             );
             let graph_policies: Vec<_> = (0..gpus)
-                .map(|rank| graph_reserve::reserve_policy(graph_layout, rank))
+                .map(|rank| graph_reserve::reserve_policy(graph_layout, gpus, rank))
                 .collect::<std::result::Result<_, _>>()?;
             ensure!(
                 graph_policies.iter().map(|policy| policy.bytes).eq(inputs.graph_reserve.iter().copied()),

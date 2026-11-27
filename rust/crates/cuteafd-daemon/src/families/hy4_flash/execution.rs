@@ -2517,8 +2517,9 @@ impl<'a> Hy4Engine<'a> {
         layout: Option<cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout>,
     ) -> Result<()> {
         let tp2_dfly2 = self.draft.as_ref().is_some_and(|d| d.tp() == 2);
+        let ranks = self.ranks.len();
         for (rank, r) in self.ranks.iter_mut().enumerate() {
-            r.graphs.attach(r.device.library, r.device.id, rank, layout, tp2_dfly2)?;
+            r.graphs.attach(r.device.library, r.device.id, rank, ranks, layout, tp2_dfly2)?;
         }
         let streams = self.ranks.iter().map(|r| (r.device.id, r.stream.raw)).collect::<Vec<_>>();
         *self.graph_cycles.borrow_mut() = Some(graph_device::EventCycles::new(self.library(), &streams)?);

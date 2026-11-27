@@ -3,7 +3,6 @@ use crate::families::{qwen3_5::Qwen35Config, qwen4::Qwen4KvCache};
 use serde::Deserialize;
 
 pub const BOOTSTRAP_BYTES: u64 = 2 << 20;
-pub const TAIL_BYTES: u64 = 2 << 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 pub struct Geometry {
@@ -45,33 +44,46 @@ pub fn variant(cfg: &Qwen35Config, fp8: bool, kv: Qwen4KvCache) -> String {
         if fp8 { "fp8" } else { "bf16" }, kv)
 }
 
-pub fn enabled() -> bool {
-    std::env::var("CUTEAFD_QWEN35_GRAPHS").ok().as_deref() == Some("1")
+/// `--decode-graphs` (default on): off charges nothing.
+pub fn configured_reserve(variant: &str, enabled: bool) -> Result<crate::placement::graph_reserve::Resolved, crate::placement::graph_reserve::Error> {
+    if enabled { reserve(variant) } else { Ok(crate::placement::graph_reserve::disabled(rank_of(variant))) }
 }
 
-pub fn configured_reserve(variant: &str, enabled: bool) -> Result<crate::placement::graph_reserve::Resolved, crate::placement::graph_reserve::Error> {
-    if enabled { reserve(variant) } else {
-        crate::placement::graph_reserve::resolve_with_extra(Some("0"), None, None, 0, false, 0, 0)
-    }
-}
+fn rank_of(variant: &str) -> usize { if variant.ends_with("-layers-rtx2-rank1") { 1 } else { 0 } }
 
 pub fn layout(variant: &str) -> Option<&'static Layout> {
     prewarm().layouts.iter().find(|layout| layout.variant == variant)
 }
 
-/// Before tracing, no prewarm or pins; 64 MiB is a provisional lazy-capture
-/// bootstrap (32 two-MiB driver pages), not a measured claim. Trace with an
-/// explicit large reserve and replace it with the selected working set.
+/// A traced variant charges its measured arena plus the shared extra; any other
+/// variant (another checkpoint, KV format or a two-rank layout) has no prewarm or
+/// pins and charges the dense Qwen × ranks envelope (2x borrows 1x per rank).
 pub fn reserve(variant: &str) -> Result<crate::placement::graph_reserve::Resolved, crate::placement::graph_reserve::Error> {
-    let (base, tail) = layout(variant).map_or((64 << 20, TAIL_BYTES),
-        |layout| (layout.reserve_base_bytes, layout.reserve_extra_bytes));
-    let rank = if variant.ends_with("-layers-rtx2-rank1") { 1 } else { 0 };
-    crate::placement::graph_reserve::current(rank, false, base, tail)
+    use crate::placement::graph_reserve::{self, GraphFamily};
+    let rank = rank_of(variant);
+    match layout(variant) {
+        Some(layout) => graph_reserve::current(rank, false, layout.reserve_base_bytes, layout.reserve_extra_bytes),
+        None => graph_reserve::current_envelope(GraphFamily::Qwen35,
+            if variant.contains("-layers-rtx2-") { 2 } else { 1 }, rank),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn variants_without_trace_charge_the_envelope_and_off_charges_nothing() {
+        use crate::placement::graph_reserve::{envelope_bytes, GraphFamily};
+        cuteafd_core::memory_policy::MemoryPolicy::default().scoped(|| {
+            for (variant, ranks, rank) in [("h4096-l32-bf16-kvfp8-rtx1", 1, 0),
+                ("h5120-l64-bf16-kvfp8-rtx1-layers-rtx2-rank0", 2, 0),
+                ("h5120-l64-bf16-kvfp8-rtx1-layers-rtx2-rank1", 2, 1)] {
+                assert_eq!(reserve(variant).unwrap().bytes, envelope_bytes(GraphFamily::Qwen35, ranks, rank));
+                assert_eq!(configured_reserve(variant, false).unwrap().bytes, 0);
+            }
+        });
+    }
+
     #[test]
     fn untraced_layouts_never_pin_or_borrow_a_working_set() {
         assert!(layout("unknown-rtx2").is_none());

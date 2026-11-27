@@ -182,6 +182,8 @@ pub struct ProductionInput<'a> {
     pub fixed: Vec<Demand>,
     /// Bundled-tower headroom facts.
     pub media: MediaOptions,
+    /// `--decode-graphs`: off charges no graph reserve.
+    pub decode_graphs: bool,
 }
 
 /// The prepared recipe plus everything the caller reports from it.
@@ -327,7 +329,7 @@ impl<'a> ProductionInput<'a> {
     pub fn prepare(self) -> Result<PreparedMuse<'a>, Refusal> {
         let ProductionInput { kv_cache, cfg, core, projections, catalog, mut budgets, host, prefill, bf16_target_head, slots, decode_rows, mark_slots,
             context, pool, partial_bf16_max_rows, partial_reply_formats, local, drafter, fixed,
-            media } = self;
+            media, decode_graphs } = self;
         let coordinator = budgets.iter().filter(|budget| budget.locations.iter()
             .any(|location| matches!(location.device, Device::Coordinator(_)))).count();
         let spark_ranks = budgets.iter().filter(|budget| budget.locations.iter()
@@ -570,7 +572,7 @@ impl<'a> ProductionInput<'a> {
             for gpu in 0..gpus {
                 // Price the captured FFN set within this onboarding candidate,
                 // not after the solve whose available KV it changes.
-                let graph = crate::serving_capacity::muse_graphs::policy(gpus, count, gpu)
+                let graph = crate::serving_capacity::muse_graphs::policy(gpus, count, gpu, decode_graphs)
                     .map_err(|error| anyhow_refusal(error.into()))?;
                 components.push(Component { activation: Activation::always(),
                     bytes: ByteCurve::fixed(graph.bytes, maximum_pages),
@@ -1065,6 +1067,7 @@ mod contract_tests {
                 partial_bf16_max_rows: crate::families::muse_spark::replies::DEFAULT_BF16_MAX_ROWS,
                 partial_reply_formats: Default::default(), local: LocalPackage::Unknown,
                 drafter: None, fixed: vec![], media: MediaOptions::from_checkpoint(checkpoint, MediaMode::Off, MediaMode::Off, 2)?,
+                decode_graphs: true,
             }.prepare()?;
             let request = production_request(64, Some(64), crate::placement::Onboard::Auto,
                 PrefillShape { rows: 64, waves: 1 }, Operation::Serving, None, Default::default());

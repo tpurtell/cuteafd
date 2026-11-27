@@ -13,6 +13,9 @@ use std::{
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    /// Bounded rank-local decode/verify graph replay; prefill and peer exchanges stay eager.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     #[command(flatten)]
     pub vision: crate::shared::vision::still::Options,
     #[command(flatten)]
@@ -172,6 +175,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                     expert_usage: false,
                     prewarm_graphs: true,
                     vision: &worker_args.vision,
+                    decode_graphs: worker_args.decode_graphs,
                 },
             )?;
             let context = usize::try_from(admitted.solved.served_context())?;

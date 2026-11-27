@@ -67,11 +67,6 @@ use cuteafd_loader::serving_capacity::qwen_graphs::{QwenGraphShapeKey, QWEN_MIN_
 /// FP8 decode projection and head span capacity (matches fork `FP8_DECODE_ROWS`).
 const FP8_PROJECTION_SKINNY_ROWS: usize = 64;
 
-/// Serving graphs are on unless `CUTEAFD_QWEN4_GRAPHS=0`.
-pub(super) fn graphs_enabled(graphs: Option<&str>) -> bool {
-    graphs != Some("0")
-}
-
 /// Selected-slot row width of the sparse attention (2048 + 3, padded to 64).
 pub(crate) const SPARSE_TOPK: usize = 2112;
 /// BF16 index-key width, independent of the K/V record format.
@@ -423,10 +418,14 @@ mod tests {
 
     #[test]
     fn serving_graphs_default_on_and_respect_the_explicit_opt_out() {
-        use super::graphs_enabled;
-        assert!(graphs_enabled(None));
-        assert!(graphs_enabled(Some("1")));
-        assert!(!graphs_enabled(Some("0")));
+        use clap::Parser;
+        #[derive(clap::Parser)]
+        struct Cli { #[command(flatten)] engine: super::super::EngineArgs }
+        let parse = |extra: &[&str]| Cli::try_parse_from(["t", "--snapshot", "/m", "--native-lib", "/l.so"]
+            .into_iter().chain(extra.iter().copied())).unwrap().engine.decode_graphs;
+        assert!(parse(&[]));
+        assert!(parse(&["--decode-graphs", "true"]));
+        assert!(!parse(&["--decode-graphs", "false"]));
     }
 
     #[test]
@@ -813,9 +812,9 @@ pub(crate) struct Qwen4Engine<'a> {
     /// Host seconds: GPU wait before expert exchanges, the exchanges.
     pub profile: RefCell<[f64; 2]>,
     graphs: RefCell<Vec<GraphBank<GraphKey, GraphExec<'a>>>>,
-    use_graphs: bool,
+    pub(super) use_graphs: bool,
     /// The bounded graph cache is configured for this launch: lazy exact-row
-    /// capture and miss accounting are on. Cleared only by `CUTEAFD_QWEN4_GRAPHS=0`.
+    /// capture and miss accounting are on. Cleared only by `--decode-graphs false`.
     graph_capture: Cell<bool>,
     graph_cycles: RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
     /// Observer seeded and startup graph initialization completed.
@@ -1023,7 +1022,7 @@ impl<'a> Qwen4Engine<'a> {
             decode_workspace: RefCell::new(None), peer_workspace: RefCell::new(None),
             peer_decode_workspace: RefCell::new(None), workspaces_prepared: Cell::new(false), experts: None, hops: None, profile: RefCell::new([0.0; 2]),
             graphs: RefCell::new(graphs),
-            use_graphs: graphs_enabled(std::env::var("CUTEAFD_QWEN4_GRAPHS").ok().as_deref()),
+            use_graphs: true,
             graph_capture: Cell::new(false),
             graph_cycles: RefCell::new(None),
             graph_warmed: Cell::new(false),

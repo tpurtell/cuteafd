@@ -317,7 +317,7 @@ pub(super) fn profile(checkpoint: &super::super::Checkpoint, options: &LayoutOpt
     let mark = cache.ranks.iter().map(|r| r.retained_mark_bytes).sum::<u64>() + draft_mark;
     let marks = options.prefix_slots.unwrap_or_else(|| cuteafd_core::prefix::mark_slots_with_host(
         concurrency, options.prefix_entries("mimo_v2"), mark, options.mimo_prefix_mark_bytes, options.host_cache_bytes != Some(0)));
-    let graphs = decode_graph::graph_layout(&cfg, ranks, spark_ranks > 0, options.mimo_decode_graphs)?;
+    let graphs = decode_graph::graph_layout(&cfg, ranks, spark_ranks > 0, options.decode_graphs)?;
     let mut runtime = Vec::new();
     for rank in 0..ranks {
         let mut additional = Vec::new();
@@ -699,7 +699,7 @@ mod tests {
                         [MimoExpertInput::Fp8, MimoExpertInput::Bf16, MimoExpertInput::Bf16Decode]
                             .map(|input| (graphs, input))) {
                         let opts = LayoutOptions { native_mtp_layers: 0, host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram), rtx_bytes: vec![95 * GIB; ranks], concurrency: 4,
-                            pool_tokens: Some(32768), mimo_decode_graphs: graphs, mimo_swa_kv: swa,
+                            pool_tokens: Some(32768), decode_graphs: graphs, mimo_swa_kv: swa,
                             mimo_expert_input: expert_input, ..Default::default() };
                         let planned = profile(&checkpoint, &opts, ranks, 4, 4096, 4, 32768, None).unwrap();
                         let lanes = prefill_shape(6, None).unwrap().waves as usize;

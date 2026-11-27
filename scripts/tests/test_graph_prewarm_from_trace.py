@@ -2027,22 +2027,18 @@ def test_dense_qwen_replays_select_geometry_siblings_and_order_by_heat():
         MODULE.generate_qwen35([data], layout["variant"])
 
 
-def test_step5_launcher_defaults_graphs_on_for_plan_and_serve():
+def test_launcher_passes_one_typed_decode_graphs_flag_to_plan_and_serve():
     launcher = (SCRIPT.parents[2] / "scripts/launch/run-family.sh").read_text()
-    assert 'step5_decode_graphs="$(get DECODE_GRAPHS on)"' in launcher
-    assert '--step5-decode-graphs "$step5_decode_graphs"' in launcher
-    step5 = launcher.split('step5_decode_graphs="$(get DECODE_GRAPHS on)"', 1)[1].split("esac", 1)[0]
-    assert 'on) family_args+=(--decode-graphs true)' in step5
-    assert 'off) family_args+=(--decode-graphs false)' in step5
-
-
-def test_dense_qwen_launcher_defaults_graphs_on_for_plan_and_serve():
-    launcher = (SCRIPT.parents[2] / "scripts/launch/run-family.sh").read_text()
-    for section in ("shared_graph_census_args()", "plan_profile_env=()"):
-        dense = launcher.split(section, 1)[1].split('if [[ "$family" == qwen3_5 ]]; then', 1)[1].split("esac", 1)[0]
-        assert 'case "$(get DECODE_GRAPHS on)" in' in dense
-        assert "CUTEAFD_QWEN35_GRAPHS=1" in dense
-        assert "CUTEAFD_QWEN35_GRAPHS=0" in dense
+    assert 'decode_graphs="$(get DECODE_GRAPHS on)"' in launcher
+    assert 'plan_draft_args+=(--decode-graphs "$decode_graphs"' in launcher
+    flagged = launcher.split('decode_graphs="$(get DECODE_GRAPHS on)"', 1)[1].split("\nesac\n", 2)[1]
+    for family in ("glm5", "glm5_flash", "qwen4", "qwen3_5", "mimo_v2", "step5", "muse_spark", "inkling2", "inkling2_mini"):
+        assert family in flagged
+    assert "family_args+=(--decode-graphs true)" in flagged and "family_args+=(--decode-graphs false)" in flagged
+    # No environment mechanism or per-family planner alias remains.
+    for gone in ("CUTEAFD_QWEN35_GRAPHS", "CUTEAFD_INKLING2_GRAPHS", "CUTEAFD_INKLING2_MINI_GRAPHS",
+                 "--mimo-decode-graphs", "--step5-decode-graphs", "--glm-decode-graphs"):
+        assert gone not in launcher
 
 
 def test_dense_qwen_engine_graph_lifetime_reconciliation_contract():

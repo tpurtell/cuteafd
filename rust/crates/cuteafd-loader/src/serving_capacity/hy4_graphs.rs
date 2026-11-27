@@ -53,10 +53,12 @@ fn working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<WorkingSet
     graph_reserve::census_working_set(rank, layout, CENSUS)
 }
 
-/// Use identical inputs for admission, provenance, and runtime. Layouts
-/// without a qualified census default to eager; explicit reserves still work.
-pub fn reserve_policy(layout: Option<Hy4GraphLayout>, rank: usize) -> Result<Resolved, Error> {
-    graph_reserve::current_census(rank, layout, CENSUS)
+/// Use identical inputs for admission, provenance, and runtime. 2x RTX + Sparks
+/// is eager by measurement (`graph_reserve::EAGER_DEFAULTS`); any other layout
+/// without a census charges the Hy4-flash × ranks envelope. Explicit reserves still work.
+pub fn reserve_policy(layout: Option<Hy4GraphLayout>, gpus: usize, rank: usize) -> Result<Resolved, Error> {
+    if layout == Some(Hy4GraphLayout::Exl3MaxSpark) { return graph_reserve::current_eager(rank); }
+    graph_reserve::current_census(rank, layout, CENSUS, graph_reserve::GraphFamily::Hy4Flash, gpus)
 }
 
 /// Short and 32K C1 physical graph-arena census for split DFly2 on `Exl3Max`
@@ -74,10 +76,11 @@ fn split_dfly2_working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Optio
 /// local TP2 rows. Preserve all layout fallbacks through the common table.
 pub fn reserve_policy_for(
     layout: Option<Hy4GraphLayout>,
+    gpus: usize,
     rank: usize,
     _tp2_dfly2: bool,
 ) -> Result<Resolved, Error> {
-    reserve_policy(layout, rank)
+    reserve_policy(layout, gpus, rank)
 }
 #[cfg(test)]
 mod tests {
@@ -133,5 +136,22 @@ mod tests {
         }
         assert_eq!(split_dfly2_working_set(Some(Hy4GraphLayout::Exl3Min), 0), None);
         assert_eq!(split_dfly2_working_set(Some(Hy4GraphLayout::Exl3MaxSpark), 0), None);
+    }
+
+    #[test]
+    fn only_the_measured_eager_layout_defaults_to_zero() {
+        use graph_reserve::{envelope_bytes, GraphFamily, EAGER_DEFAULTS};
+        assert_eq!(EAGER_DEFAULTS, &[(GraphFamily::Hy4Flash, 2, true)]);
+        cuteafd_core::memory_policy::MemoryPolicy::default().scoped(|| {
+            for sparks in [1, 4, 6] {
+                for rank in 0..2 {
+                    let eager = reserve_policy(Hy4GraphLayout::resolve(2, sparks), 2, rank).unwrap();
+                    assert_eq!((eager.bytes, eager.source), (0, "eager by measurement"));
+                }
+                assert!(reserve_policy(Hy4GraphLayout::resolve(1, sparks), 1, 0).unwrap().bytes > 0);
+            }
+            assert_eq!(reserve_policy(Hy4GraphLayout::resolve(1, 0), 1, 1).unwrap().bytes,
+                envelope_bytes(GraphFamily::Hy4Flash, 1, 1));
+        });
     }
 }

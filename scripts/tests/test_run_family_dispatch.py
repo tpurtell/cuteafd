@@ -4569,7 +4569,7 @@ def test_mimo_media_plan_keeps_ingress_onboarding_and_graph_contract(tmp_path, i
     assert f"--expert-input {ingress}" in preflight and f"--expert-input {ingress}" in launch
     assert "--rtx-expert-layers 0" in preflight and "--onboard 0" in launch
     assert "--max-context-tokens 262144" in preflight and "--max-context-tokens 262144" in launch
-    assert "--mimo-decode-graphs on" in preflight and "--decode-graphs true" in launch
+    assert "--decode-graphs on" in preflight and "--decode-graphs true" in launch
     assert "--full-prefill-logits" not in preflight and "--full-prefill-logits" not in launch
 
 
@@ -4585,7 +4585,7 @@ def test_mimo_graph_default_and_overrides_match_plan_and_serve(tmp_path, graphs)
     preflight = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--resolve-settings-only" not in line)
     launch = next(line for line in result.stderr.splitlines() if "cuteafd serve-mimo" in line)
     expected = graphs or "on"
-    assert f"--mimo-decode-graphs {expected}" in preflight
+    assert f"--decode-graphs {expected}" in preflight
     assert f"--decode-graphs {'true' if expected == 'on' else 'false'}" in launch
 
 
@@ -5920,7 +5920,7 @@ def test_dense_qwen_two_rtx_uses_native_layer_owners(tmp_path, attention):
     assert result.returncode == 0, result.stderr
     launch = next(line for line in result.stderr.splitlines() if "serve-qwen35 --snapshot" in line)
     assert "--device 0 --split-device 1" in launch
-    assert "CUTEAFD_QWEN35_GRAPHS=1" in launch
+    assert "--decode-graphs true" in launch and "CUTEAFD_QWEN35_GRAPHS" not in launch
     assert "cuteafd expertd-native" not in result.stderr
     plan = next(line for line in result.stderr.splitlines() if "cuteafd plan" in line and "--resolve-settings-only" not in line)
     assert "--rtx 2" in plan and "--attention-placement layers" in plan
@@ -6168,10 +6168,10 @@ def test_other_family_refuses_unimplemented_context_window(tmp_path):
 
 
 @pytest.mark.parametrize("extra,want_dspark,want_graphs", [
-    ("", False, "1"),
-    ("SPECULATOR=auto\n", False, "1"),
-    ("SPECULATOR=dspark\n", True, "1"),
-    ("SPECULATOR=off\nDECODE_GRAPHS=off\n", False, "0"),
+    ("", False, "true"),
+    ("SPECULATOR=auto\n", False, "true"),
+    ("SPECULATOR=dspark\n", True, "true"),
+    ("SPECULATOR=off\nDECODE_GRAPHS=off\n", False, "false"),
 ])
 def test_inkling2_mini_tp1_launch_dispatch(tmp_path, extra, want_dspark, want_graphs):
     config = {"model_type": "inkling2_loop", "text_config": {"num_hidden_layers": 24}}
@@ -6182,7 +6182,8 @@ def test_inkling2_mini_tp1_launch_dispatch(tmp_path, extra, want_dspark, want_gr
     assert result.returncode == 0, result.stderr
     serve = next(line for line in result.stderr.splitlines() if "cuteafd serve-inkling2-mini" in line)
     assert "--kv-cache fp8" in serve
-    assert (f"CUTEAFD_INKLING2_MINI_GRAPHS={want_graphs}" in result.stderr)
+    assert f"--decode-graphs {want_graphs}" in serve
+    assert "CUTEAFD_INKLING2_MINI_GRAPHS" not in result.stderr
     if want_dspark:
         assert "--dspark" in serve and "--dspark=false" not in serve
         assert "--draft-kv-cache fp8" in serve

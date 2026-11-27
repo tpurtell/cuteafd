@@ -4,22 +4,23 @@ use crate::placement::graph_reserve::{self, Error, Resolved};
 const MIB: u64 = 1 << 20;
 const GRAPH_CHUNK: u64 = 2 * MIB;
 
-fn working_set(rank: usize, ranks: usize) -> u64 {
+fn working_set(rank: usize, ranks: usize) -> Option<u64> {
     // EXL3 K4 MC original, 1 RTX + 4 Sparks / 2 RTX + 6 Sparks (#2643).
     match (ranks, rank) {
-        (1, 0) => 302 * MIB,
-        (2, 0) => 358 * MIB,
-        (2, 1) => 144 * MIB,
-        _ => unreachable!("Inkling graph policy has one or two admitted ranks"),
+        (1, 0) => Some(302 * MIB),
+        (2, 0) => Some(358 * MIB),
+        (2, 1) => Some(144 * MIB),
+        _ => None,
     }
 }
 
 fn resolve(rank: usize, ranks: usize, enabled: bool, total: Option<&str>,
     extra: Option<&str>, cap: Option<&str>) -> Result<Resolved, Error> {
-    if !enabled {
-        return graph_reserve::resolve(Some("0"), rank, false, 0, 0);
-    }
-    let base = working_set(rank, ranks);
+    if !enabled { return Ok(graph_reserve::disabled(rank)); }
+    let Some(base) = working_set(rank, ranks) else {
+        return graph_reserve::resolve_envelope(total, extra, cap, rank,
+            graph_reserve::envelope_bytes(graph_reserve::GraphFamily::Inkling2, ranks, rank));
+    };
     let mut policy = graph_reserve::resolve_with_extra(total, extra, cap, rank, false, base, 0)?;
     // Keep explicit totals and the shared override/selector rules. An implicit
     // extra has a cap (the working set by default); use the census margin
@@ -34,9 +35,9 @@ fn resolve(rank: usize, ranks: usize, enabled: bool, total: Option<&str>,
     Ok(policy)
 }
 
-pub fn policy(rank: usize, ranks: usize) -> Result<Resolved, Error> {
-    let enabled = !std::env::var_os("CUTEAFD_INKLING2_GRAPHS").is_some_and(|on| on == "0");
-    if !enabled {
+/// `decode_graphs` is `--decode-graphs` (default on); off charges nothing.
+pub fn policy(rank: usize, ranks: usize, decode_graphs: bool) -> Result<Resolved, Error> {
+    if !decode_graphs {
         return resolve(rank, ranks, false, None, None, None);
     }
     let read = |key: &'static str| match std::env::var(format!("CUTEAFD_{key}")) {
@@ -72,5 +73,7 @@ mod tests {
         assert_eq!(pick(0, true, None, Some("gpu1=20MiB"), Some("10MiB")), 368);
         assert_eq!(pick(1, true, None, Some("20MiB"), Some("15MiB")), 159);
         assert!(resolve(0, 1, true, Some("0"), Some("30MiB"), None).is_err());
+        // A rank count without a census charges the family envelope, never 0.
+        assert_eq!(resolve(2, 3, true, None, None, None).unwrap().bytes, 454 * MIB);
     }
 }

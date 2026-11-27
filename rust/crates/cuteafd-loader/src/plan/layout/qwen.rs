@@ -246,7 +246,7 @@ fn placement(input: &super::super::PlanInput, report: &mut PlanReport, options: 
     }
     let loaded_bytes = device.items.iter().filter(|item| item.category == Category::Runtime)
         .map(|item| item.bytes).sum::<u64>();
-    let inputs = qwen4::QwenInputs { target_pool: options.target_pool_tokens,
+    let inputs = qwen4::QwenInputs { decode_graphs: options.decode_graphs, target_pool: options.target_pool_tokens,
         experts: Some(experts), onboard: options.resolve_onboard(cfg.layers).unwrap_or_default(),
         arenas, expert_arenas, preallocation: true, future,
         blas_head: if options.qwen_representation.fp8_head { crate::placement::planner::serving::BlasHead::Native } else { options.bf16_target_head },
@@ -623,7 +623,7 @@ fn apply(input: &super::super::PlanInput, options: &LayoutOptions, devices: &mut
     let ple = checkpoint.tensors.iter().find(|t| t.meta.name.contains("ngram_embedding.shard_"))
         .map(|t| (resident.ple_row_bytes, t.meta.dtype == cuteafd_core::DType::F8E4M3));
     let headroom = crate::placement::reserve::gpu("qwen4");
-    let inputs = qwen4::QwenDualInputs { target_pool: options.target_pool_tokens,
+    let inputs = qwen4::QwenDualInputs { decode_graphs: options.decode_graphs, target_pool: options.target_pool_tokens,
         experts: Some(experts), blas_head: if options.qwen_representation.fp8_head { crate::placement::planner::serving::BlasHead::Native } else { options.bf16_target_head },
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), context: crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)),
         owner_manifests,

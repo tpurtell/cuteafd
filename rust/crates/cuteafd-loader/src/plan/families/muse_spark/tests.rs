@@ -166,7 +166,7 @@ fn graph_reserve_matches_the_chosen_onboarding_candidate() {
             assert!(report.fits);
             assert_eq!(report.onboard_layers, Some(placement.onboard_layers));
             for gpu in 0..gpus {
-                let policy = crate::serving_capacity::muse_graphs::policy(gpus, placement.onboard_layers, gpu).unwrap();
+                let policy = crate::serving_capacity::muse_graphs::policy(gpus, placement.onboard_layers, gpu, true).unwrap();
                 let breakdown = crate::placement::reserve::breakdown(format!("gpu{gpu}"),
                     cuteafd_core::memory_policy::DeviceKind::Gpu, crate::placement::inventory::PRO_TOTAL_BYTES,
                     0, &placement.items[gpu]);

@@ -45,6 +45,8 @@ pub fn check_dual_layer_owners(owners: &[usize]) -> anyhow::Result<()> {
 }
 
 pub struct QwenInputs<'a> {
+    /// `--decode-graphs` (default on): off charges no graph reserve.
+    pub decode_graphs: bool,
     pub target_pool: Option<u64>,
     pub experts: Option<QwenExperts>,
     pub onboard: Onboard,
@@ -200,9 +202,10 @@ fn allowance(source: &str, location: Location, bytes: u64, lifetime: PlanLifetim
 /// The graph reserve as one named owner, charged before KV sizing: the exact-row
 /// W1 soft cap plus `2x` largest-capture hard margin, which `GPU_GRAPH_RESERVE`
 /// overrides per device.
-fn graph_reserve_owner(shape: QwenGraphShapeKey, rank: usize, location: Location,
+fn graph_reserve_owner(decode_graphs: bool, shape: QwenGraphShapeKey, rank: usize, location: Location,
     maximum: u64) -> Result<Component, Refusal> {
-    let reserve = qwen_resolve_reserve(shape, rank).map_err(Refusal::InvalidFact)?;
+    let reserve = if decode_graphs { qwen_resolve_reserve(shape, rank).map_err(Refusal::InvalidFact)? }
+        else { crate::placement::graph_reserve::disabled(rank) };
     Ok(allowance(&crate::placement::graph_reserve::source(&format!("qwen4.graphs.{rank}")),
         location, reserve.bytes, PlanLifetime { first: Phase::Warmup, last: Phase::Growth }, maximum))
 }
@@ -386,7 +389,7 @@ impl Recipe for QwenSingle<'_> {
         }
         // The graph reserve is one owner, charged before KV sizing: the family's
         // measured bootstrap high-water plus one in-flight capture's headroom.
-        components.push(graph_reserve_owner(QwenGraphShapeKey::resolve(1, inputs.spark_ranks > 0), 0, gpu,
+        components.push(graph_reserve_owner(inputs.decode_graphs, QwenGraphShapeKey::resolve(1, inputs.spark_ranks > 0), 0, gpu,
             self.maximum_pages)?);
         // Everything the free sample already saw is one measured owner, so the
         // Ready capture reconciles against named bytes rather than a silent
@@ -753,6 +756,8 @@ pub fn dual_peer_diagnostics(enabled: bool) -> Vec<Demand> {
         "expert peer diagnostics", 256, Basis::Exact)).to_vec()
 }
 pub struct QwenDualInputs<'a> {
+    /// `--decode-graphs` (default on): off charges no graph reserve.
+    pub decode_graphs: bool,
     pub target_pool: Option<u64>,
     pub experts: Option<QwenExperts>,
     pub resident_weight_limit: Option<ResidentWeights>,
@@ -1167,7 +1172,7 @@ impl Recipe for QwenDual<'_> {
                 components.push(owner(format!("qwen.spark.intake.{gpu}"), location, bytes,
                     Category::Transport, "Spark intake planes", PlanLifetime::RESIDENT, self.maximum_pages));
             }
-            components.push(graph_reserve_owner(
+            components.push(graph_reserve_owner(inputs.decode_graphs,
                 QwenGraphShapeKey::resolve(2, inputs.spark_ranks > 0), gpu, location,
                 self.maximum_pages)?);
             // The measured pre-admission occupancy of this rank is one owner.
@@ -1363,7 +1368,7 @@ mod tests {
         let costs = vec![Some(tp2_cost()); 4];
         let extra = vec![vec![]; 4];
         for count in 0..=4 {
-            let inputs = QwenDualInputs { target_pool: None, experts: Some(hybrid_fixture(2, 4)),
+            let inputs = QwenDualInputs { decode_graphs: true, target_pool: None, experts: Some(hybrid_fixture(2, 4)),
                 blas_head: crate::placement::planner::serving::BlasHead::Native,
                 resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
@@ -1488,7 +1493,7 @@ mod tests {
         let extra = dual_ple_demands(&cfg, 4, &resident).unwrap();
         let experts = vec![Some(tp2_cost()); 4];
         let gib = 1u64 << 30;
-        let inputs = QwenDualInputs { target_pool: None,
+        let inputs = QwenDualInputs { decode_graphs: true, target_pool: None,
         experts: None,            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,
@@ -1717,7 +1722,7 @@ mod tests {
         requested_pool: Option<u64>,
         loaded: ResidentWeights, limit: Option<ResidentWeights>) -> QwenInputs<'a> {
         let gib = 1u64 << 30;
-        QwenInputs { target_pool: None, experts: None, onboard: Onboard::Auto,
+        QwenInputs { decode_graphs: true, target_pool: None, experts: None, onboard: Onboard::Auto,
             blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: limit, loaded_weights: loaded,
             arenas: vec![], expert_arenas: vec![], preallocation: false, future: vec![],
             spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(131_072),
@@ -1792,7 +1797,7 @@ mod tests {
         let experts = vec![Some(tp2_cost()); cfg.layers];
         let extra = vec![vec![]; cfg.layers];
         check_spark_encoder_budgets(|encoders| {
-            let inputs = QwenDualInputs { target_pool: None,
+            let inputs = QwenDualInputs { decode_graphs: true, target_pool: None,
         experts: None,                blas_head: crate::placement::planner::serving::BlasHead::Native,
                 resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                 admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: cfg.layers, mtp: false,
@@ -2103,7 +2108,7 @@ mod tests {
             let build = |bytes| {
                 let mut host = QwenHost::ample(&cfg, 2, 4096).unwrap();
                 host.host_embedding = bytes;
-                let inputs = QwenDualInputs { target_pool: None,
+                let inputs = QwenDualInputs { decode_graphs: true, target_pool: None,
         experts: None,                    blas_head: crate::placement::planner::serving::BlasHead::Native,
                     resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131072),
                     admission: single_inputs(&cfg, Baseline::Planned { context_bytes: 0, loaded_bytes: 0 },
@@ -2183,7 +2188,7 @@ mod tests {
         let experts: Vec<_> = (0..4).map(|_| Some(ExpertCost { whole: Bytes2 { resident: 0, staging: 0 },
             half: costs, tp2: true, whole_supported: true, spark_ok: true })).collect();
         let gib = 1u64 << 30;
-        let build = || QwenDualInputs { target_pool: None,
+        let build = || QwenDualInputs { decode_graphs: true, target_pool: None,
         experts: None,            blas_head: crate::placement::planner::serving::BlasHead::Native, resident_weight_limit: None, context: crate::placement::planner::Context::pinned(131_072),
             admission: QwenAdmissionInputs { prefill_shape: None, cfg: &cfg, layers: 4, mtp: false,
                 kv_format: Qwen4KvCache::Bf16, manifest: None, prefill_rows: 4096, slots: 16,

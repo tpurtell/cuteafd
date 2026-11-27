@@ -529,8 +529,7 @@ impl<'a> Step5Recipe<'a> {
         let mut runtime = serving::blas_components("sm_120", &heads, maximum_pages, PhaseOrder::TARGET_THEN_DRAFT)?;
         if inputs.decode_graphs {
             for rank in 0..ranks {
-                let (base, tail) = crate::serving_capacity::step5_graphs::reserve(inputs.graph_layout, rank);
-                let reserve = crate::placement::graph_reserve::current(rank, false, base, tail)?;
+                let reserve = crate::serving_capacity::step5_graphs::policy(inputs.graph_layout, ranks, rank)?;
                 runtime.push(Component { activation: Activation::always(), bytes: ByteCurve::fixed(reserve.bytes, maximum_pages),
                     kind: ComponentKind::Allowance(Allowance { location: Location::coordinator(rank as u8),
                         bytes: reserve.bytes, lifetime: Lifetime { first: Phase::Warmup, last: Phase::Growth },

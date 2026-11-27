@@ -479,7 +479,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
                     )
                     .bytes,
                 );
-                let gr = super::graph_reserve::reserve_policy(graph_layout, gpu)
+                let gr = super::graph_reserve::reserve_policy(graph_layout, gpus, gpu)
                     .map_err(|error| {
                         refused(
                             format!("Hy4 graph reserve refused: {error}"),
@@ -500,7 +500,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
             for (gpu, &(total, logical, free)) in samples.iter().enumerate() {
                 budgets.push(hy4::measured_budget(gpu as u8, total, logical, free));
                 code.push(loaded_code[gpu]);
-                let gr = super::graph_reserve::reserve_policy(graph_layout, gpu)
+                let gr = super::graph_reserve::reserve_policy(graph_layout, gpus, gpu)
                     .map_err(|error| {
                         refused(
                             format!("Hy4 graph reserve refused: {error}"),
