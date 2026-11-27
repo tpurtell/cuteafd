@@ -97,6 +97,17 @@ pub(crate) struct GoldenArgs {
     /// Number of decode tokens to compare past each `--resume-at` point.
     #[arg(long, default_value_t = 16)]
     pub(crate) resume_rows: usize,
+    /// Exercise bundled 5-layer DFly2 during `--resume-at` (invalidation, rejoin, batch & graph parity).
+    #[arg(long)]
+    pub(crate) resume_dfly2: bool,
+    /// Split DFly2 across both RTX GPUs during `--resume-dfly2` (default on 2x RTX).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub(crate) tp2_dflash: bool,
+    #[arg(skip)]
+    pub(crate) tp2_dflash_explicit: bool,
+    /// Exercise forced multi-row speculative verify during `--resume-at` (bit-exact vs serial decode).
+    #[arg(long)]
+    pub(crate) resume_verify: bool,
 }
 
 fn load_published_hy4_reference(
@@ -264,7 +275,11 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             concurrency: if args.resume_at.is_empty() { 1 } else { 2 },
             decode_lanes: 1,
             rtx_gpus: devices.len(),
-            draft_length: Some(0),
+            draft_length: if args.resume_dfly2 || args.resume_verify {
+                None
+            } else {
+                Some(0)
+            },
         },
     )? as usize;
 
@@ -346,6 +361,43 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         max_pages
     };
     let manifest_opt = args.manifest.is_file().then_some(args.manifest.as_path());
+    let draft_admission = if args.resume_dfly2 {
+        ensure!(
+            !args.resume_at.is_empty(),
+            "--resume-dfly2 requires --resume-at"
+        );
+        let dfly_cfg = cuteafd_loader::families::hy4::Hy4DflyConfig::from_hf(
+            &checkpoint.config,
+            "hy4",
+            cfg.layers,
+            cfg.vocab_size,
+        )?
+        .context("Hy4 --resume-dfly2 requires a checkpoint with bundled DFly2")?;
+        let draft_tp = if args.tp2_dflash && devices.len() == 2 {
+            2
+        } else {
+            1
+        };
+        let model = hy4_plan::Model::open(&checkpoint)?;
+        let adm = cuteafd_loader::families::hy4::draft::Admission::new_tp_with_context(
+            &checkpoint,
+            &cfg,
+            &dfly_cfg,
+            &model.core,
+            args.kv_cache,
+            2,
+            decode_rows,
+            draft_tp,
+            context_split,
+        )?;
+        Some((dfly_cfg, adm))
+    } else {
+        None
+    };
+    let draft_peer_rows = draft_admission
+        .as_ref()
+        .filter(|(_, adm)| adm.tp == 2)
+        .map_or(0, |(_, adm)| adm.draft_rows());
     let mut engine = if !args.resume_at.is_empty() {
         Hy4Engine::new_serving(
             &devices,
@@ -366,6 +418,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             local_pages * if context_split { 128 } else { 64 },
             args.skip_routed_experts,
             onboarded,
+            draft_peer_rows,
             Default::default(),
         )?
     } else {
@@ -385,6 +438,21 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             onboarded,
         )?
     };
+    if let Some((dfly_cfg, adm)) = draft_admission {
+        let draft_tp = adm.tp;
+        let drafter = super::draft::Drafter::new(
+            &devices[..draft_tp],
+            &programs,
+            &checkpoint,
+            &cfg,
+            dfly_cfg,
+            adm,
+            args.kv_cache,
+            2,
+            decode_rows,
+        )?;
+        engine.attach_drafter(drafter)?;
+    }
 
     if !args.peers.is_empty() && !args.skip_routed_experts && !spark_layers.is_empty() {
         let link = super::super::hy4_common::golden::spark_link(
@@ -457,10 +525,11 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                 .placement;
             let vocab = cfg.vocab_size;
 
-            // Fresh prefill of prefix into slot 0, capture pages-only snapshot.
+            // Fresh prefill of prefix into slot 0, capture pages-only snapshot + last-row logits.
             let mut units = Vec::new();
             for (idx, off) in (0..prefix_toks.len()).step_by(unit).enumerate() {
                 let len = (prefix_toks.len() - off).min(unit);
+                let is_last = off + len == prefix_toks.len();
                 units.push(crate::shared::prefill_pipeline::Unit {
                     index: idx,
                     sequence: 0,
@@ -468,9 +537,9 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                         sequence: 0,
                         rows: 0..len,
                         tokens: off..off + len,
-                        prompt_end: off + len == prefix_toks.len(),
+                        prompt_end: is_last,
                         snapshot: false,
-                        head: false,
+                        head: is_last,
                     }],
                     rows: off..off + len,
                     layers: 0..cfg.layers,
@@ -478,14 +547,26 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                     barrier: false,
                 });
             }
+            let last_idx = units.len() - 1;
+            let lib = engine.library();
             let mut p0_arr = [p0.clone()];
+            let mut logits_p = Vec::new();
             engine.run_units(
                 &mut p0_arr,
                 &[prefix_toks],
                 &units,
                 cuteafd_loader::formats::mapped_table::ReadPriority::Prefill,
-                |_| super::execution::HeadMode::None,
-                &mut |_, _, _| Ok(()),
+                |u| {
+                    if u.index == last_idx {
+                        super::execution::HeadMode::LastPerSeq
+                    } else {
+                        super::execution::HeadMode::None
+                    }
+                },
+                &mut |_, _, tile| {
+                    logits_p = tile.to_host(lib)?;
+                    Ok(())
+                },
             )?;
             p0 = p0_arr.into_iter().next().unwrap();
             let snap_before = engine.dump_state(&p0)?;
@@ -495,7 +576,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                     SnapshotKind::Prompt,
                     prefix_toks,
                     &p0,
-                    After::from_logits(&[1.0, 0.0], true),
+                    After::from_logits(&logits_p, true),
                 )?,
                 "Hy4 prefix capture at {point} returned false"
             );
@@ -516,48 +597,215 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                 ensure!(diffs.is_empty(), "Hy4 prefix restore state diff on rank {r} at P={point}: {diffs:?}");
             }
 
-            // Decode `resume_rows` 1-token steps from both p0 (fresh) and p1 (restored) and compare logits.
-            let lib = engine.library();
-            let mut step_logits = |placement: &mut Hy4Placement| -> Result<Vec<f32>> {
-                let mut all = Vec::with_capacity(tail_toks.len() * vocab);
-                for (i, &tok) in tail_toks.iter().enumerate() {
-                    let pos = point + i;
-                    let u = crate::shared::prefill_pipeline::Unit {
-                        index: 0,
+            let run_verify_step = |engine: &mut Hy4Engine<'_>,
+                                   placement: &mut Hy4Placement,
+                                   input: &[u32],
+                                   keep: usize|
+             -> Result<Vec<f32>> {
+                let pos = placement.len;
+                let rows = input.len();
+                let u = crate::shared::prefill_pipeline::Unit {
+                    index: 0,
+                    sequence: 0,
+                    segments: vec![crate::shared::prefill_pipeline::UnitSegment {
                         sequence: 0,
-                        segments: vec![crate::shared::prefill_pipeline::UnitSegment {
-                            sequence: 0,
-                            rows: 0..1,
-                            tokens: pos..pos + 1,
-                            prompt_end: false,
-                            snapshot: false,
-                            head: true,
-                        }],
-                        rows: pos..pos + 1,
-                        layers: 0..cfg.layers,
-                        slot: 0,
-                        barrier: false,
-                    };
-                    let mut p_arr = [placement.clone()];
-                    let mut row_out = Vec::new();
-                    engine.run_units(
-                        &mut p_arr,
-                        &[&[tok]],
-                        &[u],
-                        cuteafd_loader::formats::mapped_table::ReadPriority::Decode,
-                        |_| super::execution::HeadMode::Suffix(0),
-                        &mut |_, _, tile| {
-                            row_out = tile.to_host(lib)?;
-                            Ok(())
-                        },
-                    )?;
-                    *placement = p_arr.into_iter().next().unwrap();
-                    all.extend_from_slice(&row_out);
+                        rows: 0..rows,
+                        tokens: pos..pos + rows,
+                        prompt_end: false,
+                        snapshot: false,
+                        head: true,
+                    }],
+                    rows: 0..rows,
+                    layers: 0..cfg.layers,
+                    slot: 0,
+                    barrier: false,
+                };
+                let mut p_arr = [placement.clone()];
+                let mut out = Vec::new();
+                engine.set_provisional(rows > 1)?;
+                let res = engine.run_units(
+                    &mut p_arr,
+                    &[input],
+                    &[u],
+                    cuteafd_loader::formats::mapped_table::ReadPriority::Decode,
+                    |_| super::execution::HeadMode::Suffix(0),
+                    &mut |_, _, tile| {
+                        out.extend_from_slice(&tile.to_host(lib)?);
+                        Ok(())
+                    },
+                );
+                engine.set_provisional(false)?;
+                res?;
+                let mut next = p_arr.into_iter().next().unwrap();
+                if rows > 1 {
+                    engine.accept_draft(placement.slot, keep - 1, pos + keep)?;
+                    next.len = pos + keep;
                 }
-                Ok(all)
+                *placement = next;
+                out.truncate(keep * vocab);
+                Ok(out)
             };
-            let logits_fresh = step_logits(&mut p0)?;
-            let logits_restored = step_logits(&mut p1)?;
+
+            if args.resume_verify {
+                ensure!(
+                    (2..=decode_rows).contains(&args.resume_rows),
+                    "--resume-verify needs --resume-rows in 2..={decode_rows}"
+                );
+                let greedy = |logits: &[f32]| -> Result<u32> {
+                    ensure!(
+                        logits.iter().all(|f| f.is_finite()),
+                        "nonfinite target logits in Hy4 forced verify"
+                    );
+                    let mut best = 0;
+                    for i in 1..logits.len() {
+                        if logits[i] > logits[best] {
+                            best = i;
+                        }
+                    }
+                    Ok(best as u32)
+                };
+                let mut next = greedy(&logits_p)?;
+                let mut input = Vec::with_capacity(args.resume_rows);
+                let mut serial = Vec::with_capacity(args.resume_rows);
+                for _ in 0..args.resume_rows {
+                    input.push(next);
+                    let logits = run_verify_step(&mut engine, &mut p0, &[next], 1)?;
+                    next = greedy(&logits)?;
+                    serial.push(logits);
+                }
+                let batched = run_verify_step(&mut engine, &mut p1, &input, input.len())?;
+                let mut exact = 0usize;
+                let mut argmax_eq = 0usize;
+                for (j, (a, b)) in serial.iter().zip(batched.chunks_exact(vocab)).enumerate() {
+                    let mismatches = a
+                        .iter()
+                        .zip(b)
+                        .filter(|(x, y)| x.to_bits() != y.to_bits())
+                        .count();
+                    let max_abs = a
+                        .iter()
+                        .zip(b)
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0.0f32, f32::max);
+                    let ids_eq = greedy(a)? == greedy(b)?;
+                    exact += usize::from(mismatches == 0);
+                    argmax_eq += usize::from(ids_eq);
+                    println!(
+                        "hy4-golden forced verify prefix={point} row={j} exact={} mismatches={mismatches} max_abs={max_abs:.6e} argmax_match={ids_eq}",
+                        mismatches == 0
+                    );
+                }
+                let left = engine.dump_state(&p0)?;
+                let right = engine.dump_state(&p1)?;
+                let state_exact = left.iter().zip(&right).all(|(a, b)| a.diff(b).is_empty());
+                println!(
+                    "hy4-golden forced verify prefix={point}: exact={exact}/{} argmax={argmax_eq}/{} state_exact={state_exact}",
+                    args.resume_rows, args.resume_rows
+                );
+                cache.release(&family, &p0.units)?;
+                cache.release(&family, &p1.units)?;
+                ensure!(
+                    argmax_eq == args.resume_rows && state_exact,
+                    "Hy4 forced verify mismatch at P={point}: argmax={argmax_eq}/{}, state_exact={state_exact}",
+                    args.resume_rows
+                );
+                continue;
+            }
+
+            if args.resume_dfly2 {
+                engine.invalidate_draft(p1.slot);
+                let started = std::time::Instant::now();
+                let candidates = engine.draft_propose(&p0, tokens[point], 6)?;
+                let draft_us = started.elapsed().as_micros();
+                ensure!(
+                    candidates.len() == 6,
+                    "Hy4 DFly2 fresh request produced {} proposals, expected 6",
+                    candidates.len()
+                );
+                ensure!(
+                    engine.draft_propose(&p1, tokens[point], 6)?.is_empty(),
+                    "Hy4 DFly2 restored request proposed from stale taps"
+                );
+                println!(
+                    "hy4-golden DFly2 resume={point}: restored skips 1 proposal; fresh draft_us={draft_us} proposed={} ids={candidates:?}",
+                    candidates.len()
+                );
+            }
+
+            // Decode `resume_rows` steps from both p0 (fresh) and p1 (restored) and compare logits.
+            let mut logits_fresh = Vec::with_capacity(tail_toks.len() * vocab);
+            let mut logits_restored = Vec::with_capacity(tail_toks.len() * vocab);
+            for (step, &tok) in tail_toks.iter().enumerate() {
+                let verify = if args.resume_dfly2 && step == 1 {
+                    vec![
+                        tok,
+                        (tok + 1) % vocab as u32,
+                        (tok + 2) % vocab as u32,
+                        (tok + 3) % vocab as u32,
+                    ]
+                } else {
+                    vec![tok]
+                };
+                let la = run_verify_step(&mut engine, &mut p0, &verify, 1)?;
+                let lb = run_verify_step(&mut engine, &mut p1, &verify, 1)?;
+                logits_fresh.extend_from_slice(&la);
+                logits_restored.extend_from_slice(&lb);
+                if args.resume_dfly2 {
+                    ensure!(
+                        engine.draft_valid(&p1),
+                        "Hy4 DFly2 restore did not rejoin after one target step at P={point}"
+                    );
+                    if step == 0 {
+                        let members = [&p0, &p1]
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, p)| super::draft::Member {
+                                slot: p.slot,
+                                pos: p.len,
+                                bonus: if i == 0 { tok } else { (tok + 1) % vocab as u32 },
+                                depth: 6 - i * 2,
+                                rope_delta: 0,
+                            })
+                            .collect::<Vec<_>>();
+                        let separate = members
+                            .iter()
+                            .map(|m| {
+                                engine
+                                    .draft_batch(std::slice::from_ref(m))
+                                    .map(|mut batch| batch.pop().expect("singleton Hy4 DFly2 output"))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let together = engine.draft_batch(&members)?;
+                        if args.decode_graphs {
+                            let eager = engine.without_graphs(|e| e.draft_batch(&members))?;
+                            for _ in 0..2 {
+                                engine.graph_completed()?;
+                                let graphed = engine.draft_batch(&members)?;
+                                ensure!(
+                                    graphed == eager,
+                                    "Hy4 DFly2 eager and graphed proposal IDs differ at P={point}: {graphed:?} vs {eager:?}"
+                                );
+                            }
+                            engine.graph_completed()?;
+                            ensure!(
+                                engine.retained_draft_graph_rows(members.len()) > 0,
+                                "Hy4 DFly2 parity did not retain draft graphs at {} members",
+                                members.len()
+                            );
+                        }
+                        let matches = together == separate;
+                        if point + 1 <= 2048 {
+                            ensure!(
+                                matches,
+                                "Hy4 DFly2 batched proposals differ from singleton at P={point}: {together:?} vs {separate:?}"
+                            );
+                        }
+                        println!(
+                            "hy4-golden DFly2 batch at {point}: proposal_ids_match={matches} together={together:?} separate={separate:?}"
+                        );
+                    }
+                }
+            }
             cache.release(&family, &p0.units)?;
             cache.release(&family, &p1.units)?;
             let mut max_diff = 0f32;
@@ -574,7 +822,12 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
                 args.resume_rows,
                 digest_f32(&logits_restored),
             );
-            ensure!(byte_diffs == 0, "Hy4 restored decode logits differed from fresh at P={point}");
+            if point + args.resume_rows <= 2048 {
+                ensure!(
+                    byte_diffs == 0,
+                    "Hy4 restored decode logits differed from fresh at P={point}"
+                );
+            }
         }
         return Ok(());
     }

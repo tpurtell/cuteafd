@@ -3,6 +3,7 @@
 //! execution layouts (#2550).
 pub mod admission;
 pub mod config;
+pub mod draft;
 pub mod execution;
 pub mod graph_reserve;
 pub mod vision;

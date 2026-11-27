@@ -85,6 +85,14 @@ pub(crate) struct ServeArgs {
     /// Optional explicit path to `exl3-hy4-k45-mul1/rtx-tp{1,2}` package directory.
     #[arg(long)]
     pub expert_package: Option<PathBuf>,
+    /// Run bundled 5-layer DFly2; auto enables it when bundled in the checkpoint.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    pub dfly2: Option<bool>,
+    /// Split DFly2 attention heads and MLP neurons across both RTX GPUs (default on 2x RTX with DFly2).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub tp2_dflash: bool,
+    #[arg(skip)]
+    pub tp2_dflash_explicit: bool,
     #[command(flatten)]
     pub media: crate::shared::vision::still::Options,
     #[command(flatten)]
@@ -123,7 +131,11 @@ impl ServeArgs {
                 concurrency: self.max_sequences as u64,
                 decode_lanes: 1,
                 rtx_gpus: gpus,
-                draft_length: Some(0),
+                draft_length: if self.dfly2.unwrap_or(false) {
+                    self.draft_length.draft_length.map(u32::try_from).transpose()?
+                } else {
+                    Some(0)
+                },
             },
         )? as usize)
     }
@@ -262,29 +274,40 @@ fn reconcile_runtime_inventory(
     retained_receipts: &[Receipt],
 ) -> Result<()> {
     let mut target_backings = 0usize;
+    let mut draft_backings = 0usize;
     for receipt in weight_receipts.iter().filter(|r| r.allocation.view.is_none()) {
         let actual = &receipt.allocation;
-        if actual.id.starts_with("hy4/target/gpu") {
+        let drafter = actual.id.starts_with("hy4/dfly2/gpu");
+        if drafter || actual.id.starts_with("hy4/target/gpu") {
             let planned = plan
                 .facts
                 .allocations
                 .iter()
                 .find(|owner| owner.view.is_none() && owner.id == actual.id)
-                .with_context(|| format!("Hy4 target arena backing not admitted: {}", actual.id))?;
+                .with_context(|| format!("Hy4 arena backing not admitted: {}", actual.id))?;
             ensure!(
                 actual.bytes == planned.bytes && actual.location == planned.location,
-                "Hy4 target arena backing {} differs: actual {} != admitted {}",
+                "Hy4 arena backing {} differs: actual {} != admitted {}",
                 actual.id,
                 actual.bytes,
                 planned.bytes
             );
-            target_backings += 1;
+            if drafter {
+                draft_backings += 1;
+            } else {
+                target_backings += 1;
+            }
         }
     }
     ensure!(
         target_backings == inputs.gpus,
         "Hy4 target arena backing count {target_backings} != {} GPUs",
         inputs.gpus
+    );
+    let expected_draft_backings = inputs.draft.as_ref().map_or(0, |d| d.tp);
+    ensure!(
+        draft_backings == expected_draft_backings,
+        "Hy4 drafter arena backing count {draft_backings} != {expected_draft_backings}"
     );
 
     let contract = inputs.prepare(&plan.request)?;
@@ -297,6 +320,7 @@ fn reconcile_runtime_inventory(
             || id.starts_with("hy4.peer.")
             || id.starts_with("hy4.context_exchange.")
             || id.starts_with("expert-usage.gpu")
+            || (id.starts_with("hy4/dfly2/") && !id.starts_with("hy4/dfly2/gpu"))
     };
     let planned: BTreeMap<&str, &cuteafd_loader::placement::planner::Allocation> = plan
         .facts
@@ -395,14 +419,36 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
         "Hy4 supports 0..=8 distinct Spark peer endpoints"
     );
     let gpus = if args.split_device.is_some() { 2 } else { 1 };
-    let decode_rows = args.resolved_decode_rows(gpus)?;
+    args.resolved_decode_rows(gpus)?;
     let (resolved_attention, attention_placement) =
         resolve_attention_placement(gpus, args.attention_placement.as_str())?;
+    if args.dfly2.is_none() {
+        let view = args
+            .attention
+            .selected_view
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(|| args.attention.select(&args.snapshot))?;
+        args.dfly2 = Some(cuteafd_loader::families::hy4::Hy4DflyConfig::bundled(
+            &view.config()?,
+        ));
+        args.attention.selected_view = Some(view);
+    }
+    if !args.tp2_dflash_explicit {
+        args.tp2_dflash = args.dfly2 == Some(true) && gpus == 2;
+    }
+    ensure!(
+        !args.tp2_dflash || (args.dfly2 == Some(true) && gpus == 2),
+        "Hy4 --tp2-dflash requires --dfly2 and --split-device"
+    );
+    let decode_rows = args.resolved_decode_rows(gpus)?;
     args.prefix.resolve_entries(args.max_sequences);
     let prefill = args.prefill()?;
     cuteafd_bench::context::ResolvedSettings::prefill(prefill)
         .value("decode-rows", decode_rows)
+        .value("dfly2", args.dfly2 == Some(true))
         .value("attention-placement", resolved_attention)
+        .value("tp2-dflash", if args.tp2_dflash { "on" } else { "off" })
         .publish();
 
     let encoding = ModelEncoding::Hy4Flash(Arc::new(Hy4Encoding::from_snapshot(&args.snapshot)?));
@@ -544,6 +590,8 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 catalog: &catalog,
                 cfg: &cfg,
                 model_core: &model.core,
+                dfly2: worker_args.dfly2 == Some(true),
+                tp2_dflash: worker_args.tp2_dflash,
                 kv_format: worker_args.kv_format,
                 manifest_path: Some(&worker_args.manifest),
                 coordinator: Coordinator::Measured { samples, loaded_code },
@@ -985,6 +1033,11 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
 
             library.cuda_set_device(worker_args.device)?;
 
+            let draft_peer_rows = inputs
+                .draft
+                .as_ref()
+                .filter(|d| d.tp == 2)
+                .map_or(0, |d| d.draft_rows());
             let mut engine = Hy4Engine::new_serving(
                 &devices,
                 &programs,
@@ -1004,8 +1057,40 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 admitted_context,
                 false,
                 onboarded,
+                draft_peer_rows,
                 Default::default(),
             )?;
+            let drafts = if let Some(layout) = inputs.draft.clone() {
+                let config = cuteafd_loader::families::hy4::Hy4DflyConfig::from_hf(
+                    &checkpoint.config,
+                    "hy4",
+                    cfg.layers,
+                    cfg.vocab_size,
+                )?
+                .context("admitted Hy4 DFly2 config is missing")?;
+                let depth = config.num_speculative_tokens;
+                let draft_tp = layout.tp;
+                let drafter = super::draft::Drafter::new(
+                    &devices[..draft_tp],
+                    &programs,
+                    &checkpoint,
+                    &cfg,
+                    config,
+                    layout,
+                    worker_args.kv_format,
+                    worker_args.max_sequences,
+                    decode_rows,
+                )?;
+                let draft_devices = drafter.owner_devices();
+                crate::shared::draft::report::publish(dfly2_report(
+                    &draft_devices,
+                    &admitted.solved,
+                )?);
+                engine.attach_drafter(drafter)?;
+                scheduler::Drafts::Neural { depth }
+            } else {
+                scheduler::Drafts::None
+            };
             if let Some(link) = spark_link {
                 engine.attach_spark(link, onboarded_layers.clone());
             }
@@ -1055,6 +1140,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 .value("rtx-expert-layers", onboarded_layers.len())
                 .value("prefill-rows", unit_rows)
                 .value("prefill-waves", prefill.waves)
+                .value("speculator", if worker_args.dfly2 == Some(true) { "dfly2" } else { "off" })
                 .publish();
 
             let backend = Hy4Backend::new(
@@ -1080,7 +1166,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 &mut receive,
                 &worker_stats,
                 worker_args.max_sequences,
-                scheduler::Drafts::None,
+                drafts,
                 worker_args.draft_length,
                 eos,
                 worker_args.decode_share,
@@ -1212,6 +1298,8 @@ mod tests {
             assert_eq!(decode_rows, 32);
             cuteafd_bench::context::ResolvedSettings::default()
                 .value("decode-rows", decode_rows)
+                .value("dfly2", args.dfly2 == Some(true))
+                .value("tp2-dflash", if args.tp2_dflash { "on" } else { "off" })
                 .value("max-context-tokens", 1_048_576)
                 .value("pool-tokens", 262_144)
                 .value("rtx-expert-layers", 0)
@@ -1363,6 +1451,7 @@ mod tests {
             sequences: 16,
             targets: vec![target],
             target_mount_load: Default::default(),
+            draft: None,
             index_topk: IndexTopkScratch::from_manifest_value(None, 1, false, 262_144)?,
             placement: AttentionPlacement::Heads,
             modes,
@@ -1492,4 +1581,67 @@ mod tests {
         assert!(super::reconcile_runtime_inventory(&admitted.solved, &inputs, &weights_receipts, &extra).is_err());
         Ok(())
     }
+
+    #[test]
+    fn hy4_tp2_dflash_defaults_on_for_dual_rtx_dfly2_and_honors_explicit_false() -> anyhow::Result<()> {
+        use clap::{CommandFactory, FromArgMatches};
+        for (argv, expected) in [
+            (vec!["cuteafd", "serve-hy4", "--snapshot", "/s", "--native-lib", "/l", "--dfly2", "--split-device", "1"], true),
+            (vec!["cuteafd", "serve-hy4", "--snapshot", "/s", "--native-lib", "/l", "--dfly2", "--split-device", "1", "--tp2-dflash", "false"], false),
+            (vec!["cuteafd", "serve-hy4", "--snapshot", "/s", "--native-lib", "/l", "--dfly2"], false),
+            (vec!["cuteafd", "serve-hy4", "--snapshot", "/s", "--native-lib", "/l", "--split-device", "1"], false),
+        ] {
+            let matches = crate::cli::Cli::command().try_get_matches_from(&argv)?;
+            let mut cli = crate::cli::Cli::from_arg_matches(&matches)?;
+            crate::cli::resolve_tp2_dflash(&mut cli.command, &matches)?;
+            let crate::cli::Commands::ServeHy4(args) = cli.command else {
+                panic!("expected ServeHy4");
+            };
+            assert_eq!(args.tp2_dflash, expected, "{argv:?}");
+        }
+        Ok(())
+    }
+}
+
+fn dfly2_report(
+    draft_devices: &[i32],
+    plan: &cuteafd_loader::placement::planner::ResolvedPlan,
+) -> Result<crate::shared::draft::report::DrafterLayout> {
+    use crate::shared::draft::report::{self, Kind, Placement};
+    let placement = if draft_devices.len() > 1 {
+        Placement::Split
+    } else {
+        Placement::Whole
+    };
+    report::admitted(Kind::Dfly2, placement, 0, draft_devices, plan)
+}
+
+#[cfg(test)]
+#[test]
+fn dfly2_report_does_not_confuse_target_head_split_with_draft_split() -> Result<()> {
+    use crate::shared::draft::report::{
+        tests::{owner, plan},
+        Kind, Placement, Rank,
+    };
+    let layout = dfly2_report(&[5], &plan(vec![owner(0, 1024)]))?;
+    assert_eq!((layout.kind, layout.placement), (Kind::Dfly2, Some(Placement::Whole)));
+    assert_eq!(layout.ranks, [Rank::CudaRank(5)]);
+    assert_eq!(layout.lead, Some(Rank::CudaRank(5)));
+    assert_eq!(layout.arena_bytes, [1024]);
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn dfly2_report_reports_split_for_two_draft_ranks() -> Result<()> {
+    use crate::shared::draft::report::{
+        tests::{owner, plan},
+        Kind, Placement, Rank,
+    };
+    let layout = dfly2_report(&[5, 2], &plan(vec![owner(0, 2048), owner(1, 1536)]))?;
+    assert_eq!((layout.kind, layout.placement), (Kind::Dfly2, Some(Placement::Split)));
+    assert_eq!(layout.ranks, [Rank::CudaRank(5), Rank::CudaRank(2)]);
+    assert_eq!(layout.lead, Some(Rank::CudaRank(5)));
+    assert_eq!(layout.arena_bytes, [2048, 1536]);
+    Ok(())
 }

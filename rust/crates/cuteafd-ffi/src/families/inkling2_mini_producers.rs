@@ -1,4 +1,4 @@
-//! Inkling 2 Mini TP1 arithmetic producers and looped cross-pass controller kernels.
+//! Inkling 2 Mini TP1 arithmetic producers, looped cross-pass controllers, and fused per-visit glue.
 use crate::{inkling2::producers::Precision, programs::{Program, Programs, Scalar}, CuteafdDeviceBuffer as Buffer};
 use anyhow::{ensure, Result};
 use std::ffi::c_void;
@@ -12,10 +12,22 @@ pub enum Op {
     Residual { queries: usize, max_candidates: usize, addend: bool },
     LoopPairNorm { slots: usize, broadcast_dest: bool },
     LoopBlendNorm { slots: usize, broadcast_dest: bool, broadcast_weight: bool },
+    ControllerDown,
+    ControllerUp,
     Router,
     Gate { precision: Precision },
     Norm { value: bool, precision: Precision },
     KvPack { precision: Precision, fp8: bool },
+    // Dedicated Mini fused per-visit glue programs:
+    FastNorm,
+    ResidualNorm { queries: usize },
+    LoopBlendNormFast { slots: usize, broadcast_dest: bool, broadcast_weight: bool },
+    ResidualPairNorm,
+    AttnCrossPairNorm { broadcast_dest: bool },
+    AttnPrep { local: bool, fp8: bool, replay: bool },
+    PostAttnConv { starts_block: bool, replay: bool },
+    PostMlpConvResidual { replay: bool },
+    FastRouter,
 }
 
 fn precision_suffix(p: Precision) -> &'static str {
@@ -51,6 +63,8 @@ impl Op {
                     "Inkling 2 Mini loop blend_norm geometry unsupported");
                 format!("loop_blend_norm_s{slots}{}", if broadcast_dest { "_bcast" } else { "" })
             }
+            Self::ControllerDown => "controller_down".into(),
+            Self::ControllerUp => "controller_up".into(),
             Self::Router => "router_e128_k8".into(),
             Self::Gate { precision } => format!("gate_h3072_{}", precision_suffix(precision)),
             Self::Norm { value, precision } => if value {
@@ -59,6 +73,37 @@ impl Op {
                 format!("norm_h2304_{}", precision_suffix(precision))
             },
             Self::KvPack { precision, fp8 } => format!("kv_pack_{}_{}_v2", if fp8 { "fp8" } else { "bf16" }, precision_suffix(precision)),
+            Self::FastNorm => "fast_norm_h2304_bf16".into(),
+            Self::ResidualNorm { queries } => {
+                ensure!(matches!(queries, 1 | 3), "Inkling 2 Mini residual_norm queries unsupported");
+                format!("residual_norm_q{queries}_c5")
+            }
+            Self::LoopBlendNormFast { slots, broadcast_dest, broadcast_weight } => {
+                ensure!(matches!((slots, broadcast_dest, broadcast_weight),
+                    (1, false, false) | (3, true, true) | (3, false, false)),
+                    "Inkling 2 Mini fast loop blend_norm geometry unsupported");
+                format!("loop_blend_norm_fast_s{slots}{}", if broadcast_dest { "_bcast" } else { "" })
+            }
+            Self::ResidualPairNorm => "residual_pair_norm_s1".into(),
+            Self::AttnCrossPairNorm { broadcast_dest } => {
+                format!("attn_cross_pair_norm{}", if broadcast_dest { "_bcast" } else { "" })
+            }
+            Self::AttnPrep { local, fp8, replay } => {
+                ensure!(!(local && fp8), "Inkling 2 Mini local attn_prep does not use fp8");
+                format!("attn_prep_{}_{}_{}",
+                    if local { "local" } else { "global" },
+                    if fp8 { "fp8" } else { "bf16" },
+                    if replay { "replay" } else { "strided" })
+            }
+            Self::PostAttnConv { starts_block, replay } => {
+                format!("post_attn_conv_{}_{}",
+                    if starts_block { "start" } else { "cont" },
+                    if replay { "replay" } else { "strided" })
+            }
+            Self::PostMlpConvResidual { replay } => {
+                format!("post_mlp_conv_residual_{}", if replay { "replay" } else { "strided" })
+            }
+            Self::FastRouter => "fast_router_e128_k8".into(),
         }))
     }
 
@@ -68,11 +113,32 @@ impl Op {
             Self::Clip { .. } => &["x", "scale", "positions", "out"],
             Self::Residual { .. } => &["arena", "addend", "query", "out"],
             Self::LoopPairNorm { .. } => &["dest", "msg", "out"],
-            Self::LoopBlendNorm { .. } => &["dest", "msg", "forget_gain", "weight", "out"],
-            Self::Router => &["logits", "bias", "ids", "weights"],
+            Self::LoopBlendNorm { .. } | Self::LoopBlendNormFast { .. } => {
+                &["dest", "msg", "forget_gain", "weight", "out"]
+            }
+            Self::ControllerDown => &["x", "w", "out", "partial"],
+            Self::ControllerUp => &["x", "w", "out"],
+            Self::Router | Self::FastRouter => &["logits", "bias", "ids", "weights"],
             Self::Gate { .. } => &["x", "gate", "gamma", "out"],
-            Self::Norm { .. } => &["x", "weight", "out"],
+            Self::Norm { .. } | Self::FastNorm => &["x", "weight", "out"],
             Self::KvPack { .. } => &["k", "v", "slots", "cache"],
+            Self::ResidualNorm { .. } => &["arena", "query", "weight", "out"],
+            Self::ResidualPairNorm => &["arena", "query", "msg", "mixed_out", "paired_out"],
+            Self::AttnCrossPairNorm { .. } => {
+                &["arena", "attn_query", "prev_arena", "cross_query", "dest_out", "msg_out", "paired_out"]
+            }
+            Self::AttnPrep { .. } => &[
+                "q", "q_scale", "r", "r_scale", "positions", "q_out", "rel_input_out",
+                "k_bf16", "k_weight", "k_dynamic", "k_history",
+                "v_bf16", "v_weight", "v_dynamic", "v_history",
+                "first", "conv_slots", "cache_slots", "cache", "k_replay", "v_replay",
+            ],
+            Self::PostAttnConv { .. } => &[
+                "x_bf16", "weight", "history", "first", "slots", "partial", "arena", "out_base", "replay",
+            ],
+            Self::PostMlpConvResidual { .. } => &[
+                "x_bf16", "weight", "history", "first", "slots", "base", "partial", "arena", "replay",
+            ],
         }
     }
 }
@@ -87,11 +153,21 @@ impl<'a> Producer<'a> {
     pub fn load(programs: &'a Programs<'a>, op: Op) -> Result<Self> {
         let program = programs.program(&op.name()?, op.pointers())?;
         let spec = program.spec();
-        let kinds: &[u8] = if matches!(op, Op::Residual { .. }) { b"iii" }
-            else if matches!(op, Op::Convolution { .. }) { b"il" }
-            else { b"i" };
+        let kinds: &[u8] = match op {
+            Op::Residual { .. }
+            | Op::ResidualNorm { .. }
+            | Op::ResidualPairNorm
+            | Op::AttnCrossPairNorm { .. } => b"iii",
+            Op::Convolution { .. } => b"il",
+            Op::AttnPrep { .. } => b"illl",
+            Op::PostAttnConv { .. } | Op::PostMlpConvResidual { .. } => b"iiilll",
+            _ => b"i",
+        };
+        let scratch_ok = if op == Op::ControllerDown {
+            spec.scratch.len() == 1 && spec.scratch.get("partial") == Some(&(u64::from(spec.capacity_rows) * 8 * 64 * 4))
+        } else { spec.scratch.is_empty() };
         ensure!(spec.capacity_rows > 0 && spec.capacity_rows <= 4096 && spec.scalar_kinds == kinds
-            && spec.scratch.is_empty(), "Inkling 2 Mini producer export capacity/scalars/scratch differs");
+            && scratch_ok, "Inkling 2 Mini producer export capacity/scalars/scratch differs");
         let g = &spec.geometry;
         let equal = |name: &str, expected: serde_json::Value| -> Result<()> {
             ensure!(g[name] == expected,
@@ -125,13 +201,24 @@ impl<'a> Producer<'a> {
                 equal("hidden", 2304.into())?; equal("slots", slots.into())?;
                 equal("broadcast_dest", broadcast_dest.into())?; equal("eps", 1e-6.into())?;
             }
-            Op::LoopBlendNorm { slots, broadcast_dest, broadcast_weight } => {
+            Op::LoopBlendNorm { slots, broadcast_dest, broadcast_weight }
+            | Op::LoopBlendNormFast { slots, broadcast_dest, broadcast_weight } => {
                 equal("hidden", 2304.into())?; equal("slots", slots.into())?;
                 equal("broadcast_dest", broadcast_dest.into())?;
                 equal("broadcast_weight", broadcast_weight.into())?;
                 equal("eps", 1e-6.into())?;
             }
-            Op::Router => {
+            Op::ControllerDown => {
+                equal("width", 4608.into())?; equal("outputs", 64.into())?;
+                equal("output_dtype", "torch.bfloat16".into())?;
+                equal("reduction", "split8_ordered_k16_fold".into())?; equal("splits", 8.into())?;
+            }
+            Op::ControllerUp => {
+                equal("width", 64.into())?; equal("outputs", 4608.into())?;
+                equal("output_dtype", "torch.float32".into())?;
+                equal("reduction", "ordered_k16".into())?;
+            }
+            Op::Router | Op::FastRouter => {
                 equal("experts", 128.into())?; equal("topk", 8.into())?; equal("route_scale", 8.0.into())?;
             }
             Op::Gate { .. } => {
@@ -155,9 +242,45 @@ impl<'a> Producer<'a> {
                     Precision::Bf16 => "torch.bfloat16", Precision::F32 => "torch.float32"
                 }.into())?;
             }
+            Op::FastNorm => {
+                equal("width", 2304.into())?; equal("eps", 1e-6.into())?;
+                equal("output_dtype", "torch.bfloat16".into())?;
+            }
+            Op::ResidualNorm { queries } => {
+                equal("hidden", 2304.into())?; equal("queries", queries.into())?;
+                equal("max_candidates", 5.into())?; equal("eps", 1e-6.into())?;
+                equal("output_dtype", "torch.bfloat16".into())?;
+            }
+            Op::ResidualPairNorm => {
+                equal("hidden", 2304.into())?; equal("slots", 1.into())?;
+                equal("max_candidates", 5.into())?; equal("eps", 1e-6.into())?;
+            }
+            Op::AttnCrossPairNorm { broadcast_dest } => {
+                equal("hidden", 2304.into())?; equal("broadcast_dest", broadcast_dest.into())?;
+                equal("max_candidates", 5.into())?; equal("eps", 1e-6.into())?;
+            }
+            Op::AttnPrep { local, fp8, replay } => {
+                equal("local", local.into())?; equal("fp8", fp8.into())?; equal("replay", replay.into())?;
+                equal("heads", 24.into())?; equal("kv_heads", 8.into())?; equal("head_dim", 128.into())?;
+                equal("rel_dim", 16.into())?; equal("rel_padded", 64.into())?; equal("taps", 4.into())?;
+            }
+            Op::PostAttnConv { starts_block, replay } => {
+                equal("hidden", 2304.into())?; equal("taps", 4.into())?;
+                equal("starts_block", starts_block.into())?; equal("replay", replay.into())?;
+            }
+            Op::PostMlpConvResidual { replay } => {
+                equal("hidden", 2304.into())?; equal("taps", 4.into())?; equal("replay", replay.into())?;
+            }
         }
         let rows = spec.capacity_rows as usize;
         Ok(Self { program, op, rows })
+    }
+
+    fn check_common(&self, buffers: &[Buffer], rows: usize) -> Result<()> {
+        ensure!(rows > 0 && rows <= self.rows && buffers.len() == self.op.pointers().len()
+            && buffers.iter().all(|b| !b.ptr.is_null() && b.device_id == buffers[0].device_id && b.flags == 0),
+            "Inkling 2 Mini producer live rows/device/pointer count differs");
+        Ok(())
     }
 
     /// # Safety
@@ -165,14 +288,29 @@ impl<'a> Producer<'a> {
     /// stream's device. Writers do not alias readers. Owners and stream survive queued work.
     pub unsafe fn launch(&self, buffers: &[Buffer], rows: usize, residual: Option<(usize, usize)>,
         stream: *mut c_void) -> Result<()> {
-        ensure!(rows > 0 && rows <= self.rows && buffers.len() == self.op.pointers().len()
-            && buffers.iter().all(|b| !b.ptr.is_null() && b.device_id == buffers[0].device_id && b.flags == 0),
-            "Inkling 2 Mini producer live rows/device/pointer count differs");
+        self.check_common(buffers, rows)?;
+        let required = match self.op {
+            Op::ControllerDown => vec![rows * 4608 * 2, 64 * 4608 * 2, rows * 64 * 2, rows * 8 * 64 * 4],
+            Op::ControllerUp => vec![rows * 64 * 2, 4608 * 64 * 2, rows * 4608 * 4],
+            _ => vec![],
+        };
+        ensure!(buffers.iter().zip(required).all(|(b, size)| b.bytes >= size && b.ptr as usize % 16 == 0),
+            "Inkling 2 Mini controller projection extent/alignment differs");
         let mut scalars = vec![Scalar::I32(rows as i32)];
         match (self.op, residual) {
-            (Op::Residual { max_candidates, .. }, Some((arena_rows, candidates))) => {
+            (
+                Op::Residual { .. }
+                | Op::ResidualNorm { .. }
+                | Op::ResidualPairNorm
+                | Op::AttnCrossPairNorm { .. },
+                Some((arena_rows, candidates)),
+            ) => {
+                let max_c = match self.op {
+                    Op::Residual { max_candidates, .. } => max_candidates,
+                    _ => 5,
+                };
                 ensure!(arena_rows >= rows && arena_rows <= i32::MAX as usize
-                    && (1..=max_candidates).contains(&candidates),
+                    && (1..=max_c).contains(&candidates),
                     "Inkling 2 Mini residual arena/candidates differ");
                 scalars.extend([Scalar::I32(arena_rows as i32), Scalar::I32(candidates as i32)]);
             }
@@ -188,13 +326,96 @@ impl<'a> Producer<'a> {
                 ensure!(buffers[3].bytes >= 3 * width * precision.bytes(), "Inkling 2 Mini history too short");
                 scalars.push(Scalar::I64((3 * width) as i64));
             }
-            (Op::Residual { .. }, None) | (_, Some(_)) => {
+            (Op::AttnPrep { .. } | Op::PostAttnConv { .. } | Op::PostMlpConvResidual { .. }, _) => {
+                anyhow::bail!("use dedicated launch helper for fused Mini conv producers");
+            }
+            (
+                Op::Residual { .. }
+                | Op::ResidualNorm { .. }
+                | Op::ResidualPairNorm
+                | Op::AttnCrossPairNorm { .. },
+                None,
+            ) | (_, Some(_)) => {
                 anyhow::bail!("Inkling 2 Mini producer residual scalar ABI differs");
             }
             (_, None) => {}
         }
         let pointers = buffers.iter().map(|b| b.ptr).collect::<Vec<_>>();
         // SAFETY: caller supplies typed extents/metadata/lifetimes; ABI and counts checked above.
+        unsafe { self.program.launch(&pointers, &scalars, stream)?; }
+        Ok(())
+    }
+
+    /// # Safety
+    /// Buffers match `Op::AttnPrep` ABI extents and do not alias across readers/writers.
+    pub unsafe fn launch_attn_prep(
+        &self,
+        buffers: &[Buffer],
+        rows: usize,
+        slot_stride: usize,
+        lag_stride: usize,
+        replay_stride: usize,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        let Op::AttnPrep { replay, .. } = self.op else {
+            anyhow::bail!("launch_attn_prep requires Op::AttnPrep");
+        };
+        self.check_common(buffers, rows)?;
+        ensure!(
+            lag_stride >= 1024 && slot_stride >= 3 * lag_stride && (!replay || replay_stride >= 1024),
+            "Inkling 2 Mini attn_prep strides differ"
+        );
+        let pointers = buffers.iter().map(|b| b.ptr).collect::<Vec<_>>();
+        let scalars = [
+            Scalar::I32(rows as i32),
+            Scalar::I64(slot_stride as i64),
+            Scalar::I64(lag_stride as i64),
+            Scalar::I64(replay_stride as i64),
+        ];
+        // SAFETY: validated extents/strides/lifetimes on retained stream.
+        unsafe { self.program.launch(&pointers, &scalars, stream)?; }
+        Ok(())
+    }
+
+    /// # Safety
+    /// Buffers match `Op::PostAttnConv` or `Op::PostMlpConvResidual` ABI extents and do not alias.
+    pub unsafe fn launch_post_conv(
+        &self,
+        buffers: &[Buffer],
+        rows: usize,
+        arena_rows: usize,
+        mlp_cand_idx: usize,
+        slot_stride: usize,
+        lag_stride: usize,
+        replay_stride: usize,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        let (starts_block, replay) = match self.op {
+            Op::PostAttnConv { starts_block, replay } => (starts_block, replay),
+            Op::PostMlpConvResidual { replay } => (false, replay),
+            _ => anyhow::bail!("launch_post_conv requires Op::PostAttnConv or Op::PostMlpConvResidual"),
+        };
+        self.check_common(buffers, rows)?;
+        ensure!(
+            arena_rows >= rows
+                && arena_rows <= i32::MAX as usize
+                && mlp_cand_idx < 5
+                && (!starts_block || mlp_cand_idx >= 1)
+                && lag_stride >= 2304
+                && slot_stride >= 3 * lag_stride
+                && (!replay || replay_stride >= 2304),
+            "Inkling 2 Mini post_conv arena/strides differ"
+        );
+        let pointers = buffers.iter().map(|b| b.ptr).collect::<Vec<_>>();
+        let scalars = [
+            Scalar::I32(rows as i32),
+            Scalar::I32(arena_rows as i32),
+            Scalar::I32(mlp_cand_idx as i32),
+            Scalar::I64(slot_stride as i64),
+            Scalar::I64(lag_stride as i64),
+            Scalar::I64(replay_stride as i64),
+        ];
+        // SAFETY: validated extents/strides/lifetimes on retained stream.
         unsafe { self.program.launch(&pointers, &scalars, stream)?; }
         Ok(())
     }

@@ -103,8 +103,40 @@ impl<'a> MiniKernels<'a> {
                 broadcast_dest,
                 broadcast_weight,
             });
+            ops.push(Op::LoopBlendNormFast {
+                slots,
+                broadcast_dest,
+                broadcast_weight,
+            });
         }
-        ops.push(Op::Router);
+        ops.extend([
+            Op::Router,
+            Op::FastRouter,
+            Op::FastNorm,
+            Op::ResidualNorm { queries: 1 },
+            Op::ResidualNorm { queries: 3 },
+            Op::ResidualPairNorm,
+            Op::AttnCrossPairNorm { broadcast_dest: true },
+            Op::AttnCrossPairNorm { broadcast_dest: false },
+        ]);
+        let global_fp8 = kv_format == InklingKvCache::Fp8;
+        for replay in [true, false] {
+            ops.push(Op::AttnPrep {
+                local: true,
+                fp8: false,
+                replay,
+            });
+            ops.push(Op::AttnPrep {
+                local: false,
+                fp8: global_fp8,
+                replay,
+            });
+            for starts_block in [true, false] {
+                ops.push(Op::PostAttnConv { starts_block, replay });
+            }
+            ops.push(Op::PostMlpConvResidual { replay });
+        }
+        ops.extend([Op::ControllerDown, Op::ControllerUp]);
         let mut producers = BTreeMap::new();
         for op in ops {
             producers.insert(op.name()?, Producer::load(programs, op)?);
@@ -142,7 +174,6 @@ impl<'a> MiniKernels<'a> {
                 (HIDDEN, KV_WIDTH),
                 (Q_WIDTH, HIDDEN),
                 (64, 1024),
-                (2 * HIDDEN, GATE_RANK),
             ],
             4096,
             ProjectionOutput::Bf16,
@@ -153,7 +184,6 @@ impl<'a> MiniKernels<'a> {
                 (HIDDEN, HEADS),     // attn_sink_proj -> F32 sinks
                 (HIDDEN, 32),        // dynamic conv weight_proj -> F32 taps
                 (HIDDEN, 128),       // router mlp.gate -> F32 logits
-                (GATE_RANK, 2 * HIDDEN), // controller [forget; gain] -> F32
             ],
             4096,
             ProjectionOutput::F32,
@@ -242,10 +272,37 @@ impl<'a> MiniKernels<'a> {
         precision: Precision,
         rows: usize,
     ) -> Result<()> {
+        let op = if !value && precision == Precision::Bf16 {
+            Op::FastNorm
+        } else {
+            Op::Norm { value, precision }
+        };
         // SAFETY: disjoint typed planes on retained stream.
         unsafe {
-            self.producer(Op::Norm { value, precision })?
+            self.producer(op)?
                 .launch(&[input, weight, output], rows, None, owner.stream().raw)
+        }
+    }
+
+    pub fn residual_norm(
+        &self,
+        owner: &impl UnitBuffers<'a>,
+        arena: Buffer,
+        query: Buffer,
+        weight: Buffer,
+        output: Buffer,
+        rows: usize,
+        queries: usize,
+        candidates: usize,
+    ) -> Result<()> {
+        // SAFETY: arena has pitch owner.layout().rows, out has live-row pitch rows.
+        unsafe {
+            self.producer(Op::ResidualNorm { queries })?.launch(
+                &[arena, query, weight, output],
+                rows,
+                Some((owner.layout().rows, candidates)),
+                owner.stream().raw,
+            )
         }
     }
 
@@ -437,83 +494,51 @@ pub(crate) fn begin_visit<'a>(
     let w = |name: &str| -> Result<Buffer> { Ok(target.operand(&format!("{prefix}.{name}"))?.buffer) };
     let b = |name: &str| owner.buffer(name);
 
-    // 1. Attention input via AttnRes (F32).
-    let dest = if layer == 0 {
-        b("partial")?
-    } else {
-        let query = target.operand(&format!("model.llm.attn_res.attn_queries.{}", layer - 1))?.buffer;
-        let out = b(if local { "mixed" } else { "global_mixes" })?;
-        k.residual(
-            owner,
-            b("residual_arena")?,
-            query,
-            b("partial")?,
-            out,
-            rows,
-            site.queries,
-            5,
-            site.attention_candidates,
-            false,
-        )?;
-        out
-    };
-
-    // 2. Cross-pass message retrieval & Q/K/V controller blend (passes 1 & 2) or sublayer norm (pass 0).
+    // 1 & 2. Attention input AttnRes + cross-pass controller (pass > 0) or fused AttnRes+Norm (pass == 0).
     let (xq, xk, xv) = if visit.pass > 0 {
-        ensure!(visit.in_core, "cross-pass controllers only run inside looped core");
-        // Retrieve all 4 cross-pass messages [attn, k, v, mlp] in one 4-query AttnRes launch.
-        k.residual(
-            owner,
-            b("prev_pass_arena")?,
-            w("cross_pass_queries")?,
-            b("partial")?,
-            b("cross_pass_msg")?,
-            rows,
-            4,
-            2,
-            2,
-            false,
-        )?;
-        let msg3 = slice(b("cross_pass_msg")?, 0, 3 * rows * HIDDEN * 4)?;
+        ensure!(visit.in_core && layer > 0, "cross-pass controllers only run inside looped core");
+        let query = target.operand(&format!("model.llm.attn_res.attn_queries.{}", layer - 1))?.buffer;
+        let dest = b(if local { "mixed" } else { "global_mixes" })?;
         let paired = b("ctrl_paired")?;
         let rank = b("ctrl_rank")?;
         let fg = b("ctrl_fg")?;
         let out = b("ctrl_out")?;
-        // SAFETY: dest has 1 slot (local) or 3 slots (global); msg3 has 3 slots; live-row stride matches.
+        // SAFETY: fused AttnRes(dest) + CrossPass(4 queries) + LoopPairNorm(slots=3) in one launch.
         unsafe {
-            k.producer(Op::LoopPairNorm {
-                slots: 3,
-                broadcast_dest: local,
-            })?
-            .launch(&[dest, msg3, paired], rows, None, owner.stream().raw)?;
+            k.producer(Op::AttnCrossPairNorm { broadcast_dest: local })?.launch(
+                &[
+                    b("residual_arena")?,
+                    query,
+                    b("prev_pass_arena")?,
+                    w("cross_pass_queries")?,
+                    dest,
+                    b("cross_pass_msg")?,
+                    paired,
+                ],
+                rows,
+                Some((owner.layout().rows, site.attention_candidates)),
+                owner.stream().raw,
+            )?;
         }
         for (slot, stream_name) in [(0usize, "attn"), (1, "k"), (2, "v")] {
             let p_slot = slice(paired, slot * rows * 2 * HIDDEN * 2, rows * 2 * HIDDEN * 2)?;
             let r_slot = slice(rank, slot * rows * GATE_RANK * 2, rows * GATE_RANK * 2)?;
             let fg_slot = slice(fg, slot * rows * 2 * HIDDEN * 4, rows * 2 * HIDDEN * 4)?;
-            k.project_bf16(
-                owner,
-                p_slot,
-                w(&format!("controllers.{stream_name}.down_weight"))?,
-                r_slot,
-                rows,
-                2 * HIDDEN,
-                GATE_RANK,
-            )?;
-            k.project_f32(
-                owner,
-                r_slot,
-                w(&format!("controllers.{stream_name}.forget_gain_weight"))?,
-                fg_slot,
-                rows,
-                GATE_RANK,
-                2 * HIDDEN,
-            )?;
+            // SAFETY: each slot's dense views and the reusable split-K owner survive the stream.
+            unsafe {
+                k.producer(Op::ControllerDown)?.launch(
+                    &[p_slot, w(&format!("controllers.{stream_name}.down_weight"))?, r_slot, b("ctrl_down_partial")?],
+                    rows, None, owner.stream().raw)?;
+                k.producer(Op::ControllerUp)?.launch(
+                    &[r_slot, w(&format!("controllers.{stream_name}.forget_gain_weight"))?, fg_slot],
+                    rows, None, owner.stream().raw)?;
+            }
         }
+        let msg3 = slice(b("cross_pass_msg")?, 0, 3 * rows * HIDDEN * 4)?;
         let norm_w = w(if local { "attn_norm.weight" } else { "qkv_input_norm.weight" })?;
-        // SAFETY: fused F32 tanh blend + weighted RMSNorm -> BF16 [3, rows, 2304].
+        // SAFETY: fast 768-thread weight-preloaded F32 tanh blend + weighted RMSNorm -> BF16 [3, rows, 2304].
         unsafe {
-            k.producer(Op::LoopBlendNorm {
+            k.producer(Op::LoopBlendNormFast {
                 slots: 3,
                 broadcast_dest: local,
                 broadcast_weight: local,
@@ -525,19 +550,37 @@ pub(crate) fn begin_visit<'a>(
             slice(out, rows * HIDDEN * 2, rows * HIDDEN * 2)?,
             slice(out, 2 * rows * HIDDEN * 2, rows * HIDDEN * 2)?,
         )
+    } else if layer == 0 {
+        k.norm(owner, b("partial")?, w("attn_norm.weight")?, b("projection_input")?, false, Precision::Bf16, rows)?;
+        let x = b("projection_input")?;
+        (x, x, x)
     } else if local {
-        k.norm(owner, dest, w("attn_norm.weight")?, b("projection_input")?, false, Precision::Bf16, rows)?;
+        let query = target.operand(&format!("model.llm.attn_res.attn_queries.{}", layer - 1))?.buffer;
+        k.residual_norm(
+            owner,
+            b("residual_arena")?,
+            query,
+            w("attn_norm.weight")?,
+            b("projection_input")?,
+            rows,
+            1,
+            site.attention_candidates,
+        )?;
         let x = b("projection_input")?;
         (x, x, x)
     } else {
-        let norm_w = w("qkv_input_norm.weight")?;
+        let query = target.operand(&format!("model.llm.attn_res.attn_queries.{}", layer - 1))?.buffer;
         let out = b("ctrl_out")?;
-        for slot in 0..3 {
-            let src = slice(dest, slot * rows * HIDDEN * 4, rows * HIDDEN * 4)?;
-            let nw = slice(norm_w, slot * HIDDEN * 2, HIDDEN * 2)?;
-            let dst = slice(out, slot * rows * HIDDEN * 2, rows * HIDDEN * 2)?;
-            k.norm(owner, src, nw, dst, false, Precision::Bf16, rows)?;
-        }
+        k.residual_norm(
+            owner,
+            b("residual_arena")?,
+            query,
+            w("qkv_input_norm.weight")?,
+            out,
+            rows,
+            3,
+            site.attention_candidates,
+        )?;
         (
             slice(out, 0, rows * HIDDEN * 2)?,
             slice(out, rows * HIDDEN * 2, rows * HIDDEN * 2)?,
@@ -545,136 +588,204 @@ pub(crate) fn begin_visit<'a>(
         )
     };
 
-    // 3. Q / R / Gate (BF16) and Sinks (F32).
+    // 3..7. Q/R/Gate/Sinks/K/V projections + fused decode/verify AttnPrep (or parallel prefill path).
+    let fp8 = !local && k.kv_format == InklingKvCache::Fp8;
     k.project_bf16(owner, xq, w("attn.wq_du.weight")?, b("q")?, rows, HIDDEN, Q_WIDTH)?;
     k.project_bf16(owner, xq, w("attn.wr_du.weight")?, b("r")?, rows, HIDDEN, REL_WIDTH)?;
     k.project_bf16(owner, xq, w("attn.gate_attn.weight")?, b("gate")?, rows, HIDDEN, Q_WIDTH)?;
     k.project_f32(owner, xq, w("attn.attn_sink_proj.weight")?, b("sinks")?, rows, HIDDEN, HEADS)?;
 
-    // 4. K & V projections (BF16 -> F32 conv -> BF16).
-    for (x, branch, proj, bf16_name, f32_name, conv_name, history) in [
-        (xk, "k", "wk_dv", "k_bf16", "k_f32", "conv_k", "k_conv_history"),
-        (xv, "v", "wv_dv", "v_bf16", "v_f32", "conv_v", "v_conv_history"),
-    ] {
-        k.project_bf16(owner, x, w(&format!("attn.{proj}.weight"))?, b(bf16_name)?, rows, HIDDEN, KV_WIDTH)?;
-        k.widen_zero(owner, b(bf16_name)?, b(f32_name)?, rows * KV_WIDTH)?;
-        let dynamic = if local {
-            b(f32_name)?
-        } else {
-            let dyn_name = format!("{branch}_dynamic");
-            k.project_f32(
-                owner,
-                x,
-                w(&format!("attn.{branch}_sconv.weight_proj"))?,
-                b(&dyn_name)?,
-                rows,
-                HIDDEN,
-                KV_HEADS * cfg.text.sconv_kernel,
-            )?;
-            b(&dyn_name)?
-        };
-        k.convolution(
-            owner,
-            b(f32_name)?,
-            w(&format!("attn.{branch}_sconv.{}", if local { "weight" } else { "static_w" }))?,
-            dynamic,
-            b(conv_name)?,
-            history,
-            KV_WIDTH,
-            !local,
-            rows,
-        )?;
-        // Exact `.to(bf16)` at model.py:245.
-        // SAFETY: disjoint conv_k/conv_v (F32) and k_bf16/v_bf16 (BF16).
-        unsafe {
-            k.narrow.launch(b(conv_name)?.ptr, b(bf16_name)?.ptr, rows * KV_WIDTH, owner.stream().raw)?;
+    if rows <= 64 && owner.decode_attention() && owner.convolution_strides().is_some() {
+        let (slot_stride, lag_stride, _slots) = owner.convolution_strides().unwrap();
+        k.project_bf16(owner, xk, w("attn.wk_dv.weight")?, b("k_bf16")?, rows, HIDDEN, KV_WIDTH)?;
+        k.project_bf16(owner, xv, w("attn.wv_dv.weight")?, b("v_bf16")?, rows, HIDDEN, KV_WIDTH)?;
+        if !local {
+            k.project_f32(owner, xk, w("attn.k_sconv.weight_proj")?, b("k_dynamic")?, rows, HIDDEN, KV_HEADS * cfg.text.sconv_kernel)?;
+            k.project_f32(owner, xv, w("attn.v_sconv.weight_proj")?, b("v_dynamic")?, rows, HIDDEN, KV_HEADS * cfg.text.sconv_kernel)?;
         }
-    }
-
-    // 5. L2 clip on Q, R, K (BF16 I/O, F32 internals) and unweighted RMSNorm on V (F32 input -> BF16).
-    for (source, output, scale_name, relative, key) in [
-        ("q", "q_clipped", Some("attn.q_l2_clip.scale"), false, false),
-        ("r", "r_clipped", Some("attn.rel_l2_clip.scale"), true, false),
-        ("k_bf16", "k_clipped", None, false, true),
-    ] {
-        let scale = match scale_name {
-            Some(name) => w(name)?,
-            None => b(source)?,
+        let k_rep = owner.convolution_replay("k_conv_history")?;
+        let v_rep = owner.convolution_replay("v_conv_history")?;
+        let (replay, k_replay_buf, v_replay_buf, replay_stride) = match (k_rep, v_rep) {
+            (Some((kr, ks)), Some((vr, vs))) => {
+                ensure!(ks == vs, "Mini K/V replay strides differ");
+                (true, kr, vr, ks)
+            }
+            (None, None) => (false, b("k_f32")?, b("v_f32")?, 0),
+            _ => anyhow::bail!("Mini K/V replay availability disagrees"),
         };
-        // SAFETY: BF16 I/O clip producers with F32 norm/scale/log-scale internals.
+        let w_suffix = if local { "weight" } else { "static_w" };
+        // SAFETY: fused Q/R clip + R zero-pad + K/V conv/commit/clip/norm/pack in one launch.
         unsafe {
-            k.producer(Op::Clip {
-                relative,
-                key,
-                global: !local && !key,
+            k.producer(Op::AttnPrep { local, fp8, replay })?.launch_attn_prep(
+                &[
+                    b("q")?,
+                    w("attn.q_l2_clip.scale")?,
+                    b("r")?,
+                    w("attn.rel_l2_clip.scale")?,
+                    b("positions")?,
+                    b("q_clipped")?,
+                    b("relative_input")?,
+                    b("k_bf16")?,
+                    w(&format!("attn.k_sconv.{w_suffix}"))?,
+                    b("k_dynamic")?,
+                    b("k_conv_history")?,
+                    b("v_bf16")?,
+                    w(&format!("attn.v_sconv.{w_suffix}"))?,
+                    b("v_dynamic")?,
+                    b("v_conv_history")?,
+                    b("first")?,
+                    b("conv_slots")?,
+                    b("cache_slots")?,
+                    if local { b("kv_step")? } else { b("global_cache")? },
+                    k_replay_buf,
+                    v_replay_buf,
+                ],
+                rows,
+                slot_stride,
+                lag_stride,
+                replay_stride,
+                owner.stream().raw,
+            )?;
+        }
+        let mut first = 0;
+        while first < rows * HEADS {
+            let count = (rows * HEADS - first).min(4096);
+            k.project_bf16(
+                owner,
+                slice(b("relative_input")?, first * 64 * 2, count * 64 * 2)?,
+                w("attn.rel_logits_proj.padded")?,
+                slice(b("relative")?, first * 1024 * 2, count * 1024 * 2)?,
+                count,
+                64,
+                1024,
+            )?;
+            first += count;
+        }
+    } else {
+        // 4. K & V projections (BF16 -> F32 conv -> BF16).
+        for (x, branch, proj, bf16_name, f32_name, conv_name, history) in [
+            (xk, "k", "wk_dv", "k_bf16", "k_f32", "conv_k", "k_conv_history"),
+            (xv, "v", "wv_dv", "v_bf16", "v_f32", "conv_v", "v_conv_history"),
+        ] {
+            k.project_bf16(owner, x, w(&format!("attn.{proj}.weight"))?, b(bf16_name)?, rows, HIDDEN, KV_WIDTH)?;
+            k.widen_zero(owner, b(bf16_name)?, b(f32_name)?, rows * KV_WIDTH)?;
+            let dynamic = if local {
+                b(f32_name)?
+            } else {
+                let dyn_name = format!("{branch}_dynamic");
+                k.project_f32(
+                    owner,
+                    x,
+                    w(&format!("attn.{branch}_sconv.weight_proj"))?,
+                    b(&dyn_name)?,
+                    rows,
+                    HIDDEN,
+                    KV_HEADS * cfg.text.sconv_kernel,
+                )?;
+                b(&dyn_name)?
+            };
+            k.convolution(
+                owner,
+                b(f32_name)?,
+                w(&format!("attn.{branch}_sconv.{}", if local { "weight" } else { "static_w" }))?,
+                dynamic,
+                b(conv_name)?,
+                history,
+                KV_WIDTH,
+                !local,
+                rows,
+            )?;
+            // Exact `.to(bf16)` at model.py:245.
+            // SAFETY: disjoint conv_k/conv_v (F32) and k_bf16/v_bf16 (BF16).
+            unsafe {
+                k.narrow.launch(b(conv_name)?.ptr, b(bf16_name)?.ptr, rows * KV_WIDTH, owner.stream().raw)?;
+            }
+        }
+
+        // 5. L2 clip on Q, R, K (BF16 I/O, F32 internals) and unweighted RMSNorm on V (F32 input -> BF16).
+        for (source, output, scale_name, relative, key) in [
+            ("q", "q_clipped", Some("attn.q_l2_clip.scale"), false, false),
+            ("r", "r_clipped", Some("attn.rel_l2_clip.scale"), true, false),
+            ("k_bf16", "k_clipped", None, false, true),
+        ] {
+            let scale = match scale_name {
+                Some(name) => w(name)?,
+                None => b(source)?,
+            };
+            // SAFETY: BF16 I/O clip producers with F32 norm/scale/log-scale internals.
+            unsafe {
+                k.producer(Op::Clip {
+                    relative,
+                    key,
+                    global: !local && !key,
+                    precision: Precision::Bf16,
+                })?
+                .launch(
+                    &[b(source)?, scale, b("positions")?, b(output)?],
+                    rows,
+                    None,
+                    owner.stream().raw,
+                )?;
+            }
+        }
+        // Op::Norm reads F32; widen exact BF16-rounded conv_v into v_f32 first.
+        k.widen_zero(owner, b("v_bf16")?, b("v_f32")?, rows * KV_WIDTH)?;
+        k.norm(owner, b("v_f32")?, b("v_f32")?, b("v_norm")?, true, Precision::Bf16, rows)?;
+
+        // 6. Pad R to K=64 and compute BF16 relative bias `[rows * 24, 1024]`.
+        let lib = owner.stream().device.library;
+        // SAFETY: disjoint retained unit buffers on the same ordered stream.
+        unsafe {
+            if owner.decode_attention() {
+                k.copy
+                    .launch_rows(b("relative_input")?, b("r_clipped")?, 16 * 2, rows * HEADS, 64 * 2, 16 * 2, owner.stream().raw)?;
+            } else {
+                lib.cuda_zero_bytes_async(b("relative_input")?, rows * HEADS * 64 * 2, owner.stream().raw)?;
+                lib.copy_d2d_2d_async(
+                    b("relative_input")?,
+                    64 * 2,
+                    b("r_clipped")?,
+                    16 * 2,
+                    16 * 2,
+                    rows * HEADS,
+                    owner.stream().raw,
+                )?;
+            }
+        }
+        let mut first = 0;
+        while first < rows * HEADS {
+            let count = (rows * HEADS - first).min(4096);
+            k.project_bf16(
+                owner,
+                slice(b("relative_input")?, first * 64 * 2, count * 64 * 2)?,
+                w("attn.rel_logits_proj.padded")?,
+                slice(b("relative")?, first * 1024 * 2, count * 1024 * 2)?,
+                count,
+                64,
+                1024,
+            )?;
+            first += count;
+        }
+
+        // 7. Pack KV.
+        // SAFETY: disjoint k_clipped, v_norm, slots, and target cache plane.
+        unsafe {
+            k.producer(Op::KvPack {
                 precision: Precision::Bf16,
+                fp8,
             })?
             .launch(
-                &[b(source)?, scale, b("positions")?, b(output)?],
+                &[
+                    b("k_clipped")?,
+                    b("v_norm")?,
+                    b("cache_slots")?,
+                    if local { b("kv_step")? } else { b("global_cache")? },
+                ],
                 rows,
                 None,
                 owner.stream().raw,
             )?;
         }
-    }
-    // Op::Norm reads F32; widen exact BF16-rounded conv_v into v_f32 first.
-    k.widen_zero(owner, b("v_bf16")?, b("v_f32")?, rows * KV_WIDTH)?;
-    k.norm(owner, b("v_f32")?, b("v_f32")?, b("v_norm")?, true, Precision::Bf16, rows)?;
-
-    // 6. Pad R to K=64 and compute BF16 relative bias `[rows * 24, 1024]`.
-    let lib = owner.stream().device.library;
-    // SAFETY: disjoint retained unit buffers on the same ordered stream.
-    unsafe {
-        if owner.decode_attention() {
-            k.copy
-                .launch_rows(b("relative_input")?, b("r_clipped")?, 16 * 2, rows * HEADS, 64 * 2, 16 * 2, owner.stream().raw)?;
-        } else {
-            lib.cuda_zero_bytes_async(b("relative_input")?, rows * HEADS * 64 * 2, owner.stream().raw)?;
-            lib.copy_d2d_2d_async(
-                b("relative_input")?,
-                64 * 2,
-                b("r_clipped")?,
-                16 * 2,
-                16 * 2,
-                rows * HEADS,
-                owner.stream().raw,
-            )?;
-        }
-    }
-    let mut first = 0;
-    while first < rows * HEADS {
-        let count = (rows * HEADS - first).min(4096);
-        k.project_bf16(
-            owner,
-            slice(b("relative_input")?, first * 64 * 2, count * 64 * 2)?,
-            w("attn.rel_logits_proj.padded")?,
-            slice(b("relative")?, first * 1024 * 2, count * 1024 * 2)?,
-            count,
-            64,
-            1024,
-        )?;
-        first += count;
-    }
-
-    // 7. Pack KV & launch local/global attention.
-    let fp8 = !local && k.kv_format == InklingKvCache::Fp8;
-    // SAFETY: disjoint k_clipped, v_norm, slots, and target cache plane.
-    unsafe {
-        k.producer(Op::KvPack {
-            precision: Precision::Bf16,
-            fp8,
-        })?
-        .launch(
-            &[
-                b("k_clipped")?,
-                b("v_norm")?,
-                b("cache_slots")?,
-                if local { b("kv_step")? } else { b("global_cache")? },
-            ],
-            rows,
-            None,
-            owner.stream().raw,
-        )?;
     }
     let decode = owner.decode_attention();
     let tile_rows = if decode { DECODE_TILE_ROWS } else { PREFILL_TILE_ROWS };
@@ -729,71 +840,104 @@ pub(crate) fn begin_visit<'a>(
         )?;
     }
 
-    // 8. Output gate (F32 sigmoid * F32 attended -> BF16), wo_ud (BF16), attn_sconv (F32 -> BF16).
+    // 8 & 9. Output gate, wo_ud, fused post-attn conv+residual update, and MLP input (AttnRes+Norm or controller).
     // SAFETY: disjoint BF16 attended/gate/gated buffers.
     unsafe {
         k.producer(Op::Gate { precision: Precision::Bf16 })?
             .launch(&[b("attended")?, b("gate")?, b("gate")?, b("gated")?], rows, None, owner.stream().raw)?;
     }
     k.project_bf16(owner, b("gated")?, w("attn.wo_ud.weight")?, b("branch_bf16")?, rows, Q_WIDTH, HIDDEN)?;
-    k.widen_zero(owner, b("branch_bf16")?, b("branch")?, rows * HIDDEN)?;
-    k.convolution(
-        owner,
-        b("branch")?,
-        w("attn_sconv.weight")?,
-        b("branch")?,
-        b("mixed")?,
-        "attn_conv_history",
-        HIDDEN,
-        false,
-        rows,
-    )?;
-    // Exact `conv = short_conv(attn, attn_sconv).to(bf16); out = conv.float()`.
-    k.round_bf16_f32(owner, b("mixed")?, b("branch_bf16")?, b("attention")?, rows * HIDDEN)?;
-
-    // 9. Post-attention AttnRes + MLP input (optional pass>0 MLP controller + mlp_norm).
     let partial = b("partial")?;
     let arena = b("residual_arena")?;
     let stride = owner.layout().rows * HIDDEN * 4;
-    if site.starts_block {
-        k.copy_residual(owner, slice(arena, (site.attention_candidates - 1) * stride, rows * HIDDEN * 4)?, partial, rows * HIDDEN * 4)?;
-        k.copy_residual(owner, slice(arena, (site.mlp_candidates - 1) * stride, rows * HIDDEN * 4)?, b("attention")?, rows * HIDDEN * 4)?;
-    } else {
-        // SAFETY: partial + attention -> branch (F32, unrounded per model.py:328).
+    if rows <= 64 && owner.decode_attention() && owner.convolution_strides().is_some() {
+        let (slot_stride, lag_stride, _slots) = owner.convolution_strides().unwrap();
+        ensure!(
+            !site.starts_block || site.attention_candidates + 1 == site.mlp_candidates,
+            "Inkling 2 Mini block-start candidate indices differ"
+        );
+        let (replay, rep_buf, rep_stride) = match owner.convolution_replay("attn_conv_history")? {
+            Some((buf, s)) => (true, buf, s),
+            None => (false, b("mixed")?, 0),
+        };
+        let out_base = if site.starts_block { b("attention")? } else { b("branch")? };
+        // SAFETY: fused BF16->attn_sconv->commit->BF16-round->add/copy->arena update in one launch.
         unsafe {
-            k.add.launch(partial, b("attention")?, b("branch")?, rows * HIDDEN, owner.stream().raw)?;
+            k.producer(Op::PostAttnConv {
+                starts_block: site.starts_block,
+                replay,
+            })?
+            .launch_post_conv(
+                &[
+                    b("branch_bf16")?,
+                    w("attn_sconv.weight")?,
+                    b("attn_conv_history")?,
+                    b("first")?,
+                    b("conv_slots")?,
+                    partial,
+                    arena,
+                    out_base,
+                    rep_buf,
+                ],
+                rows,
+                owner.layout().rows,
+                site.mlp_candidates - 1,
+                slot_stride,
+                lag_stride,
+                rep_stride,
+                owner.stream().raw,
+            )?;
         }
-        k.copy_residual(owner, slice(arena, (site.mlp_candidates - 1) * stride, rows * HIDDEN * 4)?, b("branch")?, rows * HIDDEN * 4)?;
+    } else {
+        k.widen_zero(owner, b("branch_bf16")?, b("branch")?, rows * HIDDEN)?;
+        k.convolution(
+            owner,
+            b("branch")?,
+            w("attn_sconv.weight")?,
+            b("branch")?,
+            b("mixed")?,
+            "attn_conv_history",
+            HIDDEN,
+            false,
+            rows,
+        )?;
+        // Exact `conv = short_conv(attn, attn_sconv).to(bf16); out = conv.float()`.
+        k.round_bf16_f32(owner, b("mixed")?, b("branch_bf16")?, b("attention")?, rows * HIDDEN)?;
+        if site.starts_block {
+            k.copy_residual(owner, slice(arena, (site.attention_candidates - 1) * stride, rows * HIDDEN * 4)?, partial, rows * HIDDEN * 4)?;
+            k.copy_residual(owner, slice(arena, (site.mlp_candidates - 1) * stride, rows * HIDDEN * 4)?, b("attention")?, rows * HIDDEN * 4)?;
+        } else {
+            // SAFETY: partial + attention -> branch (F32, unrounded per model.py:328).
+            unsafe {
+                k.add.launch(partial, b("attention")?, b("branch")?, rows * HIDDEN, owner.stream().raw)?;
+            }
+            k.copy_residual(owner, slice(arena, (site.mlp_candidates - 1) * stride, rows * HIDDEN * 4)?, b("branch")?, rows * HIDDEN * 4)?;
+        }
     }
-    k.residual(
-        owner,
-        arena,
-        target.operand(&format!("model.llm.attn_res.mlp_queries.{layer}"))?.buffer,
-        partial,
-        b("mixed")?,
-        rows,
-        1,
-        5,
-        site.mlp_candidates,
-        false,
-    )?;
+    let mlp_query = target.operand(&format!("model.llm.attn_res.mlp_queries.{layer}"))?.buffer;
     if visit.pass > 0 {
         let msg_mlp = slice(b("cross_pass_msg")?, 3 * rows * HIDDEN * 4, rows * HIDDEN * 4)?;
         let p0 = slice(b("ctrl_paired")?, 0, rows * 2 * HIDDEN * 2)?;
         let r0 = slice(b("ctrl_rank")?, 0, rows * GATE_RANK * 2)?;
         let fg0 = slice(b("ctrl_fg")?, 0, rows * 2 * HIDDEN * 4)?;
-        // SAFETY: slots=1 MLP controller pair_norm -> down(BF16) -> fg(F32) -> blend_norm(BF16).
+        // SAFETY: fused MLP AttnRes + LoopPairNorm(slots=1) in one launch.
         unsafe {
-            k.producer(Op::LoopPairNorm {
-                slots: 1,
-                broadcast_dest: false,
-            })?
-            .launch(&[b("mixed")?, msg_mlp, p0], rows, None, owner.stream().raw)?;
+            k.producer(Op::ResidualPairNorm)?.launch(
+                &[arena, mlp_query, msg_mlp, b("mixed")?, p0],
+                rows,
+                Some((owner.layout().rows, site.mlp_candidates)),
+                owner.stream().raw,
+            )?;
         }
-        k.project_bf16(owner, p0, w("controllers.mlp.down_weight")?, r0, rows, 2 * HIDDEN, GATE_RANK)?;
-        k.project_f32(owner, r0, w("controllers.mlp.forget_gain_weight")?, fg0, rows, GATE_RANK, 2 * HIDDEN)?;
+        // SAFETY: retained dense MLP controller views and unit-owned split-K workspace.
         unsafe {
-            k.producer(Op::LoopBlendNorm {
+            k.producer(Op::ControllerDown)?.launch(
+                &[p0, w("controllers.mlp.down_weight")?, r0, b("ctrl_down_partial")?], rows, None, owner.stream().raw)?;
+            k.producer(Op::ControllerUp)?.launch(
+                &[r0, w("controllers.mlp.forget_gain_weight")?, fg0], rows, None, owner.stream().raw)?;
+        }
+        unsafe {
+            k.producer(Op::LoopBlendNormFast {
                 slots: 1,
                 broadcast_dest: false,
                 broadcast_weight: false,
@@ -806,14 +950,15 @@ pub(crate) fn begin_visit<'a>(
             )?;
         }
     } else {
-        k.norm(
+        k.residual_norm(
             owner,
-            b("mixed")?,
+            arena,
+            mlp_query,
             w("mlp_norm.weight")?,
             b("projection_input")?,
-            false,
-            Precision::Bf16,
             rows,
+            1,
+            site.mlp_candidates,
         )?;
     }
     Ok(())
@@ -839,8 +984,10 @@ pub(crate) fn prepare_routes<'a>(
         128,
     )?;
     // SAFETY: F32 router logits/bias -> I32 ids + F32 weights.
+    // Keep stock 128-thread router at decode/verify rows (faster at M=1..64 than single-warp).
+    let router_op = if rows > 64 { Op::FastRouter } else { Op::Router };
     unsafe {
-        k.producer(Op::Router)?.launch(
+        k.producer(router_op)?.launch(
             &[
                 owner.buffer("route_logits")?,
                 target.operand(&format!("{prefix}.mlp.gate.bias"))?.buffer,
@@ -879,7 +1026,7 @@ pub(crate) fn dispatch_experts<'a>(
     owner: &impl UnitBuffers<'a>,
     experts: &dyn Dispatcher,
     rows: usize,
-) -> Result<()> {
+) -> Result<Buffer> {
     let input = owner.buffer(if experts.wire_input() {
         "expert_wire"
     } else {
@@ -903,6 +1050,7 @@ pub(crate) fn join_visit<'a>(
     target: &MiniTargetWeights<'_>,
     cfg: &Inkling2MiniConfig,
     visit: LoopVisit,
+    expert_output: Buffer,
     rows: usize,
 ) -> Result<()> {
     let layer = visit.layer;
@@ -911,35 +1059,66 @@ pub(crate) fn join_visit<'a>(
     let arena = b("residual_arena")?;
     let stride = owner.layout().rows * HIDDEN * 4;
     let partial = b("partial")?;
-
-    k.widen_zero(owner, b("expert_output")?, b("mlp")?, rows * HIDDEN)?;
-    k.convolution(
-        owner,
-        b("mlp")?,
-        target.operand(&format!("model.llm.layers.{layer}.mlp_sconv.weight"))?.buffer,
-        b("mlp")?,
-        b("mixed")?,
-        "mlp_conv_history",
-        HIDDEN,
-        false,
-        rows,
-    )?;
-    // Exact `mlp = short_conv(moe, mlp_sconv).to(bf16)`.
-    k.round_bf16_f32(owner, b("mixed")?, b("branch_bf16")?, b("mlp")?, rows * HIDDEN)?;
-
     let base = if site.starts_block { b("attention")? } else { b("branch")? };
-    // Exact `return (out + mlp.float()).to(bf16), blocks` (model.py:340).
-    // SAFETY: base + mlp -> mixed (F32), then round BF16 -> partial (F32 holding exact BF16).
-    unsafe {
-        k.add.launch(base, b("mlp")?, b("mixed")?, rows * HIDDEN, owner.stream().raw)?;
+
+    if rows <= 64 && owner.decode_attention() && owner.convolution_strides().is_some() {
+        let (slot_stride, lag_stride, _slots) = owner.convolution_strides().unwrap();
+        let (replay, rep_buf, rep_stride) = match owner.convolution_replay("mlp_conv_history")? {
+            Some((buf, s)) => (true, buf, s),
+            None => (false, b("mixed")?, 0),
+        };
+        // SAFETY: fused BF16 expert_output -> mlp_sconv -> commit -> BF16 round -> add base -> BF16 round -> partial & arena.
+        unsafe {
+            k.producer(Op::PostMlpConvResidual { replay })?.launch_post_conv(
+                &[
+                    expert_output,
+                    target.operand(&format!("model.llm.layers.{layer}.mlp_sconv.weight"))?.buffer,
+                    b("mlp_conv_history")?,
+                    b("first")?,
+                    b("conv_slots")?,
+                    base,
+                    partial,
+                    arena,
+                    rep_buf,
+                ],
+                rows,
+                owner.layout().rows,
+                site.mlp_candidates - 1,
+                slot_stride,
+                lag_stride,
+                rep_stride,
+                owner.stream().raw,
+            )?;
+        }
+    } else {
+        k.widen_zero(owner, expert_output, b("mlp")?, rows * HIDDEN)?;
+        k.convolution(
+            owner,
+            b("mlp")?,
+            target.operand(&format!("model.llm.layers.{layer}.mlp_sconv.weight"))?.buffer,
+            b("mlp")?,
+            b("mixed")?,
+            "mlp_conv_history",
+            HIDDEN,
+            false,
+            rows,
+        )?;
+        // Exact `mlp = short_conv(moe, mlp_sconv).to(bf16)`.
+        k.round_bf16_f32(owner, b("mixed")?, b("branch_bf16")?, b("mlp")?, rows * HIDDEN)?;
+
+        // Exact `return (out + mlp.float()).to(bf16), blocks` (model.py:340).
+        // SAFETY: base + mlp -> mixed (F32), then round BF16 -> partial (F32 holding exact BF16).
+        unsafe {
+            k.add.launch(base, b("mlp")?, b("mixed")?, rows * HIDDEN, owner.stream().raw)?;
+        }
+        k.round_bf16_f32(owner, b("mixed")?, b("branch_bf16")?, partial, rows * HIDDEN)?;
+        k.copy_residual(
+            owner,
+            slice(arena, (site.mlp_candidates - 1) * stride, rows * HIDDEN * 4)?,
+            partial,
+            rows * HIDDEN * 4,
+        )?;
     }
-    k.round_bf16_f32(owner, b("mixed")?, b("branch_bf16")?, partial, rows * HIDDEN)?;
-    k.copy_residual(
-        owner,
-        slice(arena, (site.mlp_candidates - 1) * stride, rows * HIDDEN * 4)?,
-        partial,
-        rows * HIDDEN * 4,
-    )?;
 
     // Loop boundary bookkeeping (exact reference/model.py:367-375):
     let row_bytes = rows * HIDDEN * 4;

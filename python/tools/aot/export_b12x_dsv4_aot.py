@@ -640,9 +640,21 @@ def inkling2_mini_producer_programs(prefill_rows: int):
     from b12x.integration.cuteafd.inkling2_residual import compile_inkling2_residual_aot
     from b12x.integration.cuteafd.inkling2_loop_controller import (
         compile_inkling2_loop_pair_norm_aot, compile_inkling2_loop_blend_norm_aot,
+        compile_inkling2_mini_controller_down_aot, compile_inkling2_mini_controller_up_aot,
     )
     from b12x.integration.cuteafd.inkling2_router import compile_inkling2_router_aot, compile_inkling2_gate_aot
     from b12x.integration.cuteafd.inkling2_glue import compile_inkling2_norm_aot, compile_inkling2_kv_pack_aot
+    from b12x.integration.cuteafd.inkling2_mini_glue import (
+        compile_inkling2_mini_fast_norm_aot,
+        compile_inkling2_mini_residual_norm_aot,
+        compile_inkling2_mini_loop_blend_norm_aot,
+        compile_inkling2_mini_residual_pair_norm_aot,
+        compile_inkling2_mini_attn_cross_pair_norm_aot,
+        compile_inkling2_mini_attn_prep_aot,
+        compile_inkling2_mini_post_attn_conv_aot,
+        compile_inkling2_mini_post_mlp_conv_residual_aot,
+        compile_inkling2_mini_fast_router_aot,
+    )
 
     result = []
     def add(stem, op, compiler, **params):
@@ -687,7 +699,50 @@ def inkling2_mini_producer_programs(prefill_rows: int):
         add(f"loop_blend_norm_s{slots}{tag}", "loop_blend_norm",
             compile_inkling2_loop_blend_norm_aot, hidden=2304, slots=slots,
             broadcast_dest=bcast, broadcast_weight=bcast)
+    add("controller_down", "controller_down", compile_inkling2_mini_controller_down_aot)
+    add("controller_up", "controller_up", compile_inkling2_mini_controller_up_aot)
     add("router_e128_k8", "router", compile_inkling2_router_aot, experts=128, topk=8, route_scale=8.)
+    # Dedicated Mini fused per-visit glue programs (appended after existing Mini programs).
+    add("fast_norm_h2304_bf16", "fast_norm", compile_inkling2_mini_fast_norm_aot, width=2304)
+    for queries in (1, 3):
+        add(f"residual_norm_q{queries}_c5", "residual_norm",
+            compile_inkling2_mini_residual_norm_aot, hidden=2304, queries=queries, max_candidates=5)
+    for slots, bcast in ((1, False), (3, True), (3, False)):
+        tag = "_bcast" if bcast else ""
+        add(f"loop_blend_norm_fast_s{slots}{tag}", "loop_blend_norm_fast",
+            compile_inkling2_mini_loop_blend_norm_aot, hidden=2304, slots=slots,
+            broadcast_dest=bcast, broadcast_weight=bcast)
+    add("residual_pair_norm_s1", "residual_pair_norm",
+        compile_inkling2_mini_residual_pair_norm_aot, hidden=2304, max_candidates=5)
+    for bcast in (True, False):
+        tag = "_bcast" if bcast else ""
+        add(f"attn_cross_pair_norm{tag}", "attn_cross_pair_norm",
+            compile_inkling2_mini_attn_cross_pair_norm_aot, hidden=2304,
+            broadcast_dest=bcast, max_candidates=5)
+    add("fast_router_e128_k8", "fast_router",
+        compile_inkling2_mini_fast_router_aot, experts=128, topk=8, route_scale=8.)
+
+    def add64(stem, op, compiler, **params):
+        params = {**params, "max_rows": 64}
+        result.append((stem, op, params, partial(compiler, **params)))
+
+    for local, fp8 in ((True, False), (False, True), (False, False)):
+        for replay in (True, False):
+            loc_tag = "local" if local else "global"
+            fmt_tag = "fp8" if fp8 else "bf16"
+            rep_tag = "replay" if replay else "strided"
+            add64(f"attn_prep_{loc_tag}_{fmt_tag}_{rep_tag}", "attn_prep",
+                  compile_inkling2_mini_attn_prep_aot, local=local, fp8=fp8, replay=replay)
+    for starts_block in (True, False):
+        for replay in (True, False):
+            blk_tag = "start" if starts_block else "cont"
+            rep_tag = "replay" if replay else "strided"
+            add64(f"post_attn_conv_{blk_tag}_{rep_tag}", "post_attn_conv",
+                  compile_inkling2_mini_post_attn_conv_aot, starts_block=starts_block, replay=replay)
+    for replay in (True, False):
+        rep_tag = "replay" if replay else "strided"
+        add64(f"post_mlp_conv_residual_{rep_tag}", "post_mlp_conv_residual",
+              compile_inkling2_mini_post_mlp_conv_residual_aot, replay=replay)
     return result
 
 

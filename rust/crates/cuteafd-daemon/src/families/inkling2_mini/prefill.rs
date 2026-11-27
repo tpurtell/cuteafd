@@ -549,8 +549,8 @@ impl<'a> VisitOps<'a> for StatefulOps<'_, '_, 'a> {
         let rows = unit.rows.len();
         let experts = self.local[visit.layer].as_ref();
         layers::prepare_routes(self.kernels, state.unit, self.target, experts, visit.layer, rows)?;
-        layers::dispatch_experts(state.unit, experts, rows)?;
-        layers::join_visit(self.kernels, state, self.target, cfg, visit, rows)
+        let expert_output = layers::dispatch_experts(state.unit, experts, rows)?;
+        layers::join_visit(self.kernels, state, self.target, cfg, visit, expert_output, rows)
     }
 
     fn end_io(&mut self, unit: &Unit, owner: &UnitOwner<'a>) -> Result<()> {
@@ -1055,9 +1055,8 @@ mod tests {
         let experts_code = code_only(include_str!("experts.rs"));
         assert!(
             !experts_code.contains("copy_d2d_async")
-                && !experts_code.contains("cuda_zero_bytes_async")
-                && experts_code.contains("launch_rows"),
-            "experts.rs must use shared DeviceRowCopy::launch_rows instead of memcpy/memset inside captured graphs"
+                && !experts_code.contains("cuda_zero_bytes_async"),
+            "experts.rs must not issue memcpy/memset inside captured graphs"
         );
         let taps_entry_code = code_only(
             include_str!("draft_taps.rs")

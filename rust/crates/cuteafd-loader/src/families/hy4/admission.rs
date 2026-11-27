@@ -73,6 +73,8 @@ pub struct FactsRequest<'a> {
     pub cfg: &'a Hy4Config,
     pub model_core: &'a BTreeMap<String, CoreProjection>,
     pub kv_format: Hy4KvCache,
+    pub dfly2: bool,
+    pub tp2_dflash: bool,
     pub manifest_path: Option<&'a Path>,
     pub coordinator: Coordinator,
     pub attention: AttentionPlacement,
@@ -563,6 +565,54 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
             "Supply the bundled vit.* tower tensors or use VISION=off.",
         )
     })?;
+    if request.tp2_dflash && (!request.dfly2 || gpus != 2) {
+        return Err(refused(
+            "Hy4 TP2_DFLASH requires two coordinator GPUs and DFly2",
+            "Use two RTX GPUs with SPECULATOR=dfly2, or set TP2_DFLASH=off.",
+        ));
+    }
+    let draft = request
+        .dfly2
+        .then(|| {
+            use super::{draft, Hy4DflyConfig};
+            let checkpoint = request.checkpoint;
+            let config = Hy4DflyConfig::from_hf(
+                &checkpoint.config,
+                "Hy4",
+                cfg.layers,
+                cfg.vocab_size,
+            )?
+            .context("no bundled DFly2 config")?;
+            let source = checkpoint
+                .view
+                .as_ref()
+                .map(|view| {
+                    crate::plan::Checkpoint::open_view_for_role(
+                        view,
+                        "Hy4 DFly2",
+                        |name| name.starts_with(draft::PREFIX),
+                    )
+                })
+                .transpose()?;
+            draft::Admission::new_tp_with_context(
+                source.as_ref().unwrap_or(checkpoint),
+                cfg,
+                &config,
+                request.model_core,
+                request.kv_format,
+                request.sequences as usize,
+                request.decode_rows as usize,
+                if request.tp2_dflash { 2 } else { 1 },
+                context_split,
+            )
+        })
+        .transpose()
+        .map_err(|error| {
+            refused(
+                format!("Hy4 DFly2 admission refused: {error:#}"),
+                "Use a supported bundled Hy4 drafter or SPECULATOR=off.",
+            )
+        })?;
 
     Ok(Hy4Inputs {
         cfg: cfg.clone(),
@@ -577,6 +627,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
         sequences: request.sequences,
         targets,
         target_mount_load,
+        draft,
         index_topk,
         placement: request.attention,
         modes,

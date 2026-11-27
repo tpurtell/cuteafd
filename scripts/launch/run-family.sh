@@ -1664,6 +1664,12 @@ if [[ "$family" == hy4_flash && ( -z "$speculator" || "$speculator" == auto ) ]]
     speculator=dfly2
   fi
 fi
+if [[ "$family" == hy4 && ( -z "$speculator" || "$speculator" == auto ) ]]; then
+  speculator=off
+  if python3 -c 'import json,sys; n=json.load(open(sys.argv[1])).get("dfly_num_hidden_layers"); sys.exit(type(n) is not int or n != 5)' "$snapshot/$selected_config"; then
+    speculator=dfly2
+  fi
+fi
 default_drafter=""
 [[ "$family" != muse_spark ]] || default_drafter=nvidia/Muse-Spark-Open-816B-A42B-DFlash2
 [[ "$family" != inkling2_mini ]] || default_drafter=incoai/Inkling-2-Mini-DFlash2
@@ -1709,7 +1715,7 @@ if [[ -z "$speculator" ]]; then
 
 fi
 case "$family:$speculator" in
-  minimax_m3:dspark|inkling2:dspark|inkling2_mini:dspark|inkling2_mini:dflash2|hy4_flash:dfly2) ;;
+  minimax_m3:dspark|inkling2:dspark|inkling2_mini:dspark|inkling2_mini:dflash2|hy4_flash:dfly2|hy4:dfly2) ;;
   qwen4:mtp|qwen4:auto) ;;
   glm5:dspark) [[ "$checkpoint_family" == mistral_large4 ]] ||
     { echo "SPECULATOR=dspark does not apply to $family" >&2; exit 2; } ;; # The MTP layer's experts stay local even with Spark backbone experts.
@@ -1790,7 +1796,7 @@ if [[ $family == deepseek_v4 || $family == mimo_v2 || $family == glm5 || $family
 fi
 tp2_dflash_default=off
 tp2_dflash_supported=0
-if [[ "$family" == hy4_flash && "$speculator" == dfly2 ]]; then
+if [[ ( "$family" == hy4_flash || "$family" == hy4 ) && "$speculator" == dfly2 ]]; then
   tp2_dflash_supported=1
 elif [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark ) && "$speculator" == dflash2 ]]; then
   tp2_dflash_supported=1
@@ -1805,7 +1811,7 @@ tp2_dflash="$(get TP2_DFLASH "$tp2_dflash_default")"
 case "$tp2_dflash" in on|off) ;; auto) [[ "$family" == kimi_k3 && -z "$(get TP2_DFLASH)" ]] || release_die "TP2_DFLASH must be on or off" ;; *) release_die "TP2_DFLASH must be on or off" ;; esac
 [[ "$tp2_dflash" != on || ( "$tp2_dflash_supported" == 1 && ${#RELEASE_COORDINATOR_GPU_INDICES[@]} == 2 ) ]] ||
   release_die "TP2_DFLASH requires GLM 5.3/MiMo/Kimi/GLM Flash/Muse with DFlash2, Mistral Large 4 with dSpark, or Hy4-flash with DFly2 and two selected RTX GPUs"
-if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark || "$family" == hy4_flash ) && "$tp2_dflash" != auto ]]; then
+if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark || "$family" == hy4_flash || "$family" == hy4 ) && "$tp2_dflash" != auto ]]; then
   # Forward false as well: an explicit off must survive future default changes.
   tp2_dflash_bool="$([[ "$tp2_dflash" == on ]] && echo true || echo false)"
   family_args+=(--tp2-dflash "$tp2_dflash_bool")
@@ -2142,6 +2148,7 @@ if [[ $family == hy4 ]]; then
   case "$hy4_kv" in bf16|fp8) ;; *) release_die "KV_CACHE must be bf16 or fp8" ;; esac
   family_args+=(--kv-cache "$hy4_kv")
   family_args+=(--rtx-expert-layers "$(get RTX_EXPERT_LAYERS auto)")
+  if [[ "$speculator" == dfly2 ]]; then family_args+=(--dfly2); else family_args+=(--dfly2=false); fi
 fi
 if [[ $family == minimax_m3 ]]; then
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
@@ -2492,7 +2499,7 @@ audio_encoder_hash=""
     plan_cap="$(python3 -c 'import sys;f,t,b=map(int,sys.argv[1:]);print(max(1,b-(t-f)*2**20))' "$free_mib" "$total_mib" "$profile_cap")"
   fi
   plan_draft_args=(--draft-context-window "$draft_context_window" --concurrency "$effective_concurrency" --mapped-scale-preload-gib "$(get MAPPED_SCALE_PRELOAD_GIB 0)")
-  if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark || "$family" == hy4_flash ) && "$tp2_dflash" != auto ]]; then
+  if [[ ( "$family" == glm5 || "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5_flash || "$family" == muse_spark || "$family" == hy4_flash || "$family" == hy4 ) && "$tp2_dflash" != auto ]]; then
     plan_draft_args+=(--tp2-dflash "$tp2_dflash_bool")
   fi
   [[ -z "$decode_lanes" ]] || plan_draft_args+=(--decode-lanes "$decode_lanes")
