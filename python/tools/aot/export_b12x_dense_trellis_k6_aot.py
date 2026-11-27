@@ -256,9 +256,10 @@ def shapes_for(families):
 GROUPED_SHAPES = {"kda_qkvg_tp2": 4}
 GROUPED_MAX_ROWS = 4096
 FUSED_K8_MAX_ROWS = 129
-# Hy4's LM head (6144x120832, F32) loses 1-4% at 1-24 rows; keep it on the
+# Hy4's LM head (6144x120832, F32) loses 1-4% at 1-24 rows, and its TP2 sibling
+# (6144x60416, F32) is unmeasured in the same wide/short class; keep both on the
 # unfused 3-program path.
-FUSED_K8_EXCLUDED = frozenset({(6144, 120832, 1)})
+FUSED_K8_EXCLUDED = frozenset({(6144, 120832, 1), (6144, 60416, 1)})
 INKLING_TARGET_F32_GEOMETRIES = frozenset(
     shape[1:4] for shape in INKLING_TARGET_SHAPES
     if shape[3] == 1 and shape[2] not in F32_OUTPUTS

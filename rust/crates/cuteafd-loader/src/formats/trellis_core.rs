@@ -129,9 +129,10 @@ pub struct ProjectionScratchLayout {
 }
 impl ProjectionScratchLayout {
     /// Whether `(k, n, side, bits)` runs the fused K8 decode route (mirrors
-    /// `export_b12x_dense_trellis_k6_aot.py`: K8 except Hy4's `6144x120832` LM head).
+    /// `export_b12x_dense_trellis_k6_aot.py`: K8 except Hy4's `6144x120832` and
+    /// `6144x60416` TP2 LM heads).
     pub fn has_fused_k8_route(k: usize, n: usize, side: usize, bits: usize) -> bool {
-        bits == 8 && !(k == 6144 && n == 120832 && side == 1)
+        bits == 8 && !matches!((k, n, side), (6144, 120832, 1) | (6144, 60416, 1))
     }
 
     pub fn new(k: usize, n: usize, rows: usize) -> Result<Self> {
@@ -467,6 +468,13 @@ mod tests {
             shape: [120832, 6144], bytes: 0, bits: 8, codebook: Exl3Codebook::Mul1,
         };
         assert_eq!(ProjectionScratchLayout::for_weight(&hy4_head_k8, 64)?, unfused);
+        let unfused_tp2 = ProjectionScratchLayout::new(6144, 60416, 64)?;
+        let hy4_head_tp2_k8 = CoreWeightLayout {
+            stem: "lm_head".into(), side: TrellisSide::Output, rank: 0, ranks: 2,
+            shape: [60416, 6144], bytes: 0, bits: 8, codebook: Exl3Codebook::Mul1,
+        };
+        assert_eq!(ProjectionScratchLayout::for_weight(&hy4_head_tp2_k8, 64)?, unfused_tp2);
+        assert!(!ProjectionScratchLayout::has_fused_k8_route(6144, 60416, 1, 8));
         let k6_body = CoreWeightLayout {
             stem: "q_a".into(), side: TrellisSide::Output, rank: 0, ranks: 1,
             shape: [2048, 6144], bytes: 0, bits: 6, codebook: Exl3Codebook::Mul1,

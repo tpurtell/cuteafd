@@ -141,12 +141,16 @@ def test_k8_is_shipped_and_names_do_not_collide(monkeypatch):
     assert all(len(f"dense_trellis_k6_{name}") < 64 for name, *_ in shipping), [
         f"dense_trellis_k6_{name}" for name, *_ in shipping if len(f"dense_trellis_k6_{name}") >= 64
     ]
-    # Hy4 LM head (6144x120832, F32) stays on the unfused 3-program path.
+    # Hy4 LM heads (6144x120832 and TP2 6144x60416, F32) stay on the unfused 3-program path.
     fused_by_name = {name: params for name, op, params, _ in shipping if op == "trellis_linear_fused"}
     assert "trellis_hy4_lm_head_mul1_k8_fused" not in fused_by_name
+    assert "trellis_hy4_lm_head_tp2_mul1_k8_fused" not in fused_by_name
+    assert "trellis_hy4_lm_head_tp2_mul1_k8_fused_f32" not in fused_by_name
     hy4_policies = module["row_policies"](("hy4",))
     hy4_head_k8 = next(p for p in hy4_policies if p["shape"] == "hy4_lm_head" and p.get("bits") == 8)
-    assert "fused_program" not in hy4_head_k8
+    assert "fused_program" not in hy4_head_k8 and "fused_f32_program" not in hy4_head_k8
+    hy4_head_tp2_k8 = next(p for p in hy4_policies if p["shape"] == "hy4_lm_head_tp2" and p.get("bits") == 8)
+    assert "fused_program" not in hy4_head_tp2_k8 and "fused_f32_program" not in hy4_head_tp2_k8
     # Inkling target side=1 body shapes ship both BF16 (drafter) and F32 (target) fused K8 programs.
     inkling_policies = module["row_policies"](("inkling2",))
     inkling_rel_k8 = next(p for p in inkling_policies if p["shape"] == "inkling_rel" and p.get("bits") == 8 and p["codebook"] == "mcg")
