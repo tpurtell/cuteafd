@@ -19,6 +19,26 @@ max_unacked_depth = 8
 max_unacked_age_secs = 1800
 auto_nudge_on_mail = true
 
+[budget]
+# Moderate vendor load only when its LAST available account drops <= 20% remaining
+moderate_below_pct = 20.0
+conserve_below_pct = 8.0
+failover_below_pct = 3.0
+auto_failover = true
+failover_cooldown_secs = 1800
+max_concurrent_wip_per_peer = 3
+max_pending_merges_before_throttle = 4
+
+[dashboard]
+# Auto-launched alongside the swarm on LAN (strictly read-only web UI + telemetry collector)
+enabled = true
+bind = "0.0.0.0"
+port = 7788
+window_name = "dashboard"
+poll_interval_secs = 3
+usage_probe_interval_secs = 1800
+gpu_poll_interval_secs = 15
+
 [github]
 enabled = true
 repo = "tpurtell/cuteafd"
@@ -43,6 +63,7 @@ extra_paths = ["~/.cache/cuteafd/builds"]
 cli = "agy"
 vendor = "google"
 model = "gemini-4-neon-high"
+plan_usd = 200
 yolo = true
 remote_control = true
 add_dirs = [
@@ -54,7 +75,7 @@ post_start_commands = []
 [peers.agy.tiers]
 fast = "gemini-4-hydrogen-high"
 standard = "gemini-4-neon-high"
-premium = "gemini-4-carbon-high"
+premium = "gemini-4-neon-xhigh"
 
 [peers.claude]
 cli = "claude"
@@ -77,11 +98,25 @@ fast = "sonnet"
 standard = "opus"
 premium = "fable"
 
+# Bidirectional two-account Claude Max pool (both share ~/.claude/projects so `--resume` persists across switches).
+# PeerSwarm only moderates Anthropic at <= 20% of whichever is the LAST remaining account.
+[[peers.claude.accounts]]
+id = "tpurtell"
+plan_usd = 200
+unset_env = ["CLAUDE_SECURESTORAGE_CONFIG_DIR", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+
+[[peers.claude.accounts]]
+id = "vimoin"
+plan_usd = 200
+unset_env = ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+env = { CLAUDE_SECURESTORAGE_CONFIG_DIR = "~/.claude-vimoin" }
+
 [peers.codex]
 cli = "codex"
 vendor = "openai"
 model = "gpt-6.2-sol"
 effort = "high"
+plan_usd = 500
 yolo = true
 add_dirs = [
   "/home/tj/Developer/sparkinfer-glmrt",
