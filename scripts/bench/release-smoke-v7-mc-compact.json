@@ -838,6 +838,135 @@
         "ADDR": "0.0.0.0:8891",
         "EXPERT_PORT": "31400"
       }
+    },
+    {
+      "name": "hy4-mc-original-max",
+      "family": "hy4",
+      "config": "examples/configs/hy4-exl3-k4-mc-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Hy4-EXL3-K4-MC",
+        "MODEL_REVISION": "67346c4bdee2d8694606b4b4db9a96442e8667b7",
+        "EXPERT_BACKEND": "spark",
+        "CORE_VIEW": "original",
+        "VISION": "off",
+        "AUDIO": "off",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v7-rc",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "ADDR": "0.0.0.0:8892",
+        "EXPERT_PORT": "33200"
+      }
+    },
+    {
+      "name": "hy4-mc-k6-compact-max",
+      "family": "hy4",
+      "config": "examples/configs/hy4-exl3-k4-mc-k6-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Hy4-EXL3-K4-MC",
+        "MODEL_REVISION": "67346c4bdee2d8694606b4b4db9a96442e8667b7",
+        "EXPERT_BACKEND": "spark",
+        "CORE_VIEW": "k6-compact",
+        "VISION": "off",
+        "AUDIO": "off",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v7-rc",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "ADDR": "0.0.0.0:8893",
+        "EXPERT_PORT": "33400"
+      }
+    },
+    {
+      "name": "hy4-mc-fp8-compact-max",
+      "family": "hy4",
+      "config": "examples/configs/hy4-exl3-k4-mc-fp8-max.config",
+      "gpus": [
+        0,
+        1
+      ],
+      "sparks": [
+        "REPLACE-ME-spark-0",
+        "REPLACE-ME-spark-1",
+        "REPLACE-ME-spark-2",
+        "REPLACE-ME-spark-3",
+        "REPLACE-ME-spark-4",
+        "REPLACE-ME-spark-5"
+      ],
+      "set": {
+        "RTX_GPUS": "2",
+        "COORDINATOR_GPUS": "0,1",
+        "SPARK_COUNT": "6",
+        "MODEL_ID": "wrldsuksgo2mars/Hy4-EXL3-K4-MC",
+        "MODEL_REVISION": "67346c4bdee2d8694606b4b4db9a96442e8667b7",
+        "EXPERT_BACKEND": "spark",
+        "CORE_VIEW": "fp8-compact",
+        "VISION": "off",
+        "AUDIO": "off",
+        "SPARK_EXPERT_DOCKER_INFERENCE": "ghcr.io/tpurtell/cuteafd-spark-expert:REPLACE-ME-v7-rc",
+        "SPARK_0_HOST": "REPLACE-ME-spark-0",
+        "SPARK_0_LANE_A": "192.0.2.1",
+        "SPARK_1_HOST": "REPLACE-ME-spark-1",
+        "SPARK_1_LANE_A": "192.0.2.2",
+        "SPARK_2_HOST": "REPLACE-ME-spark-2",
+        "SPARK_2_LANE_A": "192.0.2.3",
+        "SPARK_3_HOST": "REPLACE-ME-spark-3",
+        "SPARK_3_LANE_A": "192.0.2.4",
+        "SPARK_4_HOST": "REPLACE-ME-spark-4",
+        "SPARK_4_LANE_A": "192.0.2.5",
+        "SPARK_5_HOST": "REPLACE-ME-spark-5",
+        "SPARK_5_LANE_A": "192.0.2.6",
+        "ADDR": "0.0.0.0:8894",
+        "EXPERT_PORT": "33600"
+      }
     }
   ]
 }

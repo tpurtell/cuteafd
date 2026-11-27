@@ -326,6 +326,9 @@ def seed_checkpoint_metadata(hf):
         "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC": {"model_type": "hy_v4_flash", "text_config": {
             "num_hidden_layers": 42, "mlp_layer_types": ["dense"] + ["sparse"] * 41},
             "quantization_config": {"quant_method": "exl3"}},
+        "wrldsuksgo2mars/Hy4-EXL3-K4-MC": {"model_type": "hy_v4_vl", "text_config": {
+            "num_hidden_layers": 78, "mlp_layer_types": ["dense"] + ["sparse"] * 77},
+            "quantization_config": {"quant_method": "exl3"}},
     }
     checkpoints.update(copy.deepcopy(aliases))
     for name, config in checkpoints.items():
@@ -348,7 +351,7 @@ def seed_checkpoint_metadata(hf):
         (root / "refs").mkdir(exist_ok=True)
         (root / "refs/main").write_text("fixture")
         if "EXL3" in name or (config.get("quantization_config") or {}).get("quant_method") == "exl3":
-            codebook = "mul1" if (config.get("model_type") == "hy_v4_flash" or "MUL1" in name) else "mcg"
+            codebook = "mul1" if (config.get("model_type") in ("hy_v4_flash", "hy_v4_vl") or "MUL1" in name) else "mcg"
             seed_exl3_index(hf, name, revision="fixture", codebook=codebook)
     repo = Path(__file__).resolve().parents[2]
     for path in (repo / "examples/configs").glob("*.config"):
