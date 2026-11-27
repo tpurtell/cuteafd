@@ -228,6 +228,36 @@ fn reachable_resolver_inputs_never_yield_zero_with_graphs_on() {
                         "Hy4-flash {ranks}x + {sparks} Sparks");
                 }
                 assert!(crate::serving_capacity::inkling2_graphs::policy(rank, ranks, true).unwrap().bytes > 0);
+                // V4: every shape, traced or provisional.
+                for sparks in [false, true] {
+                    assert!(crate::serving_capacity::v4_graphs::v4_reserves(ranks, sparks).unwrap()[rank] > 0);
+                }
+                // Kimi K3: every core view, traced or bootstrap.
+                use crate::serving_capacity::kimi_prewarm::KimiCoreFormat::*;
+                for core in [Bf16, K6, Trellis, McOriginal, McK6, McK8, McFp8] {
+                    let (base, tail) = kimi_default(core, ranks, rank);
+                    assert!(current(rank, false, base, tail).unwrap().bytes > 0, "Kimi {core:?} {ranks}x");
+                }
+                // MiMo: both checkpoints, with and without Sparks.
+                for config in [crate::plan::testing::mimo_flash_mopd_config(), crate::plan::testing::mimo_pro_config()] {
+                    let cfg = crate::families::mimo_v2::config::MimoV2Config::from_hf(&config).unwrap();
+                    for sparks in [false, true] {
+                        let layout = crate::families::mimo_v2::decode_graph::graph_layout(&cfg, ranks, sparks, true).unwrap();
+                        assert!(layout.reserves[rank] > 0, "MiMo {ranks}x sparks={sparks}");
+                    }
+                }
+                // GLM 5.3 / ML4, GLM Flash and Qwen4 always resolve a measured working set.
+                for family in [crate::serving_capacity::glm_graphs::GlmPrewarmFamily::Glm5,
+                    crate::serving_capacity::glm_graphs::GlmPrewarmFamily::MistralLarge4] {
+                    assert!(current_working_set(rank, glm_default(family, ranks, rank)).unwrap().bytes > 0);
+                }
+                for split in [false, true] {
+                    assert!(current_working_set(rank, crate::serving_capacity::glmf_graphs::working_set(ranks, split, rank)).unwrap().bytes > 0);
+                }
+                for sparks in [false, true] {
+                    let key = crate::serving_capacity::qwen_graphs::QwenGraphShapeKey::resolve(ranks, sparks);
+                    assert!(crate::serving_capacity::qwen_graphs::qwen_resolve_reserve(key, rank).unwrap().bytes > 0);
+                }
                 // Qwen 3.5: traced variant, other checkpoints/KV, two-rank layouts.
                 let suffix = if ranks == 2 { format!("-layers-rtx2-rank{rank}") } else { String::new() };
                 for variant in ["h5120-l64-bf16-kvfp8-rtx1", "h5120-l64-fp8-kvfp8-rtx1", "h4096-l32-bf16-kvbf16-rtx1"] {
