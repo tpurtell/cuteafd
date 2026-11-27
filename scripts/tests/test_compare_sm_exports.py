@@ -1083,14 +1083,14 @@ def test_gate_options_match_real_package(tmp_path, monkeypatch, geometry, compac
         assert any(options.get("warp_specialized") for _, options in recorded)
 
 
-def test_spark_exl3_groups_include_only_glm_and_glmf_tier_families():
+def test_spark_exl3_groups_include_all_sum_epilogue_exl3_families():
     jobs = compare_sm.jobs('all')
     ordinary = [(name, exporter, args) for name, exporter, args in jobs
                 if exporter == 'package_exl3_aot.py' and not name.startswith('exl3-compact-')
                 and not name.endswith('-spark')]
     for name, exporter, args in ordinary:
         expected = (name + '-spark', exporter, [*args, '--role', 'spark', '--source-package-layouts'])
-        assert (expected in jobs) == (args[args.index('--geometry') + 1] in ('glm', 'glmf'))
+        assert (expected in jobs) == (args[args.index('--geometry') + 1] != 'muse')
 
 
 @pytest.mark.parametrize('supports_segments', [False, True])
@@ -2123,7 +2123,10 @@ def test_opt_in_exl3_mul1_groups_stay_out_of_default_jobs_and_cover_all_geometri
     geometries = {args[args.index("--geometry") + 1] for _, _, args in opt_in}
     assert geometries == {"dsv4p", "glm", "glmf", "qwen4", "kimik3", "step5", "muse", "ml4", "inkling2", "hy4f", "hy4"}
     assert {"exl3-compact-glmf-k34-mul1", "exl3-glmf-spark-mul1", "exl3-glm-k45-spark-mul1",
-            "exl3-inkling2-k45-mul1", "exl3-step5-k46-mul1", "exl3-muse-k45-mul1"} <= set(opt_in_names)
+            "exl3-inkling2-k45-mul1", "exl3-inkling2-k45-spark-mul1",
+            "exl3-hy4f-k45-spark-mul1", "exl3-hy4-k45-spark-mul1",
+            "exl3-kimik3-k23-spark-mul1",
+            "exl3-step5-k46-mul1", "exl3-muse-k45-mul1"} <= set(opt_in_names)
 
     for name, exporter, extra in opt_in:
         args = compare_sm.comparison_job_args(exporter, extra, "coordinator")

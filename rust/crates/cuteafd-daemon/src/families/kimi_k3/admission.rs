@@ -2489,8 +2489,35 @@ pub(super) mod tests {
                         }
                         _ => panic!("unexpected Kimi capacity refusal: {typed}"),
                     }
-                    assert!(report.hints.iter().any(|hint| hint.what.contains(&typed.to_string())),
-                        "planner/runtime capacity refusal differs: {:?}; {error:#}", report.hints);
+                    // Planner uses Baseline::Planned ("CUDA context (estimated)" + descriptive
+                    // KDA state label) while runtime uses Baseline::Measured (context already
+                    // subtracted from free_bytes, "Kimi KDA active state"). Verify exact match
+                    // on the refusal header (context, pool tokens, budget, phase, required &
+                    // available bytes) AND strict set equality on every owner name after
+                    // mapping those two Baseline::Planned-only label differences.
+                    let rendered = typed.to_string();
+                    let parse_owners = |text: &str| -> Option<(String, Vec<String>)> {
+                        let (head, rest) = text.split_once("; owners [")?;
+                        let (list, _) = rest.split_once(']')?;
+                        let mut owners: Vec<String> = list.split(", \"")
+                            .map(|s| s.trim_matches('"').to_string())
+                            .filter(|s| !s.is_empty() && !s.starts_with("CUDA context (estimated)."))
+                            .map(|s| if let Some(rank) = s.strip_prefix("KDA FP32 state + BF16 conv, ")
+                                .and_then(|r| r.rsplit_once('.').map(|(_, r)| r)) {
+                                format!("Kimi KDA active state.{rank}")
+                            } else { s })
+                            .collect();
+                        owners.sort();
+                        Some((head.to_string(), owners))
+                    };
+                    if let Some((expected_head, expected_owners)) = parse_owners(&rendered) {
+                        assert!(report.hints.iter().any(|hint| {
+                            parse_owners(&hint.what).is_some_and(|(h, o)| h.contains(&expected_head) && o == expected_owners)
+                        }), "planner/runtime capacity refusal differs: {:?}; {error:#}", report.hints);
+                    } else {
+                        assert!(report.hints.iter().any(|hint| hint.what.contains(&rendered)),
+                            "planner/runtime capacity refusal differs: {:?}; {error:#}", report.hints);
+                    }
                     assert_eq!(report.memory_layout.context("refused Kimi ledger")?.pool_tokens, 0);
                     refused += 1;
                     continue;

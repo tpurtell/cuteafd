@@ -5813,10 +5813,13 @@ fn qwen_small_card_one_spark_buffers_three_waves_with_one_compute_slot() {
         .map(|item| item.bytes).sum::<u64>();
     let geometry = cuteafd_core::ExpertGeometry::QWEN4;
     let row = u64::from(geometry.hidden) + u64::from(geometry.hidden) / 32 + 8 * u64::from(geometry.topk);
-    let prefill = layout::spark_slot_bytes("qwen4", 2752) - (4096 - 2752) * row;
+    let extent = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
+        capacity: 2752, compiled: 2752, staging_rows: 2752, buffered_units: 3 };
+    let (wave_dev, wave_pin) = layout::spark_slots::exl3_wave_bytes(geometry, 640, extent).unwrap();
+    let prefill = layout::spark_slot_bytes("qwen4", 2752) - (4096 - 2752) * row + wave_dev;
     let decode = 51 * (1 << 20) + 64 * row;
     assert_eq!(owners.bytes, prefill + decode - residual.min(prefill));
-    assert_eq!(staging.bytes, (64 + 3 * 2752) * 8 * u64::from(geometry.topk));
+    assert_eq!(staging.bytes, (64 + 3 * 2752) * 8 * u64::from(geometry.topk) + 3 * wave_pin);
     assert!(memory.devices.iter().all(|d| d.free_bytes() >= 0), "{}", memory.render());
 }
 
@@ -5855,10 +5858,15 @@ fn memory_constrained_spark_refuses_by_typed_owner_charge_not_waves() {
     let text = render(&roomy);
     assert!(text.contains(&format!("{} tokens admitted with {} RTX expert layers", roomy.memory_layout.as_ref().unwrap().pool_tokens, placement.onboard_layers)));
     assert!(!text.contains("max_pool_tokens_no_onboard") && !text.contains("null tokens"));
-    // One wave fits the same budget: the k units divide the reserve, they
-    // never add a second prefill scratch (only per-unit staging differs).
+    // One wave fits the same budget: the k units divide the reserve and never
+    // add a second prefill scratch; multi-wave noncompact layouts add only the
+    // shared merged-wave segments arena and staged plane once.
     let one = spark(&plan_at(121 << 30, 1));
-    assert_eq!(one.items.iter().find(|item| item.group == "execution owners").unwrap().bytes, owners);
+    let two_extent = cuteafd_core::OwnerExtent { owner: cuteafd_core::ExecutionOwner::Prefill,
+        capacity: 4096, compiled: 4096, staging_rows: 4096, buffered_units: 2 };
+    let (wave_dev, _) = layout::spark_slots::exl3_wave_bytes(
+        cuteafd_core::ExpertGeometry::QWEN4, 640, two_extent).unwrap();
+    assert_eq!(one.items.iter().find(|item| item.group == "execution owners").unwrap().bytes + wave_dev, owners);
     assert!(one.used_bytes() < used);
 }
 
