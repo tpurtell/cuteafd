@@ -308,7 +308,23 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
 
 ## 8. Sharing and Consolidation Across Families
 
-Current codebase audit reveals concrete duplication across MLA families that QMLA will touch anyway:
+### 8.1 Quantization & Calibration Sharing (`quantization/qmla/` vs. `quantization/<family>/`)
+New CuteAFD quant families are built by copying the previous family's working pipeline (`quantization/<family>/`), not from prose alone. We split the calibration stack cleanly so **Hy4-flash** serves as the working end-to-end reference pipeline (`capture → fit → validate → sidecar → manifest → same-repo HF revision publish`) and the next family (**GLM 5.3 Flash**) only needs a thin family adapter:
+
+- **Shared family-agnostic library (`quantization/qmla/`):**
+  - `capture.py` *(mode-agnostic)*: `MlaLayerGeometry`, `CapturedSequence`, `CapturedLayerParams`, `CapturedLayerBank`, `QmlaCaptureAdapter` protocol, exact full-precision attention-output / positional-QK evaluators, deterministic train/val splitting, and sequential segment capture storage with streamed XXH3-128 receipts.
+  - `quantizer.py`: paper-faithful per-token asymmetric affine group-64 quantizer (RNE ties-to-even, STE, INT2/INT4/INT8 pack/unpack + CPU numeric oracle).
+  - `fit.py`: content-path Cayley orthogonal $R_C$ + log-scale $S_C$ optimizer ($\mathcal{L}_C$), RoPE-path per-pair $SO(2)$ angles + pair-tied scales optimizer ($\mathcal{L}_P$), step-0 RTN / fixed-Hadamard / SmoothQuant† $\alpha$-search baselines, shared-KV multi-consumer loss aggregation, per-layer streaming & checkpoint/resume.
+  - `sidecar.py`: `cuteafd-qmla-v1` manifest + `mla_calibration.safetensors` writer, `transform_fingerprint`, advisory `cuteafd-mc.json` integration, and fail-closed validators (geometry, source identity, SHA256 digests, orthogonality/invertibility, quantization-off algebraic equivalence, cross-view transfer).
+  - `publish.py`: same-repo incremental HF revision publisher over `quantization/hub_lfs.py` (`HF_HUB_DISABLE_XET=1`), preserving all existing weight shards/indexes/views/tokenizer without re-uploading shards, plus pilot/full CLI helpers.
+- **Thin family adapter (`quantization/hy4_flash/`, reference pipeline to copy):**
+  - `qmla_capture.py` *(mode-agnostic)*: `Hy4FlashCaptureAdapter` wiring Hy4-flash's geometry (12 DSA + 30 SWA layers, interleaved 3D M-RoPE `[12,10,10]`, compressed-indexer group top-k masks, gated MLA, learnable sinks, `post_proj_norm`, and DFly2 target taps) into `quantization/qmla/capture.py` — reusable in both full MC causal passes and standalone incremental passes.
+  - `qmla_run.py` / `qmla_publish.py`: CLI driver exposing `--pilot` / `--layers` / `--train-sequences` / `--val-sequences` / `--modes` for short pilots and full runs, invoking `quantization/qmla/` for fit/validate/sidecar/publish.
+- **What the next family (`quantization/glm5_flash/`) needs to add:** only its geometry descriptor (11 NoPE MLA layers, `qk_rope_dim=0`, 4-token pooled DSA indexer), its capture hook wrapping GLM-5.3-Flash's forward, and its thin CLI entrypoint — zero duplicated fitting, validation, sidecar, or publishing code.
+- **Docs templates (`docs/quantization/brief-template.md` and `docs/quantization/qmla-incremental-template.md`):** describe this exact working pipeline and point directly at `quantization/qmla/` + `quantization/hy4_flash/` as the reference to copy.
+
+### 8.2 Runtime Engine Consolidation (`rust/` and `b12x`)
+Current engine audit reveals concrete duplication across MLA families that runtime QMLA (Phases 3–5) will touch anyway:
 
 | Area | Current Duplication | Consolidation Proposal | Regression Risk & Boundary |
 |---|---|---|---|
@@ -377,4 +393,4 @@ Physical cache accounting **includes** scales, padding, and unchanged DSA indexe
 2. **RoPE runtime execution:** Fuse learned $(\theta_i, s_i, s_i^{-1})$ directly into the existing RoPE phase/scale step (zero extra matmuls, zero weight mutations, commutes with 3D M-RoPE and YaRN/LeRoPE).
 3. **Protection & SWA defaults:** Unprotected uniform page records first for `8:*`, `4:8`, `4:4`, `4:0`, `0:4`; `sink4_local128` via the exact prefix mark where measured necessary (expected `2:4`); Hy4-flash 30 SWA-512 rings stay native `0:0` by default.
 4. **Sidecar schema (`cuteafd-qmla-v1`):** Root `mla_calibration.json` + `mla_calibration.safetensors` (F32 transforms, independent `content.c{8,4,2}` and `rope.r{8,4}` profiles, advisory `"qmla"` pointer in `cuteafd-mc.json` never in `required_features`, explicit `artifact_status: "calibrated_unqualified" | "runtime_qualified"`).
-5. **Library placement for Phase 1:** Shared pure-PyTorch/NumPy QMLA calibration, capture contracts, sidecar I/O, and validators in `quantization/qmla/` inside `cuteafd` (zero `GPTQModel` fork pin bump required unless TJ prefers placing the optimizer in `tpurtell/GPTQModel`).
+5. **Library placement & reference pipeline for Phases 1–2:** Place shared family-agnostic QMLA modules (capture interface, quantizer, fit routines, sidecar schema/writers/validators, same-repo incremental HF publisher) in `quantization/qmla/` inside `cuteafd` (no `GPTQModel` fork pin bump required unless TJ prefers placing the optimizer in `tpurtell/GPTQModel`), and implement the working end-to-end Hy4-flash reference pipeline in `quantization/hy4_flash/` with pilot/full CLI flags so subsequent families (starting with GLM 5.3 Flash) only add a thin geometry/capture/RoPE adapter.
