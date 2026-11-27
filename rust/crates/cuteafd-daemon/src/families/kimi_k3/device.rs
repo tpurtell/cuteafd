@@ -237,6 +237,9 @@ fn packing_inventory(core: Option<&serde_json::Value>, native: &[String])
             for name in [policy.native_input, policy.native, policy.output_program] {
                 add(format!("dense_trellis_k6_{name}"), PackedRows)?;
             }
+            for name in [policy.fused_program, policy.fused_f32_program].into_iter().flatten() {
+                add(format!("dense_trellis_k6_{name}"), PackedRows)?;
+            }
             if let Some(grouped) = cuteafd_ffi::dense_trellis::GroupedPolicy::parse(value)? {
                 for name in [grouped.native_input, grouped.native, grouped.output_program] {
                     add(name, PackedRows)?;
@@ -2908,16 +2911,22 @@ mod packing_inventory_tests {
 
     #[test]
     fn packed_coordinator_catalogue_classifies_k6_and_rejects_new_programs() -> Result<()> {
-        let core = serde_json::json!({"row_policies": [{"shape":"shared", "input_features":7168,
-            "output_features":3072, "sharded_side":1, "codebook":"mcg",
-            "native_input":"input", "native_program":"core", "output_program":"output",
-            "grouped":{"groups":4, "max_rows":4096, "native_input":"input_g4",
-                "native_program":"core_g4", "output_program":"output_g4"}}]});
+        let core = serde_json::json!({"row_policies": [
+            {"shape":"shared", "input_features":7168,
+             "output_features":3072, "sharded_side":1, "codebook":"mcg",
+             "native_input":"input", "native_program":"core", "output_program":"output",
+             "grouped":{"groups":4, "max_rows":4096, "native_input":"input_g4",
+                 "native_program":"core_g4", "output_program":"output_g4"}},
+            {"shape":"shared", "input_features":7168, "bits":8,
+             "output_features":3072, "sharded_side":1, "codebook":"mcg",
+             "native_input":"input", "native_program":"core_k8", "output_program":"output",
+             "fused_program":"fused", "fused_f32_program":"fused_f32"}]});
         let catalogue = packing_inventory(Some(&core), &[])?;
         let inventory = classify_packing_inventory(catalogue.iter().map(|(name, _)| name.as_str()), &catalogue)?;
         let roles = inventory.iter().copied().collect::<BTreeMap<_, _>>();
         for name in ["kimik3_router_scores", "kimik3_ffn_gate_up_i16896", "kimik3_rmsnorm_h7168",
-            "dense_trellis_k6_input", "dense_trellis_k6_core", "dense_trellis_k6_output",
+            "dense_trellis_k6_input", "dense_trellis_k6_core", "dense_trellis_k6_core_k8",
+            "dense_trellis_k6_output", "dense_trellis_k6_fused", "dense_trellis_k6_fused_f32",
             "dense_trellis_k6_input_g4", "dense_trellis_k6_core_g4", "dense_trellis_k6_output_g4"] {
             assert_eq!(roles[name], PackedRows, "{name}");
         }
