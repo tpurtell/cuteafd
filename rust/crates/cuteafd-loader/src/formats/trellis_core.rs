@@ -128,19 +128,49 @@ pub struct ProjectionScratchLayout {
     pub rows: usize,
 }
 impl ProjectionScratchLayout {
+    /// Whether `(k, n, side, bits)` runs the fused K8 decode route (mirrors
+    /// `export_b12x_dense_trellis_k6_aot.py`: K8 except Hy4's `6144x120832` and
+    /// `6144x60416` TP2 LM heads).
+    pub fn has_fused_k8_route(k: usize, n: usize, side: usize, bits: usize) -> bool {
+        bits == 8 && !matches!((k, n, side), (6144, 120832, 1) | (6144, 60416, 1))
+    }
+
     pub fn new(k: usize, n: usize, rows: usize) -> Result<Self> {
+        Self::new_with_fused(k, n, rows, false)
+    }
+
+    /// Scratch layout adding the `"fused"` route-arena extent only when the
+    /// resolved projection actually runs the fused K8 decode program.
+    pub fn new_with_fused(k: usize, n: usize, rows: usize, fused: bool) -> Result<Self> {
         ensure!((1..=4096).contains(&rows) && k > 0 && n > 0 && k % 128 == 0 && n % 128 == 0,
             "dense trellis scratch geometry");
         let product = |values: &[usize]| values.iter().try_fold(1usize, |a, b| a.checked_mul(*b))
             .context("dense trellis scratch overflow");
-        let extents = BTreeMap::from([
+        let partial_rows = rows.min(129);
+        let partial = product(&[partial_rows, k.div_ceil(1024), n, 4])?;
+        let mut extents = BTreeMap::from([
             ("rotated", product(&[rows, k, 2])?), ("table", 8), ("scales", k / 128 * 2),
-            ("partial", product(&[rows.min(129), k.div_ceil(1024), n, 4])?),
+            ("partial", partial),
             ("accumulator", product(&[rows, n, 4])?),
         ]);
+        if fused {
+            let fused_bytes = partial.checked_add(product(&[partial_rows, k, 2])?)
+                .context("dense trellis fused scratch overflow")?;
+            extents.insert("fused", fused_bytes);
+        }
         let layout = Self { extents, rows };
         layout.bytes()?;
         Ok(layout)
+    }
+
+    /// Scratch layout for a resident weight layout, charging `"fused"` only when
+    /// its width and geometry run the fused K8 decode route.
+    pub fn for_weight(weight: &CoreWeightLayout, rows: usize) -> Result<Self> {
+        let side = if weight.side == crate::formats::dense_trellis::TrellisSide::Input { 2 } else { 1 };
+        Self::new_with_fused(
+            weight.shape[1], weight.shape[0], rows,
+            Self::has_fused_k8_route(weight.shape[1], weight.shape[0], side, weight.bits),
+        )
     }
     /// A grouped native launch (KDA q/k/v/g):
     /// each member uses a fixed quarter of rotated/scales/accumulator, the
@@ -175,14 +205,20 @@ impl ProjectionScratchLayout {
             return Ok(ProjectionStorageLayout { owners, route_offsets: BTreeMap::new() });
         }
         let partial = owners.remove("partial").context("dense trellis native partial absent")?;
-        let route_offsets = BTreeMap::from([("partial", 0)]);
-        owners.insert("route arena", partial);
+        let fused = owners.remove("fused");
+        let arena = fused.map_or(partial, |bytes| partial.max(bytes));
+        let mut route_offsets = BTreeMap::from([("partial", 0)]);
+        if fused.is_some() {
+            route_offsets.insert("fused", 0);
+        }
+        owners.insert("route arena", arena);
         Ok(ProjectionStorageLayout { owners, route_offsets })
     }
-    /// One backing with cudaMalloc-equivalent alignment for each live operand.
-    /// Separate from `storage`: families opt into packing without changing routes.
+    /// One backing with cudaMalloc-equivalent alignment for each live owner.
+    /// Mutually exclusive route buffers (partial/fused) share the route arena.
     pub fn packed(&self) -> Result<crate::serving_capacity::PackedWeightRegions> {
-        crate::serving_capacity::PackedWeightRegions::new(self.extents.values().copied())
+        let storage = self.storage()?;
+        crate::serving_capacity::PackedWeightRegions::new(storage.owners.values().copied())
     }
     pub fn packed_bytes(&self) -> Result<usize> { Ok(self.packed()?.bytes) }
 
@@ -421,6 +457,40 @@ mod tests {
         assert_eq!(storage.owners["route arena"], layout.extents["partial"]);
         assert_eq!(layout.bytes()?, layout.extents.values().sum::<usize>());
         assert!(layout.merge(&ProjectionScratchLayout::new(6144, 640, 64)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fused_k8_scratch_charges_route_arena_once_and_leaves_k6_and_hy4_head_unchanged() -> Result<()> {
+        let unfused = ProjectionScratchLayout::new(6144, 120832, 64)?;
+        let hy4_head_k8 = CoreWeightLayout {
+            stem: "lm_head".into(), side: TrellisSide::Output, rank: 0, ranks: 1,
+            shape: [120832, 6144], bytes: 0, bits: 8, codebook: Exl3Codebook::Mul1,
+        };
+        assert_eq!(ProjectionScratchLayout::for_weight(&hy4_head_k8, 64)?, unfused);
+        let unfused_tp2 = ProjectionScratchLayout::new(6144, 60416, 64)?;
+        let hy4_head_tp2_k8 = CoreWeightLayout {
+            stem: "lm_head".into(), side: TrellisSide::Output, rank: 0, ranks: 2,
+            shape: [60416, 6144], bytes: 0, bits: 8, codebook: Exl3Codebook::Mul1,
+        };
+        assert_eq!(ProjectionScratchLayout::for_weight(&hy4_head_tp2_k8, 64)?, unfused_tp2);
+        assert!(!ProjectionScratchLayout::has_fused_k8_route(6144, 60416, 1, 8));
+        let k6_body = CoreWeightLayout {
+            stem: "q_a".into(), side: TrellisSide::Output, rank: 0, ranks: 1,
+            shape: [2048, 6144], bytes: 0, bits: 6, codebook: Exl3Codebook::Mul1,
+        };
+        assert_eq!(ProjectionScratchLayout::for_weight(&k6_body, 64)?,
+            ProjectionScratchLayout::new(6144, 2048, 64)?);
+        let k8_body = CoreWeightLayout { bits: 8, ..k6_body };
+        let fused = ProjectionScratchLayout::for_weight(&k8_body, 64)?;
+        assert_eq!(fused.extents["fused"], 64 * 6 * 2048 * 4 + 64 * 6144 * 2);
+        let storage = fused.storage()?;
+        assert_eq!(storage.owners.len(), 5);
+        assert_eq!(storage.route_offsets["partial"], 0);
+        assert_eq!(storage.route_offsets["fused"], 0);
+        assert_eq!(storage.owners["route arena"], fused.extents["fused"]);
+        assert_eq!(fused.bytes()? - ProjectionScratchLayout::new(6144, 2048, 64)?.bytes()?, 64 * 6144 * 2);
+        assert_eq!(fused.packed()?.regions.len(), 5);
         Ok(())
     }
 }

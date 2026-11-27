@@ -122,13 +122,20 @@ impl CoreCharges {
             programs.insert(cuteafd_ffi::draft_projection::validate_package_geometry(
                 manifest, k, n, unit.max(decode_rows))?);
         }
+        let mut fused_keys = BTreeSet::new();
         for weight in bodies.iter().flatten().chain(head.iter()) {
             let book = weight.codebook.marker();
-            programs.extend(cuteafd_ffi::dense_trellis::validate_package_geometry_bits(manifest,
-                weight.shape[1], weight.shape[0], if weight.side == TrellisSide::Input { 2 } else { 1 }, weight.bits, book,
-                if weight.stem == "lm_head" { decode_rows.max(draft_rows.unwrap_or(1)) } else { unit.max(decode_rows) },
-                if weight.stem == "lm_head" { cuteafd_ffi::dense_trellis::TrellisDType::F32 }
-                else { cuteafd_ffi::dense_trellis::TrellisDType::Bf16 })?);
+            let side = if weight.side == TrellisSide::Input { 2 } else { 1 };
+            let is_head = weight.stem == "lm_head";
+            let resolved = cuteafd_ffi::dense_trellis::validate_package_geometry_bits(manifest,
+                weight.shape[1], weight.shape[0], side, weight.bits, book,
+                if is_head { decode_rows.max(draft_rows.unwrap_or(1)) } else { unit.max(decode_rows) },
+                if is_head { cuteafd_ffi::dense_trellis::TrellisDType::F32 }
+                else { cuteafd_ffi::dense_trellis::TrellisDType::Bf16 })?;
+            if resolved.len() == 4 {
+                fused_keys.insert((weight.shape[1], weight.shape[0], side, weight.bits, book, is_head));
+            }
+            programs.extend(resolved);
         }
         let entries = manifest["programs"].as_array().context("Flash K6 manifest programs")?;
         let lookup = |name: &str| -> Result<usize> {
@@ -156,15 +163,20 @@ impl CoreCharges {
             }
         }
         for name in native_names.iter().flatten().flatten() { lookup(name)?; programs.insert(name.clone()); }
+        let has_fused = |w: &CoreWeightLayout| fused_keys.contains(&(
+            w.shape[1], w.shape[0], if w.side == TrellisSide::Input { 2 } else { 1 },
+            w.bits, w.codebook.marker(), w.stem == "lm_head",
+        ));
         let projection = |body: &[CoreWeightLayout], rows| -> Result<Option<ProjectionScratchLayout>> {
             let mut result: Option<ProjectionScratchLayout> = None;
             for w in body {
-                let layout = ProjectionScratchLayout::new(w.shape[1], w.shape[0], rows)?;
+                let layout = ProjectionScratchLayout::new_with_fused(w.shape[1], w.shape[0], rows, has_fused(w))?;
                 if let Some(result) = &mut result { result.merge(&layout)?; } else { result = Some(layout); }
             }
             Ok(result)
         };
-        let head_scratch = |rows| head.as_ref().map(|h| ProjectionScratchLayout::new(h.shape[1], h.shape[0], rows)).transpose();
+        let head_scratch = |rows| head.as_ref().map(|h|
+            ProjectionScratchLayout::new_with_fused(h.shape[1], h.shape[0], rows, has_fused(h))).transpose();
         let split = ranks > 1 && (native_split || bodies.iter().flatten().any(|w| w.side == TrellisSide::Input));
         let retained_rows = decode_rows.checked_add(unit.checked_mul(slots).context("Flash K6 live rows overflow")?)
             .context("Flash K6 live rows overflow")?;

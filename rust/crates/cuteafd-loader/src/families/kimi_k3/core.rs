@@ -423,7 +423,8 @@ pub fn projection_scratch_for_ranks_rows(cfg: &KimiK3Config, core: &CoreInventor
             ensure!(matching.len() == 1, "{}: expected one K{} row policy for K{k}/N{n}/side{side}/{book}, found {}",
                 projection.stem, projection.bits, matching.len());
             let policy = matching[0];
-            let mut layout = ProjectionScratchLayout::new(k,n,if head {rows.min(64)} else {rows})?;
+            let has_fused = policy.get("fused_program").and_then(serde_json::Value::as_str).is_some();
+            let mut layout = ProjectionScratchLayout::new_with_fused(k,n,if head {rows.min(64)} else {rows}, has_fused)?;
             if let Some(grouped) = policy.get("grouped") {
                 let groups = grouped["groups"].as_u64().and_then(|v| usize::try_from(v).ok())
                     .context("Kimi K6 grouped row-policy groups")?;
@@ -473,7 +474,8 @@ pub fn draft_head_scratch(core: &CoreInventory, rows: usize, metadata: &serde_js
         && p["sharded_side"] == 1 && p["codebook"] == book
         && p.get("bits").and_then(serde_json::Value::as_u64).unwrap_or(6) == head.bits as u64).collect::<Vec<_>>();
     ensure!(matching.len() == 1, "lm_head: expected one K{} row policy for K{k}/N{n}/{book}, found {}", head.bits, matching.len());
-    Ok(Some(ProjectionScratchLayout::new(k, n, rows)?))
+    let has_fused = matching[0].get("fused_program").and_then(serde_json::Value::as_str).is_some();
+    Ok(Some(ProjectionScratchLayout::new_with_fused(k, n, rows, has_fused)?))
 }
 
 /// Admission charge of [`draft_head_scratch`] on the head rank (GPU1).

@@ -503,7 +503,7 @@ pub fn rank_admission_for_layout(contract: &CoordinatorContract, cfg: &Config, l
         let head_scratch = if layout.operands.iter().any(|owner| owner.name == "lm_head.weight" && owner.dtype == cuteafd_core::DType::F8E4M3) {
             FP8_HEAD_SCRATCH_BYTES as u64
         } else { layout.core.get("lm_head.weight").map(|core|
-            crate::formats::head::native_private_scratch(core.shape, unit)?.packed_bytes())
+            crate::formats::head::native_private_scratch_for_weight(core, unit)?.packed_bytes())
             .transpose()?.unwrap_or(0) as u64 };
         if head_scratch > 0 { private_requests.push(head_scratch); }
         immutable = immutable.checked_add(head_scratch).context("Step-5 private head scratch overflow")?;
@@ -532,7 +532,7 @@ pub fn projection_scratch_layout(layout:&RankWeightLayout,rows:usize,
     let mut merged:Option<ProjectionScratchLayout>=None;
     for (name,core) in layout.core.iter().filter(|(name,_)|select(name)) {
         let _=name;
-        let next=ProjectionScratchLayout::new(core.shape[1],core.shape[0],rows)?;
+        let next=ProjectionScratchLayout::for_weight(core,rows)?;
         match &mut merged {Some(layout)=>layout.merge(&next)?,None=>merged=Some(next)}
     }
     if layout.operands.iter().any(|owner|owner.fp8() && select(&owner.name)) {
@@ -585,8 +585,7 @@ pub fn mtp_native_scratch_requests(checkpoint: &Checkpoint, contract: &Coordinat
         for (name, core) in &layout.core {
             let owner = if name.contains(".self_attn.") { "attention" } else if name.contains(".mlp.") { "dense" }
                 else if name.ends_with(".eh_proj.weight") { "eh" } else { "head" };
-            let [n, k] = core.shape;
-            let next = ProjectionScratchLayout::new(k, n, if owner == "head" { rows.head } else { rows.layer })?;
+            let next = ProjectionScratchLayout::for_weight(core, if owner == "head" { rows.head } else { rows.layer })?;
             match owners.get_mut(owner) { Some(layout) => layout.merge(&next)?, None => { owners.insert(owner, next); } }
         }
         let groups=layout.operands.iter().filter(|owner|owner.fp8()).map(|owner|
@@ -688,14 +687,13 @@ mod tests {
             for layout in &layouts {
                 let mut layer_owners = std::collections::BTreeMap::<&str, ProjectionScratchLayout>::new();
                 for (name, core) in &layout.core {
-                    let [n, k] = core.shape;
                     if name.contains(".transformer.shared_head.") {
-                        expected += crate::formats::head::native_private_scratch(core.shape, rows.head)?.packed_bytes()? as u64;
+                        expected += crate::formats::head::native_private_scratch_for_weight(core, rows.head)?.packed_bytes()? as u64;
                         continue;
                     }
                     let owner = if name.contains(".self_attn.") { "attention" }
                         else if name.contains(".mlp.") { "dense" } else { "eh" };
-                    let scratch = ProjectionScratchLayout::new(k, n, rows.layer)?;
+                    let scratch = ProjectionScratchLayout::for_weight(core, rows.layer)?;
                     match layer_owners.get_mut(owner) {
                         Some(layout) => layout.merge(&scratch)?,
                         None => { layer_owners.insert(owner, scratch); }

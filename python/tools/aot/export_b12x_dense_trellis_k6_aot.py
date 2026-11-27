@@ -255,6 +255,15 @@ def shapes_for(families):
 # Projections sharing one activation and geometry, launched as one group of four.
 GROUPED_SHAPES = {"kda_qkvg_tp2": 4}
 GROUPED_MAX_ROWS = 4096
+FUSED_K8_MAX_ROWS = 129
+# Hy4's LM head (6144x120832, F32) loses 1-4% at 1-24 rows, and its TP2 sibling
+# (6144x60416, F32) is unmeasured in the same wide/short class; keep both on the
+# unfused 3-program path.
+FUSED_K8_EXCLUDED = frozenset({(6144, 120832, 1), (6144, 60416, 1)})
+INKLING_TARGET_F32_GEOMETRIES = frozenset(
+    shape[1:4] for shape in INKLING_TARGET_SHAPES
+    if shape[3] == 1 and shape[2] not in F32_OUTPUTS
+)
 
 
 def _codebooks(name):
@@ -269,14 +278,19 @@ def row_policies(families=("kimik3",)):
     result = []
     for item in shapes_for(families):
         name, k, n, side = item[:4]
+        bits = _bits(item)
+        has_fused = bits == 8 and (k, n, side) not in FUSED_K8_EXCLUDED
         for book in _codebooks(name):
             result.append(dict(shape=name, input_features=k, output_features=n,
                 sharded_side=side, codebook=book,
-                **({} if _bits(item) == 6 else {"bits": _bits(item)}),
+                **({} if bits == 6 else {"bits": bits}),
                 native_program=f"trellis_{name}_{book}{_suffix(item)}",
                 native_input=f"trellis_input_k{k}_bf16",
                 output_program=f"trellis_output_n{n}_{output_dtype(k, n, side)}",
-                **({"grouped": grouped_policy(name, k, n, book, _bits(item))} if name in GROUPED_SHAPES else {})))
+                **({"fused_program": f"trellis_{name}_{book}_k8_fused"} if has_fused else {}),
+                **({"fused_f32_program": f"trellis_{name}_{book}_k8_fused_f32"}
+                   if has_fused and (k, n, side) in INKLING_TARGET_F32_GEOMETRIES else {}),
+                **({"grouped": grouped_policy(name, k, n, book, bits)} if name in GROUPED_SHAPES else {})))
     return result
 
 
@@ -311,7 +325,9 @@ def programs(*, families=("kimik3",), input_dtype="f16"):
 
 def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=F32_OUTPUTS, input_dtype="f16"):
     """Explicit-shape hook for small native fixture packages; production uses the table."""
-    from b12x.integration.cuteafd.trellis_linear import compile_trellis_linear_aot
+    from b12x.integration.cuteafd.trellis_linear import (
+        compile_trellis_linear_aot, compile_trellis_linear_fused_aot,
+    )
     from b12x.integration.cuteafd.trellis_transform import (
         compile_trellis_input_aot, compile_trellis_output_aot,
     )
@@ -356,6 +372,22 @@ def programs_for_shapes(shapes, *, max_rows=4096, f32_outputs=F32_OUTPUTS, input
         params = dict(features=n, output_dtype="bf16", max_rows=rows, groups=groups)
         result.append((f"trellis_output_n{n}_bf16_g{groups}", "trellis_output", params,
                        partial(compile_trellis_output_aot, **params)))
+    for item in shapes:
+        name, k, n, side = item[:4]
+        if _bits(item) != 8 or (k, n, side) in FUSED_K8_EXCLUDED:
+            continue
+        fused_rows = min(max_rows, FUSED_K8_MAX_ROWS)
+        fused_odt = "raw_f32" if side == 2 else output_dtype(k, n, side, f32_outputs)
+        for codebook in _codebooks(name):
+            params = dict(input_features=k, output_features=n, bits=8, codebook=codebook,
+                          sharded_side=side, max_rows=fused_rows,
+                          input_dtype="bf16", output_dtype=fused_odt)
+            result.append((f"trellis_{name}_{codebook}_k8_fused", "trellis_linear_fused", params,
+                           partial(compile_trellis_linear_fused_aot, **params)))
+            if (k, n, side) in INKLING_TARGET_F32_GEOMETRIES:
+                f32_params = dict(params, output_dtype="f32")
+                result.append((f"trellis_{name}_{codebook}_k8_fused_f32", "trellis_linear_fused", f32_params,
+                               partial(compile_trellis_linear_fused_aot, **f32_params)))
     unique = {}
     for entry in result:
         if entry[0] in unique and entry[:3] != unique[entry[0]][:3]:

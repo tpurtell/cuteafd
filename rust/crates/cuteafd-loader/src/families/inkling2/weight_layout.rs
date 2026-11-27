@@ -203,7 +203,7 @@ impl CoordinatorWeights {
         let mut scratch = None::<ProjectionScratchLayout>;
         for layout in self.core.values() {
             let active = if layout.stem == HEAD { head_rows } else { rows };
-            let mut need = ProjectionScratchLayout::new(layout.shape[1], layout.shape[0], active)?;
+            let mut need = ProjectionScratchLayout::for_weight(layout, active)?;
             need.rows = rows.max(head_rows);
             if let Some(scratch) = &mut scratch { scratch.merge(&need)?; } else { scratch = Some(need); }
         }

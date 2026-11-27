@@ -105,7 +105,7 @@ impl HeadPlan {
         planes: &[usize; 4], kernel_rows: usize) -> Result<u64> {
         let native_bytes = native.map(|core| -> Result<u64> {
             (core.bytes as u64).checked_add(
-                cuteafd_loader::formats::head::native_private_scratch(core.shape, kernel_rows)?.packed_bytes()? as u64)
+                cuteafd_loader::formats::head::native_private_scratch_for_weight(core, kernel_rows)?.packed_bytes()? as u64)
                 .context("Step-5 native head overflow")
         }).transpose()?.unwrap_or(0);
         weights.iter().map(|w| w.allocation_bytes)
@@ -136,8 +136,8 @@ impl HeadPlan {
     pub(super) fn private_scratch_bytes(&self) -> Result<u64> {
         if self.fp8 { return Ok(cuteafd_loader::plan::families::step5::native::FP8_HEAD_SCRATCH_BYTES as u64); }
         self.native.as_ref().map(|name| -> Result<u64> {
-            Ok(cuteafd_loader::formats::head::native_private_scratch(
-                self.layout.core[name].shape, self.kernel_rows)?.packed_bytes()? as u64)
+            Ok(cuteafd_loader::formats::head::native_private_scratch_for_weight(
+                &self.layout.core[name], self.kernel_rows)?.packed_bytes()? as u64)
         }).transpose().map(|bytes| bytes.unwrap_or(0))
     }
 }
@@ -192,8 +192,8 @@ impl<'a> TargetHeadOwner<'a> {
             let native = plan.native.as_ref().map(|name| -> Result<_> {
                 let mut layer = super::native::NativeLayer::load(device, programs, checkpoint, &plan.layout,
                     plan.kernel_rows, |n| n == name, weights_arena)?;
-                let layout = cuteafd_loader::formats::head::native_private_scratch(
-                    plan.layout.core[name].shape, plan.kernel_rows)?;
+                let layout = cuteafd_loader::formats::head::native_private_scratch_for_weight(
+                    &plan.layout.core[name], plan.kernel_rows)?;
                 let linear = std::rc::Rc::try_unwrap(layer.linears.remove(name).context("native head")?)
                     .map_err(|_| anyhow::anyhow!("native head aliased"))?;
                 Ok((linear, super::native::NativeScratch::allocate(device, &layout, if plan.predictor { crate::shared::memory::Tag::drafter_workspace("step5/mtp-head-projection") } else { crate::shared::memory::Tag::workspace("step5/head-projection") })?))

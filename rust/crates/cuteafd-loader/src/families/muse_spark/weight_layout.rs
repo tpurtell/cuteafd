@@ -298,8 +298,9 @@ pub fn projections_with_manifest(cfg: &MuseSparkConfig, core: &CoreInventory, ra
             rank.native_programs.fp8_scratch_bytes = rank.native_programs.fp8_scratch_bytes.max(selected.fp8_scratch_bytes);
         }
         let mut merged: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
-        for (&((k, n, _, _, _), _), &program_rows) in &rank.programs {
-            let mut layout = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, program_rows)?;
+        for (&((k, n, side, _, bits), _), &program_rows) in &rank.programs {
+            let fused = crate::formats::trellis_core::ProjectionScratchLayout::has_fused_k8_route(k, n, side, bits);
+            let mut layout = crate::formats::trellis_core::ProjectionScratchLayout::new_with_fused(k, n, program_rows, fused)?;
             // One scratch set serves the body's full row capacity.
             layout.rows = rows;
             match &mut merged { Some(m) => m.merge(&layout)?, None => merged = Some(layout) }
