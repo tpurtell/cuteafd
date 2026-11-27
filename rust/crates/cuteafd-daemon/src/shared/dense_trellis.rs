@@ -222,10 +222,11 @@ impl ProjectionLayout {
         Self::with_workspace(p.input,p.output,rows,program.workspace())
     }
     fn with_workspace(input:usize,output:usize,rows:usize,w:cuteafd_ffi::dense_trellis::DenseTrellisWorkspace)->Result<Self> {
-        let layout=ProjectionScratchLayout::new(input,output,rows)?;
+        let layout=ProjectionScratchLayout::new_with_fused(input,output,rows,w.fused.is_some())?;
         ensure!([("rotated",w.rotated),("table",w.pointer_table),("scales",w.block_scales),
-            ("partial",w.partial),("fused",w.fused),("accumulator",w.accumulator)].iter()
-            .all(|(name,bytes)|layout.extents.get(name)==Some(bytes)),
+            ("partial",w.partial),("accumulator",w.accumulator)].iter()
+            .all(|(name,bytes)|layout.extents.get(name)==Some(bytes))
+            && layout.extents.get("fused").copied()==w.fused,
             "K6 package/planner scratch mismatch");
         Ok(Self{extents:layout.extents,rows:layout.rows})
     }
@@ -382,6 +383,7 @@ mod retained_tests {
         let library = fixture.load()?;
         let device = Device { library: &library, id: 0 };
         for layout in [ProjectionScratchLayout::new(128, 256, 3)?,
+            ProjectionScratchLayout::new_with_fused(128, 256, 3, true)?,
             ProjectionScratchLayout::grouped(128, 256, 3, 4)?] {
             let projection = ProjectionLayout { extents: layout.extents.clone(), rows: layout.rows };
             let before = fixture.events()?.matches('D').count();

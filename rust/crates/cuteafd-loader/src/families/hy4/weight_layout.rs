@@ -155,8 +155,7 @@ impl CoordinatorWeights {
             if stem == HEAD_STEM {
                 continue;
             }
-            let [n, k] = layout.shape;
-            let one = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, rows)?;
+            let one = crate::formats::trellis_core::ProjectionScratchLayout::for_weight(layout, rows)?;
             match &mut combined {
                 Some(acc) => acc.merge(&one)?,
                 None => combined = Some(one),
@@ -183,9 +182,8 @@ impl CoordinatorWeights {
         head_rows: usize,
     ) -> Result<Option<crate::formats::trellis_core::ProjectionScratchLayout>> {
         if let Some(layout) = self.core.get(HEAD_STEM) {
-            let [n, k] = layout.shape;
-            return Ok(Some(crate::formats::trellis_core::ProjectionScratchLayout::new(
-                k, n, head_rows,
+            return Ok(Some(crate::formats::trellis_core::ProjectionScratchLayout::for_weight(
+                layout, head_rows,
             )?));
         }
         if self.fp8.contains_key(HEAD_STEM) {
@@ -205,8 +203,7 @@ impl CoordinatorWeights {
         let mut combined: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
         let rows = prefill_rows.max(decode_rows);
         for layout in self.core.values() {
-            let [n, k] = layout.shape;
-            let one = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, rows)?;
+            let one = crate::formats::trellis_core::ProjectionScratchLayout::for_weight(layout, rows)?;
             match &mut combined {
                 Some(acc) => acc.merge(&one)?,
                 None => combined = Some(one),

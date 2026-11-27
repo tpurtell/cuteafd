@@ -191,7 +191,9 @@ impl<'a> Hy4NativeLinear<'a> {
 
     fn scratch_layout(&self, rows: usize) -> Result<ProjectionScratchLayout> {
         match self {
-            Self::Trellis { weights, .. } => ProjectionScratchLayout::new(weights.shape[1], weights.shape[0], rows),
+            Self::Trellis { weights, projection } => ProjectionScratchLayout::new_with_fused(
+                weights.shape[1], weights.shape[0], rows, projection.program.has_fused(),
+            ),
             Self::Fp8 { .. } => Ok(ProjectionScratchLayout {
                 rows,
                 extents: BTreeMap::from([("fp8", 256)]),

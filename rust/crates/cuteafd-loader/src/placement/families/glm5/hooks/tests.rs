@@ -100,7 +100,7 @@ fn native_hooks_name_physical_owners_and_k6_route_aliases_once() {
     );
     assert_eq!(
         get("prefill.core.projection.storage.route_arena").bytes,
-        128 * 256 * 4 + 128 * 128 * 2
+        128 * 256 * 4
     );
     assert_eq!(get("core.draft_head.storage.rotated").bytes, 96 * 128 * 2);
     assert_eq!(

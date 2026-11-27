@@ -80,7 +80,9 @@ impl<'a> Rank<'a> {
             let expected = if index == 0 { admission.decode.as_ref() } else { admission.prefill.as_ref() };
             let mut actual: Option<cuteafd_loader::formats::trellis_core::ProjectionScratchLayout> = None;
             for weights in layers.iter().flat_map(|l| l.core.values()) {
-                let next = cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(weights.shape[1], weights.shape[0], rows)?;
+                let fused = projections[&key(weights)].program.has_fused();
+                let next = cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new_with_fused(
+                    weights.shape[1], weights.shape[0], rows, fused)?;
                 if let Some(actual) = &mut actual { actual.merge(&next)?; } else { actual = Some(next); }
             }
             ensure!(actual.as_ref() == expected, "Flash loaded/admitted projection scratch mismatch");

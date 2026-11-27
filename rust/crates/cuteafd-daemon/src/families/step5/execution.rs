@@ -1865,7 +1865,7 @@ mod tests {
                     &contract, &cfg, layout, &ownership, rank, 64, 64, 1)?;
                 let head = rank == usize::from(ownership.execution().spec().head_gpu);
                 let head_scratch = if head { layout.core.get("lm_head.weight").map(|core|
-                    cuteafd_loader::formats::head::native_private_scratch(core.shape, 64)?.packed_bytes())
+                    cuteafd_loader::formats::head::native_private_scratch_for_weight(core, 64)?.packed_bytes())
                     .transpose()?.unwrap_or(0) as u64 } else { 0 };
                 assert_eq!(admitted.immutable, head_scratch);
                 assert_eq!(admitted.weight_arenas[0].0, served);

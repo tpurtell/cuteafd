@@ -2812,7 +2812,7 @@ mod tests {
                     assert_eq!(charge(planned), charge(started), "{command} draft head charge");
                     if command == "serve-glmf" && concurrency == 16 && extra.is_empty() {
                         assert_eq!(planned, 128);
-                        assert_eq!(charge(planned), 397_541_448 + 128 * 4096 * 2);
+                        assert_eq!(charge(planned), 397_541_448);
                     }
                 }
             }

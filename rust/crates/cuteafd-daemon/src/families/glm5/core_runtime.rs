@@ -34,8 +34,10 @@ impl<'a> CorePrograms<'a> {
             let projection = Projection::load_geometry_bits(programs, key.0, key.1, key.2, key.4, key.3,
                 rows, TrellisDType::Bf16)?;
             ProjectionLayout::new(&projection.program, rows)?;
+            let fused = projection.program.has_fused();
             for (layout, rows) in layouts.iter_mut().zip([super::engine::DECODE_ROWS, unit]) {
-                let required = cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new(key.0, key.1, rows)?;
+                let required = cuteafd_loader::formats::trellis_core::ProjectionScratchLayout::new_with_fused(
+                    key.0, key.1, rows, fused)?;
                 let required = ProjectionLayout { rows, extents: required.extents };
                 if let Some(layout) = layout { layout.merge(&required)?; } else { *layout = Some(required); }
             }

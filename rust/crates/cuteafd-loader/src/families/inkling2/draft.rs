@@ -71,7 +71,7 @@ impl DraftLayout {
             let rows=work.context_rows.max(work.sequences*config.transformer.block);
             let mut projection:Option<crate::formats::trellis_core::ProjectionScratchLayout>=None;
             for core in weight.core.values(){
-                let need=crate::formats::trellis_core::ProjectionScratchLayout::new(core.shape[1],core.shape[0],rows)?;
+                let need=crate::formats::trellis_core::ProjectionScratchLayout::for_weight(core,rows)?;
                 if let Some(projection)=&mut projection{projection.merge(&need)?;}else{projection=Some(need);}
             }
             if let Some(projection)=projection{

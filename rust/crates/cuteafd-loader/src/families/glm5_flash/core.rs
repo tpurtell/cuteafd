@@ -708,7 +708,7 @@ mod tests {
         }
         let before = ProjectionScratchLayout::new(4096, 154880, 4096)?;
         let after = ProjectionScratchLayout::new(4096, 154880, 64)?;
-        assert_eq!(before.bytes()? - after.bytes()?, 2_692_009_984 + (129 - 64) * 4096 * 2);
+        assert_eq!(before.bytes()? - after.bytes()?, 2_692_009_984);
         Ok(())
     }
 

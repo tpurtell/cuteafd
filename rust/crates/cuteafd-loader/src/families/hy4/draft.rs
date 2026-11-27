@@ -269,8 +269,7 @@ impl DraftWeights {
     ) -> Result<Option<crate::formats::trellis_core::ProjectionScratchLayout>> {
         let mut merged: Option<crate::formats::trellis_core::ProjectionScratchLayout> = None;
         for layout in self.native.values() {
-            let [n, k] = layout.shape;
-            let next = crate::formats::trellis_core::ProjectionScratchLayout::new(k, n, rows)?;
+            let next = crate::formats::trellis_core::ProjectionScratchLayout::for_weight(layout, rows)?;
             if let Some(old) = &mut merged {
                 old.merge(&next)?;
             } else {

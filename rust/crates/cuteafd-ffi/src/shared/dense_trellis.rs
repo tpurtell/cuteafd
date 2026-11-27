@@ -61,7 +61,7 @@ pub struct DenseTrellisGeometry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DenseTrellisWorkspace {
     pub rotated: usize, pub pointer_table: usize, pub block_scales: usize,
-    pub partial: usize, pub fused: usize, pub accumulator: usize,
+    pub partial: usize, pub fused: Option<usize>, pub accumulator: usize,
 }
 impl DenseTrellisGeometry {
     pub fn workspace(self) -> Result<DenseTrellisWorkspace> {
@@ -85,9 +85,8 @@ impl DenseTrellisGeometry {
         product(&[rows, n, self.output_dtype.bytes()])?;
         let partial_rows = rows.min(TRELLIS_PARTIAL_ROWS);
         let partial = product(&[partial_rows, splits, n, 4])?;
-        let fused = fused_scratch_bytes(partial_rows, k, n)?;
         Ok(DenseTrellisWorkspace { rotated: product(&[rows, k, 2])?, pointer_table: 8,
-            block_scales: k / 128 * 2, partial, fused,
+            block_scales: k / 128 * 2, partial, fused: None,
             accumulator: product(&[rows, n, 4])? })
     }
 }
@@ -116,7 +115,7 @@ impl<'a> DenseTrellis<'a> {
     /// geometry, the single fused K8 decode program.
     pub fn load_with_fused(programs: &'a Programs<'a>, names: [&str; 3], fused_name: Option<&str>,
         geometry: DenseTrellisGeometry, codebook: &str) -> Result<Self> {
-        let workspace = geometry.workspace()?;
+        let mut workspace = geometry.workspace()?;
         validate_manifest([programs.spec(names[0])?, programs.spec(names[1])?, programs.spec(names[2])?],
             geometry, codebook, workspace)?;
         let fused = match fused_name {
@@ -125,6 +124,9 @@ impl<'a> DenseTrellis<'a> {
                 let max_rows = validate_fused_manifest(spec, geometry, codebook)?;
                 let raw_f32 = geometry.side == 2;
                 let pointers = if raw_f32 { FUSED_RAW } else { FUSED_EGRESS };
+                workspace.fused = Some(fused_scratch_bytes(
+                    geometry.rows.min(max_rows), geometry.input, geometry.output,
+                )?);
                 Some(FusedProgram { program: programs.program(name, pointers)?, max_rows, raw_f32 })
             }
             None => None,
@@ -462,7 +464,7 @@ mod tests {
         let g = geometry();
         let w = g.workspace().unwrap();
         assert_eq!(w, DenseTrellisWorkspace { rotated: 917504, pointer_table: 8,
-            block_scales: 112, partial: 11010048, fused: 11010048 + 917504, accumulator: 1572864 });
+            block_scales: 112, partial: 11010048, fused: None, accumulator: 1572864 });
         let mut s = specs(g);
         validate_manifest([&s[0], &s[1], &s[2]], g, "mcg", w).unwrap();
         s[2].geometry["output_dtype"] = json!("bf16");

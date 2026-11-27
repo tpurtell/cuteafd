@@ -463,10 +463,15 @@ impl CoreCharges {
         let fp8_head = core.native.get(cfg.head());
         let mut programs = std::collections::BTreeSet::new();
         let mut geometries = std::collections::BTreeSet::new();
+        let mut fused_geometries = std::collections::BTreeSet::new();
         for weight in bodies.iter().flatten().chain(head.iter()) {
             let side = if weight.side == TrellisSide::Input { 2 } else { 1 };
-            if geometries.insert((weight.shape, side, weight.codebook.marker(), weight.bits)) {
-                for name in policy_programs(weight, manifest)? { programs.insert(name); }
+            let is_head = matches!(weight.stem.as_str(), "lm_head" | "output");
+            let gkey = (weight.shape, side, weight.codebook.marker(), weight.bits, is_head);
+            if geometries.insert(gkey) {
+                let resolved = policy_programs(weight, manifest)?;
+                if resolved.len() == 4 { fused_geometries.insert(gkey); }
+                for name in resolved { programs.insert(name); }
             }
         }
         use crate::placement::planner::native_attention::{NativeProgram, NativePrograms};
@@ -568,16 +573,21 @@ impl CoreCharges {
             (w.stem.ends_with(".w2") || w.stem.ends_with(".down_proj")) && w.split == CoreSplit::Input && w.ranks > 1) { 4 } else { 2 };
         let split = bodies.iter().flatten().any(|w| w.side == TrellisSide::Input)
             || attention_partial_bytes == 4;
+        let has_fused = |weight: &CoreWeightLayout| {
+            let side = if weight.side == TrellisSide::Input { 2 } else { 1 };
+            let is_head = matches!(weight.stem.as_str(), "lm_head" | "output");
+            fused_geometries.contains(&(weight.shape, side, weight.codebook.marker(), weight.bits, is_head))
+        };
         let scratch = |body: &[CoreWeightLayout], rows| -> Result<Option<ProjectionScratchLayout>> {
             let mut result: Option<ProjectionScratchLayout> = None;
             for weight in body {
-                let layout = ProjectionScratchLayout::new(weight.shape[1], weight.shape[0], rows)?;
+                let layout = ProjectionScratchLayout::new_with_fused(weight.shape[1], weight.shape[0], rows, has_fused(weight))?;
                 if let Some(result) = &mut result { result.merge(&layout)?; } else { result = Some(layout); }
             }
             Ok(result)
         };
         let head_scratch = |rows| head.as_ref().map(|head|
-            ProjectionScratchLayout::new(head.shape[1], head.shape[0], rows)).transpose();
+            ProjectionScratchLayout::new_with_fused(head.shape[1], head.shape[0], rows, has_fused(head))).transpose();
         let mut layouts = Vec::new();
         for (rank, body) in bodies.into_iter().enumerate() {
             let active = !body.is_empty() || !native[rank].is_empty();

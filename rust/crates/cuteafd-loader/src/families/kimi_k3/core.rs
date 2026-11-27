@@ -423,7 +423,8 @@ pub fn projection_scratch_for_ranks_rows(cfg: &KimiK3Config, core: &CoreInventor
             ensure!(matching.len() == 1, "{}: expected one K{} row policy for K{k}/N{n}/side{side}/{book}, found {}",
                 projection.stem, projection.bits, matching.len());
             let policy = matching[0];
-            let mut layout = ProjectionScratchLayout::new(k,n,if head {rows.min(64)} else {rows})?;
+            let has_fused = policy.get("fused_program").and_then(serde_json::Value::as_str).is_some();
+            let mut layout = ProjectionScratchLayout::new_with_fused(k,n,if head {rows.min(64)} else {rows}, has_fused)?;
             if let Some(grouped) = policy.get("grouped") {
                 let groups = grouped["groups"].as_u64().and_then(|v| usize::try_from(v).ok())
                     .context("Kimi K6 grouped row-policy groups")?;
@@ -473,7 +474,8 @@ pub fn draft_head_scratch(core: &CoreInventory, rows: usize, metadata: &serde_js
         && p["sharded_side"] == 1 && p["codebook"] == book
         && p.get("bits").and_then(serde_json::Value::as_u64).unwrap_or(6) == head.bits as u64).collect::<Vec<_>>();
     ensure!(matching.len() == 1, "lm_head: expected one K{} row policy for K{k}/N{n}/{book}, found {}", head.bits, matching.len());
-    Ok(Some(ProjectionScratchLayout::new(k, n, rows)?))
+    let has_fused = matching[0].get("fused_program").and_then(serde_json::Value::as_str).is_some();
+    Ok(Some(ProjectionScratchLayout::new_with_fused(k, n, rows, has_fused)?))
 }
 
 /// Admission charge of [`draft_head_scratch`] on the head rank (GPU1).
@@ -753,7 +755,7 @@ mod scratch_admission_tests {
     use super::*;
     #[test]
     fn production_merged_scratch_includes_grouped_owners_once() -> Result<()> {
-        for (rows,expected) in [(2048,612_368_864 + 64 * 7168 * 2),(4096,931_135_968 + 64 * 7168 * 2)] {
+        for (rows,expected) in [(2048,612_368_864),(4096,931_135_968)] {
             let mut layout=ProjectionScratchLayout::grouped(7168,6144,rows,4)?;
             // Hook-local owners use the unit ceiling, not the in-flight wave span.
             assert_eq!(layout.extents["rotated"],rows*57_344);
@@ -768,7 +770,7 @@ mod scratch_admission_tests {
             head.rows=rows;
             layout.merge(&head)?;
             assert_eq!(layout.bytes()?,expected);
-            assert_eq!(layout.bytes()? - body,204_832_768 + 64 * 7168 * 2);
+            assert_eq!(layout.bytes()? - body,204_832_768);
             assert_eq!(layout.extents["partial"],293_601_280);
         }
         Ok(())
@@ -828,9 +830,8 @@ mod scratch_admission_tests {
         for rows in [1,8,16,63,64,129,130,4096] {
             let layout=ProjectionScratchLayout::new(7168,6144,rows)?;
             assert_eq!(layout.extents["partial"],rows.min(129)*7*6144*4);
-            assert_eq!(layout.extents["fused"],rows.min(129)*(7*6144*4 + 7168*2));
-            assert_eq!(layout.extents.len(),6);
-            assert_eq!(layout.storage()?.owners["route arena"],layout.extents["fused"]);
+            assert_eq!(layout.extents.len(),5);
+            assert_eq!(layout.storage()?.owners["route arena"],layout.extents["partial"]);
             assert_eq!(exchange_recv_bytes(rows)?,rows*7168*2);
         }
         assert!(ProjectionScratchLayout::new(7168,6144,0).is_err());
@@ -841,7 +842,7 @@ mod scratch_admission_tests {
         assert_eq!(grouped.extents["accumulator"],4*4096*6144*4);
         let mut merged=ProjectionScratchLayout::new(7168,6144,4096)?;
         merged.merge(&grouped)?;
-        assert_eq!(merged.storage()?.owners,grouped.storage()?.owners);
+        assert_eq!(merged,grouped);
         assert!(ProjectionScratchLayout::grouped(7168,6144,8,2).is_err());
         Ok(())
     }
