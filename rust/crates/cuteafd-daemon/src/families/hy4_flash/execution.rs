@@ -1904,6 +1904,7 @@ pub(crate) struct Hy4Engine<'a> {
     max_seq_pages: usize,
     context_split: bool,
     graphs_enabled: Cell<bool>,
+    graph_cycles: RefCell<Option<graph_device::EventCycles<'a>>>,
     swa_pt_host: Vec<i32>,
     metadata_uploads: Vec<Vec<MetadataUpload<'a>>>,
     ranks: Vec<RankRuntime<'a>>,
@@ -2233,6 +2234,7 @@ impl<'a> Hy4Engine<'a> {
             max_seq_pages: max_seq_pages.max(16),
             context_split,
             graphs_enabled: Cell::new(false),
+            graph_cycles: RefCell::new(None),
             swa_pt_host,
             metadata_uploads,
             ranks,
@@ -2409,6 +2411,7 @@ impl<'a> Hy4Engine<'a> {
         let graphs = self.graphs_active().then_some(graphs_vec.as_slice());
         let ropes: Vec<CuteafdDeviceBuffer> = self.ranks.iter().map(|r| r.weights.inv_freq_dsa.buffer).collect();
         if graphs.is_some() {
+            self.begin_graph_cycle()?;
             self.set_graph_cycle(ReadPriority::Decode);
         }
         let result = draft.propose(
@@ -2422,10 +2425,9 @@ impl<'a> Hy4Engine<'a> {
             |rank, layer| self.ranks[rank].cache.dsa_kv_layer(self.dsa_index_of[&layer]),
             |hidden, rows| self.project_vocab_tile(0, hidden, rows),
         );
-        // Successful proposals settle with their following target round. On an
-        // error there may not be a target round to settle an aborted capture.
-        if graphs.is_some() && result.is_err() {
-            let _ = self.graph_completed();
+        if graphs.is_some() {
+            if result.is_ok() { self.end_graph_cycle()?; }
+            else if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() { cycles.abandon(); }
         }
         result
     }
@@ -2480,6 +2482,8 @@ impl<'a> Hy4Engine<'a> {
         for (rank, r) in self.ranks.iter_mut().enumerate() {
             r.graphs.attach(r.device.library, r.device.id, rank, layout, tp2_dfly2)?;
         }
+        let streams = self.ranks.iter().map(|r| (r.device.id, r.stream.raw)).collect::<Vec<_>>();
+        *self.graph_cycles.borrow_mut() = Some(graph_device::EventCycles::new(self.library(), &streams)?);
         self.graphs_enabled.set(true);
         Ok(())
     }
@@ -2523,32 +2527,37 @@ impl<'a> Hy4Engine<'a> {
         }
     }
 
+    fn begin_graph_cycle(&self) -> Result<()> {
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        // SAFETY: all graph sections borrow persistent engine storage.
+        unsafe { cycles.begin_persistent(|visit| {
+            for r in &self.ranks { r.graphs.visit(visit)?; }
+            Ok(())
+        }) }
+    }
+
+    fn end_graph_cycle(&self) -> Result<()> {
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        for r in &self.ranks { r.graphs.tick(); }
+        // SAFETY: every rank's launches for this submission are queued.
+        unsafe { cycles.complete()?; }
+        if self.ranks.iter().any(|r| r.graphs.first_touch_pending()) {
+            // First touch can allocate module/workspace storage. Settle it before
+            // the next capture baseline; ordinary capture/eviction needs no drain.
+            let wait = std::time::Instant::now();
+            self.drain()?;
+            cycles.record_drain(wait.elapsed());
+            cycles.poll()?;
+            for r in &self.ranks { r.graphs.observed(); }
+        }
+        Ok(())
+    }
+
     pub(super) fn graph_completed(&self) -> Result<()> {
-        if !self.graphs_active() {
-            return Ok(());
-        }
-        if !self.ranks.iter().any(|r| r.graphs.needs_boundary()) {
-            for r in &self.ranks {
-                r.graphs.tick();
-            }
-            return Ok(());
-        }
-        let wait = std::time::Instant::now();
-        self.drain()?;
-        graph_device::record_boundary_drain(self.ranks.iter().map(|r| r.device.id), wait.elapsed());
-        // SAFETY: every rank stream is drained; graph owners hold no allocations and
-        // engine weights/cache/scratch outlive all banks (cleared in terminate()).
-        unsafe {
-            graph_device::observe_completed(self.ranks[0].device.library, |visit| {
-                for r in &self.ranks {
-                    r.graphs.visit(visit)?;
-                }
-                Ok(())
-            })?;
-        }
-        for r in &self.ranks {
-            r.graphs.observed();
-        }
+        // Golden diagnostics may poll between proposals, never submit a fake cycle.
+        if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() { cycles.poll()?; }
         Ok(())
     }
 
@@ -5718,11 +5727,12 @@ impl<'a> Hy4Engine<'a> {
         on_tile: &mut dyn FnMut(&Unit, usize, DeviceLogits) -> Result<()>,
     ) -> Result<()> {
         self.require_live()?;
-        if self.graphs_active() {
-            self.set_graph_cycle(priority);
-        }
         ensure!(!self.verifying || (units.len() == 1 && units[0].rows.len() <= self.decode_rows),
             "Hy4 provisional verification requires one admitted decode unit");
+        if self.graphs_active() && priority == ReadPriority::Decode {
+            self.begin_graph_cycle()?;
+            self.set_graph_cycle(priority);
+        }
         let initial_starts: Vec<usize> = placements.iter().map(|p| p.len).collect();
         let staged_frontiers = initial_starts.clone();
         let staged_engram_tails: Vec<[u32; 2]> = placements.iter().map(|p| p.engram_tail).collect();
@@ -5967,13 +5977,12 @@ impl<'a> Hy4Engine<'a> {
             Ok(())
         })();
         self.spark = spark;
-        // Failed captures can still grow driver storage; observe at the completed boundary
-        // on both success and failure before terminal retirement.
         let completed = if priority == ReadPriority::Decode && self.graphs_active() {
-            self.graph_completed()
-        } else {
-            Ok(())
-        };
+            if result.is_ok() { self.end_graph_cycle() } else {
+                if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() { cycles.abandon(); }
+                Ok(())
+            }
+        } else { Ok(()) };
         let result = result.and(completed);
         if result.is_err() {
             self.terminate();
@@ -6314,6 +6323,31 @@ fn build_hy4_spark_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graph_cycles_complete_by_event_and_drain_only_on_first_touch() {
+        let source = include_str!("execution.rs").split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(source.contains("graph_device::EventCycles::new("), "Hy4-flash must construct shared EventCycles over rank streams");
+        assert!(!source.contains("observe_completed"), "Hy4-flash completion must not credit host-drain epochs");
+        let end = source.split("    fn end_graph_cycle(").nth(1).unwrap()
+            .split("    pub(super) fn graph_completed(").next().unwrap();
+        let complete = end.find("cycles.complete()").unwrap();
+        let first_touch = end.find("first_touch_pending()").unwrap();
+        assert!(complete < first_touch, "cycle completes by event before the first-touch check");
+        assert!(end[first_touch..].contains("self.drain()"), "only first-touch settlement drains");
+        assert_eq!(end.matches("self.drain()").count(), 1);
+        let completed = source.split("    pub(super) fn graph_completed(").nth(1).unwrap()
+            .split("    pub(crate) fn library(").next().unwrap();
+        assert!(!completed.contains("drain") && !completed.contains("complete()"), "golden polling never submits a cycle");
+        let run = source.split("    pub(crate) fn run_units(").nth(1).unwrap();
+        assert!(run.find("self.begin_graph_cycle()?").unwrap() < run.find("run_prefill_units(").unwrap());
+        assert!(run.find("run_prefill_units(").unwrap() < run.find("self.end_graph_cycle()").unwrap());
+        assert!(run.contains("cycles.abandon()"));
+        let draft = source.split("    pub(super) fn draft_propose(").nth(1).unwrap()
+            .split("    fn set_graph_cycle(").next().unwrap();
+        assert!(draft.find("self.begin_graph_cycle()?").unwrap() < draft.find("draft.propose(").unwrap());
+        assert!(draft.contains("self.end_graph_cycle()?") && draft.contains("cycles.abandon()"));
+    }
 
     #[test]
     fn partial_verify_commits_only_the_accepted_indexer_and_engram_tail() {
