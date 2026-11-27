@@ -201,8 +201,6 @@ pub(crate) trait Backend<'a> {
     fn configure_draft_scores(&self, _traced: bool, _scored: bool) {}
     /// Scores of the request's current proposal.
     fn draft_head<'d>(&self, _draft: &'d Self::Draft) -> Option<&'d [f32]> { None }
-    /// Whether verification and acceptance take history-copy rows past the drafter's block.
-    fn draft_copies(&self) -> bool { false }
     fn accept(&self, verified: &mut [Verified<'_, Self::Placement, Self::Draft, Self::History>],
         speculative: bool) -> Result<()>;
     /// Drop any unaccepted replay owned by this request before its storage is released.
@@ -937,7 +935,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
         let shared = if width > 0 {
             let (traced, scored) = crate::shared::draft::history::score_readback(length.control());
             engine.configure_draft_scores(traced, scored);
-            Some(Policy::new(length, width, engine.draft_head_kind(), engine.draft_copies()))
+            Some(Policy::new(length, width, engine.draft_head_kind()))
         } else { None };
         let trace = Trace::open()?;
         let prefills = decode_share.queue::<Prefill<'_, B::Placement, B::Draft>>()?;

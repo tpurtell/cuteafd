@@ -566,7 +566,6 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
     // The bundled dSpark's trained confidence head, one sigmoid per drafted position.
     fn draft_head_kind(&self) -> cuteafd_core::HeadScore { cuteafd_core::HeadScore::Probability }
     fn draft_head<'d>(&self,draft:&'d DraftState) -> Option<&'d [f32]> { Some(&draft.confidence) }
-    fn draft_copies(&self) -> bool { true }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, u64>], speculative: bool) -> Result<()> {
         self.live()?;
         if let Some(draft)=&self.owners.storage.draft_prefix {

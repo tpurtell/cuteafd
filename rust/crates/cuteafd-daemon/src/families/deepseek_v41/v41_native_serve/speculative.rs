@@ -234,7 +234,7 @@ impl<'w, 'a, C: DraftChain<'a>> DraftRuntime<'w, 'a, C> {
     /// the installed placement's RTX layer count, for the console.
     pub(crate) fn bind_policy(&mut self, local_layers: usize) {
         LOCAL_LAYERS.store(local_layers as u64, std::sync::atomic::Ordering::Relaxed);
-        self.policy = Some(Policy::new(self.length, self.draft_width, cuteafd_core::HeadScore::Logit, true));
+        self.policy = Some(Policy::new(self.length, self.draft_width, cuteafd_core::HeadScore::Logit));
     }
     /// What a verification round records besides its outputs: layer events under the timing profile.
     pub fn capture(&self) -> Capture {

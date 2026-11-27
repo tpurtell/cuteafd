@@ -377,7 +377,6 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         self.engine.verify_attention_trace(contexts, rows)
     }
-    fn draft_copies(&self) -> bool { true }
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>, draft: &mut Self::Draft)
         -> Result<()> {
         super::speculate::prefill_chunk(self.engine, placement, start, chunk, next, draft)

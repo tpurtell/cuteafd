@@ -696,9 +696,6 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
     fn draft_head<'d>(&self, draft: &'d Draft) -> Option<&'d [f32]> {
         (!draft.confidence.is_empty()).then_some(draft.confidence.as_slice())
     }
-    fn draft_copies(&self) -> bool {
-        false
-    }
 
     fn prefill_draft(&self, p: &Placement, _: usize, _: &[u32], next: Option<u32>, state: &mut Draft) -> Result<()> {
         if let Some(draft) = &self.execution.borrow().draft {

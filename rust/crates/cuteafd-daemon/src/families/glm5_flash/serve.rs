@@ -873,7 +873,7 @@ fn schedule(engine: &GlmfEngine<'_>, opened: &Opened, snapshot: &std::path::Path
     // The history draft policy chooses each request's verify length under the verify-row budget.
     let mut shared = match drafter {
         Some(drafter) => {
-            Some(DraftPolicy::new(policy.length, drafter.drafts(), drafter.head_kind(), true))
+            Some(DraftPolicy::new(policy.length, drafter.drafts(), drafter.head_kind()))
         }
         _ => None,
     };
