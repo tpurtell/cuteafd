@@ -54,18 +54,7 @@ impl<'a> Commit<'a>{
     /// Metadata validation precedes upload and every mutation. Segments and
     /// destination slots are unique and contain only actually verified inputs.
     pub fn table(&self,entries:&[(usize,usize,usize)],available:&[(usize,usize)])->Result<Vec<i32>>{
-        let cap=self.capacity;
-        ensure!(!entries.is_empty() && entries.len()<=cap && entries.len()==available.len(),"FIR commit sequence inventory differs");
-        let mut slots=std::collections::BTreeSet::new();
-        let mut table=vec![0;entries.len()*3];
-        for (index,(&(slot,first,keep),&(start,count))) in entries.iter().zip(available).enumerate(){
-            ensure!(slot<self.layout.slots && slots.insert(slot) && first==start && count>0 && count<=8
-                && keep<=count && first.checked_add(count).is_some_and(|end|end<=cap),"FIR commit outside staged segment or aliases slot");
-            table[index]=i32::try_from(slot)?;
-            table[entries.len()+index]=i32::try_from(first)?;
-            table[2*entries.len()+index]=i32::try_from(keep)?;
-        }
-        Ok(table)
+        build_table(self.layout,self.capacity,entries,available)
     }
     /// # Safety
     /// Table was checked by `table` and uploaded before this stream reaches the
@@ -93,6 +82,26 @@ impl<'a> Commit<'a>{
     }
 }
 
+fn build_table(layout:Layout,cap:usize,entries:&[(usize,usize,usize)],available:&[(usize,usize)])->Result<Vec<i32>>{
+    ensure!(cap<=layout.replay_rows,"FIR commit capacity exceeds replay layout");
+    ensure!(!entries.is_empty() && entries.len()<=cap && entries.len()==available.len(),"FIR commit sequence inventory differs");
+    let mut slots=std::collections::BTreeSet::new();
+    let mut table=vec![0;entries.len()*3];
+    for (index,(&(slot,first,keep),&(start,count))) in entries.iter().zip(available).enumerate(){
+        ensure!(slot<layout.slots && slots.insert(slot) && first==start && count>0 && count<=cap
+            && keep<=count && first.checked_add(count).is_some_and(|end|end<=cap),"FIR commit outside staged segment or aliases slot");
+        // The lag-3 FIR commit kernel caps its `keep` scalar at 8 while `replay` holds `cap`
+        // rows (64 or 128). For `keep > 3`, all three lags read exclusively from the final
+        // three accepted replay rows `first + keep - 3 .. first + keep`, which is bit-identical
+        // to passing `(first + keep - 3, 3)`.
+        let (table_first,table_keep)=if keep>3 {(first+keep-3,3)} else {(first,keep)};
+        table[index]=i32::try_from(slot)?;
+        table[entries.len()+index]=i32::try_from(table_first)?;
+        table[2*entries.len()+index]=i32::try_from(table_keep)?;
+    }
+    Ok(table)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,6 +115,41 @@ mod tests {
         assert!(layout.replay_layer_stride >= 64 * layout.replay_row_stride);
         assert!(layout.replay_layer_stride >= 128 * layout.replay_row_stride);
         assert_eq!(layout.replay_bytes()?, 48 * 128 * 6656 * 4);
+        Ok(())
+    }
+
+    /// Simulate the exact `fir_history_commit` kernel guard and lag-3 gather for one sequence.
+    fn simulate_kernel(cap:usize,prior:[u32;3],replay:&[u32],table_first:i32,table_keep:i32)->Option<[u32;3]>{
+        let (first,keep)=(usize::try_from(table_first).ok()?,usize::try_from(table_keep).ok()?);
+        // Mirror `fir_history.py:58-59` exactly, including `keep <= 8`.
+        if first>cap || keep>8 || first+keep>cap {return None;}
+        let mut live=[0u32;3];
+        for lag in 0..3 {
+            live[lag]=if keep>lag {replay[first+keep-1-lag]} else {prior[lag-keep]};
+        }
+        Some(live)
+    }
+
+    #[test]
+    fn copy_extended_accepts_reproduce_exact_lag3_fir_state_under_kernel_keep_guard()->Result<()>{
+        let prior=[900,901,902];
+        for (replay_rows,cap) in [(64usize,64usize),(128,64),(128,128)]{
+            let layout=Layout::contiguous_rows(16,6656,replay_rows)?;
+            let replay: Vec<u32> = (1000..1000 + replay_rows as u32).collect();
+            for (first,count) in [(0,1),(0,8),(0,40),(0,cap),(7,40),(cap-40,40),(cap-9,9)]{
+                for keep in 0..=count {
+                    let table=build_table(layout,cap,&[(3,first,keep)],&[(first,count)])?;
+                    let live=simulate_kernel(cap,prior,&replay,table[1],table[2])
+                        .context("kernel guard rejected encoded table entry")?;
+                    let mut serial=prior.to_vec();
+                    for &tok in &replay[first..first+keep]{serial.insert(0,tok);serial.truncate(3);}
+                    assert_eq!(live.as_slice(),serial.as_slice(),"replay={replay_rows} cap={cap} first={first} count={count} keep={keep}");
+                }
+            }
+            assert!(build_table(layout,cap,&[(0,0,cap+1)],&[(0,cap)]).is_err());
+            assert!(build_table(layout,cap,&[(0,1,cap)],&[(1,cap)]).is_err());
+            assert!(build_table(layout,cap,&[(0,0,1),(0,1,1)],&[(0,1),(1,1)]).is_err());
+        }
         Ok(())
     }
 }

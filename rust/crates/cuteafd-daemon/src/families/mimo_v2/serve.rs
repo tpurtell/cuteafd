@@ -539,7 +539,7 @@ fn schedule_inner(engine: &MimoEngine<'_>, opened: &Opened, snapshot: &std::path
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let width = drafter.map_or_else(|| engine.mtp.as_ref().map_or(0, |m| m.stages.len()), |d| d.cfg.drafts());
     let mut shared = if width > 0 {
-        Some(DraftPolicy::new(policy.length, width, draft_score_source(drafter.is_some()), true))
+        Some(DraftPolicy::new(policy.length, width, draft_score_source(drafter.is_some())))
     } else { None };
 
     let mut trace = crate::shared::speculation_trace::Trace::open()?;

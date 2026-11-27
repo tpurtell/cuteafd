@@ -380,8 +380,6 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     fn draft_head<'d>(&self, draft: &'d Draft) -> Option<&'d [f32]> {
         (!draft.confidence.is_empty()).then_some(draft.confidence.as_slice())
     }
-    // Exact FIR verification owns one anchor plus the native seven drafts.
-    fn draft_copies(&self) -> bool { false }
     fn prefill_draft(&self,p:&Placement,_:usize,_:&[u32],next:Option<u32>,state:&mut Draft)->Result<()>{
         if let Some(draft)=&self.execution.borrow().draft{ensure!(draft.drafter.frontier(p.slot)?.1==p.len,"Inkling draft prefill frontier differs");}
         state.anchor=next;Ok(())
@@ -661,12 +659,15 @@ mod tests {
     #[test]
     fn agreeing_history_copies_preserve_exact_fir_prefixes() -> Result<()> {
         use cuteafd_loader::families::inkling2::verify::{accepted_history, Source};
-        let history = [1,2,3,4,5,6,7,8,20,21,22,23,24,25,26,27,28,29,50,1,2,3,4,5,6,7,8];
+        let mut history: Vec<u32> = (1..=8).collect();
+        history.extend(20..60);
+        history.extend(900..910);
+        history.extend(1..=8);
         let draft = [20,21,22,23,24,25,26];
         let tail = crate::shared::draft::copy::continuation(&history, &draft, true).unwrap();
-        assert!(!tail.is_empty());
-        let rows = std::iter::once(9).chain(draft).collect::<Vec<_>>();
-        assert_eq!(rows.len(), 8, "Inkling FIR verifier remains at its admitted native block");
+        assert_eq!(tail.len(), crate::shared::draft::copy::COPY_EXTENSION);
+        let rows = std::iter::once(9).chain(draft).chain(tail.iter().copied()).collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1 + draft.len() + crate::shared::draft::copy::COPY_EXTENSION);
         let prior = [100,99,98];
         for keep in 0..=rows.len() {
             let committed = accepted_history(3, rows.len(), keep)?.into_iter().map(|source| match source {
@@ -675,7 +676,7 @@ mod tests {
             for &token in &rows[..keep] { serial.insert(0, token); serial.truncate(3); }
             assert_eq!(committed, serial);
         }
-        assert_eq!(decode_spans([8;8],64)?.last().unwrap().end,64);
+        assert_eq!(decode_spans([40, 24], 64)?.last().unwrap().end, 64);
         Ok(())
     }
 

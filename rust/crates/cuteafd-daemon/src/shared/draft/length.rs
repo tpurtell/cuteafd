@@ -133,7 +133,7 @@ mod tests {
                 let effective = requested.min(native);
                 assert_eq!(length.effective(native), effective);
                 let (mut policy, settings) = cuteafd_bench::context::capture_resolved(||
-                    Policy::new(length, native, HeadScore::None, true));
+                    Policy::new(length, native, HeadScore::None));
                 assert!(policy.fixed());
                 assert!(settings.0.iter().any(|(k, v)| k == "draft-mode" && v == &format!("fixed {effective}")));
                 let mut context = cuteafd_bench::context::ServerContext::default();

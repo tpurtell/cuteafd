@@ -61,9 +61,10 @@ impl<'a> BlockVerifyTarget for Target<'_, 'a> {
             &mark.conv.slots,
         )?;
         let draft = self.execution.draft.as_ref().context("Mini drafter missing")?.clone();
+        let decode_rows = self.execution.requests.decode.layout.rows;
         ensure!(
             request.tap_sites == draft.sites
-                && request.rows.len() <= self.execution.requests.decode.layout.rows
+                && request.rows.len() <= decode_rows
                 && request.rows.iter().all(|row| row.token.is_some()),
             "Inkling 2 Mini verify requires admitted native sites and active packed rows"
         );
@@ -73,7 +74,7 @@ impl<'a> BlockVerifyTarget for Target<'_, 'a> {
         let mut first = 0;
         for (index, p) in mark.placements.iter().enumerate() {
             let rows: Vec<_> = request.rows.iter().filter(|row| row.slot == p.slot).collect();
-            ensure!((1..=8).contains(&rows.len()), "Mini verify member exceeds bundled block");
+            ensure!((1..=decode_rows).contains(&rows.len()), "Mini verify member exceeds decode rows");
             let source: Vec<u32> = rows.iter().map(|row| row.token.unwrap()).collect();
             ensure!(
                 request.rows[first..first + rows.len()].iter().all(|row| row.slot == p.slot),

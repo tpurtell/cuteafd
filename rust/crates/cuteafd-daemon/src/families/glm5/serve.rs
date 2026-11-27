@@ -630,7 +630,7 @@ fn schedule(engine: &GlmEngine<'_>, opened: &Opened, receive: &mut mpsc::Receive
     let drafter = engine.drafter.as_ref();
     let mut free_slots: Vec<usize> = drafter.map_or(Vec::new(), |d| (0..d.slots).rev().collect());
     let mut shared = drafter.map(|d| {
-        anyhow::Ok(DraftPolicy::new(policy.length, d.cfg.drafts(), d.score_source(), true))
+        anyhow::Ok(DraftPolicy::new(policy.length, d.cfg.drafts(), d.score_source()))
     }).transpose()?;
     let mut active: Vec<Active<'_>> = Vec::new();
     // Decoding requests waiting for KV pages: they keep their slot and pages, skip rounds.

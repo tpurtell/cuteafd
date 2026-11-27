@@ -474,7 +474,6 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
     fn draft_head<'d>(&self, draft: &'d DraftState) -> Option<&'d [f32]> {
         self.drafter.as_ref().map(|_| draft.confidence.as_slice())
     }
-    fn draft_copies(&self) -> bool { true }
     fn accept(&self, verified: &mut [scheduler::Verified<'_, Placement, DraftState, ()>], speculative: bool) -> Result<()> {
         if let Some(mtp) = &self.mtp {
             let mut engine = self.engine.borrow_mut();

@@ -46,8 +46,8 @@ mod tests {
         // These are wiring checks for adapters whose constructors require an
         // admitted accelerator. The policy itself is exercised with CPU replays.
         for (family, source, declaration) in [
-            ("GLM 5.3 / ML4", include_str!("../families/glm5/serve.rs"), "d.score_source(), true"),
-            ("GLM Flash", include_str!("../families/glm5_flash/serve.rs"), "drafter.head_kind(), true"),
+            ("GLM 5.3 / ML4", include_str!("../families/glm5/serve.rs"), "d.score_source())"),
+            ("GLM Flash", include_str!("../families/glm5_flash/serve.rs"), "drafter.head_kind())"),
             ("GLM Flash routes", include_str!("../families/glm5_flash/dspark.rs"), "Self::Dflash2(d) => d.score_source()"),
             ("Kimi", include_str!("../families/kimi_k3/draft_common.rs"), "Self::Block { .. } => cuteafd_core::HeadScore::Probability"),
             ("Kimi DFlash2", include_str!("../families/kimi_k3/draft_common.rs"), "Self::Mla(d) => d.score_source()"),

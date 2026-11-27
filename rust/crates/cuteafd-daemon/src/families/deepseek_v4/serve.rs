@@ -208,7 +208,7 @@ fn serve_loop(
         engine.configure_packing(packing, transports)?;
         // V4's Markov dSpark proposes tokens only: no trained confidence head.
         let shared = (engine.draft_block() > 0 && !engine.skip_routed).then(||
-            DraftPolicy::new(length, engine.draft_block(), cuteafd_core::HeadScore::None, true));
+            DraftPolicy::new(length, engine.draft_block(), cuteafd_core::HeadScore::None));
         let local = engine.local_layers();
         console::layer_classes((0..engine.weights.layers.len()).map(|l| console::layer_class(false, l >= local)).collect());
         let mut selector = TokenSelector::new(&loaded.library, args.token_io.token_select, engine.cfg.vocab_size,

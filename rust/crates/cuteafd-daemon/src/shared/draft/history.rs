@@ -38,10 +38,10 @@ pub(crate) struct Policy {
 }
 
 impl Policy {
-    /// `block` is the drafter's native block; `head` its score source;
-    /// `copies` whether the family verifies history copies.
-    pub fn new(length: DraftLength, block: usize, head: HeadScore, copies: bool) -> Self {
-        let spec = DrafterSpec { block, head, copy: if copies { copy::COPY_EXTENSION } else { 0 } };
+    /// `block` is the drafter's native block; `head` its score source.
+    /// Every speculating family verifies agreeing history copies on the shared copy track.
+    pub fn new(length: DraftLength, block: usize, head: HeadScore) -> Self {
+        let spec = DrafterSpec { block, head, copy: copy::COPY_EXTENSION };
         let history = DraftHistory::new(spec, length.control()).with_cut_rule(length.cut_rule());
         SPECULATION_ENABLED.store(block > 0 && history.control() != DraftControl::Off,
             std::sync::atomic::Ordering::Relaxed);
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn shape_cuts_to_the_plan_extends_agreeing_copies_and_fits_the_budget() {
-        let mut policy = Policy::new(length(None), 4, HeadScore::None, true);
+        let mut policy = Policy::new(length(None), 4, HeadScore::None);
         let history = repeating(8);
         assert_eq!(policy.plan(&[(1, 40), (2, 40)], 64), [4, 4]);
         let (mut agreeing, mut differing) = (vec![100, 101, 102, 103], vec![100, 101, 7, 103]);
@@ -295,12 +295,12 @@ mod tests {
     #[test]
     fn fixed_length_and_off_come_from_the_launch_configuration() {
         let (mut fixed, settings) = cuteafd_bench::context::capture_resolved(||
-            Policy::new(length(Some(9)), 7, HeadScore::Logit, true));
+            Policy::new(length(Some(9)), 7, HeadScore::Logit));
         assert!(fixed.fixed() && fixed.max_positions() == 7);
         assert!(settings.0.iter().any(|(name, value)| name == "draft-mode" && value == "fixed 7"));
         assert_eq!(fixed.plan(&[(1, 40)], 64), [7]);
         let mut off = Policy::new(DraftLength { draft_policy: super::super::length::DraftPolicyChoice::Off,
-            ..Default::default() }, 7, HeadScore::None, true);
+            ..Default::default() }, 7, HeadScore::None);
         assert_eq!((off.plan(&[(1, 40)], 64), off.max_positions()), (vec![0], 0));
     }
 
@@ -368,7 +368,7 @@ mod tests {
     fn clamped_policy_learns_round_cost_and_plans_each_round_at_its_band() {
         use super::super::length::DraftPolicyChoice;
         let length = DraftLength { draft_policy: DraftPolicyChoice::Clamped, ..Default::default() };
-        let mut policy = Policy::new(length, 4, HeadScore::Probability, false);
+        let mut policy = Policy::new(length, 4, HeadScore::Probability);
         assert_eq!(policy.history.cut_rule(), cuteafd_core::CutRule::Clamped);
         // Rounds at 40K context: 10 ms + 2 ms/row, eight requests at 1 or 4 drafts each.
         for round in 0..64 {
@@ -436,5 +436,14 @@ mod tests {
         assert!(!finish_censored(true, 2, &rows, Some(99)));
         assert!(finish_censored(true, 2, &rows, Some(12)));
         assert!(finish_censored(true, 4, &rows, Some(99)));
+    }
+
+    #[test]
+    fn history_copy_drafting_has_no_per_family_switch() {
+        let scheduler = include_str!("../qwen/scheduler.rs");
+        assert!(!scheduler.contains("fn draft_copies"), "shared scheduler must not expose a per-family copy switch");
+        assert!(scheduler.contains("Policy::new(length, width, engine.draft_head_kind())"));
+        let policy = Policy::new(length(None), 7, HeadScore::CandidateProbability);
+        assert_eq!(policy.history.spec().copy, copy::COPY_EXTENSION);
     }
 }

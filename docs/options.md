@@ -949,8 +949,14 @@ estimated chance the whole prefix survives verification. The probabilities:
   the request's first 3 completed verify rounds. An unreached position stops
   the plan after the fade; the cold server rate is 1 for neural drafts and
   0.25 for copies.
-- A history copy extending an agreeing draft keeps its per-position rule: each
-  copy position is kept while its own history estimate exceeds 0.3.
+- History copy drafting is enabled uniformly for every speculating family under
+  `history` and `clamped` (no per-family switch): when a greedy request's kept
+  neural draft (at least 3 tokens, and at least 7 anchored tokens together with
+  the matched 4–8-token history suffix) matches the continuation of the latest
+  earlier occurrence in the request's own history, the policy extends it by up
+  to 32 copied tokens within the verify-row budget. Each copy position keeps its
+  per-position rule: it is kept while its own history estimate exceeds 0.3, plus
+  per-request exploration on the copy track.
 
 Scored drafters can propose their full native block (7 drafts for V4.1).
 The plan includes the first position past the kept prefix as an explore if
