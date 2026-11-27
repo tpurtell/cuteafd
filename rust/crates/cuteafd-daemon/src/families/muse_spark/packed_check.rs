@@ -138,8 +138,7 @@ fn check_wide_decode_rows(
             .zip(seq_inputs.iter().map(|&(_, cont)| cont))
             .collect();
         let logits = if eager {
-            backend.verify_device_ungraphed(&mut batch, true,
-                crate::shared::qwen::scheduler::UngraphedKind::Decode, cache.pool())?
+            backend.verify_eager(&mut batch, true, super::backend::verify_kind(true))?
         } else {
             backend.verify_device(&mut batch, true, cache.pool())?
         }.context("Muse wide decode check produced no logits")?;
@@ -168,8 +167,7 @@ fn check_wide_decode_rows(
             |pages| Placement { pages, slot: 0, ..Default::default() })?.placement;
         backend.prefill_device(&mut placement, prompt, 1, cache.pool())?;
         backend.diagnostic_sync()?;
-        let solo = backend.verify_device_ungraphed(&mut [(&mut placement, cont)], true,
-            crate::shared::qwen::scheduler::UngraphedKind::Decode, cache.pool())?
+        let solo = backend.verify_eager(&mut [(&mut placement, cont)], true, super::backend::verify_kind(true))?
             .context("Muse wide solo control produced no logits")?
             .to_host(backend.library())?;
         for r in 0..cont.len() {
@@ -328,8 +326,7 @@ fn snapshot_and_restore(backend: &MuseBackend<'_, '_>, family: &super::prefix::M
                 family.drain().map_err(boxed)?;
                 let sequences = &mut [(&mut restored, tokens.as_slice())];
                 let logits = if eager {
-                    backend.verify_device_ungraphed(sequences, speculative,
-                        crate::shared::qwen::scheduler::UngraphedKind::Decode, pool)?
+                    backend.verify_eager(sequences, speculative, super::backend::verify_kind(speculative))?
                 } else {
                     backend.verify_device(sequences, speculative, pool)?
                 }.context("Muse graph oracle produced no logits")?;

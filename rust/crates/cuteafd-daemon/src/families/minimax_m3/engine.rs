@@ -1408,10 +1408,14 @@ mod tests {
             }
         }
         let backend = include_str!("backend.rs");
-        let ungraphed = backend.split_once("    fn verify_device_ungraphed(").unwrap().1
+        // Only probe scoring is ungraphed; live (probed) decode is the captured path.
+        let ungraphed = backend.split_once("    fn score_device(").unwrap().1
             .split_once("    fn verify_bucket_rows(").unwrap().0;
-        assert!(ungraphed.contains("self.decode(sequences, pool, true, false)"));
+        assert!(!ungraphed.contains("self.decode(sequences, pool, true, false)"));
         assert!(ungraphed.contains("self.decode(sequences, pool, false, false)"));
+        let served = backend.split_once("    fn verify_device(").unwrap().1
+            .split_once("    fn score_device(").unwrap().0;
+        assert!(served.contains("self.decode(sequences, pool, true, true)"));
         let decode = include_str!("engine.rs").split_once("    pub fn decode(").unwrap().1
             .split_once("    pub fn drain(").unwrap().0;
         assert_eq!(decode.matches("decode_section(captured,").count(), 4);

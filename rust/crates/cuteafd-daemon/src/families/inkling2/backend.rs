@@ -357,13 +357,12 @@ impl<'a> Backend<'a> for InklingBackend<'a> {
     fn verify_device(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.decode(sequences, speculative, pool)
     }
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, speculative, pool); }
-        scoring_replay(sequences, speculative, |sequences| self.decode(sequences, false, pool),
+    fn score_device(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool)
+        -> Result<Option<DeviceLogits>> {
+        scoring_replay(sequences, false, |sequences| self.decode(sequences, false, pool),
             |verified| self.accept(verified, false))
     }
-    fn verify_bucket_rows(&self, rows: usize, _: bool, _: bool) -> usize { rows }
+    fn verify_bucket_rows(&self, rows: usize, _: bool) -> usize { rows }
     fn verify_attention_trace(&self, _: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"inkling2", "rows":rows, "attention":"eager"}))
     }
@@ -599,14 +598,14 @@ mod tests {
         let cold = scheduler.split("let decode = p.job.probe.as_ref()").nth(1).unwrap()
             .split("p.done += chunk.len();").next().unwrap();
         assert!(cold.contains("step.decode"));
-        assert!(cold.contains("UngraphedKind::Scoring"));
+        assert!(cold.contains("engine.score_device("));
         assert!(cold.contains("engine.prefill_draft(&p.placement, start, chunk"));
         assert!(!cold.contains("engine.accept("), "cold replay must not accept twice");
         assert!(!cold.contains("lanes::commit("));
         let backend = include_str!("backend.rs").split("#[cfg(test)]").next().unwrap();
-        let replay = backend.split("fn verify_device_ungraphed(").nth(1).unwrap()
+        let replay = backend.split("fn score_device(").nth(1).unwrap()
             .split("fn verify_bucket_rows(").next().unwrap();
-        assert!(replay.contains("scoring_replay(sequences, speculative"));
+        assert!(replay.contains("scoring_replay(sequences, false"));
         assert!(replay.contains("self.accept(verified, false)"));
 
         let mut placement = Placement { media: None, units: vec![], slot: 0, len: 8, state_len: 8 };

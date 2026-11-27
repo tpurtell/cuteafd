@@ -642,25 +642,17 @@ impl<'a> Backend<'a> for Hy4Backend<'a> {
         self.decode(sequences, speculative, pool, true)
     }
 
-    fn verify_device_ungraphed(
-        &self,
-        sequences: &mut [(&mut Hy4Placement, &[u32])],
-        speculative: bool,
-        kind: scheduler::UngraphedKind,
-        pool: &RefPagePool,
-    ) -> Result<Option<DeviceLogits>> {
-        if kind == scheduler::UngraphedKind::Decode {
-            return self.decode(sequences, speculative, pool, false);
-        }
+    fn score_device(&self, sequences: &mut [(&mut Hy4Placement, &[u32])], pool: &RefPagePool)
+        -> Result<Option<DeviceLogits>> {
         scoring_replay(
             sequences,
-            speculative,
+            false,
             |sequences| self.decode(sequences, false, pool, false),
             |verified| self.accept(verified, false),
         )
     }
 
-    fn verify_bucket_rows(&self, rows: usize, _: bool, _: bool) -> usize {
+    fn verify_bucket_rows(&self, rows: usize, _: bool) -> usize {
         rows
     }
 

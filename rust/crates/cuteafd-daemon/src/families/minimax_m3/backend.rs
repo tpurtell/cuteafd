@@ -319,7 +319,7 @@ impl<'e, 'a> MiniMaxBackend<'e, 'a> {
         }
         // Non-speculative input is committed even if selection later cancels.
         // A retained receipt validates the scheduler's optional accept callback;
-        // publication itself never depends on that callback or UngraphedKind.
+        // publication itself never depends on that callback or the scoring path.
         let published = publish(&self.owners.storage.prefix, sequences, &submitted);
         self.completed(published)?;
         *self.pending.borrow_mut() = retain_receipt.then_some(submitted);
@@ -503,10 +503,8 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         let _ = speculative;
         self.decode(sequences, pool, true, true)
     }
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        let _ = speculative;
-        if kind == scheduler::UngraphedKind::Decode { return self.decode(sequences, pool, true, false); }
+    fn score_device(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool)
+        -> Result<Option<DeviceLogits>> {
         let total: usize = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         ensure!(sequences.len() == 1 && total <= self.geometry().decode_rows,
             "MiniMax diagnostic scoring requires one bounded sequence");
@@ -529,7 +527,7 @@ impl<'e, 'a> Backend<'a> for MiniMaxBackend<'e, 'a> {
         })?;
         Ok(result)
     }
-    fn verify_bucket_rows(&self, rows: usize, _: bool, _: bool) -> usize { rows }
+    fn verify_bucket_rows(&self, rows: usize, _: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         let contexts = contexts.to_vec();
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({
@@ -1027,7 +1025,7 @@ mod tests {
     fn zero_proposal_rounds_use_native_decode_and_stage_before_publication() {
         let source = include_str!("backend.rs");
         let verify = source.split_once("    fn verify_device(").unwrap().1
-            .split_once("    fn verify_device_ungraphed(").unwrap().0;
+            .split_once("    fn score_device(").unwrap().0;
         assert!(!verify.contains("verify_staged"));
         assert!(verify.contains("self.decode(sequences, pool, true, true)"));
         assert!(!verify.contains("draft_prefix.is_some()"));

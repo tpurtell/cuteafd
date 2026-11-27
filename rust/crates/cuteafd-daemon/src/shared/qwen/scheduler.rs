@@ -12,13 +12,6 @@ pub(crate) enum Drafts {
     Neural { depth: usize },
 }
 
-/// Ungraphed rows can replay prompt tokens or advance a live decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UngraphedKind {
-    Scoring,
-    Decode,
-}
-
 pub(crate) struct Geometry {
     pub family: &'static str,
     pub vocab_size: usize,
@@ -182,12 +175,15 @@ pub(crate) trait Backend<'a> {
     fn verify_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
         pool: &cuteafd_engine::prefix::RefPagePool)
         -> Result<Option<DeviceLogits>>;
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
-        kind: UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool)
-        -> Result<Option<DeviceLogits>>;
-    fn verify_bucket_rows(&self, rows: usize, speculative: bool, diagnostic: bool) -> usize;
+    /// Teacher-forced probe scoring and decode-shaped cold prompt replay: a
+    /// non-speculative append that commits every row before returning, eager
+    /// by contract (it never captures or replays a serving graph). Live decode,
+    /// probed or not, always goes through [`Self::verify_device`].
+    fn score_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>>;
+    fn verify_bucket_rows(&self, rows: usize, speculative: bool) -> usize;
     /// `None` declares an exact-row path; `Some(rows)` on a padded path may have no slack.
-    fn verify_explore_bucket(&self, _rows: usize, _diagnostic: bool) -> Option<usize> { None }
+    fn verify_explore_bucket(&self, _rows: usize) -> Option<usize> { None }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred;
     fn prefill_draft(&self, placement: &Self::Placement, start: usize, chunk: &[u32], next: Option<u32>,
         draft: &mut Self::Draft) -> Result<()>;
@@ -578,19 +574,20 @@ mod readiness_tests {
     use std::cell::Cell;
 
     #[test]
-    fn ungraphed_callers_distinguish_scoring_replay_from_live_decode() {
-        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1;
-        let calls = source.split("engine.verify_device_ungraphed(").skip(1)
+    fn only_scoring_and_cold_replay_take_the_eager_path() {
+        let source = include_str!("scheduler.rs").split_once("\npub(crate) fn schedule").unwrap().1
+            .split_once("\n#[cfg(test)]").unwrap().0;
+        let calls = source.split("engine.score_device(").skip(1)
             .map(|call| call.split_once("cache.pool()").unwrap().0
                 .chars().filter(|c| !c.is_whitespace()).collect::<String>())
             .collect::<Vec<_>>();
-        assert_eq!(calls, [
-            // Teacher-forced rows, then decode-shaped cold prompt replay.
-            "&mut[(placement,chunk)],false,UngraphedKind::Scoring,",
-            "&mut[(&mutp.placement,chunk)],false,UngraphedKind::Scoring,",
-            // Only the live diagnostic decode advances generated rows.
-            "&mutrows,spec,UngraphedKind::Decode,",
-        ]);
+        // Teacher-forced rows, then decode-shaped cold prompt replay.
+        assert_eq!(calls, ["&mut[(placement,chunk)],", "&mut[(&mutp.placement,chunk)],"]);
+        let round = source.split_once("\nasync fn decode_round").unwrap().1;
+        assert!(!round.contains("score_device("), "live decode never runs eagerly");
+        assert_eq!(round.matches("engine.verify_device(").count(), 1);
+        // No probe-dependent routing or geometry anywhere in the round.
+        assert!(!round.contains("probe.is_some()"));
     }
 
     #[test]
@@ -1146,8 +1143,8 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                     },
                     |placement, chunk| {
                         offer()?;
-                        engine.verify_device_ungraphed(&mut [(placement, chunk)], false,
-                            UngraphedKind::Scoring, cache.pool())?.context("scoring needs every layer")
+                        engine.score_device(&mut [(placement, chunk)], cache.pool())?
+                            .context("scoring needs every layer")
                     });
                 if let Err(stall) = turn.check() {
                     let error = anyhow::Error::from(stall);
@@ -1229,8 +1226,7 @@ pub(crate) fn schedule<'a, B: Backend<'a>>(engine: &B, snapshot: &std::path::Pat
                         .is_some_and(|step| step.decode);
                     let units = crate::shared::prefill_pipeline::PrefillUnitObserver::begin();
                     let logits = if decode {
-                        engine.verify_device_ungraphed(&mut [(&mut p.placement, chunk)], false,
-                            UngraphedKind::Scoring, cache.pool())?
+                        engine.score_device(&mut [(&mut p.placement, chunk)], cache.pool())?
                     } else { engine.prefill_device(&mut p.placement, chunk, 1, cache.pool())? };
                     let units = (!decode).then(|| units.finish().unwrap_or(1));
                     if end == p.tokens.len() {
@@ -1533,14 +1529,13 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
         crate::shared::draft::copy::trace_window(&a.history, p.len() + crate::shared::draft::copy::COPY_EXTENSION))
         .collect::<Vec<_>>());
     // Cut each proposal to its plan, extend agreeing ones with a history copy, fit the row budget.
-    let diagnostic = active.iter().any(|a| a.job.probe.is_some());
     let neural_lengths = match shared.as_mut() {
         Some(policy) => {
             let mut shaped: Vec<_> = active.iter().zip(proposals.iter_mut()).map(|(a, tokens)| Proposal {
                 id: a.ticket.id(), tokens, head: engine.draft_head(&a.draft), history: &a.history,
                 greedy: a.job.sampling.is_greedy() }).collect();
             policy.shape_with_padding(&mut shaped, geometry.decode_rows, |rows|
-                engine.verify_explore_bucket(rows, diagnostic))
+                engine.verify_explore_bucket(rows))
         }
         None => vec![0; active.len()],
     };
@@ -1570,11 +1565,10 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
         .map(|(a, s)| (&mut a.placement, s.as_slice())).collect();
     lane.steps += 1;
     let timer = Instant::now();
-    let step = if diagnostic {
-        engine.verify_device_ungraphed(&mut rows, spec, UngraphedKind::Decode, cache.pool())
-    } else {
-        engine.verify_device(&mut rows, spec, cache.pool())
-    }.and_then(|logits| logits.context("decode needs every layer"))
+    // Probed and unprobed rows share this one served (graphed) step: a probe
+    // only reads its rows' logits back after the step, on the step's stream.
+    let step = engine.verify_device(&mut rows, spec, cache.pool())
+        .and_then(|logits| logits.context("decode needs every layer"))
         .and_then(|logits| {
             // Each row draws at the position after it, masked along its sequence's drafts.
             let mut batch = SelectBatch::default();
@@ -1585,7 +1579,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             Ok((selector.select(&logits, &batch)?, logits))
         });
     let elapsed = timer.elapsed().as_secs_f64();
-    lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic), spec, 1e3 * elapsed);
+    lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec), spec, 1e3 * elapsed);
     lane.verify_s += elapsed;
     let (selected, logits) = match step {
         Ok(step) => step,
@@ -1702,7 +1696,7 @@ async fn decode_round<'a, B: Backend<'a>>(lease: LaneLease<'_>, engine: &B, geom
             .map(|(&start, rows)| (1..=rows.len()).map(|offset| start + offset).collect()).collect();
         trace.cycle(crate::shared::speculation_trace::record! {rows: tokens.len(), seqs: sequences.len(),
             attention: engine.verify_attention_trace(&contexts,
-                engine.verify_bucket_rows(tokens.len(), spec, diagnostic)),
+                engine.verify_bucket_rows(tokens.len(), spec)),
             contexts: contexts,
             ids: active.iter().map(|a| a.id).collect::<Vec<_>>(),
             depths: sequences.iter().map(|s| s.len() - 1).collect::<Vec<_>>(),
@@ -2026,7 +2020,7 @@ mod loop_abort_tests {
 
     /// A reversible byte tokenizer (ids 0..=255), so `emit` can detokenise
     /// synthetic id streams without a model snapshot.
-    fn byte_tokenizer() -> tempfile::TempDir {
+    pub(super) fn byte_tokenizer() -> tempfile::TempDir {
         let mut extra = 256u32;
         let mut vocab = serde_json::Map::new();
         for byte in 0..=255u32 {
@@ -2153,5 +2147,215 @@ mod loop_abort_tests {
                 assert_eq!(*finish_reason, InferenceFinishReason::Length),
             other => panic!("last chunk is not Finish: {other:?}"),
         }
+    }
+}
+
+/// #2898: a probed request decodes on the served (graphed) step, batched with
+/// unprobed requests, and records exactly the rows that step produced.
+#[cfg(test)]
+mod probed_decode_tests {
+    use super::*;
+    use crate::shared::memory::device::{Allocation, Device, Stream};
+    use cuteafd_api::openai::probe::{Probe, ProbeSpec};
+    use cuteafd_core::memory_layout::Tag;
+    use cuteafd_engine::prefix::{BoxError, FamilyLayout, MarkSlot, MarkStore, PageOwners, PrefixConfig,
+        ReuseRule, TailCopy};
+    use cuteafd_ffi::{native_library_lifetime_fixture::Fixture, CuteafdDeviceBuffer};
+    use cuteafd_hostcache::copy::DeviceRange;
+    use std::{cell::Cell, sync::Arc};
+
+    const VOCAB: usize = 8;
+
+    #[derive(Clone, Default)]
+    struct Placed { len: usize, slot: i32 }
+    impl Placement for Placed {
+        fn len(&self) -> usize { self.len }
+        fn set_len(&mut self, len: usize) { self.len = len; }
+        fn units(&self) -> &[u32] { &[0] }
+        fn slot(&self) -> i32 { self.slot }
+        fn spans(&self) -> &[cuteafd_core::MediaSpan] { &[] }
+    }
+
+    #[derive(Default)]
+    struct Draft;
+    impl DraftState for Draft {
+        fn pending_rows(&self) -> usize { 0 }
+        fn close(&mut self, _: u32) {}
+    }
+
+    struct Family;
+    impl PrefixFamily for Family {
+        type Placement = Placed;
+        fn layout(&self) -> FamilyLayout {
+            FamilyLayout { page_rows: 64, pages: 4, page_bytes: 64, mark_bytes: 0, draft_bytes: 0,
+                rule: ReuseRule::EXACT, mark_store: MarkStore::Arena, page_owners: PageOwners::Uniform }
+        }
+        fn pages<'p>(&self, _: &'p Placed) -> &'p [u32] { &[] }
+        fn commit_point(&self, placement: &Placed) -> usize { placement.len }
+        fn capture(&self, _: MarkSlot, _: &Placed, _: usize) -> Result<(), BoxError> { Ok(()) }
+        fn restore(&self, _: Option<MarkSlot>, _: &mut Placed, _: usize) -> Result<(), BoxError> { Ok(()) }
+        fn copy_rows(&self, _: TailCopy) -> Result<(), BoxError> { Ok(()) }
+        fn drain(&self) -> Result<(), BoxError> { Ok(()) }
+        fn page_segments(&self, _: u32) -> Vec<DeviceRange> { Vec::new() }
+        fn mark_segments(&self, _: MarkSlot) -> Vec<DeviceRange> { Vec::new() }
+    }
+
+    /// Writes each step's logits (a function of the row's slot and position)
+    /// into one head buffer, as a captured decode graph's head does, and counts
+    /// which step entry point the scheduler used.
+    struct Engine<'a> {
+        library: &'a NativeLibrary,
+        head: CuteafdDeviceBuffer,
+        stream: *mut std::ffi::c_void,
+        profile: RefCell<[f64; 2]>,
+        served: Cell<usize>,
+        eager: Cell<usize>,
+    }
+
+    /// Row logits: greedy argmax `(slot + position) % VOCAB`, every row distinct.
+    fn row(slot: i32, position: usize) -> Vec<f32> {
+        let top = (slot as usize + position) % VOCAB;
+        (0..VOCAB).map(|i| if i == top { 10.0 } else { (slot as usize * 31 + position * 7 + i) as f32 * 1e-3 }).collect()
+    }
+
+    impl<'a> Engine<'a> {
+        fn step(&self, sequences: &mut [(&mut Placed, &[u32])]) -> Result<Option<DeviceLogits>> {
+            let bytes: Vec<u8> = sequences.iter().flat_map(|(p, tokens)| (0..tokens.len())
+                .flat_map(|j| row(p.slot, p.len + j + 1))).flat_map(f32::to_le_bytes).collect();
+            let rows = bytes.len() / (4 * VOCAB);
+            self.library.copy_h2d(self.head, &bytes)?;
+            Ok(Some(DeviceLogits { ptr: self.head.ptr, rows, vocab: VOCAB, stride: VOCAB, stream: self.stream,
+                greedy: None }))
+        }
+    }
+
+    impl<'a> Backend<'a> for Engine<'a> {
+        type Placement = Placed;
+        type Draft = Draft;
+        type History = ();
+        type Coordinates = ();
+        type Encoder = crate::shared::qwen::Encoder;
+        type Meta = ();
+        type Prefix = Family;
+        fn geometry(&self) -> Geometry {
+            Geometry { family: "fixture", vocab_size: VOCAB, max_context: 256, slots: 4, prefill_rows: 64, decode_rows: 4 }
+        }
+        fn library(&self) -> &'a NativeLibrary { self.library }
+        fn profile(&self) -> &RefCell<[f64; 2]> { &self.profile }
+        fn prefix_cache(&self, _: &PrefixArgs, _: usize) -> Result<(Family, PrefixCache<CudaCopyEngine<'a>, ()>)> {
+            unreachable!()
+        }
+        fn prepare(&self, _: NativeRequest, _: Vec<u32>) -> Result<(Prompt, RequestMedia, Vec<EncodeJob>)> { unreachable!() }
+        fn probe_features(&self, _: &Prompt, _: &mut RequestMedia, _: &mut cuteafd_engine::media::EmbeddingCache,
+            _: &Path) -> Result<()> { unreachable!() }
+        fn coordinates(&self, _: &[u32], _: &NativeRequest, _: &RequestMedia) -> Result<()> { Ok(()) }
+        fn placement(&self, _: Vec<u32>, slot: i32) -> Placed { Placed { len: 0, slot } }
+        fn bind_request(&self, _: &mut Placed, _: (), _: RequestMedia, _: &[u32], _: usize) -> Result<()> { Ok(()) }
+        fn history(&self, _: &Placed) {}
+        fn require_live(&self) -> Result<()> { Ok(()) }
+        fn log_table_stats(&self, _: &str) {}
+        fn prefill_device(&self, _: &mut Placed, _: &[u32], _: usize, _: &cuteafd_engine::prefix::RefPagePool)
+            -> Result<Option<DeviceLogits>> { unreachable!() }
+        fn verify_device(&self, sequences: &mut [(&mut Placed, &[u32])], _: bool,
+            _: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
+            self.served.set(self.served.get() + 1);
+            self.step(sequences)
+        }
+        fn score_device(&self, sequences: &mut [(&mut Placed, &[u32])], _: &cuteafd_engine::prefix::RefPagePool)
+            -> Result<Option<DeviceLogits>> {
+            self.eager.set(self.eager.get() + 1);
+            self.step(sequences)
+        }
+        fn verify_bucket_rows(&self, rows: usize, _: bool) -> usize { rows }
+        fn verify_attention_trace(&self, _: &[Vec<usize>], _: usize) -> crate::shared::speculation_trace::Deferred {
+            crate::shared::speculation_trace::Deferred::new(|| serde_json::Value::Null)
+        }
+        fn prefill_draft(&self, _: &Placed, _: usize, _: &[u32], _: Option<u32>, _: &mut Draft) -> Result<()> { Ok(()) }
+        fn draft(&self, sequences: &mut [DraftSeq<'_, Placed, Draft>], _: &mut DraftTiming, _: &mut TokenSelector<'_>)
+            -> Result<Vec<Vec<u32>>> { Ok(vec![Vec::new(); sequences.len()]) }
+        fn accept(&self, _: &mut [Verified<'_, Placed, Draft, ()>], _: bool) -> Result<()> { Ok(()) }
+    }
+
+    fn request(dir: &tempfile::TempDir, slot: i32, probe: Option<Arc<Probe>>)
+        -> (Active<'static, Placed, Draft>, mpsc::UnboundedReceiver<Result<InferenceChunk, NativeFailure>>) {
+        let (events, receive) = mpsc::unbounded_channel();
+        let job = NativeRequest { image_groups: Vec::new(), prefix_cache_source: Default::default(),
+            finish_detail: Default::default(), literal_spans: Vec::new(), prompt: String::new(), constraint: None,
+            images: Vec::new(), media: Vec::new(), audio: Vec::new(), max_tokens: 64, sampling: Default::default(),
+            stop_token_ids: Vec::new(), events, usage: None, probe };
+        let loop_abort = crate::shared::loop_abort::LoopAbortConfig { run: 0, copies: 8, fast_span: 0, fast_copies: 8 }
+            .guard(job.finish_detail.clone(), 1);
+        let lease = cuteafd_engine::reserve::KvReserve::new(
+            cuteafd_engine::reserve::ReserveConfig::new(16_384, 0, -1, 1_000_000).unwrap(), 1)
+            .lease(0, 64, 1, usize::MAX).unwrap();
+        (Active { job, history: vec![1; 4], keyed_history: vec![1; 4], constraint: None,
+            placement: Placed { len: 4, slot }, draft: Draft, proposed: 0, accepted: 0, cycles: 0, turn: None,
+            capacity: 256, lease, next: 1,
+            decoder: cuteafd_loader::streaming_token_decoder(dir.path(), false).unwrap(),
+            generated: 0, buffered: 0, started: Instant::now(), id: slot as u64,
+            ticket: console::Ticket::new(slot as u64, 0, None), loop_abort, looped: false }, receive)
+    }
+
+    #[test]
+    fn probed_decode_selects_the_served_step_and_records_its_rows() -> Result<()> {
+        let fixture = Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let device = Device { library: &library, id: 0 };
+        let stream = Stream::new(device)?;
+        let head = Allocation::new(device, 4 * VOCAB * 4, Tag::workspace("test/head"))?;
+        let engine = Engine { library: &library, head: head.buffer, stream: stream.raw,
+            profile: RefCell::new([0.0; 2]), served: Cell::new(0), eager: Cell::new(0) };
+        let dir = super::loop_abort_tests::byte_tokenizer();
+        let geometry = engine.geometry();
+        let mut cache = PrefixCache::<CudaCopyEngine<'_>>::new(Family.layout(), PrefixConfig {
+            entries: 0, mark_slots: 0, keep_logits: false, min_tokens: 0 }, None)?;
+        let mut selector = TokenSelector::new(&library, SelectPlacement::Host, VOCAB, 4)?;
+        let steps = 3;
+        // Solo unprobed, then probed batched with two unprobed peers, then solo probed.
+        let mut records = Vec::new();
+        let mut generated = Vec::new();
+        for (probed, slots) in [(None, &[0, 1, 2][..]), (Some(1), &[0, 1, 2][..]), (Some(0), &[1][..])] {
+            let probe = Probe::new(ProbeSpec { record_rows: steps, top_k: 2, ..ProbeSpec::default() });
+            let mut receivers = Vec::new();
+            let mut active = slots.iter().enumerate().map(|(i, &slot)| {
+                let (active, receive) = request(&dir, slot, (probed == Some(i)).then(|| probe.clone()));
+                receivers.push(receive);
+                active
+            }).collect::<Vec<_>>();
+            let (served, eager) = (engine.served.get(), engine.eager.get());
+            let lanes = crate::shared::serve::lanes::LaneSet::default();
+            let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+            let mut lane = DecodeLane { steps: 0, verify_s: 0.0, timing: DraftTiming::default(),
+                stats: VerifyStats::new(geometry.decode_rows) };
+            let (mut policy, mut free, mut trace) = (None, Vec::new(), None);
+            for _ in 0..steps {
+                let finished = runtime.block_on(lanes.run_one(|lease| decode_round(lease, &engine, &geometry,
+                    Drafts::None, &mut lane, &mut active, &mut policy, &mut selector,
+                    &mut cache, &Family, &mut free, &mut trace, Instant::now())))?
+                    .context("decode round failed")?;
+                assert!(finished.iter().all(|&done| !done));
+            }
+            assert_eq!(engine.served.get() - served, steps, "every round is one served step");
+            assert_eq!(engine.eager.get(), eager, "a probe never routes decode to the eager path");
+            generated.push(active.iter().map(|a| (a.placement.slot, a.history[4..].to_vec())).collect::<Vec<_>>());
+            if probed.is_some() { records.push((slots[probed.unwrap()], probe.record())); }
+        }
+        // Probing changes no request's tokens: probed and unprobed batches agree slot for slot.
+        assert_eq!(generated[0], generated[1]);
+        assert_eq!(generated[2][0], generated[0][1]);
+        for (slot, record) in records {
+            assert_eq!(record.rows.len(), steps);
+            for (k, recorded) in record.rows.iter().enumerate() {
+                // The recorded row is the one the served step wrote for this request
+                // (positions 5.. after a 4-token prompt), hashed exactly as the
+                // probe hashes host rows: what the eager path would have recorded.
+                let expected = cuteafd_api::openai::probe::summarize(4 + k, &row(slot, 4 + k + 1), 2, &[]);
+                assert_eq!((recorded.position, &recorded.hash, recorded.argmax),
+                    (expected.position, &expected.hash, expected.argmax));
+            }
+        }
+        Ok(())
     }
 }

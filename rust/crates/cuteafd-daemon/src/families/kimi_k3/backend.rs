@@ -200,17 +200,13 @@ impl<'e, 'a> Backend<'a> for KimiBackend<'e, 'a> {
         let rows = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         self.engine.step_device(sequences, pool, rows, true).map(Some)
     }
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        self.engine.usage_phase(match kind {
-            scheduler::UngraphedKind::Scoring => cuteafd_ffi::expert_usage::UsagePhase::Prefill,
-            scheduler::UngraphedKind::Decode => cuteafd_ffi::expert_usage::UsagePhase::Decode,
-        });
-        if speculative { return self.engine.verify_device(sequences, pool, false).map(Some); }
+    fn score_device(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool)
+        -> Result<Option<DeviceLogits>> {
+        self.engine.usage_phase(cuteafd_ffi::expert_usage::UsagePhase::Prefill);
         let rows = sequences.iter().map(|(_, tokens)| tokens.len()).sum();
         self.engine.step_device(sequences, pool, rows, false).map(Some)
     }
-    fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
+    fn verify_bucket_rows(&self, rows: usize, _speculative: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         let contexts = contexts.to_vec();
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"kimi_owned_mla_tp2_kda", "rows":rows, "contexts":contexts}))

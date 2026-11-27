@@ -636,17 +636,8 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
         self.decode(sequences, speculative, pool)
     }
 
-    fn verify_device_ungraphed(
-        &self,
-        sequences: &mut [(&mut Placement, &[u32])],
-        speculative: bool,
-        kind: scheduler::UngraphedKind,
-        pool: &RefPagePool,
-    ) -> Result<Option<DeviceLogits>> {
-        if kind == scheduler::UngraphedKind::Decode {
-            return self.decode(sequences, speculative, pool);
-        }
-        ensure!(!speculative, "Mini scoring replay cannot speculate");
+    fn score_device(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool)
+        -> Result<Option<DeviceLogits>> {
         let logits = self.decode(sequences, false, pool)?;
         let mut drafts = (0..sequences.len()).map(|_| Draft::default()).collect::<Vec<_>>();
         let mut verified = sequences
@@ -672,7 +663,7 @@ impl<'a> Backend<'a> for MiniBackend<'a> {
         Ok(logits)
     }
 
-    fn verify_bucket_rows(&self, rows: usize, _: bool, _: bool) -> usize {
+    fn verify_bucket_rows(&self, rows: usize, _: bool) -> usize {
         rows
     }
     fn verify_attention_trace(&self, _: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {

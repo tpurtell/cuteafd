@@ -2108,7 +2108,7 @@ def test_dense_qwen_diagnostic_verify_bypasses_capture_and_replay():
     graph = (root / "graphs.rs").read_text()
     serve = (root / "serve.rs").read_text()
     golden = (root / "mod.rs").read_text()
-    diagnostic = serve.split("    fn verify_device_ungraphed(", 1)[1].split("    fn verify_bucket_rows(", 1)[0]
+    diagnostic = serve.split("    fn score_device(", 1)[1].split("    fn verify_bucket_rows(", 1)[0]
     assert diagnostic.index("let _bypass = self.engine.borrow().bypass_graphs()") < diagnostic.index("self.verify_device(")
     assert "impl Drop for GraphBypass" in graph
     assert "self.ready.set(self.previous)" in graph
@@ -2116,8 +2116,7 @@ def test_dense_qwen_diagnostic_verify_bypasses_capture_and_replay():
     assert "diagnostic_bypass_restores_on_error_nested_calls_and_unwind" in graph
     assert "if !self.graphs.enabled || !self.graphs.capture_ready.get() { return segment(); }" in graph
     assert "ensure!(counters() == before" in serve
-    assert "(true, scheduler::UngraphedKind::Decode)" in serve
-    assert "(false, scheduler::UngraphedKind::Scoring)" in serve
+    assert "self.score_device(&mut [(&mut placement, &tokens[..2])], &pool)?" in serve
     assert "check_diagnostic_graph_bypass(&tokens)?" in golden
 
 
