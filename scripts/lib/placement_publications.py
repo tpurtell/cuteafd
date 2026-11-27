@@ -1,9 +1,10 @@
 """Placement-input publications: a checkout's inputs fingerprint and the publication that matches it.
 
 The Rust consumers (cuteafd_loader::plan::inputs) accept a publication only when
-its recorded sparkinfer_revision, source_tree_sha256 and engine_sources_sha256
-equal what the checkout computes. Those three values are the publication's
-inputs key. This module computes a checkout's key with that checkout's own
+its recorded sparkinfer_revision, source_tree_sha256, engine_sources_sha256 (the
+compiled tier) and selection_sources_sha256 (what installed tests select and
+admit; absent in publications made before the two tiers) equal what the
+checkout computes. Those values are the publication's inputs key. This module computes a checkout's key with that checkout's own
 exporter code, and finds a publication in a store that records the same key,
 so a gate validates against exactly the compiled facts of its own checkout.
 """
@@ -17,14 +18,15 @@ from pathlib import Path
 import stat
 
 STORES = {'all': 'placement-inputs', 'v4': 'v4-placement-inputs'}
-FINGERPRINT = ('sparkinfer_revision', 'source_tree_sha256', 'engine_sources_sha256')
+FINGERPRINT = ('sparkinfer_revision', 'source_tree_sha256', 'engine_sources_sha256', 'selection_sources_sha256')
+COMPILED = FINGERPRINT[:3]
 # The fingerprint fields precede "exports" (KB into a ~100 MB INPUTS.json).
 HEAD_BYTES = 1 << 20
 
 
 def inputs_key(fingerprint):
     """Canonical digest of a fingerprint; equal keys mean equal fingerprints."""
-    canonical = json.dumps({key: fingerprint[key] for key in FINGERPRINT}, sort_keys=True, separators=(',', ':'))
+    canonical = json.dumps({key: fingerprint.get(key) for key in FINGERPRINT}, sort_keys=True, separators=(',', ':'))
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
@@ -32,8 +34,9 @@ def checkout_fingerprints(root):
     """{'all': ..., 'v4': ...} computed by the checkout's own exporter source hashing.
 
     Runs the checkout's scripts/build/export-placement-inputs.py source_hashes()
-    and compare-sm-exports.py v4_placement_sources(), the functions the Rust
-    validator mirrors, against root. Standard library only; no CUDA, no fork import.
+    (and, for checkouts before the two tiers, compare-sm-exports.py
+    v4_placement_sources()), the functions the Rust validator mirrors, against
+    root. Standard library only; no CUDA, no fork import.
     """
     root = Path(root).resolve()
     previous = os.environ.get('CUTEAFD_SOURCE_ROOT')
@@ -47,6 +50,8 @@ def checkout_fingerprints(root):
             raise ValueError(f'exporter resolved a different checkout than {root}')
         lock = json.loads((root / 'third_party/sparkinfer.lock.json').read_text())
         pin = {'sparkinfer_revision': lock['revision'], 'source_tree_sha256': lock['source_tree_sha256']}
+        if hasattr(publisher, 'compiled_hashes'):
+            return {kind: {**pin, **publisher.source_hashes(kind)} for kind in STORES}
         return {'all': {**pin, 'engine_sources_sha256': publisher.source_hashes()},
                 'v4': {**pin, 'engine_sources_sha256': publisher.compare.v4_placement_sources()}}
     finally:
@@ -69,9 +74,9 @@ def recorded_fingerprint(publication):
         data = json.loads(head[:cut].rstrip().rstrip(',') + '\n}') if cut > 0 else json.loads(head)
     except ValueError:
         return None
-    if not isinstance(data, dict) or not all(key in data for key in FINGERPRINT):
+    if not isinstance(data, dict) or not all(key in data for key in COMPILED):
         return None
-    return {key: data[key] for key in ('engine_commit', *FINGERPRINT)}
+    return {'engine_commit': data.get('engine_commit'), **{key: data.get(key) for key in FINGERPRINT}}
 
 
 def publications(store):
@@ -119,6 +124,29 @@ def differing(expected, recorded):
     """Fingerprint fields and source paths that differ, for refusal messages."""
     if recorded is None:
         return ['unreadable INPUTS.json']
-    fields = [key for key in FINGERPRINT[:2] if expected[key] != recorded.get(key)]
-    sources, theirs = expected['engine_sources_sha256'], recorded.get('engine_sources_sha256') or {}
-    return fields + sorted(path for path in sources.keys() | theirs.keys() if sources.get(path) != theirs.get(path))
+    fields = [key for key in FINGERPRINT[:2] if expected.get(key) != recorded.get(key)]
+    paths = []
+    for tier in FINGERPRINT[2:]:
+        ours, theirs = expected.get(tier) or {}, recorded.get(tier) or {}
+        if expected.get(tier) is None or recorded.get(tier) is None:
+            if expected.get(tier) != recorded.get(tier):
+                fields.append(tier)
+            continue
+        paths += sorted(path for path in ours.keys() | theirs.keys() if ours.get(path) != theirs.get(path))
+    return fields + paths
+
+
+def compiled_matches(expected, recorded):
+    """Only the selection tier differs: a re-attested publication suffices (no compile)."""
+    return recorded is not None and all(expected.get(key) == recorded.get(key) for key in COMPILED)
+
+
+def resolve_compiled(store, fingerprint):
+    """A publication whose compiled tier matches (a --reattest-from source), preferring current."""
+    store = Path(store)
+    current = store / 'current'
+    candidates = [Path(os.path.realpath(current))] if current.is_symlink() else []
+    for path in [*candidates, *publications(store)]:
+        if compiled_matches(fingerprint, recorded_fingerprint(path)):
+            return path
+    return None

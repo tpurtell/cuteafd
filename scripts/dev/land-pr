@@ -52,7 +52,7 @@ BUILDS = Path.home() / '.cache/cuteafd/builds'
 STORES = {'all': 'placement-inputs', 'v4': 'v4-placement-inputs'}
 SHA = re.compile(r'[0-9a-f]{40}\Z')
 HEX = re.compile(r'[0-9a-f]{64}\Z')
-FINGERPRINT = ('sparkinfer_revision', 'source_tree_sha256', 'engine_sources_sha256')
+FINGERPRINT = ('sparkinfer_revision', 'source_tree_sha256', 'engine_sources_sha256', 'selection_sources_sha256')
 
 # Executed with python3 on every host (locally too), reading arguments from argv
 # and printing one JSON object. Keep it standard-library only.
@@ -311,12 +311,14 @@ def plan(args, local, fingerprints=head_fingerprints, view=pr_view):
             metadata = read_inputs(store / name)
             target = Target(kind, name, sha256(store / name / 'INPUTS.json'), named=False)
         recorded = {key: metadata.get(key) for key in FINGERPRINT}
-        if recorded != expected[kind]:
-            differing = sorted(key for key in expected[kind]['engine_sources_sha256'].keys()
-                               | (recorded['engine_sources_sha256'] or {}).keys()
-                               if expected[kind]['engine_sources_sha256'].get(key)
-                               != (recorded['engine_sources_sha256'] or {}).get(key))
-            pin = [key for key in FINGERPRINT[:2] if recorded[key] != expected[kind][key]]
+        wanted = {key: expected[kind].get(key) for key in FINGERPRINT}
+        if recorded != wanted:
+            differing = []
+            for tier in FINGERPRINT[2:]:
+                ours, theirs = wanted[tier] or {}, recorded[tier] or {}
+                differing += ([tier] if wanted[tier] is None or recorded[tier] is None else
+                              sorted(key for key in ours.keys() | theirs.keys() if ours.get(key) != theirs.get(key)))
+            pin = [key for key in FINGERPRINT[:2] if recorded[key] != wanted[key]]
             which = 'named publication' if given else f'current ({name[:12]})'
             raise Refused(f'{head[:12]} changes {STORES[kind]} inputs vs the {which}: '
                           f'{", ".join(pin + differing[:8]) or "fingerprint"}'

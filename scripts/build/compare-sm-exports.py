@@ -1271,16 +1271,6 @@ def parse_sms(value):
     return sms
 
 
-def v4_placement_sources():
-    # Keep this set identical to plan::testing::v4_placement_source_hashes.
-    paths = {ROOT / "scripts/build/compare-sm-exports.py", ROOT / "scripts/build/kernel-records.py",
-             ROOT / "scripts/build/export-placement-inputs.py"}
-    for directory in ("python/tools/aot", "python/tools/lib"):
-        paths.update((ROOT / directory).rglob("*.py"))
-    paths.update((ROOT / "scripts/build").glob("*.json"))
-    return {str(path.relative_to(ROOT)): sha(path.read_bytes()) for path in sorted(paths)}
-
-
 def v4_export_jobs():
     """V4 case exports. Spark worlds charge native expert-wave segment programs
     from the case manifest, so the exported program set carries the dsv4f/dsv4p
@@ -1310,7 +1300,8 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
         path.mkdir(parents=True, exist_ok=True)
     engine = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
     lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
-    sources = v4_placement_sources()
+    publisher.require_job_specs()
+    sources = publisher.source_hashes("v4")
     exports = v4_export_jobs()
 
     if backend_cache:
@@ -1322,15 +1313,15 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         summaries = list(pool.map(compile_one, exports))
-    if sources != v4_placement_sources() or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
+    if sources != publisher.source_hashes("v4") or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
         raise ValueError("V4 export sources changed during compilation")
     for summary in summaries:
         if (summary.get("sparkinfer_revision") != lock["revision"]
                 or summary.get("source_tree_sha256") != lock["source_tree_sha256"]
                 or summary.get("cuda_initialized") is not False):
             raise ValueError("V4 worker provenance differs from captured source lock or initialized CUDA")
-    publisher = load_file("v4_publication_records", ROOT / "scripts/build/export-placement-inputs.py")
     records = publisher.publication_records(staging, [(name, exporter, extra) for name, exporter, extra in exports])
+    publisher.require_reads_hashed(summaries, records, sources["engine_sources_sha256"])
     for context in (131072, 1048576):
         for model in ("flash", "pro"):
             for rtx in (1, 2):
@@ -1348,7 +1339,7 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
     files = {str(path.relative_to(destination)): sha(path.read_bytes())
              for path in sorted(destination.rglob("*.json"))}
     provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],
-                      source_tree_sha256=lock["source_tree_sha256"], engine_sources_sha256=sources,
+                      source_tree_sha256=lock["source_tree_sha256"], **sources,
                       exports=summaries, files=files, program_records=records)
     (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
     sm_report = publisher.kernel_records.change_report({}, records)

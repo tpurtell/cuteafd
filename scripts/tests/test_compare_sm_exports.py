@@ -1727,13 +1727,21 @@ def test_v4_placement_publication_preserves_compiler_metadata_and_provenance(tmp
     monkeypatch.setattr(compare_sm.subprocess, 'run', compile_export)
     monkeypatch.setattr(compare_sm.subprocess, 'check_output', lambda *a, **kw: 'a' * 40)
     target = tmp_path / 'published'
-    if mismatch == 'sources':
-        real_sources = compare_sm.v4_placement_sources
-        captures = []
-        def changing_sources():
-            captures.append(True)
-            return real_sources() if len(captures) == 1 else {}
-        monkeypatch.setattr(compare_sm, 'v4_placement_sources', changing_sources)
+    loader = compare_sm.load_file
+    publishers = []
+    def load_publisher(name, path):
+        module = loader(name, path)
+        if name == 'v4_publication_records':
+            publishers.append(module)
+            if mismatch == 'sources':
+                real_sources = module.source_hashes
+                captures = []
+                def changing_sources(kind='all', root=module.ROOT):
+                    captures.append(True)
+                    return real_sources(kind, root) if len(captures) == 1 else {}
+                module.source_hashes = changing_sources
+        return module
+    monkeypatch.setattr(compare_sm, 'load_file', load_publisher)
     if mismatch:
         with pytest.raises(ValueError, match='worker provenance' if mismatch == 'worker' else 'sources changed'):
             compare_sm.v4_placement_inputs(target, tmp_path / 'staging', 1, 1)
@@ -1742,7 +1750,9 @@ def test_v4_placement_publication_preserves_compiler_metadata_and_provenance(tmp
     compare_sm.v4_placement_inputs(target, tmp_path / 'staging', 1, 1)
     provenance = json.loads((target / 'INPUTS.json').read_text())
     assert provenance['engine_commit'] == 'a' * 40
-    assert provenance['engine_sources_sha256'] == compare_sm.v4_placement_sources()
+    expected = publishers[0].source_hashes('v4')
+    assert provenance['engine_sources_sha256'] == expected['engine_sources_sha256']
+    assert provenance['selection_sources_sha256'] == expected['selection_sources_sha256'] == {}
     lock = json.loads((ROOT / 'third_party/sparkinfer.lock.json').read_text())
     assert provenance['sparkinfer_revision'] == lock['revision']
     assert provenance['source_tree_sha256'] == lock['source_tree_sha256']
@@ -1808,12 +1818,13 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
             (output / 'dsv4_programs.json').write_text('{"compiler":true}')
     monkeypatch.setattr(publisher.subprocess, 'run', compile_export)
     monkeypatch.setattr(publisher.subprocess, 'check_output', lambda *a, **kw: 'a' * 40)
+    monkeypatch.setattr(publisher, 'require_job_specs', lambda: None)  # synthetic job list
     if mismatch == 'sources':
         original = publisher.source_hashes
         captures = []
-        def changed():
+        def changed(kind='all'):
             captures.append(True)
-            return original() if len(captures) == 1 else {}
+            return original(kind) if len(captures) == 1 else {}
         monkeypatch.setattr(publisher, 'source_hashes', changed)
     target, staging = tmp_path / 'published', tmp_path / 'staging'
     if mismatch:
@@ -1824,7 +1835,9 @@ def test_all_family_placement_publication_preserves_compiler_metadata(tmp_path, 
     publisher.publish(target, staging, 1, 1)
     metadata = json.loads((target / 'INPUTS.json').read_text())
     assert metadata['engine_commit'] == 'a' * 40
-    assert metadata['engine_sources_sha256'] == publisher.source_hashes()
+    expected = publisher.source_hashes('all')
+    assert metadata['engine_sources_sha256'] == expected['engine_sources_sha256']
+    assert metadata['selection_sources_sha256'] == expected['selection_sources_sha256']
     assert len(calls) == len(metadata['exports']) == len(jobs)
     for name, (source, installed) in publisher.V41_MANIFESTS.items():
         assert (target / 'share' / installed).read_bytes() == (staging / name / source).read_bytes()
@@ -1961,35 +1974,50 @@ def test_native_placement_rejects_invalid_capacity_recipe(tmp_path, recipe):
     assert publisher.fp8_capacities(tmp_path) == '1,16,80,256,1024,4096'
 
 
-def test_placement_fingerprints_only_live_config_contents(tmp_path, monkeypatch):
+def test_placement_fingerprint_tiers_compiled_vs_selection(tmp_path, monkeypatch):
+    """#2835 (wip_aot_scopes.py) and #2880 (example configs) change only the selection tier;
+    an exporter or capacity recipe changes the compiled tier."""
     publisher = compare_sm.load_file('test_live_placement_hashes', ROOT / 'scripts/build/export-placement-inputs.py')
-    for relative in ('scripts/build/export-placement-inputs.py', 'scripts/build/release-scope.py',
-                     'scripts/build/kernel-records.py', 'scripts/lib/wip_aot_scopes.py', 'examples/configs/live.config',
-                     'examples/configs/retired.config', 'benchmarks/current-matrix.json',
-                     'native/cmake/shared/fp8_moe.cmake',
-                     'rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json'):
+    sources = {'schema': 1, 'compiled': {'all': ['python/tools/aot/export.py', 'native/cmake/shared/fp8_moe.cmake'],
+                                         'v4': ['python/tools/aot/export.py']},
+               'selection': {'all': {'files': ['scripts/lib/wip_aot_scopes.py',
+                                               'rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json'],
+                                     'live_configs': True}, 'v4': {'files': [], 'live_configs': False}}}
+    for relative in ('python/tools/aot/export.py', 'native/cmake/shared/fp8_moe.cmake', 'scripts/lib/wip_aot_scopes.py',
+                     'rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json', 'scripts/build/placement-jobs.json',
+                     'examples/configs/live.config', 'examples/configs/retired.config'):
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('original')
+    (tmp_path / 'scripts/build/placement-sources.json').write_text(json.dumps(sources))
     matrix = tmp_path / 'benchmarks/current-matrix.json'
+    matrix.parent.mkdir()
     retired = [{'config': 'examples/configs/retired.config'}]
     matrix.write_text(json.dumps({'retired': retired, 'cells': [{'report': 'old'}]}))
-    monkeypatch.setattr(publisher, 'ROOT', tmp_path)
-    monkeypatch.setattr(publisher.compare, 'v4_placement_sources', lambda: {})
-    before = publisher.source_hashes()
-    assert 'examples/configs/retired.config' not in before
-    (tmp_path / 'examples/configs/retired.config').write_text('retired edit')
+    before = {kind: publisher.source_hashes(kind, tmp_path) for kind in ('all', 'v4')}
+    assert 'examples/configs/retired.config' not in before['all']['selection_sources_sha256']
+
+    def tiers(kind='all'):
+        after = publisher.source_hashes(kind, tmp_path)
+        return tuple(after[tier] != before[kind][tier] for tier in ('engine_sources_sha256', 'selection_sources_sha256'))
+
+    for relative, expected in (('python/tools/aot/export.py', (True, False)),
+                               ('native/cmake/shared/fp8_moe.cmake', (True, False)),
+                               ('scripts/build/placement-jobs.json', (True, False)),
+                               ('scripts/lib/wip_aot_scopes.py', (False, True)),
+                               ('examples/configs/live.config', (False, True)),
+                               ('rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json', (False, True)),
+                               ('examples/configs/retired.config', (False, False))):
+        (tmp_path / relative).write_text('changed')
+        assert tiers() == expected, relative
+        assert tiers('v4') == ((True, False) if relative in ('python/tools/aot/export.py',
+                                                              'scripts/build/placement-jobs.json') else (False, False))
+        (tmp_path / relative).write_text('original')
     matrix.write_text(json.dumps({'retired': retired, 'cells': [{'report': 'new'}]}))
-    assert publisher.source_hashes() == before
-    recipe = tmp_path / publisher.FP8_CAPACITY_RECIPE
-    recipe.write_text('changed capacities')
-    assert publisher.source_hashes() != before
-    recipe.write_text('original')
-    (tmp_path / 'examples/configs/live.config').write_text('MODEL_REVISION=changed')
-    assert publisher.source_hashes() != before
-    (tmp_path / 'examples/configs/live.config').write_text('original')
+    assert tiers() == (False, False)
     matrix.write_text(json.dumps({'retired': [], 'cells': []}))
-    assert publisher.source_hashes()['installed_live_configs'] != before['installed_live_configs']
+    assert publisher.source_hashes('all', tmp_path)['selection_sources_sha256']['installed_live_configs'] != \
+        before['all']['selection_sources_sha256']['installed_live_configs']
 
 
 def test_placement_selection_ignores_card_publication_but_tracks_retirement(tmp_path):

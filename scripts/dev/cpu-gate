@@ -753,10 +753,14 @@ def placement_inputs(source, env, args):
             elif required[kind]:
                 current = publications.recorded_fingerprint(store / 'current')
                 differing = publications.differing(fingerprints[kind], current)
+                compiled = getattr(publications, 'resolve_compiled', lambda *a: None)(store, fingerprints[kind])
+                remedy = (f're-attest it in seconds, no compile (only the selection tier differs): '
+                          f'python3 scripts/build/export-placement-inputs.py --reattest-from {compiled} '
+                          f'--output {store}/<sha>{" --v4" if kind == "v4" else ""}'
+                          if compiled is not None else f'publish one from this commit: {EXPORT_COMMANDS[kind]}')
                 errors.append(f'no {publications.STORES[kind]} publication records this checkout\'s inputs key '
                               f'{key[:16]} (vs current: {", ".join(differing[:6])}{" ..." if len(differing) > 6 else ""}); '
-                              f'publish one from this commit: {EXPORT_COMMANDS[kind]}, '
-                              f'then rerun (or set {variable})')
+                              f'{remedy}, then rerun (or set {variable})')
         record[kind] = entry
     record['seconds'] = round(time.monotonic() - started, 3)
     return record, '; '.join(errors) or None

@@ -730,7 +730,9 @@ def test_publisher_writes_sm170_report_before_failing(tmp_path, monkeypatch):
     spec.loader.exec_module(publisher)
     job = ("programs", "export_b12x_dsv4_aot.py", [])
     monkeypatch.setattr(publisher, "export_jobs", lambda: [job])
-    monkeypatch.setattr(publisher, "source_hashes", lambda: {})
+    monkeypatch.setattr(publisher, "source_hashes", lambda kind="all": {"engine_sources_sha256": {},
+                                                                        "selection_sources_sha256": {}})
+    monkeypatch.setattr(publisher, "require_job_specs", lambda: None)
     lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
     def worker(job, staging, *args):
         directory = staging / "programs"

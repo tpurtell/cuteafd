@@ -65,16 +65,51 @@ def live_configs(root=ROOT):
                   if str(path.relative_to(root)) not in retired)
 
 
-def source_hashes():
-    # Keep identical to plan::testing::placement_input_source_hashes. Card report
-    # rewrites do not affect compilation; only the selected example inventory does.
-    paths = [ROOT / "scripts/build/export-placement-inputs.py", ROOT / "scripts/build/kernel-records.py",
-             ROOT / "scripts/build/release-scope.py", ROOT / "scripts/lib/wip_aot_scopes.py", ROOT / FP8_CAPACITY_RECIPE,
-             ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json",
-             *(ROOT / config for config in live_configs(ROOT))]
-    return {**compare.v4_placement_sources(),
-            **{str(path.relative_to(ROOT)): compare.sha(path.read_bytes()) for path in paths},
-            "installed_live_configs": compare.sha("\n".join(live_configs(ROOT)).encode())}
+SOURCES = Path("scripts/build/placement-sources.json")
+JOBS = Path("scripts/build/placement-jobs.json")
+
+
+def placement_sources(root=ROOT):
+    return json.loads((root / SOURCES).read_text())
+
+
+def hashed(root, paths):
+    return {str(path): compare.sha((root / path).read_bytes()) for path in sorted(set(map(str, paths)))}
+
+
+def compiled_hashes(kind, root=ROOT):
+    """Tier 1: files whose bytes can change compiled programs, plus the derived job specs.
+
+    placement-sources.json lists them exactly (publish refuses a recorded read
+    outside the list); placement-jobs.json is what export_jobs() derives, so a
+    config edit that selects no new job leaves this tier unchanged.
+    Keep identical to plan::inputs::compiled_source_hashes."""
+    return hashed(root, [*placement_sources(root)["compiled"][kind], SOURCES, JOBS])
+
+
+def selection_hashes(kind, root=ROOT):
+    """Tier 2: inputs that select what installed planner tests plan and admit
+    (live example configs and their model revisions, measured Spark memory)
+    without changing a compiled program. A change here needs a re-attested
+    publication (--reattest-from), not a compile.
+    Keep identical to plan::inputs::selection_source_hashes."""
+    spec = placement_sources(root)["selection"][kind]
+    files = hashed(root, spec["files"])
+    if spec["live_configs"]:
+        configs = live_configs(root)
+        files.update(hashed(root, configs))
+        files["installed_live_configs"] = compare.sha("\n".join(configs).encode())
+    return files
+
+
+def source_hashes(kind="all", root=ROOT):
+    return {"engine_sources_sha256": compiled_hashes(kind, root),
+            "selection_sources_sha256": selection_hashes(kind, root)}
+
+
+def derived_jobs():
+    """The checked-in placement-jobs.json must equal this (scripts/tests)."""
+    return {"all": [list(job) for job in export_jobs()], "v4": [list(job) for job in compare.v4_export_jobs()]}
 
 
 def export_jobs():
@@ -466,9 +501,10 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
             raise ValueError(f"output is not empty: {path}")
         path.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    sources = source_hashes()
+    sources = source_hashes("all")
     lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
     engine = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
+    require_job_specs()
     jobs = export_jobs()
 
     def compile_one(job):
@@ -483,7 +519,7 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
             summaries = [programs, *[future.result() for future in pending]]
         else:
             summaries = list(pool.map(compile_one, jobs))
-    if sources != source_hashes() or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
+    if sources != source_hashes("all") or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
         raise ValueError("placement export sources changed during compilation")
     if any(summary.get("sparkinfer_revision") != lock["revision"]
            or summary.get("source_tree_sha256") != lock["source_tree_sha256"]
@@ -524,10 +560,11 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
             (target / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     copy_replay_metadata(staging, destination, jobs)
     records = publication_records(staging, jobs)
+    require_reads_hashed(summaries, records, sources["engine_sources_sha256"])
     files = {str(path.relative_to(destination)): compare.sha(path.read_bytes())
              for path in sorted(destination.rglob("*.json"))}
     provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],
-                      source_tree_sha256=lock["source_tree_sha256"], engine_sources_sha256=sources,
+                      source_tree_sha256=lock["source_tree_sha256"], **sources,
                       exports=summaries, files=files, wall_seconds=round(time.monotonic() - started, 3))
     provenance["program_records"] = records
     (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
@@ -551,6 +588,75 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
     print(f"Published placement inputs: {destination}; {provenance['wall_seconds']} s; "
           f"{sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())} bytes; "
           f"INPUTS.json sha256 {compare.sha((destination / 'INPUTS.json').read_bytes())}", flush=True)
+
+
+def require_job_specs():
+    """The checked-in job specs (the compiled-tier fingerprint's stand-in for configs) are current."""
+    recorded = json.loads((ROOT / JOBS).read_text())
+    if recorded != derived_jobs():
+        raise ValueError(f"{JOBS} is stale: regenerate with scripts/build/export-placement-inputs.py --write-jobs")
+
+
+def unhashed_reads(summaries, records, compiled):
+    """Engine files a job actually read that the compiled tier does not hash (fork files are pinned by tree).
+
+    Every program's recorded reads count, and every job's except the scoped
+    program exporter's: its job context deliberately sweeps all of python/tools
+    as a conservative Stage-0 skip key (compare-sm-exports.py worker), not as
+    reads; each of its programs records what it actually read."""
+    reads = set()
+    for summary in summaries:
+        if summary.get("exporter") != "export_b12x_dsv4_aot.py":
+            reads.update(summary.get("source_reads_sha256", {}))
+    for record in records.values():
+        reads.update(record.get("source_reads_sha256", {}))
+    return sorted(path for path in reads if not path.startswith("third_party/") and path not in compiled)
+
+
+def require_reads_hashed(summaries, records, compiled):
+    missing = unhashed_reads(summaries, records, compiled)
+    if missing:
+        raise ValueError(f"exporters read files outside {SOURCES} compiled list: {missing}; add them")
+
+
+def reattest(destination, source, kind="all"):
+    """Publish source's compiled bytes for this checkout when only the selection tier differs.
+
+    The checkout's fork pin and compiled tier must equal what source records,
+    so every compiled byte is the one this checkout would produce; the planner
+    files are copied (reflinked) unchanged and INPUTS.json records this
+    checkout's selection tier and commit. No compile, seconds."""
+    refuse_current(destination)
+    filesystem = compare.load_file("placement_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
+    filesystem.check_path(str(destination))
+    if destination.exists() and any(destination.iterdir()):
+        raise ValueError(f"output is not empty: {destination}")
+    metadata = json.loads((source / "INPUTS.json").read_text())
+    lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
+    sources = source_hashes(kind)
+    if (metadata.get("sparkinfer_revision"), metadata.get("source_tree_sha256")) != (
+            lock["revision"], lock["source_tree_sha256"]):
+        raise ValueError(f"{source} was compiled at a different fork pin; publish with a compile instead")
+    if metadata.get("engine_sources_sha256") != sources["engine_sources_sha256"]:
+        raise ValueError(f"{source} compiled tier differs from this checkout; publish with a compile instead")
+    for name, checksum in metadata["files"].items():
+        if compare.sha((source / name).read_bytes()) != checksum:
+            raise ValueError(f"{source}/{name} differs from its INPUTS.json")
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in metadata["files"]:
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["cp", "--reflink=auto", "--preserve=mode,timestamps", str(source / name), str(target)],
+                       check=True)
+    for name in ("CHANGES.json", "CHANGES.md"):
+        if (source / name).is_file():
+            shutil.copy2(source / name, destination / name)
+    engine = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
+    metadata.update(engine_commit=engine, **sources, reattested_from=dict(
+        engine_commit=metadata.get("engine_commit"), inputs_sha256=compare.sha((source / "INPUTS.json").read_bytes())))
+    (destination / "INPUTS.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(f"Re-attested placement inputs: {destination} from {source}; INPUTS.json sha256 "
+          f"{compare.sha((destination / 'INPUTS.json').read_bytes())}", flush=True)
 
 
 def copy_replay_metadata(staging, destination, jobs):
@@ -622,8 +728,12 @@ def publication_records(staging, jobs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--staging", type=Path, required=True, help="staging directory on NVMe")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--staging", type=Path, help="staging directory on NVMe")
+    parser.add_argument("--reattest-from", type=Path, help="publication whose compiled tier equals this checkout's: "
+                        "copy its planner files and record this checkout's selection tier (no compile)")
+    parser.add_argument("--v4", action="store_true", help="with --reattest-from: a V4 publication")
+    parser.add_argument("--write-jobs", action="store_true", help=f"rewrite {JOBS} from the derived job specs")
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument("--workers", type=int, default=default_workers(),
                         help="CPU export workers (default: host-admitted export jobs)")
@@ -632,6 +742,21 @@ def main():
     parser.add_argument("--backend-cache", type=Path, help="content-addressed lowered-MLIR cache on NVMe")
     parser.add_argument("--verify-skips", action="store_true", help="run skipped frontends and reject changed IR")
     args = parser.parse_args()
+    if args.write_jobs:
+        (ROOT / JOBS).write_text(json.dumps(derived_jobs(), indent=1) + "\n")
+        return
+    if args.output is None:
+        parser.error("--output is required")
+    if args.reattest_from:
+        try:
+            refuse_current(args.output.expanduser().absolute())
+        except ValueError as error:
+            parser.error(str(error))
+        reattest(args.output.expanduser().resolve(), args.reattest_from.expanduser().resolve(),
+                 "v4" if args.v4 else "all")
+        return
+    if args.staging is None:
+        parser.error("--staging is required")
     if args.expect and not args.previous:
         parser.error("--expect requires --previous")
     if args.workers < 1 or args.timeout < 1:

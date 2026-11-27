@@ -1183,7 +1183,7 @@ def _publication_tree(tmp_path, edit=None):
     """A copy of this checkout's exporter sources and a store holding its publication."""
     import placement_publications as publications
     checkout = tmp_path / 'checkout'
-    for relative in ('scripts/build', 'scripts/lib', 'python/tools', 'examples/configs'):
+    for relative in ('scripts/build', 'scripts/lib', 'python/tools', 'examples/configs', 'scripts/qualify/deepseek_v41'):
         shutil.copytree(ROOT / relative, checkout / relative, ignore=shutil.ignore_patterns('__pycache__'))
     for relative in ('third_party/sparkinfer.lock.json', 'benchmarks/current-matrix.json',
                      'native/cmake/shared/fp8_moe.cmake',
