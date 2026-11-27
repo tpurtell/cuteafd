@@ -150,7 +150,7 @@ impl<'a> MiniKernels<'a> {
             ops.push(Op::PostMlpConvResidual { replay });
         }
         ops.extend([Op::ControllerDown, Op::ControllerUp]);
-        ops.extend([Op::AttnInProjLocal, Op::AttnInProjGlobal, Op::RouterProj]);
+        ops.extend([Op::AttnInProjLocal, Op::AttnInProjGlobal]);
         let mut producers = BTreeMap::new();
         for op in ops {
             producers.insert(op.name()?, Producer::load(programs, op)?);
@@ -200,7 +200,7 @@ impl<'a> MiniKernels<'a> {
         )?;
         let projections_f32 = DraftProjections::load_with_output(
             programs,
-            &[],
+            &[(HIDDEN, 128)], // router mlp.gate -> F32 logits
             4096,
             ProjectionOutput::F32,
         )?;
@@ -1034,19 +1034,17 @@ pub(crate) fn prepare_routes<'a>(
     rows: usize,
 ) -> Result<()> {
     let prefix = format!("model.llm.layers.{layer}");
-    // SAFETY: retained BF16 input/weight and F32 route logits on ordered stream.
-    unsafe {
-        k.producer(Op::RouterProj)?.launch(
-            &[
-                owner.buffer("projection_input")?,
-                target.operand(&format!("{prefix}.mlp.gate.weight"))?.buffer,
-                owner.buffer("route_logits")?,
-            ],
-            rows,
-            None,
-            owner.stream().raw,
-        )?;
-    }
+    // Stock ordered-K16 F32 projection at every row count: decode and copy-extended
+    // verify (up to 1 + 7 + 32 rows) must pick the same experts (#2903).
+    k.project_f32(
+        owner,
+        owner.buffer("projection_input")?,
+        target.operand(&format!("{prefix}.mlp.gate.weight"))?.buffer,
+        owner.buffer("route_logits")?,
+        rows,
+        HIDDEN,
+        128,
+    )?;
     // SAFETY: F32 router logits/bias -> I32 ids + F32 weights.
     // Keep stock 128-thread router at decode/verify rows (faster at M=1..64 than single-warp).
     let router_op = if rows > 64 { Op::FastRouter } else { Op::Router };
