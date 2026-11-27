@@ -14,6 +14,9 @@ pub enum Op {
     LoopBlendNorm { slots: usize, broadcast_dest: bool, broadcast_weight: bool },
     ControllerDown,
     ControllerUp,
+    AttnInProjLocal,
+    AttnInProjGlobal,
+    RouterProj,
     Router,
     Gate { precision: Precision },
     Norm { value: bool, precision: Precision },
@@ -65,6 +68,9 @@ impl Op {
             }
             Self::ControllerDown => "controller_down".into(),
             Self::ControllerUp => "controller_up".into(),
+            Self::AttnInProjLocal => "attn_in_proj_local".into(),
+            Self::AttnInProjGlobal => "attn_in_proj_global".into(),
+            Self::RouterProj => "router_proj".into(),
             Self::Router => "router_e128_k8".into(),
             Self::Gate { precision } => format!("gate_h3072_{}", precision_suffix(precision)),
             Self::Norm { value, precision } => if value {
@@ -119,6 +125,17 @@ impl Op {
             Self::ControllerDown => &["x", "w", "out", "partial"],
             Self::ControllerUp => &["x", "w", "out"],
             Self::Router | Self::FastRouter => &["logits", "bias", "ids", "weights"],
+            Self::AttnInProjLocal => &[
+                "xq", "xk", "xv",
+                "wq", "wr", "wgate", "wsink", "wk", "wv",
+                "out_q", "out_r", "out_gate", "out_sink", "out_k", "out_v",
+            ],
+            Self::AttnInProjGlobal => &[
+                "xq", "xk", "xv",
+                "wq", "wr", "wgate", "wsink", "wk", "wv", "wk_dyn", "wv_dyn",
+                "out_q", "out_r", "out_gate", "out_sink", "out_k", "out_v", "out_k_dyn", "out_v_dyn",
+            ],
+            Self::RouterProj => &["x", "w", "out"],
             Self::Gate { .. } => &["x", "gate", "gamma", "out"],
             Self::Norm { .. } | Self::FastNorm => &["x", "weight", "out"],
             Self::KvPack { .. } => &["k", "v", "slots", "cache"],
@@ -218,6 +235,27 @@ impl<'a> Producer<'a> {
                 equal("output_dtype", "torch.float32".into())?;
                 equal("reduction", "ordered_k16".into())?;
             }
+            Op::AttnInProjLocal => {
+                equal("width", 2304.into())?;
+                equal("small_row_max", 8.into())?;
+                equal("global_dynamic", false.into())?;
+                equal("outputs", serde_json::json!([3072, 384, 3072, 24, 1024, 1024]))?;
+                equal("reduction", "ordered_k16".into())?;
+            }
+            Op::AttnInProjGlobal => {
+                equal("width", 2304.into())?;
+                equal("small_row_max", 8.into())?;
+                equal("global_dynamic", true.into())?;
+                equal("outputs", serde_json::json!([3072, 384, 3072, 24, 1024, 1024, 32, 32]))?;
+                equal("reduction", "ordered_k16".into())?;
+            }
+            Op::RouterProj => {
+                equal("width", 2304.into())?;
+                equal("outputs", 128.into())?;
+                equal("output_dtype", "torch.float32".into())?;
+                equal("small_row_max", 8.into())?;
+                equal("reduction", "block_k288_le8_ordered_k16_gt8".into())?;
+            }
             Op::Router | Op::FastRouter => {
                 equal("experts", 128.into())?; equal("topk", 8.into())?; equal("route_scale", 8.0.into())?;
             }
@@ -289,13 +327,26 @@ impl<'a> Producer<'a> {
     pub unsafe fn launch(&self, buffers: &[Buffer], rows: usize, residual: Option<(usize, usize)>,
         stream: *mut c_void) -> Result<()> {
         self.check_common(buffers, rows)?;
-        let required = match self.op {
+        let required: Vec<usize> = match self.op {
             Op::ControllerDown => vec![rows * 4608 * 2, 64 * 4608 * 2, rows * 64 * 2, rows * 8 * 64 * 4],
             Op::ControllerUp => vec![rows * 64 * 2, 4608 * 64 * 2, rows * 4608 * 4],
+            Op::AttnInProjLocal => vec![
+                rows * 2304 * 2, rows * 2304 * 2, rows * 2304 * 2,
+                3072 * 2304 * 2, 384 * 2304 * 2, 3072 * 2304 * 2, 24 * 2304 * 2, 1024 * 2304 * 2, 1024 * 2304 * 2,
+                rows * 3072 * 2, rows * 384 * 2, rows * 3072 * 2, rows * 24 * 4, rows * 1024 * 2, rows * 1024 * 2,
+            ],
+            Op::AttnInProjGlobal => vec![
+                rows * 2304 * 2, rows * 2304 * 2, rows * 2304 * 2,
+                3072 * 2304 * 2, 384 * 2304 * 2, 3072 * 2304 * 2, 24 * 2304 * 2, 1024 * 2304 * 2, 1024 * 2304 * 2,
+                32 * 2304 * 2, 32 * 2304 * 2,
+                rows * 3072 * 2, rows * 384 * 2, rows * 3072 * 2, rows * 24 * 4, rows * 1024 * 2, rows * 1024 * 2,
+                rows * 32 * 4, rows * 32 * 4,
+            ],
+            Op::RouterProj => vec![rows * 2304 * 2, 128 * 2304 * 2, rows * 128 * 4],
             _ => vec![],
         };
         ensure!(buffers.iter().zip(required).all(|(b, size)| b.bytes >= size && b.ptr as usize % 16 == 0),
-            "Inkling 2 Mini controller projection extent/alignment differs");
+            "Inkling 2 Mini projection extent/alignment differs");
         let mut scalars = vec![Scalar::I32(rows as i32)];
         match (self.op, residual) {
             (

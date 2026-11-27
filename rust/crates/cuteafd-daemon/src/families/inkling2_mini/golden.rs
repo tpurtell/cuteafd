@@ -91,6 +91,10 @@ fn read_logits(library: &cuteafd_ffi::NativeLibrary, device_id: i32, logits: &De
         device_id,
         flags: 0,
     };
+    // Engine streams are created with `cudaStreamNonBlocking`, so null-stream `cudaMemcpy`
+    // (`copy_d2h`) does not order against `logits.stream`; drain before reading `logits.ptr`
+    // while the head logits buffer remains live during the callback.
+    library.cuda_device_synchronize()?;
     library.copy_d2h(&mut bytes, buf)?;
     Ok(bytes
         .chunks_exact(4)
