@@ -311,6 +311,7 @@ fn reconcile_runtime_inventory(
             || id.starts_with("hy4_flash.target.")
             || id.starts_with("hy4_flash.peer.")
             || id.starts_with("hy4_flash.context_exchange.")
+            || id.starts_with("hy4_flash.context_staging.")
             || id.starts_with("expert-usage.gpu")
             || (id.starts_with("hy4_flash/dfly2/") && !id.starts_with("hy4_flash/dfly2/gpu"))
     };
@@ -1358,6 +1359,7 @@ mod tests {
                 || alloc.id.starts_with("hy4_flash.target.")
                 || alloc.id.starts_with("hy4_flash.peer.")
                 || alloc.id.starts_with("hy4_flash.context_exchange.")
+                || alloc.id.starts_with("hy4_flash.context_staging.")
             {
                 let curve = contract_ctx
                     .components
@@ -1380,6 +1382,8 @@ mod tests {
         }
         assert!(r_ctx.iter().any(|r| r.allocation.id == "hy4_flash.context_exchange.0"));
         assert!(r_ctx.iter().any(|r| r.allocation.id == "hy4_flash.context_exchange.1"));
+        assert!(r_ctx.iter().any(|r| r.allocation.id == "hy4_flash.context_staging.0"));
+        assert!(r_ctx.iter().any(|r| r.allocation.id == "hy4_flash.context_staging.1"));
         super::reconcile_runtime_inventory(&admitted_ctx.solved, &inputs_ctx, &w_ctx, &r_ctx)?;
         Ok(())
     }
