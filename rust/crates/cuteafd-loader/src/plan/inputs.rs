@@ -13,61 +13,97 @@ pub fn v4_placement_inputs() -> anyhow::Result<std::path::PathBuf> {
     Ok(root)
 }
 
-fn v4_placement_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
+/// Hash each listed repo file (sorted, deduplicated) by its repo-relative path.
+fn hashed_files<'a>(root: &std::path::Path, paths: impl IntoIterator<Item = &'a str>)
+    -> anyhow::Result<serde_json::Map<String, Value>> {
+    use anyhow::Context;
     use sha2::{Digest, Sha256};
-    fn collect(root: &std::path::Path, directory: &std::path::Path, recursive: bool, extension: &str,
-        files: &mut serde_json::Map<String, Value>) -> anyhow::Result<()> {
-        for entry in fs::read_dir(directory)? {
+    let mut files = serde_json::Map::new();
+    for path in paths.into_iter().collect::<std::collections::BTreeSet<_>>() {
+        let bytes = fs::read(root.join(path)).with_context(|| format!("hashing placement source {path}"))?;
+        files.insert(path.into(), Value::String(format!("{:x}", Sha256::digest(bytes))));
+    }
+    Ok(files)
+}
+
+fn placement_sources(root: &std::path::Path) -> anyhow::Result<Value> {
+    Ok(serde_json::from_slice(&fs::read(root.join("scripts/build/placement-sources.json"))?)?)
+}
+
+/// Compiled tier: every file whose bytes can change a compiled program, as
+/// scripts/build/placement-sources.json lists them (a default-tier script test
+/// checks the list covers the exporters' full import closure), plus the list
+/// itself and the derived job specs. Keep identical to
+/// export-placement-inputs.py::compiled_hashes.
+fn compiled_source_hashes(root: &std::path::Path, kind: &str) -> anyhow::Result<Value> {
+    let sources = placement_sources(root)?;
+    let listed = sources["compiled"][kind].as_array()
+        .ok_or_else(|| anyhow::anyhow!("placement-sources.json has no compiled.{kind} list"))?;
+    let mut paths = listed.iter().map(|path| path.as_str()
+        .ok_or_else(|| anyhow::anyhow!("non-string compiled source"))).collect::<anyhow::Result<Vec<_>>>()?;
+    paths.extend(["scripts/build/placement-sources.json", "scripts/build/placement-jobs.json"]);
+    Ok(Value::Object(hashed_files(root, paths)?))
+}
+
+/// Selection tier: inputs that select what installed planner tests plan and
+/// admit (live example configs and their revisions, measured Spark memory)
+/// without changing compiled bytes. Keep identical to
+/// export-placement-inputs.py::selection_hashes.
+fn selection_source_hashes(root: &std::path::Path, kind: &str) -> anyhow::Result<Value> {
+    use sha2::{Digest, Sha256};
+    let sources = placement_sources(root)?;
+    let spec = &sources["selection"][kind];
+    let listed = spec["files"].as_array()
+        .ok_or_else(|| anyhow::anyhow!("placement-sources.json has no selection.{kind} files"))?;
+    let mut paths = listed.iter().map(|path| path.as_str().map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("non-string selection source"))).collect::<anyhow::Result<Vec<_>>>()?;
+    let mut live = Vec::new();
+    if spec["live_configs"].as_bool().ok_or_else(|| anyhow::anyhow!("selection.{kind}.live_configs missing"))? {
+        let matrix: Value = serde_json::from_slice(&fs::read(root.join("benchmarks/current-matrix.json"))?)?;
+        let retired = matrix["retired"].as_array().ok_or_else(|| anyhow::anyhow!("missing retired config list"))?
+            .iter().filter_map(|entry| entry["config"].as_str()).collect::<std::collections::BTreeSet<_>>();
+        for entry in fs::read_dir(root.join("examples/configs"))? {
             let path = entry?.path();
-            if path.is_dir() && recursive { collect(root, &path, true, extension, files)?; }
-            else if path.is_file() && path.extension().is_some_and(|value| value == extension) {
-                files.insert(path.strip_prefix(root)?.to_string_lossy().into_owned(),
-                    Value::String(format!("{:x}", Sha256::digest(fs::read(&path)?))));
+            if path.extension().is_some_and(|extension| extension == "config") {
+                let relative = path.strip_prefix(root)?.to_string_lossy().into_owned();
+                if !retired.contains(relative.as_str()) {
+                    live.push(relative);
+                }
             }
         }
-        Ok(())
+        live.sort();
+        paths.extend(live.iter().cloned());
     }
-    // Keep this set identical to compare-sm-exports.py::v4_placement_sources.
-    let mut files = serde_json::Map::new();
-    for directory in ["python/tools/aot", "python/tools/lib"] {
-        collect(root, &root.join(directory), true, "py", &mut files)?;
-    }
-    collect(root, &root.join("scripts/build"), false, "json", &mut files)?;
-    for script in ["scripts/build/compare-sm-exports.py", "scripts/build/kernel-records.py",
-        "scripts/build/export-placement-inputs.py"] {
-        files.insert(script.into(), Value::String(format!("{:x}", Sha256::digest(fs::read(root.join(script))?))));
+    let mut files = hashed_files(root, paths.iter().map(String::as_str))?;
+    if spec["live_configs"].as_bool() == Some(true) {
+        files.insert("installed_live_configs".into(),
+            Value::String(format!("{:x}", Sha256::digest(live.join("\n").as_bytes()))));
     }
     Ok(Value::Object(files))
 }
 
-fn placement_input_source_hashes(root: &std::path::Path) -> anyhow::Result<Value> {
-    use sha2::{Digest, Sha256};
-    let mut files = v4_placement_source_hashes(root)?;
-    let mut paths = ["scripts/build/export-placement-inputs.py", "scripts/build/kernel-records.py", "scripts/build/release-scope.py",
-        "scripts/lib/wip_aot_scopes.py", "native/cmake/shared/fp8_moe.cmake",
-        "rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json"].map(|path| root.join(path)).to_vec();
-    let matrix: Value = serde_json::from_slice(&fs::read(root.join("benchmarks/current-matrix.json"))?)?;
-    let retired = matrix["retired"].as_array().ok_or_else(|| anyhow::anyhow!("missing retired config list"))?
-        .iter().filter_map(|entry| entry["config"].as_str()).collect::<std::collections::BTreeSet<_>>();
-    let mut live = Vec::new();
-    for entry in fs::read_dir(root.join("examples/configs"))? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|extension| extension == "config") {
-            let relative = path.strip_prefix(root)?.to_string_lossy().into_owned();
-            if !retired.contains(relative.as_str()) {
-                live.push(relative);
-                paths.push(path);
-            }
-        }
-    }
-    live.sort();
-    files.as_object_mut().unwrap().insert("installed_live_configs".into(),
-        Value::String(format!("{:x}", Sha256::digest(live.join("\n").as_bytes()))));
-    for path in paths {
-        files.as_object_mut().unwrap().insert(path.strip_prefix(root)?.to_string_lossy().into_owned(),
-            Value::String(format!("{:x}", Sha256::digest(fs::read(path)?))));
-    }
-    Ok(files)
+/// Both tiers must equal the checkout's: a stale compiled tier means stale
+/// programs; a stale selection tier means the publication was taken for a
+/// different installed inventory or measured Spark memory.
+fn validate_sources(metadata: &Value, root: &std::path::Path, kind: &str, stale: &str) -> anyhow::Result<()> {
+    let compiled = compiled_source_hashes(root, kind)?;
+    anyhow::ensure!(metadata["engine_sources_sha256"] == compiled,
+        "{stale}: export source fingerprints differ ({})", differing(&metadata["engine_sources_sha256"], &compiled));
+    let selection = selection_source_hashes(root, kind)?;
+    anyhow::ensure!(metadata["selection_sources_sha256"] == selection,
+        "{stale}: selection source fingerprints differ ({}); re-attest with export-placement-inputs.py --reattest-from",
+        differing(&metadata["selection_sources_sha256"], &selection));
+    Ok(())
+}
+
+fn differing(recorded: &Value, expected: &Value) -> String {
+    let (Some(recorded), Some(expected)) = (recorded.as_object(), expected.as_object()) else {
+        return "fingerprint missing".into();
+    };
+    let keys = recorded.keys().chain(expected.keys()).collect::<std::collections::BTreeSet<_>>();
+    let changed = keys.into_iter().filter(|key| recorded.get(*key) != expected.get(*key)).collect::<Vec<_>>();
+    let shown = changed.iter().take(6).map(|key| key.as_str()).collect::<Vec<_>>().join(", ");
+    if changed.len() > 6 { format!("{shown} and {} more", changed.len() - 6) } else { shown }
 }
 
 /// A verified publication; reads recheck the bytes actually returned to the caller.
@@ -115,8 +151,7 @@ pub fn validate_placement_inputs(manifest: &std::path::Path) -> anyhow::Result<P
         anyhow::ensure!(metadata["sparkinfer_revision"] == lock["revision"]
             && metadata["source_tree_sha256"] == lock["source_tree_sha256"], "stale placement inputs: fork pin mismatch");
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        anyhow::ensure!(metadata["engine_sources_sha256"] == placement_input_source_hashes(&source)?,
-            "stale placement inputs: export source fingerprints differ");
+        validate_sources(&metadata, &source, "all", "stale placement inputs")?;
         let exports = metadata["exports"].as_array().context("missing placement worker provenance")?;
         anyhow::ensure!(!exports.is_empty() && exports.iter().all(|export|
             export["sparkinfer_revision"] == lock["revision"]
@@ -141,9 +176,8 @@ pub fn validate_placement_inputs(manifest: &std::path::Path) -> anyhow::Result<P
 }
 
 fn validate_v4_placement_sources(metadata: &Value, root: &std::path::Path) -> anyhow::Result<()> {
-    anyhow::ensure!(metadata["engine_sources_sha256"] == v4_placement_source_hashes(root)?,
-        "stale V4 placement inputs: engine export sources changed; regenerate inputs");
-    Ok(())
+    validate_sources(metadata, root, "v4", "stale V4 placement inputs")
+        .map_err(|error| anyhow::anyhow!("{error:#}; regenerate inputs"))
 }
 
 fn validate_v4_placement_inputs(root: &std::path::Path) -> anyhow::Result<()> {
@@ -225,7 +259,8 @@ pub(crate) fn write_test_publication(root: &std::path::Path, files: &[(&str, &[u
     }
     let metadata = serde_json::json!({"schema": 1, "engine_commit": "a".repeat(40),
         "sparkinfer_revision": lock["revision"], "source_tree_sha256": lock["source_tree_sha256"],
-        "engine_sources_sha256": placement_input_source_hashes(&source).unwrap(),
+        "engine_sources_sha256": compiled_source_hashes(&source, "all").unwrap(),
+        "selection_sources_sha256": selection_source_hashes(&source, "all").unwrap(),
         "exports": [{"sparkinfer_revision": lock["revision"],
             "source_tree_sha256": lock["source_tree_sha256"], "cuda_initialized": false}], "files": checksums});
     fs::write(root.join("INPUTS.json"), metadata.to_string()).unwrap();
@@ -237,65 +272,108 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn live_v4_inputs_refuse_same_fork_changed_added_or_removed_export_sources() {
-        let root = tempfile::tempdir().unwrap();
-        for directory in ["python/tools/aot", "python/tools/lib", "scripts/build"] {
-            fs::create_dir_all(root.path().join(directory)).unwrap();
-        }
-        let script = root.path().join("scripts/build/compare-sm-exports.py");
-        fs::write(&script, "source").unwrap();
-        for name in ["kernel-records.py", "export-placement-inputs.py"] {
-            fs::write(root.path().join("scripts/build").join(name), "source").unwrap();
-        }
-        let metadata = json!({"engine_sources_sha256": v4_placement_source_hashes(root.path()).unwrap()});
-        validate_v4_placement_sources(&metadata, root.path()).unwrap();
-        fs::write(&script, "changed").unwrap();
-        assert!(validate_v4_placement_sources(&metadata, root.path()).is_err());
-        fs::write(&script, "source").unwrap();
-        let added = root.path().join("python/tools/lib/new.py");
-        fs::write(&added, "new").unwrap();
-        assert!(validate_v4_placement_sources(&metadata, root.path()).is_err());
-        let metadata = json!({"engine_sources_sha256": v4_placement_source_hashes(root.path()).unwrap()});
-        fs::remove_file(added).unwrap();
-        assert!(validate_v4_placement_sources(&metadata, root.path()).is_err());
-    }
-
-    #[test]
-    fn placement_fingerprints_ignore_retired_contents_but_track_live_revision_and_selection() {
-        let directory = tempfile::tempdir().unwrap();
-        let root = directory.path();
-        for relative in ["python/tools/aot", "python/tools/lib", "scripts/build", "scripts/lib",
-            "examples/configs", "benchmarks", "native/cmake/shared",
+    /// A synthetic checkout: a placement-sources.json listing two compiled files
+    /// and the selection inputs, the job specs, live and retired configs.
+    fn sources_fixture(root: &std::path::Path) {
+        for relative in ["python/tools/aot", "scripts/build", "scripts/lib", "examples/configs", "benchmarks",
             "rust/crates/cuteafd-loader/src/serving_capacity"] {
             fs::create_dir_all(root.join(relative)).unwrap();
         }
-        for relative in ["scripts/build/compare-sm-exports.py", "scripts/build/export-placement-inputs.py",
-            "scripts/build/kernel-records.py", "scripts/build/release-scope.py", "scripts/lib/wip_aot_scopes.py",
-            "examples/configs/live.config", "examples/configs/retired.config", "native/cmake/shared/fp8_moe.cmake",
-            "rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json"] {
+        fs::write(root.join("scripts/build/placement-sources.json"), json!({"schema": 1,
+            "compiled": {"all": ["python/tools/aot/export.py", "scripts/build/layout.json"],
+                         "v4": ["python/tools/aot/export.py"]},
+            "selection": {"all": {"files": ["rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json",
+                                            "scripts/lib/wip_aot_scopes.py"], "live_configs": true},
+                          "v4": {"files": [], "live_configs": false}}}).to_string()).unwrap();
+        for relative in ["python/tools/aot/export.py", "scripts/build/layout.json", "scripts/build/placement-jobs.json",
+            "rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json", "scripts/lib/wip_aot_scopes.py",
+            "examples/configs/live.config", "examples/configs/retired.config", "python/tools/aot/unlisted.py"] {
             fs::write(root.join(relative), "original").unwrap();
         }
-        let matrix = root.join("benchmarks/current-matrix.json");
-        let retired = json!([{"config": "examples/configs/retired.config"}]);
-        fs::write(&matrix, json!({"retired": retired, "cells": [{"report": "old"}]}).to_string()).unwrap();
-        let before = placement_input_source_hashes(root).unwrap();
+        fs::write(root.join("benchmarks/current-matrix.json"),
+            json!({"retired": [{"config": "examples/configs/retired.config"}], "cells": [{"report": "old"}]}).to_string()).unwrap();
+    }
+
+    fn fingerprint(root: &std::path::Path, kind: &str) -> Value {
+        json!({"engine_sources_sha256": compiled_source_hashes(root, kind).unwrap(),
+               "selection_sources_sha256": selection_source_hashes(root, kind).unwrap()})
+    }
+
+    #[test]
+    fn compiled_tier_tracks_listed_sources_and_job_specs_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        sources_fixture(root);
+        for kind in ["all", "v4"] {
+            let metadata = fingerprint(root, kind);
+            validate_sources(&metadata, root, kind, "stale").unwrap();
+            for (path, refused) in [("python/tools/aot/export.py", true), ("scripts/build/placement-jobs.json", true),
+                ("scripts/build/layout.json", kind == "all"), ("python/tools/aot/unlisted.py", false)] {
+                fs::write(root.join(path), "changed").unwrap();
+                let error = validate_sources(&metadata, root, kind, "stale").err().map(|error| error.to_string());
+                assert_eq!(error.is_some(), refused, "{kind} {path}: {error:?}");
+                if let Some(error) = error {
+                    assert!(error.contains("export source fingerprints differ") && error.contains(path), "{error}");
+                }
+                fs::write(root.join(path), "original").unwrap();
+            }
+            // Listing an added file changes the tier: the list itself is hashed.
+            let mut sources: Value = serde_json::from_slice(&fs::read(root.join("scripts/build/placement-sources.json")).unwrap()).unwrap();
+            let original = sources.clone();
+            sources["compiled"][kind].as_array_mut().unwrap().push(json!("python/tools/aot/unlisted.py"));
+            fs::write(root.join("scripts/build/placement-sources.json"), sources.to_string()).unwrap();
+            assert!(validate_sources(&metadata, root, kind, "stale").is_err());
+            fs::write(root.join("scripts/build/placement-sources.json"), original.to_string()).unwrap();
+        }
+    }
+
+    #[test]
+    fn selection_tier_tracks_measured_memory_live_configs_and_revisions_but_not_retired_or_cards() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        sources_fixture(root);
+        let metadata = fingerprint(root, "all");
+        let before = &metadata["selection_sources_sha256"];
         assert!(before.get("examples/configs/retired.config").is_none());
-        let measured = root.join("rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json");
-        fs::write(&measured, "refreshed idle sample").unwrap();
-        assert_ne!(placement_input_source_hashes(root).unwrap(), before);
-        fs::write(measured, "original").unwrap();
-        fs::write(root.join("examples/configs/retired.config"), "retired edit").unwrap();
-        fs::write(&matrix, json!({"retired": retired, "cells": [{"report": "new"}]}).to_string()).unwrap();
-        assert_eq!(placement_input_source_hashes(root).unwrap(), before);
-        fs::write(root.join("native/cmake/shared/fp8_moe.cmake"), "changed capacities").unwrap();
-        assert_ne!(placement_input_source_hashes(root).unwrap(), before);
-        fs::write(root.join("native/cmake/shared/fp8_moe.cmake"), "original").unwrap();
-        fs::write(root.join("examples/configs/live.config"), "MODEL_REVISION=changed").unwrap();
-        assert_ne!(placement_input_source_hashes(root).unwrap(), before);
+        let refused = |path: &str, bytes: &str| {
+            let original = fs::read(root.join(path)).unwrap();
+            fs::write(root.join(path), bytes).unwrap();
+            let error = validate_sources(&metadata, root, "all", "stale").err().map(|error| error.to_string());
+            fs::write(root.join(path), original).unwrap();
+            error
+        };
+        for path in ["rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json",
+            "examples/configs/live.config", "scripts/lib/wip_aot_scopes.py"] {
+            let error = refused(path, "MODEL_REVISION=changed").expect(path);
+            assert!(error.contains("selection source fingerprints differ") && error.contains(path)
+                && error.contains("--reattest-from"), "{error}");
+        }
+        assert!(refused("examples/configs/retired.config", "retired edit").is_none());
+        assert!(refused("benchmarks/current-matrix.json",
+            &json!({"retired": [{"config": "examples/configs/retired.config"}], "cells": [{"report": "new"}]}).to_string()).is_none());
+        let error = refused("benchmarks/current-matrix.json", &json!({"retired": [], "cells": []}).to_string()).unwrap();
+        assert!(error.contains("installed_live_configs") && error.contains("examples/configs/retired.config"), "{error}");
+        // The V4 inventory selects no configs, so they never stale it.
+        let v4 = fingerprint(root, "v4");
+        fs::write(root.join("examples/configs/live.config"), "changed").unwrap();
+        validate_sources(&v4, root, "v4", "stale").unwrap();
+        // A publication predating the selection tier is stale, not silently accepted.
+        let mut old = metadata.clone();
+        old.as_object_mut().unwrap().remove("selection_sources_sha256");
         fs::write(root.join("examples/configs/live.config"), "original").unwrap();
-        fs::write(&matrix, json!({"retired": [], "cells": []}).to_string()).unwrap();
-        assert_ne!(placement_input_source_hashes(root).unwrap()["installed_live_configs"], before["installed_live_configs"]);
+        assert!(validate_sources(&old, root, "all", "stale").unwrap_err().to_string().contains("fingerprint missing"));
+    }
+
+    #[test]
+    fn checked_in_placement_sources_hash_on_this_checkout() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        for kind in ["all", "v4"] {
+            let compiled = compiled_source_hashes(&root, kind).unwrap();
+            assert!(compiled.get("scripts/build/placement-jobs.json").is_some());
+            assert!(compiled.get("rust/crates/cuteafd-core/src/dspark_verify.rs").is_some());
+            assert!(compiled.as_object().unwrap().keys().all(|path| !path.starts_with("examples/")));
+            selection_source_hashes(&root, kind).unwrap();
+        }
     }
 
     #[test]
@@ -314,7 +392,8 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
         let valid = json!({"schema": 1, "engine_commit": "a".repeat(40),
             "sparkinfer_revision": lock["revision"], "source_tree_sha256": lock["source_tree_sha256"],
-            "engine_sources_sha256": placement_input_source_hashes(&root).unwrap(),
+            "engine_sources_sha256": compiled_source_hashes(&root, "all").unwrap(),
+            "selection_sources_sha256": selection_source_hashes(&root, "all").unwrap(),
             "exports": [{"sparkinfer_revision": lock["revision"],
                 "source_tree_sha256": lock["source_tree_sha256"], "cuda_initialized": false}],
             "files": {"share/PROGRAMS.json": format!("{:x}", Sha256::digest(fs::read(&manifest).unwrap()))}});
@@ -323,6 +402,7 @@ mod tests {
         for (field, value, expected) in [
             ("sparkinfer_revision", json!("wrong"), "fork pin mismatch"),
             ("engine_sources_sha256", json!({}), "source fingerprints differ"),
+            ("selection_sources_sha256", json!({}), "selection source fingerprints differ"),
             ("exports", json!([]), "worker provenance mismatch"),
             ("files", json!({}), "PROGRAMS.json missing from placement provenance"),
         ] {

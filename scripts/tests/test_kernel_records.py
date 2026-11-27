@@ -505,6 +505,26 @@ def test_job_reads_include_helpers_after_last_program(tmp_path, fake_worker):
         path.write_text(original)
 
 
+def test_other_exporters_are_provenance_not_recorded_job_reads(tmp_path, fake_worker):
+    """#2885: hashing every python/tools/aot/*.py under the recorder made each job
+    depend on every exporter, so one exporter edit reran all 26 placement jobs."""
+    output = tmp_path / "output"
+    output.mkdir()
+    other = tmp_path / "python/tools/aot/export_unrelated_aot.py"
+    other.write_text("TILE = 64\n")
+    fake_worker({"sms": 188, "exporter": "x.py", "args": [], "output": str(output), "program_records": True})
+    summary = json.loads((output / "comparison-context.json").read_text())
+    assert "python/tools/aot/export_unrelated_aot.py" in summary["export_sources_sha256"]  # still provenance
+    assert "python/tools/aot/export_unrelated_aot.py" not in summary["source_reads_sha256"]
+    records_by_object = json.loads((output / "program-records.json").read_text())
+    assert all("python/tools/aot/export_unrelated_aot.py" not in record["source_reads_sha256"]
+               for record in records_by_object.values())
+    other.write_text("TILE = 128\n")
+    assert records.job_candidates(tmp_path, summary, summary["stage0_inputs"]) == []
+    (tmp_path / "recipe.py").write_text((tmp_path / "recipe.py").read_text() + "\n# changed recipe\n")
+    assert records.job_candidates(tmp_path, summary, summary["stage0_inputs"]) == ["recipe.py"]
+
+
 @pytest.mark.parametrize("changed", ["args", "environment"])
 def test_changed_identity_runs_traced_with_unchanged_reads_and_ir(tmp_path, monkeypatch, changed, fake_worker):
     spec = importlib.util.spec_from_file_location("traced_publisher", ROOT / "scripts/build/export-placement-inputs.py")
@@ -710,7 +730,9 @@ def test_publisher_writes_sm170_report_before_failing(tmp_path, monkeypatch):
     spec.loader.exec_module(publisher)
     job = ("programs", "export_b12x_dsv4_aot.py", [])
     monkeypatch.setattr(publisher, "export_jobs", lambda: [job])
-    monkeypatch.setattr(publisher, "source_hashes", lambda: {})
+    monkeypatch.setattr(publisher, "source_hashes", lambda kind="all": {"engine_sources_sha256": {},
+                                                                        "selection_sources_sha256": {}})
+    monkeypatch.setattr(publisher, "require_job_specs", lambda: None)
     lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
     def worker(job, staging, *args):
         directory = staging / "programs"
@@ -947,3 +969,63 @@ def test_static_import_closure_is_independent_of_import_execution(tmp_path):
     (package / "helper.py").write_text("TILE = 128\n")
     with pytest.raises(ValueError, match="recorded source changed"):
         recorder.validate_sources()
+
+
+def _publisher(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts/build/export-placement-inputs.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _raw(index):
+    return {"ir_sha256": f"ir{index}", "object_sha256": f"o{index}", "source_reads_sha256": {"k.py": "h"}}
+
+
+def _publication(root, layout):
+    """A previous publication in the old (worker program-records copied) or deduplicated layout."""
+    publisher = _publisher(f"layout_{layout}")
+    directory = root / ".workers/programs"
+    directory.mkdir(parents=True)
+    raw = {"a.o": _raw(1), "b.o": _raw(2)}
+    (directory / "comparison-context.json").write_text(json.dumps({"stage0_inputs": {"g": 1}}))
+    if layout == "old":
+        (directory / "program-records.json").write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+    files = {str(path.relative_to(root)): records.digest(path.read_bytes()) for path in directory.iterdir()}
+    program_records = {f"programs/{key}": {**value, "group": "programs", "family": "glm",
+                                           "planner_metadata": {"x": 1}, "scratch_bytes_at_capacity": {"1": 2}}
+                       for key, value in raw.items()}
+    program_records["fp8/other/c.o"] = {**_raw(3), "group": "fp8/other"}
+    (root / "INPUTS.json").write_text(json.dumps({"files": files, "program_records": program_records}))
+    return publisher, raw
+
+
+@pytest.mark.parametrize("layout", ["old", "deduplicated"])
+def test_replay_rebuilds_worker_records_identically_from_either_layout(tmp_path, layout):
+    publisher, raw = _publication(tmp_path, layout)
+    directory, files, rebuilt = publisher.verified_job_files(tmp_path, "programs")
+    if layout == "old":
+        assert rebuilt is None and "program-records.json" in files
+        replayed = (directory / "program-records.json").read_bytes()
+    else:
+        assert "program-records.json" not in files
+        replayed = rebuilt
+    assert json.loads(replayed) == raw
+    assert replayed == (json.dumps(raw, indent=2, sort_keys=True) + "\n").encode()
+    assert publisher.worker_records(json.loads((tmp_path / "INPUTS.json").read_text())["program_records"],
+                                    "programs") == raw
+
+
+def test_publication_keeps_program_records_once(tmp_path):
+    publisher = _publisher("dedup_copy")
+    staging, destination = tmp_path / "staging", tmp_path / "out"
+    for job in ("programs", "exl3/x"):
+        (staging / job / "nested").mkdir(parents=True)
+        (staging / job / "program-records.json").write_text("{}")
+        (staging / job / "comparison-context.json").write_text("{}")
+        (staging / job / "nested/program-records.json").write_text("{}")  # not the job's own record file
+        (staging / job / "program-timings.json").write_text("{}")
+    publisher.copy_replay_metadata(staging, destination, [("programs", "", []), ("exl3/x", "", [])])
+    copied = sorted(str(path.relative_to(destination)) for path in destination.rglob("*.json"))
+    assert copied == [".workers/exl3/x/comparison-context.json", ".workers/exl3/x/nested/program-records.json",
+                      ".workers/programs/comparison-context.json", ".workers/programs/nested/program-records.json"]

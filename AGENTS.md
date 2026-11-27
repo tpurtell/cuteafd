@@ -180,8 +180,9 @@ Writing a quantization brief: start from [docs/quantization/brief-template.md](d
   Kernel changes go to `~/Developer/sparkinfer-glmrt` master, quantizer changes to
   `~/Developer/GPTQModel` main; push there first, then bump pin and lock here.
   A fork or export-source bump regenerates and publishes V4 and all-family placement inputs (`scripts/build/export-placement-inputs.py`, `~/.cache/cuteafd/builds/placement-inputs/<sha>/` plus `current`)
-  at the merged dev SHA, validated beforehand through
+  from the PR head, validated beforehand through
   `CUTEAFD_V4_PLACEMENT_INPUTS` / `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` without switching `current`.
+  Only the coordinator's `scripts/dev/land-pr` flips `current`: it merges and promotes on raptor and maxq in one step.
   Dev images are toolchain-only and pin-independent: a SparkInfer bump
   needs only a new WIP slot build. Rebuild them with
   `scripts/build/build-dev-images.sh` only when the toolchain changes;
@@ -215,11 +216,12 @@ Writing a quantization brief: start from [docs/quantization/brief-template.md](d
   release cuts only, to restore every nonignored test, including installed
   example plans through the launcher's `release_prefill_shape`. That sweep uses
   `HF_HOME` (or `~/.cache/huggingface`); override with
-  `CUTEAFD_DEPLOYMENT_TEST_HF_HOME` and optionally supply the matching
-  `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` manifest and adjacent exports (default
-  `~/.cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json`). The gate
-  supplies this single manifest variable to all installed planner tests on
-  every host, including the default tier's installed GLM physical test. Missing
+  `CUTEAFD_DEPLOYMENT_TEST_HF_HOME`. The gate resolves the publication that records
+  the checkout's own inputs key (`current` when it matches, else a matching
+  `placement-inputs/<sha>`; an explicit `CUTEAFD_DEPLOYMENT_TEST_PROGRAMS` must match too),
+  fails before compiling when none does, records the choice in the receipt, and
+  supplies that manifest to all installed planner tests on every host,
+  including the default tier's installed GLM physical test. Missing
   checkpoints/revisions or missing/stale exports fail; only the explicitly
   recorded `--skip-live-planners` opts out. Installed inventories exclude
   retired example configs and read live cells from `benchmarks/current-matrix.json`.

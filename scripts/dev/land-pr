@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""Merge a PR and promote its placement inputs in one fail-closed step (coordinator only).
+
+  scripts/dev/land-pr PR --match-head-commit SHA
+      [--publication DIR --inputs-sha256 HEX] [--v4-publication DIR --v4-inputs-sha256 HEX]
+      [--host maxq ...] [--dry-run]
+
+Only this command flips placement-inputs/current and v4-placement-inputs/current;
+the exporters refuse to write them. Before merging it verifies, and refuses on
+any failure:
+
+1. the PR is open, ready, targets dev, its head is SHA, and SHA contains origin/dev
+   (so the merge commit's tree is SHA's tree);
+2. SHA's own placement-input fingerprints (fork pin, tree hash and export source
+   hashes, computed by SHA's own exporter code from `git archive SHA`) either equal
+   the store's current publication or equal the named publication;
+3. each named publication is a real directory of its store, its engine_commit is
+   SHA, its INPUTS.json sha256 is the given value, every file it lists matches its
+   checksum, and its CHANGES.json (when present) lists no leaks or SM mismatches;
+4. every --host (default maxq) holds the same publication with the same bytes:
+   a missing one is rsynced into STORE/.NAME.tmp-*, verified, then renamed.
+
+Then it merges with `gh pr merge --merge --match-head-commit SHA`, checks the
+merge commit's parents are exactly (old dev, SHA), and flips `current` on this
+host and every --host (a temporary link renamed over it, as ln -sfn + mv -T).
+It reads every link back and exits 0 only when every host resolves each store
+to the same publication with the expected INPUTS.json sha256. It prints the new
+dev SHA and each host's links. --dry-run runs the checks and changes nothing.
+"""
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass, field
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import uuid
+
+REPO = Path(__file__).resolve().parents[2]
+REPOSITORY = 'tpurtell/cuteafd'
+BASE = 'dev'
+BUILDS = Path.home() / '.cache/cuteafd/builds'
+STORES = {'all': 'placement-inputs', 'v4': 'v4-placement-inputs'}
+SHA = re.compile(r'[0-9a-f]{40}\Z')
+HEX = re.compile(r'[0-9a-f]{64}\Z')
+FINGERPRINT = ('sparkinfer_revision', 'source_tree_sha256', 'engine_sources_sha256', 'selection_sources_sha256')
+
+# Executed with python3 on every host (locally too), reading arguments from argv
+# and printing one JSON object. Keep it standard-library only.
+OPS = r'''
+import hashlib, json, os, stat, sys
+from pathlib import Path
+
+def sha(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+def verify(directory, expected):
+    path = Path(directory)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False, "ok": False, "error": "missing"}
+    if not stat.S_ISDIR(info.st_mode):
+        return {"exists": True, "ok": False, "error": "not a real directory"}
+    inputs = path / "INPUTS.json"
+    if not inputs.is_file() or inputs.is_symlink():
+        return {"exists": True, "ok": False, "error": "INPUTS.json missing"}
+    actual = sha(inputs)
+    if actual != expected:
+        return {"exists": True, "ok": False, "error": f"INPUTS.json sha256 {actual} != {expected}"}
+    metadata = json.loads(inputs.read_text())
+    for name, checksum in metadata.get("files", {}).items():
+        parts = Path(name).parts
+        if not parts or Path(name).is_absolute() or ".." in parts:
+            return {"exists": True, "ok": False, "error": f"invalid listed path {name}"}
+        target = path / name
+        if target.is_symlink() or not target.is_file() or sha(target) != checksum:
+            return {"exists": True, "ok": False, "error": f"listed file differs: {name}"}
+    return {"exists": True, "ok": True, "engine_commit": metadata.get("engine_commit"),
+            "files": len(metadata.get("files", {}))}
+
+def install(temporary, final):
+    if os.path.lexists(final):
+        return {"ok": False, "error": f"{final} appeared while staging"}
+    os.rename(temporary, final)
+    return {"ok": True}
+
+def discard(temporary):
+    name = Path(temporary).name
+    if not (name.startswith(".") and ".tmp-" in name):
+        return {"ok": False, "error": "refusing to remove a non-temporary path"}
+    import shutil
+    shutil.rmtree(temporary, ignore_errors=True)
+    return {"ok": True}
+
+def flip(store, name):
+    store = Path(store)
+    target = store / name
+    if target.is_symlink() or not target.is_dir():
+        return {"ok": False, "error": f"{target} is not a real publication directory"}
+    temporary = store / f".current.tmp-{os.getpid()}"
+    if os.path.lexists(temporary):
+        os.unlink(temporary)
+    os.symlink(name, temporary)
+    os.replace(temporary, store / "current")
+    return {"ok": True}
+
+def readback(store):
+    link = Path(store) / "current"
+    if not link.is_symlink():
+        return {"ok": False, "error": f"{link} is not a symlink"}
+    return {"ok": True, "target": os.readlink(link), "inputs_sha256": sha(link / "INPUTS.json")}
+
+command, *args = sys.argv[1:]
+print(json.dumps({"verify": verify, "install": install, "discard": discard,
+                  "flip": flip, "readback": readback}[command](*args)))
+'''
+
+
+class Refused(Exception):
+    """A check failed; nothing (more) is changed."""
+
+
+def log(message):
+    print(f'land-pr: {message}', file=sys.stderr, flush=True)
+
+
+def git(*args):
+    result = subprocess.run(['git', '-C', str(REPO), *args], capture_output=True, text=True, timeout=600)
+    if result.returncode:
+        raise Refused(f'git {" ".join(args[:2])} failed: {(result.stderr or result.stdout).strip()[-300:]}')
+    return result.stdout.strip()
+
+
+class LocalTransport:
+    python = sys.executable
+
+    def run(self, argv, stdin):
+        return subprocess.run(argv, input=stdin, capture_output=True, text=True, timeout=1800)
+
+    def copy(self, source, destination):
+        shutil.copytree(source, destination, symlinks=True)
+
+
+class SshTransport:
+    python = 'python3'
+
+    def __init__(self, host):
+        self.host = host
+
+    def run(self, argv, stdin):
+        return subprocess.run(['ssh', '-o', 'BatchMode=yes', self.host, shlex.join(argv)],
+                              input=stdin, capture_output=True, text=True, timeout=1800)
+
+    def copy(self, source, destination):
+        result = subprocess.run(['rsync', '-a', '--mkpath', f'{source}/', f'{self.host}:{destination}/'],
+                                capture_output=True, text=True, timeout=7200)
+        if result.returncode:
+            raise Refused(f'rsync to {self.host}:{destination} failed: {result.stderr.strip()[-300:]}')
+
+
+@dataclass
+class Host:
+    name: str
+    builds: Path
+    transport: object
+
+    def store(self, kind):
+        return self.builds / STORES[kind]
+
+    def op(self, *args):
+        transport = self.transport
+        result = transport.run([transport.python, '-', *map(str, args)], OPS)
+        try:
+            reply = json.loads(result.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            raise Refused(f'{self.name}: {args[0]} failed (exit {result.returncode}): '
+                          f'{(result.stderr or result.stdout).strip()[-300:]}')
+        return reply
+
+
+@dataclass
+class Target:
+    kind: str
+    name: str              # publication directory name in the store
+    inputs_sha256: str
+    named: bool            # given on the command line (else: the current publication)
+
+
+@dataclass
+class Plan:
+    pr: int
+    head: str
+    base: str
+    targets: list = field(default_factory=list)
+
+
+def pr_view(number):
+    result = subprocess.run(['gh', 'pr', 'view', str(number), '--repo', REPOSITORY, '--json',
+                             'state,isDraft,baseRefName,headRefOid,url'], capture_output=True, text=True, timeout=120)
+    if result.returncode:
+        raise Refused(f'gh pr view {number} failed: {result.stderr.strip()[-300:]}')
+    return json.loads(result.stdout)
+
+
+def pr_merge(number, head):
+    result = subprocess.run(['gh', 'pr', 'merge', str(number), '--repo', REPOSITORY, '--merge',
+                             '--match-head-commit', head], capture_output=True, text=True, timeout=600)
+    if result.returncode:
+        raise Refused(f'gh pr merge {number} failed: {(result.stderr or result.stdout).strip()[-300:]}')
+
+
+def fetch(number):
+    git('fetch', '--quiet', 'origin', f'+refs/heads/{BASE}:refs/remotes/origin/{BASE}',
+        f'+refs/pull/{number}/head:refs/land-pr/{number}')
+    return git('rev-parse', f'refs/remotes/origin/{BASE}'), git('rev-parse', f'refs/land-pr/{number}')
+
+
+def head_fingerprints(head):
+    """SHA's placement fingerprints as SHA's own exporters compute them (no submodules needed)."""
+    scratch = BUILDS / 'land-pr'
+    scratch.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=scratch, prefix=f'{head[:12]}-') as directory:
+        archive = subprocess.Popen(['git', '-C', str(REPO), 'archive', head], stdout=subprocess.PIPE)
+        extracted = subprocess.run(['tar', '-x', '-C', directory], stdin=archive.stdout, capture_output=True)
+        archive.stdout.close()
+        if archive.wait() or extracted.returncode:
+            raise Refused(f'could not extract {head}')
+        # The shared resolver (this checkout's) runs SHA's own exporter hashing code against SHA's tree.
+        code = ('import json, sys; sys.path.insert(0, sys.argv[1]); import placement_publications as p; '
+                'print(json.dumps(p.checkout_fingerprints(sys.argv[2])))')
+        result = subprocess.run([sys.executable, '-I', '-c', code, str(REPO / 'scripts/lib'), directory],
+                                capture_output=True, text=True, timeout=600, cwd=directory)
+        if result.returncode:
+            raise Refused(f'computing {head[:12]} fingerprints failed: {result.stderr.strip()[-400:]}')
+        return json.loads(result.stdout)
+
+
+def read_inputs(path):
+    return json.loads((path / 'INPUTS.json').read_text())
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with open(path, 'rb') as stream:
+        for block in iter(lambda: stream.read(1 << 20), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def publication_name(store, given):
+    """A named publication must be a real directory directly in its store."""
+    path = Path(given).expanduser()
+    path = path if path.is_absolute() else store / path
+    if path.is_symlink() or not path.is_dir():
+        raise Refused(f'{path} is not a real publication directory')
+    if Path(os.path.realpath(path)).parent != Path(os.path.realpath(store)) or path.name == 'current':
+        raise Refused(f'{path} is not a publication directly in {store}')
+    return path.name
+
+
+def plan(args, local, fingerprints=head_fingerprints, view=pr_view):
+    pr = view(args.pr)
+    if pr.get('state') != 'OPEN':
+        raise Refused(f'PR #{args.pr} is {pr.get("state")}')
+    if pr.get('isDraft'):
+        raise Refused(f'PR #{args.pr} is a draft; mark it ready first')
+    if pr.get('baseRefName') != BASE:
+        raise Refused(f'PR #{args.pr} targets {pr.get("baseRefName")}, not {BASE}')
+    if pr.get('headRefOid') != args.match_head_commit:
+        raise Refused(f'PR #{args.pr} head is {pr.get("headRefOid")}, not {args.match_head_commit}')
+    base, head = fetch(args.pr)
+    if head != args.match_head_commit:
+        raise Refused(f'fetched PR head {head} differs from {args.match_head_commit}')
+    if subprocess.run(['git', '-C', str(REPO), 'merge-base', '--is-ancestor', base, head]).returncode:
+        raise Refused(f'{head[:12]} does not contain origin/{BASE} {base[:12]}; rebase or merge {BASE} first')
+    expected = fingerprints(head)
+    result = Plan(args.pr, head, base)
+    for kind, given, digest in (('all', args.publication, args.inputs_sha256),
+                                ('v4', args.v4_publication, args.v4_inputs_sha256)):
+        store = local.store(kind)
+        if given:
+            name = publication_name(store, given)
+            target = Target(kind, name, digest, named=True)
+            metadata = read_inputs(store / name)
+            if metadata.get('engine_commit') != head:
+                raise Refused(f'{STORES[kind]}/{name} was published from {metadata.get("engine_commit")}, not {head}')
+            changes = store / name / 'CHANGES.json'
+            if changes.is_file():
+                report = json.loads(changes.read_text())
+                if report.get('leaks') or report.get('sm170_mismatches'):
+                    raise Refused(f'{STORES[kind]}/{name} CHANGES.json lists leaks or SM 170/188 mismatches')
+        else:
+            current = store / 'current'
+            if not current.is_symlink():
+                raise Refused(f'{current} is missing; name the publication to promote')
+            name = publication_name(store, os.readlink(current))
+            metadata = read_inputs(store / name)
+            target = Target(kind, name, sha256(store / name / 'INPUTS.json'), named=False)
+        recorded = {key: metadata.get(key) for key in FINGERPRINT}
+        wanted = {key: expected[kind].get(key) for key in FINGERPRINT}
+        if recorded != wanted:
+            differing = []
+            for tier in FINGERPRINT[2:]:
+                ours, theirs = wanted[tier] or {}, recorded[tier] or {}
+                differing += ([tier] if wanted[tier] is None or recorded[tier] is None else
+                              sorted(key for key in ours.keys() | theirs.keys() if ours.get(key) != theirs.get(key)))
+            pin = [key for key in FINGERPRINT[:2] if recorded[key] != wanted[key]]
+            which = 'named publication' if given else f'current ({name[:12]})'
+            raise Refused(f'{head[:12]} changes {STORES[kind]} inputs vs the {which}: '
+                          f'{", ".join(pin + differing[:8]) or "fingerprint"}'
+                          f'{f" (+{len(differing) - 8} more)" if len(differing) > 8 else ""}; '
+                          + ('publish from this head' if given else 'publish from this head and pass it'))
+        result.targets.append(target)
+    return result
+
+
+def verify_on(host, target, directory=None):
+    directory = directory or host.store(target.kind) / target.name
+    return host.op('verify', directory, target.inputs_sha256)
+
+
+def stage(hosts, targets, dry_run):
+    """Every host holds every target, byte-verified; copies go to .tmp then rename."""
+    local = hosts[0]
+    for target in targets:
+        reply = verify_on(local, target)
+        if not reply['ok']:
+            raise Refused(f'{local.name}: {STORES[target.kind]}/{target.name}: {reply["error"]}')
+        for host in hosts[1:]:
+            final = host.store(target.kind) / target.name
+            reply = verify_on(host, target)
+            if reply['ok']:
+                continue
+            if reply['exists']:
+                raise Refused(f'{host.name}: {final} differs: {reply["error"]}')
+            if dry_run:
+                log(f'would copy {STORES[target.kind]}/{target.name} to {host.name}')
+                continue
+            temporary = final.parent / f'.{target.name}.tmp-{uuid.uuid4().hex[:8]}'
+            log(f'copying {STORES[target.kind]}/{target.name} to {host.name}:{temporary}')
+            try:
+                host.transport.copy(local.store(target.kind) / target.name, temporary)
+                reply = verify_on(host, target, temporary)
+                if not reply['ok']:
+                    raise Refused(f'{host.name}: copied {temporary} failed verification: {reply["error"]}')
+                reply = host.op('install', temporary, final)
+                if not reply['ok']:
+                    raise Refused(f'{host.name}: {reply["error"]}')
+            except BaseException:
+                host.op('discard', temporary)
+                raise
+
+
+def merge(plan_, merge_pr=pr_merge):
+    merge_pr(plan_.pr, plan_.head)
+    git('fetch', '--quiet', 'origin', f'+refs/heads/{BASE}:refs/remotes/origin/{BASE}')
+    dev = git('rev-parse', f'refs/remotes/origin/{BASE}')
+    parents = git('rev-list', '--parents', '-n', '1', dev).split()[1:]
+    if parents != [plan_.base, plan_.head]:
+        raise Refused(f'origin/{BASE} {dev[:12]} has parents {parents}, not ({plan_.base[:12]}, {plan_.head[:12]}): '
+                      'another merge landed concurrently; current was NOT flipped. Check its inputs and rerun the flip.')
+    return dev
+
+
+def promote(hosts, targets):
+    for host in hosts:
+        for target in targets:
+            reply = host.op('flip', host.store(target.kind), target.name)
+            if not reply['ok']:
+                raise Refused(f'{host.name}: flipping {STORES[target.kind]}/current failed: {reply["error"]}')
+    links, problems = [], []
+    for host in hosts:
+        for target in targets:
+            reply = host.op('readback', host.store(target.kind))
+            links.append(f'{host.name}:{host.store(target.kind)}/current -> {reply.get("target")}')
+            if not reply['ok'] or reply['target'] != target.name or reply['inputs_sha256'] != target.inputs_sha256:
+                problems.append(f'{host.name} {STORES[target.kind]}: {reply}')
+    return links, problems
+
+
+def hosts_for(args):
+    local = Host(platform.node().split('.')[0], BUILDS, LocalTransport())
+    return [local, *(Host(name, BUILDS, SshTransport(name)) for name in args.host)]
+
+
+def run(args, hosts, fingerprints=head_fingerprints, view=pr_view, merge_pr=pr_merge):
+    try:
+        return land(args, hosts, fingerprints, view, merge_pr)
+    finally:
+        subprocess.run(['git', '-C', str(REPO), 'update-ref', '-d', f'refs/land-pr/{args.pr}'], capture_output=True)
+
+
+def land(args, hosts, fingerprints, view, merge_pr):
+    try:
+        planned = plan(args, hosts[0], fingerprints, view)
+        for target in planned.targets:
+            log(f'{STORES[target.kind]}: {target.name} ({"named" if target.named else "current, unchanged"}) '
+                f'INPUTS.json {target.inputs_sha256[:12]}')
+        stage(hosts, planned.targets, args.dry_run)
+        if args.dry_run:
+            print(f'dry run: PR #{planned.pr} at {planned.head} is ready to land; nothing changed')
+            return 0
+        dev = merge(planned, merge_pr)
+    except Refused as error:
+        log(f'REFUSED before merging: {error}')
+        return 2
+    try:
+        links, problems = promote(hosts, planned.targets)
+    except Refused as error:
+        log(f'MERGED as {BASE} {dev} but promotion FAILED: {error}')
+        return 3
+    print(f'merged PR #{planned.pr}: {BASE} {dev}')
+    for line in links:
+        print(line)
+    if problems:
+        log('MERGED but hosts disagree after promotion: ' + '; '.join(problems))
+        return 3
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('pr', type=int)
+    parser.add_argument('--match-head-commit', required=True)
+    parser.add_argument('--publication', help='all-family publication directory (name or path in the store)')
+    parser.add_argument('--inputs-sha256', help="sha256 of the publication's INPUTS.json")
+    parser.add_argument('--v4-publication', help='V4 publication directory (name or path in the store)')
+    parser.add_argument('--v4-inputs-sha256', help="sha256 of the V4 publication's INPUTS.json")
+    parser.add_argument('--host', action='append', help='other hosts to promote on (default: maxq)')
+    parser.add_argument('--dry-run', action='store_true', help='check and report; merge and change nothing')
+    args = parser.parse_args(argv)
+    args.host = args.host if args.host is not None else ['maxq']
+    if not SHA.fullmatch(args.match_head_commit):
+        parser.error('--match-head-commit must be a full 40-hex SHA')
+    for given, digest, flag in ((args.publication, args.inputs_sha256, '--inputs-sha256'),
+                                (args.v4_publication, args.v4_inputs_sha256, '--v4-inputs-sha256')):
+        if bool(given) != bool(digest):
+            parser.error(f'a publication and its {flag} go together')
+        if digest and not HEX.fullmatch(digest):
+            parser.error(f'{flag} must be 64 hex characters')
+    BUILDS.mkdir(parents=True, exist_ok=True)
+    with open(BUILDS.parent / 'land-pr.lock', 'a') as guard:
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            log('another land-pr is running')
+            return 2
+        return run(args, hosts_for(args))
+
+
+if __name__ == '__main__':
+    sys.exit(main())

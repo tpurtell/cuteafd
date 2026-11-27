@@ -995,6 +995,18 @@ def worker(payload):
     if torch.cuda.is_initialized():
         raise RuntimeError("SM comparison initialized CUDA")
     (Path(payload["output"]) / "comparison-plans.json").write_text(json.dumps(plans, indent=2) + "\n")
+    # Fingerprint every exporter as provenance without recording them as this
+    # job's source reads: a read here would make every job depend on every
+    # exporter and defeat Stage-0 skipping (#2885).
+    active = recorder.active if recorder is not None else False
+    if recorder is not None:
+        recorder.active = False
+    try:
+        export_sources = {str(source.relative_to(ROOT)): sha(source.read_bytes())
+                          for source in sorted((ROOT / "python/tools/aot").glob("*.py"))}
+    finally:
+        if recorder is not None:
+            recorder.active = active
     summary = {"sms": payload["sms"], "capability": list(capability), "cuda_initialized": False,
                "sparkinfer_revision": _pinned_sparkinfer.REVISION,
                "source_tree_sha256": _pinned_sparkinfer.LOCK_DATA["source_tree_sha256"],
@@ -1002,8 +1014,7 @@ def worker(payload):
                "build_kind": os.environ.get("CUTEAFD_BUILD_KIND", "development"),
                "environment": {key: os.environ[key] for key in ("CUTEAFD_EXPORT_NARROW_AOT", "CUTEAFD_EXPORT_HC_LAGGED")},
                "exporter_sha256": sha(path.read_bytes()), "comparison_script_sha256": sha(Path(__file__).read_bytes()),
-               "export_sources_sha256": {str(source.relative_to(ROOT)): sha(source.read_bytes())
-                   for source in sorted((ROOT / "python/tools/aot").glob("*.py"))},
+               "export_sources_sha256": export_sources,
                "max_shared_memory_per_block": 101376, "max_shared_memory_per_multiprocessor": 102400,
                "seconds": time.monotonic() - start}
     if recorder is not None:
@@ -1260,16 +1271,6 @@ def parse_sms(value):
     return sms
 
 
-def v4_placement_sources():
-    # Keep this set identical to plan::testing::v4_placement_source_hashes.
-    paths = {ROOT / "scripts/build/compare-sm-exports.py", ROOT / "scripts/build/kernel-records.py",
-             ROOT / "scripts/build/export-placement-inputs.py"}
-    for directory in ("python/tools/aot", "python/tools/lib"):
-        paths.update((ROOT / directory).rglob("*.py"))
-    paths.update((ROOT / "scripts/build").glob("*.json"))
-    return {str(path.relative_to(ROOT)): sha(path.read_bytes()) for path in sorted(paths)}
-
-
 def v4_export_jobs():
     """V4 case exports. Spark worlds charge native expert-wave segment programs
     from the case manifest, so the exported program set carries the dsv4f/dsv4p
@@ -1289,6 +1290,8 @@ def v4_export_jobs():
 def v4_placement_inputs(destination, staging, timeout, workers, previous=None, backend_cache=None,
                         verify_skips=False, expect=None):
     """Publish compiler-produced planner metadata, never inferred scratch sizes."""
+    publisher = load_file("v4_publication_records", ROOT / "scripts/build/export-placement-inputs.py")
+    publisher.refuse_current(destination, staging)  # only scripts/dev/land-pr flips current
     filesystem = load_file("cuteafd_build_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
     for path in (destination, staging):
         filesystem.check_path(str(path))
@@ -1297,10 +1300,10 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
         path.mkdir(parents=True, exist_ok=True)
     engine = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
     lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
-    sources = v4_placement_sources()
+    publisher.require_job_specs()
+    sources = publisher.source_hashes("v4")
     exports = v4_export_jobs()
 
-    publisher = load_file("v4_publication_records", ROOT / "scripts/build/export-placement-inputs.py")
     if backend_cache:
         filesystem.check_path(str(backend_cache))
     verify_skips = verify_skips or os.environ.get("CUTEAFD_BUILD_KIND") == "release"
@@ -1310,24 +1313,21 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
         summaries = list(pool.map(compile_one, exports))
-    if sources != v4_placement_sources() or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
+    if sources != publisher.source_hashes("v4") or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
         raise ValueError("V4 export sources changed during compilation")
     for summary in summaries:
         if (summary.get("sparkinfer_revision") != lock["revision"]
                 or summary.get("source_tree_sha256") != lock["source_tree_sha256"]
                 or summary.get("cuda_initialized") is not False):
             raise ValueError("V4 worker provenance differs from captured source lock or initialized CUDA")
-    publisher = load_file("v4_publication_records", ROOT / "scripts/build/export-placement-inputs.py")
     records = publisher.publication_records(staging, [(name, exporter, extra) for name, exporter, extra in exports])
+    publisher.require_reads_hashed(summaries, records, sources["engine_sources_sha256"])
     for context in (131072, 1048576):
         for model in ("flash", "pro"):
             for rtx in (1, 2):
                 target = destination / f"{model}-{rtx}-{context}"
                 target.mkdir()
                 programs = json.loads((staging / str(context) / "dsv4_programs.json").read_text())
-                if records:
-                    programs["kernel_records"] = {name: record for name, record in records.items()
-                                                  if name.startswith(str(context) + "/")}
                 (target / "PROGRAMS.json").write_text(json.dumps(programs, indent=2) + "\n")
                 if model == "pro":
                     package = target / "exl3/exl3-dsv4p-k23"
@@ -1335,17 +1335,11 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
                         copied = package / source.relative_to(staging / "exl3")
                         copied.parent.mkdir(parents=True, exist_ok=True)
                         shutil.copy2(source, copied)
-    for name, _, _ in exports:
-        for source in (staging / name).rglob("*.json"):
-            if source.name == "program-timings.json":
-                continue
-            target = destination / ".workers" / name / source.relative_to(staging / name)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+    publisher.copy_replay_metadata(staging, destination, exports)
     files = {str(path.relative_to(destination)): sha(path.read_bytes())
              for path in sorted(destination.rglob("*.json"))}
     provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],
-                      source_tree_sha256=lock["source_tree_sha256"], engine_sources_sha256=sources,
+                      source_tree_sha256=lock["source_tree_sha256"], **sources,
                       exports=summaries, files=files, program_records=records)
     (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
     sm_report = publisher.kernel_records.change_report({}, records)
@@ -1365,7 +1359,8 @@ def v4_placement_inputs(destination, staging, timeout, workers, previous=None, b
         records_module.write_report(destination, report)
         if report["leaks"]:
             raise ValueError(f"UNEXPECTED V4 KERNEL CHANGES outside --expect: {report['leaks']}")
-    print(f"Published V4 placement inputs: {destination}", flush=True)
+    print(f"Published V4 placement inputs: {destination}; INPUTS.json sha256 "
+          f"{sha((destination / 'INPUTS.json').read_bytes())}", flush=True)
 
 
 def main():
@@ -1409,6 +1404,8 @@ def main():
             parser.error("--workers and --timeout must be positive")
         if args.expect and not args.previous:
             parser.error("--expect requires --previous")
+        load_file("v4_current_guard", ROOT / "scripts/build/export-placement-inputs.py").refuse_current(
+            args.v4_placement_inputs.expanduser().absolute(), args.output_dir.expanduser().absolute())
         v4_placement_inputs(args.v4_placement_inputs.expanduser().resolve(),
                             args.output_dir.expanduser().resolve(), args.timeout, args.workers,
                             args.previous.expanduser().resolve() if args.previous else None,

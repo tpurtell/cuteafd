@@ -12,6 +12,15 @@ inventory; CUTEAFD_DEPLOYMENT_TEST_HF_HOME overrides it. Missing required inputs
 fail, including pinned checkpoint revisions and the published placement-inputs
 share/PROGRAMS.json with sibling lib/fp8 and adjacent expert metadata. CUTEAFD_DEPLOYMENT_TEST_PROGRAMS
 overrides manifest discovery; the gate only reads exports, never builds them.
+Before taking a gate lease or compiling, the gate computes the checkout's
+placement inputs key (fork pin, tree hash and export-source fingerprints, by the
+checkout's own exporter code) and points CUTEAFD_DEPLOYMENT_TEST_PROGRAMS and
+CUTEAFD_V4_PLACEMENT_INPUTS at the publication recording that key: current when
+it matches, else any matching publication in the store, so a branch on an older
+base tests against its own compiled facts. With no match it fails in seconds,
+naming the differing sources and the export command (V4 only for --full, which
+runs the live V4 planners). An explicit variable is kept and must match too.
+The receipt records each publication used and why.
 Receipts name every exclusion; compiled test inventories reject dead exclusion
 IDs. --slow separately adds the explicit ignored CPU soaks and is also required at release cuts. Install cargo-nextest
 without root into the persistent architecture Cargo home (see AGENTS.md).
@@ -686,6 +695,85 @@ def gate_lease(directory=None, slots=None, timeout=GATE_LEASE_WAIT):
         lease.close()
 
 
+def _placement_publications(source):
+    spec = importlib.util.spec_from_file_location('cuteafd_placement_publications',
+                                                  REPO / 'scripts/lib/placement_publications.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+PLACEMENT_VARIABLES = {'all': 'CUTEAFD_DEPLOYMENT_TEST_PROGRAMS', 'v4': 'CUTEAFD_V4_PLACEMENT_INPUTS'}
+EXPORT_COMMANDS = {
+    'all': ('scripts/build/cuteafd-dev.sh cpu -- python3 scripts/build/export-placement-inputs.py '
+            '--output <store>/placement-inputs/<sha> --staging <store>/placement-inputs/staging-<sha> --previous <current>'),
+    'v4': ('scripts/build/cuteafd-dev.sh cpu -- python3 scripts/build/compare-sm-exports.py '
+           '--v4-placement-inputs <store>/v4-placement-inputs/<sha> --output-dir <store>/v4-placement-inputs/staging-<sha>'),
+}
+
+
+def placement_inputs(source, env, args):
+    """Choose the publications whose recorded inputs key equals this checkout's (no Cargo, no lease).
+
+    Returns (record, error). record maps 'all'/'v4' to the chosen path, how it
+    was chosen and the key; error is set when a required inventory has no match.
+    """
+    if not args.cargo or args.skip_live_planners:
+        return dict(skipped='--skip-live-planners' if args.cargo else 'no cargo suite'), None
+    publications = _placement_publications(source)
+    started = time.monotonic()
+    try:
+        fingerprints = publications.checkout_fingerprints(source)
+    except (OSError, ValueError, KeyError, AttributeError) as error:
+        return {}, f'cannot compute placement inputs key for {source}: {error}'
+    builds = Path(env.get('HOME', str(Path.home()))) / '.cache/cuteafd/builds'
+    required = {'all': not getattr(args, 'cargo_filter', None),
+                'v4': getattr(args, 'full', False) and not getattr(args, 'cargo_filter', None)}
+    record, errors = {}, []
+    for kind, variable in PLACEMENT_VARIABLES.items():
+        key = publications.inputs_key(fingerprints[kind])
+        store = builds / publications.STORES[kind]
+        given = env.get(variable)
+        if given:
+            root = Path(given)
+            root = root.parent.parent if kind == 'all' else root
+            recorded = publications.recorded_fingerprint(root)
+            matches = recorded is not None and publications.inputs_key(recorded) == key
+            entry = dict(path=given, how=f'explicit {variable}', key=key, matches=matches)
+            if not matches:
+                differing = publications.differing(fingerprints[kind], recorded)
+                errors.append(f'explicit {variable}={given} does not record this checkout\'s inputs key {key[:16]} '
+                              f'(differs: {", ".join(differing[:6])}{" ..." if len(differing) > 6 else ""})')
+        else:
+            path, how = publications.resolve(store, fingerprints[kind])
+            entry = dict(key=key, how=how, path=None)
+            if path is not None:
+                entry['path'] = str(path / 'share/PROGRAMS.json') if kind == 'all' else str(path)
+                entry['engine_commit'] = (publications.recorded_fingerprint(path) or {}).get('engine_commit')
+            elif required[kind]:
+                current = publications.recorded_fingerprint(store / 'current')
+                differing = publications.differing(fingerprints[kind], current)
+                compiled = getattr(publications, 'resolve_compiled', lambda *a: None)(store, fingerprints[kind])
+                remedy = (f're-attest it in seconds, no compile (only the selection tier differs): '
+                          f'python3 scripts/build/export-placement-inputs.py --reattest-from {compiled} '
+                          f'--output {store}/<sha>{" --v4" if kind == "v4" else ""}'
+                          if compiled is not None else f'publish one from this commit: {EXPORT_COMMANDS[kind]}')
+                errors.append(f'no {publications.STORES[kind]} publication records this checkout\'s inputs key '
+                              f'{key[:16]} (vs current: {", ".join(differing[:6])}{" ..." if len(differing) > 6 else ""}); '
+                              f'{remedy}, then rerun (or set {variable})')
+        record[kind] = entry
+    record['seconds'] = round(time.monotonic() - started, 3)
+    return record, '; '.join(errors) or None
+
+
+def apply_placement_inputs(env, record):
+    for kind, variable in PLACEMENT_VARIABLES.items():
+        entry = record.get(kind) or {}
+        if entry.get('path') and not env.get(variable):
+            env[variable] = entry['path']
+    return env
+
+
 def validate_full_test_ids(source, root, args, env):
     """Check exclusions against compiled libtest IDs, independently of the runner."""
     path = root / 'logs/cargo-test-inventory.log'
@@ -715,6 +803,7 @@ def cargo(source, root, args, env):
            'RUST_TEST_THREADS': str(getattr(args, 'cargo_jobs', 16))}
     env.setdefault('CUTEAFD_DEPLOYMENT_TEST_PROGRAMS',
                    str(Path(env.get('HOME', str(Path.home()))) / '.cache/cuteafd/builds/placement-inputs/current/share/PROGRAMS.json'))
+    placement = getattr(args, 'placement_inputs', None)
     log('cargo: compiling tests (build slot held while compiling)')
     build_log = root / 'logs/cargo-build.log'
     code, build_s = run_logged(['nice', '-n', '19', str(source / 'scripts/build/build-slot.sh'), 'cargo', 'test', '--workspace', '--locked',
@@ -722,7 +811,8 @@ def cargo(source, root, args, env):
     complete = cargo_build_succeeded(build_log)
     result = dict(suite='cargo', build_exit=code, build_complete=complete, build_s=round(build_s), build_log=str(build_log),
                   compiler_cache=compiler_cache_receipt(env, target),
-                  scrubbed_env=[], deployment_test_programs=env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'])
+                  scrubbed_env=[], deployment_test_programs=env['CUTEAFD_DEPLOYMENT_TEST_PROGRAMS'],
+                  **({'placement_inputs': placement} if placement is not None else {}))
     if code or not complete:
         tail = [line for line in build_log.read_text(errors='replace').splitlines() if line.startswith('error')][:5]
         return {**result, 'status': 'failed', 'error': 'compile failed: ' + ('; '.join(tail) or
@@ -932,6 +1022,15 @@ def gate(source, root, args, owned=False):
     # Never bypass Cargo caches unless TJ asks, release requires it, or disk is short.
     # Only script fixtures scrub ambient launchers; BUILD_CACHES=off is global.
     env = {**os.environ, 'TMPDIR': str(root / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'}
+    placement, error = placement_inputs(source, env, args)
+    args.placement_inputs = placement
+    if error:
+        log(f'placement inputs: {error}')
+        return dict(source=str(source), head=head, dirty=False, moved=False, scratch=[], scrubbed_env=[],
+                    placement_inputs=placement, status='failed',
+                    suites=[dict(suite='cargo', status='failed', error=f'placement inputs: {error}',
+                                 passed=0, failed=0, failing=[], placement_inputs=placement)])
+    env = apply_placement_inputs(env, placement)
     scrubbed_env = []
     requested = [fn for enabled, fn in ((args.cargo, cargo), (args.scripts, scripts),
                                          (args.benches, benches)) if enabled]
@@ -952,7 +1051,7 @@ def gate(source, root, args, owned=False):
     dirty = bool(checked(['git', '-C', str(source), 'status', '--porcelain', '--untracked-files=no']).strip())
     passed = suites and all(s['status'] == 'pass' for s in suites) and not moved
     return dict(source=str(source), head=head, dirty=dirty, moved=moved, suites=suites, scratch=scratch,
-                scrubbed_env=scrubbed_env, status='pass' if passed else 'failed')
+                scrubbed_env=scrubbed_env, placement_inputs=placement, status='pass' if passed else 'failed')
 
 
 def render(record):
@@ -976,6 +1075,12 @@ def render(record):
             note = (note + '; ' if note else '') + f"{test} medians " + ', '.join(f'{k} {v:.0f} us' for k, v in values.items())
         lines.append(f"| {suite['suite']} | {suite['status']} | {suite.get('passed', '')} | {suite.get('failed', '')} | "
                      f"{suite.get('build_s', 0) + suite.get('inventory_s', 0) + suite.get('test_s', 0)} | {note} |")
+    for suite in record['suites']:
+        placement = suite.get('placement_inputs') or {}
+        for kind in ('all', 'v4'):
+            entry = placement.get(kind)
+            if entry and entry.get('path'):
+                lines.append(f"\nPlacement inputs ({kind}): `{entry['path']}` ({entry['how']}, key {entry['key'][:16]})")
     for suite in record['suites']:
         if suite.get('failing'):
             lines += ['', f"## Failing {suite['suite']} ids", *[f'- {i}' for i in suite['failing']]]
@@ -1036,6 +1141,17 @@ def main():
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGHUP, interrupt)
     signal.signal(signal.SIGINT, interrupt)
+    if not args.base:
+        # Fail in seconds, before waiting for a lease or compiling anything.
+        _, error = placement_inputs(args.source.resolve(), dict(os.environ), args)
+        if error:
+            record = dict(task=args.task, verdict='failed', status='failed', exit=1, error=f'placement inputs: {error}',
+                          head=checked(['git', '-C', str(args.source), 'rev-parse', 'HEAD']).strip(),
+                          dirty=False, suites=[dict(suite='cargo', status='failed', error=f'placement inputs: {error}')])
+            (root / 'cpu-gate.json').write_text(json.dumps(record, indent=2) + '\n')
+            (root / 'cpu-gate.md').write_text(render(record))
+            log(f'verdict failed before compiling: placement inputs: {error}')
+            return 1
     try:
         whole_gate = (args.cargo and not args.cargo_filter) or (args.scripts and args.pytest_target == 'scripts/tests') or args.benches
         with gate_lease() if whole_gate else nullcontext(None) as lease:

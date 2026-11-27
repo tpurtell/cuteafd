@@ -2,8 +2,10 @@
 """Publish CPU-compiled planner inputs for the live installed checkpoint inventory.
 
 Run through scripts/build/cuteafd-dev.sh cpu, with --output and --staging on
-NVMe. Publication never switches current; validate the candidate with
-CUTEAFD_DEPLOYMENT_TEST_PROGRAMS=<output>/share/PROGRAMS.json before promoting it.
+NVMe. Publication never switches current, and refuses an output or staging
+path that is or resolves through a store's current link: validate the candidate
+with CUTEAFD_DEPLOYMENT_TEST_PROGRAMS=<output>/share/PROGRAMS.json, and let the
+coordinator's scripts/dev/land-pr merge and promote it on every host.
 """
 from __future__ import annotations
 
@@ -63,16 +65,51 @@ def live_configs(root=ROOT):
                   if str(path.relative_to(root)) not in retired)
 
 
-def source_hashes():
-    # Keep identical to plan::testing::placement_input_source_hashes. Card report
-    # rewrites do not affect compilation; only the selected example inventory does.
-    paths = [ROOT / "scripts/build/export-placement-inputs.py", ROOT / "scripts/build/kernel-records.py",
-             ROOT / "scripts/build/release-scope.py", ROOT / "scripts/lib/wip_aot_scopes.py", ROOT / FP8_CAPACITY_RECIPE,
-             ROOT / "rust/crates/cuteafd-loader/src/serving_capacity/spark_memory.json",
-             *(ROOT / config for config in live_configs(ROOT))]
-    return {**compare.v4_placement_sources(),
-            **{str(path.relative_to(ROOT)): compare.sha(path.read_bytes()) for path in paths},
-            "installed_live_configs": compare.sha("\n".join(live_configs(ROOT)).encode())}
+SOURCES = Path("scripts/build/placement-sources.json")
+JOBS = Path("scripts/build/placement-jobs.json")
+
+
+def placement_sources(root=ROOT):
+    return json.loads((root / SOURCES).read_text())
+
+
+def hashed(root, paths):
+    return {str(path): compare.sha((root / path).read_bytes()) for path in sorted(set(map(str, paths)))}
+
+
+def compiled_hashes(kind, root=ROOT):
+    """Tier 1: files whose bytes can change compiled programs, plus the derived job specs.
+
+    placement-sources.json lists them exactly (publish refuses a recorded read
+    outside the list); placement-jobs.json is what export_jobs() derives, so a
+    config edit that selects no new job leaves this tier unchanged.
+    Keep identical to plan::inputs::compiled_source_hashes."""
+    return hashed(root, [*placement_sources(root)["compiled"][kind], SOURCES, JOBS])
+
+
+def selection_hashes(kind, root=ROOT):
+    """Tier 2: inputs that select what installed planner tests plan and admit
+    (live example configs and their model revisions, measured Spark memory)
+    without changing a compiled program. A change here needs a re-attested
+    publication (--reattest-from), not a compile.
+    Keep identical to plan::inputs::selection_source_hashes."""
+    spec = placement_sources(root)["selection"][kind]
+    files = hashed(root, spec["files"])
+    if spec["live_configs"]:
+        configs = live_configs(root)
+        files.update(hashed(root, configs))
+        files["installed_live_configs"] = compare.sha("\n".join(configs).encode())
+    return files
+
+
+def source_hashes(kind="all", root=ROOT):
+    return {"engine_sources_sha256": compiled_hashes(kind, root),
+            "selection_sources_sha256": selection_hashes(kind, root)}
+
+
+def derived_jobs():
+    """The checked-in placement-jobs.json must equal this (scripts/tests)."""
+    return {"all": [list(job) for job in export_jobs()], "v4": [list(job) for job in compare.v4_export_jobs()]}
 
 
 def export_jobs():
@@ -257,7 +294,28 @@ def compile_program_shards(job, staging, previous, lock, timeout, backend_cache,
     return summary
 
 
+# Fields publication_records adds to a worker's raw program-records.json entries.
+DERIVED_RECORD_FIELDS = ("family", "planner_metadata", "scratch_bytes_at_capacity", "group")
+WORKER_RECORDS = "program-records.json"
+
+
+def worker_records(program_records, name):
+    """A job's raw worker program-records.json, rebuilt from the publication's program_records.
+
+    Publications keep the records once (INPUTS.json program_records); the raw
+    per-job file is the same entries for that group minus the derived fields.
+    """
+    prefix = name + "/"
+    return {path[len(prefix):]: {key: value for key, value in record.items() if key not in DERIVED_RECORD_FIELDS}
+            for path, record in program_records.items() if path.startswith(prefix)}
+
+
+def worker_records_bytes(records):
+    return (json.dumps(records, indent=2, sort_keys=True) + "\n").encode()
+
+
 def verified_job_files(previous, name):
+    """(directory, {relative: checksum}, rebuilt program records or None) for one replayable job."""
     metadata = json.loads((previous / "INPUTS.json").read_text())
     prefix = ".workers/" + name + "/"
     files = {path[len(prefix):]: checksum for path, checksum in metadata["files"].items()
@@ -269,7 +327,11 @@ def verified_job_files(previous, name):
         path = Path(relative)
         if path.is_absolute() or ".." in path.parts or compare.sha((directory / path).read_bytes()) != checksum:
             raise ValueError(f"invalid or corrupt replay file: {name}/{relative}")
-    return directory, files
+    rebuilt = None
+    if WORKER_RECORDS not in files:
+        records = worker_records(metadata.get("program_records") or {}, name)
+        rebuilt = worker_records_bytes(records) if records else None
+    return directory, files, rebuilt
 
 
 def refresh_replay_provenance(directory, lock):
@@ -308,12 +370,16 @@ def verified_metadata_bytes(path, lock):
     return json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
 
 
-def verify_job_metadata(previous, current, lock, name):
+def verify_job_metadata(previous, current, lock, name, prior_records=None):
     old = {path.relative_to(previous): path for path in previous.rglob("*.json") if path.name != "program-timings.json"}
     new = {path.relative_to(current): path for path in current.rglob("*.json") if path.name != "program-timings.json"}
-    changed = sorted(str(path) for path in old.keys() | new.keys()
-                     if path not in old or path not in new
-                     or verified_metadata_bytes(old[path], lock) != verified_metadata_bytes(new[path], lock))
+    with tempfile.TemporaryDirectory() as scratch:
+        if prior_records is not None and Path(WORKER_RECORDS) not in old:
+            old[Path(WORKER_RECORDS)] = Path(scratch) / WORKER_RECORDS
+            old[Path(WORKER_RECORDS)].write_bytes(prior_records)
+        changed = sorted(str(path) for path in old.keys() | new.keys()
+                         if path not in old or path not in new
+                         or verified_metadata_bytes(old[path], lock) != verified_metadata_bytes(new[path], lock))
     if changed:
         raise ValueError(f"--verify-skips changed IR or placement metadata in skipped job {name}: {changed}")
 
@@ -368,7 +434,7 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
     prior = verified_job_files(previous, name) if previous else None
     skipped = False
     if prior:
-        prior_directory, prior_files = prior
+        prior_directory, prior_files, prior_records = prior
         prior_context = json.loads((prior_directory / "comparison-context.json").read_text())
         current_inputs = kernel_records.stage0_inputs(ROOT, payload, (12, 0))
         triggers = kernel_records.job_candidates(ROOT, prior_context, current_inputs)
@@ -379,6 +445,8 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
                 target = output / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(prior_directory / relative, target)
+            if prior_records is not None:
+                (output / WORKER_RECORDS).write_bytes(prior_records)
             refresh_replay_provenance(output, lock)
             summary = json.loads((output / "comparison-context.json").read_text())
             summary["execution_stats"] = {"stage0_skipped": True, "verified_skip": False,
@@ -388,7 +456,7 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
         summary = compile_program_shards(job, staging, previous, lock, timeout, backend_cache,
                                          verify_skips, program_pool, workers)
         if skipped:
-            verify_job_metadata(prior_directory, output, lock, name)
+            verify_job_metadata(prior_directory, output, lock, name, prior_records)
         return summary
     env = dict(os.environ, CUDA_VISIBLE_DEVICES="", CUTEAFD_SOURCE_ROOT=str(ROOT),
                CUTEAFD_SPARKINFER_SOURCE_DIR=str(ROOT / "third_party/sparkinfer"),
@@ -398,7 +466,7 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
         subprocess.run(worker_command(payload, staging), env=env, stdout=log,
                        stderr=subprocess.STDOUT, check=True, timeout=timeout)
     if skipped:
-        verify_job_metadata(prior_directory, output, lock, name)
+        verify_job_metadata(prior_directory, output, lock, name, prior_records)
     summary = json.loads((output / "comparison-context.json").read_text())
     reuse = summary.get("backend_reuse", {})
     sm170 = check_job_sm170(job, staging, previous, timeout, env, verify_all=verify_skips)
@@ -408,8 +476,21 @@ def compile_job(job, staging, previous, lock, timeout, backend_cache=None, verif
     return summary
 
 
+def refuse_current(*paths):
+    """Only scripts/dev/land-pr flips a store's current link (after the merge)."""
+    for path in paths:
+        path = Path(path)
+        for part in (path, *path.parents):
+            link = part.parent / "current"
+            if part.name == "current" or (link.is_symlink() and part.parent != part
+                                          and os.path.realpath(link) == os.path.realpath(part)):
+                raise ValueError(f"refusing {path}: publications never write a store's current link or its "
+                                 "target; publish into <store>/<sha> and promote with scripts/dev/land-pr")
+
+
 def publish(destination, staging, timeout, workers, previous=None, expect=None,
-            backend_cache=None, verify_skips=False, rsync_hosts=()):
+            backend_cache=None, verify_skips=False):
+    refuse_current(destination, staging)
     filesystem = compare.load_file("placement_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
     if backend_cache:
         filesystem.check_path(str(backend_cache))
@@ -420,9 +501,10 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
             raise ValueError(f"output is not empty: {path}")
         path.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
-    sources = source_hashes()
+    sources = source_hashes("all")
     lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
     engine = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
+    require_job_specs()
     jobs = export_jobs()
 
     def compile_one(job):
@@ -437,7 +519,7 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
             summaries = [programs, *[future.result() for future in pending]]
         else:
             summaries = list(pool.map(compile_one, jobs))
-    if sources != source_hashes() or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
+    if sources != source_hashes("all") or lock != json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text()):
         raise ValueError("placement export sources changed during compilation")
     if any(summary.get("sparkinfer_revision") != lock["revision"]
            or summary.get("source_tree_sha256") != lock["source_tree_sha256"]
@@ -476,24 +558,13 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
             for layout in layouts:
                 (target / layout).mkdir()
             (target / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    # Preserve only the exact metadata needed to replay a job, not heavy objects.
-    for name, _, _ in jobs:
-        for source in (staging / name).rglob("*.json"):
-            if source.name in ("export.log", "program-timings.json"):
-                continue
-            target = destination / ".workers" / name / source.relative_to(staging / name)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, target)
+    copy_replay_metadata(staging, destination, jobs)
     records = publication_records(staging, jobs)
-    if records:
-        programs_path = share / "PROGRAMS.json"
-        programs = json.loads(programs_path.read_text())
-        programs["kernel_records"] = records
-        programs_path.write_text(json.dumps(programs, indent=2) + "\n")
+    require_reads_hashed(summaries, records, sources["engine_sources_sha256"])
     files = {str(path.relative_to(destination)): compare.sha(path.read_bytes())
              for path in sorted(destination.rglob("*.json"))}
     provenance = dict(schema=1, engine_commit=engine, sparkinfer_revision=lock["revision"],
-                      source_tree_sha256=lock["source_tree_sha256"], engine_sources_sha256=sources,
+                      source_tree_sha256=lock["source_tree_sha256"], **sources,
                       exports=summaries, files=files, wall_seconds=round(time.monotonic() - started, 3))
     provenance["program_records"] = records
     (destination / "INPUTS.json").write_text(json.dumps(provenance, indent=2) + "\n")
@@ -515,28 +586,91 @@ def publish(destination, staging, timeout, workers, previous=None, expect=None,
         if report["leaks"]:
             raise ValueError(f"UNEXPECTED KERNEL CHANGES outside --expect: {report['leaks']}")
     print(f"Published placement inputs: {destination}; {provenance['wall_seconds']} s; "
-          f"{sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())} bytes", flush=True)
-    if rsync_hosts:
-        rsync_publication(destination, rsync_hosts, timeout)
+          f"{sum(path.stat().st_size for path in destination.rglob('*') if path.is_file())} bytes; "
+          f"INPUTS.json sha256 {compare.sha((destination / 'INPUTS.json').read_bytes())}", flush=True)
 
 
-def rsync_publication(destination, hosts, timeout=7200):
-    resolved = Path(destination).expanduser().resolve()
-    for required in ("INPUTS.json", "share/PROGRAMS.json"):
-        if not (resolved / required).is_file():
-            raise ValueError(f"missing published placement input {resolved / required}")
-    cleaned = [host.strip() for host in hosts if host and host.strip()]
-    if not cleaned:
-        return
-    with tempfile.TemporaryDirectory() as tmp:
-        current = Path(tmp) / "current"
-        current.symlink_to(resolved.name)
-        for host in cleaned:
-            subprocess.run(["rsync", "-a", "--delete", "--mkpath", f"{resolved}/", f"{host}:{resolved}/"],
-                           check=True, timeout=timeout)
-            subprocess.run(["rsync", "-a", "--mkpath", str(current), f"{host}:{resolved.parent}/"],
-                           check=True, timeout=timeout)
-            print(f"Synced placement inputs to {host}:{resolved} (current -> {resolved.name})", flush=True)
+def require_job_specs():
+    """The checked-in job specs (the compiled-tier fingerprint's stand-in for configs) are current."""
+    recorded = json.loads((ROOT / JOBS).read_text())
+    if recorded != derived_jobs():
+        raise ValueError(f"{JOBS} is stale: regenerate with scripts/build/export-placement-inputs.py --write-jobs")
+
+
+def unhashed_reads(summaries, records, compiled):
+    """Engine files a job actually read that the compiled tier does not hash (fork files are pinned by tree).
+
+    Every program's recorded reads count, and every job's except the scoped
+    program exporter's: its job context deliberately sweeps all of python/tools
+    as a conservative Stage-0 skip key (compare-sm-exports.py worker), not as
+    reads; each of its programs records what it actually read."""
+    reads = set()
+    for summary in summaries:
+        if summary.get("exporter") != "export_b12x_dsv4_aot.py":
+            reads.update(summary.get("source_reads_sha256", {}))
+    for record in records.values():
+        reads.update(record.get("source_reads_sha256", {}))
+    return sorted(path for path in reads if not path.startswith("third_party/") and path not in compiled)
+
+
+def require_reads_hashed(summaries, records, compiled):
+    missing = unhashed_reads(summaries, records, compiled)
+    if missing:
+        raise ValueError(f"exporters read files outside {SOURCES} compiled list: {missing}; add them")
+
+
+def reattest(destination, source, kind="all"):
+    """Publish source's compiled bytes for this checkout when only the selection tier differs.
+
+    The checkout's fork pin and compiled tier must equal what source records,
+    so every compiled byte is the one this checkout would produce; the planner
+    files are copied (reflinked) unchanged and INPUTS.json records this
+    checkout's selection tier and commit. No compile, seconds."""
+    refuse_current(destination)
+    filesystem = compare.load_file("placement_filesystem", ROOT / "scripts/build/assert-build-filesystem.py")
+    filesystem.check_path(str(destination))
+    if destination.exists() and any(destination.iterdir()):
+        raise ValueError(f"output is not empty: {destination}")
+    metadata = json.loads((source / "INPUTS.json").read_text())
+    lock = json.loads((ROOT / "third_party/sparkinfer.lock.json").read_text())
+    sources = source_hashes(kind)
+    if (metadata.get("sparkinfer_revision"), metadata.get("source_tree_sha256")) != (
+            lock["revision"], lock["source_tree_sha256"]):
+        raise ValueError(f"{source} was compiled at a different fork pin; publish with a compile instead")
+    if metadata.get("engine_sources_sha256") != sources["engine_sources_sha256"]:
+        raise ValueError(f"{source} compiled tier differs from this checkout; publish with a compile instead")
+    for name, checksum in metadata["files"].items():
+        if compare.sha((source / name).read_bytes()) != checksum:
+            raise ValueError(f"{source}/{name} differs from its INPUTS.json")
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in metadata["files"]:
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["cp", "--reflink=auto", "--preserve=mode,timestamps", str(source / name), str(target)],
+                       check=True)
+    for name in ("CHANGES.json", "CHANGES.md"):
+        if (source / name).is_file():
+            shutil.copy2(source / name, destination / name)
+    engine = subprocess.check_output(["git", "-C", str(ROOT), "rev-parse", "HEAD"], text=True).strip()
+    metadata.update(engine_commit=engine, **sources, reattested_from=dict(
+        engine_commit=metadata.get("engine_commit"), inputs_sha256=compare.sha((source / "INPUTS.json").read_bytes())))
+    (destination / "INPUTS.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(f"Re-attested placement inputs: {destination} from {source}; INPUTS.json sha256 "
+          f"{compare.sha((destination / 'INPUTS.json').read_bytes())}", flush=True)
+
+
+def copy_replay_metadata(staging, destination, jobs):
+    """Preserve the exact metadata needed to replay each job, not heavy objects.
+
+    Program records are kept once, in INPUTS.json program_records; replay rebuilds
+    each job's raw program-records.json from them (verified_job_files)."""
+    for name, _, _ in jobs:
+        for source in (staging / name).rglob("*.json"):
+            if source.name in ("export.log", "program-timings.json") or source == staging / name / WORKER_RECORDS:
+                continue
+            target = destination / ".workers" / name / source.relative_to(staging / name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
 
 
 def publication_records(staging, jobs):
@@ -594,8 +728,12 @@ def publication_records(staging, jobs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--staging", type=Path, help="staging directory on NVMe (required unless syncing an existing publication with --rsync-host)")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--staging", type=Path, help="staging directory on NVMe")
+    parser.add_argument("--reattest-from", type=Path, help="publication whose compiled tier equals this checkout's: "
+                        "copy its planner files and record this checkout's selection tier (no compile)")
+    parser.add_argument("--v4", action="store_true", help="with --reattest-from: a V4 publication")
+    parser.add_argument("--write-jobs", action="store_true", help=f"rewrite {JOBS} from the derived job specs")
     parser.add_argument("--timeout", type=int, default=7200)
     parser.add_argument("--workers", type=int, default=default_workers(),
                         help="CPU export workers (default: host-admitted export jobs)")
@@ -603,25 +741,36 @@ def main():
     parser.add_argument("--expect", type=Path, help="JSON list of export job groups expected to change")
     parser.add_argument("--backend-cache", type=Path, help="content-addressed lowered-MLIR cache on NVMe")
     parser.add_argument("--verify-skips", action="store_true", help="run skipped frontends and reject changed IR")
-    parser.add_argument("--rsync-host", action="append", default=[],
-                        help="remote host(s) to receive the published directory and current symlink via rsync")
     args = parser.parse_args()
-    hosts = [host.strip() for raw in args.rsync_host for host in raw.split(",") if host.strip()]
+    if args.write_jobs:
+        (ROOT / JOBS).write_text(json.dumps(derived_jobs(), indent=1) + "\n")
+        return
+    if args.output is None:
+        parser.error("--output is required")
+    if args.reattest_from:
+        try:
+            refuse_current(args.output.expanduser().absolute())
+        except ValueError as error:
+            parser.error(str(error))
+        reattest(args.output.expanduser().resolve(), args.reattest_from.expanduser().resolve(),
+                 "v4" if args.v4 else "all")
+        return
+    if args.staging is None:
+        parser.error("--staging is required")
     if args.expect and not args.previous:
         parser.error("--expect requires --previous")
     if args.workers < 1 or args.timeout < 1:
         parser.error("--workers and --timeout must be positive")
+    try:
+        refuse_current(args.output.expanduser().absolute(), args.staging.expanduser().absolute())
+    except ValueError as error:
+        parser.error(str(error))
     output = args.output.expanduser().resolve()
-    if args.staging is None:
-        if not hosts:
-            parser.error("--staging is required unless syncing an existing publication with --rsync-host")
-        rsync_publication(output, hosts, args.timeout)
-        return
     publish(output, args.staging.expanduser().resolve(), args.timeout, args.workers,
             args.previous.expanduser().resolve() if args.previous else None,
             args.expect.expanduser().resolve() if args.expect else None,
             args.backend_cache.expanduser().resolve() if args.backend_cache else None,
-            args.verify_skips, rsync_hosts=hosts)
+            args.verify_skips)
 
 
 if __name__ == "__main__":
