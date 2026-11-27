@@ -6325,6 +6325,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn graph_cycles_complete_by_event_and_drain_only_on_first_touch() {
+        let source = include_str!("execution.rs").split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        assert!(source.contains("graph_device::EventCycles::new("), "Hy4-flash must construct shared EventCycles over rank streams");
+        assert!(!source.contains("observe_completed"), "Hy4-flash completion must not credit host-drain epochs");
+        let end = source.split("    fn end_graph_cycle(").nth(1).unwrap()
+            .split("    pub(super) fn graph_completed(").next().unwrap();
+        let complete = end.find("cycles.complete()").unwrap();
+        let first_touch = end.find("first_touch_pending()").unwrap();
+        assert!(complete < first_touch, "cycle completes by event before the first-touch check");
+        assert!(end[first_touch..].contains("self.drain()"), "only first-touch settlement drains");
+        assert_eq!(end.matches("self.drain()").count(), 1);
+        let completed = source.split("    pub(super) fn graph_completed(").nth(1).unwrap()
+            .split("    pub(crate) fn library(").next().unwrap();
+        assert!(!completed.contains("drain") && !completed.contains("complete()"), "golden polling never submits a cycle");
+        let run = source.split("    pub(crate) fn run_units(").nth(1).unwrap();
+        assert!(run.find("self.begin_graph_cycle()?").unwrap() < run.find("run_prefill_units(").unwrap());
+        assert!(run.find("run_prefill_units(").unwrap() < run.find("self.end_graph_cycle()").unwrap());
+        assert!(run.contains("cycles.abandon()"));
+        let draft = source.split("    pub(super) fn draft_propose(").nth(1).unwrap()
+            .split("    fn set_graph_cycle(").next().unwrap();
+        assert!(draft.find("self.begin_graph_cycle()?").unwrap() < draft.find("draft.propose(").unwrap());
+        assert!(draft.contains("self.end_graph_cycle()?") && draft.contains("cycles.abandon()"));
+    }
+
+    #[test]
     fn partial_verify_commits_only_the_accepted_indexer_and_engram_tail() {
         // Exercise every C4 alignment and every rejection position, including
         // history-copy extensions that cross several compressed groups.
