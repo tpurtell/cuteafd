@@ -36,6 +36,11 @@ build cache older than --days. Freed space is measured with statvfs before
 and after (builds/ is a btrfs reflink/hardlink farm, so per-entry sizes
 overstate what a delete frees). Appends one summary line per run to
 ROOT/cache-gc.log; --dry-run prints what would go and logs nothing.
+
+Then runs scripts/dev/prune-placement-inputs on the placement-input stores
+(with --delete unless --dry-run; --no-placement-prune skips it): those stores
+are rewritten daily, so the idle rule above never reaches their old
+publications. That script keeps every referenced publication.
 """
 from __future__ import annotations
 
@@ -350,6 +355,7 @@ def main():
     parser.add_argument('--dry-run', action='store_true', help='print what would be deleted and its allocated size')
     parser.add_argument('--root', type=Path, default=Path.home() / '.cache/cuteafd')
     parser.add_argument('--no-docker-prune', action='store_true', help='skip docker builder prune')
+    parser.add_argument('--no-placement-prune', action='store_true', help='skip prune-placement-inputs')
     args = parser.parse_args()
     if args.days <= 0:
         parser.error('--days must be positive')
@@ -363,7 +369,13 @@ def main():
         except BlockingIOError:
             log('another cache-gc is running')
             return 0
-        return collect(root, args)
+        code = collect(root, args)
+    if args.no_placement_prune:
+        return code
+    prune = Path(__file__).resolve().parent / 'prune-placement-inputs'
+    command = [sys.executable, str(prune), '--root', str(root), *([] if args.dry_run else ['--delete'])]
+    pruned = subprocess.run(command, timeout=3600)
+    return code or pruned.returncode
 
 
 def gather(root):
