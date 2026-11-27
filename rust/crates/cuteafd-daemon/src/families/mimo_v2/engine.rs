@@ -875,6 +875,9 @@ pub(crate) struct MimoEngine<'a> {
     graphs_warmed: Cell<bool>,
     /// Physical and tracked bytes per rank before the first capture miss.
     graphs_first_touch: Cell<bool>,
+    /// Serving graph-cycle completion proofs: one event per rank stream per
+    /// cycle. Created after the startup prewarm's drained boundaries.
+    graph_cycles: RefCell<Option<crate::shared::decode_graph::device::EventCycles<'a>>>,
 }
 
 fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
@@ -964,7 +967,7 @@ impl<'a> MimoEngine<'a> {
             output_fp8_decode: true, kv_cache,
             decode_graphs: false, graphs: RefCell::new(crate::shared::decode_graph::GraphBank::new()),
             graph_layout: None, graphs_warming: Cell::new(false), graphs_warmed: Cell::new(false),
-            graphs_first_touch: Cell::new(false) })
+            graphs_first_touch: Cell::new(false), graph_cycles: RefCell::new(None) })
     }
 
     /// Layer `layer`'s KV storage: the paged record pool (full attention; page `p` holds
@@ -1606,7 +1609,7 @@ impl<'a> MimoEngine<'a> {
         self.unit_index.set(None);
         result?;
         self.finish_tp2_route_step()?;
-        self.graph_end_of_step()?;
+        self.graph_prefill_end()?;
         Ok((self.weights.layers.len() == self.cfg.layers).then(|| self.device_logits(base,
             if all_logits { tokens.len() } else { 1 }, false)))
     }
@@ -1731,7 +1734,7 @@ impl<'a> MimoEngine<'a> {
             self.unit_index.set(None);
             result?;
             self.finish_tp2_route_step()?;
-            self.graph_end_of_step()?;
+            self.graph_prefill_end()?;
             for (placement, tokens) in sequences.iter_mut() { placement.len += tokens.len(); }
             let outcomes = crate::shared::prefill_packing::finish_members(sequences.len(), |i| {
                 self.launch_head(&work[0], segments[i].end_row(), 1, false)?;
@@ -1793,11 +1796,17 @@ impl<'a> MimoEngine<'a> {
         forced: Option<&dyn Fn(usize) -> Option<Vec<u8>>>, media: Option<&cuteafd_engine::media::RequestMedia>) -> Result<Option<DeviceLogits>> {
         self.graph_cycle(tables);
         self.submit(|| {
-            self.prepare_tp2_route_step(&[tokens.len()])?;
-            let result = self.step_inner(tables, tokens, logit_rows, on_layer, forced, media)?;
-            self.finish_tp2_route_step()?;
-            self.graph_end_of_step()?;
-            Ok(result)
+            self.graph_begin()?;
+            let result = (|| {
+                self.prepare_tp2_route_step(&[tokens.len()])?;
+                let result = self.step_inner(tables, tokens, logit_rows, on_layer, forced, media)?;
+                self.finish_tp2_route_step()?;
+                Ok(result)
+            })();
+            match result {
+                Ok(result) => { self.graph_end_of_step()?; Ok(result) }
+                Err(error) => { self.graph_abandon(); Err(error) }
+            }
         })
     }
 
@@ -2357,14 +2366,57 @@ impl<'a> MimoEngine<'a> {
         Ok(())
     }
 
-    /// Flush pinned hits and settle failed captures at a completed step only.
+    /// Opens a serving graph cycle: poll earlier cycles' events, retire
+    /// persistent owners the proofs show idle, then advance the clock. Before
+    /// `graph_cycles` exists (startup) this is a no-op; startup boundaries drain.
+    fn graph_begin(&self) -> Result<()> {
+        let mut cycles = self.graph_cycles.borrow_mut();
+        let Some(cycles) = cycles.as_mut() else { return Ok(()) };
+        cycles.poll()?;
+        for rank in 0..self.ranks() {
+            let graphs = match (rank, &self.peer) { (1, Some(peer)) => &peer.graphs, _ => &self.graphs };
+            self.on(rank, || {
+                // SAFETY: MiMo executables capture only persistent engine weights,
+                // workspaces, caches and exchange planes; the shared cache retires
+                // owners only after their event proof.
+                unsafe { graphs.borrow_mut().cache_evict_persistent(); }
+                Ok(())
+            })?;
+        }
+        cycles.begin();
+        Ok(())
+    }
+
+    /// A failed submission credits nothing; its terminal shutdown drains.
+    fn graph_abandon(&self) {
+        if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() { cycles.abandon(); }
+    }
+
+    /// Prefill units launch no decode graph: flush pinned-hit counts only.
+    /// No serving cycle opens or completes here; startup keeps its drained boundary.
+    fn graph_prefill_end(&self) -> Result<()> {
+        if self.graph_cycles.borrow().is_some() {
+            self.graphs.borrow_mut().cache_tick();
+            if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_tick(); }
+            return Ok(());
+        }
+        self.graph_end_of_step()
+    }
+
+    /// Serving: record this step's completion event on every rank stream (no
+    /// host wait). Startup (no `graph_cycles` yet): the drained boundary flushes
+    /// pinned hits and settles failed captures.
     fn graph_end_of_step(&self) -> Result<()> {
-        if self.graphs.borrow().cache_needs_boundary()
-            || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().cache_needs_boundary()) {
+        if self.graph_cycles.borrow().is_none() && (self.graphs.borrow().cache_needs_boundary()
+            || self.peer.as_ref().is_some_and(|peer| peer.graphs.borrow().cache_needs_boundary())) {
             self.graph_boundary()?;
         }
         self.graphs.borrow_mut().cache_tick();
         if let Some(peer) = &self.peer { peer.graphs.borrow_mut().cache_tick(); }
+        if let Some(cycles) = self.graph_cycles.borrow_mut().as_mut() {
+            // SAFETY: every rank stream has queued all of this step's graph launches.
+            unsafe { cycles.complete()?; }
+        }
         Ok(())
     }
 
@@ -2439,6 +2491,26 @@ impl<'a> MimoEngine<'a> {
     /// inventory: other shapes capture-or-run-eager in serving through the same
     /// bounded cache. Returns the graphs captured.
     pub fn capture_decode_graphs(&self, max_rows: usize) -> Result<usize> {
+        let captured = self.capture_decode_graphs_startup(max_rows)?;
+        self.enable_graph_cycles()?;
+        Ok(captured)
+    }
+
+    /// After the startup prewarm and its drained boundaries: serving steps
+    /// complete by one event per rank stream instead of host submission epochs.
+    /// Layouts with no graph reserve (or graphs off) keep no proof pool.
+    fn enable_graph_cycles(&self) -> Result<()> {
+        let reserved = self.graph_layout.as_ref().is_some_and(|layout| layout.reserves.iter().any(|&bytes| bytes > 0));
+        if !self.decode_graphs || !self.graphable() || !reserved || self.graph_cycles.borrow().is_some() { return Ok(()); }
+        let streams = (0..self.ranks()).map(|rank| {
+            let device = self.peer.as_ref().filter(|_| rank == 1).map_or(self.device, |peer| peer.device);
+            (device, self.stream_of(rank))
+        }).collect::<Vec<_>>();
+        *self.graph_cycles.borrow_mut() = Some(crate::shared::decode_graph::device::EventCycles::new(self.library, &streams)?);
+        Ok(())
+    }
+
+    fn capture_decode_graphs_startup(&self, max_rows: usize) -> Result<usize> {
         if !self.decode_graphs || !self.graphable() { return Ok(0); }
         let started = std::time::Instant::now();
         ensure!(!self.graphs_warmed.get() && self.graphs.borrow().len() == 0
@@ -3402,7 +3474,13 @@ mod tests {
         assert_eq!(engine.graphs.borrow().len(), 0);
         let key = GraphKey { layer: 0, rows: 1, table_stride: 1, previous: Previous::First, head: true };
         let calls = Cell::new(0);
+        // Serving shape: begin a cycle, launch, record its completion event, and
+        // let the next cycle's poll prove completion and settle the capture.
+        assert!(engine.graph_cycles.borrow().is_some(), "a reserved graph layout completes by event after startup");
+        engine.graph_begin()?;
         engine.graph(0, key, || { calls.set(calls.get() + 1); Ok(()) })?;
+        engine.graph_end_of_step()?;
+        engine.graph_begin()?;
         // A transient lane bank must not discard the engine's controller or
         // consume the capture's original allocation baseline on reattachment.
         for _ in 0..2 {
@@ -3424,6 +3502,7 @@ mod tests {
         engine.graph_end_of_step()?;
         assert_eq!(calls.get(), 1);
         assert_eq!(engine.graphs.borrow().len(), 1, "first miss must capture, not remain eager");
+        engine.graph_begin()?;
         engine.graph(0, key, || anyhow::bail!("captured key must replay"))?;
         engine.graph_end_of_step()?;
         assert_eq!(fixture.events()?.matches('G').count(), 1);
@@ -3451,6 +3530,33 @@ mod tests {
         let peers = [(sample(800, 100), sample(700, 180)),
             (sample(600, 200), sample(540, 210))];
         assert_eq!(peers.map(|(before, after)| super::graph_capture_growth(before, after)), [20, 50]);
+    }
+
+    #[test]
+    fn serving_graph_cycles_complete_by_event_without_host_drain() {
+        let source = include_str!("engine.rs").split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let enable = source.split_once("fn enable_graph_cycles(").unwrap().1
+            .split_once("fn capture_decode_graphs_startup(").unwrap().0;
+        assert!(enable.contains("EventCycles::new(self.library, &streams)"), "one proof pool over every rank stream");
+        let capture = source.split_once("pub fn capture_decode_graphs(").unwrap().1
+            .split_once("fn enable_graph_cycles(").unwrap().0;
+        assert!(capture.find("capture_decode_graphs_startup(").unwrap() < capture.find("enable_graph_cycles()").unwrap(),
+            "cycles start only after the drained startup prewarm");
+        let begin = source.split_once("fn graph_begin(").unwrap().1.split_once("fn graph_abandon(").unwrap().0;
+        assert!(begin.find("cycles.poll()").unwrap() < begin.find("cache_evict_persistent()").unwrap());
+        assert!(begin.find("cache_evict_persistent()").unwrap() < begin.find("cycles.begin()").unwrap());
+        let end = source.split_once("fn graph_end_of_step(").unwrap().1.split_once("fn graph_pinned(").unwrap().0;
+        assert!(end.contains("self.graph_cycles.borrow().is_none() &&"), "the drained boundary is startup-only");
+        assert!(end.contains("cycles.complete()"));
+        assert!(!end.contains("synchronize") && !end.contains("observe_completed"));
+        let step = source.split_once("    fn step(&self, tables: &StepTables").unwrap().1
+            .split_once("    fn step_inner(").unwrap().0;
+        assert!(step.find("self.graph_begin()?").unwrap() < step.find("self.step_inner(").unwrap());
+        assert!(step.contains("Err(error) => { self.graph_abandon(); Err(error) }"));
+        let prefill = source.split_once("fn graph_prefill_end(").unwrap().1.split_once("fn graph_end_of_step(").unwrap().0;
+        assert!(!prefill.contains("complete()"), "prefill units open and complete no serving cycle");
+        let units = source.split_once("    fn step_units_with(").unwrap().1.split_once("    fn ").unwrap().0;
+        assert!(units.contains("self.graph_prefill_end()?") && !units.contains("graph_end_of_step"));
     }
 
     #[test]
