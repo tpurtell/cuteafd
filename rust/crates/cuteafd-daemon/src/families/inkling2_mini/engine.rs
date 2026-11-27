@@ -15,6 +15,7 @@ use cuteafd_loader::families::inkling2_mini::{Inkling2MiniConfig, LoopVisit};
 
 pub(crate) struct Execution<'a> {
     pub(super) graphs: Option<DecodeGraphs<'a>>,
+    graph_cycles: Option<crate::shared::decode_graph::device::EventCycles<'a>>,
     pub requests: RequestOwners<'a>,
     pub head: MiniHead<'a>,
     pub target: MiniTargetWeights<'a>,
@@ -44,6 +45,7 @@ impl<'a> Execution<'a> {
         let visits = cfg.visits();
         Ok(Self {
             graphs: None,
+            graph_cycles: None,
             requests,
             head,
             target,
@@ -186,6 +188,10 @@ impl<'a> Execution<'a> {
             Cycle::Decode
         };
         if use_graphs {
+            if let (Some(cycles), Some(graphs)) = (&mut self.graph_cycles, &mut self.graphs) {
+                // SAFETY: graph operands are persistent decode storage.
+                unsafe { cycles.begin_persistent(|visit| graphs.visit(visit))?; }
+            }
             if let Some(graphs) = &mut self.graphs {
                 graphs.cycle(cycle);
             }
@@ -224,18 +230,23 @@ impl<'a> Execution<'a> {
                 io: &mut io,
             }
             .run(std::slice::from_ref(unit))?;
-            let observe = use_graphs && self.graphs.as_ref().is_some_and(DecodeGraphs::needs_boundary);
-            if !staged || observe {
+            let first_touch = use_graphs && self.graphs.as_ref().is_some_and(DecodeGraphs::first_touch_pending);
+            if use_graphs {
+                if let Some(graphs) = &mut self.graphs { graphs.tick(); }
+                if let Some(cycles) = &mut self.graph_cycles {
+                    // SAFETY: the decode stream has queued every graph launch.
+                    unsafe { cycles.complete()?; }
+                }
+            }
+            if !staged || first_touch {
+                // Plain decode publishes state; first touch initializes lazy native storage.
                 let wait = std::time::Instant::now();
                 self.completed()?;
-                if staged && observe { crate::shared::decode_graph::device::record_boundary_drain([self.requests.decode.stream.device.id], wait.elapsed()); }
-            }
-            if observe {
-                self.observe_completed()?;
-            } else if use_graphs {
-                if let Some(graphs) = &mut self.graphs {
-                    graphs.tick();
+                if let Some(cycles) = &mut self.graph_cycles {
+                    if staged && first_touch { cycles.record_drain(wait.elapsed()); }
+                    cycles.poll()?;
                 }
+                if let Some(graphs) = &mut self.graphs { graphs.observed(); }
             }
             Ok(DeviceLogits {
                 ptr: self.head.logits.buffer.ptr,
@@ -250,6 +261,14 @@ impl<'a> Execution<'a> {
             self.terminate();
         }
         result
+    }
+
+    pub(super) fn enable_graph_cycles(&mut self) -> Result<()> {
+        if self.graphs.is_some() {
+            let stream = &self.requests.decode.stream;
+            self.graph_cycles = Some(crate::shared::decode_graph::device::EventCycles::new(stream.device.library, &[(stream.device.id, stream.raw)])?);
+        }
+        Ok(())
     }
 
     fn observe_completed(&mut self) -> Result<()> {

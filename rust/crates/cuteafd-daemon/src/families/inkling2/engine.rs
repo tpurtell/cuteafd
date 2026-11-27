@@ -31,6 +31,7 @@ impl<'a> Peer<'a> {
 
 pub(crate) struct Execution<'a> {
     pub(super) graphs: Option<DecodeGraphs<'a>>,
+    graph_cycles: Option<crate::shared::decode_graph::device::EventCycles<'a>>,
     pub link: SparkLink<'a>,
     pub requests: RequestOwners<'a>,
     pub peer: Option<Peer<'a>>,
@@ -78,7 +79,7 @@ impl<'a> Execution<'a> {
         ensure!(target.rank == 0 && target.layers.iter().copied().eq(0..cfg.layers)
             && !requests.prefill.is_empty() && local.len() <= cfg.layers && ingress.len() == cfg.layers,
             "Inkling whole execution differs from admitted owners");
-        Ok(Self { graphs: None, link, requests, peer: None, head, target, kernels, local, cfg, ingress, next_identity: 1, terminal: false, draft:None, width_trace:None })
+        Ok(Self { graphs: None, graph_cycles: None, link, requests, peer: None, head, target, kernels, local, cfg, ingress, next_identity: 1, terminal: false, draft:None, width_trace:None })
     }
 
     /// Tokens are submitted suffixes; placement frontiers define their origins
@@ -128,6 +129,7 @@ impl<'a> Execution<'a> {
         let starts = placements.iter().map(|placement| placement.len).collect::<Vec<_>>();
         let media = placements.iter().map(|placement| placement.media.clone()).collect::<Vec<_>>();
         let result = (|| {
+            self.begin_graph_cycle()?;
             let waves = self.link.exchange()?;
             let (peer_head, peer_units) = self.peer.as_mut().map(|peer| peer.units(true)).unzip();
             let mut io = TokenIo { kernels: &self.kernels, head: &self.head, peer_head, cache: &self.requests.cache,
@@ -138,17 +140,22 @@ impl<'a> Execution<'a> {
                 uploads: std::slice::from_mut(&mut self.requests.decode_uploads), waves,
                 onboarded: self.local.len(), local: &self.local, next_identity: &mut self.next_identity,
                 placement_version: version, kind: cuteafd_transport::ExpertV2SourceKind::Decode, io: &mut io }.run(std::slice::from_ref(unit))?;
-            let observe = self.graph_needs_boundary();
-            // Staged logits stay on their producing stream until sampling.
-            if !staged || observe {
+            let first_touch = self.graphs.as_ref().is_some_and(DecodeGraphs::first_touch_pending)
+                || self.peer.as_ref().and_then(|p| p.graphs.as_ref()).is_some_and(DecodeGraphs::first_touch_pending);
+            self.for_each_graph(DecodeGraphs::tick);
+            if let Some(cycles) = &mut self.graph_cycles {
+                // SAFETY: both graph owner streams have queued the whole decode.
+                unsafe { cycles.complete()?; }
+            }
+            if !staged || first_touch {
+                // Plain decode publishes state; first touch initializes lazy native storage.
                 let wait = std::time::Instant::now();
                 self.completed()?;
-                if staged && observe { crate::shared::decode_graph::device::record_boundary_drain(std::iter::once(self.requests.decode.stream.device.id).chain(self.peer.iter().map(|p| p.requests.decode.stream.device.id)), wait.elapsed()); }
-            }
-            if observe {
-                self.observe_completed()?;
-            } else {
-                self.for_each_graph(DecodeGraphs::tick);
+                if let Some(cycles) = &mut self.graph_cycles {
+                    if staged && first_touch { cycles.record_drain(wait.elapsed()); }
+                    cycles.poll()?;
+                }
+                self.for_each_graph(DecodeGraphs::observed);
             }
             Ok(DeviceLogits { ptr: self.head.logits.buffer.ptr, rows: unit.rows.len(),
                 vocab: self.cfg.unpadded_vocab_size, stride: self.cfg.unpadded_vocab_size,
@@ -161,24 +168,21 @@ impl<'a> Execution<'a> {
         if let Some(graphs) = &mut self.graphs { f(graphs); }
         if let Some(graphs) = self.peer.as_mut().and_then(|peer| peer.graphs.as_mut()) { f(graphs); }
     }
-    fn graph_needs_boundary(&self) -> bool {
-        self.graphs.as_ref().is_some_and(DecodeGraphs::needs_boundary)
-            || self.peer.as_ref().and_then(|peer| peer.graphs.as_ref()).is_some_and(DecodeGraphs::needs_boundary)
-    }
-
-    fn observe_completed(&mut self) -> Result<()> {
-        let mut peer = self.peer.as_mut().and_then(|peer| peer.graphs.as_mut());
-        if self.graphs.is_none() && peer.is_none() { return Ok(()); }
-        let library = self.requests.decode.stream.device.library;
-        // SAFETY: both ranks have drained, and every graph borrows persistent
-        // unit/cache/weight storage; destroying a graph cannot retire those owners.
-        unsafe { crate::shared::decode_graph::device::observe_completed(library, |visit| {
-            if let Some(graphs) = &mut self.graphs { graphs.visit(visit)?; }
-            if let Some(graphs) = peer.as_deref_mut() { graphs.visit(visit)?; }
-            Ok(())
-        }) }?;
-        self.for_each_graph(DecodeGraphs::observed);
+    pub(super) fn enable_graph_cycles(&mut self) -> Result<()> {
+        if self.graphs.is_some() {
+            let streams = self.request_ranks().map(|r| (r.decode.stream.device.id, r.decode.stream.raw)).collect::<Vec<_>>();
+            self.graph_cycles = Some(crate::shared::decode_graph::device::EventCycles::new(self.requests.decode.stream.device.library, &streams)?);
+        }
         Ok(())
+    }
+    fn begin_graph_cycle(&mut self) -> Result<()> {
+        let Some(cycles) = &mut self.graph_cycles else { return Ok(()) };
+        // SAFETY: graph owners borrow persistent request storage.
+        unsafe { cycles.begin_persistent(|visit| {
+            if let Some(graphs) = &mut self.graphs { graphs.visit(visit)?; }
+            if let Some(graphs) = self.peer.as_mut().and_then(|p| p.graphs.as_mut()) { graphs.visit(visit)?; }
+            Ok(())
+        }) }
     }
     pub fn terminate(&mut self) {
         if self.terminal { return; }
@@ -216,7 +220,7 @@ mod tests {
         assert!(source.contains("Stateful {"));
         assert!(source.contains(".run(units)"));
         assert!(source.contains("self.link.exchange()?"));
-        assert!(source.contains("device::observe_completed("));
+        assert!(source.contains("cycles.begin_persistent("));
         assert!(!source.split("pub fn decode(").nth(1).unwrap().contains("begin_capture("));
         let terminal = source.split("pub fn terminate(").nth(1).unwrap();
         // #2543: the head split, every TP2 expert owner and the drafter are aborted together.

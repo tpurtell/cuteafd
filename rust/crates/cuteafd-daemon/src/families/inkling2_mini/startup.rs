@@ -398,6 +398,7 @@ pub(crate) fn whole<'a>(
     } else {
         (0, 0)
     };
+    execution.enable_graph_cycles()?;
     let prewarm_secs = t_prewarm.elapsed().as_secs_f64();
     if options.prewarm_graphs {
         phase.log("inkling2_mini graph prewarm");
