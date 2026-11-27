@@ -2875,7 +2875,7 @@ mod tests {
             else if family != "qwen3_5" { cases.push(("PREFILL_ROWS", "1024", "--prefill-rows", "1024")); }
             if matches!(family, "glm5" | "mistral_large4") {
                 cases.extend([("PREFILL_SPAN_ROWS", "4096", "--prefill-span-rows", "4096"),
-                    ("DECODE_GRAPHS", "off", "--glm-decode-graphs", "off"),
+                    ("DECODE_GRAPHS", "off", "--decode-graphs", "off"),
                     ("MEDIA_CACHE_BYTES", "256MiB", "--media-cache-bytes", "256MiB")]);
                 let mut request = args(std::path::Path::new("/model"), 4, false);
                 let cfg = [("PREFILL_BATCH_TOKENS".into(), "1024".into())].into_iter().collect();
