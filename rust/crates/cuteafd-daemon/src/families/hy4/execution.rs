@@ -5599,6 +5599,59 @@ impl<'a> Hy4Engine<'a> {
         self.golden_placement = placements.into_iter().next().unwrap();
         Ok(logits)
     }
+
+    pub(crate) fn verify_concurrent_two_seq_waves(
+        &mut self,
+        prompt_a: &[u32],
+        prompt_b: &[u32],
+        unit_rows: usize,
+        last_layer: usize,
+    ) -> Result<super::super::hy4_common::golden::TwoSeqWaveProof> {
+        super::super::hy4_common::golden::verify_concurrent_two_seq_waves(
+            self,
+            prompt_a,
+            prompt_b,
+            unit_rows,
+            last_layer,
+        )
+    }
+}
+
+impl super::super::hy4_common::golden::TwoSeqWaveEngine for Hy4Engine<'_> {
+    type Placement = Hy4Placement;
+
+    fn gpus(&self) -> usize { self.ranks.len() }
+    fn prefill_waves(&self) -> usize { self.prefill_waves }
+    fn max_sequences(&self) -> usize { self.max_sequences }
+    fn max_rows(&self) -> usize { self.max_rows }
+    fn max_pages(&self) -> usize { self.max_pages }
+    fn context_split(&self) -> bool { self.context_split }
+    fn layers(&self) -> usize { self.cfg.layers }
+    fn vocab_size(&self) -> usize { self.cfg.vocab_size }
+    fn reset_for_wave_proof(&mut self) -> Result<()> { self.reset_golden() }
+    fn make_wave_placement(&self, pages: Vec<u32>, slot: usize) -> Hy4Placement {
+        Hy4Placement::new(pages, slot)
+    }
+    fn run_wave_units(
+        &mut self,
+        placements: &mut [Hy4Placement],
+        sources: &[&[u32]],
+        units: &[Unit],
+        on_tile: &mut dyn FnMut(&Unit, usize, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let library = self.library();
+        self.run_units(
+            placements,
+            sources,
+            units,
+            ReadPriority::Prefill,
+            |_| HeadMode::Suffix(0),
+            &mut |u, row_off, logits| {
+                let tile = logits.to_host(library)?;
+                on_tile(u, row_off, &tile)
+            },
+        )
+    }
 }
 
 impl Drop for Hy4Engine<'_> {

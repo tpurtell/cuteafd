@@ -6161,234 +6161,14 @@ impl<'a> Hy4Engine<'a> {
         prompt_b: &[u32],
         unit_rows: usize,
         last_layer: usize,
-    ) -> Result<TwoSeqWaveProof> {
-        use crate::shared::prefill_pipeline::sequence_units;
-        ensure!(
-            self.prefill_waves >= 2 && self.max_sequences >= 2,
-            "verify_concurrent_two_seq_waves requires prefill_waves >= 2 and max_sequences >= 2"
-        );
-        ensure!(
-            !prompt_a.is_empty() && !prompt_b.is_empty() && unit_rows > 0 && unit_rows <= self.max_rows,
-            "invalid prompt or unit_rows for wave verification"
-        );
-        ensure!(last_layer + 1 == self.cfg.layers, "verify_concurrent_two_seq_waves requires full 42 layers");
-        self.assert_disjoint_wave_engram_buffers()?;
-        let buffer_summary = self.wave_engram_buffer_summary();
-
-        let pages_a = prompt_a.len().div_ceil(PAGE_ROWS);
-        let pages_b = prompt_b.len().div_ceil(PAGE_ROWS);
-        let base_b = if self.context_split {
-            (pages_a + 1) & !1
-        } else {
-            pages_a
-        };
-        let pool_pages = if self.context_split {
-            self.max_pages * 2
-        } else {
-            self.max_pages
-        };
-        ensure!(
-            base_b + pages_b <= pool_pages,
-            "two-sequence wave proof needs {} pages, engine has {}",
-            base_b + pages_b,
-            pool_pages
-        );
-        let vocab = self.cfg.vocab_size;
-        let pad_id = self.cfg.engram_pad_id;
-        let layers = self.cfg.layers;
-        let library = self.library();
-
-        let make_solo_units = |len: usize, waves: usize| -> Result<Vec<Unit>> {
-            let mut units = sequence_units(len, unit_rows, waves, layers)?;
-            let last_idx = units.len() - 1;
-            for (i, u) in units.iter_mut().enumerate() {
-                let span = u.rows.clone();
-                u.segments = vec![UnitSegment {
-                    sequence: 0,
-                    rows: 0..span.len(),
-                    tokens: span,
-                    prompt_end: i == last_idx,
-                    snapshot: false,
-                    head: true,
-                }];
-            }
-            Ok(units)
-        };
-
-        // 1. Prompt A solo at waves=1 (one unit per run_units call = strictly 1 wave in flight).
-        self.reset()?;
-        let units_a1 = make_solo_units(prompt_a.len(), 1)?;
-        let mut p_a1 = [Hy4Placement::new((0..pages_a as u32).collect(), 0, pad_id)];
-        let mut logits_a_solo = vec![0f32; prompt_a.len() * vocab];
-        for mut unit in units_a1 {
-            unit.index = 0;
-            unit.slot = 0;
-            let src = &prompt_a[unit.rows.clone()];
-            self.run_units(
-                &mut p_a1,
-                &[src],
-                &[unit],
-                ReadPriority::Prefill,
-                |_| HeadMode::Suffix(0),
-                &mut |u, row_off, logits| {
-                    let tile = logits.to_host(library)?;
-                    let dst = (u.rows.start + row_off) * vocab;
-                    logits_a_solo[dst..dst + tile.len()].copy_from_slice(&tile);
-                    Ok(())
-                },
-            )?;
-        }
-        let tail_a_solo = p_a1[0].engram_tail;
-
-        // 2. Prompt B solo at waves=1 (one unit per run_units call = strictly 1 wave in flight).
-        self.reset()?;
-        let units_b1 = make_solo_units(prompt_b.len(), 1)?;
-        let mut p_b1 = [Hy4Placement::new((base_b as u32..(base_b + pages_b) as u32).collect(), 1, pad_id)];
-        let mut logits_b_solo = vec![0f32; prompt_b.len() * vocab];
-        for mut unit in units_b1 {
-            unit.index = 0;
-            unit.slot = 0;
-            let src = &prompt_b[unit.rows.clone()];
-            self.run_units(
-                &mut p_b1,
-                &[src],
-                &[unit],
-                ReadPriority::Prefill,
-                |_| HeadMode::Suffix(0),
-                &mut |u, row_off, logits| {
-                    let tile = logits.to_host(library)?;
-                    let dst = (u.rows.start + row_off) * vocab;
-                    logits_b_solo[dst..dst + tile.len()].copy_from_slice(&tile);
-                    Ok(())
-                },
-            )?;
-        }
-        let tail_b_solo = p_b1[0].engram_tail;
-
-        // 3. Prompt A solo at waves=W (cross-wave boundary tail + logits check).
-        self.reset()?;
-        let units_aw = make_solo_units(prompt_a.len(), self.prefill_waves)?;
-        ensure!(units_aw.len() >= 2, "prompt A must span >= 2 units at unit_rows={unit_rows} to cross wave boundary");
-        let mut p_aw = [Hy4Placement::new((0..pages_a as u32).collect(), 0, pad_id)];
-        let mut logits_a_mw = vec![0f32; prompt_a.len() * vocab];
-        self.run_units(
-            &mut p_aw,
-            &[prompt_a],
-            &units_aw,
-            ReadPriority::Prefill,
-            |_| HeadMode::Suffix(0),
-            &mut |u, row_off, logits| {
-                let tile = logits.to_host(library)?;
-                let dst = (u.rows.start + row_off) * vocab;
-                logits_a_mw[dst..dst + tile.len()].copy_from_slice(&tile);
-                Ok(())
-            },
-        )?;
-        let tail_a_mw = p_aw[0].engram_tail;
-        let diff_a_mw = count_f32_bit_diffs(&logits_a_solo, &logits_a_mw);
-        ensure!(
-            diff_a_mw == 0 && tail_a_mw == tail_a_solo,
-            "single-sequence multi-wave (waves={}) diverged from waves=1: diff_elems={diff_a_mw} tail={tail_a_mw:?} != {tail_a_solo:?}",
-            self.prefill_waves
-        );
-
-        // 4. Prompt A and Prompt B concurrently in interleaved waves (A in wave k, B in wave k+1).
-        self.reset()?;
-        let a_ranges = crate::shared::prefill_pipeline::prefill_units(prompt_a.len(), unit_rows, self.prefill_waves, 256)?;
-        let b_ranges = crate::shared::prefill_pipeline::prefill_units(prompt_b.len(), unit_rows, self.prefill_waves, 256)?;
-        let mut interleaved = Vec::with_capacity(a_ranges.len() + b_ranges.len());
-        let max_len = a_ranges.len().max(b_ranges.len());
-        let mut idx = 0usize;
-        for step in 0..max_len {
-            if let Some(span) = a_ranges.get(step).cloned() {
-                interleaved.push(Unit {
-                    index: idx,
-                    sequence: 0,
-                    segments: vec![UnitSegment {
-                        sequence: 0,
-                        rows: 0..span.len(),
-                        tokens: span.clone(),
-                        prompt_end: step + 1 == a_ranges.len(),
-                        snapshot: false,
-                        head: true,
-                    }],
-                    rows: span,
-                    layers: 0..layers,
-                    slot: idx % self.prefill_waves,
-                    barrier: false,
-                });
-                idx += 1;
-            }
-            if let Some(span) = b_ranges.get(step).cloned() {
-                interleaved.push(Unit {
-                    index: idx,
-                    sequence: 1,
-                    segments: vec![UnitSegment {
-                        sequence: 1,
-                        rows: 0..span.len(),
-                        tokens: span.clone(),
-                        prompt_end: step + 1 == b_ranges.len(),
-                        snapshot: false,
-                        head: true,
-                    }],
-                    rows: span,
-                    layers: 0..layers,
-                    slot: idx % self.prefill_waves,
-                    barrier: false,
-                });
-                idx += 1;
-            }
-        }
-        let mut placements = [
-            Hy4Placement::new((0..pages_a as u32).collect(), 0, pad_id),
-            Hy4Placement::new((base_b as u32..(base_b + pages_b) as u32).collect(), 1, pad_id),
-        ];
-        let mut logits_a_conc = vec![0f32; prompt_a.len() * vocab];
-        let mut logits_b_conc = vec![0f32; prompt_b.len() * vocab];
-        self.run_units(
-            &mut placements,
-            &[prompt_a, prompt_b],
-            &interleaved,
-            ReadPriority::Prefill,
-            |_| HeadMode::Suffix(0),
-            &mut |u, row_off, logits| {
-                let tile = logits.to_host(library)?;
-                let dst = (u.rows.start + row_off) * vocab;
-                if u.sequence == 0 {
-                    logits_a_conc[dst..dst + tile.len()].copy_from_slice(&tile);
-                } else {
-                    logits_b_conc[dst..dst + tile.len()].copy_from_slice(&tile);
-                }
-                Ok(())
-            },
-        )?;
-        let tail_a_conc = placements[0].engram_tail;
-        let tail_b_conc = placements[1].engram_tail;
-        let diff_a_conc = count_f32_bit_diffs(&logits_a_solo, &logits_a_conc);
-        let diff_b_conc = count_f32_bit_diffs(&logits_b_solo, &logits_b_conc);
-        ensure!(
-            diff_a_conc == 0 && tail_a_conc == tail_a_solo,
-            "concurrent 2-seq multi-wave prompt A diverged: diff_elems={diff_a_conc} tail={tail_a_conc:?} != {tail_a_solo:?}"
-        );
-        ensure!(
-            diff_b_conc == 0 && tail_b_conc == tail_b_solo,
-            "concurrent 2-seq multi-wave prompt B diverged: diff_elems={diff_b_conc} tail={tail_b_conc:?} != {tail_b_solo:?}"
-        );
-
-        Ok(TwoSeqWaveProof {
-            gpus: self.ranks.len(),
-            waves: self.prefill_waves,
+    ) -> Result<super::super::hy4_common::golden::TwoSeqWaveProof> {
+        super::super::hy4_common::golden::verify_concurrent_two_seq_waves(
+            self,
+            prompt_a,
+            prompt_b,
             unit_rows,
-            prompt_a_len: prompt_a.len(),
-            prompt_b_len: prompt_b.len(),
-            units_a: a_ranges.len(),
-            units_b: b_ranges.len(),
-            logits_a_solo,
-            logits_b_solo,
-            tail_a: tail_a_solo,
-            tail_b: tail_b_solo,
-            buffer_summary,
-        })
+            last_layer,
+        )
     }
 
     /// Return the active 4-stream residual `[rows, 4, H]` F32 from rank 0 (for layer-0 boundary checks).
@@ -6405,29 +6185,52 @@ impl<'a> Hy4Engine<'a> {
     }
 }
 
+impl super::super::hy4_common::golden::TwoSeqWaveEngine for Hy4Engine<'_> {
+    type Placement = Hy4Placement;
+
+    fn gpus(&self) -> usize { self.ranks.len() }
+    fn prefill_waves(&self) -> usize { self.prefill_waves }
+    fn max_sequences(&self) -> usize { self.max_sequences }
+    fn max_rows(&self) -> usize { self.max_rows }
+    fn max_pages(&self) -> usize { self.max_pages }
+    fn context_split(&self) -> bool { self.context_split }
+    fn layers(&self) -> usize { self.cfg.layers }
+    fn vocab_size(&self) -> usize { self.cfg.vocab_size }
+    fn check_wave_buffers(&self) -> Result<Vec<String>> {
+        self.assert_disjoint_wave_engram_buffers()?;
+        Ok(self.wave_engram_buffer_summary())
+    }
+    fn reset_for_wave_proof(&mut self) -> Result<()> { self.reset() }
+    fn make_wave_placement(&self, pages: Vec<u32>, slot: usize) -> Hy4Placement {
+        Hy4Placement::new(pages, slot, self.cfg.engram_pad_id)
+    }
+    fn placement_tail(&self, placement: &Hy4Placement) -> [u32; 2] { placement.engram_tail }
+    fn run_wave_units(
+        &mut self,
+        placements: &mut [Hy4Placement],
+        sources: &[&[u32]],
+        units: &[Unit],
+        on_tile: &mut dyn FnMut(&Unit, usize, &[f32]) -> Result<()>,
+    ) -> Result<()> {
+        let library = self.library();
+        self.run_units(
+            placements,
+            sources,
+            units,
+            ReadPriority::Prefill,
+            |_| HeadMode::Suffix(0),
+            &mut |u, row_off, logits| {
+                let tile = logits.to_host(library)?;
+                on_tile(u, row_off, &tile)
+            },
+        )
+    }
+}
+
 impl Drop for Hy4Engine<'_> {
     fn drop(&mut self) {
         self.terminate();
     }
-}
-
-pub(crate) struct TwoSeqWaveProof {
-    pub(crate) gpus: usize,
-    pub(crate) waves: usize,
-    pub(crate) unit_rows: usize,
-    pub(crate) prompt_a_len: usize,
-    pub(crate) prompt_b_len: usize,
-    pub(crate) units_a: usize,
-    pub(crate) units_b: usize,
-    pub(crate) logits_a_solo: Vec<f32>,
-    pub(crate) logits_b_solo: Vec<f32>,
-    pub(crate) tail_a: [u32; 2],
-    pub(crate) tail_b: [u32; 2],
-    pub(crate) buffer_summary: Vec<String>,
-}
-
-fn count_f32_bit_diffs(a: &[f32], b: &[f32]) -> usize {
-    a.iter().zip(b.iter()).filter(|(x, y)| x.to_bits() != y.to_bits()).count() + a.len().abs_diff(b.len())
 }
 
 /// Advance staged frontier and rolling Engram tail on `begin_unit` before any predecessor wave commits.

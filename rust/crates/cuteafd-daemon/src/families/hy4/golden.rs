@@ -108,6 +108,10 @@ pub(crate) struct GoldenArgs {
     /// Exercise forced multi-row speculative verify during `--resume-at` (bit-exact vs serial decode).
     #[arg(long)]
     pub(crate) resume_verify: bool,
+    /// Prove multi-wave single-sequence and concurrent two-sequence byte-identity
+    /// (prompt A in wave k, prompt B in wave k+1) via the shared Hy4 wave harness.
+    #[arg(long)]
+    pub(crate) verify_waves: bool,
 }
 
 fn load_published_hy4_reference(
@@ -234,6 +238,8 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     let unit = args.prefill_units.unwrap_or(max_seq).min(4096);
     let max_pages = if !args.resume_at.is_empty() {
         (max_seq.div_ceil(64) * 3 + 16).max(64)
+    } else if args.verify_waves {
+        (max_seq.div_ceil(64) * 2 + 16).max(64)
     } else {
         max_seq.div_ceil(64).max(16)
     };
@@ -352,6 +358,12 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         };
 
     let prefill_waves = usize::from(args.prefill_waves);
+    if prefill_waves > 1 {
+        ensure!(
+            unit % 64 == 0,
+            "hy4-golden --prefill-waves {prefill_waves} requires 64-row-aligned --prefill-units (got {unit})"
+        );
+    }
     let (_, attention) =
         super::serve::resolve_attention_placement(devices.len(), args.attention_placement.as_str())?;
     let context_split = attention == cuteafd_loader::placement::AttentionPlacement::Context;
@@ -398,7 +410,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         .as_ref()
         .filter(|(_, adm)| adm.tp == 2)
         .map_or(0, |(_, adm)| adm.draft_rows());
-    let mut engine = if !args.resume_at.is_empty() {
+    let mut engine = if !args.resume_at.is_empty() || args.verify_waves {
         Hy4Engine::new_serving(
             &devices,
             &programs,
@@ -478,6 +490,32 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
             .map(|rank| graph_reserve::reserve_policy(layout, rank))
             .collect::<std::result::Result<_, _>>()?;
         engine.configure_graphs(&policies)?;
+    }
+
+    if args.verify_waves {
+        ensure!(prefill_waves >= 2, "--verify-waves requires --prefill-waves >= 2");
+        let (prompt_a, prompt_b) = if let Some(ws) = &selected_windows {
+            ensure!(ws.len() >= 2, "--verify-waves needs at least 2 distinct windows (e.g. --window a00,a01)");
+            (ws[0].tokens.clone(), ws[1].tokens.clone())
+        } else {
+            ensure!(raw_tokens.len() >= unit * 4, "--verify-waves on raw tokens needs >= 4 * unit tokens");
+            let half = (raw_tokens.len() / 2 / 64) * 64;
+            (raw_tokens[..half].to_vec(), raw_tokens[half..half * 2].to_vec())
+        };
+        let proof = engine.verify_concurrent_two_seq_waves(&prompt_a, &prompt_b, unit, args.last_layer)?;
+        println!(
+            "hy4-golden --verify-waves PASS: gpus={} waves={} unit={} prompt_a={}({}u) digest_a={} prompt_b={}({}u) digest_b={} single_mw_diffs=0 conc_a_diffs=0 conc_b_diffs=0",
+            proof.gpus,
+            proof.waves,
+            proof.unit_rows,
+            proof.prompt_a_len,
+            proof.units_a,
+            digest_f32(&proof.logits_a_solo),
+            proof.prompt_b_len,
+            proof.units_b,
+            digest_f32(&proof.logits_b_solo),
+        );
+        return Ok(());
     }
 
     if !args.resume_at.is_empty() {

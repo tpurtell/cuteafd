@@ -199,3 +199,262 @@ pub(crate) fn spark_link<'a>(
     device.run(|| link.bootstrap(&session))?;
     Ok(link)
 }
+
+/// Shared multi-wave and concurrent two-sequence byte-identity proof returned by
+/// `hy4-golden --verify-waves` and `hy4f-golden --verify-waves`.
+pub(crate) struct TwoSeqWaveProof {
+    pub(crate) gpus: usize,
+    pub(crate) waves: usize,
+    pub(crate) unit_rows: usize,
+    pub(crate) prompt_a_len: usize,
+    pub(crate) prompt_b_len: usize,
+    pub(crate) units_a: usize,
+    pub(crate) units_b: usize,
+    pub(crate) logits_a_solo: Vec<f32>,
+    pub(crate) logits_b_solo: Vec<f32>,
+    pub(crate) tail_a: [u32; 2],
+    pub(crate) tail_b: [u32; 2],
+    pub(crate) buffer_summary: Vec<String>,
+}
+
+/// Family adapter for the shared two-sequence multi-wave byte-identity proof.
+pub(crate) trait TwoSeqWaveEngine {
+    type Placement;
+
+    fn gpus(&self) -> usize;
+    fn prefill_waves(&self) -> usize;
+    fn max_sequences(&self) -> usize;
+    fn max_rows(&self) -> usize;
+    fn max_pages(&self) -> usize;
+    fn context_split(&self) -> bool;
+    fn layers(&self) -> usize;
+    fn vocab_size(&self) -> usize;
+    fn page_rows(&self) -> usize {
+        64
+    }
+    fn check_wave_buffers(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    fn reset_for_wave_proof(&mut self) -> Result<()>;
+    fn make_wave_placement(&self, pages: Vec<u32>, slot: usize) -> Self::Placement;
+    fn placement_tail(&self, _placement: &Self::Placement) -> [u32; 2] {
+        [0, 0]
+    }
+    fn run_wave_units(
+        &mut self,
+        placements: &mut [Self::Placement],
+        sources: &[&[u32]],
+        units: &[crate::shared::prefill_pipeline::Unit],
+        on_tile: &mut dyn FnMut(&crate::shared::prefill_pipeline::Unit, usize, &[f32]) -> Result<()>,
+    ) -> Result<()>;
+}
+
+pub(crate) fn count_f32_bit_diffs(a: &[f32], b: &[f32]) -> usize {
+    a.iter().zip(b.iter()).filter(|(x, y)| x.to_bits() != y.to_bits()).count() + a.len().abs_diff(b.len())
+}
+
+/// Shared 4-phase proof of single-sequence multi-wave and concurrent two-sequence
+/// multi-wave byte-identity (`single_mw_diffs=0`, `conc_a_diffs=0`, `conc_b_diffs=0`).
+pub(crate) fn verify_concurrent_two_seq_waves<E: TwoSeqWaveEngine>(
+    engine: &mut E,
+    prompt_a: &[u32],
+    prompt_b: &[u32],
+    unit_rows: usize,
+    last_layer: usize,
+) -> Result<TwoSeqWaveProof> {
+    use crate::shared::prefill_pipeline::{prefill_units, sequence_units, Unit, UnitSegment};
+
+    let page_rows = engine.page_rows();
+    let layers = engine.layers();
+    let vocab = engine.vocab_size();
+    let waves = engine.prefill_waves();
+    let gpus = engine.gpus();
+    let context_split = engine.context_split();
+
+    ensure!(
+        waves >= 2 && engine.max_sequences() >= 2,
+        "verify_concurrent_two_seq_waves requires prefill_waves >= 2 and max_sequences >= 2"
+    );
+    ensure!(
+        !prompt_a.is_empty() && !prompt_b.is_empty() && unit_rows > 0 && unit_rows <= engine.max_rows(),
+        "invalid prompt or unit_rows for wave verification"
+    );
+    ensure!(
+        last_layer + 1 == layers,
+        "verify_concurrent_two_seq_waves requires full {layers} layers"
+    );
+    let buffer_summary = engine.check_wave_buffers()?;
+
+    let pages_a = prompt_a.len().div_ceil(page_rows);
+    let pages_b = prompt_b.len().div_ceil(page_rows);
+    let base_b = if context_split { (pages_a + 1) & !1 } else { pages_a };
+    let pool_pages = if context_split { engine.max_pages() * 2 } else { engine.max_pages() };
+    ensure!(
+        base_b + pages_b <= pool_pages,
+        "two-sequence wave proof needs {} pages, engine has {}",
+        base_b + pages_b,
+        pool_pages
+    );
+
+    let make_solo_units = |len: usize, w: usize| -> Result<Vec<Unit>> {
+        let mut units = sequence_units(len, unit_rows, w, layers)?;
+        let last_idx = units.len() - 1;
+        for (i, u) in units.iter_mut().enumerate() {
+            let span = u.rows.clone();
+            u.segments = vec![UnitSegment {
+                sequence: 0,
+                rows: 0..span.len(),
+                tokens: span,
+                prompt_end: i == last_idx,
+                snapshot: false,
+                head: true,
+            }];
+        }
+        Ok(units)
+    };
+
+    // 1. Prompt A solo at waves=1.
+    engine.reset_for_wave_proof()?;
+    let units_a1 = make_solo_units(prompt_a.len(), 1)?;
+    let mut p_a1 = [engine.make_wave_placement((0..pages_a as u32).collect(), 0)];
+    let mut logits_a_solo = vec![0f32; prompt_a.len() * vocab];
+    for mut unit in units_a1 {
+        unit.index = 0;
+        unit.slot = 0;
+        let src = &prompt_a[unit.rows.clone()];
+        engine.run_wave_units(&mut p_a1, &[src], &[unit], &mut |u, row_off, tile| {
+            let dst = (u.rows.start + row_off) * vocab;
+            logits_a_solo[dst..dst + tile.len()].copy_from_slice(tile);
+            Ok(())
+        })?;
+    }
+    let tail_a_solo = engine.placement_tail(&p_a1[0]);
+
+    // 2. Prompt B solo at waves=1.
+    engine.reset_for_wave_proof()?;
+    let units_b1 = make_solo_units(prompt_b.len(), 1)?;
+    let mut p_b1 = [engine.make_wave_placement((base_b as u32..(base_b + pages_b) as u32).collect(), 1)];
+    let mut logits_b_solo = vec![0f32; prompt_b.len() * vocab];
+    for mut unit in units_b1 {
+        unit.index = 0;
+        unit.slot = 0;
+        let src = &prompt_b[unit.rows.clone()];
+        engine.run_wave_units(&mut p_b1, &[src], &[unit], &mut |u, row_off, tile| {
+            let dst = (u.rows.start + row_off) * vocab;
+            logits_b_solo[dst..dst + tile.len()].copy_from_slice(tile);
+            Ok(())
+        })?;
+    }
+    let tail_b_solo = engine.placement_tail(&p_b1[0]);
+
+    // 3. Prompt A solo at waves=W (cross-wave boundary check).
+    engine.reset_for_wave_proof()?;
+    let units_aw = make_solo_units(prompt_a.len(), waves)?;
+    ensure!(
+        units_aw.len() >= 2,
+        "prompt A must span >= 2 units at unit_rows={unit_rows} to cross wave boundary"
+    );
+    let mut p_aw = [engine.make_wave_placement((0..pages_a as u32).collect(), 0)];
+    let mut logits_a_mw = vec![0f32; prompt_a.len() * vocab];
+    engine.run_wave_units(&mut p_aw, &[prompt_a], &units_aw, &mut |u, row_off, tile| {
+        let dst = (u.rows.start + row_off) * vocab;
+        logits_a_mw[dst..dst + tile.len()].copy_from_slice(tile);
+        Ok(())
+    })?;
+    let tail_a_mw = engine.placement_tail(&p_aw[0]);
+    let diff_a_mw = count_f32_bit_diffs(&logits_a_solo, &logits_a_mw);
+    ensure!(
+        diff_a_mw == 0 && tail_a_mw == tail_a_solo,
+        "single-sequence multi-wave (waves={waves}) diverged from waves=1: diff_elems={diff_a_mw} tail={tail_a_mw:?} != {tail_a_solo:?}"
+    );
+
+    // 4. Prompt A and Prompt B concurrently in interleaved waves.
+    engine.reset_for_wave_proof()?;
+    let a_ranges = prefill_units(prompt_a.len(), unit_rows, waves, 256)?;
+    let b_ranges = prefill_units(prompt_b.len(), unit_rows, waves, 256)?;
+    let mut interleaved = Vec::with_capacity(a_ranges.len() + b_ranges.len());
+    let max_len = a_ranges.len().max(b_ranges.len());
+    let mut idx = 0usize;
+    for step in 0..max_len {
+        if let Some(span) = a_ranges.get(step).cloned() {
+            interleaved.push(Unit {
+                index: idx,
+                sequence: 0,
+                segments: vec![UnitSegment {
+                    sequence: 0,
+                    rows: 0..span.len(),
+                    tokens: span.clone(),
+                    prompt_end: step + 1 == a_ranges.len(),
+                    snapshot: false,
+                    head: true,
+                }],
+                rows: span,
+                layers: 0..layers,
+                slot: idx % waves,
+                barrier: false,
+            });
+            idx += 1;
+        }
+        if let Some(span) = b_ranges.get(step).cloned() {
+            interleaved.push(Unit {
+                index: idx,
+                sequence: 1,
+                segments: vec![UnitSegment {
+                    sequence: 1,
+                    rows: 0..span.len(),
+                    tokens: span.clone(),
+                    prompt_end: step + 1 == b_ranges.len(),
+                    snapshot: false,
+                    head: true,
+                }],
+                rows: span,
+                layers: 0..layers,
+                slot: idx % waves,
+                barrier: false,
+            });
+            idx += 1;
+        }
+    }
+    let mut placements = [
+        engine.make_wave_placement((0..pages_a as u32).collect(), 0),
+        engine.make_wave_placement((base_b as u32..(base_b + pages_b) as u32).collect(), 1),
+    ];
+    let mut logits_a_conc = vec![0f32; prompt_a.len() * vocab];
+    let mut logits_b_conc = vec![0f32; prompt_b.len() * vocab];
+    engine.run_wave_units(&mut placements, &[prompt_a, prompt_b], &interleaved, &mut |u, row_off, tile| {
+        let dst = (u.rows.start + row_off) * vocab;
+        if u.sequence == 0 {
+            logits_a_conc[dst..dst + tile.len()].copy_from_slice(tile);
+        } else {
+            logits_b_conc[dst..dst + tile.len()].copy_from_slice(tile);
+        }
+        Ok(())
+    })?;
+    let tail_a_conc = engine.placement_tail(&placements[0]);
+    let tail_b_conc = engine.placement_tail(&placements[1]);
+    let diff_a_conc = count_f32_bit_diffs(&logits_a_solo, &logits_a_conc);
+    let diff_b_conc = count_f32_bit_diffs(&logits_b_solo, &logits_b_conc);
+    ensure!(
+        diff_a_conc == 0 && tail_a_conc == tail_a_solo,
+        "concurrent 2-seq multi-wave prompt A diverged: diff_elems={diff_a_conc} tail={tail_a_conc:?} != {tail_a_solo:?}"
+    );
+    ensure!(
+        diff_b_conc == 0 && tail_b_conc == tail_b_solo,
+        "concurrent 2-seq multi-wave prompt B diverged: diff_elems={diff_b_conc} tail={tail_b_conc:?} != {tail_b_solo:?}"
+    );
+
+    Ok(TwoSeqWaveProof {
+        gpus,
+        waves,
+        unit_rows,
+        prompt_a_len: prompt_a.len(),
+        prompt_b_len: prompt_b.len(),
+        units_a: a_ranges.len(),
+        units_b: b_ranges.len(),
+        logits_a_solo,
+        logits_b_solo,
+        tail_a: tail_a_solo,
+        tail_b: tail_b_solo,
+        buffer_summary,
+    })
+}
