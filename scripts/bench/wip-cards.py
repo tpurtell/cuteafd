@@ -1083,10 +1083,18 @@ def explicit_launchers(arms, arm_repos):
     return explicit
 
 
+# Publishing-only submodules: no launcher, build or serving path reads them, so
+# wip-source-checkout.sh leaves them uninitialized (its header names the same two).
+# Initialized, they must still sit at their pins.
+LAUNCHER_OPTIONAL_SUBMODULES = frozenset({'third_party/gptqmodel', 'third_party/tool-eval-bench'})
+
+
 def submodule_problems(repo):
     """How a launcher checkout's submodules differ from what run.sh verifies: every
     submodule (recursively) initialized at the commit its superproject records, and
-    each third_party/<name> at the revision third_party/<name>.lock.json pins."""
+    each third_party/<name> at the revision third_party/<name>.lock.json pins. The
+    publishing-only LAUNCHER_OPTIONAL_SUBMODULES may stay uninitialized: a launcher
+    wip-source-checkout.sh made must pass the check it is resolved against (#2924)."""
     try:
         status = run(['git', '-C', str(repo), 'submodule', 'status', '--recursive']).stdout
     except subprocess.CalledProcessError as error:
@@ -1099,7 +1107,8 @@ def submodule_problems(repo):
             continue
         flag, (commit, path, *_rest) = line[0], line[1:].split()
         if flag == '-':
-            problems.append(f'{path} is not initialized')
+            if path not in LAUNCHER_OPTIONAL_SUBMODULES:
+                problems.append(f'{path} is not initialized')
         elif flag == '+':
             problems.append(f'{path} is checked out at {commit[:12]}, not the commit the superproject records')
         elif flag == 'U':

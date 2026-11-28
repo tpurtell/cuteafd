@@ -2829,6 +2829,58 @@ def test_each_slot_arm_validates_against_its_own_launcher(entry, tmp_path, monke
     assert pinned['none']['repo'] == str(own) and pinned['none']['repo_commit'] == candidate
 
 
+def test_slot_launcher_reuses_its_own_checkout_with_publishing_submodules_uninitialized(tmp_path, monkeypatch):
+    # #2924: wip-source-checkout.sh initializes only the build submodules; the launcher it
+    # made must pass the clean check slot_launcher reuses it under (the grant-time preflight),
+    # not refuse as "not a clean checkout".
+    monkeypatch.setattr(cards, 'slot_launcher', REAL_SLOT_LAUNCHER)
+    repo, _fresh, pinned = _checkout_with_submodule(tmp_path, 'source')
+    publishing = tmp_path / 'gptqmodel-upstream'
+    _checkout(publishing, run_sh=False)
+    _git(repo, 'submodule', '-q', 'add', str(publishing), 'third_party/gptqmodel')
+    (repo / 'third_party/gptqmodel.lock.json').write_text(json.dumps(dict(schema=1, revision=_real_head(publishing))))
+    helper = repo / 'scripts/build/wip-source-checkout.sh'
+    helper.parent.mkdir(parents=True)
+    # As the real script: build submodules only, never the publishing ones.
+    helper.write_text('#!/bin/sh\nset -e\ngit -C "$1" worktree add -q --detach "$3" "$2"\n'
+                      'git -C "$3" -c protocol.file.allow=always submodule -q update --init -- third_party/sparkinfer\n')
+    _git(repo, 'add', '-A')
+    _git(repo, 'commit', '-qm', 'publishing submodule')
+    candidate = _git(repo, 'rev-parse', 'HEAD')
+    _git(repo, 'commit', '-q', '--allow-empty', '-m', 'dev moves on')
+    home = tmp_path / 'home'
+    monkeypatch.setattr(Path, 'home', lambda: home)
+    monkeypatch.setattr(cards, 'REPO', repo)
+    _stamped_slot(home, 'ab-cand', 'cand', candidate)
+    own = home / '.cache/cuteafd/builds/grant' / ('launcher-' + candidate[:12])
+    for _turn in ('preflight', 'grant-time preflight'):
+        arms = cards.resolve_launchers(cards.arms_from(['cand=ab-cand:cand']), [], {}, repo, tmp_path, 'grant', False)
+        assert arms['cand']['repo'] == str(own) and arms['cand']['repo_commit'] == candidate
+    status = _git(own, 'submodule', 'status')
+    assert f'-{_real_head(publishing)} third_party/gptqmodel' in status
+    assert f' {pinned} third_party/sparkinfer' in status
+    assert cards.submodule_problems(own) == []
+    # A build submodule left uninitialized still refuses, and so does a publishing one away from its pin.
+    _git(own, 'submodule', '-q', 'deinit', '-f', 'third_party/sparkinfer')
+    assert cards.submodule_problems(own) == ['third_party/sparkinfer is not initialized']
+    with pytest.raises(ValueError, match='is not a clean checkout of'):
+        cards.resolve_launchers(cards.arms_from(['cand=ab-cand:cand']), [], {}, repo, tmp_path, 'grant', False)
+    _git(own, '-c', 'protocol.file.allow=always', 'submodule', '-q', 'update', '--init', '--', 'third_party/sparkinfer')
+    _git(own, '-c', 'protocol.file.allow=always', 'submodule', '-q', 'update', '--init', '--', 'third_party/gptqmodel')
+    assert cards.submodule_problems(own) == []
+    _git(own / 'third_party/gptqmodel', 'commit', '-q', '--allow-empty', '-m', 'local edit')
+    assert cards.submodule_problems(own)[0].startswith('third_party/gptqmodel is checked out at ')
+
+
+def test_launcher_optional_submodules_are_exactly_those_the_source_checkout_skips():
+    text = (cards.REPO / 'scripts/build/wip-source-checkout.sh').read_text()
+    gitmodules = (cards.REPO / '.gitmodules').read_text()
+    paths = set(re.findall(r'^\s*path = (\S+)$', gitmodules, re.M))
+    initialized = set(re.findall(r'submodule_from_local "\$dest" (\S+)', text))
+    assert initialized and initialized <= paths
+    assert cards.LAUNCHER_OPTIONAL_SUBMODULES == paths - initialized
+
+
 def test_per_arm_repo_preflight_refusals(tmp_path, monkeypatch):
     arms = lambda: cards.arms_from(['a=a:s', 'b=b:s2'])
     no_run, plain = tmp_path / 'no-run', tmp_path / 'plain'
