@@ -14,9 +14,9 @@ from kimi_k3 import prepare_corpus as panel
 
 SOURCE_REVISION = "d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959"
 SCHEMA = "cuteafd-hy4-flash-corpus-v2"
-PANEL_REVISION = panel_corpus.DEFAULT_PANEL_REVISION
-PANEL_SUMS = panel_corpus.DEFAULT_PANEL_SHA256SUMS_SHA256
-DATASET = dict(panel_corpus.DEFAULT_DATASET)
+PANEL_REVISION = panel_corpus.default_panel_revision()
+PANEL_SUMS = panel_corpus.default_panel_sha256sums()
+DATASET = panel_corpus.default_dataset()
 PACKER = panel_corpus.EXL3_STANDARD_PACKER
 ASSETS = ("config.json", "tokenizer.json", "tokenizer_config.json", "chat_template.jinja")
 CHAT = dict(tokenize=True, add_generation_prompt=True, return_dict=False,
