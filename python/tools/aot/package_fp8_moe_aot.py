@@ -671,9 +671,9 @@ def build(args: argparse.Namespace) -> None:
                            *activation_params(g.activation, g.weights, getattr(g, "swiglu_alpha", None),
                                               getattr(g, "swiglu_beta", None), g.swiglu_limit), ABI_VERSION,
                            _pinned_sparkinfer.REVISION, props.major, props.minor, props.multi_processor_count,
-                           list(core_variants(args.role, g.weights,
-                                              os.environ.get("CUTEAFD_BUILD_KIND", "development")
-                                              if args.role == "spark" and g.weights != "nvfp4" else "development")))
+                           tuple(core_variants(args.role, g.weights,
+                                               os.environ.get("CUTEAFD_BUILD_KIND", "development")
+                                               if args.role == "spark" and g.weights != "nvfp4" else "development")))
             identity = hashlib.sha256(json.dumps(compile_key).encode()).hexdigest()[:20]
             reused = compiled_widths.get(compile_key)
             raw = args.build_dir / args.geometry / f"width{g.slice}-{identity}"
