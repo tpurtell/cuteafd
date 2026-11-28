@@ -1,6 +1,6 @@
 # Incremental QMLA calibration template: add calibrated MLA sidecar to an existing checkpoint
 
-**Every incremental QMLA calibration brief starts from this file.** Given a `MODEL_ID` and an immutable `SOURCE_REVISION` (MC or plain/non-MC), it adds a validated `cuteafd-qmla-v1` sidecar (`mla_calibration.safetensors` + `mla_calibration.json`) as a **new revision of the same Hugging Face repository**, preserving every existing weight shard, view, index, tokenizer, and asset with **zero weight shard re-uploads**.
+**Every incremental QMLA calibration brief starts from this file.** Given a `MODEL_ID` and an immutable `SOURCE_REVISION` (MC or plain/non-MC), it adds a validated `cuteafd-qmla-v1` sidecar (**one** file: `mla_calibration.safetensors`, with **no separate `mla_calibration.json`**) as a **new revision of the same Hugging Face repository**, preserving every existing weight shard, view, index, tokenizer, and asset with **zero weight shard re-uploads**.
 
 Copy this file whole, keep every section, and fill in **§9 Model addendum**. Never weaken a template rule.
 
@@ -16,10 +16,13 @@ Copy this file whole, keep every section, and fill in **§9 Model addendum**. Ne
 ## 0. Operating context and scope
 - **Target:** Existing checkpoint `MODEL_ID` at immutable 40-char `SOURCE_REVISION` (MC or plain/non-MC — **do not convert a plain checkpoint to MC**).
 - **Same repository only:** Publish as a **new parent-guarded commit on `MODEL_ID`**. Never create a new HF repo for a calibration-only update.
+- **Single sidecar file, no `mla_calibration.json`:**
+  - **MC checkpoints:** Rewrites `cuteafd-mc.json` with the added optional `"qmla"` section (never in `required_features`; existing `variants` and `shared_inventory_sha256` unchanged) and adds `mla_calibration.safetensors`.
+  - **Non-MC (plain/official) checkpoints:** Adds **only** `mla_calibration.safetensors` (self-describing via `__metadata__["cuteafd_qmla"]`; never creates `cuteafd-mc.json`).
 - **Zero re-quantization / zero shard re-uploads:** Existing routed experts, dense cores, view indexes, configs, tokenizers, vision towers, drafters, and native assets stay **byte-for-byte identical** (`reuploaded_shard_bytes == 0`). Never re-encode cores or experts.
 - **No `GPTQModel` fork changes:** All QMLA code lives in `cuteafd` under `quantization/qmla/` and `quantization/<family>/`.
 - **`0:0` and `--kv-cache` compatibility:** Users not passing `--quant-mla` / `QUANT_MLA` see zero behavioral change. `--kv-cache` and `QUANT_MLA` compose: `--kv-cache` sets the default format for every cache (SWA rings, indexer keys, MLA), and `QUANT_MLA` overrides only the full-history MLA path(s) set nonzero.
-- **SWA / KDA / HCA / indexer exclusion:** QMLA targets **full-history MLA layers only**. SWA rings (e.g., Hy4-flash's 30 SWA-512 layers), KDA/GDN recurrence, HCA/CSA layers, and DSA indexer keys are untouched. `sink4/local128` protection (when enabled at runtime) applies to full-history MLA layers only, never SWA.
+- **SWA / KDA / HCA / indexer exclusion & default `sink4_local128` protection:** QMLA targets **full-history MLA layers only**. SWA rings (e.g., Hy4-flash's 30 SWA-512 layers), KDA/GDN recurrence, HCA/CSA layers, and DSA indexer keys are untouched. Recent-token protection (`sink4_local128`: first 4 sink + last 128 recent tokens exact) is **enabled by default** in both calibration and serving on full-history MLA layers only (never SWA); `--protection none` is only the measured alternative if protection later proves unnecessary.
 - **Calibrated vs. runtime-qualified artifacts:** Until runtime Phases 3–5 qualify the checkpoint on matched Standard fidelity + long-context + performance tests, the manifest **must** record `"artifact_status": "calibrated_unqualified"`. Never label an untested calibration artifact as runtime-qualified.
 
 ---
@@ -38,19 +41,18 @@ Before capturing any activation:
 
 ---
 
-## 2. Calibration corpus (data-driven, never Standard Fidelity)
-Pass corpus components explicitly via repeatable `--corpus-component NAME=REPO@REV:PATH` (never hard-code the component list, and **never** use the held-out Standard Fidelity panel):
-1. **Base components (always available, sufficient to run):**
-   - `agentic` (`wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7`), rendered with **this checkpoint's own** tokenizer and chat template (matching `brief-template.md` §3).
-   - `exl3_standard` (`wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7`), packed with this checkpoint's tokenizer (`exl3-standard-pack-v1`).
-2. **Optional long-context component (plug in when available; do not block on it):**
-   - Pass `--corpus-component long_context_16k=<REPO>@<REV>:<PATH>` and/or `--corpus-component long_context_32k=<REPO>@<REV>:<PATH>` (16K/32K traces, ~128K tokens per length class, plus agentic traces and long articles) to exercise DSA top-k selection past 2,048 tokens.
-   - Every plugged component is recorded with its pinned `repo`, `revision`, `sequences`, `tokens`, and `input_ids_sha256` in `mla_calibration.json`'s `calibration_provenance.components`.
+## 2. Calibration corpus (single pinned 3-component revision, never Standard Fidelity)
+Calibration draws deterministically from **one pinned revision** of `wrldsuksgo2mars/agentic-quant-panel-v2` containing all **three** fixed components (never use the held-out Standard Fidelity panel):
+1. `agentic`: rendered with **this checkpoint's own** tokenizer and chat template (matching `quantization/hy4_flash/prepare_corpus.py` and `brief-template.md` §3).
+2. `exl3_standard`: packed with this checkpoint's tokenizer (`exl3-standard-pack-v1`).
+3. `QMLA_LONG_CONTEXT_COMPONENT`: the third long-context bank (16K/32K traces, ~128K tokens per length class, plus agentic traces and long articles) in that same pinned dataset revision, exercising DSA top-k selection past 2,048 tokens.
+
+**Fail-closed pin constants:** `QMLA_PANEL_REVISION` and `QMLA_LONG_CONTEXT_COMPONENT` live as one clearly named constant pair in `quantization/qmla/sidecar.py`. Until both are filled in once the new dataset revision lands on HF, `load_pinned_qmla_corpus()` and the CLI driver **fail closed** with an explicit error naming the missing constants rather than silently calibrating on only two components. All three components and the single `dataset_revision` are recorded in `calibration_provenance`.
 
 ---
 
 ## 3. Pilot first (required before full run)
-Always run a short pilot first — a few representative MLA layers, a small corpus slice, and one principal mode (`4:4`, or `4:0` for pure-NoPE families) — and report results to TJ before running all layers and modes.
+Always run a short pilot first — a few representative MLA layers, a small corpus slice, and one principal mode (`4:4`, or `4:0` for pure-NoPE families) with default `--protection sink4_local128` — and report results to TJ before running all layers and modes.
 
 **Reference pilot command (Hy4-flash):**
 ```bash
@@ -60,18 +62,16 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
   --source-repo "$MODEL_ID" \
   --source-revision "$SOURCE_REVISION" \
   --view original \
-  --corpus-component "agentic=wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7:$CORPUS_DIR/agentic.safetensors" \
-  --corpus-component "exl3_standard=wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7:$CORPUS_DIR/exl3_standard.safetensors" \
+  --corpus-dir "$CORPUS_DIR" \
   --output "$WORK_ROOT/pilot" \
   --pilot
-# --pilot defaults to: --layers 0,21,41 --modes 4:4 --train-sequences 16 --val-sequences 4 --steps 100
-# Optional long-context bank adds: --corpus-component "long_context_16k=$LC_REPO@$LC_REV:$LC_PATH"
+# --pilot defaults to: --layers 0,21,41 --modes 4:4 --protection sink4_local128 --train-sequences 16 --val-sequences 4 --steps 100
 ```
 
 **Pilot gates (must pass before full run):**
-- `validate_sidecar` passes with `status == "passed"`.
+- `validate_sidecar` passes with `status == "passed"` and `protection_policy == "sink4_local128"`.
 - Every pilot layer satisfies orthogonality $\|R_C^\top R_C - I\|_\infty < 10^{-5}$, strictly positive finite scales, and quantization-off algebraic equivalence `< 1e-4` relative L2.
-- Held-out validation $\mathcal{L}_C$ and $\mathcal{L}_P$ improve over step-0 RTN (and report comparison vs fixed Sylvester Hadamard and SmoothQuant† $\alpha$-search).
+- Held-out validation $\mathcal{L}_C$ and $\mathcal{L}_P$ improve over step-0 RTN (and report comparison vs fixed Sylvester Hadamard and SmoothQuant† $\alpha$-search under the same protection policy).
 - Wall time per layer and peak GPU/host RAM logged to forecast full-run ETA (Asia/Taipei).
 
 ---
@@ -87,11 +87,11 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
   --source-repo "$MODEL_ID" \
   --source-revision "$SOURCE_REVISION" \
   --view original \
-  --corpus-component "agentic=wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7:$CORPUS_DIR/agentic.safetensors" \
-  --corpus-component "exl3_standard=wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7:$CORPUS_DIR/exl3_standard.safetensors" \
+  --corpus-dir "$CORPUS_DIR" \
   --output "$WORK_ROOT/full" \
   --layers all-dsa \
   --modes 8:8,4:8,4:4,2:4,4:0,0:4,8:0,0:8,2:0 \
+  --protection sink4_local128 \
   --train-sequences 128 \
   --val-sequences 32 \
   --steps 300
@@ -104,11 +104,12 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
 ## 5. Validation and cross-view transfer
 Before any publication step:
 1. Run `qmla.validate_sidecar(sidecar_dir, expected_source=..., expected_geometries=..., banks_by_layer=..., strict=True)` to verify:
-   - Schema (`cuteafd-qmla-v1`), canonical conventions & quantizer recipe, `artifact_status == "calibrated_unqualified"`.
-   - `tensors_sha256`, `tensors_bytes`, exact F32 tensor inventory, `profile_fingerprint`, and `transform_fingerprint`.
+   - Single sidecar file `mla_calibration.safetensors` (no `mla_calibration.json`), self-describing `__metadata__["cuteafd_qmla"]`.
+   - Schema (`cuteafd-qmla-v1`), canonical conventions & quantizer recipe, `artifact_status == "calibrated_unqualified"`, `protection_policy == "sink4_local128"`, `protection_scope == "full_history_mla_only"`.
+   - `tensors_payload_sha256`, `tensors_payload_bytes`, exact F32 tensor inventory, `profile_fingerprint`, and `transform_fingerprint`.
    - Orthogonality $\|R_C^\top R_C - I\|_\infty < 10^{-5}$, positive finite scales, and quantization-off numerical equivalence `< 1e-4`.
 2. **Cross-view transfer (MC checkpoints):** Validate the fitted sidecar on each available core view (`original`, `k8-compact`, `k6-compact`, `fp8-compact`) by checking quantization-off equivalence and quantized $\mathcal{L}_C/\mathcal{L}_P$ delta on the validation slice. Record validated views in `applicable_views` and `view_transfer_validation`. Share one sidecar across views whenever transfer validates; create a view-scoped profile only if measured necessary.
-3. **MC manifest check (MC checkpoints):** Confirm `attach_qmla_advisory_to_mc` + `mc_manifest.validate` passes with `required_features` unchanged, `shared_inventory_sha256` identical, all view fingerprints identical, and `mla_calibration.safetensors` absent from every view's `weight_map`.
+3. **MC manifest check (MC checkpoints):** Confirm `attach_qmla_to_mc` + `validate_sidecar(..., mc_manifest=updated_mc)` + `mc_manifest.validate` passes with `required_features` unchanged, `shared_inventory_sha256` identical, all view fingerprints identical, exact agreement between `cuteafd-mc.json["qmla"]` and `__metadata__["cuteafd_qmla"]` (plus whole-file `tensors_sha256`/`tensors_bytes`), and `mla_calibration.safetensors` absent from every view's `weight_map`.
 
 ---
 
@@ -126,11 +127,14 @@ HF_HUB_DISABLE_XET=1 PYTHONPATH="$PWD/quantization:$PWD/scripts/lib" \
   --validation-report "$WORK_ROOT/full/qmla-validation-report.json" \
   --update-mc-manifest \
   --dry-run
+# Omit --update-mc-manifest for non-MC (plain/official) checkpoints; only mla_calibration.safetensors is added.
 ```
 Verify the dry-run receipt reports:
 - `reuploaded_shard_bytes == 0`
 - `preserved_shards_count` equals the exact model shard count at `SOURCE_REVISION`
-- `uploaded_files` contains ONLY the small QMLA files (`mla_calibration.safetensors`, `mla_calibration.json`, optional `cuteafd-mc.json`, optional `qmla-validation-report.json` / `README.md`).
+- `uploaded_files` contains ONLY:
+  - MC repo: `mla_calibration.safetensors`, rewritten `cuteafd-mc.json` (with `"qmla"`), and optional `qmla-validation-report.json` / `README.md`.
+  - Non-MC repo: `mla_calibration.safetensors` (self-describing `__metadata__["cuteafd_qmla"]`), and optional `qmla-validation-report.json` / `README.md` (no `cuteafd-mc.json` created).
 
 2. **Commit new revision (after TJ approves the validation report and dry-run plan):**
 Re-run without `--dry-run`, piping the HF token over stdin. `publish_incremental_revision` guards on `parent_commit=SOURCE_REVISION` (refuses if head moved) and verifies after commit that every preserved shard blob and size at `new_revision` is byte-identical to `SOURCE_REVISION`.
@@ -143,8 +147,8 @@ Re-run without `--dry-run`, piping the HF token over stdin. `publish_incremental
 Calibration alone produces an artifact with `"artifact_status": "calibrated_unqualified"`. Do **not** flip `"artifact_status"` to `"runtime_qualified"` until the runtime family qualifies the checkpoint on untouched held-out tests:
 - `0:0` byte/launch/memory parity unchanged.
 - Matched **Standard generated-token fidelity** on untouched held-out windows: mean KL, top-1 agreement, NLL, context scores separately, reported as **deltas vs matched `0:0` baseline** (both FP8 and BF16 where applicable; report honestly if INT8 fails to beat FP8).
-- Held-out long-context / needle retrieval and agentic multi-turn prefix-cache exact-restore sessions.
-- Matched speed & physical memory (bytes/token including scales, indexers, and any `sink4_local128` protection; load time; write-transform overhead; cold prefill; short & long decode; concurrency).
+- Held-out long-context / needle retrieval and agentic multi-turn prefix-cache exact-restore sessions (with default `sink4_local128` protection active on full-history MLA layers, SWA untouched).
+- Matched speed & physical memory (bytes/token including scales, indexers, and `sink4_local128` protection rows; load time; write-transform overhead; cold prefill; short & long decode; concurrency).
 - Speculative decoding correctness (especially target-KV-sharing drafters such as DFly2) and zero hidden full-precision KV duplicate.
 
 ---
@@ -161,11 +165,12 @@ Follow `docs/quantization/brief-template.md` §12:
 ## 9. Model addendum (fill in per checkpoint)
 - **MODEL_ID:** `<org/repo>` (e.g. `wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC`)
 - **SOURCE_REVISION:** `<immutable 40-char SHA>`
-- **Checkpoint kind:** `mc` (`original`, `k8-compact`, `k6-compact`, `fp8-compact`) | `plain`
+- **Checkpoint kind:** `mc` (`original`, `k8-compact`, `k6-compact`, `fp8-compact`; rewrites `cuteafd-mc.json` + adds `mla_calibration.safetensors`) | `plain` (adds `mla_calibration.safetensors` only)
 - **Family adapter:** `quantization/<family>/qmla_{capture,run,publish}.py`
 - **Eligible full-history MLA layers:** `<list>` (explicitly list untouched SWA / KDA / HCA layers)
 - **RoPE / NoPE convention:** `<interleaved | split_half | unrotated_pe | none>`, `mrope_section=<...>`, `shared_consumers=<...>`
 - **Target modes:** `<e.g. 8:8,4:8,4:4,2:4,4:0,0:4,8:0,0:8,2:0 or 8:0,4:0,2:0 for pure NoPE>`
-- **Corpus components:** base (`agentic`, `exl3_standard` at `wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7`) + optional long-context components (`<none | NAME=REPO@REV>`)
-- **Pilot configuration:** `--layers <subset> --modes <one-mode> --train-sequences 16 --val-sequences 4 --steps 100`
+- **Protection policy:** `sink4_local128` (default on full-history MLA layers; SWA untouched)
+- **Pinned 3-component corpus:** `wrldsuksgo2mars/agentic-quant-panel-v2@<QMLA_PANEL_REVISION>` (`agentic`, `exl3_standard`, `<QMLA_LONG_CONTEXT_COMPONENT>`)
+- **Pilot configuration:** `--layers <subset> --modes <one-mode> --protection sink4_local128 --train-sequences 16 --val-sequences 4 --steps 100`
 - **Artifact status target:** `calibrated_unqualified` (promote to `runtime_qualified` after runtime qualification in #2909 Phases 3–5)

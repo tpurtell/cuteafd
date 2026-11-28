@@ -136,29 +136,106 @@ def _read(root, name):
 
 
 QMLA_SCHEMA = "cuteafd-qmla-v1"
-QMLA_MANIFEST_FILE = "mla_calibration.json"
 QMLA_TENSORS_FILE = "mla_calibration.safetensors"
 QMLA_STATUSES = frozenset({"calibrated_unqualified", "runtime_qualified"})
+QMLA_PROTECTION_POLICIES = frozenset({"sink4_local128", "none"})
+QMLA_PROTECTION_SCOPE = "full_history_mla_only"
+QMLA_MODE_RE = re.compile(r"^(0|2|4|8):(0|4|8)$")
+
+
+def _hex40(value):
+    return isinstance(value, str) and len(value) == 40 and all(c in "0123456789abcdef" for c in value)
 
 
 def validate_qmla_advisory(qmla, *, strict=False):
-    """Validate optional advisory QMLA sidecar metadata (never in required_features)."""
+    """Validate optional embedded QMLA manifest section in cuteafd-mc.json (never in required_features)."""
     _fields(
         qmla,
-        ("schema", "manifest", "manifest_sha256", "tensors", "tensors_sha256",
-         "transform_fingerprint", "artifact_status"),
+        (
+            "schema",
+            "artifact_status",
+            "protection_policy",
+            "protection_scope",
+            "source",
+            "applicable_views",
+            "view_transfer_validation",
+            "conventions",
+            "quantizer_recipe",
+            "geometry",
+            "profiles",
+            "supported_modes",
+            "unsupported_modes_reason",
+            "calibration_provenance",
+            "tensors_file",
+            "tensors_payload_bytes",
+            "tensors_payload_sha256",
+            "tensors_bytes",
+            "tensors_sha256",
+            "transform_fingerprint",
+        ),
         strict=strict,
     )
-    _require(qmla["schema"] == QMLA_SCHEMA, "unsupported MC advisory QMLA schema")
+    _require(qmla["schema"] == QMLA_SCHEMA, "unsupported MC QMLA schema")
+    _require(qmla["artifact_status"] in QMLA_STATUSES, "invalid MC QMLA artifact_status")
+    policy = qmla["protection_policy"]
+    _require(policy in QMLA_PROTECTION_POLICIES, "invalid MC QMLA protection_policy")
+    _require(qmla["protection_scope"] == QMLA_PROTECTION_SCOPE, "invalid MC QMLA protection_scope")
+    _require(qmla["tensors_file"] == QMLA_TENSORS_FILE, "noncanonical MC QMLA tensors_file")
     _require(
-        qmla["manifest"] == QMLA_MANIFEST_FILE and qmla["tensors"] == QMLA_TENSORS_FILE,
-        "noncanonical MC advisory QMLA sidecar filenames",
+        type(qmla["tensors_payload_bytes"]) is int and qmla["tensors_payload_bytes"] > 0
+        and type(qmla["tensors_bytes"]) is int and qmla["tensors_bytes"] >= qmla["tensors_payload_bytes"],
+        "invalid MC QMLA tensor byte sizes",
     )
     _require(
-        all(_digest(qmla[k]) for k in ("manifest_sha256", "tensors_sha256", "transform_fingerprint")),
-        "invalid MC advisory QMLA digest",
+        all(_digest(qmla[k]) for k in ("tensors_payload_sha256", "tensors_sha256", "transform_fingerprint")),
+        "invalid MC QMLA digest",
     )
-    _require(qmla["artifact_status"] in QMLA_STATUSES, "invalid MC advisory QMLA artifact_status")
+    source = qmla["source"]
+    _require(isinstance(source, dict) and all(_text(source.get(k)) for k in (
+        "repo", "revision", "family", "model_type", "config_sha256", "checkpoint_kind"
+    )), "invalid MC QMLA source metadata")
+    views = qmla["applicable_views"]
+    _require(isinstance(views, list) and bool(views) and all(_text(v) for v in views),
+             "MC QMLA requires applicable_views")
+    _require(isinstance(qmla["view_transfer_validation"], dict)
+             and isinstance(qmla["conventions"], dict)
+             and isinstance(qmla["quantizer_recipe"], dict)
+             and isinstance(qmla["unsupported_modes_reason"], dict),
+             "invalid MC QMLA metadata sections")
+    geoms = qmla["geometry"]
+    _require(isinstance(geoms, list) and bool(geoms) and all(isinstance(g, dict) for g in geoms),
+             "MC QMLA requires non-empty geometry")
+    profiles = qmla["profiles"]
+    _fields(profiles, ("content", "rope"), strict=strict)
+    _require(isinstance(profiles["content"], dict) and isinstance(profiles["rope"], dict)
+             and (bool(profiles["content"]) or bool(profiles["rope"])),
+             "MC QMLA requires at least one content or RoPE profile")
+    for section in ("content", "rope"):
+        for prof in profiles[section].values():
+            _require(isinstance(prof, dict)
+                     and prof.get("protection_calibrated") == policy
+                     and _digest(prof.get("profile_fingerprint")),
+                     f"invalid MC QMLA {section} profile")
+    modes = qmla["supported_modes"]
+    _require(isinstance(modes, list) and bool(modes)
+             and all(isinstance(m, str) and QMLA_MODE_RE.fullmatch(m) and m != "0:0" for m in modes),
+             "invalid MC QMLA supported_modes")
+    prov = qmla["calibration_provenance"]
+    _require(isinstance(prov, dict)
+             and _text(prov.get("dataset_repo"))
+             and _hex40(prov.get("dataset_revision"))
+             and _digest(prov.get("input_ids_sha256")),
+             "invalid MC QMLA calibration_provenance")
+    comps = prov.get("components")
+    _require(isinstance(comps, dict) and len(comps) == 3
+             and {"agentic", "exl3_standard"} < set(comps.keys()),
+             "MC QMLA calibration_provenance.components requires all 3 pinned components")
+    for row in comps.values():
+        _require(isinstance(row, dict)
+                 and type(row.get("sequences")) is int and row["sequences"] > 0
+                 and type(row.get("tokens")) is int and row["tokens"] > 0
+                 and _digest(row.get("input_ids_sha256")),
+                 "invalid MC QMLA corpus component entry")
     return qmla
 
 

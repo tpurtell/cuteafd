@@ -1,9 +1,13 @@
 """Same-repo incremental Hugging Face revision publisher for QMLA sidecars.
 
-Publishes ``mla_calibration.safetensors`` and ``mla_calibration.json`` (plus an
-optional advisory ``qmla`` section in ``cuteafd-mc.json`` and optional validation
-report / model-card update) onto a **new revision of the same HF repository** at
-pinned ``source_revision``.
+Publishes ``mla_calibration.safetensors`` (the ONLY sidecar file — no separate
+``mla_calibration.json``) onto a **new revision of the same HF repository** at pinned
+``source_revision``:
+- For MC checkpoints: rewrites ``cuteafd-mc.json`` with the added ``"qmla"`` section
+  and adds ``mla_calibration.safetensors`` (+ optional validation report / README).
+- For non-MC checkpoints: adds ONLY ``mla_calibration.safetensors`` (self-describing via
+  ``__metadata__["cuteafd_qmla"]``, never creating ``cuteafd-mc.json``) (+ optional
+  validation report / README).
 
 Guarantees:
 - Zero new repositories.
@@ -18,7 +22,6 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
-import json
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -27,15 +30,13 @@ from hub_requirements import require_qualified_hub
 
 from .capture import _atomic_json
 from .sidecar import (
-    MANIFEST_FILE,
     TENSORS_FILE,
-    attach_qmla_advisory_to_mc,
+    attach_qmla_to_mc,
     validate_sidecar,
 )
 
 INCREMENTAL_PLAN_SCHEMA = "cuteafd-qmla-incremental-upload-plan-v1"
 ALLOWED_INCREMENTAL_FILES = frozenset({
-    MANIFEST_FILE,
     TENSORS_FILE,
     "cuteafd-mc.json",
     "README.md",
@@ -66,7 +67,7 @@ def _file_row(path: Path, name: str) -> dict[str, Any]:
 def plan_incremental_revision(
     repo_id: str,
     source_revision: str,
-    sidecar_dir: Path | str,
+    sidecar_path_or_dir: Path | str,
     *,
     remote_tree: Mapping[str, Mapping[str, Any]],
     existing_mc_manifest: Mapping[str, Any] | None = None,
@@ -81,10 +82,10 @@ def plan_incremental_revision(
     if not source_revision or len(source_revision) != 40 or not all(c in "0123456789abcdef" for c in source_revision):
         raise ValueError(f"source_revision must be a 40-char immutable git commit SHA, got {source_revision!r}")
 
-    sidecar_dir = Path(sidecar_dir).resolve()
-    validation = validate_sidecar(sidecar_dir, expected_source=expected_source, strict=True)
+    sidecar_root = Path(sidecar_path_or_dir).resolve()
+    tensors_path = sidecar_root / TENSORS_FILE if sidecar_root.is_dir() else sidecar_root
+    validation = validate_sidecar(tensors_path, expected_source=expected_source, strict=True)
 
-    # Identify all preserved weight shards and metadata at source_revision.
     preserved_shards = sorted(
         name for name in remote_tree if name.endswith(".safetensors") and name != TENSORS_FILE
     )
@@ -92,21 +93,17 @@ def plan_incremental_revision(
         raise ValueError(f"remote tree at {repo_id}@{source_revision} contains no model weight shards")
 
     additions: dict[str, dict[str, Any]] = {
-        TENSORS_FILE: _file_row(sidecar_dir / TENSORS_FILE, TENSORS_FILE),
-        MANIFEST_FILE: _file_row(sidecar_dir / MANIFEST_FILE, MANIFEST_FILE),
+        TENSORS_FILE: _file_row(tensors_path, TENSORS_FILE),
     }
     if additions[TENSORS_FILE]["sha256"] != validation["tensors_sha256"]:
         raise ValueError("sidecar tensors changed after validation")
-    if additions[MANIFEST_FILE]["sha256"] != validation["manifest_sha256"]:
-        raise ValueError("sidecar manifest changed after validation")
 
     if existing_mc_manifest is not None:
         if "cuteafd-mc.json" not in remote_tree:
             raise ValueError("existing_mc_manifest provided, but remote repo has no cuteafd-mc.json")
         if stage_dir is None:
             raise ValueError("stage_dir is required when updating cuteafd-mc.json")
-        updated_mc = attach_qmla_advisory_to_mc(existing_mc_manifest, sidecar_dir)
-        # Verify invariant MC fields did not move.
+        updated_mc = attach_qmla_to_mc(existing_mc_manifest, tensors_path)
         for invariant in (
             "schema",
             "source",
@@ -119,6 +116,7 @@ def plan_incremental_revision(
         ):
             if existing_mc_manifest.get(invariant) != updated_mc.get(invariant):
                 raise ValueError(f"incremental QMLA update must not alter MC field {invariant!r}")
+        validate_sidecar(tensors_path, mc_manifest=updated_mc, expected_source=expected_source, strict=True)
         staged_mc = Path(stage_dir).resolve() / "cuteafd-mc.json"
         _atomic_json(staged_mc, updated_mc)
         additions["cuteafd-mc.json"] = _file_row(staged_mc, "cuteafd-mc.json")
@@ -130,7 +128,6 @@ def plan_incremental_revision(
     if readme_path is not None:
         additions["README.md"] = _file_row(Path(readme_path), "README.md")
 
-    # Hard guard: never touch any existing weight shard or disallowed path.
     disallowed = set(additions) - ALLOWED_INCREMENTAL_FILES
     if disallowed:
         raise ValueError(f"incremental QMLA plan touches disallowed files: {sorted(disallowed)}")
@@ -148,6 +145,7 @@ def plan_incremental_revision(
         "repo_id": repo_id,
         "source_revision": source_revision,
         "artifact_status": validation["artifact_status"],
+        "protection_policy": validation["protection_policy"],
         "transform_fingerprint": validation["transform_fingerprint"],
         "supported_modes": validation["supported_modes"],
         "additions": additions,
@@ -191,6 +189,7 @@ def publish_incremental_revision(
             "source_revision": plan["source_revision"],
             "new_revision": None,
             "artifact_status": plan["artifact_status"],
+            "protection_policy": plan["protection_policy"],
             "transform_fingerprint": plan["transform_fingerprint"],
             "uploaded_files": sorted(additions),
             "upload_bytes": int(plan["upload_bytes"]),
@@ -222,7 +221,7 @@ def publish_incremental_revision(
         operations = [hub_lfs.receipt_operation(name, additions[name]) for name in ordered]
         msg = commit_message or (
             f"Add QMLA calibration sidecar ({plan['artifact_status']}, "
-            f"modes={','.join(plan['supported_modes'])})"
+            f"protection={plan['protection_policy']}, modes={','.join(plan['supported_modes'])})"
         )
         commit_info = api.create_commit(
             repo_id=repo_id,
@@ -236,7 +235,6 @@ def publish_incremental_revision(
         hub_lfs.check_fingerprints(additions, ordered)
 
         remote_after = hub_lfs.remote_tree(api, repo_id, new_sha)
-        # Verify every preserved file kept identical bytes & blob, and every added file matches.
         for name, expected_row in plan["preserved_tree"].items():
             if name == ".gitattributes":
                 continue
@@ -253,6 +251,7 @@ def publish_incremental_revision(
             "source_revision": parent,
             "new_revision": new_sha,
             "artifact_status": plan["artifact_status"],
+            "protection_policy": plan["protection_policy"],
             "transform_fingerprint": plan["transform_fingerprint"],
             "supported_modes": list(plan["supported_modes"]),
             "uploaded_files": ordered,

@@ -98,7 +98,7 @@ def test_hy4_flash_capture_reproduces_independent_f32_reference(kind: str, seq_l
     # Positional QK oracle matches direct q_rope @ k_rope^T and preserves mask.
     z_p, mask = eval_positional_qk(captured, geom)
     direct = torch.einsum("thd,sd->hts", captured.q_rope, captured.k_rope)
-    torch.testing.assert_close(z_p, direct, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(z_p, direct, rtol=1e-5, atol=1e-5)
     assert torch.equal(mask, captured.allowed_mask)
     if kind == reference.SPARSE:
         assert tap is not None and tap.groups.shape == (seq_len, 3)

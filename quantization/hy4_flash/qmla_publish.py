@@ -1,9 +1,12 @@
 """Publish a validated Hy4-flash QMLA sidecar onto a new revision of the same HF repo.
 
 Thin family CLI wrapper over ``quantization/qmla/publish.py``:
-- No new repository.
-- Zero weight shard re-uploads (preserves every existing shard/index/view/asset).
-- HTTP LFS only (``HF_HUB_DISABLE_XET=1``).
+- Single sidecar file: ``mla_calibration.safetensors`` (no ``mla_calibration.json``).
+- MC checkpoints (``--update-mc-manifest``): rewrites ``cuteafd-mc.json`` with the added
+  ``"qmla"`` section and adds ``mla_calibration.safetensors``.
+- Non-MC checkpoints (omit ``--update-mc-manifest``): adds ONLY
+  ``mla_calibration.safetensors`` (self-describing via ``__metadata__["cuteafd_qmla"]``).
+- No new repository; zero weight shard re-uploads; HTTP LFS only (``HF_HUB_DISABLE_XET=1``).
 - Reads HF write token from stdin only when not ``--dry-run``.
 """
 from __future__ import annotations
@@ -27,11 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-id", default=hy4_recipe.TARGET_REPO, help="Existing HF repo to add a new revision to")
     parser.add_argument("--source-revision", required=True, help="Immutable 40-char parent commit SHA")
-    parser.add_argument("--sidecar-dir", type=Path, required=True, help="Directory holding mla_calibration.{json,safetensors}")
+    parser.add_argument("--sidecar-dir", type=Path, required=True, help="Directory holding mla_calibration.safetensors")
     parser.add_argument("--state-root", type=Path, required=True, help="Task state directory for upload lock/receipts")
     parser.add_argument("--validation-report", type=Path, default=None)
     parser.add_argument("--readme", type=Path, default=None)
-    parser.add_argument("--update-mc-manifest", action="store_true", help="Attach advisory qmla pointer in cuteafd-mc.json")
+    parser.add_argument("--update-mc-manifest", action="store_true", help="Embed full qmla section in cuteafd-mc.json (MC repos)")
     parser.add_argument("--dry-run", action="store_true", help="Validate plan locally without committing to HF")
     hub_lfs.add_arguments(parser, batches=False)
     return parser
@@ -53,7 +56,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     api = HfApi(token=token or False)
     remote = hub_lfs.remote_tree(api, args.repo_id, args.source_revision)
     existing_mc = None
-    if args.update_mc_manifest and "cuteafd-mc.json" in remote:
+    if args.update_mc_manifest:
+        if "cuteafd-mc.json" not in remote:
+            parser.error("--update-mc-manifest requested, but remote repo has no cuteafd-mc.json")
         mc_path = Path(
             hf_hub_download(
                 args.repo_id, "cuteafd-mc.json", revision=args.source_revision, token=token or False

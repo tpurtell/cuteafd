@@ -5,10 +5,13 @@ Provides:
   reference evaluators, deterministic train/val split, XXH3-128 capture storage.
 - ``quantizer``: QuantMLA per-token asymmetric affine group-64 quantizer,
   bit-exact INT2/INT4/INT8 pack/unpack oracle, record sizing, Hadamard baseline.
-- ``fit``: function-aligned content (L_C) and RoPE (L_P) optimizers, step-0
-  baselines (RTN / Hadamard / SmoothQuant alpha-grid), XXH3-128 fit checkpoints.
-- ``sidecar``: ``cuteafd-qmla-v1`` sidecar writer, fail-closed validator,
-  pluggable ``CorpusComponentSpec``, and advisory ``cuteafd-mc.json`` builder.
+- ``fit``: function-aligned content (L_C) and RoPE (L_P) optimizers with default
+  ``sink4_local128`` protection on full-history MLA layers, step-0 baselines
+  (RTN / Hadamard / SmoothQuant alpha-grid), XXH3-128 fit checkpoints.
+- ``sidecar``: ``cuteafd-qmla-v1`` single-file sidecar (``mla_calibration.safetensors``
+  with embedded ``__metadata__["cuteafd_qmla"]`` + full ``qmla`` section in
+  ``cuteafd-mc.json`` for MC checkpoints; no separate ``mla_calibration.json``),
+  single pinned 3-component panel contract, and fail-closed validators.
 - ``publish``: same-repo incremental HF revision planner and HTTP LFS publisher
   (zero weight shard re-upload).
 """
@@ -32,7 +35,11 @@ from .capture import (
 )
 from .fit import (
     ALPHA_INIT_GRID,
+    DEFAULT_PROTECTION_POLICY,
+    DEFAULT_RECENT_TOKENS,
+    DEFAULT_SINK_TOKENS,
     FIT_CHECKPOINT_SCHEMA,
+    VALID_PROTECTION_POLICIES,
     ContentFitResult,
     FitConfig,
     RopeFitResult,
@@ -45,6 +52,7 @@ from .fit import (
     fit_content_layer,
     fit_rope_layer,
     load_fit_checkpoint,
+    protection_mask,
     rope_qk_loss,
     save_fit_checkpoint,
 )
@@ -78,15 +86,21 @@ from .quantizer import (
 from .sidecar import (
     CANONICAL_CONVENTIONS,
     CANONICAL_QUANTIZER_RECIPE,
-    MANIFEST_FILE,
+    PROTECTION_SCOPE,
+    QMLA_BASE_COMPONENTS,
+    QMLA_LONG_CONTEXT_COMPONENT,
+    QMLA_METADATA_KEY,
+    QMLA_PANEL_REPO,
+    QMLA_PANEL_REVISION,
     QMLA_SCHEMA,
     TENSORS_FILE,
     VALID_ARTIFACT_STATUSES,
-    CorpusComponentSpec,
-    attach_qmla_advisory_to_mc,
-    build_mc_qmla_advisory,
+    attach_qmla_to_mc,
+    build_mc_qmla_section,
     compute_transform_fingerprint,
     derive_supported_modes,
+    read_sidecar_manifest,
+    require_pinned_qmla_panel,
     validate_sidecar,
     write_sidecar,
 )
@@ -102,14 +116,21 @@ __all__ = [
     "CapturedLayerParams",
     "CapturedSequence",
     "ContentFitResult",
-    "CorpusComponentSpec",
+    "DEFAULT_PROTECTION_POLICY",
+    "DEFAULT_RECENT_TOKENS",
+    "DEFAULT_SINK_TOKENS",
     "EPS_SCALE",
     "FIT_CHECKPOINT_SCHEMA",
     "FitConfig",
     "GROUP_SIZE",
     "INCREMENTAL_PLAN_SCHEMA",
-    "MANIFEST_FILE",
     "MlaLayerGeometry",
+    "PROTECTION_SCOPE",
+    "QMLA_BASE_COMPONENTS",
+    "QMLA_LONG_CONTEXT_COMPONENT",
+    "QMLA_METADATA_KEY",
+    "QMLA_PANEL_REPO",
+    "QMLA_PANEL_REVISION",
     "QMLA_SCHEMA",
     "QmlaCaptureAdapter",
     "ROPE_NONZERO_BITS",
@@ -117,11 +138,12 @@ __all__ = [
     "TENSORS_FILE",
     "VALID_ARTIFACT_STATUSES",
     "VALID_CONTENT_BITS",
+    "VALID_PROTECTION_POLICIES",
     "VALID_ROPE_BITS",
     "apply_content_forward",
     "apply_rope_pair_transform",
-    "attach_qmla_advisory_to_mc",
-    "build_mc_qmla_advisory",
+    "attach_qmla_to_mc",
+    "build_mc_qmla_section",
     "causal_mask",
     "cayley_orthogonal",
     "compensate_kv_b",
@@ -141,10 +163,13 @@ __all__ = [
     "pack_unsigned_codes",
     "parse_qmla_mode",
     "plan_incremental_revision",
+    "protection_mask",
     "publish_incremental_revision",
     "qdq_asymmetric_group",
     "quantize_params_asymmetric",
+    "read_sidecar_manifest",
     "record_bytes_for_mode",
+    "require_pinned_qmla_panel",
     "rms_norm",
     "rope_qk_loss",
     "save_fit_checkpoint",

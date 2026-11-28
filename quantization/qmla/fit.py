@@ -1,6 +1,9 @@
 """Function-aligned dual-path QMLA transformation optimizer and baseline evaluator.
 
-Reproduces QuantMLA (Su et al., 2026-09, arXiv:2609.36760) Section 3 and Appendix C.4:
+Reproduces QuantMLA (Su et al., 2026-09, arXiv:2609.36760) Section 3 and Appendix C.4,
+with CuteAFD Adaptation A4: recent-token protection (``sink4_local128``) is enabled by
+default on full-history MLA layers during both calibration and serving (SWA untouched),
+with ``protection="none"`` available as the measured unprotected alternative:
 - Content path: Cayley-parameterized orthogonal R_C and log-space positive scale S_C
   in weightless unit_rms coordinates (z_C = u R_C S_C, compensated consumer
   W_kv_b_tilde = W_kv_b @ diag(gamma) @ R_C @ diag(1/S_C)), trained by post-o_proj
@@ -17,7 +20,6 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import json
 import math
-import os
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -46,11 +48,19 @@ from .quantizer import (
 
 FIT_CHECKPOINT_SCHEMA = "cuteafd-qmla-fit-checkpoint-v1"
 ALPHA_INIT_GRID = (0.0, 0.125, 0.25, 0.5, 0.75, 1.0)
+DEFAULT_PROTECTION_POLICY = "sink4_local128"
+VALID_PROTECTION_POLICIES = frozenset({"sink4_local128", "none"})
+DEFAULT_SINK_TOKENS = 4
+DEFAULT_RECENT_TOKENS = 128
 
 
 @dataclass(frozen=True)
 class FitConfig:
-    """Hyperparameters matching QuantMLA Appendix C.4 Table 7 (overridable for pilots)."""
+    """Hyperparameters matching QuantMLA Appendix C.4 Table 7 (overridable for pilots).
+
+    Defaults ``protection="sink4_local128"`` (4 sink + 128 recent tokens exact on
+    full-history MLA layers, CuteAFD Adaptation A4).
+    """
 
     steps: int = 300
     content_rot_lr: float = 3e-3
@@ -67,6 +77,9 @@ class FitConfig:
     seed: int = 0
     alpha_grid: tuple[float, ...] = ALPHA_INIT_GRID
     batch_size: int = 4
+    protection: str = DEFAULT_PROTECTION_POLICY
+    sink_tokens: int = DEFAULT_SINK_TOKENS
+    recent_tokens: int = DEFAULT_RECENT_TOKENS
 
     def validate(self) -> None:
         if self.steps < 0:
@@ -75,6 +88,12 @@ class FitConfig:
             raise ValueError("val_every, batch_size, and group_size must be positive")
         if not (0.0 <= self.warmup_frac <= 1.0) or self.log_scale_bound <= 0.0:
             raise ValueError("invalid warmup_frac or log_scale_bound")
+        if self.protection not in VALID_PROTECTION_POLICIES:
+            raise ValueError(
+                f"invalid protection policy {self.protection!r}; expected one of {sorted(VALID_PROTECTION_POLICIES)}"
+            )
+        if self.sink_tokens < 0 or self.recent_tokens < 0:
+            raise ValueError("sink_tokens and recent_tokens must be non-negative")
 
 
 @dataclass(frozen=True)
@@ -89,6 +108,7 @@ class ContentFitResult:
     equiv_max_rel_err: float
     orth_max_err: float
     baselines: dict[str, float]
+    protection_calibrated: str = DEFAULT_PROTECTION_POLICY
 
 
 @dataclass(frozen=True)
@@ -102,6 +122,57 @@ class RopeFitResult:
     init_alpha: float
     equiv_max_rel_err: float
     baselines: dict[str, float]
+    protection_calibrated: str = DEFAULT_PROTECTION_POLICY
+
+
+def protection_mask(
+    seq_len: int,
+    *,
+    protection: str = DEFAULT_PROTECTION_POLICY,
+    sink_tokens: int = DEFAULT_SINK_TOKENS,
+    recent_tokens: int = DEFAULT_RECENT_TOKENS,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor | None:
+    """Return boolean mask [T] where True marks protected exact tokens P_T (None for ``none``)."""
+    if protection not in VALID_PROTECTION_POLICIES:
+        raise ValueError(f"unsupported protection policy: {protection!r}")
+    if protection == "none":
+        return None
+    mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
+    if sink_tokens > 0:
+        mask[: min(sink_tokens, seq_len)] = True
+    if recent_tokens > 0:
+        mask[max(0, seq_len - recent_tokens) :] = True
+    return mask
+
+
+def _require_unprotected_tokens(
+    seqs: Sequence[CapturedSequence],
+    *,
+    protection: str,
+    sink_tokens: int,
+    recent_tokens: int,
+    split_name: str,
+) -> None:
+    if protection == "none":
+        return
+    unprotected = 0
+    for seq in seqs:
+        mask = protection_mask(
+            seq.seq_len,
+            protection=protection,
+            sink_tokens=sink_tokens,
+            recent_tokens=recent_tokens,
+            device="cpu",
+        )
+        assert mask is not None
+        unprotected += int((~mask).sum().item())
+    if unprotected == 0:
+        raise ValueError(
+            f"protection={protection!r} (sink_tokens={sink_tokens}, recent_tokens={recent_tokens}) "
+            f"covers 100% of {split_name} tokens; sequences must be longer than {sink_tokens + recent_tokens} "
+            "tokens (or pass --protection none for an explicit unprotected measurement)"
+        )
 
 
 def cayley_orthogonal(skew_raw: torch.Tensor) -> torch.Tensor:
@@ -198,23 +269,38 @@ def content_output_loss(
     group_size: int = GROUP_SIZE,
     eps_scale: float = EPS_SCALE,
     ste: bool = True,
+    protection: str = DEFAULT_PROTECTION_POLICY,
+    sink_tokens: int = DEFAULT_SINK_TOKENS,
+    recent_tokens: int = DEFAULT_RECENT_TOKENS,
     extra_consumers: Sequence[tuple[CapturedLayerParams, MlaLayerGeometry, Sequence[CapturedSequence]]] = (),
 ) -> torch.Tensor:
-    """Mean normalized attention-output reconstruction loss L_C (QuantMLA Eq. 8)."""
+    """Mean normalized attention-output reconstruction loss L_C (QuantMLA Eq. 8 + A4 protection)."""
     all_groups = [(params, geometry, seqs), *extra_consumers]
     losses: list[torch.Tensor] = []
     for c_params, c_geom, c_seqs in all_groups:
         w_tilde = compensate_kv_b(c_params.kv_b_weight, c_params.kv_norm_weight, r_c, s_c)
 
-        def _content_fn(u: torch.Tensor) -> torch.Tensor:
-            z = apply_content_forward(u, r_c, s_c)
-            if quantize:
-                z = qdq_asymmetric_group(
-                    z, bits, group_size=group_size, scale_dtype="BF16", eps=eps_scale, ste=ste
-                )
-            return z
-
         for seq in c_seqs:
+            prot_mask = protection_mask(
+                seq.seq_len,
+                protection=protection,
+                sink_tokens=sink_tokens,
+                recent_tokens=recent_tokens,
+                device=seq.u.device,
+            )
+
+            def _content_fn(u: torch.Tensor, _mask: torch.Tensor | None = prot_mask) -> torch.Tensor:
+                z = apply_content_forward(u, r_c, s_c)
+                if quantize:
+                    z_q = qdq_asymmetric_group(
+                        z, bits, group_size=group_size, scale_dtype="BF16", eps=eps_scale, ste=ste
+                    )
+                    if _mask is not None:
+                        z = torch.where(_mask.unsqueeze(-1), z, z_q)
+                    else:
+                        z = z_q
+                return z
+
             pred = eval_attention_output(
                 seq, c_params, c_geom, content_fn=_content_fn, kv_b_override=w_tilde
             )
@@ -233,22 +319,38 @@ def rope_qk_loss(
     group_size: int = GROUP_SIZE,
     eps_scale: float = EPS_SCALE,
     ste: bool = True,
+    protection: str = DEFAULT_PROTECTION_POLICY,
+    sink_tokens: int = DEFAULT_SINK_TOKENS,
+    recent_tokens: int = DEFAULT_RECENT_TOKENS,
 ) -> torch.Tensor:
-    """Mean normalized causal positional-QK reconstruction loss L_P (QuantMLA Eq. 10)."""
+    """Mean normalized causal positional-QK reconstruction loss L_P (QuantMLA Eq. 10 + A4 protection)."""
     losses: list[torch.Tensor] = []
 
     def _q_fn(qp: torch.Tensor) -> torch.Tensor:
         return apply_rope_pair_transform(qp, theta, s_p, rope_kind=geometry.rope_kind, inverse_scale=True)
 
-    def _k_fn(kp: torch.Tensor) -> torch.Tensor:
-        kt = apply_rope_pair_transform(kp, theta, s_p, rope_kind=geometry.rope_kind, inverse_scale=False)
-        if quantize:
-            kt = qdq_asymmetric_group(
-                kt, bits, group_size=group_size, scale_dtype="F32", eps=eps_scale, ste=ste
-            )
-        return kt
-
     for seq in seqs:
+        assert seq.k_rope is not None
+        prot_mask = protection_mask(
+            seq.seq_len,
+            protection=protection,
+            sink_tokens=sink_tokens,
+            recent_tokens=recent_tokens,
+            device=seq.k_rope.device,
+        )
+
+        def _k_fn(kp: torch.Tensor, _mask: torch.Tensor | None = prot_mask) -> torch.Tensor:
+            kt = apply_rope_pair_transform(kp, theta, s_p, rope_kind=geometry.rope_kind, inverse_scale=False)
+            if quantize:
+                kt_q = qdq_asymmetric_group(
+                    kt, bits, group_size=group_size, scale_dtype="F32", eps=eps_scale, ste=ste
+                )
+                if _mask is not None:
+                    kt = torch.where(_mask.unsqueeze(-1), kt, kt_q)
+                else:
+                    kt = kt_q
+            return kt
+
         ref_z, mask = eval_positional_qk(seq, geometry)
         pred_z, _ = eval_positional_qk(seq, geometry, rope_query_fn=_q_fn, rope_key_fn=_k_fn)
         losses.append(_normalized_qk_mse(pred_z, ref_z, mask))
@@ -343,6 +445,20 @@ def fit_content_layer(
         raise ValueError(f"fit_content_layer requires bits in {sorted(CONTENT_NONZERO_BITS)}, got {bits}")
     config.validate()
     bank.validate()
+    _require_unprotected_tokens(
+        bank.train,
+        protection=config.protection,
+        sink_tokens=config.sink_tokens,
+        recent_tokens=config.recent_tokens,
+        split_name="train",
+    )
+    _require_unprotected_tokens(
+        bank.val,
+        protection=config.protection,
+        sink_tokens=config.sink_tokens,
+        recent_tokens=config.recent_tokens,
+        split_name="val",
+    )
     dev = torch.device(device)
 
     geom = bank.geometry
@@ -355,31 +471,40 @@ def fit_content_layer(
 
     eye = torch.eye(d_c, device=dev, dtype=torch.float32)
     ones = torch.ones(d_c, device=dev, dtype=torch.float32)
+    prot_kwargs = {
+        "protection": config.protection,
+        "sink_tokens": config.sink_tokens,
+        "recent_tokens": config.recent_tokens,
+    }
 
-    # Step-0 baselines: native RTN (on c = u*gamma), unit_rms RTN (on u), fixed Hadamard, and SmoothQuant alpha grid.
+    # Step-0 baselines under the active protection policy: native RTN, unit_rms RTN, Hadamard, SmoothQuant alpha grid.
     baselines: dict[str, float] = {}
     with torch.no_grad():
         native_losses = []
         for seq in val_seqs:
-            pred = eval_attention_output(
-                seq,
-                params,
-                geom,
-                content_fn=lambda u: qdq_asymmetric_group(
-                    u * params.kv_norm_weight.float(),
-                    bits,
-                    group_size=config.group_size,
-                    scale_dtype="BF16",
-                    eps=config.eps_scale,
-                    ste=False,
-                ),
+            pm = protection_mask(
+                seq.seq_len,
+                protection=config.protection,
+                sink_tokens=config.sink_tokens,
+                recent_tokens=config.recent_tokens,
+                device=dev,
             )
+
+            def _native_fn(u: torch.Tensor, _mask: torch.Tensor | None = pm) -> torch.Tensor:
+                c = u * params.kv_norm_weight.float()
+                c_q = qdq_asymmetric_group(
+                    c, bits, group_size=config.group_size, scale_dtype="BF16", eps=config.eps_scale, ste=False
+                )
+                return torch.where(_mask.unsqueeze(-1), c, c_q) if _mask is not None else c_q
+
+            pred = eval_attention_output(seq, params, geom, content_fn=_native_fn)
             native_losses.append(_normalized_output_mse(pred, seq.ref_output.float()))
         baselines["rtn_native_val"] = float(torch.stack(native_losses).mean().item())
         baselines["rtn_unit_rms_val"] = float(
             content_output_loss(
                 val_seqs, params, geom, eye, ones, bits,
-                group_size=config.group_size, eps_scale=config.eps_scale, ste=False, extra_consumers=extra_val,
+                group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
+                extra_consumers=extra_val, **prot_kwargs,
             ).item()
         )
         if (d_c & (d_c - 1)) == 0:
@@ -387,7 +512,8 @@ def fit_content_layer(
             baselines["hadamard_val"] = float(
                 content_output_loss(
                     val_seqs, params, geom, h_mat, ones, bits,
-                    group_size=config.group_size, eps_scale=config.eps_scale, ste=False, extra_consumers=extra_val,
+                    group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
+                    extra_consumers=extra_val, **prot_kwargs,
                 ).item()
             )
 
@@ -401,7 +527,8 @@ def fit_content_layer(
             cand_loss = float(
                 content_output_loss(
                     val_seqs, params, geom, eye, torch.exp(cand_log_s), bits,
-                    group_size=config.group_size, eps_scale=config.eps_scale, ste=False, extra_consumers=extra_val,
+                    group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
+                    extra_consumers=extra_val, **prot_kwargs,
                 ).item()
             )
             # Favor alpha=0 on ties (Appendix C.4).
@@ -446,7 +573,8 @@ def fit_content_layer(
         s_c = torch.exp(log_s)
         loss = content_output_loss(
             batch, params, geom, r_c, s_c, bits,
-            group_size=config.group_size, eps_scale=config.eps_scale, ste=True, extra_consumers=batch_extra,
+            group_size=config.group_size, eps_scale=config.eps_scale, ste=True,
+            extra_consumers=batch_extra, **prot_kwargs,
         )
         if config.anchor > 0.0:
             reg = config.anchor * ((r_c - eye).pow(2).sum() / d_c + log_s.pow(2).mean())
@@ -465,7 +593,8 @@ def fit_content_layer(
                 val_loss = float(
                     content_output_loss(
                         val_seqs, params, geom, r_eval, s_eval, bits,
-                        group_size=config.group_size, eps_scale=config.eps_scale, ste=False, extra_consumers=extra_val,
+                        group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
+                        extra_consumers=extra_val, **prot_kwargs,
                     ).item()
                 )
                 if math.isfinite(val_loss) and val_loss < best_val_loss:
@@ -487,6 +616,7 @@ def fit_content_layer(
         equiv_max_rel_err=equiv_err,
         orth_max_err=orth_err,
         baselines=baselines,
+        protection_calibrated=config.protection,
     )
 
 
@@ -505,6 +635,20 @@ def fit_rope_layer(
     geom = bank.geometry
     if not geom.has_rope:
         raise ValueError(f"layer {geom.layer_id} has no RoPE path (rope_kind={geom.rope_kind!r})")
+    _require_unprotected_tokens(
+        bank.train,
+        protection=config.protection,
+        sink_tokens=config.sink_tokens,
+        recent_tokens=config.recent_tokens,
+        split_name="train",
+    )
+    _require_unprotected_tokens(
+        bank.val,
+        protection=config.protection,
+        sink_tokens=config.sink_tokens,
+        recent_tokens=config.recent_tokens,
+        split_name="val",
+    )
 
     dev = torch.device(device)
     pairs = geom.qk_rope_dim // 2
@@ -513,13 +657,18 @@ def fit_rope_layer(
 
     zeros = torch.zeros(pairs, device=dev, dtype=torch.float32)
     ones = torch.ones(pairs, device=dev, dtype=torch.float32)
+    prot_kwargs = {
+        "protection": config.protection,
+        "sink_tokens": config.sink_tokens,
+        "recent_tokens": config.recent_tokens,
+    }
 
     baselines: dict[str, float] = {}
     with torch.no_grad():
         baselines["rtn_val"] = float(
             rope_qk_loss(
                 val_seqs, geom, zeros, ones, bits,
-                group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
+                group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs,
             ).item()
         )
         # Pair-tied 99.9th-percentile magnitude statistic across both coords of each pair.
@@ -538,7 +687,7 @@ def fit_rope_layer(
             cand_loss = float(
                 rope_qk_loss(
                     val_seqs, geom, zeros, torch.exp(cand_log_s), bits,
-                    group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
+                    group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs,
                 ).item()
             )
             if cand_loss < best_alpha_loss - 1e-12 or (
@@ -580,7 +729,7 @@ def fit_rope_layer(
         s_p = torch.exp(log_s)
         loss = rope_qk_loss(
             batch, geom, theta_param, s_p, bits,
-            group_size=config.group_size, eps_scale=config.eps_scale, ste=True,
+            group_size=config.group_size, eps_scale=config.eps_scale, ste=True, **prot_kwargs,
         )
         if config.anchor > 0.0:
             reg = config.anchor * (theta_param.pow(2).mean() + log_s.pow(2).mean())
@@ -598,7 +747,7 @@ def fit_rope_layer(
                 val_loss = float(
                     rope_qk_loss(
                         val_seqs, geom, theta_param, s_eval, bits,
-                        group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
+                        group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs,
                     ).item()
                 )
                 if math.isfinite(val_loss) and val_loss < best_val_loss:
@@ -618,6 +767,7 @@ def fit_rope_layer(
         init_alpha=best_alpha,
         equiv_max_rel_err=equiv_err,
         baselines=baselines,
+        protection_calibrated=config.protection,
     )
 
 
@@ -644,6 +794,7 @@ def save_fit_checkpoint(
             "equiv_max_rel_err": result.equiv_max_rel_err,
             "orth_max_err": result.orth_max_err,
             "baselines": result.baselines,
+            "protection_calibrated": result.protection_calibrated,
         }
     else:
         kind = "rope"
@@ -658,6 +809,7 @@ def save_fit_checkpoint(
             "init_alpha": result.init_alpha,
             "equiv_max_rel_err": result.equiv_max_rel_err,
             "baselines": result.baselines,
+            "protection_calibrated": result.protection_calibrated,
         }
     payload = _write_safetensors_streamed(directory / f"{stem}.safetensors", tensors)
     record = {
@@ -707,6 +859,7 @@ def load_fit_checkpoint(
             equiv_max_rel_err=float(meta["equiv_max_rel_err"]),
             orth_max_err=float(meta["orth_max_err"]),
             baselines=dict(meta["baselines"]),
+            protection_calibrated=str(meta["protection_calibrated"]),
         )
     return RopeFitResult(
         layer_id=int(meta["layer_id"]),
@@ -718,6 +871,7 @@ def load_fit_checkpoint(
         init_alpha=float(meta["init_alpha"]),
         equiv_max_rel_err=float(meta["equiv_max_rel_err"]),
         baselines=dict(meta["baselines"]),
+        protection_calibrated=str(meta["protection_calibrated"]),
     )
 
 

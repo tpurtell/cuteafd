@@ -1,7 +1,6 @@
 """CPU numeric oracle tests for shared QMLA quantizer, fit, sidecar, publish, and Hy4-flash pipeline."""
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 import sys
@@ -20,23 +19,25 @@ from hy4_flash.qmla_capture import Hy4FlashCaptureAdapter
 from hy4_flash.qmla_run import (
     build_parser,
     calibrate_hy4_flash_from_banks,
-    parse_corpus_component_arg,
+    load_pinned_qmla_corpus,
     parse_layers_arg,
     parse_modes_arg,
     resolve_run_settings,
 )
 from qmla import (
-    CorpusComponentSpec,
+    DEFAULT_PROTECTION_POLICY,
+    PROTECTION_SCOPE,
+    QMLA_METADATA_KEY,
+    QMLA_PANEL_REPO,
+    QMLA_PANEL_REVISION,
+    QMLA_LONG_CONTEXT_COMPONENT,
     FitConfig,
     MlaLayerGeometry,
     apply_content_forward,
     apply_rope_pair_transform,
-    attach_qmla_advisory_to_mc,
-    cayley_orthogonal,
-    compensate_kv_b,
+    attach_qmla_to_mc,
     content_output_loss,
     eval_attention_output,
-    eval_positional_qk,
     fit_config_digest,
     fit_content_layer,
     fit_rope_layer,
@@ -46,9 +47,13 @@ from qmla import (
     pack_rope_row,
     parse_qmla_mode,
     plan_incremental_revision,
+    protection_mask,
     publish_incremental_revision,
     qdq_asymmetric_group,
+    read_sidecar_manifest,
     record_bytes_for_mode,
+    require_pinned_qmla_panel,
+    rope_qk_loss,
     save_fit_checkpoint,
     sylvester_hadamard,
     unpack_content_row,
@@ -58,7 +63,28 @@ from qmla import (
 )
 
 
-def _make_skewed_hy4_bank(seed: int, *, layer_id: int = 0, d_c: int = 64, d_r: int = 64, seqs: int = 6):
+def _synthetic_3comp_provenance(long_ctx_name: str = "long_context") -> dict:
+    return {
+        "dataset_repo": QMLA_PANEL_REPO,
+        "dataset_revision": "a" * 40,
+        "components": {
+            "agentic": {"sequences": 4, "tokens": 600, "input_ids_sha256": "1" * 64},
+            "exl3_standard": {"sequences": 2, "tokens": 300, "input_ids_sha256": "2" * 64},
+            long_ctx_name: {"sequences": 2, "tokens": 32768, "input_ids_sha256": "3" * 64},
+        },
+        "input_ids_sha256": "4" * 64,
+    }
+
+
+def _make_skewed_hy4_bank(
+    seed: int,
+    *,
+    layer_id: int = 0,
+    d_c: int = 64,
+    d_r: int = 64,
+    seqs: int = 6,
+    base_seq_len: int = 16,
+):
     """Build a synthetic Hy4-flash layer with strong channel outliers (using repo generators only)."""
     g = torch.Generator().manual_seed(seed)
 
@@ -79,12 +105,11 @@ def _make_skewed_hy4_bank(seed: int, *, layer_id: int = 0, d_c: int = 64, d_r: i
         },
         compressed_indexer_compress_ratio=2,
         compressed_indexer_group_topk=3,
-        compressed_indexer_candidate_topk=32,
+        compressed_indexer_candidate_topk=max(32, base_seq_len + 8),
         compressed_indexer_num_attention_heads=2,
         compressed_indexer_head_dim=d_r,
     )
     kv_a = rand(d_c + d_r, hidden)
-    # Inject strong outlier channels in content latent and frequency-pair outliers in RoPE key.
     kv_a[0] *= 18.0
     kv_a[1] *= 12.0
     kv_a[d_c + 0] *= 15.0
@@ -111,16 +136,26 @@ def _make_skewed_hy4_bank(seed: int, *, layer_id: int = 0, d_c: int = 64, d_r: i
     model = Model(SimpleNamespace(config=config))
     layer = Layer(layer_id, f"model.layers.{layer_id}.", weights)
     adapter = Hy4FlashCaptureAdapter(model)
-    inputs = [(f"seq_{i:02d}", rand(10 + (i % 3), hidden), None) for i in range(seqs)]
+    inputs = [(f"seq_{i:02d}", rand(base_seq_len + (i % 3), hidden), None) for i in range(seqs)]
     bank = adapter.capture_layer(
         layer,
         inputs,
         train_count=seqs - 2,
         val_count=2,
         seed=seed,
-        provenance={"synthetic": True},
+        provenance=_synthetic_3comp_provenance(),
     )
     return config, model, layer, adapter, bank
+
+
+def test_pinned_three_component_panel_fails_closed_until_set(tmp_path: Path):
+    """Correction 1: production fails closed clearly while QMLA_PANEL_REVISION / QMLA_LONG_CONTEXT_COMPONENT are unset."""
+    assert QMLA_PANEL_REVISION is None
+    assert QMLA_LONG_CONTEXT_COMPONENT is None
+    with pytest.raises(ValueError, match="QMLA_PANEL_REVISION.*QMLA_LONG_CONTEXT_COMPONENT"):
+        require_pinned_qmla_panel()
+    with pytest.raises(ValueError, match="QMLA_PANEL_REVISION"):
+        load_pinned_qmla_corpus(tmp_path)
 
 
 def test_quantizer_rne_pack_unpack_bit_exact_and_record_sizes():
@@ -164,7 +199,6 @@ def test_quantizer_rne_pack_unpack_bit_exact_and_record_sizes():
     assert record_bytes_for_mode(2, 0, d_r=0) == 160
     assert record_bytes_for_mode(8, 0, d_r=0) == 544
 
-    # Mode parser fail-closed rules.
     assert parse_qmla_mode("4:4") == (4, 4)
     assert parse_qmla_mode("0:0") == (0, 0)
     with pytest.raises(ValueError, match="INT2 RoPE"):
@@ -174,7 +208,6 @@ def test_quantizer_rne_pack_unpack_bit_exact_and_record_sizes():
     with pytest.raises(ValueError, match="NoPE"):
         record_bytes_for_mode(4, 4, d_r=0)
 
-    # Hadamard orthogonality oracle.
     h = sylvester_hadamard(64)
     torch.testing.assert_close(h @ h.T, torch.eye(64), atol=1e-6, rtol=1e-6)
 
@@ -187,7 +220,6 @@ def test_rope_pair_transform_commutes_with_3d_interleaved_mrope_and_split_half()
     theta = torch.randn(d_r // 2, generator=g) * 0.7
     scale = torch.exp(torch.randn(d_r // 2, generator=g).clamp(-1.5, 1.5))
 
-    # Non-degenerate 3D interleaved M-RoPE positions (T != H != W).
     pos = torch.stack((
         torch.tensor([0, 1, 2, 2, 2, 2, 3, 4, 5]),
         torch.tensor([0, 1, 2, 2, 3, 3, 3, 4, 5]),
@@ -195,7 +227,6 @@ def test_rope_pair_transform_commutes_with_3d_interleaved_mrope_and_split_half()
     ))
     cos, sin = reference.mrope_phase(pos, d_r, 10_000_000.0, (12, 10, 10))
 
-    # Commutation check: RoPE(T(x)) == T(RoPE(x)) for both K and Q.
     k_pre = reference.rotate(
         apply_rope_pair_transform(k_raw, theta, scale, rope_kind="interleaved", inverse_scale=False).unsqueeze(1),
         cos,
@@ -210,7 +241,6 @@ def test_rope_pair_transform_commutes_with_3d_interleaved_mrope_and_split_half()
     )
     torch.testing.assert_close(k_pre, k_post, rtol=1e-5, atol=1e-5)
 
-    # Positional QK equivalence for both interleaved and split-half.
     for rope_kind in ("interleaved", "split_half"):
         q_rot = reference.rotate(q_raw, cos, sin) if rope_kind == "interleaved" else q_raw
         k_rot = reference.rotate(k_raw.unsqueeze(1), cos, sin).squeeze(1) if rope_kind == "interleaved" else k_raw
@@ -221,48 +251,105 @@ def test_rope_pair_transform_commutes_with_3d_interleaved_mrope_and_split_half()
         torch.testing.assert_close(comp_scores, ref_scores, rtol=1e-5, atol=1e-5)
 
 
-def test_content_and_rope_fit_improve_over_rtn_and_preserve_equivalence(tmp_path: Path):
-    _, _, _, _, bank = _make_skewed_hy4_bank(101, layer_id=0, d_c=64, d_r=64, seqs=6)
-    cfg = FitConfig(steps=40, val_every=10, content_rot_lr=5e-2, content_scale_lr=5e-2, rope_angle_lr=5e-2, rope_scale_lr=5e-2, seed=3)
+def test_default_sink4_local128_protection_fit_and_none_alternative(tmp_path: Path):
+    """Correction 2: sink4_local128 is default in calibration, keeps P_T exact, fails closed on 100%-covered short seqs."""
+    # Canonical (4, 128) mask check on T=148: exact 4 sink + 128 recent = 132 protected, 16 quantized.
+    m = protection_mask(148)
+    assert m is not None
+    assert int(m.sum().item()) == 132
+    assert bool(m[:4].all()) and bool(m[20:].all()) and not bool(m[4:20].any())
+    assert protection_mask(148, protection="none") is None
 
-    res_c = fit_content_layer(bank, bits=2, config=cfg)
+    # Default FitConfig uses sink4_local128 (4, 128).
+    assert FitConfig().protection == DEFAULT_PROTECTION_POLICY == "sink4_local128"
+
+    # Fail closed if sequences are too short for sink4_local128 (0 unprotected tokens).
+    _, _, _, _, short_bank = _make_skewed_hy4_bank(99, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=16)
+    with pytest.raises(ValueError, match="covers 100%"):
+        fit_content_layer(short_bank, bits=4, config=FitConfig(steps=2, val_every=2))
+
+    # Real canonical (4, 128) protection on sequences with T >= 144 (> 132): protected tokens have 0 loss, middle quantized.
+    _, _, _, _, long_bank = _make_skewed_hy4_bank(101, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=148)
+    eye = torch.eye(64)
+    ones = torch.ones(64)
+    loss_prot = float(content_output_loss(long_bank.val, long_bank.params, long_bank.geometry, eye, ones, 2, ste=False).item())
+    loss_unprot = float(
+        content_output_loss(
+            long_bank.val, long_bank.params, long_bank.geometry, eye, ones, 2, ste=False, protection="none"
+        ).item()
+    )
+    assert 0.0 < loss_prot < loss_unprot
+
+    cfg_prot = FitConfig(
+        steps=20,
+        val_every=10,
+        content_rot_lr=5e-2,
+        content_scale_lr=5e-2,
+        rope_angle_lr=5e-2,
+        rope_scale_lr=5e-2,
+        seed=3,
+        protection="sink4_local128",
+        sink_tokens=4,
+        recent_tokens=128,
+    )
+    res_c = fit_content_layer(long_bank, bits=2, config=cfg_prot)
+    assert res_c.protection_calibrated == "sink4_local128"
     assert res_c.orth_max_err < 1e-5
     assert res_c.equiv_max_rel_err < 1e-4
     assert res_c.best_val_loss < res_c.baselines["rtn_native_val"]
     assert res_c.best_val_loss <= res_c.baselines["smoothquant_alpha_val"] + 1e-9
 
-    res_r = fit_rope_layer(bank, bits=4, config=cfg)
+    res_r = fit_rope_layer(long_bank, bits=4, config=cfg_prot)
+    assert res_r.protection_calibrated == "sink4_local128"
     assert res_r.equiv_max_rel_err < 1e-4
     assert res_r.best_val_loss < res_r.baselines["rtn_val"]
 
+    # Measured unprotected alternative ("none") also works cleanly on short banks.
+    cfg_none = FitConfig(
+        steps=20,
+        val_every=10,
+        content_rot_lr=5e-2,
+        content_scale_lr=5e-2,
+        rope_angle_lr=5e-2,
+        rope_scale_lr=5e-2,
+        seed=3,
+        protection="none",
+    )
+    res_none = fit_content_layer(short_bank, bits=2, config=cfg_none)
+    assert res_none.protection_calibrated == "none"
+    assert res_none.best_val_loss < res_none.baselines["rtn_native_val"]
+
     # Shared-KV multi-consumer content loss (Mistral Large 4 pattern) evaluates cleanly.
-    _, _, _, _, bank_consumer = _make_skewed_hy4_bank(103, layer_id=3, d_c=64, d_r=64, seqs=6)
+    _, _, _, _, bank_consumer = _make_skewed_hy4_bank(103, layer_id=3, d_c=64, d_r=64, seqs=4, base_seq_len=16)
     joint_loss = content_output_loss(
-        bank.val,
-        bank.params,
-        bank.geometry,
-        res_c.r_c,
-        res_c.s_c,
+        short_bank.val,
+        short_bank.params,
+        short_bank.geometry,
+        res_none.r_c,
+        res_none.s_c,
         bits=4,
         ste=False,
+        protection="none",
         extra_consumers=((bank_consumer.params, bank_consumer.geometry, bank_consumer.val),),
     )
     assert torch.isfinite(joint_loss) and float(joint_loss.item()) >= 0.0
 
-    # Fit checkpoint XXH3-128 save/resume and identity fail-closed.
-    id_key = fit_config_digest(cfg, extra={"layer": 0})
+    # Fit checkpoint XXH3-128 save/resume preserves protection_calibrated and fails closed on stale identity.
+    id_key = fit_config_digest(cfg_prot, extra={"layer": 0})
     save_fit_checkpoint(tmp_path, res_c, identity_key=id_key)
     reloaded = load_fit_checkpoint(tmp_path, kind="content", bits=2, layer_id=0, identity_key=id_key)
-    assert reloaded is not None and torch.equal(reloaded.r_c, res_c.r_c) and torch.equal(reloaded.s_c, res_c.s_c)
+    assert reloaded is not None and reloaded.protection_calibrated == "sink4_local128"
+    assert torch.equal(reloaded.r_c, res_c.r_c) and torch.equal(reloaded.s_c, res_c.s_c)
     with pytest.raises(ValueError, match="identity mismatch"):
         load_fit_checkpoint(tmp_path, kind="content", bits=2, layer_id=0, identity_key="stale-identity")
 
 
-def test_hy4_flash_end_to_end_pilot_sidecar_mc_advisory_and_incremental_publish(tmp_path: Path):
-    _, _, _, _, bank0 = _make_skewed_hy4_bank(201, layer_id=0, d_c=64, d_r=64, seqs=6)
-    _, _, _, _, bank5 = _make_skewed_hy4_bank(205, layer_id=5, d_c=64, d_r=64, seqs=6)
+def test_hy4_flash_single_file_sidecar_mc_embedded_section_and_incremental_publish(tmp_path: Path):
+    """Corrections 1, 2, 3 end-to-end: single mla_calibration.safetensors, full cuteafd-mc.json['qmla'], no mla_calibration.json."""
+    _, _, _, _, bank0 = _make_skewed_hy4_bank(201, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=24)
+    _, _, _, _, bank5 = _make_skewed_hy4_bank(205, layer_id=5, d_c=64, d_r=64, seqs=4, base_seq_len=24)
 
-    # CLI pilot vs full flag resolution + pluggable corpus component parser.
+    # CLI pilot vs full flag resolution (default protection=sink4_local128; --corpus-dir, no --corpus-component).
     parser = build_parser()
     pilot_args = parser.parse_args([
         "--checkpoint", str(tmp_path),
@@ -274,43 +361,12 @@ def test_hy4_flash_end_to_end_pilot_sidecar_mc_advisory_and_incremental_publish(
     resolved = resolve_run_settings(pilot_args, (0, 1, 5, 9, 21, 41))
     assert resolved["layers"] == (0, 5)
     assert resolved["modes"] == ((4, 4),)
+    assert resolved["protection"] == "sink4_local128"
     assert resolved["train_sequences"] == 16 and resolved["val_sequences"] == 4
-
-    comp_desc = parse_corpus_component_arg(
-        "long_context_16k=wrldsuksgo2mars/qmla-long-context-v1@1234567890abcdef1234567890abcdef12345678:/tmp/lc16k"
-    )
-    assert comp_desc["name"] == "long_context_16k"
     assert parse_layers_arg("all-dsa", (0, 1, 5)) == (0, 1, 5)
     assert parse_modes_arg("4:4,2:4,4:0") == ((4, 4), (2, 4), (4, 0))
 
-    # End-to-end calibration with 3 pluggable components (base two + optional long-context).
     source_rev = "b" * 40
-    components = [
-        CorpusComponentSpec(
-            name="agentic",
-            repo="wrldsuksgo2mars/agentic-quant-panel-v2",
-            revision="54683731eb01c7c2fa5b801a0888e029a0e1b1c7",
-            sequences=4,
-            tokens=44,
-            input_ids_sha256="1" * 64,
-        ),
-        CorpusComponentSpec(
-            name="exl3_standard",
-            repo="wrldsuksgo2mars/agentic-quant-panel-v2",
-            revision="54683731eb01c7c2fa5b801a0888e029a0e1b1c7",
-            sequences=2,
-            tokens=22,
-            input_ids_sha256="2" * 64,
-        ),
-        CorpusComponentSpec(
-            name="long_context_16k",
-            repo="wrldsuksgo2mars/qmla-long-context-v1",
-            revision="3" * 40,
-            sequences=2,
-            tokens=32768,
-            input_ids_sha256="4" * 64,
-        ),
-    ]
     source = {
         "repo": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
         "revision": source_rev,
@@ -328,20 +384,28 @@ def test_hy4_flash_end_to_end_pilot_sidecar_mc_advisory_and_incremental_publish(
         output_dir=run_out,
         source=source,
         modes=((4, 4), (2, 4)),
-        corpus_components=components,
-        fit_config=FitConfig(steps=10, val_every=5, seed=0),
+        corpus_provenance=_synthetic_3comp_provenance("long_context_16k_32k"),
+        fit_config=FitConfig(steps=6, val_every=3, seed=0, protection="sink4_local128", sink_tokens=2, recent_tokens=6),
     )
     sidecar_dir = Path(result["sidecar_dir"])
+    # Correction 3: ONLY mla_calibration.safetensors is written; NO mla_calibration.json!
+    assert (sidecar_dir / "mla_calibration.safetensors").is_file()
+    assert not (sidecar_dir / "mla_calibration.json").exists()
     assert result["manifest"]["artifact_status"] == "calibrated_unqualified"
+    assert result["manifest"]["protection_policy"] == "sink4_local128"
+    assert result["manifest"]["protection_scope"] == PROTECTION_SCOPE
     assert sorted(result["manifest"]["supported_modes"]) == sorted(["4:0", "2:0", "0:4", "4:4", "2:4"])
-    assert [c["name"] for c in result["manifest"]["calibration_provenance"]["components"]] == [
+    assert sorted(result["manifest"]["calibration_provenance"]["components"].keys()) == [
         "agentic",
         "exl3_standard",
-        "long_context_16k",
+        "long_context_16k_32k",
     ]
 
-    # Attach advisory qmla pointer to a valid cuteafd-mc.json and confirm mc_manifest accepts it
-    # without touching required_features or shared_inventory_sha256.
+    # Self-describing metadata matches read_sidecar_manifest.
+    re_read = read_sidecar_manifest(sidecar_dir)
+    assert re_read == result["manifest"]
+
+    # Embed full qmla section in cuteafd-mc.json; mc_manifest.validate AND validate_sidecar both pass.
     mc_root = tmp_path / "mc"
     mc_root.mkdir()
     index_orig = {"weight_map": {"shared.w": "model-00001.safetensors", "core.w": "core-orig.safetensors"}}
@@ -361,13 +425,20 @@ def test_hy4_flash_end_to_end_pilot_sidecar_mc_advisory_and_incremental_publish(
         source_revision="c" * 40,
         core_tensors={"original": ["core.w"], "k8-compact": ["core.trellis"]},
     )
-    updated_mc = attach_qmla_advisory_to_mc(mc_doc, sidecar_dir)
+    updated_mc = attach_qmla_to_mc(mc_doc, sidecar_dir)
     assert updated_mc.get("required_features", []) == []
     assert updated_mc["shared_inventory_sha256"] == mc_doc["shared_inventory_sha256"]
     assert updated_mc["variants"] == mc_doc["variants"]
     mc_manifest.validate(updated_mc, root=mc_root)
+    validate_sidecar(sidecar_dir, mc_manifest=updated_mc, strict=True)
 
-    # Same-repo incremental publish plan + dry-run: preserves all existing weight shards (0 re-uploaded).
+    # Tampering cuteafd-mc.json["qmla"] must fail cross-check closed.
+    bad_mc = json.loads(json.dumps(updated_mc))
+    bad_mc["qmla"]["artifact_status"] = "runtime_qualified"
+    with pytest.raises(ValueError, match="disagrees with mla_calibration.safetensors"):
+        validate_sidecar(sidecar_dir, mc_manifest=bad_mc, strict=True)
+
+    # Same-repo incremental publish plan + dry-run (MC repo): rewrites cuteafd-mc.json + adds mla_calibration.safetensors.
     remote_tree = {
         "model-00001.safetensors": {"bytes": 4_000_000_000, "blob": "9" * 64},
         "core-orig.safetensors": {"bytes": 2_000_000_000, "blob": "8" * 64},
@@ -388,7 +459,6 @@ def test_hy4_flash_end_to_end_pilot_sidecar_mc_advisory_and_incremental_publish(
     assert plan["preserved_shards_count"] == 2
     assert set(plan["additions"]) == {
         "mla_calibration.safetensors",
-        "mla_calibration.json",
         "cuteafd-mc.json",
         "qmla-validation-report.json",
     }
@@ -399,7 +469,7 @@ def test_hy4_flash_end_to_end_pilot_sidecar_mc_advisory_and_incremental_publish(
     assert dry_receipt["reuploaded_shard_bytes"] == 0
     assert dry_receipt["preserved_shards_count"] == 2
 
-    # Tampering with mla_calibration.safetensors must fail sidecar validation closed.
+    # Tampering with mla_calibration.safetensors payload fails validation closed.
     st_path = sidecar_dir / "mla_calibration.safetensors"
     corrupted = bytearray(st_path.read_bytes())
     corrupted[-1] ^= 0x01
@@ -408,40 +478,42 @@ def test_hy4_flash_end_to_end_pilot_sidecar_mc_advisory_and_incremental_publish(
         validate_sidecar(sidecar_dir, strict=True)
 
 
-def test_token_stream_component_loader_and_offline_fake_api_incremental_publish(
+def test_pinned_corpus_loader_and_offline_fake_api_non_mc_incremental_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
+    """Non-MC repo adds ONLY mla_calibration.safetensors (no cuteafd-mc.json, no mla_calibration.json)."""
     from safetensors.torch import save_file
-    from huggingface_hub.hf_api import RepoFile
-    from hy4_flash.qmla_run import load_token_stream_component
     import hub_lfs
     from qmla import publish as qmla_publish
 
-    # 1. Pluggable token-stream component loader (e.g. optional long-context bank).
-    comp_dir = tmp_path / "lc16k"
-    comp_dir.mkdir()
+    # 1. Pinned 3-component corpus loader (with explicit pin override for CPU test; missing component fails closed).
+    corpus_dir = tmp_path / "panel"
+    corpus_dir.mkdir()
     g = torch.Generator().manual_seed(313)
-    seq0 = torch.randint(10, 1000, (12,), generator=g, dtype=torch.int64)
-    seq1 = torch.randint(10, 1000, (15,), generator=g, dtype=torch.int64)
-    save_file(
-        {"input_ids": torch.cat((seq0, seq1)), "offsets": torch.tensor([0, 12, 27], dtype=torch.int64)},
-        str(comp_dir / "calibration.safetensors"),
+    for comp in ("agentic", "exl3_standard", "long_context"):
+        s0 = torch.randint(10, 1000, (12,), generator=g, dtype=torch.int64)
+        s1 = torch.randint(10, 1000, (15,), generator=g, dtype=torch.int64)
+        save_file(
+            {"input_ids": torch.cat((s0, s1)), "offsets": torch.tensor([0, 12, 27], dtype=torch.int64)},
+            str(corpus_dir / f"{comp}.safetensors"),
+        )
+    recs, prov = load_pinned_qmla_corpus(
+        corpus_dir, panel_revision="e" * 40, long_context_component="long_context"
     )
-    recs, spec = load_token_stream_component(
-        "long_context_16k", "wrldsuksgo2mars/qmla-long-context-v1", "e" * 40, comp_dir
-    )
-    assert len(recs) == 2 and spec.tokens == 27 and spec.sequences == 2
-    assert recs[0][0] == "long_context_16k:00000" and torch.equal(recs[0][1], seq0)
+    assert len(recs) == 6
+    assert sorted(prov["components"].keys()) == ["agentic", "exl3_standard", "long_context"]
+    with pytest.raises(ValueError, match="missing"):
+        load_pinned_qmla_corpus(corpus_dir, panel_revision="e" * 40, long_context_component="absent_bank")
 
-    # 2. Build a real sidecar from a synthetic Hy4-flash bank.
-    _, _, _, _, bank0 = _make_skewed_hy4_bank(317, layer_id=0, d_c=64, d_r=64, seqs=6)
+    # 2. Build a real sidecar for a plain/non-MC checkpoint.
+    _, _, _, _, bank0 = _make_skewed_hy4_bank(317, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=20)
     parent_sha = "1" * 40
     new_sha = "2" * 40
     source = {
-        "repo": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
+        "repo": "tencent/Hy4-flash",
         "revision": parent_sha,
         "base_repo": "tencent/Hy4-flash",
-        "base_revision": "c" * 40,
+        "base_revision": parent_sha,
         "family": "hy4_flash",
         "model_type": "hy_v4_flash",
         "config_sha256": "d" * 64,
@@ -453,12 +525,12 @@ def test_token_stream_component_loader_and_offline_fake_api_incremental_publish(
         output_dir=tmp_path / "cal",
         source=source,
         modes=((4, 4),),
-        corpus_components=[spec],
-        fit_config=FitConfig(steps=6, val_every=3, seed=0),
+        corpus_provenance=prov,
+        fit_config=FitConfig(steps=6, val_every=3, seed=0, protection="sink4_local128", sink_tokens=2, recent_tokens=4),
     )
     sidecar_dir = Path(res["sidecar_dir"])
 
-    # 3. Offline fake HfApi verifying parent guard, zero shard re-upload, and post-commit tree check.
+    # 3. Offline fake HfApi for non-MC repo: uploads ONLY mla_calibration.safetensors.
     initial_tree = {
         "model-00001.safetensors": {"bytes": 5_000_000_000, "blob": "a" * 64},
         "config.json": {"bytes": 400, "blob": "b" * 40},
@@ -468,8 +540,10 @@ def test_token_stream_component_loader_and_offline_fake_api_incremental_publish(
         parent_sha,
         sidecar_dir,
         remote_tree=initial_tree,
+        existing_mc_manifest=None,
         expected_source={"repo": source["repo"], "revision": parent_sha, "family": "hy4_flash"},
     )
+    assert set(plan["additions"]) == {"mla_calibration.safetensors"}
 
     class _FakeApi:
         def __init__(self, head_sha: str):
@@ -498,14 +572,12 @@ def test_token_stream_component_loader_and_offline_fake_api_incremental_publish(
     monkeypatch.setattr(qmla_publish, "require_qualified_hub", lambda: None)
     monkeypatch.setattr(hub_lfs, "remote_tree", lambda api, repo, rev: api.trees[rev])
 
-    pub = publish_incremental_revision(
-        plan, api=fake_api, state_root=tmp_path / "pub_ok", dry_run=False
-    )
+    pub = publish_incremental_revision(plan, api=fake_api, state_root=tmp_path / "pub_ok", dry_run=False)
     assert pub["status"] == "published"
     assert pub["new_revision"] == new_sha
     assert pub["reuploaded_shard_bytes"] == 0
-    assert set(fake_api.committed_paths) == {"mla_calibration.safetensors", "mla_calibration.json"}
-    # Original weight shard preserved untouched.
+    assert fake_api.committed_paths == ["mla_calibration.safetensors"]
+    assert "cuteafd-mc.json" not in fake_api.trees[new_sha]
     assert fake_api.trees[new_sha]["model-00001.safetensors"] == initial_tree["model-00001.safetensors"]
 
     # Guard against moved remote head.
@@ -514,8 +586,8 @@ def test_token_stream_component_loader_and_offline_fake_api_incremental_publish(
         publish_incremental_revision(plan, api=moved_api, state_root=tmp_path / "pub_moved", dry_run=False)
 
 
-def test_pure_nope_sidecar_disallows_nonzero_rope_modes(tmp_path: Path):
-    """GLM 5.3 Flash pattern: pure NoPE (qk_rope_dim=0) emits C:0 modes only."""
+def test_pure_nope_sidecar_disallows_nonzero_rope_modes_and_rejects_2_component_provenance(tmp_path: Path):
+    """GLM 5.3 Flash pattern: pure NoPE (qk_rope_dim=0) emits C:0 only and rejects 2-component provenance."""
     from qmla import CapturedLayerBank, CapturedLayerParams, CapturedSequence, write_sidecar
 
     g = torch.Generator().manual_seed(409)
@@ -547,43 +619,56 @@ def test_pure_nope_sidecar_disallows_nonzero_rope_modes(tmp_path: Path):
     bank = CapturedLayerBank(
         geometry=geom,
         params=params,
-        train=tuple(_seq(f"tr_{i}", 8) for i in range(4)),
-        val=tuple(_seq(f"va_{i}", 8) for i in range(2)),
-        provenance={"synthetic": True},
+        train=tuple(_seq(f"tr_{i}", 20) for i in range(4)),
+        val=tuple(_seq(f"va_{i}", 20) for i in range(2)),
+        provenance=_synthetic_3comp_provenance(),
     )
-    res_c4 = fit_content_layer(bank, bits=4, config=FitConfig(steps=6, val_every=3, seed=0))
+    res_c4 = fit_content_layer(
+        bank,
+        bits=4,
+        config=FitConfig(steps=6, val_every=3, seed=0, protection="sink4_local128", sink_tokens=2, recent_tokens=4),
+    )
+    base_prov = {
+        **_synthetic_3comp_provenance(),
+        "train_sequences": 4,
+        "val_sequences": 2,
+        "optimizer": "adamw",
+        "steps_per_path": 6,
+        "seed": 0,
+        "code_commit": "test",
+    }
+    source = {
+        "repo": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
+        "revision": "5" * 40,
+        "family": "glm5_flash",
+        "model_type": "glm5_next",
+        "config_sha256": "6" * 64,
+        "checkpoint_kind": "mc",
+        "calibrated_view": "original",
+    }
+    # Reject 2-component provenance (must fail closed).
+    two_comp_prov = json.loads(json.dumps(base_prov))
+    del two_comp_prov["components"]["long_context"]
+    with pytest.raises(ValueError, match="exactly 3 components"):
+        write_sidecar(
+            tmp_path / "bad",
+            source=source,
+            geometries=[geom],
+            content_profiles={4: [res_c4]},
+            rope_profiles={},
+            provenance=two_comp_prov,
+        )
+
     manifest = write_sidecar(
-        tmp_path,
-        source={
-            "repo": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
-            "revision": "5" * 40,
-            "family": "glm5_flash",
-            "model_type": "glm5_next",
-            "config_sha256": "6" * 64,
-            "checkpoint_kind": "mc",
-            "calibrated_view": "original",
-        },
+        tmp_path / "ok",
+        source=source,
         geometries=[geom],
         content_profiles={4: [res_c4]},
         rope_profiles={},
-        provenance={
-            "components": [
-                CorpusComponentSpec(
-                    name="agentic", repo="wrldsuksgo2mars/agentic-quant-panel-v2",
-                    revision="54683731eb01c7c2fa5b801a0888e029a0e1b1c7",
-                    sequences=6, tokens=48, input_ids_sha256="7" * 64,
-                )
-            ],
-            "train_sequences": 4,
-            "val_sequences": 2,
-            "input_ids_sha256": "7" * 64,
-            "optimizer": "adamw",
-            "steps_per_path": 6,
-            "seed": 0,
-            "code_commit": "test",
-        },
+        provenance=base_prov,
     )
     assert manifest["supported_modes"] == ["4:0"]
     assert "*:4" in manifest["unsupported_modes_reason"]
-    validate_sidecar(tmp_path, expected_geometries=[geom], banks_by_layer={3: bank}, strict=True)
-
+    assert manifest["protection_policy"] == "sink4_local128"
+    assert not (tmp_path / "ok" / "mla_calibration.json").exists()
+    validate_sidecar(tmp_path / "ok", expected_geometries=[geom], banks_by_layer={3: bank}, strict=True)

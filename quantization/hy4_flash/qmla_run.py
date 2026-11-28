@@ -4,14 +4,18 @@ Supports both short pilot runs (``--pilot`` or explicit ``--layers``, ``--modes`
 ``--train-sequences``, ``--val-sequences``, ``--steps``) and full 12-DSA-layer
 calibration over all principal modes.
 
-Corpus components are data-driven via repeatable ``--corpus-component`` flags
-(defaulting to the pinned ``agentic`` and ``exl3_standard`` streams from
-``wrldsuksgo2mars/agentic-quant-panel-v2``, and accepting optional long-context
-components such as 16K/32K traces without code changes).
+Corpus contract (Correction 1): uses ONE pinned 3-component revision of
+``wrldsuksgo2mars/agentic-quant-panel-v2`` (``agentic``, ``exl3_standard``, and
+``QMLA_LONG_CONTEXT_COMPONENT``). Production CLI fails closed via
+``require_pinned_qmla_panel()`` until ``QMLA_PANEL_REVISION`` and
+``QMLA_LONG_CONTEXT_COMPONENT`` are filled in.
 
-Outputs:
-- ``<output>/sidecar/mla_calibration.safetensors``
-- ``<output>/sidecar/mla_calibration.json`` (``artifact_status="calibrated_unqualified"``)
+Protection default (Correction 2): ``--protection sink4_local128`` is enabled by
+default on full-history MLA layers only (Hy4-flash's 30 SWA-512 layers are untouched).
+
+Outputs (Correction 3 — no separate ``mla_calibration.json``):
+- ``<output>/sidecar/mla_calibration.safetensors`` (self-describing with embedded
+  ``__metadata__["cuteafd_qmla"]``, ``artifact_status="calibrated_unqualified"``)
 - ``<output>/qmla-validation-report.json``
 """
 from __future__ import annotations
@@ -36,6 +40,8 @@ from qmla.capture import (
     save_layer_capture,
 )
 from qmla.fit import (
+    DEFAULT_PROTECTION_POLICY,
+    VALID_PROTECTION_POLICIES,
     ContentFitResult,
     FitConfig,
     RopeFitResult,
@@ -46,12 +52,15 @@ from qmla.fit import (
     save_fit_checkpoint,
 )
 from qmla.quantizer import parse_qmla_mode
-from qmla.sidecar import CorpusComponentSpec, validate_sidecar, write_sidecar
+from qmla.sidecar import (
+    require_pinned_qmla_panel,
+    validate_sidecar,
+    write_sidecar,
+)
 
 from . import forward as hy4_forward
-from . import prepare_corpus as hy4_corpus
 from . import recipe as hy4_recipe
-from .qmla_capture import Hy4FlashCaptureAdapter, hy4_flash_mla_geometries
+from .qmla_capture import Hy4FlashCaptureAdapter
 
 DEFAULT_PILOT_LAYERS = (0, 21, 41)
 DEFAULT_PILOT_MODES = ("4:4",)
@@ -114,52 +123,32 @@ def parse_layers_arg(spec: str, available_layers: Sequence[int]) -> tuple[int, .
     return tuple(sorted(layers))
 
 
-def parse_corpus_component_arg(spec: str) -> dict[str, str]:
-    """Parse ``NAME=REPO@REVISION:PATH`` data-driven corpus component descriptor."""
-    if "=" not in spec or "@" not in spec or ":" not in spec:
-        raise ValueError(
-            f"invalid --corpus-component {spec!r}: expected NAME=REPO@REVISION:PATH"
-        )
-    name, rest = spec.split("=", 1)
-    repo_rev, path_str = rest.rsplit(":", 1)
-    if "@" not in repo_rev:
-        raise ValueError(f"invalid --corpus-component {spec!r}: missing @REVISION")
-    repo, revision = repo_rev.split("@", 1)
-    if not name or not repo or not revision or not path_str:
-        raise ValueError(f"incomplete --corpus-component {spec!r}")
-    return {"name": name.strip(), "repo": repo.strip(), "revision": revision.strip(), "path": path_str.strip()}
-
-
-def load_token_stream_component(
-    name: str,
-    repo: str,
-    revision: str,
-    path: Path | str,
+def _load_one_component_file(
+    corpus_dir: Path,
+    comp_name: str,
     *,
     max_sequences: int | None = None,
-) -> tuple[list[tuple[str, torch.Tensor]], CorpusComponentSpec]:
-    """Load one prepared token-stream component (safetensors ``input_ids`` + ``offsets``).
-
-    Works identically for ``agentic``, ``exl3_standard``, and any optional
-    long-context bank (e.g. 16K/32K traces) prepared in the same canonical format.
-    """
+) -> tuple[list[tuple[str, torch.Tensor]], dict[str, Any]]:
     from safetensors.torch import load_file
 
-    path = Path(path)
-    if path.is_dir():
-        st_path = path / "calibration.safetensors"
-    else:
-        st_path = path
-    if not st_path.is_file():
-        raise ValueError(f"corpus component {name!r} token file missing: {st_path}")
+    candidates = (
+        corpus_dir / f"{comp_name}.safetensors",
+        corpus_dir / comp_name / "calibration.safetensors",
+    )
+    st_path = next((p for p in candidates if p.is_file()), None)
+    if st_path is None:
+        raise ValueError(
+            f"pinned QMLA corpus component {comp_name!r} missing under {corpus_dir} "
+            f"(expected {comp_name}.safetensors or {comp_name}/calibration.safetensors)"
+        )
 
     data = load_file(str(st_path))
     if "input_ids" not in data or "offsets" not in data:
-        raise ValueError(f"corpus component {name!r} must contain input_ids and offsets tensors")
+        raise ValueError(f"corpus component {comp_name!r} must contain input_ids and offsets tensors")
     ids = data["input_ids"].to(torch.int64).contiguous()
     offsets = data["offsets"].to(torch.int64).contiguous().tolist()
     if len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != int(ids.numel()):
-        raise ValueError(f"corpus component {name!r} has malformed offsets")
+        raise ValueError(f"corpus component {comp_name!r} has malformed offsets")
 
     records: list[tuple[str, torch.Tensor]] = []
     hasher = hashlib.sha256()
@@ -169,21 +158,60 @@ def load_token_stream_component(
         seq = ids[offsets[idx] : offsets[idx + 1]]
         if seq.numel() == 0:
             continue
-        seq_id = f"{name}:{idx:05d}"
+        seq_id = f"{comp_name}:{idx:05d}"
         records.append((seq_id, seq))
         hasher.update(seq.numpy().tobytes())
         total_tokens += int(seq.numel())
+    if not records:
+        raise ValueError(f"corpus component {comp_name!r} produced zero non-empty sequences")
 
-    spec = CorpusComponentSpec(
-        name=name,
-        repo=repo,
-        revision=revision,
-        sequences=len(records),
-        tokens=total_tokens,
-        input_ids_sha256=hasher.hexdigest(),
+    return records, {
+        "sequences": len(records),
+        "tokens": total_tokens,
+        "input_ids_sha256": hasher.hexdigest(),
+    }
+
+
+def load_pinned_qmla_corpus(
+    corpus_dir: Path | str,
+    *,
+    panel_revision: str | None = None,
+    long_context_component: str | None = None,
+    max_sequences_per_component: int | None = None,
+) -> tuple[list[tuple[str, torch.Tensor]], dict[str, Any]]:
+    """Load all three components from the single pinned revision of ``agentic-quant-panel-v2``.
+
+    Fails closed via ``require_pinned_qmla_panel()`` if ``QMLA_PANEL_REVISION`` or
+    ``QMLA_LONG_CONTEXT_COMPONENT`` are not filled in yet, or if any of the 3 component
+    token files is absent from ``corpus_dir``.
+    """
+    dataset_repo, dataset_revision, component_names = require_pinned_qmla_panel(
+        panel_revision=panel_revision,
+        long_context_component=long_context_component,
     )
-    spec.validate()
-    return records, spec
+    corpus_dir = Path(corpus_dir)
+    if not corpus_dir.is_dir():
+        raise ValueError(f"prepared QMLA corpus directory missing: {corpus_dir}")
+
+    all_records: list[tuple[str, torch.Tensor]] = []
+    components_meta: dict[str, dict[str, Any]] = {}
+    for comp_name in component_names:
+        recs, meta = _load_one_component_file(
+            corpus_dir, comp_name, max_sequences=max_sequences_per_component
+        )
+        all_records.extend(recs)
+        components_meta[comp_name] = meta
+
+    combined_sha = hashlib.sha256(
+        "\n".join(f"{k}:{components_meta[k]['input_ids_sha256']}" for k in sorted(components_meta)).encode("utf-8")
+    ).hexdigest()
+    corpus_provenance = {
+        "dataset_repo": dataset_repo,
+        "dataset_revision": dataset_revision,
+        "components": components_meta,
+        "input_ids_sha256": combined_sha,
+    }
+    return all_records, corpus_provenance
 
 
 def calibrate_hy4_flash_from_banks(
@@ -192,7 +220,7 @@ def calibrate_hy4_flash_from_banks(
     output_dir: Path | str,
     source: Mapping[str, Any],
     modes: Sequence[tuple[int, int]],
-    corpus_components: Sequence[CorpusComponentSpec],
+    corpus_provenance: Mapping[str, Any],
     fit_config: FitConfig = FitConfig(),
     applicable_views: Sequence[str] = ("original", "k8-compact", "k6-compact", "fp8-compact"),
     view_transfer_validation: Mapping[str, Any] | None = None,
@@ -201,7 +229,7 @@ def calibrate_hy4_flash_from_banks(
     thinking_mode: str = "high",
     renderer_template_sha256: str = "",
 ) -> dict[str, Any]:
-    """Run fit -> checkpoint/resume -> sidecar -> validation from captured layer banks.
+    """Run fit -> checkpoint/resume -> single-file sidecar -> validation from captured layer banks.
 
     Shared by the production CLI driver and CPU numeric oracle tests.
     """
@@ -223,7 +251,7 @@ def calibrate_hy4_flash_from_banks(
         extra={
             "source_revision": source["revision"],
             "layers": ordered_layers,
-            "components": [c.to_dict() for c in corpus_components],
+            "corpus": dict(corpus_provenance),
         },
     )
 
@@ -258,18 +286,16 @@ def calibrate_hy4_flash_from_banks(
                     save_fit_checkpoint(ckpt_dir, res_r, identity_key=identity_key)
                 rope_profiles[r_bits].append(res_r)
 
-    # Drop empty RoPE profiles if every selected layer is NoPE.
     rope_profiles = {b: rows for b, rows in rope_profiles.items() if rows}
 
     sample_bank = banks[ordered_layers[0]]
-    combined_input_sha = hashlib.sha256(
-        "\n".join(f"{c.name}:{c.input_ids_sha256}" for c in corpus_components).encode("utf-8")
-    ).hexdigest()
     provenance: dict[str, Any] = {
-        "components": [c.to_dict() for c in corpus_components],
+        "dataset_repo": corpus_provenance["dataset_repo"],
+        "dataset_revision": corpus_provenance["dataset_revision"],
+        "components": corpus_provenance["components"],
         "train_sequences": len(sample_bank.train),
         "val_sequences": len(sample_bank.val),
-        "input_ids_sha256": combined_input_sha,
+        "input_ids_sha256": corpus_provenance["input_ids_sha256"],
         "renderer_template_sha256": renderer_template_sha256,
         "thinking_mode": thinking_mode,
         "optimizer": "adamw",
@@ -288,9 +314,11 @@ def calibrate_hy4_flash_from_banks(
         applicable_views=applicable_views,
         view_transfer_validation=view_transfer_validation,
         artifact_status="calibrated_unqualified",
+        protection_policy=fit_config.protection,
     )
     validation = validate_sidecar(
         sidecar_dir,
+        mc_qmla=manifest,
         expected_source={"repo": source["repo"], "revision": source["revision"], "family": source["family"]},
         expected_geometries=geometries,
         banks_by_layer=banks,
@@ -299,6 +327,8 @@ def calibrate_hy4_flash_from_banks(
     report = {
         "schema": "cuteafd-qmla-validation-report-v1",
         "artifact_status": manifest["artifact_status"],
+        "protection_policy": manifest["protection_policy"],
+        "protection_scope": manifest["protection_scope"],
         "source": manifest["source"],
         "layers_calibrated": ordered_layers,
         "supported_modes": manifest["supported_modes"],
@@ -333,16 +363,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint-kind", choices=("mc", "plain"), default="mc")
     parser.add_argument("--view", default="original", help="Core view used for forward capture")
     parser.add_argument(
-        "--corpus-component",
-        action="append",
-        default=[],
-        metavar="NAME=REPO@REV:PATH",
-        help="Repeatable data-driven corpus component (agentic, exl3_standard, optional long-context bank)",
+        "--corpus-dir",
+        type=Path,
+        default=None,
+        help="Prepared 3-component corpus dir for pinned wrldsuksgo2mars/agentic-quant-panel-v2 revision",
     )
     parser.add_argument("--output", type=Path, required=True, help="Task output/work directory on root NVMe")
     parser.add_argument("--pilot", action="store_true", help="Short pilot preset (layers 0,21,41; mode 4:4; 16/4 seqs; 100 steps)")
     parser.add_argument("--layers", default=None, help="Layer selection: 'all-dsa' or comma-separated IDs (e.g. 0,21,41)")
     parser.add_argument("--modes", default=None, help="Comma-separated QUANT_MLA modes (e.g. 4:4 or 8:8,4:8,4:4,2:4)")
+    parser.add_argument(
+        "--protection",
+        choices=sorted(VALID_PROTECTION_POLICIES),
+        default=DEFAULT_PROTECTION_POLICY,
+        help="Recent-token protection policy on full-history MLA layers (default: sink4_local128; SWA untouched)",
+    )
     parser.add_argument("--train-sequences", type=int, default=None)
     parser.add_argument("--val-sequences", type=int, default=None)
     parser.add_argument("--steps", type=int, default=None)
@@ -371,6 +406,7 @@ def resolve_run_settings(args: argparse.Namespace, eligible_layers: Sequence[int
     return {
         "layers": layers,
         "modes": modes,
+        "protection": args.protection,
         "train_sequences": train_n,
         "val_sequences": val_n,
         "steps": steps,
@@ -395,7 +431,6 @@ def _stream_hy4_flash_captures(
     target_set = set(target_layers)
     embedding = reader.raw(hy4_forward.reference.OUTER_NAMES[0])
 
-    # Keep only the selected subset (train_count + val_count) in the layer-major wavefront.
     from qmla.capture import split_train_val
 
     train_items, val_items = split_train_val(
@@ -455,28 +490,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     eligible = tuple(g.layer_id for g in adapter.mla_geometries(include_swa=False))
     resolved = resolve_run_settings(args, eligible)
 
-    if not args.corpus_component and args.reuse_captures is None:
-        parser.error("provide at least one --corpus-component NAME=REPO@REV:PATH or --reuse-captures DIR")
-
-    component_specs: list[CorpusComponentSpec] = []
-    all_records: list[tuple[str, torch.Tensor]] = []
-    for raw in args.corpus_component:
-        desc = parse_corpus_component_arg(raw)
-        recs, spec = load_token_stream_component(
-            desc["name"], desc["repo"], desc["revision"], desc["path"]
-        )
-        all_records.extend(recs)
-        component_specs.append(spec)
+    if args.corpus_dir is None and args.reuse_captures is None:
+        parser.error("provide --corpus-dir PATH (3-component pinned panel) or --reuse-captures DIR")
 
     capture_dir = (args.reuse_captures or (args.output / "captures")).resolve()
     if args.reuse_captures is not None:
         banks = {lid: load_layer_capture(capture_dir, lid) for lid in resolved["layers"]}
-        if not component_specs:
-            # Recover recorded corpus components from capture provenance when reusing captures.
-            first_prov = banks[resolved["layers"][0]].provenance
-            for c in first_prov.get("components", ()):
-                component_specs.append(CorpusComponentSpec(**c))
+        corpus_provenance = dict(banks[resolved["layers"][0]].provenance)
     else:
+        assert args.corpus_dir is not None
+        all_records, corpus_provenance = load_pinned_qmla_corpus(args.corpus_dir)
         banks = _stream_hy4_flash_captures(
             reader,
             adapter,
@@ -486,7 +509,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             val_count=resolved["val_sequences"],
             seed=args.seed,
             capture_dir=capture_dir,
-            provenance={"components": [c.to_dict() for c in component_specs]},
+            provenance=corpus_provenance,
         )
 
     source = {
@@ -500,7 +523,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "checkpoint_kind": args.checkpoint_kind,
         "calibrated_view": args.view,
     }
-    fit_cfg = FitConfig(steps=resolved["steps"], seed=args.seed)
+    fit_cfg = FitConfig(steps=resolved["steps"], seed=args.seed, protection=resolved["protection"])
     template_path = checkpoint / "chat_template.jinja"
     template_sha = hashlib.sha256(template_path.read_bytes()).hexdigest() if template_path.is_file() else ""
 
@@ -509,7 +532,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         output_dir=args.output,
         source=source,
         modes=resolved["modes"],
-        corpus_components=component_specs,
+        corpus_provenance=corpus_provenance,
         fit_config=fit_cfg,
         device=args.device,
         renderer_template_sha256=template_sha,
@@ -518,6 +541,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dumps({
             "status": result["validation"]["status"],
             "artifact_status": result["manifest"]["artifact_status"],
+            "protection_policy": result["manifest"]["protection_policy"],
             "layers": list(resolved["layers"]),
             "supported_modes": result["manifest"]["supported_modes"],
             "transform_fingerprint": result["manifest"]["transform_fingerprint"],

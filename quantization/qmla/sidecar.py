@@ -1,17 +1,26 @@
-"""Versioned cuteafd-qmla-v1 sidecar writer, fail-closed validator, and MC advisory integration.
+"""Versioned cuteafd-qmla-v1 single-file sidecar writer, fail-closed validator, and MC integration.
 
-Writes root ``mla_calibration.safetensors`` (F32 per-path/per-width profiles) and
-``mla_calibration.json`` with deterministic ``transform_fingerprint``, pluggable
-corpus component provenance, and explicit ``artifact_status`` distinguishing
-``calibrated_unqualified`` artifacts from ``runtime_qualified`` ones.
+There is NO separate ``mla_calibration.json`` file. The ONLY sidecar file added at a
+checkpoint root is ``mla_calibration.safetensors`` (F32 per-path/per-width profiles):
+- On MC checkpoints (have ``cuteafd-mc.json``): the full ``cuteafd-qmla-v1`` manifest lives
+  as the optional advisory ``"qmla"`` section inside ``cuteafd-mc.json`` (never in
+  ``required_features``), pinning whole-file ``tensors_sha256`` and ``tensors_bytes``.
+- On non-MC checkpoints (official / plain without ``cuteafd-mc.json``): the exact same
+  canonical manifest JSON lives in ``mla_calibration.safetensors``'s
+  ``__metadata__["cuteafd_qmla"]`` header (written for BOTH MC and non-MC checkpoints so
+  every sidecar file is self-describing and cross-checked).
+
+Corpus provenance uses ONE pinned 3-component revision of
+``wrldsuksgo2mars/agentic-quant-panel-v2`` (``agentic``, ``exl3_standard``, and the third
+long-context bank). ``QMLA_PANEL_REVISION`` and ``QMLA_LONG_CONTEXT_COMPONENT`` are the
+single clearly named constant pair to fill in when the long-context bank lands; production
+calibration fails closed until both are set.
 """
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import struct
@@ -22,13 +31,14 @@ import torch
 from .capture import (
     CapturedLayerBank,
     MlaLayerGeometry,
-    _atomic_json,
     _canonical_json,
     _fsync_dir,
     eval_attention_output,
     eval_positional_qk,
 )
 from .fit import (
+    DEFAULT_PROTECTION_POLICY,
+    VALID_PROTECTION_POLICIES,
     ContentFitResult,
     RopeFitResult,
     apply_content_forward,
@@ -38,9 +48,18 @@ from .fit import (
 from .quantizer import CONTENT_NONZERO_BITS, EPS_SCALE, GROUP_SIZE, ROPE_NONZERO_BITS, parse_qmla_mode
 
 QMLA_SCHEMA = "cuteafd-qmla-v1"
-MANIFEST_FILE = "mla_calibration.json"
 TENSORS_FILE = "mla_calibration.safetensors"
+QMLA_METADATA_KEY = "cuteafd_qmla"
 VALID_ARTIFACT_STATUSES = frozenset({"calibrated_unqualified", "runtime_qualified"})
+PROTECTION_SCOPE = "full_history_mla_only"
+
+# Single pinned 3-component panel contract (matches quantization/hy4_flash/prepare_corpus.py).
+# Fill in this ONE constant pair when the long-context bank lands in a new revision of
+# wrldsuksgo2mars/agentic-quant-panel-v2; production calibration fails closed until both are set.
+QMLA_PANEL_REPO = "wrldsuksgo2mars/agentic-quant-panel-v2"
+QMLA_BASE_COMPONENTS = ("agentic", "exl3_standard")
+QMLA_PANEL_REVISION: str | None = None
+QMLA_LONG_CONTEXT_COMPONENT: str | None = None
 
 CANONICAL_CONVENTIONS = {
     "vector_layout": "row",
@@ -65,65 +84,139 @@ CANONICAL_QUANTIZER_RECIPE = {
     "pack_order": "lsb_first",
 }
 
+_EMBEDDED_REQUIRED_FIELDS = frozenset({
+    "schema",
+    "artifact_status",
+    "protection_policy",
+    "protection_scope",
+    "source",
+    "applicable_views",
+    "view_transfer_validation",
+    "conventions",
+    "quantizer_recipe",
+    "geometry",
+    "profiles",
+    "supported_modes",
+    "unsupported_modes_reason",
+    "calibration_provenance",
+    "tensors_file",
+    "tensors_payload_bytes",
+    "tensors_payload_sha256",
+    "transform_fingerprint",
+})
+_MC_EXTRA_FIELDS = frozenset({"tensors_bytes", "tensors_sha256"})
 
-@dataclass(frozen=True)
-class CorpusComponentSpec:
-    """Data-driven pinned corpus component (agentic, exl3_standard, or optional long-context)."""
 
-    name: str
-    repo: str
-    revision: str
-    sequences: int
-    tokens: int
-    input_ids_sha256: str
-    renderer_template_sha256: str | None = None
-    thinking_mode: str | None = None
-    notes: str | None = None
-
-    def validate(self) -> None:
-        for field_name in ("name", "repo", "revision", "input_ids_sha256"):
-            val = getattr(self, field_name)
-            if not isinstance(val, str) or not val or any(c in val for c in "\0\n\r"):
-                raise ValueError(f"invalid corpus component {field_name}: {val!r}")
-        if self.sequences <= 0 or self.tokens <= 0:
-            raise ValueError(f"corpus component {self.name!r} requires positive sequences and tokens")
-        if len(self.input_ids_sha256) != 64 or not all(c in "0123456789abcdef" for c in self.input_ids_sha256):
-            raise ValueError(f"corpus component {self.name!r} has invalid input_ids_sha256")
-
-    def to_dict(self) -> dict[str, Any]:
-        self.validate()
-        row: dict[str, Any] = {
-            "name": self.name,
-            "repo": self.repo,
-            "revision": self.revision,
-            "sequences": self.sequences,
-            "tokens": self.tokens,
-            "input_ids_sha256": self.input_ids_sha256,
-        }
-        if self.renderer_template_sha256 is not None:
-            row["renderer_template_sha256"] = self.renderer_template_sha256
-        if self.thinking_mode is not None:
-            row["thinking_mode"] = self.thinking_mode
-        if self.notes is not None:
-            row["notes"] = self.notes
-        return row
+def _is_hex(value: Any, length: int) -> bool:
+    return isinstance(value, str) and len(value) == length and all(c in "0123456789abcdef" for c in value)
 
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _write_f32_safetensors_sha256(path: Path, tensors: Mapping[str, torch.Tensor]) -> tuple[str, int, dict[str, str]]:
-    """Write F32 safetensors sequentially while streaming file SHA256 and per-tensor SHA256s."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".partial")
-    if tmp.is_symlink() or path.is_symlink():
-        raise ValueError(f"refuse symlink sidecar path: {path}")
+def require_pinned_qmla_panel(
+    *,
+    panel_revision: str | None = None,
+    long_context_component: str | None = None,
+) -> tuple[str, str, tuple[str, str, str]]:
+    """Fail closed until ``QMLA_PANEL_REVISION`` and ``QMLA_LONG_CONTEXT_COMPONENT`` are filled in.
 
+    Returns ``(dataset_repo, dataset_revision, (agentic, exl3_standard, long_context_component))``.
+    """
+    rev = QMLA_PANEL_REVISION if panel_revision is None else panel_revision
+    third = QMLA_LONG_CONTEXT_COMPONENT if long_context_component is None else long_context_component
+    missing: list[str] = []
+    if not rev:
+        missing.append("QMLA_PANEL_REVISION")
+    if not third:
+        missing.append("QMLA_LONG_CONTEXT_COMPONENT")
+    if missing:
+        raise ValueError(
+            f"QMLA 3-component calibration panel is not pinned yet ({', '.join(missing)} unset in "
+            f"quantization/qmla/sidecar.py for {QMLA_PANEL_REPO}); fill in both constants once the "
+            "long-context bank lands rather than calibrating on only two components"
+        )
+    if not _is_hex(rev, 40):
+        raise ValueError(f"QMLA_PANEL_REVISION must be a 40-char lowercase commit SHA, got {rev!r}")
+    if not isinstance(third, str) or any(c in third for c in "\0\n\r/\\") or third in QMLA_BASE_COMPONENTS:
+        raise ValueError(
+            f"QMLA_LONG_CONTEXT_COMPONENT must be a valid component name distinct from {QMLA_BASE_COMPONENTS}, "
+            f"got {third!r}"
+        )
+    return QMLA_PANEL_REPO, rev, (QMLA_BASE_COMPONENTS[0], QMLA_BASE_COMPONENTS[1], third)
+
+
+def _validate_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:
+    prov = deepcopy(dict(provenance))
+    repo = prov.get("dataset_repo")
+    rev = prov.get("dataset_revision")
+    if not isinstance(repo, str) or not repo or "/" not in repo:
+        raise ValueError(f"calibration_provenance.dataset_repo invalid: {repo!r}")
+    if not _is_hex(rev, 40):
+        raise ValueError(f"calibration_provenance.dataset_revision must be a 40-char SHA, got {rev!r}")
+
+    components = prov.get("components")
+    if not isinstance(components, Mapping):
+        raise ValueError("calibration_provenance.components must be a 3-entry dict (agentic, exl3_standard, long-context)")
+    keys = set(components.keys())
+    if len(keys) != 3 or not set(QMLA_BASE_COMPONENTS) < keys:
+        raise ValueError(
+            "calibration_provenance.components must contain exactly 3 components "
+            f"('agentic', 'exl3_standard', and the pinned long-context component); got {sorted(keys)}"
+        )
+    validated_components: dict[str, dict[str, Any]] = {}
+    for comp_name in sorted(keys):
+        if not isinstance(comp_name, str) or not comp_name or any(c in comp_name for c in "\0\n\r/\\"):
+            raise ValueError(f"invalid corpus component name: {comp_name!r}")
+        row = components[comp_name]
+        if not isinstance(row, Mapping):
+            raise ValueError(f"corpus component {comp_name!r} entry must be an object")
+        seqs = row.get("sequences")
+        toks = row.get("tokens")
+        sha = row.get("input_ids_sha256")
+        if type(seqs) is not int or seqs <= 0 or type(toks) is not int or toks <= 0:
+            raise ValueError(f"corpus component {comp_name!r} requires positive integer sequences and tokens")
+        if not _is_hex(sha, 64):
+            raise ValueError(f"corpus component {comp_name!r} has invalid input_ids_sha256")
+        validated_components[comp_name] = {
+            "sequences": seqs,
+            "tokens": toks,
+            "input_ids_sha256": sha,
+        }
+    prov["components"] = validated_components
+
+    for key in ("train_sequences", "val_sequences"):
+        val = prov.get(key)
+        if type(val) is not int or val <= 0:
+            raise ValueError(f"calibration_provenance.{key} must be a positive integer")
+    if not _is_hex(prov.get("input_ids_sha256"), 64):
+        raise ValueError("calibration_provenance.input_ids_sha256 must be a 64-char hex digest")
+    for key in ("optimizer", "code_commit"):
+        if not isinstance(prov.get(key), str) or not prov[key]:
+            raise ValueError(f"calibration_provenance.{key} must be a non-empty string")
+    if type(prov.get("steps_per_path")) is not int or prov["steps_per_path"] < 0:
+        raise ValueError("calibration_provenance.steps_per_path must be a non-negative integer")
+    if type(prov.get("seed")) is not int:
+        raise ValueError("calibration_provenance.seed must be an integer")
+    return prov
+
+
+def _resolve_sidecar_path(path_or_dir: Path | str) -> Path:
+    p = Path(path_or_dir)
+    if p.is_dir():
+        return p / TENSORS_FILE
+    return p
+
+
+def _prepare_f32_tensors(
+    tensors: Mapping[str, torch.Tensor],
+) -> tuple[dict[str, Any], list[tuple[str, bytes]], dict[str, str], str, int]:
+    """Serialize sorted F32 tensor payloads and compute payload SHA256 before building header."""
     header: dict[str, Any] = {}
     ordered: list[tuple[str, bytes]] = []
     tensor_digests: dict[str, str] = {}
+    payload_hash = hashlib.sha256()
     offset = 0
     for name in sorted(tensors):
         tensor = tensors[name].detach().contiguous().cpu().to(torch.float32)
@@ -133,42 +226,75 @@ def _write_f32_safetensors_sha256(path: Path, tensors: Mapping[str, torch.Tensor
         end = offset + len(raw)
         header[name] = {"dtype": "F32", "shape": list(tensor.shape), "data_offsets": [offset, end]}
         tensor_digests[name] = _sha256_bytes(raw)
+        payload_hash.update(raw)
         ordered.append((name, raw))
         offset = end
+    return header, ordered, tensor_digests, payload_hash.hexdigest(), offset
 
+
+def _write_f32_safetensors_with_metadata(
+    path: Path,
+    header_tensors: dict[str, Any],
+    ordered_payloads: Sequence[tuple[str, bytes]],
+    embedded_manifest: Mapping[str, Any],
+) -> tuple[str, int]:
+    """Write ``mla_calibration.safetensors`` with embedded ``__metadata__["cuteafd_qmla"]``."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".partial")
+    if tmp.is_symlink() or path.is_symlink():
+        raise ValueError(f"refuse symlink sidecar path: {path}")
+
+    header = dict(header_tensors)
+    header["__metadata__"] = {QMLA_METADATA_KEY: _canonical_json(embedded_manifest)}
     encoded = _canonical_json(header).encode("utf-8")
     encoded += b" " * (-len(encoded) % 8)
     prefix = struct.pack("<Q", len(encoded)) + encoded
+
     file_hash = hashlib.sha256()
+    payload_len = 0
     with tmp.open("wb") as handle:
         handle.write(prefix)
         file_hash.update(prefix)
-        for _, raw in ordered:
+        for _, raw in ordered_payloads:
             handle.write(raw)
             file_hash.update(raw)
+            payload_len += len(raw)
         handle.flush()
         os.fsync(handle.fileno())
-    total_bytes = len(prefix) + offset
+    total_bytes = len(prefix) + payload_len
     if tmp.stat().st_size != total_bytes:
         raise ValueError("sidecar safetensors size mismatch after write")
     os.replace(tmp, path)
     _fsync_dir(path.parent)
-    return file_hash.hexdigest(), total_bytes, tensor_digests
+    return file_hash.hexdigest(), total_bytes
 
 
-def _read_f32_safetensors_sha256(path: Path) -> tuple[str, dict[str, torch.Tensor], dict[str, str]]:
+def _read_f32_safetensors_with_metadata(
+    path: Path,
+) -> tuple[str, int, str, int, dict[str, Any], dict[str, torch.Tensor], dict[str, str]]:
+    """Read ``mla_calibration.safetensors`` returning whole-file + payload digests, embedded manifest, tensors."""
     path = Path(path)
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"sidecar tensors missing or symlink: {path}")
     raw = path.read_bytes()
     file_sha256 = _sha256_bytes(raw)
-    if len(raw) < 8:
+    file_bytes = len(raw)
+    if file_bytes < 8:
         raise ValueError("truncated sidecar safetensors file")
     header_len = struct.unpack("<Q", raw[:8])[0]
-    if 8 + header_len > len(raw):
+    if 8 + header_len > file_bytes:
         raise ValueError("corrupt sidecar safetensors header")
     header = json.loads(raw[8 : 8 + header_len].decode("utf-8"))
+    metadata = header.get("__metadata__")
+    if not isinstance(metadata, dict) or QMLA_METADATA_KEY not in metadata:
+        raise ValueError(f"sidecar safetensors missing __metadata__[{QMLA_METADATA_KEY!r}]")
+    embedded_manifest = json.loads(metadata[QMLA_METADATA_KEY])
+
     base = 8 + header_len
+    payload_bytes = file_bytes - base
+    payload_sha256 = _sha256_bytes(raw[base:])
+
     tensors: dict[str, torch.Tensor] = {}
     tensor_digests: dict[str, str] = {}
     for name, spec in header.items():
@@ -177,17 +303,20 @@ def _read_f32_safetensors_sha256(path: Path) -> tuple[str, dict[str, torch.Tenso
         if spec["dtype"] != "F32":
             raise ValueError(f"sidecar tensor {name} must be F32, found {spec['dtype']}")
         start, end = spec["data_offsets"]
+        if start < 0 or end < start or end > payload_bytes:
+            raise ValueError(f"sidecar tensor {name} has out-of-bounds data_offsets {[start, end]}")
         span = raw[base + start : base + end]
         tensor_digests[name] = _sha256_bytes(span)
         buf = bytearray(span)
         tensors[name] = torch.frombuffer(buf, dtype=torch.float32).reshape(spec["shape"]).clone()
-    return file_sha256, tensors, tensor_digests
+    return file_sha256, file_bytes, payload_sha256, payload_bytes, embedded_manifest, tensors, tensor_digests
 
 
 def _profile_fingerprint(
     kind: str,
     bits: int,
     transform_kind: str,
+    protection_calibrated: str,
     layers: Sequence[int],
     tensor_digests: Mapping[str, str],
 ) -> str:
@@ -196,6 +325,7 @@ def _profile_fingerprint(
         "kind": kind,
         "bits": bits,
         "transform_kind": transform_kind,
+        "protection_calibrated": protection_calibrated,
         "layers": list(layers),
         "tensors": {k: tensor_digests[k] for k in sorted(tensor_digests)},
     }
@@ -203,9 +333,11 @@ def _profile_fingerprint(
 
 
 def compute_transform_fingerprint(manifest: Mapping[str, Any]) -> str:
-    """Deterministic SHA256 binding coordinate identity across graphs & prefix caches."""
+    """Deterministic SHA256 binding coordinate & protection identity across graphs and prefix caches."""
     payload = {
         "schema": manifest["schema"],
+        "protection_policy": manifest["protection_policy"],
+        "protection_scope": manifest["protection_scope"],
         "source_revision": manifest["source"]["revision"],
         "base_revision": manifest["source"].get("base_revision"),
         "geometry": manifest["geometry"],
@@ -221,7 +353,7 @@ def compute_transform_fingerprint(manifest: Mapping[str, Any]) -> str:
                 for k, v in sorted(manifest["profiles"]["rope"].items())
             },
         },
-        "tensors_sha256": manifest["tensors_sha256"],
+        "tensors_payload_sha256": manifest["tensors_payload_sha256"],
     }
     return _sha256_bytes(_canonical_json(payload).encode("utf-8"))
 
@@ -262,11 +394,18 @@ def write_sidecar(
     applicable_views: Sequence[str] = ("original",),
     view_transfer_validation: Mapping[str, Any] | None = None,
     artifact_status: str = "calibrated_unqualified",
+    protection_policy: str = DEFAULT_PROTECTION_POLICY,
     extra_unsupported_reasons: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Write ``mla_calibration.safetensors`` and ``mla_calibration.json`` and validate them."""
+    """Write single-file ``mla_calibration.safetensors`` (with embedded metadata) and validate it.
+
+    Returns the full MC-ready ``qmla`` manifest dict (embedded manifest plus whole-file
+    ``tensors_bytes`` and ``tensors_sha256``). Never writes a separate ``mla_calibration.json``.
+    """
     if artifact_status not in VALID_ARTIFACT_STATUSES:
         raise ValueError(f"invalid artifact_status: {artifact_status!r}")
+    if protection_policy not in VALID_PROTECTION_POLICIES:
+        raise ValueError(f"invalid protection_policy: {protection_policy!r}")
     if not geometries:
         raise ValueError("write_sidecar requires at least one MlaLayerGeometry")
     geom_by_layer: dict[int, MlaLayerGeometry] = {}
@@ -280,9 +419,6 @@ def write_sidecar(
         raise ValueError("write_sidecar requires at least one content or RoPE profile")
 
     tensors: dict[str, torch.Tensor] = {}
-    content_meta: dict[str, Any] = {}
-    rope_meta: dict[str, Any] = {}
-
     for bits in sorted(content_profiles):
         if bits not in CONTENT_NONZERO_BITS:
             raise ValueError(f"unsupported content profile bits: {bits}")
@@ -291,6 +427,11 @@ def write_sidecar(
             raise ValueError(f"empty content profile for c{bits}")
         prefix = f"content.c{bits}"
         for res in results:
+            if res.protection_calibrated != protection_policy:
+                raise ValueError(
+                    f"content c{bits} layer {res.layer_id} protection_calibrated={res.protection_calibrated!r} "
+                    f"disagrees with sidecar protection_policy={protection_policy!r}"
+                )
             if res.layer_id not in geom_by_layer:
                 raise ValueError(f"content c{bits} layer {res.layer_id} absent from geometries")
             g = geom_by_layer[res.layer_id]
@@ -307,6 +448,11 @@ def write_sidecar(
             raise ValueError(f"empty RoPE profile for r{bits}")
         prefix = f"rope.r{bits}"
         for res in results:
+            if res.protection_calibrated != protection_policy:
+                raise ValueError(
+                    f"RoPE r{bits} layer {res.layer_id} protection_calibrated={res.protection_calibrated!r} "
+                    f"disagrees with sidecar protection_policy={protection_policy!r}"
+                )
             if res.layer_id not in geom_by_layer:
                 raise ValueError(f"RoPE r{bits} layer {res.layer_id} absent from geometries")
             g = geom_by_layer[res.layer_id]
@@ -318,12 +464,9 @@ def write_sidecar(
             tensors[f"{prefix}.layer_{res.layer_id}.theta"] = res.theta
             tensors[f"{prefix}.layer_{res.layer_id}.s"] = res.s_p
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    tensors_sha256, tensors_bytes, tensor_digests = _write_f32_safetensors_sha256(
-        output_dir / TENSORS_FILE, tensors
-    )
+    header_tensors, ordered_payloads, tensor_digests, payload_sha256, payload_bytes = _prepare_f32_tensors(tensors)
 
+    content_meta: dict[str, Any] = {}
     for bits in sorted(content_profiles):
         results = sorted(content_profiles[bits], key=lambda r: r.layer_id)
         prefix = f"content.c{bits}"
@@ -334,7 +477,7 @@ def write_sidecar(
             "transform_kind": "dense_orth",
             "layers": layers,
             "tensors_prefix": prefix,
-            "protection_calibrated": "none",
+            "protection_calibrated": protection_policy,
             "validation": {
                 "val_loss_mean": float(sum(r.best_val_loss for r in results) / len(results)),
                 "equiv_max_rel_err": float(max(r.equiv_max_rel_err for r in results)),
@@ -351,9 +494,12 @@ def write_sidecar(
                     for r in results
                 },
             },
-            "profile_fingerprint": _profile_fingerprint("content", bits, "dense_orth", layers, prof_digests),
+            "profile_fingerprint": _profile_fingerprint(
+                "content", bits, "dense_orth", protection_policy, layers, prof_digests
+            ),
         }
 
+    rope_meta: dict[str, Any] = {}
     for bits in sorted(rope_profiles):
         results = sorted(rope_profiles[bits], key=lambda r: r.layer_id)
         prefix = f"rope.r{bits}"
@@ -364,7 +510,7 @@ def write_sidecar(
             "transform_kind": "pair_so2",
             "layers": layers,
             "tensors_prefix": prefix,
-            "protection_calibrated": "none",
+            "protection_calibrated": protection_policy,
             "validation": {
                 "val_loss_mean": float(sum(r.best_val_loss for r in results) / len(results)),
                 "equiv_max_rel_err": float(max(r.equiv_max_rel_err for r in results)),
@@ -379,7 +525,9 @@ def write_sidecar(
                     for r in results
                 },
             },
-            "profile_fingerprint": _profile_fingerprint("rope", bits, "pair_so2", layers, prof_digests),
+            "profile_fingerprint": _profile_fingerprint(
+                "rope", bits, "pair_so2", protection_policy, layers, prof_digests
+            ),
         }
 
     supported_modes, unsupported_reasons = derive_supported_modes(
@@ -388,35 +536,13 @@ def write_sidecar(
     if extra_unsupported_reasons:
         unsupported_reasons.update(extra_unsupported_reasons)
 
-    # Validate data-driven provenance components (never hard-coded).
-    prov = deepcopy(dict(provenance))
-    components = prov.get("components")
-    if not isinstance(components, list) or not components:
-        raise ValueError("calibration_provenance.components must be a non-empty list of component dicts")
-    for comp in components:
-        if isinstance(comp, CorpusComponentSpec):
-            comp.validate()
-        elif isinstance(comp, Mapping):
-            CorpusComponentSpec(
-                name=comp["name"],
-                repo=comp["repo"],
-                revision=comp["revision"],
-                sequences=int(comp["sequences"]),
-                tokens=int(comp["tokens"]),
-                input_ids_sha256=str(comp["input_ids_sha256"]),
-                renderer_template_sha256=comp.get("renderer_template_sha256"),
-                thinking_mode=comp.get("thinking_mode"),
-                notes=comp.get("notes"),
-            ).validate()
-        else:
-            raise ValueError("each calibration_provenance.components entry must be a dict/CorpusComponentSpec")
-    prov["components"] = [
-        c.to_dict() if isinstance(c, CorpusComponentSpec) else dict(c) for c in components
-    ]
+    prov = _validate_provenance(provenance)
 
-    manifest: dict[str, Any] = {
+    embedded_manifest: dict[str, Any] = {
         "schema": QMLA_SCHEMA,
         "artifact_status": artifact_status,
+        "protection_policy": protection_policy,
+        "protection_scope": PROTECTION_SCOPE,
         "source": dict(source),
         "applicable_views": list(applicable_views),
         "view_transfer_validation": dict(view_transfer_validation or {}),
@@ -435,18 +561,41 @@ def write_sidecar(
         "unsupported_modes_reason": unsupported_reasons,
         "calibration_provenance": prov,
         "tensors_file": TENSORS_FILE,
-        "tensors_bytes": tensors_bytes,
-        "tensors_sha256": tensors_sha256,
+        "tensors_payload_bytes": payload_bytes,
+        "tensors_payload_sha256": payload_sha256,
     }
-    manifest["transform_fingerprint"] = compute_transform_fingerprint(manifest)
-    _atomic_json(output_dir / MANIFEST_FILE, manifest)
-    validate_sidecar(output_dir, strict=True)
-    return manifest
+    embedded_manifest["transform_fingerprint"] = compute_transform_fingerprint(embedded_manifest)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tensors_path = output_dir / TENSORS_FILE
+    file_sha256, file_bytes = _write_f32_safetensors_with_metadata(
+        tensors_path, header_tensors, ordered_payloads, embedded_manifest
+    )
+
+    full_manifest = dict(embedded_manifest)
+    full_manifest["tensors_bytes"] = file_bytes
+    full_manifest["tensors_sha256"] = file_sha256
+
+    validate_sidecar(tensors_path, mc_qmla=full_manifest, strict=True)
+    return full_manifest
+
+
+def read_sidecar_manifest(sidecar_path_or_dir: Path | str) -> dict[str, Any]:
+    """Read embedded ``cuteafd_qmla`` manifest plus whole-file ``tensors_bytes``/``tensors_sha256``."""
+    tensors_path = _resolve_sidecar_path(sidecar_path_or_dir)
+    file_sha256, file_bytes, _, _, embedded_manifest, _, _ = _read_f32_safetensors_with_metadata(tensors_path)
+    full = dict(embedded_manifest)
+    full["tensors_bytes"] = file_bytes
+    full["tensors_sha256"] = file_sha256
+    return full
 
 
 def validate_sidecar(
-    root: Path | str,
+    sidecar_path_or_dir: Path | str,
     *,
+    mc_manifest: Mapping[str, Any] | None = None,
+    mc_qmla: Mapping[str, Any] | None = None,
     expected_source: Mapping[str, Any] | None = None,
     expected_geometries: Sequence[MlaLayerGeometry] | None = None,
     banks_by_layer: Mapping[int, CapturedLayerBank] | None = None,
@@ -454,46 +603,43 @@ def validate_sidecar(
     equiv_tol: float = 1e-4,
     strict: bool = True,
 ) -> dict[str, Any]:
-    """Fail-closed validation of ``mla_calibration.json`` and ``mla_calibration.safetensors``."""
-    root = Path(root)
-    manifest_path = root / MANIFEST_FILE
-    if manifest_path.is_symlink() or not manifest_path.is_file():
-        raise ValueError(f"missing QMLA sidecar manifest: {manifest_path}")
-    manifest_bytes = manifest_path.read_bytes()
-    manifest = json.loads(manifest_bytes.decode("utf-8"))
+    """Fail-closed validation of ``mla_calibration.safetensors`` (and optional ``cuteafd-mc.json["qmla"]``)."""
+    tensors_path = _resolve_sidecar_path(sidecar_path_or_dir)
+    (
+        actual_file_sha256,
+        actual_file_bytes,
+        actual_payload_sha256,
+        actual_payload_bytes,
+        manifest,
+        tensors,
+        tensor_digests,
+    ) = _read_f32_safetensors_with_metadata(tensors_path)
 
-    required_top = {
-        "schema",
-        "artifact_status",
-        "source",
-        "applicable_views",
-        "view_transfer_validation",
-        "conventions",
-        "quantizer_recipe",
-        "geometry",
-        "profiles",
-        "supported_modes",
-        "unsupported_modes_reason",
-        "calibration_provenance",
-        "tensors_file",
-        "tensors_bytes",
-        "tensors_sha256",
-        "transform_fingerprint",
-    }
-    if not isinstance(manifest, dict) or not required_top <= manifest.keys():
-        raise ValueError(f"QMLA manifest missing required fields: {sorted(required_top - set(manifest))}")
-    if strict and manifest.keys() != required_top:
-        raise ValueError(f"unexpected QMLA manifest fields: {sorted(set(manifest) - required_top)}")
+    if not isinstance(manifest, dict) or not _EMBEDDED_REQUIRED_FIELDS <= manifest.keys():
+        missing = sorted(_EMBEDDED_REQUIRED_FIELDS - set(manifest)) if isinstance(manifest, dict) else ["<not-dict>"]
+        raise ValueError(f"QMLA embedded manifest missing required fields: {missing}")
+    if strict and manifest.keys() != _EMBEDDED_REQUIRED_FIELDS:
+        raise ValueError(f"unexpected QMLA embedded manifest fields: {sorted(set(manifest) - _EMBEDDED_REQUIRED_FIELDS)}")
     if manifest["schema"] != QMLA_SCHEMA:
         raise ValueError(f"unsupported QMLA schema: {manifest['schema']!r}")
     if manifest["artifact_status"] not in VALID_ARTIFACT_STATUSES:
         raise ValueError(f"invalid artifact_status: {manifest['artifact_status']!r}")
+    if manifest["protection_policy"] not in VALID_PROTECTION_POLICIES:
+        raise ValueError(f"invalid protection_policy: {manifest['protection_policy']!r}")
+    if manifest["protection_scope"] != PROTECTION_SCOPE:
+        raise ValueError(f"invalid protection_scope: {manifest['protection_scope']!r}")
     if manifest["conventions"] != CANONICAL_CONVENTIONS:
         raise ValueError("QMLA manifest conventions differ from canonical cuteafd-qmla-v1")
     if manifest["quantizer_recipe"] != CANONICAL_QUANTIZER_RECIPE:
         raise ValueError("QMLA manifest quantizer_recipe differs from canonical cuteafd-qmla-v1")
     if manifest["tensors_file"] != TENSORS_FILE:
         raise ValueError(f"unexpected QMLA tensors_file: {manifest['tensors_file']!r}")
+    if int(manifest["tensors_payload_bytes"]) != actual_payload_bytes:
+        raise ValueError("QMLA tensors payload byte size mismatch")
+    if manifest["tensors_payload_sha256"] != actual_payload_sha256:
+        raise ValueError(
+            f"QMLA tensors payload SHA256 mismatch: {actual_payload_sha256} != {manifest['tensors_payload_sha256']}"
+        )
 
     source = manifest["source"]
     for key in ("repo", "revision", "family", "model_type", "config_sha256", "checkpoint_kind"):
@@ -504,22 +650,7 @@ def validate_sidecar(
             if source.get(key) != expected_val:
                 raise ValueError(f"QMLA source.{key} mismatch: {source.get(key)!r} != {expected_val!r}")
 
-    # Validate corpus provenance components.
-    components = manifest["calibration_provenance"].get("components")
-    if not isinstance(components, list) or not components:
-        raise ValueError("QMLA calibration_provenance.components must be non-empty")
-    for comp in components:
-        CorpusComponentSpec(
-            name=comp["name"],
-            repo=comp["repo"],
-            revision=comp["revision"],
-            sequences=int(comp["sequences"]),
-            tokens=int(comp["tokens"]),
-            input_ids_sha256=str(comp["input_ids_sha256"]),
-            renderer_template_sha256=comp.get("renderer_template_sha256"),
-            thinking_mode=comp.get("thinking_mode"),
-            notes=comp.get("notes"),
-        ).validate()
+    _validate_provenance(manifest["calibration_provenance"])
 
     # Validate geometries.
     geoms = [MlaLayerGeometry.from_dict(g) for g in manifest["geometry"]]
@@ -533,25 +664,20 @@ def validate_sidecar(
         if geom_by_layer != expected_map:
             raise ValueError("QMLA manifest geometry disagrees with checkpoint geometry")
 
-    # Verify safetensors digest and tensors.
-    tensors_path = root / TENSORS_FILE
-    actual_sha256, tensors, tensor_digests = _read_f32_safetensors_sha256(tensors_path)
-    if actual_sha256 != manifest["tensors_sha256"]:
-        raise ValueError(f"QMLA tensors SHA256 mismatch: {actual_sha256} != {manifest['tensors_sha256']}")
-    if tensors_path.stat().st_size != int(manifest["tensors_bytes"]):
-        raise ValueError("QMLA tensors byte size mismatch")
-
     expected_tensors: set[str] = set()
     content_profiles = manifest["profiles"]["content"]
     rope_profiles = manifest["profiles"]["rope"]
     if not content_profiles and not rope_profiles:
         raise ValueError("QMLA manifest defines no profiles")
 
+    policy = manifest["protection_policy"]
     max_orth_err = 0.0
     for key, prof in content_profiles.items():
         bits = int(prof["bits"])
         if key != f"c{bits}" or bits not in CONTENT_NONZERO_BITS:
             raise ValueError(f"invalid content profile key/bits: {key}/{bits}")
+        if prof.get("protection_calibrated") != policy:
+            raise ValueError(f"content profile {key} protection_calibrated disagrees with protection_policy")
         prefix = f"content.c{bits}"
         if prof["tensors_prefix"] != prefix:
             raise ValueError(f"unexpected tensors_prefix for {key}")
@@ -580,7 +706,7 @@ def validate_sidecar(
                 raise ValueError(f"content R_C orthogonality error {orth:.3e} > {orth_tol:.3e} at layer {lid} {key}")
             prof_digests[r_name] = tensor_digests[r_name]
             prof_digests[s_name] = tensor_digests[s_name]
-        expected_fp = _profile_fingerprint("content", bits, prof["transform_kind"], layers, prof_digests)
+        expected_fp = _profile_fingerprint("content", bits, prof["transform_kind"], policy, layers, prof_digests)
         if prof["profile_fingerprint"] != expected_fp:
             raise ValueError(f"content profile fingerprint mismatch for {key}")
 
@@ -588,6 +714,8 @@ def validate_sidecar(
         bits = int(prof["bits"])
         if key != f"r{bits}" or bits not in ROPE_NONZERO_BITS:
             raise ValueError(f"invalid RoPE profile key/bits: {key}/{bits}")
+        if prof.get("protection_calibrated") != policy:
+            raise ValueError(f"RoPE profile {key} protection_calibrated disagrees with protection_policy")
         prefix = f"rope.r{bits}"
         if prof["tensors_prefix"] != prefix:
             raise ValueError(f"unexpected tensors_prefix for {key}")
@@ -614,7 +742,7 @@ def validate_sidecar(
                 raise ValueError(f"non-positive RoPE scale at layer {lid} profile {key}")
             prof_digests[t_name] = tensor_digests[t_name]
             prof_digests[s_name] = tensor_digests[s_name]
-        expected_fp = _profile_fingerprint("rope", bits, prof["transform_kind"], layers, prof_digests)
+        expected_fp = _profile_fingerprint("rope", bits, prof["transform_kind"], policy, layers, prof_digests)
         if prof["profile_fingerprint"] != expected_fp:
             raise ValueError(f"RoPE profile fingerprint mismatch for {key}")
 
@@ -628,7 +756,6 @@ def validate_sidecar(
     if manifest["transform_fingerprint"] != expected_tfp:
         raise ValueError("QMLA transform_fingerprint mismatch")
 
-    # Validate supported_modes list consistency.
     expected_modes, _ = derive_supported_modes(
         [int(p["bits"]) for p in content_profiles.values()],
         [int(p["bits"]) for p in rope_profiles.values()],
@@ -638,6 +765,27 @@ def validate_sidecar(
         parse_qmla_mode(mode)
     if sorted(manifest["supported_modes"]) != sorted(expected_modes):
         raise ValueError(f"supported_modes {manifest['supported_modes']} != expected {expected_modes}")
+
+    # Cross-check cuteafd-mc.json["qmla"] when provided.
+    if mc_manifest is not None:
+        if "qmla" not in mc_manifest:
+            raise ValueError("cuteafd-mc.json missing qmla section")
+        mc_qmla = mc_manifest["qmla"]
+    if mc_qmla is not None:
+        if not isinstance(mc_qmla, Mapping):
+            raise ValueError("cuteafd-mc.json['qmla'] must be an object")
+        expected_mc_keys = _EMBEDDED_REQUIRED_FIELDS | _MC_EXTRA_FIELDS
+        if strict and set(mc_qmla.keys()) != expected_mc_keys:
+            raise ValueError(f"cuteafd-mc.json['qmla'] keys mismatch: {sorted(set(mc_qmla) ^ expected_mc_keys)}")
+        if mc_qmla.get("tensors_sha256") != actual_file_sha256:
+            raise ValueError(
+                f"cuteafd-mc.json['qmla'].tensors_sha256 mismatch: {actual_file_sha256} != {mc_qmla.get('tensors_sha256')}"
+            )
+        if int(mc_qmla.get("tensors_bytes", -1)) != actual_file_bytes:
+            raise ValueError("cuteafd-mc.json['qmla'].tensors_bytes mismatch")
+        stripped = {k: v for k, v in mc_qmla.items() if k not in _MC_EXTRA_FIELDS}
+        if stripped != manifest:
+            raise ValueError("cuteafd-mc.json['qmla'] disagrees with mla_calibration.safetensors __metadata__")
 
     # Optional quantization-off algebraic equivalence verification against captured banks.
     max_equiv_err = 0.0
@@ -696,9 +844,12 @@ def validate_sidecar(
         "status": "passed",
         "schema": QMLA_SCHEMA,
         "artifact_status": manifest["artifact_status"],
-        "manifest_sha256": _sha256_bytes(manifest_bytes),
-        "tensors_sha256": actual_sha256,
-        "tensors_bytes": int(manifest["tensors_bytes"]),
+        "protection_policy": policy,
+        "protection_scope": manifest["protection_scope"],
+        "tensors_payload_sha256": actual_payload_sha256,
+        "tensors_payload_bytes": actual_payload_bytes,
+        "tensors_sha256": actual_file_sha256,
+        "tensors_bytes": actual_file_bytes,
         "transform_fingerprint": expected_tfp,
         "supported_modes": list(manifest["supported_modes"]),
         "max_orth_err": max_orth_err,
@@ -706,26 +857,18 @@ def validate_sidecar(
     }
 
 
-def build_mc_qmla_advisory(sidecar_dir: Path | str) -> dict[str, Any]:
-    """Build the advisory ``qmla`` pointer object for ``cuteafd-mc.json`` (never in required_features)."""
-    report = validate_sidecar(sidecar_dir, strict=True)
-    return {
-        "schema": QMLA_SCHEMA,
-        "manifest": MANIFEST_FILE,
-        "manifest_sha256": report["manifest_sha256"],
-        "tensors": TENSORS_FILE,
-        "tensors_sha256": report["tensors_sha256"],
-        "transform_fingerprint": report["transform_fingerprint"],
-        "artifact_status": report["artifact_status"],
-    }
+def build_mc_qmla_section(sidecar_path_or_dir: Path | str) -> dict[str, Any]:
+    """Build the full embedded ``qmla`` section for ``cuteafd-mc.json`` (never in required_features)."""
+    validate_sidecar(sidecar_path_or_dir, strict=True)
+    return read_sidecar_manifest(sidecar_path_or_dir)
 
 
-def attach_qmla_advisory_to_mc(mc_manifest: Mapping[str, Any], sidecar_dir: Path | str) -> dict[str, Any]:
-    """Return a copy of ``cuteafd-mc.json`` with the advisory ``qmla`` section attached.
+def attach_qmla_to_mc(mc_manifest: Mapping[str, Any], sidecar_path_or_dir: Path | str) -> dict[str, Any]:
+    """Return a copy of ``cuteafd-mc.json`` with the full advisory ``qmla`` section attached.
 
     Preserves ``variants``, ``shared_inventory_sha256``, ``required_features``,
     ``source``, ``original_core_dtype``, ``exl3_codebook``, and ``engram_fp8`` byte-for-byte.
     """
     updated = deepcopy(dict(mc_manifest))
-    updated["qmla"] = build_mc_qmla_advisory(sidecar_dir)
+    updated["qmla"] = build_mc_qmla_section(sidecar_path_or_dir)
     return updated
