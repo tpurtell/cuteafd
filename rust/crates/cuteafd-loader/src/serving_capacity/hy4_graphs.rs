@@ -43,7 +43,7 @@ impl Hy4GraphLayout {
 /// 1,420 / 1,340 MiB, growth 28 / 26 MiB, resolving to 1,704/1,760 and 1,608/1,660 MiB
 /// soft/hard. The C1-only census (116/108 MiB, #2802) churned at C1 and C16. At the
 /// full-card reserve the timed bands are capture-free; replay still costs 2-3% at
-/// C1/C8 versus eager (follow-up issue), ties at C16 and 32K C8.
+/// C1/C8 versus eager (#2922), ties at C16 and 32K C8.
 const CENSUS: &[(Hy4GraphLayout, usize, WorkingSet)] = &[
     (Hy4GraphLayout::Exl3Min, 0, WorkingSet { w1: 88 << 20, step_growth: 18 << 20, capture_growth: 4 << 20 }),
     (Hy4GraphLayout::Exl3Max, 0, WorkingSet { w1: 100 << 20, step_growth: 20 << 20, capture_growth: 4 << 20 }),
