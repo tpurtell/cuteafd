@@ -247,7 +247,7 @@ def test_exporter_forwards_role_to_the_fork_and_appends_last():
     assert 'exlr8_programs(role=args.exlr8_role)' in text
     # After glmf wide decode and context split, immediately before compilation.
     assert text.index('if args.context_split == "on":') < text.index('if "exlr8" in geometries:') \
-        < text.index('for family, suffix, op, params, thunk in work:')
+        < text.index('for work_index, (family, suffix, op, params, thunk) in enumerate(work):')
     wrapper = ast.parse((ROOT / 'python/tools/aot/export_b12x_exlr8_aot.py').read_text())
     programs = next(n for n in wrapper.body if isinstance(n, ast.FunctionDef) and n.name == 'programs')
     assert any(isinstance(n, ast.ImportFrom) and n.module == 'b12x.integration.cuteafd.exlr8_glue'

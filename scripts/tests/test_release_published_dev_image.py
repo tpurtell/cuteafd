@@ -335,3 +335,41 @@ def test_missing_release_cache_receipts_warn_without_failing(tmp_path):
     assert 'WARNING: coordinator export cache receipt unavailable' in result.stderr
     assert 'WARNING: Spark export cache receipt unavailable' in result.stderr
     assert not list((tmp_path/'dist').iterdir())
+
+
+@pytest.mark.parametrize('arch', ['amd64', 'arm64'])
+def test_registry_miss_reuses_verified_local_toolchain_image_without_rebuild(tmp_path, arch):
+    """When the registry image is absent, reuse a verified local tc- image so WIP and release share one ID."""
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir(exist_ok=True)
+    role = 'cuteafd-coordinator-dev' if arch == 'amd64' else 'cuteafd-spark-expert-dev'
+    tc_hash = MOD._toolchain.identity(ROOT)
+    local_ref = f'{role}:tc-{tc_hash}'
+    docker = bin_dir / 'docker'
+    docker.write_text(f'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+root = pathlib.Path(os.environ['STUB_ROOT'])
+with (root/'calls').open('a') as out: out.write(json.dumps(args)+'\\n')
+if args[0] == 'pull':
+    print('manifest unknown', file=sys.stderr); sys.exit(1)
+elif args[:2] == ['image', 'inspect'] and args[2] == {local_ref!r}:
+    print(json.dumps([json.loads(os.environ['OBJECT'])]))
+else:
+    sys.exit(1)
+''')
+    docker.chmod(0o755)
+    obj = dict(Id=IMAGE, Architecture=arch, RepoDigests=[],
+               Config=dict(Labels={'io.cuteafd.toolchain.hash': tc_hash,
+                                  'io.cuteafd.base.digest': MOD._toolchain.BASE + MOD._toolchain.BASE_DIGESTS[arch]}))
+    env = dict(os.environ, PATH=str(bin_dir) + ':' + os.environ['PATH'], STUB_ROOT=str(tmp_path),
+               OBJECT=json.dumps(obj))
+    result = subprocess.run(command(tmp_path, arch), env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == IMAGE
+    assert not any(call[0] == 'build' for call in calls(tmp_path))
+    assert not any(call[0] == 'tag' for call in calls(tmp_path))
+    manifest = json.loads((tmp_path / 'manifest.json').read_text())
+    assert manifest['source'] == 'local'
+    assert manifest['local_reference'] == local_ref
+    assert manifest['image_id'] == IMAGE

@@ -587,7 +587,7 @@ def test_context_only_dispatches_native_geometry_without_other_programs(exporter
     validation = next(node for node in main.body if isinstance(node, ast.If)
                       and any(isinstance(child, ast.Constant) and isinstance(child.value, str)
                               and child.value.startswith("--context-split-only takes") for child in ast.walk(node)))
-    dispatch = next(node for node in ast.walk(main) if isinstance(node, ast.If)
+    dispatch = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
                     and ast.unparse(node.test) == "args.context_split_only"
                     and any(isinstance(child, ast.Name) and child.id == "family_work" for child in ast.walk(node)))
     geometry = types.SimpleNamespace(heads=64, index_topk=2048, record_bytes=656,

@@ -211,6 +211,29 @@ def job_candidates(root, previous, current_inputs):
     return changed
 
 
+def _normalized_compile_environment(raw):
+    """Strip per-build cache paths and kache shim dirs from backend compile env."""
+    if not isinstance(raw, (tuple, list)):
+        return raw
+    from _export_cache import PLACEMENT_ENV, resolve_compiler_shim
+    normalized = []
+    for item in raw:
+        if not (isinstance(item, (tuple, list)) and len(item) == 2):
+            normalized.append(item)
+            continue
+        name, value = item
+        if name in PLACEMENT_ENV:
+            continue
+        if name in ("CC", "CXX") and isinstance(value, str) and value:
+            resolved = resolve_compiler_shim(value)
+            if resolved is not None:
+                value = resolved
+            elif os.path.exists(value):
+                value = os.path.realpath(value)
+        normalized.append((name, value))
+    return tuple(normalized)
+
+
 def backend_identity():
     """Lowering inputs only; target, ABI and recipes are in IR/options, not placement."""
     import platform
@@ -222,7 +245,7 @@ def backend_identity():
     from _export_cache import static_environment
     return {"schema": 2, "image": image, "machine": platform.machine(),
             "runtime": compiler._runtime_toolchain_key(),
-            "environment": compiler._compile_environment_key(),
+            "environment": _normalized_compile_environment(compiler._compile_environment_key()),
             "static_environment": static_environment(),
             "ptxas_sha256": digest(Path(ptxas).read_bytes())}
 
@@ -258,7 +281,12 @@ def install_backend_cache(directory=None):
     @functools.wraps(original)
     def compile_cached(dsl, module, *args, **kwargs):
         cache = BaseDSL._cuteafd_backend_cache
-        cache.identity = backend_identity()
+        export_cache = sys.modules.get("_export_cache")
+        if export_cache is not None:
+            with export_cache.paused():
+                cache.identity = backend_identity()
+        else:
+            cache.identity = backend_identity()
         return cache.compile(dsl, original, module, args, kwargs, digest(str(module).encode()))
 
     compile_cached._cuteafd_backend_cache = True
