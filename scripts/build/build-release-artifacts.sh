@@ -405,20 +405,13 @@ if [[ "$coordinator_aot" == ON ]]; then
   # Automatic RTX placement requires the full local-expert ABI in release images.
   # Read the dynamic symbol table instead of loading the library: exports run in
   # CPU-only containers with no CUDA driver, and loading pulls in libcuda.so.1.
-  # Strip symbol versions (name@@VER): the dynamic linker matches by bare name.
-  nm -D --defined-only "$output_dir/libcuteafd_native.so" | awk '{sub(/@.*/, "", $NF); print $NF}' |
-    grep -qx 'cuteafd_v41_local_expert_info' ||
-    { echo "release native library lacks cuteafd_v41_local_expert_info" >&2
-      echo "nm -D v41 expert symbols:" >&2
-      nm -D "$output_dir/libcuteafd_native.so" 2>&1 | grep -iE 'v41_(local|tp2)_expert' | head -20 >&2 || true
-      echo "readelf v41 expert symbols:" >&2
-      readelf --dyn-syms --wide "$output_dir/libcuteafd_native.so" 2>&1 | grep -iE 'v41_(local|tp2)_expert' | head -20 >&2 || true
-      echo "nm -D total defined: $(nm -D --defined-only "$output_dir/libcuteafd_native.so" 2>&1 | wc -l)" >&2
-      ls -la "$output_dir/libcuteafd_native.so" "$build_root/native/libcuteafd_native.so" >&2 || true
-      exit 1; }
-  nm -D --defined-only "$output_dir/libcuteafd_native.so" | awk '{sub(/@.*/, "", $NF); print $NF}' |
-    grep -qx 'cuteafd_v41_tp2_expert_info' ||
-    { echo "release native library lacks cuteafd_v41_tp2_expert_info" >&2; exit 1; }
+  # Collect the names first: `nm | grep -q` under pipefail fails on SIGPIPE when
+  # grep exits early on a large table. Strip symbol versions (name@@VER).
+  v41_symbols="$(nm -D --defined-only "$output_dir/libcuteafd_native.so" | awk '{sub(/@.*/, "", $NF); print $NF}')"
+  for v41_symbol in cuteafd_v41_local_expert_info cuteafd_v41_tp2_expert_info; do
+    grep -qx "$v41_symbol" <<<"$v41_symbols" ||
+      { echo "release native library lacks $v41_symbol" >&2; exit 1; }
+  done
   install -m 0644 "$build_root/native/v41_fp8/v41_fp8.json" "$output_dir/V41_FP8_AOT.json"
 else
   printf '%s\n' '{"schema":1,"role":"expert","enabled":false}' >"$output_dir/V41_FP8_AOT.json"

@@ -895,8 +895,7 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" \
         script = (ROOT / "scripts/build/build-release-artifacts.sh").read_text()
         self.assertIn('-DCUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot"', script)
         self.assertIn('-DCUTEAFD_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot"', script)
-        self.assertIn("grep -qx 'cuteafd_v41_local_expert_info'", script)
-        self.assertIn("grep -qx 'cuteafd_v41_tp2_expert_info'", script)
+        self.assertIn("for v41_symbol in cuteafd_v41_local_expert_info cuteafd_v41_tp2_expert_info; do", script)
         # CPU-only export containers have no libcuda.so.1: read symbols, never load the library.
         abi_check = script.split("Automatic RTX placement requires", 1)[1].split("install -m 0644", 1)[0]
         self.assertIn("nm -D --defined-only", abi_check)
@@ -912,12 +911,16 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" \
         check = check.split("  install -m 0644", 1)[0]
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
-            both = "void cuteafd_v41_local_expert_info(void){}\nvoid cuteafd_v41_tp2_expert_info(void){}\n"
+            # Thousands of other symbols, as in the real ~58k-symbol library: an early-exiting
+            # `grep -q` on an `nm` pipe then hits SIGPIPE, which pipefail turned into a failure.
+            filler = "".join(f"void cuteafd_filler_{i}(void){{}}\n" for i in range(40000))
+            both = ("void cuteafd_v41_local_expert_info(void){}\n" + filler +
+                    "void cuteafd_v41_tp2_expert_info(void){}\n")
             versions = out / "versions.map"
             versions.write_text("V1 { global: cuteafd_*; local: *; };\n")
             # "versioned": the real library's dynamic symbols carry name@@VERSION suffixes.
             for name, body, extra in (("good", both, []), ("versioned", both, [f"-Wl,--version-script={versions}"]),
-                                      ("bad", "void cuteafd_v41_local_expert_info(void){}\n", [])):
+                                      ("bad", "void cuteafd_v41_local_expert_info(void){}\n" + filler, [])):
                 src = out / f"{name}.c"
                 src.write_text(body)
                 lib_dir = out / name
