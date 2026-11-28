@@ -2325,7 +2325,7 @@ impl<'a> Qwen4Engine<'a> {
         self.verify_step(sequences, None, spec, true)
     }
 
-    /// Diagnostic probes retain exact row geometry and never capture serving graphs.
+    /// Eager control arm of the graph oracles and probe scoring; never captures serving graphs.
     pub fn verify_device_ungraphed(&self, sequences: &mut [(&mut Qwen4Placement, &[u32])], spec: bool)
         -> Result<Option<DeviceLogits>> {
         self.verify_step(sequences, None, spec, false)

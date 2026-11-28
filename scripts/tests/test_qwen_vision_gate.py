@@ -199,7 +199,7 @@ def test_qwen_cold_replay_echo_has_validated_prefill_decode_execution():
     assert serve.index("probe.spec.validate_cold_steps(") < serve.index('probe::admitted(&job.probe, geometry.family,')
     assert "probe.spec.cold_steps.iter().map(|step| step.end).collect(), points: Vec::new()" in serve
     assert "probe.spec.cold_steps.get(p.chunks)" in serve
-    assert "let logits = if decode {\n                        engine.verify_device_ungraphed" in serve
+    assert "let logits = if decode {\n                        engine.score_device(" in serve
     assert "} else { engine.prefill_device(&mut p.placement, chunk, 1, cache.pool())? };" in serve
     assert 'matches!(engine, "mimo_v2" | "glm5_flash" | "qwen4" | "deepseek_v41")' in api
     assert "else if logits.is_some() { PointPlan::default() } else { plan }" in serve
@@ -334,10 +334,10 @@ def test_qwen_verify_histogram_uses_existing_timer_and_exact_rows():
     serve = (ROOT / "rust/crates/cuteafd-daemon/src/shared/qwen/scheduler.rs").read_text()
     family = (ROOT / "rust/crates/cuteafd-daemon/src/families/qwen4/serve.rs").read_text()
     timer = serve[serve.index("    let elapsed = timer.elapsed().as_secs_f64();"):]
-    assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec, diagnostic)") < timer.index("policy.observe_timed(&outcomes,")
+    assert timer.index("lane.stats.record(tokens.len(), engine.verify_bucket_rows(tokens.len(), spec)") < timer.index("policy.observe_timed(&outcomes,")
     assert '"verify": verify.snapshot()' in serve
     assert serve.count("&cache, media, preparer, &lane.stats,\n") == 2
-    assert "fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize {\n        rows\n    }" in family
+    assert "fn verify_bucket_rows(&self, rows: usize, _speculative: bool) -> usize {\n        rows\n    }" in family
     assert "fn verify_explore_bucket(" not in family
     assert '"by_real_rows"' in serve and '"by_bucket"' in serve
 
@@ -367,9 +367,11 @@ def test_qwen_graph_cache_precedes_ready_and_diagnostics_bypass_capture():
     assert startup.index("engine.warm_decode_graphs(") < startup.index("ready.send(Ok(")
     assert startup.index("engine.check_decode_graphs(") < startup.index("ready.send(Ok(")
     scoring = serve[serve.index("|placement, chunk|"):serve.index("|placement, chunk|") + 160]
-    assert "verify_device_ungraphed" in scoring
-    assert "active.iter().any(|a| a.job.probe.is_some())" in serve
-    assert "if diagnostic {\n        engine.verify_device_ungraphed" in serve
+    assert "engine.score_device(" in scoring
+    # Probed decode is served by the same graphed step as unprobed decode (#2898).
+    round_ = serve[serve.index("async fn decode_round"):]
+    assert "active.iter().any(|a| a.job.probe.is_some())" not in round_
+    assert "let step = engine.verify_device(&mut rows, spec, cache.pool())" in round_
     assert "Self::region(&w.select, rows * 4, rows * 4)" in engine
     assert engine.count("decode_graph::begin_capture(") == 1
     replay = engine[engine.index("    fn replay(&self, key: GraphKey"):engine.index("    fn miss_graph(")]

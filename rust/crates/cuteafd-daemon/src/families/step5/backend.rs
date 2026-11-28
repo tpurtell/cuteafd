@@ -16,13 +16,6 @@ fn verify_kind(speculative: bool) -> cuteafd_transport::ExpertV2SourceKind {
     else { cuteafd_transport::ExpertV2SourceKind::Decode }
 }
 
-fn ungraphed_kind(speculative: bool, kind: scheduler::UngraphedKind) -> cuteafd_transport::ExpertV2SourceKind {
-    if speculative { return verify_kind(true); }
-    match kind {
-        scheduler::UngraphedKind::Scoring => cuteafd_transport::ExpertV2SourceKind::Prefill,
-        scheduler::UngraphedKind::Decode => cuteafd_transport::ExpertV2SourceKind::Decode,
-    }
-}
 
 const H: usize = 4096;
 const V: usize = 128896;
@@ -642,16 +635,14 @@ impl<'e, 'a> Backend<'a> for Step5Backend<'e, 'a> {
         pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
         self.state.verify(|| self.execute(sequences, pool, verify_kind(speculative), None)).map(Some)
     }
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        kind: scheduler::UngraphedKind, pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
+    /// Teacher-forced rows reach the Sparks as prefill-shaped scoring rows.
+    fn score_device(&self, sequences: &mut [(&mut Placement, &[u32])], pool: &RefPagePool)
+        -> Result<Option<DeviceLogits>> {
         self.state.retire();
-        let source = ungraphed_kind(speculative, kind);
-        self.execution.without_graphs(|| {
-            if speculative { self.state.verify(|| self.execute(sequences, pool, source, None)).map(Some) }
-            else { self.immediate(sequences, pool, source, None).map(Some) }
-        })
+        self.execution.without_graphs(|| self.immediate(sequences, pool,
+            cuteafd_transport::ExpertV2SourceKind::Prefill, None).map(Some))
     }
-    fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
+    fn verify_bucket_rows(&self, rows: usize, _speculative: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         let contexts = contexts.to_vec();
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"step5_swa512_csa64", "rows":rows, "contexts":contexts,
@@ -796,16 +787,15 @@ mod tests {
     }
 
     #[test]
-    fn ungraphed_source_metadata_preserves_scoring_decode_and_speculation() {
-        use cuteafd_transport::ExpertV2SourceKind::{Decode, MtpVerify, Prefill};
-        use scheduler::UngraphedKind;
-        assert_eq!(ungraphed_kind(false, UngraphedKind::Scoring), Prefill);
-        assert_eq!(ungraphed_kind(false, UngraphedKind::Decode), Decode);
-        for kind in [UngraphedKind::Scoring, UngraphedKind::Decode] {
-            assert_eq!(ungraphed_kind(true, kind), MtpVerify);
-        }
+    fn source_metadata_separates_scoring_decode_and_speculation() {
+        use cuteafd_transport::ExpertV2SourceKind::{Decode, MtpVerify};
         assert_eq!(verify_kind(false), Decode);
         assert_eq!(verify_kind(true), MtpVerify);
+        let source = include_str!("backend.rs");
+        let scoring = source.split_once("    fn score_device(").unwrap().1
+            .split_once("    fn verify_bucket_rows(").unwrap().0;
+        assert!(scoring.contains("ExpertV2SourceKind::Prefill"));
+        assert!(scoring.contains("without_graphs("));
     }
 
     #[test]

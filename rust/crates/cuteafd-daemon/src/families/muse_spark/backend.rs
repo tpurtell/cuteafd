@@ -62,18 +62,10 @@ fn committed(start: usize, rows: usize, kept: Option<usize>) -> Result<usize> {
 
 /// A drafted verify reaches the Sparks as MTP verify rows (each request's
 /// rows stay under the BF16 cutoff: lossless); a plain step as decode.
-fn verify_kind(speculative: bool) -> cuteafd_transport::ExpertV2SourceKind {
+pub(super) fn verify_kind(speculative: bool) -> cuteafd_transport::ExpertV2SourceKind {
     if speculative { cuteafd_transport::ExpertV2SourceKind::MtpVerify } else { cuteafd_transport::ExpertV2SourceKind::Decode }
 }
 
-/// Probe scoring rows are prefill-shaped teacher-forced rows; cold steps are decode.
-fn ungraphed_kind(speculative: bool, kind: scheduler::UngraphedKind) -> cuteafd_transport::ExpertV2SourceKind {
-    if speculative { return verify_kind(true); }
-    match kind {
-        scheduler::UngraphedKind::Scoring => cuteafd_transport::ExpertV2SourceKind::Prefill,
-        scheduler::UngraphedKind::Decode => cuteafd_transport::ExpertV2SourceKind::Decode,
-    }
-}
 
 /// A sequence's drafter state: the next block's anchor, whether its context
 /// is current (prefilled or accepted through the frontier), and the first
@@ -297,6 +289,17 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
         Ok(())
     }
 
+    /// The served verify with graphs bypassed: probe scoring, and the eager
+    /// control arm of the graph oracles. Serving never takes this path.
+    pub(super) fn verify_eager(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
+        kind: cuteafd_transport::ExpertV2SourceKind) -> Result<Option<DeviceLogits>> {
+        ensure!(!speculative || self.draft.is_some(), "Muse speculative verify without a drafter");
+        let enabled = self.graph_enabled.replace(false);
+        let result = self.verify_rows(sequences, speculative, kind);
+        self.graph_enabled.set(enabled);
+        result
+    }
+
     fn verify_rows(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
         kind: cuteafd_transport::ExpertV2SourceKind) -> Result<Option<DeviceLogits>> {
         let logits = self.step(sequences, kind)?;
@@ -498,15 +501,12 @@ impl<'r, 'a> Backend<'a> for MuseBackend<'r, 'a> {
         ensure!(!speculative || self.draft.is_some(), "Muse speculative verify without a drafter");
         self.verify_rows(sequences, speculative, verify_kind(speculative))
     }
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        kind: scheduler::UngraphedKind, _pool: &RefPagePool) -> Result<Option<DeviceLogits>> {
-        ensure!(!speculative || self.draft.is_some(), "Muse speculative verify without a drafter");
-        let enabled = self.graph_enabled.replace(false);
-        let result = self.verify_rows(sequences, speculative, ungraphed_kind(speculative, kind));
-        self.graph_enabled.set(enabled);
-        result
+    /// Probe scoring rows are prefill-shaped teacher-forced rows.
+    fn score_device(&self, sequences: &mut [(&mut Placement, &[u32])], _pool: &RefPagePool)
+        -> Result<Option<DeviceLogits>> {
+        self.verify_eager(sequences, false, cuteafd_transport::ExpertV2SourceKind::Prefill)
     }
-    fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
+    fn verify_bucket_rows(&self, rows: usize, _speculative: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         let contexts = contexts.to_vec();
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind": "muse_gqa_swa2048_full", "rows": rows, "contexts": contexts}))
@@ -710,8 +710,6 @@ mod tests {
             len = after_verify(len, chunk, false);
         }
         assert_eq!(written, [500, 564, 628], "each chunk writes past the last");
-        assert_eq!(ungraphed_kind(false, scheduler::UngraphedKind::Scoring), cuteafd_transport::ExpertV2SourceKind::Prefill);
-        assert_eq!(ungraphed_kind(true, scheduler::UngraphedKind::Scoring), cuteafd_transport::ExpertV2SourceKind::MtpVerify);
         Ok(())
     }
 }

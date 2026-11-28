@@ -104,20 +104,15 @@ impl<'e, 'a> DenseBackend<'e, 'a> {
                 (captures + cycle.captures, hits + cycle.hits));
         let before = counters();
         let pool = cuteafd_engine::prefix::RefPagePool::new(self.engine.borrow().pool_tokens / 64, 64);
-        for (speculative, kind) in [(false, scheduler::UngraphedKind::Decode),
-            (true, scheduler::UngraphedKind::Decode), (false, scheduler::UngraphedKind::Scoring)] {
-            self.engine.borrow_mut().reset_slot(0)?;
-            let mut placement = Placement { units: vec![0], slot: 0, len: 0, state_len: 0 };
-            for _ in 0..2 {
-                self.verify_device_ungraphed(&mut [(&mut placement, &tokens[..2])], speculative,
-                    kind, &pool)?.context("diagnostic needs logits")?
-                    .to_host(self.library)?;
-                if let Some(mark) = self.pending.borrow_mut().take() { self.engine.borrow_mut().restore(&mark)?; }
-            }
+        self.engine.borrow_mut().reset_slot(0)?;
+        let mut placement = Placement { units: vec![0], slot: 0, len: 0, state_len: 0 };
+        for _ in 0..2 {
+            self.score_device(&mut [(&mut placement, &tokens[..2])], &pool)?
+                .context("diagnostic needs logits")?.to_host(self.library)?;
         }
         self.engine.borrow_mut().reset_slot(0)?;
-        ensure!(counters() == before, "dense diagnostic verify captured or replayed a graph");
-        println!("dense diagnostic verify: zero captures and zero replays (plain and speculative)");
+        ensure!(counters() == before, "dense probe scoring captured or replayed a graph");
+        println!("dense probe scoring: zero captures and zero replays");
         Ok(())
     }
 
@@ -370,38 +365,35 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
         };
         Ok(Some(output))
     }
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Placement, &[u32])], speculative: bool,
-        kind: scheduler::UngraphedKind, pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
+    fn score_device(&self, sequences: &mut [(&mut Placement, &[u32])],
+        pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<DeviceLogits>> {
         let rows = sequences.iter().flat_map(|(placement, tokens)|
             tokens.iter().enumerate().map(|(offset, _)| (placement.slot, placement.len + offset))).collect::<Vec<_>>();
         let output = {
             // The shared Qwen scheduler submits this single lane synchronously;
             // the engine-local override never changes the shared device cache.
             let _bypass = self.engine.borrow().bypass_graphs();
-            self.verify_device(sequences, speculative, pool)?
+            self.verify_device(sequences, false, pool)?
         };
-        if kind == scheduler::UngraphedKind::Scoring {
-            ensure!(!speculative, "dense scoring cannot leave speculative state");
-            if let Some(mtp) = &self.mtp {
-                let mut engine = self.engine.borrow_mut();
-                let tap = engine.verify_taps()[0];
-                let mut first = 0;
-                for (placement, tokens) in sequences {
-                    let width = engine.cfg.hidden * 2;
-                    let hidden = CuteafdDeviceBuffer { ptr: tap.ptr.cast::<u8>().wrapping_add(first * width).cast_mut().cast(),
-                        bytes: tokens.len() * width, device_id: self.library.cuda_get_device()?, ..Default::default() };
-                    mtp.update(&mut engine, placement.slot, placement.len - tokens.len(), tokens, hidden)?;
-                    first += tokens.len();
-                }
+        if let Some(mtp) = &self.mtp {
+            let mut engine = self.engine.borrow_mut();
+            let tap = engine.verify_taps()[0];
+            let mut first = 0;
+            for (placement, tokens) in sequences {
+                let width = engine.cfg.hidden * 2;
+                let hidden = CuteafdDeviceBuffer { ptr: tap.ptr.cast::<u8>().wrapping_add(first * width).cast_mut().cast(),
+                    bytes: tokens.len() * width, device_id: self.library.cuda_get_device()?, ..Default::default() };
+                mtp.update(&mut engine, placement.slot, placement.len - tokens.len(), tokens, hidden)?;
+                first += tokens.len();
             }
-            if let Some(draft) = &self.drafter {
-                draft.update(&rows.into_iter().enumerate().map(|(tap_row, (slot, position))|
-                    ContextRow { tap_row, slot, position }).collect::<Vec<_>>())?;
-            }
+        }
+        if let Some(draft) = &self.drafter {
+            draft.update(&rows.into_iter().enumerate().map(|(tap_row, (slot, position))|
+                ContextRow { tap_row, slot, position }).collect::<Vec<_>>())?;
         }
         Ok(output)
     }
-    fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize { rows }
+    fn verify_bucket_rows(&self, rows: usize, _speculative: bool) -> usize { rows }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
         let contexts = contexts.to_vec();
         crate::shared::speculation_trace::Deferred::new(move || serde_json::json!({"kind":"causal_gqa", "rows":rows, "contexts":contexts}))

@@ -366,12 +366,11 @@ impl<'e, 'a> Backend<'a> for Qwen4Backend<'e, 'a> {
         -> Result<Option<crate::shared::token_io::DeviceLogits>> {
         self.engine.verify_device(sequences, speculative)
     }
-    fn verify_device_ungraphed(&self, sequences: &mut [(&mut Self::Placement, &[u32])], speculative: bool,
-        _kind: scheduler::UngraphedKind, _pool: &cuteafd_engine::prefix::RefPagePool)
-        -> Result<Option<crate::shared::token_io::DeviceLogits>> {
-        self.engine.verify_device_ungraphed(sequences, speculative)
+    fn score_device(&self, sequences: &mut [(&mut Self::Placement, &[u32])],
+        _pool: &cuteafd_engine::prefix::RefPagePool) -> Result<Option<crate::shared::token_io::DeviceLogits>> {
+        self.engine.verify_device_ungraphed(sequences, false)
     }
-    fn verify_bucket_rows(&self, rows: usize, _speculative: bool, _diagnostic: bool) -> usize {
+    fn verify_bucket_rows(&self, rows: usize, _speculative: bool) -> usize {
         rows
     }
     fn verify_attention_trace(&self, contexts: &[Vec<usize>], rows: usize) -> crate::shared::speculation_trace::Deferred {
