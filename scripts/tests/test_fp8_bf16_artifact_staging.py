@@ -567,6 +567,17 @@ def test_release_stages_nvfp4_mtp_sibling_only_on_coordinator(tmp_path, role):
     assert {p.name for p in output.iterdir()} == expected
 
 
+def test_release_expert_skips_coordinator_only_inkling2_mini(tmp_path):
+    # fp8_moe.cmake builds no Spark package for Inkling 2 Mini (TP1, 0 Sparks),
+    # so the Spark leg must not try to stage one: the v7.0.0-rc1 build failed
+    # with `cp: cannot stat .../fp8/fp8-inkling2_mini-mxfp8`.
+    result, output = stage(tmp_path, "release", requested="", role="expert",
+                           families="inkling2_mini:mxfp8;inkling2_mini:nvfp4a4;glm:nvfp4")
+    assert result.returncode == 0, result.stderr
+    assert {p.name for p in output.iterdir()} == {
+        "fp8-glm-nvfp4", "fp8-glm-nvfp4a4", "fp8-mimo-bf16"}
+
+
 @pytest.mark.parametrize("kind", ["release", "wip"])
 def test_requested_sibling_is_verified_and_staged_with_existing_a8_packages(tmp_path, kind):
     result, output = stage(tmp_path, kind)
