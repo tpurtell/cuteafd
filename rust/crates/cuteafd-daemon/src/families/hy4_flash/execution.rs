@@ -5201,6 +5201,11 @@ impl<'a> Hy4Engine<'a> {
                                 r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale)?;
                             } else if rank == 0 {
                                 r.moe_router(&p, wave_slot, rows, routed_scale)?;
+                            } else {
+                                // TP2 Spark-routed rank 1 does not run the router or Spark send;
+                                // fuse its shared FFN into `SparkRouter` (matching GLM 5.3) so it
+                                // overlaps rank 0's router + Spark RTT in one graph executable.
+                                r.shared_ffn(&p, gpus, wave_slot, rows)?;
                             }
                             if rank == 0 {
                                 r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)?;
@@ -5246,19 +5251,19 @@ impl<'a> Hy4Engine<'a> {
 
     /// Enqueue the shared FFN after the Spark request has been staged, before landing its reply.
     ///
-    /// On TP1 graphed decode, launches eagerly in the Spark RDMA round-trip shadow (matching GLM 5.3's
-    /// `moe_exchange`) to eliminate a separate per-layer executable while keeping full overlap.
+    /// On graphed decode (both TP1 and TP2), rank 0 launches eagerly in the Spark RDMA round-trip
+    /// shadow (matching GLM 5.3's `moe_exchange`) to eliminate a separate per-layer executable
+    /// while keeping full overlap. On TP2 graphed decode, rank 1 already fused its shared FFN
+    /// into `SparkRouter`, so only rank 0 runs here.
     fn run_spark_shared_ffn(&self, layer: usize, batch: &ActiveBatch) -> Result<()> {
         let p = format!("model.layers.{layer}");
         let rows = batch.rows;
         let gpus = self.ranks.len();
-        for r in &self.ranks {
-            let work = || r.device.run(|| r.shared_ffn(&p, gpus, batch.wave_slot, rows));
-            if batch.graphed && gpus == 2 {
-                r.graphs.run(GraphKey::new(layer, rows, GraphSection::SparkShared), &r.stream, work)?;
-            } else {
-                work()?;
+        for (rank, r) in self.ranks.iter().enumerate() {
+            if batch.graphed && rank == 1 {
+                continue;
             }
+            r.device.run(|| r.shared_ffn(&p, gpus, batch.wave_slot, rows))?;
         }
         Ok(())
     }
@@ -5825,7 +5830,7 @@ impl<'a> Hy4Engine<'a> {
                         .and_then(Option::as_mut)
                         .context("Hy4 send_experts without active unit")?;
                     self.engine.run_moe_frontend(layer, batch, false)?;
-                    if self.engine.ranks.len() == 2 && self.engine.prefill_waves > 1 {
+                    if self.engine.ranks.len() == 2 && !self.single_wave {
                         // Protect rank 1's PEER_SLOT_ATTN read before another wave starts attention(layer).
                         let exchange = self.engine.peer_exchange()?;
                         exchange.signal(1, DIRECT)?;
@@ -6737,7 +6742,7 @@ mod tests {
         let send = hook.find("waves.send(").unwrap();
         let shared = hook.find("run_spark_shared_ffn(layer, batch)").unwrap();
         assert!(router < send && send < shared);
-        assert!(prod.contains("GraphSection::SparkShared"));
+        assert!(!prod.contains("GraphSection::SparkShared"));
     }
 
     #[test]
@@ -6758,10 +6763,6 @@ mod tests {
         assert!(!tp1_spark.contains("GraphSection::SparkRouter"));
         assert!(!tp1_spark.contains("GraphSection::DsaIndexQ"));
 
-        let shared = prod.split("fn run_spark_shared_ffn(").nth(1).unwrap()
-            .split("fn finish_ffn_combine_and_post(").next().unwrap();
-        assert!(shared.contains("if batch.graphed && gpus == 2"));
-
         let finish = prod.split("fn finish_ffn_combine_and_post(").nth(1).unwrap()
             .split("fn run_layer_local_ffn(").next().unwrap();
         assert!(finish.contains("if batch.can_defer_ffn {\n            batch.prev_ffn_deferred = Some(deferred_ffn);"));
@@ -6774,6 +6775,30 @@ mod tests {
             super::super::graphs::tp1_spark_layer_sections(true, true, true),
             &[GraphSection::DsaPreScored, GraphSection::DsaSparkPost]
         );
+    }
+
+    #[test]
+    fn tp2_spark_decode_fuses_rank1_shared_and_skips_single_wave_barrier() {
+        let prod = include_str!("execution.rs").split("#[cfg(test)]").next().unwrap();
+        let frontend = prod.split("fn run_moe_frontend(").nth(1).unwrap()
+            .split("fn run_spark_shared_ffn(").next().unwrap();
+        let graphed_frontend = frontend.split("if batch.graphed {").nth(1).unwrap()
+            .split("return Ok(());").next().unwrap();
+        assert!(graphed_frontend.contains("r.shared_ffn(&p, gpus, wave_slot, rows)?;"),
+            "TP2 graphed SparkRouter must fuse rank-1 shared_ffn");
+
+        let shared = prod.split("fn run_spark_shared_ffn(").nth(1).unwrap()
+            .split("fn finish_ffn_combine_and_post(").next().unwrap();
+        assert!(shared.contains("if batch.graphed && rank == 1"),
+            "TP2 graphed run_spark_shared_ffn must skip rank 1 after SparkRouter fusion");
+        assert!(!shared.contains("r.graphs.run("),
+            "rank-0 shared_ffn must launch eagerly in the Spark RDMA shadow");
+
+        let send = prod.split("fn send_experts(").nth(1).unwrap()
+            .split("fn land_experts(").next().unwrap();
+        assert!(send.contains("if self.engine.ranks.len() == 2 && !self.single_wave"),
+            "single-wave decode must not emit the multi-wave DIRECT PEER_SLOT_ATTN barrier");
+        assert!(!send.contains("self.engine.prefill_waves > 1"));
     }
 
 }

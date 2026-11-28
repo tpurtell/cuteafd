@@ -51,10 +51,8 @@ pub(crate) enum Section {
     DsaAttnOut,
     /// Post-attn iHC + Dense/MoE frontend (TP2 local/dense; includes TP2 local EXL3 when onboarded).
     FfnFrontend,
-    /// Spark-routed post-attention and router, before request staging (TP2).
+    /// Spark-routed post-attention + router on rank 0, or post-attention + shared FFN on rank 1 (TP2).
     SparkRouter,
-    /// Shared expert FFN launched after staging, ahead of the landed wait (TP2; TP1 runs eagerly in the RDMA shadow).
-    SparkShared,
     /// Post-FFN combine + norm + iHC post (non-deferred fallback).
     FfnFinish,
     /// Rank-0 final layer post-FFN combine + norm + iHC post + terminal `hc_head`.
@@ -334,7 +332,6 @@ mod tests {
                     Section::DsaAttnOut,
                     Section::FfnFrontend,
                     Section::SparkRouter,
-                    Section::SparkShared,
                     Section::FfnFinish,
                     Section::Tail,
                 ] {
