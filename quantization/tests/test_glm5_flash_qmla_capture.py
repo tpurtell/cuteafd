@@ -68,3 +68,21 @@ def test_reject_unknown_glm_layer_schedule():
     cfg.indexer_types[3] = "shared"
     with pytest.raises(ValueError, match="unsupported attention/indexer"):
         Glm5FlashCaptureAdapter(cfg)
+
+
+def test_glm_native_protection_uses_the_original_bf16_kv():
+    cfg, layer = _layer(torch.bfloat16, "sdpa")
+    adapter = Glm5FlashCaptureAdapter(cfg)
+    # Native weights usually carry learned RMS scales; unit scales hide the BF16 product rounding.
+    with torch.no_grad():
+        layer.kv_a_layernorm.weight.copy_(torch.randn_like(layer.kv_a_layernorm.weight))
+    x = torch.randn(21, cfg.hidden_size).bfloat16()
+    seq, native = adapter.capture_sequence(x, layer, seq_id="protected")
+    params = adapter.layer_params(layer)
+    quantized = eval_attention_output(
+        seq, params, adapter.geometry_for(3), content_fn=torch.zeros_like,
+        kv_b_override=params.kv_b_weight * params.kv_norm_weight,
+        exact_content_fn=lambda u: u,
+        recent_tokens=32,
+    )
+    torch.testing.assert_close(quantized, native.float(), rtol=2e-5, atol=2e-5)

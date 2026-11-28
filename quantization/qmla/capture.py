@@ -637,7 +637,11 @@ def _native_bf16_output(seq, params, geom, latent, kv_b_override, exact_content_
     query = seq.q_nope.to(dtype)
     protect = exact_content_fn is not None and (sink_tokens or recent_tokens)
     if protect:
-        exact_k, exact_v = expand(exact_content_fn(seq.u.float()))
+        # Protected slots carry the original native KV, including the RMSNorm product's
+        # BF16 rounding. Reprojecting compensated FP32 coordinates changes that rounding.
+        exact_latent = (seq.u.float() * params.kv_norm_weight.float()).to(dtype)
+        exact = F.linear(exact_latent, params.kv_b_weight.to(dtype)).reshape(count, geom.heads, out_dim)
+        exact_k, exact_v = exact.split([geom.qk_nope_dim, geom.v_head_dim], dim=-1)
     # Match the native prefill's shape and SDPA backend for ordinary calibration sequences.
     # Only long contexts or query-dependent selection of the exact/quantized KV require tiles.
     step = count if seq.sparse_selection is None and not protect else ROWS
