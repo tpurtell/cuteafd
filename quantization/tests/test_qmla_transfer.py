@@ -7,7 +7,8 @@ import torch
 
 from hy4_flash import forward, recipe
 from inkling2 import numerical
-from hy4_flash.qmla_transfer import K8Model, K8Reader, summarize_transfer, transfer_records
+from hy4_flash.qmla_mc import MCModel, MCReader
+from hy4_flash.qmla_transfer import summarize_transfer, transfer_records
 from qmla.capture import describe_splits, sequence_sha256
 from qmla.sidecar import attach_view_transfer, load_sidecar_transforms
 from test_qmla_pipeline import _make_skewed_hy4_bank, _synthetic_panel_provenance
@@ -54,12 +55,13 @@ def test_transfer_matches_ordered_test_tokens_and_preserves_sidecar(tmp_path):
         assert torch.equal(old, new)
 
 
-def test_installed_compact_index_dispatches_k8_core_k4_experts(monkeypatch):
+@pytest.mark.parametrize("view", ["original", "k8-compact"])
+def test_installed_mc_view_dispatches_its_core_and_shared_k4_experts(monkeypatch, view):
     hub = Path(os.environ.get("HF_HUB_CACHE", Path(os.environ.get("HF_HOME", Path.home()/".cache/huggingface"))/"hub"))
     checkpoint = hub / "models--wrldsuksgo2mars--Hy4-flash-EXL3-K4-MC/snapshots/cc72179113573d751ed3245e3e58d3640694378d"
     if not checkpoint.is_dir():
         pytest.skip("pinned Hy4-flash MC snapshot is absent")
-    reader = K8Reader(checkpoint, "cpu")
+    reader = MCReader(checkpoint, "cpu", view=view)
     assert reader.source["revision"] == recipe.BASE_REVISION
     # Exercise real packed scale/marker reads and the same validator used before CUDA decode.
     dispatched = []
@@ -69,11 +71,21 @@ def test_installed_compact_index_dispatches_k8_core_k4_experts(monkeypatch):
         return torch.empty(shape, device="meta", dtype=dtype)
 
     monkeypatch.setattr(numerical, "reconstruct_projection", verify)
-    reader.reconstruct("model.layers.1.self_attn.q_a_proj", (1024, 3072), 8)
+    first_projection = "model.layers.1.self_attn.q_a_proj"
+    if view == "original":
+        name = first_projection + ".weight"
+        native = reader.raw(name)
+        assert native.dtype == torch.bfloat16 and name in reader.core
+        assert torch.equal(native.float(), reader.load(name))
+        assert reader.variant["fingerprint"] == reader.original_fingerprint
+    else:
+        reader.reconstruct(first_projection, (1024, 3072), 8)
+        assert reader.variant["fingerprint"] != reader.original_fingerprint
     reader.reconstruct("model.layers.1.mlp.experts.237.gate_proj", (1536, 1536), 4)
-    assert dispatched == [(8, "cpu", torch.bfloat16, "mul1"), (4, "cpu", torch.bfloat16, "mul1")]
+    assert [call[0] for call in dispatched] == ([4] if view == "original" else [8, 4])
+    assert all(call[1:] == ("cpu", torch.bfloat16, "mul1") for call in dispatched)
     with pytest.raises(ValueError, match="wrong bit width"):
-        reader.reconstruct("model.layers.1.self_attn.q_a_proj", (1024, 3072), 4)
+        reader.reconstruct("model.layers.1.mlp.experts.237.gate_proj", (1536, 1536), 8)
     # Check the physical packed operands and their bits without loading a CUDA extension.
     calls = {}
     def inspect(module, shape, bits):
@@ -89,9 +101,13 @@ def test_installed_compact_index_dispatches_k8_core_k4_experts(monkeypatch):
     monkeypatch.setattr(reader, "reconstruct", inspect)
     monkeypatch.setattr(reader, "load", lambda name, **kw: torch.empty(reader.descriptor(name)["shape"], device="meta"))
     monkeypatch.setattr(reader, "raw", lambda name: torch.empty(reader.descriptor(name)["shape"], device="meta"))
-    model = K8Model(reader)
+    model = MCModel(reader)
     layer = model.load_layer(1)
-    assert calls["model.layers.1.self_attn.kv_b_proj"] == 8
+    if view == "original":
+        assert calls == {}
+        assert "self_attn.kv_b_proj.weight" in layer.weights
+    else:
+        assert calls["model.layers.1.self_attn.kv_b_proj"] == 8
     assert forward.reference.TABLE in layer.weights
     assert all(key not in layer.weights for key in forward.reference.EXPERTS)
     latent = torch.empty((2, reader.config.routed_expert_hidden_size), device="meta")

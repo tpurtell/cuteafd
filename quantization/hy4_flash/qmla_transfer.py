@@ -1,6 +1,6 @@
 """Score the frozen Hy4-flash QMLA transforms on the MC K8 core and shared K4 experts.
 
-Run after BF16 calibration with --checkpoint MC_SNAPSHOT --corpus-dir PREPARED
+Run after MC original-view calibration with --checkpoint MC_SNAPSHOT --corpus-dir PREPARED
 --output CALIBRATION_OUTPUT. Only the recorded test sequences run through the model.
 """
 from __future__ import annotations
@@ -11,79 +11,17 @@ import json
 import math
 from pathlib import Path
 
-import torch
-
-from inkling2 import numerical
 from qmla.capture import _atomic_json, check_split_description, sequence_sha256
 from qmla.long_eval import LongContextRecord
 from qmla.quantizer import parse_qmla_mode
 from qmla.sidecar import attach_view_transfer, read_sidecar_manifest, validate_sidecar
 
-from . import forward, recipe
-from .engram import mc_manifest
+from . import recipe
+from .qmla_mc import MCModel, MCReader
 from .qmla_capture import Hy4FlashCaptureAdapter
 from .qmla_run import load_pinned_qmla_corpus, run_hy4_flash_long_eval
 
 VIEW = "k8-compact"
-
-
-class K8Reader(forward.reference.Checkpoint):
-    """Read every executed operand from the verified compact variant index."""
-
-    def __init__(self, checkpoint, device):
-        super().__init__(checkpoint, device=device)
-        mc = json.loads((self.snapshot / "cuteafd-mc.json").read_bytes())
-        mc_manifest.validate(mc, self.snapshot, view=VIEW)
-        self.variant = next(view for view in mc["variants"] if view["name"] == VIEW)
-        document = json.loads((self.snapshot / self.variant["config"]).read_bytes())
-        storage = document.pop("quantization_config")
-        if (storage["checkpoint_format"], storage["core_bits"], storage["bits"], storage["codebook"]) != (
-            "exl3", 8, 4, "mul1"
-        ) or storage["safetensors_index"] != self.variant["index"]:
-            raise ValueError("compact config does not specify K8 core and K4 MUL1 experts")
-        # The native reference checks the architecture after the MC storage contract is consumed.
-        self.config = forward.reference.Config.parse(document)
-        self.index = json.loads((self.snapshot / self.variant["index"]).read_bytes())["weight_map"]
-        self.core = frozenset(self.variant["core_tensors"])
-        self.source = mc["source"]
-        if mc["exl3_codebook"] != {"name": "mul1", "multiplier": recipe.MUL1_MULTIPLIER}:
-            raise ValueError("K8 replay requires the Hy4 MUL1 codebook")
-
-    def reconstruct(self, module, shape, bits):
-        packed = {suffix: self.raw(f"{module}.{suffix}") for suffix in recipe.SUFFIXES}
-        if packed["trellis"].shape[-1] != bits * 16:
-            raise ValueError(f"wrong bit width for {module}: expected K{bits}")
-        return numerical.reconstruct_projection(
-            packed, shape, device=str(self.device), dtype=torch.bfloat16, codebook="mul1"
-        ).float()
-
-    def load_layer(self, index):
-        prefix = f"model.layers.{index}."
-        weights = {}
-        for name, (shape, _dtype) in forward.reference.tensor_contract(self.config, index).items():
-            leaf = name.removeprefix(prefix)
-            if leaf in forward.reference.EXPERTS:
-                continue  # The MC stores separate, per-expert K4 modules.
-            module = name.removesuffix(".weight")
-            if name.endswith(".weight") and module + ".trellis" in self.core:
-                weights[leaf] = self.reconstruct(module, shape, 8)
-            elif leaf == forward.reference.TABLE:
-                weights[leaf] = self.raw(name)  # Map large native Engram tables and gather only used rows.
-            else:
-                weights[leaf] = self.load(name, native=leaf == "engram_layer.lookup_table")
-        return forward.Layer(index, prefix, weights)
-
-
-class K8Model(forward.Model):
-    def routed_expert_weights(self, index, latent, layer):
-        prefix = layer.prefix + f"mlp.experts.{index}."
-        width = latent.shape[-1]
-        inner = self.config.moe_intermediate_size
-        return (
-            self.reader.reconstruct(prefix + "gate_proj", (inner, width), 4),
-            self.reader.reconstruct(prefix + "up_proj", (inner, width), 4),
-            self.reader.reconstruct(prefix + "down_proj", (width, inner), 4),
-        )
 
 
 def transfer_records(records, provenance):
@@ -137,12 +75,14 @@ def run(checkpoint, corpus_dir, output, device):
     validate_sidecar(sidecar, expected_source=expected)
     if (report["source"] != source or report["validation"]["transform_fingerprint"] != manifest["transform_fingerprint"]
             or set(report["combinations"]) != set(manifest["calibration_provenance"]["combination_measurements"])):
-        raise ValueError("BF16 report and sidecar disagree")
+        raise ValueError("MC original-view report and sidecar disagree")
 
-    reader = K8Reader(checkpoint, device)
+    reader = MCReader(checkpoint, device, view=VIEW)
     if reader.source != {"repo": source["base_repo"], "revision": source["base_revision"]}:
-        raise ValueError("MC base differs from the calibration teacher")
+        raise ValueError("MC upstream source identity differs from calibration provenance")
     provenance = manifest["calibration_provenance"]
+    if provenance.get("forward_view_fingerprint") != reader.original_fingerprint:
+        raise ValueError("transfer requires transforms fitted on this MC original view")
     records, panel = load_pinned_qmla_corpus(corpus_dir, panel_revision=provenance["dataset_revision"],
                                              components=tuple(provenance["components"]), full=False)
     for key in ("dataset_repo", "dataset_revision", "input_ids_sha256"):
@@ -165,7 +105,7 @@ def run(checkpoint, corpus_dir, output, device):
             raise ValueError("existing K8 transfer receipt differs from requested sidecar, test set or view")
     else:
         measured = run_hy4_flash_long_eval(
-            Hy4FlashCaptureAdapter(K8Model(reader)), sidecar_path=sidecar, records=test, corpus_meta=panel,
+            Hy4FlashCaptureAdapter(MCModel(reader)), sidecar_path=sidecar, records=test, corpus_meta=panel,
             layers=identity["layers"], modes=[parse_qmla_mode(mode) for mode in identity["modes"]],
             expected_source=expected, device=device, phase="k8_transfer",
         )
