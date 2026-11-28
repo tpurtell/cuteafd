@@ -349,16 +349,13 @@ def inkling2_projection_shapes(parts=1):
 def compile_draft_bf16_projection(k, n, output="bf16"):
 
     import torch
-    from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection
+    from b12x.gemm.bf16_gemv._skinny import TmaBf16Projection, decode_tma_tiles
     from b12x.integration.cuteafd._common import Operand, Scalar, compile_program
     import cutlass
-    from b12x.gemm.bf16_gemv._skinny import DECODE_TMA_TILES
     if output not in ("bf16", "f32"):
         raise ValueError("projection output is bf16 or f32")
     dtype = torch.bfloat16 if output == "bf16" else torch.float32
-    # Preserve fixed-M16 routes already shared by GLM Flash, MiMo and drafters.
-    native_shapes = native_attention_bf16_shapes() - {(6144, 512), (6144, 576), (8192, 4096), (8192, 2048)}
-    tiles = DECODE_TMA_TILES.get((n, k), ()) if (k, n) in native_shapes else ((16, 1, 4, 16, 64, 6),)
+    tiles = decode_tma_tiles(n, k) or ((16, 1, 4, 16, 64, 6),)
     launch = TmaBf16Projection(n, k, out_dtype=cutlass.BFloat16 if output == "bf16" else cutlass.Float32,
                                tiles_by_rows=tiles)
     return compile_program(launch, name="draft_bf16_projection", operands=(
