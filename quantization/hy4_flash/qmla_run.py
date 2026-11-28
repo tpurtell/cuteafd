@@ -44,7 +44,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from qmla.capture import CapturedLayerBank, SPLIT_NAMES, layer_memory_bytes, load_layer_capture, save_layer_capture, split_train_val_test
+from qmla.capture import CapturedLayerBank, SPLIT_NAMES, AttentionInput, AttentionReplay, LayerCaptureWriter, group_token_records, layer_memory_bytes, load_layer_capture, split_train_val_test
 from qmla.fit import FitConfig
 from qmla.long_eval import (
     LongContextEvaluator,
@@ -109,6 +109,20 @@ def _routed_forward(model, layer, inputs):
     return routed
 
 
+def hy4_replay(adapter, reader):
+    def load(lid):
+        layer = adapter.model.load_layer(lid)
+        return layer, adapter.layer_params(layer).to(reader.device)
+
+    @torch.no_grad()
+    def replay(layer, params, row):
+        seq, _, _ = adapter.capture_sequence(row.hidden.to(reader.device, dtype=torch.float32), layer,
+            seq_id=row.seq_id, positions=row.positions, allowed_override=None if row.allowed_mask is None else row.allowed_mask.to(reader.device),
+            capture_device=reader.device)
+        return seq
+    return AttentionReplay(load, replay)
+
+
 @torch.no_grad()
 def _stream_hy4_flash_captures(
     reader: hy4_forward.Reader,
@@ -127,9 +141,7 @@ def _stream_hy4_flash_captures(
     model = adapter.model
     max_layer = max(target_layers)
     target_set = set(target_layers)
-    embedding = reader.raw(hy4_forward.reference.OUTER_NAMES[0])
-
-    provenance = {**provenance, "splits": corpus_split_description(
+    provenance = {**provenance, "capture_input_precision": "bf16", "splits": corpus_split_description(
         token_records, train_count=train_count, val_count=val_count, test_count=test_count, seed=seed
     )}
     train_items, val_items, test_items = split_train_val_test(
@@ -137,46 +149,51 @@ def _stream_hy4_flash_captures(
         key_fn=lambda r: r[0], seed=seed,
     )
     active = [*train_items, *val_items, *test_items]
-    active = [(sid, tokens.to(reader.device)) for sid, tokens in active]
-    states = deque(model.initial(tokens, embedding=embedding) for _, tokens in active)
-    del embedding
-    for layer_idx in range(max_layer + 1):
-        started = time.monotonic()
-        layer = model.load_layer(layer_idx)
-        captures, mlp_args = [], deque()
-        for seq_id, tokens in active:
-            residual, attention_post, attn_in = model.attention_start(states.popleft(), tokens, layer)
-            if layer_idx in target_set:
-                cap, attn_out, _ = adapter.capture_sequence(attn_in, layer, seq_id=seq_id)
-                captures.append(cap)
-            else:
-                attn_out, _ = model.attention(attn_in, layer)
-            if layer_idx < max_layer:
-                mlp_args.append(model.mlp_start(residual, attention_post, attn_out, layer))
-            del residual, attention_post, attn_in, attn_out
-
-        if layer_idx in target_set:
-            bank = CapturedLayerBank(adapter.geometry_for(layer_idx), adapter.layer_params(layer),
-                                     tuple(captures[:train_count]),
-                                     tuple(captures[train_count:train_count + val_count]),
-                                     tuple(captures[train_count + val_count:]), provenance)
-            save_layer_capture(capture_dir, bank)
-            del bank, captures, cap
-        if mlp_args:
-            routed = [None] * len(mlp_args)
-            if model.config.mlp_layer_types[layer_idx] == "sparse":
-                routed = _routed_forward(model, layer, [args[2] for args in mlp_args])
-            for result in routed:
-                states.append(model.mlp_finish(*mlp_args.popleft(), layer, result))
-            del routed, result
-        del layer
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    groups = list(group_token_records([(i, tokens) for i, (_, tokens) in enumerate(active)], reader.device,
+                                     bytes_per_token=_hy4_long_eval_bytes_per_token(model.config)))
+    writers = {lid: LayerCaptureWriter(capture_dir, adapter.geometry_for(lid), provenance)
+               for lid in target_set}
+    for group_idx, group in enumerate(groups):
+        embedding = reader.raw(hy4_forward.reference.OUTER_NAMES[0])
+        states = deque(model.initial(tokens, embedding=embedding) for _, tokens in group)
+        del embedding
         reader.close()
-        if reader.device.type == "cuda":
-            torch.cuda.empty_cache()
-        print(json.dumps({"phase": "capture", "completed_layer": layer_idx,
-                          "seconds": time.monotonic() - started,
-                          "memory_bytes": layer_memory_bytes(reader.device)}), flush=True)
-    return {lid: load_layer_capture(capture_dir, lid) for lid in sorted(target_set)}
+        for layer_idx in range(max_layer + 1):
+            started = time.monotonic()
+            layer = model.load_layer(layer_idx)
+            writer = writers.get(layer_idx)
+            mlp_args = []
+            for row, tokens in group:
+                seq_id = active[row][0]
+                residual, attention_post, attn_in = model.attention_start(states.popleft(), tokens.to(reader.device), layer)
+                if writer is not None:
+                    cap, attn_out, _ = adapter.capture_sequence(attn_in, layer, seq_id=seq_id)
+                    writer.append(AttentionInput(seq_id, attn_in, cap.positions, cap.allowed_mask))
+                    del cap
+                else:
+                    attn_out, _ = model.attention(attn_in, layer)
+                if layer_idx < max_layer:
+                    mlp_args.append(model.mlp_start(residual, attention_post, attn_out, layer))
+                del residual, attention_post, attn_in, attn_out
+            if mlp_args:
+                routed = [None] * len(mlp_args)
+                if model.config.mlp_layer_types[layer_idx] == "sparse":
+                    routed = _routed_forward(model, layer, [args[2] for args in mlp_args])
+                for args, result in zip(mlp_args, routed, strict=True):
+                    states.append(model.mlp_finish(*args, layer, result))
+                del routed, result, args
+            del mlp_args, layer
+            reader.close()
+            if reader.device.type == "cuda":
+                torch.cuda.empty_cache()
+            print(json.dumps({"phase": "capture", "group": group_idx+1, "groups": len(groups),
+                              "completed_layer": layer_idx, "seconds": time.monotonic() - started,
+                              "memory_bytes": layer_memory_bytes(reader.device)}), flush=True)
+    for writer in writers.values():
+        writer.finish()
+    replay = hy4_replay(adapter, reader)
+    return {lid: load_layer_capture(capture_dir, lid, replay) for lid in sorted(target_set)}
 
 
 @torch.no_grad()
@@ -414,7 +431,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     split_counts = resolve_split_counts(resolved, len(all_records)) if all_records is not None else {
         f"{name}_count": resolved[f"{name}_sequences"] for name in SPLIT_NAMES}
     if args.reuse_captures is not None:
-        banks = {lid: load_layer_capture(capture_dir, lid) for lid in resolved["layers"]}
+        replay = hy4_replay(adapter, reader)
+        banks = {lid: load_layer_capture(capture_dir, lid, replay) for lid in resolved["layers"]}
         corpus_provenance = check_reused_captures(
             banks, resolved, forward_identity, seed=args.seed,
             expected_splits=None if all_records is None else corpus_split_description(

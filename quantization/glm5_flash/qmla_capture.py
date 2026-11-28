@@ -168,6 +168,22 @@ class Glm5FlashCaptureAdapter(QmlaCaptureAdapter):
         seq.validate(geom)
         return seq
 
+    @torch.no_grad()
+    def replay_input(self, layer, params, row):
+        from dataclasses import replace
+        from qmla.capture import eval_attention_output
+        dev = layer.q_a_proj.weight.device
+        x = row.hidden.to(device=dev, dtype=layer.q_a_proj.weight.dtype).unsqueeze(0)
+        raw = layer.kv_a_proj_with_mqa(x)[0]
+        query = layer.q_b_proj(layer.q_a_layernorm(layer.q_a_proj(x)))
+        geom = self.geometry_for(layer.layer_idx)
+        u = unit_rms_norm(raw, geom.rms_norm_eps).to(raw.dtype).float()
+        seq = CapturedSequence(row.seq_id, row.positions.to(dev), u,
+                               query.reshape(row.seq_len, geom.heads, geom.qk_nope_dim).float(),
+                               None, None, row.allowed_mask.to(dev), None,
+                               torch.empty((row.seq_len, x.shape[-1]), device=dev))
+        return replace(seq, ref_output=eval_attention_output(seq, params.to(dev), geom))
+
     @contextmanager
     def capture_hook(self, layer, *, seq_id, positions=None, compact_mask=False):
         """Observe one real decoder invocation; projection hooks leave its output untouched."""

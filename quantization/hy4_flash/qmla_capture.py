@@ -142,6 +142,7 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
         capture_tap: bool = False,
         compact_mask: bool = False,
         capture_device: torch.device | str = "cpu",
+        allowed_override: torch.Tensor | None = None,
     ) -> tuple[CapturedSequence, torch.Tensor, hy4_forward.AttentionTap | None]:
         """Run exact Hy4-flash attention and capture mode-agnostic MLA tensors.
 
@@ -198,7 +199,7 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
         sink = w[p + "learnable_sink_param"]
 
         # Stage 3: exact causal / SWA / compressed-indexer DSA mask and attention (128-row tiles).
-        indexed = kind == reference.SPARSE and seq_len > c.compressed_indexer_candidate_topk
+        indexed = allowed_override is None and kind == reference.SPARSE and seq_len > c.compressed_indexer_candidate_topk
         if indexed:
             rope_arg = positions if positions.ndim == 2 else None
             iq, ik, iw = reference.index_projections(inputs, q_norm, w, c, slot_pos, base, rope_arg)
@@ -229,6 +230,10 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
             allowed = (distance >= 0) & (key_id < stop)
             if kind == reference.SLIDING:
                 allowed &= distance < c.sliding_window
+            elif allowed_override is not None:
+                allowed &= F.pad(allowed_override[start:stop, first_key:stop], (0, kv_pad, 0, q_pad))
+                if full_mask is not None:
+                    full_mask[start:stop, :stop] = allowed[:stop-start, :stop]
             elif indexed:
                 current_group = slot_pos[start:stop] // ratio
                 groups = reference.recall_groups(

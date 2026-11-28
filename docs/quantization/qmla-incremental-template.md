@@ -44,10 +44,10 @@ Before capturing any activation:
 
 ## 2. Calibration corpus (pinned panel revision + fixed known component set, never Standard Fidelity)
 `quantization/panel_corpus.py` owns the panel pin, component order, renderer and loader (`brief-template.md` §3). QMLA resolves the panel through `panel_corpus.resolve_panel_policy` (full = not `--pilot`) and never pins its own revision. Never use the held-out Standard Fidelity panel.
-1. **Fitting corpus: `wrldsuksgo2mars/agentic-quant-panel-v3@e3ac6ee6126f469e37ddf879a6cb2dccc10c6c99`, the two base components in order:**
+1. **Fitting corpus: `wrldsuksgo2mars/agentic-quant-panel-v3@e3ac6ee6126f469e37ddf879a6cb2dccc10c6c99`, all three calibration components in order:**
    - `agentic`: rendered with **this checkpoint's own** tokenizer and chat template.
    - `exl3_standard`: packed with this checkpoint's tokenizer (`exl3-standard-pack-v1`).
-   - **`long_context` is not fitted on.** Its full-length 16K/32K records are the separate `--long-eval` set (section 5), so fitting and long-context evaluation never share data.
+   - `long_context`: calibration records windowed to 2,048 tokens; heldout full-length records form the separate `--long-eval` set (section 5).
    - `--corpus-dir` is a `panel_corpus.prepare_panel_corpus` output (`python quantization/panel_corpus.py ...`), loaded and verified through `panel_corpus.load_component_records`.
 2. **Pilot:** `--pilot` may pass a subset with `--components` (always including `agentic` and `exl3_standard`).
 3. **Past runs:** `wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7` (two components) stays pinned for frozen reproductions via `--panel-revision 54683731eb01c7c2fa5b801a0888e029a0e1b1c7`.
@@ -104,14 +104,15 @@ MIMALLOC_PURGE_DELAY=0 PYTHONPATH="$PWD/quantization:$PWD/third_party/transforme
   --long-eval
 ```
 - **Pure-NoPE models (e.g., GLM 5.3 Flash):** pass `--modes 8:0,4:0,2:0`. Any `R > 0` mode is omitted and recorded under `unsupported_modes_reason`.
-- **Recovery & I/O (`brief-template.md` §7):** Layer captures (`captures/layer-XXXX.{safetensors,json}`) and per-layer candidate checkpoints (`fit-checkpoints/*.{safetensors,json}`) are written sequentially with streamed XXH3-128 receipts bound to the frozen config/source/corpus identity so a crash resumes automatically on restart without manual intervention.
+- **Input replay:** Capture schema v3 keeps BF16-rounded MLA inputs and exact packed DSA selections; the pinned checkpoint supplies MLA weights, and replay recomputes projected operands and reference output without the indexer. Hy4 rounds the attention input once before replay; the original decoder trajectory is unchanged. Long-eval headlines use heldout records only; calibration full-length scores overlap the fitting corpus.
+- **Recovery & I/O (`brief-template.md` §7):** Layer input captures (`captures/layer-XXXX.json` and one BF16 hidden/packed DSA mask/position safetensors per sequence) and per-layer candidate checkpoints (`fit-checkpoints/*.{safetensors,json}`) are written sequentially with streamed XXH3-128 receipts bound to the frozen config/source/corpus identity so a crash resumes automatically on restart without manual intervention.
 
 ---
 
 ### Capture, fitting and validation contract (both templates)
 - **Primary forward.** Load the pinned MC checkpoint’s `original` view through the MC runtime. Use the core and all experts from that view. The upstream BF16 repo in `cuteafd-mc.json["source"]` is provenance only. For a plain checkpoint, load its own weights. Record the source revision and view. Use this forward’s own `0:0` outputs as the reference for fitting, validation and test.
 - **Content coordinates:** fit and quantize the checkpoint's native weighted cache latent $c$ ($c=\mathrm{BF16}(u\Gamma)$ at a BF16 output boundary). Use $z_C=c R_C S_C$ (or $c \odot s_C$ for `scale_only`, or $c$ for `identity`) on writes and the matching inverse in consumers, including target-sharing drafters. Every view applies the transform after weighted RMSNorm.
-- **Three disjoint splits:** `train` fits, `val` selects fit steps and per-width transforms, `test` produces every reported short-context number. A full run splits **all** base-component rows **60 / 30 / 10** (`FULL_SPLIT_FRACTIONS`; about 1,005 / 502 / 169 rows on the v3 panel); a pilot uses 16 / 4 / 4. Split IDs and hashes are recorded in provenance and the fit identity.
+- **Three disjoint splits:** `train` fits, `val` selects fit steps and per-width transforms, `test` produces every reported short-context number. A full run splits **all** calibration rows **60 / 30 / 10** (`FULL_SPLIT_FRACTIONS`; about 1,076 / 538 / 180 rows on the v3 panel); a pilot uses 16 / 4 / 4. Split IDs and hashes are recorded in provenance and the fit identity.
 - On PyTorch builds with mimalloc, set `MIMALLOC_PURGE_DELAY=0` before the Python process starts so freeing a capture returns its anonymous pages to the OS. With Docker, pass `-e MIMALLOC_PURGE_DELAY=0` to the container. Log `qmla.capture.layer_memory_bytes(device)` after releasing each layer. On GB10, use `system_total - system_available` to track unified memory pressure alongside process RSS and CUDA allocations.
 - **Capture once:** capture each sequence once on the MC `original` view and reuse its activations across every bit width.
 - **Fitting budget & candidate persistence (kept during the run, deleted after publish):**

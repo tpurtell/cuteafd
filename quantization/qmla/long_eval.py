@@ -277,6 +277,7 @@ class LongContextEvaluator:
         self.buckets = tuple(buckets)
         self._layer_stats: dict[str, dict[int, dict[str, _BucketAcc]]] = {}
         self._split_stats: dict[str, dict[str, dict[str, _BucketAcc]]] = {}
+        self._heldout_layer_stats: dict[str, dict[int, dict[str, _BucketAcc]]] = {}
         self._sparse_layers: set[int] = set()
         self._layers_seen: set[int] = set()
         self._scorer_layer_id: int | None = None
@@ -326,9 +327,12 @@ class LongContextEvaluator:
                 n = int(mask.sum().item())
                 if n:
                     vals = (n, float(s_err[mask].sum().item()), float(r_err[mask].sum().item()), float(h_err[mask].sum().item()))
-                    for tgt in (lb.setdefault(bname, _BucketAcc()), lb.setdefault("__all__", _BucketAcc()),
-                                sb.setdefault(bname, _BucketAcc()), sb.setdefault("__all__", _BucketAcc())):
-                        tgt.add(*vals)
+                    targets = [lb, sb]
+                    if split == "heldout":
+                        targets.append(self._heldout_layer_stats.setdefault(mkey, {}).setdefault(lid, {}))
+                    for tgt in targets:
+                        tgt.setdefault(bname, _BucketAcc()).add(*vals)
+                        tgt.setdefault("__all__", _BucketAcc()).add(*vals)
             del s_err, r_err, h_err
         seq_len = seq_dev.seq_len
         del seq_dev, bmasks
@@ -338,64 +342,37 @@ class LongContextEvaluator:
     def finalize(self, *, corpus_meta: Mapping[str, Any], transform_fingerprint: str,
                  wall_seconds: float, device: torch.device | str) -> dict[str, Any]:
         names = [n for n, _, _ in self.buckets]
-        combinations: dict[str, Any] = {}
-        for mkey, per_layer_raw in self._layer_stats.items():
-            overall, overall_b, per_layer_out = _BucketAcc(), {}, {}
-            for lid in sorted(per_layer_raw):
-                lb = per_layer_raw[lid]
-                a = lb["__all__"]
-                overall.add(a.tokens, a.shipped, a.rtn, a.hadamard)
-                row = {**a.summary(), "by_position_bucket": {}}
-                for bname in names:
-                    if bname in lb:
-                        b = lb[bname]
-                        row["by_position_bucket"][bname] = b.summary()
-                        overall_b.setdefault(bname, _BucketAcc()).add(b.tokens, b.shipped, b.rtn, b.hadamard)
-                per_layer_out[str(lid)] = row
-
-            by_split_out = {
+        combinations = self._summarize_layers(self._layer_stats, names)
+        heldout = self._summarize_layers(self._heldout_layer_stats, names)
+        for mkey, summary in combinations.items():
+            summary["by_split"] = {
                 sp: {**{k: v for k, v in sb["__all__"].summary().items() if k != "tokens"},
-                     "layer_tokens": sb["__all__"].tokens,
-                     "by_position_bucket": {b: sb[b].summary() for b in names if b in sb}}
+                     "layer_tokens": sb["__all__"].tokens, "overlaps_fit_data": sp == "calibration",
+                     "by_position_bucket": {b: {**sb[b].summary(), "overlaps_fit_data": sp == "calibration"}
+                                            for b in names if b in sb}}
                 for sp, sb in self._split_stats.get(mkey, {}).items() if "__all__" in sb
             }
-            summary = overall.summary()
-            summary["layer_tokens"] = summary.pop("tokens")
-            summary.update(
-                layers=len(per_layer_raw),
-                by_position_bucket={b: overall_b[b].summary() for b in names if b in overall_b},
-                by_split=by_split_out, per_layer=per_layer_out,
-            )
-            combinations[mkey] = summary
+            summary["overlaps_fit_data"] = "calibration" in summary["by_split"]
 
-        headline_overall = build_headline_table(
-            combinations,
-            self.profiles,
-            unsupported_reasons=self.unsupported_modes_reason,
-        )
+        headline_overall = build_headline_table(heldout, self.profiles, unsupported_reasons=self.unsupported_modes_reason)
         headline_by_bucket: dict[str, list[dict[str, Any]]] = {}
         for bname in names:
-            bucket_combos: dict[str, dict[str, Any]] = {}
-            for mkey, summary in combinations.items():
+            bucket_combos = {}
+            for mkey, summary in heldout.items():
                 if bname not in summary["by_position_bucket"]:
                     continue
                 b_overall = summary["by_position_bucket"][bname]
-                b_per_layer = {
-                    lid_s: lrow["by_position_bucket"][bname]
-                    for lid_s, lrow in summary["per_layer"].items()
-                    if bname in lrow["by_position_bucket"]
-                }
+                b_per_layer = {lid: row["by_position_bucket"][bname] for lid, row in summary["per_layer"].items()
+                               if bname in row["by_position_bucket"]}
                 bucket_combos[mkey] = {**b_overall, "layer_tokens": b_overall["tokens"], "per_layer": b_per_layer}
             if bucket_combos:
                 headline_by_bucket[bname] = build_headline_table(
-                    bucket_combos,
-                    self.profiles,
-                    unsupported_reasons=self.unsupported_modes_reason,
-                )
+                    bucket_combos, self.profiles, unsupported_reasons=self.unsupported_modes_reason)
 
         dev = torch.device(device)
         return {
             "schema": LONG_EVAL_SCHEMA,
+            "headline_split": "heldout",
             "headline_modes": list(HEADLINE_DEPLOYMENT_MODES),
             "headline_table": headline_overall,
             "headline_table_markdown": format_headline_table(headline_overall),
@@ -412,7 +389,35 @@ class LongContextEvaluator:
                 "sparse_layers": sorted(self._sparse_layers), "note": self.dsa_indexer_note,
             },
             "corpus": dict(corpus_meta), "layers_evaluated": sorted(self._layers_seen),
-            "combinations": combinations, "wall_seconds": float(wall_seconds),
+            "combinations": combinations, "heldout_combinations": heldout, "wall_seconds": float(wall_seconds),
             "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
             "process_peak_cuda_allocated_bytes": torch.cuda.max_memory_allocated(dev) if dev.type == "cuda" else None,
         }
+
+    @staticmethod
+    def _summarize_layers(stats, names):
+        combinations = {}
+        for mkey, per_layer_raw in stats.items():
+            overall, overall_b, per_layer_out = _BucketAcc(), {}, {}
+            for lid in sorted(per_layer_raw):
+                lb = per_layer_raw[lid]
+                a = lb["__all__"]
+                overall.add(a.tokens, a.shipped, a.rtn, a.hadamard)
+                row = {**a.summary(), "by_position_bucket": {}}
+                for bname in names:
+                    if bname in lb:
+                        b = lb[bname]
+                        row["by_position_bucket"][bname] = b.summary()
+                        overall_b.setdefault(bname, _BucketAcc()).add(b.tokens, b.shipped, b.rtn, b.hadamard)
+                per_layer_out[str(lid)] = row
+
+            summary = overall.summary()
+            summary["layer_tokens"] = summary.pop("tokens")
+            summary.update(
+                layers=len(per_layer_raw),
+                by_position_bucket={b: overall_b[b].summary() for b in names if b in overall_b},
+                per_layer=per_layer_out,
+            )
+            combinations[mkey] = summary
+
+        return combinations

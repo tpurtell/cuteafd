@@ -156,6 +156,7 @@ def _make_skewed_hy4_bank(
     val: int = 1,
     test: int = 1,
     shared_seed: int | None = None,
+    input_bank: bool = False,
 ):
     """Build a synthetic Hy4-flash layer with strong channel outliers (using repo generators only)."""
     g = torch.Generator().manual_seed(seed)
@@ -213,6 +214,8 @@ def _make_skewed_hy4_bank(
     inputs = [
         (f"seq_{i:02d}", torch.randn(base_seq_len + (i % 3), hidden, generator=gi), None) for i in range(seqs)
     ]
+    if input_bank:
+        inputs = [(sid, x.bfloat16().float(), pos) for sid, x, pos in inputs]
     bank = adapter.capture_layer(
         layer,
         inputs,
@@ -222,6 +225,8 @@ def _make_skewed_hy4_bank(
         seed=seed if shared_seed is None else shared_seed,
         provenance=_synthetic_panel_provenance(),
     )
+    if input_bank:
+        return config, model, layer, adapter, bank, {sid: x for sid, x, _ in inputs}
     return config, model, layer, adapter, bank
 
 
@@ -243,24 +248,20 @@ def test_panel_resolution_via_panel_corpus_defaults_to_v3_three_components():
 
     parser = build_parser()
     base = ["--checkpoint", "/x", "--source-revision", "a" * 40, "--output", "/y"]
-    # QMLA fits on the base components in every run; long_context is --long-eval only.
+    # A full run requires all components.
     full = resolve_run_settings(parser.parse_args(base), (0, 1))
-    assert (full["panel_revision"], full["components"], full["full"]) == (V3.revision, QMLA_BASE_COMPONENTS, True)
-    explicit = resolve_run_settings(parser.parse_args(base + ["--components", "agentic,exl3_standard"]), (0, 1))
-    assert explicit["components"] == QMLA_BASE_COMPONENTS
+    assert (full["panel_revision"], full["components"], full["full"]) == (V3.revision, QMLA_KNOWN_COMPONENTS, True)
+    with pytest.raises(ValueError, match="full calibration"):
+        resolve_run_settings(parser.parse_args(base + ["--components", "agentic,exl3_standard"]), (0, 1))
     pilot = resolve_run_settings(parser.parse_args(base + ["--pilot", "--components", "agentic,exl3_standard"]), (0, 1))
     assert (pilot["components"], pilot["full"]) == (QMLA_BASE_COMPONENTS, False)
 
 
 def test_load_pinned_qmla_corpus_from_real_v3_and_v2_panels(tmp_path: Path):
-    """Fitting loads the base components of a full v3 corpus; long_context windows load only on request."""
+    """Fitting loads all three components of the calibration split."""
     prep3 = _prepare_hy4f(tmp_path / "v3", V3)
     manifest = json.loads((prep3 / "manifest.json").read_text())
-    base, base_prov = load_pinned_qmla_corpus(prep3, full=True)
-    assert list(base_prov["components"]) == list(QMLA_BASE_COMPONENTS)
-    assert not any(sid.startswith("lc-") for sid, _ in base)
-    assert len(base) == sum(manifest["components"][c]["count"] for c in QMLA_BASE_COMPONENTS)
-    recs, prov = load_pinned_qmla_corpus(prep3, components=QMLA_KNOWN_COMPONENTS)
+    recs, prov = load_pinned_qmla_corpus(prep3, full=True)
     assert (prov["dataset_repo"], prov["dataset_revision"]) == (V3.repo_id, V3.revision)
     assert list(prov["components"]) == list(QMLA_KNOWN_COMPONENTS)
     for comp in QMLA_KNOWN_COMPONENTS:
@@ -493,8 +494,8 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
     assert resolved["modes"] == tuple(parse_qmla_mode(m) for m in DEFAULT_FULL_MODES)
     assert len(resolved["modes"]) == 9
     assert resolved["panel_revision"] == V3.revision
-    # QMLA fits on the base components; long_context feeds --long-eval only.
-    assert resolved["components"] == QMLA_BASE_COMPONENTS
+    # Full calibration includes windowed long_context.
+    assert resolved["components"] == QMLA_KNOWN_COMPONENTS
     assert resolved["protection"] == "sink4_local128"
     assert (resolved["train_sequences"], resolved["val_sequences"], resolved["test_sequences"]) == (16, 4, 4)
     full = resolve_run_settings(
@@ -502,15 +503,15 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
         (0, 1, 5),
     )
     assert (full["train_sequences"], full["val_sequences"], full["test_sequences"]) == (None, None, None)
-    assert full["components"] == QMLA_BASE_COMPONENTS
-    # 60/30/10 of the base-component rows, test taking the remainder.
-    assert resolve_split_counts(full, 1676) == {"train_count": 1005, "val_count": 502, "test_count": 169}
-    assert resolve_split_counts(resolved, 1676) == {"train_count": 16, "val_count": 4, "test_count": 4}
+    assert full["components"] == QMLA_KNOWN_COMPONENTS
+    # 60/30/10 of the calibration rows, test taking the remainder.
+    assert resolve_split_counts(full, 1794) == {"train_count": 1076, "val_count": 538, "test_count": 180}
+    assert resolve_split_counts(resolved, 1794) == {"train_count": 16, "val_count": 4, "test_count": 4}
     with pytest.raises(ValueError, match="do not fit"):
         resolve_split_counts(full, 3)
     partial = {**full, "train_sequences": 10}
     with pytest.raises(ValueError, match="or none"):
-        resolve_split_counts(partial, 1676)
+        resolve_split_counts(partial, 1794)
     assert parse_layers_arg("all-dsa", (0, 1, 5)) == (0, 1, 5)
     assert parse_modes_arg("4:4,2:4,4:0") == ((4, 4), (2, 4), (4, 0))
 
@@ -1369,3 +1370,41 @@ def test_headline_table_per_layer_spread_and_pure_nope_na_rows(tmp_path: Path):
         assert f"| `{mode}` | n/a | n/a | n/a | n/a | n/a (" in report["headline_table_markdown"]
 
     assert HEADLINE_TABLE_CAPTION in report["headline_table_markdown"]
+
+
+@pytest.mark.parametrize("device", ["cpu"] + (["cuda"] if torch.cuda.is_available() else []))
+def test_streamed_fit_and_selection_are_bit_exact(tmp_path, monkeypatch, device):
+    from qmla import fit, measurement
+    from qmla.capture import load_layer_capture
+    from test_qmla_capture import _save_input_bank
+    _, _, layer, adapter, bank, inputs = _make_skewed_hy4_bank(91, seqs=8, val=2, test=2, input_bank=True)
+    # Recompute on the same device as the resident fit.
+    layer = Layer(layer.index, layer.prefix, {k: v.to(device) for k, v in layer.weights.items()})
+    replay = _save_input_bank(tmp_path, bank, adapter, layer, inputs)
+    disk_bank = load_layer_capture(tmp_path, bank.geometry.layer_id, replay)
+    from qmla.capture import CapturedLayerBank
+    bank = CapturedLayerBank(disk_bank.geometry, disk_bank.params, *(tuple(disk_bank.split(n)) for n in ("train", "val", "test")), disk_bank.provenance)
+    config = FitConfig(steps=3, val_every=1, batch_size=2, protection="none")
+    modes = ((4, 0), (0, 4), (4, 4))
+
+    def run(source, budget):
+        monkeypatch.setattr(fit, "split_residency_budget", lambda _: budget)
+        monkeypatch.setattr(measurement, "split_residency_budget", lambda _: budget)
+        c = fit_content_layer(source, 4, config, device=device)
+        r = fit_rope_layer(source, 4, config, device=device)
+        candidates = measurement.layer_candidates(source, {4: c}, {4: r}, config)
+        val = measurement.measure_candidates(source, candidates, modes, config, device, split="val")
+        test = measurement.measure_candidates(source, candidates, modes, config, device, split="test")
+        return c, r, val, test, measurement.select_per_width(val, candidates, source.geometry)
+
+    resident = run(bank, 1 << 60)
+    streamed = run(disk_bank, 0)
+    from dataclasses import fields
+    for a, b in zip(resident[:2], streamed[:2], strict=True):
+        for field in fields(a):
+            x, y = getattr(a, field.name), getattr(b, field.name)
+            if isinstance(x, torch.Tensor):
+                assert torch.equal(x.contiguous().view(torch.uint8), y.contiguous().view(torch.uint8)), field.name
+            else:
+                assert x == y, field.name
+    assert resident[2:] == streamed[2:]

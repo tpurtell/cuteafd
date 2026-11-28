@@ -9,7 +9,7 @@ import time
 
 import torch
 
-from qmla.capture import (CapturedLayerBank, SPLIT_NAMES, load_layer_capture, save_layer_capture,
+from qmla.capture import (CapturedLayerBank, SPLIT_NAMES, AttentionInput, AttentionReplay, LayerCaptureWriter, group_token_records, layer_memory_bytes, load_layer_capture,
                           split_train_val_test)
 from qmla.fit import FitConfig
 from qmla.long_eval import (
@@ -68,7 +68,7 @@ def read_identities(checkpoint, args):
 
 
 @torch.no_grad()
-def stream_layers(source, adapter, layers, records, device, *, long_eval=None, phase="capture"):
+def stream_layers(source, adapter, layers, records, device, *, long_eval=None, capture_writers=None, phase="capture"):
     """Walk the native decoder layer-major. Only one sequence's recurrence is on the device.
 
     Yields one capture bank's inputs at a time. During long eval score each row immediately
@@ -102,8 +102,10 @@ def stream_layers(source, adapter, layers, records, device, *, long_eval=None, p
                 normalized = native.attention_inputs(block, state)
                 seq, output = adapter.capture_sequence(normalized, block.self_attn, seq_id=seq_id,
                                                        compact_mask=long_eval is not None)
-                if long_eval is None:
-                    captured.append(seq.to("cpu"))
+                if capture_writers is not None:
+                    capture_writers[index].append(AttentionInput(seq_id, normalized.reshape(seq.seq_len, -1), seq.positions, seq.allowed_mask))
+                elif long_eval is None:
+                    raise ValueError("capture requires a streaming writer")
                 else:
                     evaluator, splits = long_eval
                     evaluator.evaluate_layer_sequence(seq, params, geometry, split=splits[seq_id], device=device)
@@ -126,20 +128,32 @@ def stream_layers(source, adapter, layers, records, device, *, long_eval=None, p
                               seconds=time.monotonic() - started)), flush=True)
 
 
+def glm_replay(source, adapter, device):
+    def load(lid):
+        attn = source.load_block(lid, device, include_experts=False).self_attn
+        return attn, adapter.layer_params(attn).to(device)
+    return AttentionReplay(load, adapter.replay_input)
+
+
+@torch.no_grad()
 def capture_banks(source, adapter, records, settings, capture_dir, provenance, seed, device):
     counts = resolve_split_counts(settings, len(records))
     parts = split_train_val_test(records, **counts, key_fn=lambda row: row[0], seed=seed)
-    provenance = {**provenance, "splits": corpus_split_description(records, seed=seed, **counts)}
-    train_n, val_n = len(parts[0]), len(parts[1])
-    banks = {}
-    for idx, params, caps in stream_layers(source, adapter, settings["layers"], sum(parts, []), device):
-        bank = CapturedLayerBank(adapter.geometry_for(idx), params.to("cpu"), tuple(caps[:train_n]),
-                                 tuple(caps[train_n:train_n + val_n]), tuple(caps[train_n + val_n:]), provenance)
-        save_layer_capture(capture_dir, bank)
-        caps.clear()
-        del bank
-        banks[idx] = load_layer_capture(capture_dir, idx)
-    return banks
+    provenance = {**provenance, "capture_input_precision": "bf16", "splits": corpus_split_description(records, seed=seed, **counts)}
+    records = sum(parts, [])
+    layers = settings["layers"]
+    writers = {lid: LayerCaptureWriter(capture_dir, adapter.geometry_for(lid), provenance) for lid in layers}
+    groups = list(group_token_records(records, "cpu", bytes_per_token=4 * source.config["hc_mult"] * source.config["hidden_size"] * 4))
+    for group_idx, group in enumerate(groups):
+        for index, _, _ in stream_layers(source, adapter, layers, group, device,
+                                         capture_writers=writers, phase="capture"):
+            pass
+        print(json.dumps(dict(phase="capture_group", group=group_idx+1, groups=len(groups),
+                              memory_bytes=layer_memory_bytes(device))), flush=True)
+    for writer in writers.values():
+        writer.finish()
+    replay = glm_replay(source, adapter, device)
+    return {idx: load_layer_capture(capture_dir, idx, replay) for idx in settings["layers"]}
 
 
 def run_evaluation(source, adapter, sidecar_path, records, corpus_meta, *, expected_source, device,
@@ -227,7 +241,8 @@ def main(argv=None):
     records, prov = load_pinned_qmla_corpus(args.corpus_dir, panel_revision=settings["panel_revision"],
                                             components=settings["components"], full=settings["full"])
     if args.reuse_captures:
-        banks = {lid: load_layer_capture(args.reuse_captures, lid) for lid in settings["layers"]}
+        replay = glm_replay(source, adapter, args.device)
+        banks = {lid: load_layer_capture(args.reuse_captures, lid, replay) for lid in settings["layers"]}
         counts = resolve_split_counts(settings, len(records))
         prov = check_reused_captures(banks, settings, capture_identity, seed=args.seed,
                                      expected_splits=corpus_split_description(records, seed=args.seed, **counts))

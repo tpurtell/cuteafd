@@ -8,7 +8,7 @@ remain completely family-agnostic.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 import hashlib
 import json
 import math
@@ -29,7 +29,7 @@ if str(REFERENCE) not in sys.path:
 from families.hy4_common import tiled_sink_attention
 from shape_invariant import ROWS, linear
 
-CAPTURE_SCHEMA = "cuteafd-qmla-capture-v2"
+CAPTURE_SCHEMA = "cuteafd-qmla-capture-v3"
 SPLIT_SALT = "cuteafd-qmla-split-v2"
 SPLIT_NAMES = ("train", "val", "test")
 VALID_ATTENTION_KINDS = frozenset({"dsa", "swa", "full"})
@@ -91,6 +91,67 @@ def layer_memory_bytes(device: torch.device | str) -> dict[str, int]:
                       cuda_reserved=torch.cuda.memory_reserved(dev),
                       cuda_peak_allocated=torch.cuda.max_memory_allocated(dev))
     return result
+
+
+def available_device_memory_bytes(device: torch.device | str) -> int | None:
+    """Unified memory uses reclaimable host memory, discrete CUDA uses free VRAM."""
+    dev = torch.device(device)
+    mem = layer_memory_bytes("cpu")
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return mem.get("system_available")
+    props = torch.cuda.get_device_properties(dev)
+    if getattr(props, "is_integrated", False) or (props.major, props.minor) == (12, 1):
+        return mem.get("system_available")
+    return int(torch.cuda.mem_get_info(dev)[0])
+
+
+def group_token_records(records, device, *, bytes_per_token, reserve_bytes=32 * 1024**3):
+    """Token-budgeted consecutive groups; an oversized singleton is never split."""
+    available = available_device_memory_bytes(device) or 0
+    budget = max(1, (available - reserve_bytes) // (5 * bytes_per_token))
+    group, tokens = [], 0
+    for record in records:
+        count = record[1].numel()
+        if group and tokens + count > budget:
+            yield group
+            group, tokens = [], 0
+        group.append(record)
+        tokens += count
+    if group:
+        yield group
+
+
+class DeviceSplit(Sequence):
+    """Reiterable split, either cached as a whole or transferred one row at a time."""
+
+    def __init__(self, seqs, device, *, budget_bytes=0):
+        self.device = torch.device(device)
+        self.source = seqs
+        self.resident = None
+        if isinstance(seqs, _MappedSplit):
+            size = seqs.device_bytes
+            self.tokens = sum(row["seq_len"] for row in seqs.rows)
+        else:
+            size = sum(t.numel() * t.element_size() for seq in seqs for f in fields(seq)
+                       if isinstance(t := getattr(seq, f.name), torch.Tensor))
+            self.tokens = sum(seq.seq_len for seq in seqs)
+        if size <= budget_bytes:
+            self.resident = tuple(seq.to(device) for seq in seqs)
+
+    def __len__(self):
+        return len(self.source)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self[i] for i in range(*index.indices(len(self))))
+        return self.resident[index] if self.resident is not None else self.source[index].to(self.device)
+
+
+def split_residency_budget(device):
+    # Leave capacity for per-sequence workspaces, temporary compensated weights,
+    # training batches and (on GB10) reclaimable capture file cache.
+    available = available_device_memory_bytes(device) or 0
+    return max(0, (available - 32 * 1024**3) // 2)
 
 
 def unit_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
@@ -456,12 +517,12 @@ class CapturedLayerBank:
 
     geometry: MlaLayerGeometry
     params: CapturedLayerParams
-    train: tuple[CapturedSequence, ...]
-    val: tuple[CapturedSequence, ...]
-    test: tuple[CapturedSequence, ...]
+    train: Sequence[CapturedSequence]
+    val: Sequence[CapturedSequence]
+    test: Sequence[CapturedSequence]
     provenance: dict[str, Any]
 
-    def split(self, name: str) -> tuple[CapturedSequence, ...]:
+    def split(self, name: str) -> Sequence[CapturedSequence]:
         if name not in SPLIT_NAMES:
             raise ValueError(f"unknown split {name!r}")
         return getattr(self, name)
@@ -876,123 +937,152 @@ def _read_safetensors_verified(path: Path, expected_bytes: int, expected_xxh3: s
     return _mapped_tensors(_verified_mapping(path, expected_bytes, expected_xxh3))
 
 
-def save_layer_capture(directory: Path | str, bank: CapturedLayerBank) -> dict[str, Any]:
-    """Persist one CapturedLayerBank sequentially with streamed XXH3-128 receipt."""
-    bank.validate()
+@dataclass(frozen=True)
+class AttentionInput:
+    seq_id: str
+    hidden: torch.Tensor
+    positions: torch.Tensor
+    allowed_mask: torch.Tensor | None
+
+    @property
+    def seq_len(self):
+        return self.hidden.shape[0]
+
+
+class LayerCaptureWriter:
+    """Persist BF16 hidden inputs and exact DSA mask metadata, one row at a time."""
+
+    def __init__(self, directory, geometry, provenance):
+        self.directory = Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.geometry = geometry
+        self.provenance = provenance
+        self.stem = f"layer-{geometry.layer_id:04d}"
+        self.splits = {name: [] for name in SPLIT_NAMES}
+        description = check_split_description(provenance.get("splits"))
+        self.expected = [(name, sid) for name in SPLIT_NAMES for sid in description[name]["seq_ids"]]
+        self.count = 0
+
+    def append(self, row: AttentionInput):
+        if self.count >= len(self.expected) or row.seq_id != self.expected[self.count][1]:
+            raise ValueError(f"unexpected capture row {row.seq_id!r} at index {self.count}")
+        name, _ = self.expected[self.count]
+        tensors = {"hidden": row.hidden.detach().bfloat16(), "positions": row.positions.long()}
+        if row.allowed_mask is not None:
+            # Store exact selected token indices in packed bit rows (8x smaller than bool).
+            mask = row.allowed_mask
+            pad = (-mask.shape[-1]) % 8
+            bits = F.pad(mask, (0, pad)).reshape(mask.shape[0], -1, 8).to(torch.uint8)
+            tensors["mask_bits"] = (bits << torch.arange(8, device=bits.device, dtype=torch.uint8)).sum(-1).to(torch.uint8)
+        payload = _write_safetensors_streamed(self.directory / f"{self.stem}-{self.count:05d}.safetensors", tensors)
+        self.splits[name].append({"seq_id": row.seq_id, "seq_len": row.seq_len, "payload": payload})
+        self.count += 1
+
+    def finish(self):
+        if self.count != len(self.expected):
+            raise ValueError(f"incomplete layer capture: {self.count} != {len(self.expected)}")
+        manifest = {"schema": CAPTURE_SCHEMA, "geometry": self.geometry.to_dict(),
+                    "provenance": self.provenance, "splits": self.splits}
+        _atomic_json(self.directory / f"{self.stem}.json", manifest)
+        return manifest
+
+
+class AttentionReplay:
+    """One checkpoint-backed MLA layer at a time, shared across all capture banks."""
+
+    def __init__(self, load, replay):
+        self.load = load
+        self.replay_fn = replay
+        self.layer_id = None
+        self.layer = self.params = None
+
+    def get(self, layer_id):
+        if self.layer_id != layer_id:
+            self.layer = self.params = None
+            self.layer, self.params = self.load(layer_id)
+            self.layer_id = layer_id
+        return self.layer, self.params
+
+    def replay(self, layer_id, row):
+        layer, params = self.get(layer_id)
+        return self.replay_fn(layer, params, row)
+
+
+class _MappedSplit(Sequence[CapturedSequence]):
+    def __init__(self, directory, rows, geometry, replay):
+        self.directory, self.rows, self.geometry, self.replay = directory, rows, geometry, replay
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self[i] for i in range(*index.indices(len(self))))
+        row = self.rows[index]
+        payload = row["payload"]
+        path = self.directory / payload["file"]
+        with path.open("rb") as handle:
+            raw = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_COPY)
+        t = _mapped_tensors(raw)
+        if t["hidden"].dtype != torch.bfloat16 or t["hidden"].shape[0] != row["seq_len"]:
+            raise ValueError("invalid BF16 attention input")
+        mask = t.get("mask_bits")
+        if mask is not None:
+            mask = ((mask[..., None] >> torch.arange(8, dtype=torch.uint8)) & 1).bool().flatten(1)[:, :row["seq_len"]]
+        return self.replay.replay(self.geometry.layer_id, AttentionInput(row["seq_id"], t["hidden"], t["positions"], mask))
+
+    @property
+    def lengths(self):
+        return [row["seq_len"] for row in self.rows]
+
+    @property
+    def ids(self):
+        return [row["seq_id"] for row in self.rows]
+
+    @property
+    def device_bytes(self):
+        g = self.geometry
+        per_token = 4 * (g.kv_lora_rank + g.heads * (g.qk_nope_dim + g.qk_rope_dim + g.v_head_dim) + g.qk_rope_dim + 8192)
+        return sum(n * (per_token + n + 8) for n in self.lengths)
+
+
+class ReplayLayerBank:
+    def __init__(self, geometry, replay, splits, provenance):
+        self.geometry, self.replay, self.provenance = geometry, replay, provenance
+        self.train, self.val, self.test = splits
+
+    @property
+    def params(self):
+        return self.replay.get(self.geometry.layer_id)[1]
+
+    def split(self, name):
+        return getattr(self, name)
+
+    def validate(self):
+        self.geometry.validate()
+        check_split_description(self.provenance.get("splits"), {name: self.split(name).ids for name in SPLIT_NAMES})
+
+
+def split_lengths(seqs):
+    return seqs.lengths if isinstance(seqs, _MappedSplit) else [s.seq_len for s in seqs]
+
+
+def load_layer_capture(directory: Path | str, layer_id: int, replay: AttentionReplay):
+    """Verify every input receipt before constructing a lazy checkpoint-backed bank."""
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    tensors: dict[str, torch.Tensor] = {
-        "params.kv_norm_weight": bank.params.kv_norm_weight.float(),
-        "params.kv_b_weight": bank.params.kv_b_weight.float(),
-        "params.o_proj_weight": bank.params.o_proj_weight.float(),
-    }
-    if bank.params.sink is not None:
-        tensors["params.sink"] = bank.params.sink.float()
-    if bank.params.post_proj_norm_weight is not None:
-        tensors["params.post_proj_norm_weight"] = bank.params.post_proj_norm_weight.float()
-
-    split_meta: dict[str, list[dict[str, Any]]] = {}
-    for split_name in SPLIT_NAMES:
-        seqs = bank.split(split_name)
-        rows = []
-        for idx, seq in enumerate(seqs):
-            prefix = f"{split_name}.{idx:05d}."
-            tensors[prefix + "positions"] = seq.positions.to(torch.int64)
-            tensors[prefix + "u"] = seq.u.float()
-            tensors[prefix + "q_nope"] = seq.q_nope.float()
-            tensors[prefix + "ref_output"] = seq.ref_output.float()
-            if seq.q_rope is not None:
-                tensors[prefix + "q_rope"] = seq.q_rope.float()
-            if seq.k_rope is not None:
-                tensors[prefix + "k_rope"] = seq.k_rope.float()
-            if seq.allowed_mask is not None:
-                tensors[prefix + "allowed_mask"] = seq.allowed_mask.to(torch.bool)
-            if seq.gate is not None:
-                tensors[prefix + "gate"] = seq.gate.float()
-            rows.append({
-                "index": idx,
-                "seq_id": seq.seq_id,
-                "seq_len": seq.seq_len,
-                "has_mask": seq.allowed_mask is not None,
-                "has_gate": seq.gate is not None,
-            })
-        split_meta[split_name] = rows
-
-    stem = f"layer-{bank.geometry.layer_id:04d}"
-    payload_receipt = _write_safetensors_streamed(directory / f"{stem}.safetensors", tensors)
-    manifest = {
-        "schema": CAPTURE_SCHEMA,
-        "geometry": bank.geometry.to_dict(),
-        "provenance": bank.provenance,
-        "attention_arithmetic": bank.params.attention_arithmetic,
-        "has_sink": bank.params.sink is not None,
-        "has_post_proj_norm": bank.params.post_proj_norm_weight is not None,
-        "splits": split_meta,
-        "payload": payload_receipt,
-    }
-    _atomic_json(directory / f"{stem}.json", manifest)
-    return manifest
-
-
-def load_layer_capture(directory: Path | str, layer_id: int) -> CapturedLayerBank:
-    """Reload and verify one CapturedLayerBank against its XXH3-128 receipt."""
-    directory = Path(directory)
-    stem = f"layer-{layer_id:04d}"
-    manifest = json.loads((directory / f"{stem}.json").read_text(encoding="utf-8"))
+    manifest = json.loads((directory / f"layer-{layer_id:04d}.json").read_text(encoding="utf-8"))
     if manifest.get("schema") != CAPTURE_SCHEMA:
-        raise ValueError(
-            f"unsupported capture schema: {manifest.get('schema')!r} (expected {CAPTURE_SCHEMA!r}); "
-            "recapture under the three-way train/val/test split"
-        )
+        raise ValueError(f"unsupported capture schema: {manifest.get('schema')!r}; recapture")
     geometry = MlaLayerGeometry.from_dict(manifest["geometry"])
     if geometry.layer_id != layer_id:
         raise ValueError(f"capture layer_id {geometry.layer_id} != requested {layer_id}")
-    payload = manifest["payload"]
-    raw = _verified_mapping(
-        directory / payload["file"], int(payload["bytes"]), str(payload["xxh3_128"])
-    )
-    tensors = _mapped_tensors(raw)
-    params = CapturedLayerParams(
-        attention_arithmetic=manifest.get("attention_arithmetic", "f32_tiled"),
-        kv_norm_weight=tensors["params.kv_norm_weight"],
-        kv_b_weight=tensors["params.kv_b_weight"],
-        o_proj_weight=tensors["params.o_proj_weight"],
-        sink=tensors["params.sink"] if manifest["has_sink"] else None,
-        post_proj_norm_weight=tensors["params.post_proj_norm_weight"] if manifest["has_post_proj_norm"] else None,
-    )
-    loaded: dict[str, tuple[CapturedSequence, ...]] = {}
-    for split_name in SPLIT_NAMES:
-        seqs = []
-        for row in manifest["splits"][split_name]:
-            prefix = f"{split_name}.{int(row['index']):05d}."
-            seqs.append(
-                CapturedSequence(
-                    seq_id=str(row["seq_id"]),
-                    positions=tensors[prefix + "positions"],
-                    u=tensors[prefix + "u"],
-                    q_nope=tensors[prefix + "q_nope"],
-                    q_rope=tensors.get(prefix + "q_rope"),
-                    k_rope=tensors.get(prefix + "k_rope"),
-                    allowed_mask=tensors[prefix + "allowed_mask"] if row["has_mask"] else None,
-                    gate=tensors[prefix + "gate"] if row["has_gate"] else None,
-                    ref_output=tensors[prefix + "ref_output"],
-                )
-            )
-        loaded[split_name] = tuple(seqs)
-
-    bank = CapturedLayerBank(
-        geometry=geometry,
-        params=params,
-        train=loaded["train"],
-        val=loaded["val"],
-        test=loaded["test"],
-        provenance=dict(manifest.get("provenance", {})),
-    )
+    for rows in manifest["splits"].values():
+        for row in rows:
+            payload = row["payload"]
+            _verified_mapping(directory / payload["file"], payload["bytes"], payload["xxh3_128"]).close()
+    bank = ReplayLayerBank(geometry, replay, tuple(
+        _MappedSplit(directory, manifest["splits"][name], geometry, replay) for name in SPLIT_NAMES), manifest["provenance"])
     bank.validate()
-    # Verification touched every page of this private file mapping. Leave the
-    # validated tensors demand-paged until a consumer actually uses this layer.
-    if hasattr(mmap, "MADV_DONTNEED"):
-        raw.madvise(mmap.MADV_DONTNEED)
     return bank
 
 

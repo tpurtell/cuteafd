@@ -24,7 +24,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from .capture import CapturedLayerBank, cached_content, eval_attention_output
+from .capture import CapturedLayerBank, DeviceSplit, split_residency_budget, eval_attention_output
 from .fit import (
     ContentFitResult,
     FitConfig,
@@ -34,7 +34,8 @@ from .fit import (
     _check_content_equivalence,
     _check_rope_equivalence,
     _init_log_scales,
-    _quantile_999,
+    content_stats,
+    rope_stats,
     apply_content_forward,
     apply_content_scale_only,
     apply_rope_pair_transform,
@@ -102,16 +103,11 @@ class LayerCandidates:
 
 
 def _content_stats(bank: CapturedLayerBank, device) -> torch.Tensor:
-    return _quantile_999(torch.cat([cached_content(seq.u, bank.params) for seq in bank.train]).to(device))
+    return content_stats(bank.train, bank.params.to(device), device)
 
 
 def _rope_stats(bank: CapturedLayerBank, device) -> torch.Tensor:
-    k = torch.cat([seq.k_rope.float() for seq in bank.train])
-    if bank.geometry.rope_kind == "split_half":
-        pair_values = torch.cat(k.chunk(2, dim=-1))
-    else:
-        pair_values = torch.cat((k[:, ::2], k[:, 1::2]))
-    return _quantile_999(pair_values.to(device))
+    return rope_stats(bank.train, bank.geometry, device)
 
 
 def _init_scale(fit, stats_fn, bank, config) -> torch.Tensor:
@@ -241,7 +237,7 @@ def with_equivalence(result, bank: CapturedLayerBank, device):
     """Measure quantization-off equivalence for a candidate that has not been checked."""
     if math.isfinite(result.equiv_max_rel_err):
         return result
-    seqs = tuple(seq.to(device) for seq in bank.val)
+    seqs = DeviceSplit(bank.val, device, budget_bytes=split_residency_budget(device))
     if isinstance(result, ContentFitResult):
         kind = classify_content_kind(result.r_c, result.s_c)
         if kind == "identity":
@@ -295,8 +291,8 @@ class _Scorer:
         self.params = params.to(device)
         self.device = device
         self.config = config
-        self.seqs = tuple(seq.to(device) for seq in seqs)
-        self.tokens = sum(seq.seq_len for seq in self.seqs)
+        self.seqs = DeviceSplit(seqs, device, budget_bytes=split_residency_budget(device))
+        self.tokens = self.seqs.tokens
         self.protection = (
             {"sink_tokens": config.sink_tokens, "recent_tokens": config.recent_tokens}
             if config.protection == "sink4_local128" else {}
@@ -421,26 +417,44 @@ def measure_candidates(
     """Score every candidate cell plus RTN (identity) and fixed Hadamard on ``split``."""
     scorer = _Scorer(bank, split, config, device)
     table: dict[str, dict[str, Any]] = {}
+    jobs = []
     for mode in modes:
         if not layer_quantizes(bank.geometry, mode):
             continue
         cb, rb = mode
         rope_on = bool(rb) and bank.geometry.has_rope
-        rtn = scorer.score(mode, "rtn", NATIVE_ROPE)
-        row: dict[str, Any] = {
-            "tokens": scorer.tokens,
-            "rtn": rtn,
-            "hadamard": scorer.score(mode, "hadamard", NATIVE_ROPE) if cb else rtn,
-            "cells": {},
-        }
+        row = {"tokens": scorer.tokens, "cells": {}}
+        table[combo_key(mode)] = row
+        jobs.append((row, "rtn", mode, "rtn", NATIVE_ROPE))
+        if cb:
+            jobs.append((row, "hadamard", mode, "hadamard", NATIVE_ROPE))
         for c, r in table_cells(candidates, bank.geometry, mode):
-            if (c is None or c == "identity") and (r is None or r == "identity"):
-                row["cells"][pair_id(c, r)] = rtn
+            if c in (None, "identity") and r in (None, "identity"):
                 continue
             content_arm = (c, candidates.content[c]) if c is not None else "rtn"
-            rope_arm = candidates.rope[r] if (r is not None and rope_on) else NATIVE_ROPE
-            row["cells"][pair_id(c, r)] = scorer.score(mode, content_arm, rope_arm)
-        table[combo_key(mode)] = row
+            rope_arm = candidates.rope[r] if r is not None and rope_on else NATIVE_ROPE
+            jobs.append((row["cells"], pair_id(c, r), mode, content_arm, rope_arm))
+    sums = [[] for _ in jobs]
+    for seq in scorer.seqs:
+        for acc, (_, _, (cb, rb), c, r) in zip(sums, jobs, strict=True):
+            hooks = {**scorer.content_hooks(cb, c), **scorer.rope_hooks(rb, r), **scorer.protection}
+            pred = eval_attention_output(seq, scorer.params, scorer.geom, **hooks)
+            acc.append(_token_relative_squares(pred, seq.ref_output).sum(dtype=torch.float64))
+    for acc, (row, key, *_rest) in zip(sums, jobs, strict=True):
+        value = torch.stack(acc).sum().item() / scorer.tokens
+        if not math.isfinite(value):
+            raise ValueError(f"invalid candidate attention error at layer {bank.geometry.layer_id}")
+        row[key] = value
+    for mode in modes:
+        if combo_key(mode) not in table:
+            continue
+        row = table[combo_key(mode)]
+        row.setdefault("hadamard", row["rtn"])
+        for c, r in table_cells(candidates, bank.geometry, mode):
+            if c in (None, "identity") and r in (None, "identity"):
+                row["cells"][pair_id(c, r)] = row["rtn"]
+        # Keep the original canonical candidate enumeration order.
+        row["cells"] = {pair_id(c, r): row["cells"][pair_id(c, r)] for c, r in table_cells(candidates, bank.geometry, mode)}
     return table
 
 

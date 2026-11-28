@@ -15,6 +15,7 @@ import torch
 
 import panel_corpus
 from qmla.capture import (
+    split_lengths,
     SPLIT_NAMES,
     CapturedLayerBank,
     MlaLayerGeometry,
@@ -67,15 +68,13 @@ from qmla.measurement import (
 from qmla.quantizer import parse_qmla_mode
 from qmla.sidecar import (
     CANONICAL_CONVENTIONS,
-    QMLA_BASE_COMPONENTS,
     resolve_qmla_panel,
     validate_sidecar,
     write_sidecar,
 )
 
 PILOT_SPLITS = (16, 4, 4)
-# Full runs split the base-component calibration rows (agentic + exl3_standard)
-# train/val/test = 60/30/10; long_context records feed long-eval only.
+# Full runs split all calibration rows train/val/test = 60/30/10.
 FULL_SPLIT_FRACTIONS = (0.6, 0.3, 0.1)
 VALIDATION_REPORT_SCHEMA = "cuteafd-qmla-validation-report-v3"
 CANDIDATE_TABLE_SCHEMA = "cuteafd-qmla-candidate-table-v3"
@@ -151,15 +150,9 @@ def load_pinned_qmla_corpus(
     components: Sequence[str] | None = None,
     full: bool = True,
 ) -> tuple[list[tuple[str, torch.Tensor]], dict[str, Any]]:
-    """Load a prepared ``panel_corpus`` calibration split's fitting rows through ``load_component_records``.
-
-    QMLA fits on the base components only (default ``QMLA_BASE_COMPONENTS``); ``full``
-    still requires the prepared corpus itself to be complete.
-    """
+    """Load the prepared panel's calibration rows; never its heldout rows."""
     dataset_repo, dataset_revision, component_names = resolve_qmla_panel(
-        panel_revision=panel_revision,
-        components=QMLA_BASE_COMPONENTS if components is None else components,
-        full=False,
+        panel_revision=panel_revision, components=components, full=full
     )
     pin = panel_corpus.panel_pin(dataset_revision)
     rows, prov = panel_corpus.load_component_records(
@@ -310,7 +303,7 @@ def compute_fit_identity_key(
             "source": dict(source),
             "splits": splits,
             "seq_lens": {
-                str(lid): {name: [seq.seq_len for seq in bank.split(name)] for name in SPLIT_NAMES}
+                str(lid): {name: split_lengths(bank.split(name)) for name in SPLIT_NAMES}
                 for lid, bank in banks.items()
             },
             "layers": ordered_layers,
@@ -569,6 +562,7 @@ def calibrate_from_banks(
                 "forward_attention_arithmetic",
                 "capture_input_trajectory",
                 "capture_forward",
+                "capture_input_precision",
             )
             if k in corpus_provenance
         },
@@ -641,7 +635,7 @@ def calibrate_from_banks(
         "measurement_reference": provenance["measurement_reference"],
         **{
             key: provenance[key]
-            for key in ("forward_attention_arithmetic", "capture_input_trajectory")
+            for key in ("forward_attention_arithmetic", "capture_input_trajectory", "capture_input_precision")
             if key in provenance
         },
         "layers_calibrated": ordered_layers,
@@ -868,7 +862,7 @@ def build_run_parser(
         "--pilot",
         action="store_true",
         help="Family pilot layers and modes; 16/4/4 train/val/test sequences; 100 steps "
-             "(full runs split the base-component rows 60/30/10)",
+             "(full runs split the calibration rows 60/30/10)",
     )
     parser.add_argument("--layers", default=None, help="Layer selection: 'all-dsa' or comma-separated IDs")
     parser.add_argument("--modes", default=None, help="Comma-separated QUANT_MLA modes (e.g. 4:4 or 8:8,4:8,4:4,2:4)")
@@ -926,12 +920,10 @@ def resolve_settings(
     layers = parse_layers_arg(args.layers or default_layers, eligible_layers)
     modes = parse_modes_arg(args.modes or default_modes)
     full = not args.pilot
-    # QMLA fits on the base components only (agentic + exl3_standard); the panel's
-    # long_context records are evaluated separately by --long-eval at full length.
     _, panel_revision, components = resolve_qmla_panel(
         panel_revision=args.panel_revision,
-        components=QMLA_BASE_COMPONENTS if args.components is None else parse_components_arg(args.components),
-        full=False,
+        components=None if args.components is None else parse_components_arg(args.components),
+        full=full,
     )
     train_n = default_train if args.train_sequences is None else int(args.train_sequences)
     val_n = default_val if args.val_sequences is None else int(args.val_sequences)
@@ -1015,6 +1007,9 @@ def check_reused_captures(
     splits = split_identity(banks)
     if splits["seed"] != seed:
         raise ValueError(f"capture split seed {splits['seed']} differs from the requested seed {seed}")
+    counts = {f"{name}_count": resolved[f"{name}_sequences"] for name in SPLIT_NAMES}
+    if all(v is None for v in counts.values()):
+        counts = resolve_split_counts(resolved, sum(splits[name]["count"] for name in SPLIT_NAMES))
     for bank in banks.values():
         if (
             "forward_attention_arithmetic" in teacher_identity
@@ -1024,7 +1019,7 @@ def check_reused_captures(
         if bank.provenance != corpus_provenance:
             raise ValueError(f"capture provenance differs at layer {bank.geometry.layer_id}")
         for name in SPLIT_NAMES:
-            if len(bank.split(name)) != resolved[f"{name}_sequences"]:
+            if len(bank.split(name)) != counts[f"{name}_count"]:
                 raise ValueError(f"capture {name} split count differs at layer {bank.geometry.layer_id}")
     if expected_splits is not None and dict(expected_splits) != splits:
         raise ValueError("capture split membership differs from the split of the requested corpus")
@@ -1048,7 +1043,7 @@ def attach_long_context_eval(
             combined_headline = build_headline_table(
                 existing["combinations"],
                 profiles,
-                long_combinations=long_eval_section.get("combinations"),
+                long_combinations=long_eval_section["heldout_combinations"],
                 unsupported_reasons=reasons,
             )
             combined_md = format_headline_table(combined_headline)

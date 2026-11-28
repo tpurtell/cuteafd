@@ -17,7 +17,7 @@ from qmla.capture import (
     eval_attention_output,
     eval_positional_qk,
     load_layer_capture,
-    save_layer_capture,
+    AttentionInput, AttentionReplay, LayerCaptureWriter,
 )
 
 
@@ -134,11 +134,25 @@ def test_hy4_flash_capture_3d_interleaved_mrope_matches_reference():
     assert not torch.allclose(out, out_1d, atol=1e-4)
 
 
+def _save_input_bank(directory, bank, adapter, layer, inputs):
+    from types import SimpleNamespace
+    device = next(iter(layer.weights.values())).device
+    writer = LayerCaptureWriter(directory, bank.geometry, bank.provenance)
+    for name in ("train", "val", "test"):
+        for seq in bank.split(name):
+            writer.append(AttentionInput(seq.seq_id, inputs[seq.seq_id], seq.positions, seq.allowed_mask))
+    writer.finish()
+    def replay(layer, params, row):
+        return adapter.capture_sequence(row.hidden.to(device).float(), layer, seq_id=row.seq_id,
+            positions=row.positions, allowed_override=row.allowed_mask.to(device), capture_device=device)[0]
+    return AttentionReplay(lambda _: (layer, adapter.layer_params(layer).to(device)), replay)
+
+
 def test_capture_bank_xxh3_roundtrip_and_corruption_fail_closed(tmp_path: Path):
     _, model, layer, g = _synthetic_hy4_layer(97, kind=reference.SPARSE)
     adapter = Hy4FlashCaptureAdapter(model)
     sequences = [
-        (f"seq_{i:02d}", torch.randn(8 + i, 10, generator=g), None)
+        (f"seq_{i:02d}", torch.randn(8 + i, 10, generator=g).bfloat16().float(), None)
         for i in range(6)
     ]
     bank = adapter.capture_layer(
@@ -154,8 +168,8 @@ def test_capture_bank_xxh3_roundtrip_and_corruption_fail_closed(tmp_path: Path):
     ids = [{s.seq_id for s in bank.split(name)} for name in ("train", "val", "test")]
     assert not (ids[0] & ids[1] or ids[0] & ids[2] or ids[1] & ids[2])
 
-    save_layer_capture(tmp_path, bank)
-    reloaded = load_layer_capture(tmp_path, layer.index)
+    replay = _save_input_bank(tmp_path, bank, adapter, layer, {sid: x for sid, x, _ in sequences})
+    reloaded = load_layer_capture(tmp_path, layer.index, replay)
     assert reloaded.geometry == bank.geometry
     assert [s.seq_id for s in reloaded.train] == [s.seq_id for s in bank.train]
     assert [s.seq_id for s in reloaded.val] == [s.seq_id for s in bank.val]
@@ -167,22 +181,17 @@ def test_capture_bank_xxh3_roundtrip_and_corruption_fail_closed(tmp_path: Path):
         assert torch.equal(orig.k_rope, loaded.k_rope)
         assert torch.equal(orig.ref_output, loaded.ref_output)
 
-    # Large capture banks must stay file-backed, even after the loader closes its fd.
-    payload_path = tmp_path / "layer-0000.safetensors"
-    if Path("/proc/self/maps").is_file():
-        address = reloaded.train[0].u.data_ptr()
-        ranges = [line.split()[0].split("-") for line in Path("/proc/self/maps").read_text().splitlines()
-                  if line.endswith(str(payload_path))]
-        assert any(int(lo, 16) <= address < int(hi, 16) for lo, hi in ranges)
-    reloaded.train[0].u.zero_()
-    assert torch.equal(load_layer_capture(tmp_path, layer.index).train[0].u, bank.train[0].u)
+    payload_path = tmp_path / "layer-0000-00000.safetensors"
+    from safetensors.torch import load_file
+    assert load_file(payload_path)["hidden"].dtype == torch.bfloat16
+    assert "q_nope" not in load_file(payload_path)
 
     # Corrupting a single payload byte must fail XXH3-128 verification.
     blob = bytearray(payload_path.read_bytes())
     blob[-1] ^= 0xFF
     payload_path.write_bytes(bytes(blob))
     with pytest.raises(ValueError, match="XXH3-128 mismatch"):
-        load_layer_capture(tmp_path, layer.index)
+        load_layer_capture(tmp_path, layer.index, replay)
 
 
 def test_hy4_flash_geometry_filtering_and_nope_validation():
@@ -305,12 +314,12 @@ def test_three_way_split_disjoint_deterministic_salt_versioned_and_refuses_reuse
     # Capture banks carry the description; reuse refuses a split, seed or count change.
     _, model, layer, g = _synthetic_hy4_layer(131, kind=reference.SPARSE)
     adapter = Hy4FlashCaptureAdapter(model)
-    rows = [(f"agentic:{i:05d}", torch.randn(8 + i, 10, generator=g), None) for i in range(7)]
+    rows = [(f"agentic:{i:05d}", torch.randn(8 + i, 10, generator=g).bfloat16().float(), None) for i in range(7)]
     teacher = {"target_revision": "a" * 40}
     provenance = {"dataset_revision": "b" * 40, "components": {"agentic": {}}, **teacher}
     bank = adapter.capture_layer(layer, rows, train_count=3, val_count=2, test_count=2, provenance=provenance)
-    save_layer_capture(tmp_path, bank)
-    reloaded = {0: load_layer_capture(tmp_path, 0)}
+    replay = _save_input_bank(tmp_path, bank, adapter, layer, {sid: x for sid, x, _ in rows})
+    reloaded = {0: load_layer_capture(tmp_path, 0, replay)}
     resolved = {"panel_revision": "b" * 40, "components": ("agentic",),
                 "train_sequences": 3, "val_sequences": 2, "test_sequences": 2}
     check_reused_captures(reloaded, resolved, teacher, seed=0, expected_splits=bank.provenance["splits"])
@@ -328,9 +337,9 @@ def test_three_way_split_disjoint_deterministic_salt_versioned_and_refuses_reuse
     manifest = json.loads((tmp_path / "layer-0000.json").read_text())
     manifest["schema"] = "cuteafd-qmla-capture-v1"
     (tmp_path / "layer-0000.json").write_text(json.dumps(manifest))
-    assert CAPTURE_SCHEMA == "cuteafd-qmla-capture-v2"
-    with pytest.raises(ValueError, match="three-way"):
-        load_layer_capture(tmp_path, 0)
+    assert CAPTURE_SCHEMA == "cuteafd-qmla-capture-v3"
+    with pytest.raises(ValueError, match="unsupported capture schema"):
+        load_layer_capture(tmp_path, 0, replay)
 
 
 def test_content_transform_uses_rounded_cache_and_identity_matches_native_bytes():

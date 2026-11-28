@@ -458,6 +458,9 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path, monkeypatc
     assert set(long_eval["combinations"]) == {"4:4", "4:0", "0:4"}
     for mkey, row in long_eval["combinations"].items():
         assert row["layer_tokens"] == 832 and set(row["by_split"]) == {"heldout", "calibration"}
+        assert row["by_split"]["calibration"]["overlaps_fit_data"]
+        assert not row["by_split"]["heldout"]["overlaps_fit_data"]
+        assert long_eval["heldout_combinations"][mkey]["layer_tokens"] == 384
         assert set(row["per_layer"]) == {"0", "2"}
         assert row["rtn_attn_rel_err"] > 0
         assert row["ratio_to_rtn"] == pytest.approx(row["attn_rel_err"] / row["rtn_attn_rel_err"])
@@ -475,7 +478,7 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path, monkeypatc
     row_40 = upd_hl["4:0"]
     assert row_40["supported"] is True and row_40["short"] is not None and row_40["long"] is not None
     assert row_40["short"]["attn_rel_err"] == pytest.approx(cal_res["report"]["combinations"]["4:0"]["attn_rel_err"])
-    assert row_40["long"]["attn_rel_err"] == pytest.approx(long_eval["combinations"]["4:0"]["attn_rel_err"])
+    assert row_40["long"]["attn_rel_err"] == pytest.approx(long_eval["heldout_combinations"]["4:0"]["attn_rel_err"])
     if abs(row_40["short"]["error_reduction_pct"]) > 1e-12:
         assert row_40["long_to_short_improvement_ratio"] == pytest.approx(
             row_40["long"]["error_reduction_pct"] / row_40["short"]["error_reduction_pct"]

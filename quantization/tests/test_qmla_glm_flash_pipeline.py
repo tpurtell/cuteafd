@@ -29,7 +29,7 @@ def test_glm_flash_release_scope_and_presets(tmp_path):
     p = run.build_parser()
     eligible = tuple(range(3, 44, 4))
     for flags, layers, counts in ((["--pilot"], run.PILOT_LAYERS, (16, 4, 4, 100)),
-                                 # Full runs: counts resolve to 60/30/10 of the loaded base-component rows.
+                                 # Full runs: counts resolve to 60/30/10 of the loaded calibration rows.
                                  ([], eligible, (None, None, None, 300))):
         settings = run.resolve_run_settings(p.parse_args(argv + flags), eligible)
         assert settings["layers"] == layers

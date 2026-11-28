@@ -30,6 +30,9 @@ from .capture import (
     CapturedLayerBank,
     CapturedLayerParams,
     CapturedSequence,
+    DeviceSplit,
+    split_residency_budget,
+    split_lengths,
     MlaLayerGeometry,
     ROWS,
     causal_mask,
@@ -250,9 +253,9 @@ def _require_unprotected_tokens(
     if protection == "none":
         return
     unprotected = 0
-    for seq in seqs:
+    for length in split_lengths(seqs):
         mask = protection_mask(
-            seq.seq_len,
+            length,
             protection=protection,
             sink_tokens=sink_tokens,
             recent_tokens=recent_tokens,
@@ -481,6 +484,41 @@ def _quantile_999(samples_2d: torch.Tensor) -> torch.Tensor:
     return torch.quantile(abs_x, 0.999, dim=0).clamp_min(1e-8)
 
 
+def _bounded_quantile(samples, device):
+    # torch.quantile limits the total element count to 2**24; columns are independent.
+    width = max(1, (2**24) // samples.shape[0])
+    if samples.shape[0] > 2**24:
+        raise ValueError("quantile input exceeds supported row count")
+    return torch.cat([_quantile_999(part.to(device).contiguous())
+                      for part in samples.split(width, dim=1)])
+
+
+def content_stats(seqs, params, device):
+    # Only the cached latent is needed; the large query/output tensors never enter this bank.
+    samples = torch.empty((sum(split_lengths(seqs)), params.kv_norm_weight.numel()),
+                          dtype=torch.float32, device="cpu")
+    offset = 0
+    for seq in seqs:
+        values = cached_content(seq.u.to(device), params)
+        samples[offset:offset + len(values)].copy_(values)
+        offset += len(values)
+    return _bounded_quantile(samples, device)
+
+
+def rope_stats(seqs, geom, device):
+    count = sum(split_lengths(seqs))
+    pairs = geom.qk_rope_dim // 2
+    samples = torch.empty((2 * count, pairs), dtype=torch.float32, device="cpu")
+    offset = 0
+    for seq in seqs:
+        k = seq.k_rope.float()
+        a, b = k.chunk(2, dim=-1) if geom.rope_kind == "split_half" else (k[:, ::2], k[:, 1::2])
+        samples[offset:offset + len(k)].copy_(a)
+        samples[count + offset:count + offset + len(k)].copy_(b)
+        offset += len(k)
+    return _bounded_quantile(samples, device)
+
+
 def _init_log_scales(a_j: torch.Tensor, alpha: float, bound: float) -> torch.Tensor:
     log_a = torch.log(a_j.clamp_min(1e-8))
     return (float(alpha) * (log_a.mean() - log_a)).clamp(-bound, bound)
@@ -629,10 +667,12 @@ def fit_content_layer(
     geom = bank.geometry
     d_c = geom.kv_lora_rank
     params = bank.params.to(dev)
-    train_seqs = tuple(s.to(dev) for s in bank.train)
-    val_seqs = tuple(s.to(dev) for s in bank.val)
-    extra_train = tuple((b.params.to(dev), b.geometry, tuple(s.to(dev) for s in b.train)) for b in extra_consumers)
-    extra_val = tuple((b.params.to(dev), b.geometry, tuple(s.to(dev) for s in b.val)) for b in extra_consumers)
+    train_seqs = DeviceSplit(bank.train, dev)
+    budget = split_residency_budget(dev) // (1 + len(extra_consumers))
+    val_seqs = DeviceSplit(bank.val, dev, budget_bytes=budget)
+    extra_train = tuple((b.params.to(dev), b.geometry, DeviceSplit(b.train, dev)) for b in extra_consumers)
+    extra_val = tuple((ep, b.geometry, DeviceSplit(b.val, dev, budget_bytes=budget))
+                      for (ep, _, _), b in zip(extra_train, extra_consumers, strict=True))
 
     eye = torch.eye(d_c, device=dev, dtype=torch.float32)
     ones = torch.ones(d_c, device=dev, dtype=torch.float32)
@@ -642,47 +682,32 @@ def fit_content_layer(
         "recent_tokens": config.recent_tokens,
     }
 
-    # Step-0 baselines under the active protection policy, all using the native cached latent.
+    # All initialization arms share one replay of each validation row. Preserve
+    # the original per-arm stack/mean reduction and consumer order.
     baselines: dict[str, float] = {}
     with torch.no_grad():
-        baselines["rtn_native_val"] = float(
-            content_output_loss(
-                val_seqs, params, geom, None if fit_mode == "scale_only" else eye, ones, bits,
-                group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
-                extra_consumers=extra_val, **prot_kwargs,
-            ).item()
-        )
+        a_j = content_stats(bank.train, params, dev)
+        base_r = None if fit_mode == "scale_only" else eye
+        arms = [("rtn_native_val", base_r, ones)]
         if (d_c & (d_c - 1)) == 0:
-            h_mat = sylvester_hadamard(d_c, device=dev, dtype=torch.float32)
-            baselines["hadamard_val"] = float(
-                content_output_loss(
-                    val_seqs, params, geom, h_mat, ones, bits,
-                    group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
-                    extra_consumers=extra_val, **prot_kwargs,
-                ).item()
-            )
-
-        c_all = torch.cat([cached_content(s.u, params) for s in train_seqs], dim=0)
-        a_j = _quantile_999(c_all)
+            arms.append(("hadamard_val", sylvester_hadamard(d_c, device=dev), ones))
+        alpha_scales = [_init_log_scales(a_j, alpha, config.log_scale_bound) for alpha in config.alpha_grid]
+        arms += [(f"alpha:{alpha}", base_r, scale.exp()) for alpha, scale in zip(config.alpha_grid, alpha_scales)]
+        values = [[] for _ in arms]
+        for cp, cg, seqs in [(params, geom, val_seqs), *extra_val]:
+            for seq in seqs:
+                for acc, (_, rotation, scale) in zip(values, arms, strict=True):
+                    acc.append(content_output_loss((seq,), cp, cg, rotation, scale, bits,
+                        group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs))
+        scores = {key: torch.stack(v).mean().item() for (key, _, _), v in zip(arms, values, strict=True)}
+        baselines = {key: value for key, value in scores.items() if not key.startswith("alpha:")}
         best_alpha = 0.0
         best_alpha_loss = float("inf")
-        best_init_log_s = torch.zeros(d_c, device=dev, dtype=torch.float32)
-        for alpha in config.alpha_grid:
-            cand_log_s = _init_log_scales(a_j, alpha, config.log_scale_bound)
-            cand_loss = float(
-                content_output_loss(
-                    val_seqs, params, geom, None if fit_mode == "scale_only" else eye, torch.exp(cand_log_s), bits,
-                    group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
-                    extra_consumers=extra_val, **prot_kwargs,
-                ).item()
-            )
-            # Favor alpha=0 on ties (Appendix C.4).
-            if cand_loss < best_alpha_loss - 1e-12 or (
-                abs(cand_loss - best_alpha_loss) <= 1e-12 and alpha == 0.0
-            ):
-                best_alpha = float(alpha)
-                best_alpha_loss = cand_loss
-                best_init_log_s = cand_log_s
+        best_init_log_s = torch.zeros(d_c, device=dev)
+        for alpha, scale in zip(config.alpha_grid, alpha_scales):
+            cand_loss = scores[f"alpha:{alpha}"]
+            if cand_loss < best_alpha_loss - 1e-12 or (abs(cand_loss - best_alpha_loss) <= 1e-12 and alpha == 0.0):
+                best_alpha, best_alpha_loss, best_init_log_s = float(alpha), cand_loss, scale
         baselines["smoothquant_alpha_val"] = best_alpha_loss
 
     log_s_param = best_init_log_s.clone().detach().requires_grad_(True)
@@ -832,8 +857,8 @@ def fit_rope_layer(
 
     dev = torch.device(device)
     pairs = geom.qk_rope_dim // 2
-    train_seqs = tuple(s.to(dev) for s in bank.train)
-    val_seqs = tuple(s.to(dev) for s in bank.val)
+    train_seqs = DeviceSplit(bank.train, dev)
+    val_seqs = DeviceSplit(bank.val, dev, budget_bytes=split_residency_budget(dev))
 
     zeros = torch.zeros(pairs, device=dev, dtype=torch.float32)
     ones = torch.ones(pairs, device=dev, dtype=torch.float32)
@@ -845,37 +870,23 @@ def fit_rope_layer(
 
     baselines: dict[str, float] = {}
     with torch.no_grad():
-        baselines["rtn_val"] = float(
-            rope_qk_loss(
-                val_seqs, geom, None if fit_mode == "scale_only" else zeros, ones, bits,
-                group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs,
-            ).item()
-        )
-        # Pair-tied 99.9th-percentile magnitude statistic across both coords of each pair.
-        kp_all = torch.cat([s.k_rope.float() for s in train_seqs if s.k_rope is not None], dim=0)
-        if geom.rope_kind in ("interleaved", "unrotated_pe"):
-            pair_vals = torch.stack((kp_all[:, 0::2], kp_all[:, 1::2]), dim=0).reshape(-1, pairs)
-        else:
-            pair_vals = torch.stack((kp_all[:, :pairs], kp_all[:, pairs:]), dim=0).reshape(-1, pairs)
-        a_pair = _quantile_999(pair_vals)
-
+        a_pair = rope_stats(bank.train, geom, dev)
+        base_theta = None if fit_mode == "scale_only" else zeros
+        alpha_scales = [_init_log_scales(a_pair, alpha, config.log_scale_bound) for alpha in config.alpha_grid]
+        arms = [ones, *(scale.exp() for scale in alpha_scales)]
+        values = [[] for _ in arms]
+        for seq in val_seqs:
+            for acc, scale in zip(values, arms, strict=True):
+                acc.append(rope_qk_loss((seq,), geom, base_theta, scale, bits,
+                    group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs))
+        scores = [torch.stack(v).mean().item() for v in values]
+        baselines["rtn_val"] = scores[0]
         best_alpha = 0.0
         best_alpha_loss = float("inf")
-        best_init_log_s = torch.zeros(pairs, device=dev, dtype=torch.float32)
-        for alpha in config.alpha_grid:
-            cand_log_s = _init_log_scales(a_pair, alpha, config.log_scale_bound)
-            cand_loss = float(
-                rope_qk_loss(
-                    val_seqs, geom, None if fit_mode == "scale_only" else zeros, torch.exp(cand_log_s), bits,
-                    group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs,
-                ).item()
-            )
-            if cand_loss < best_alpha_loss - 1e-12 or (
-                abs(cand_loss - best_alpha_loss) <= 1e-12 and alpha == 0.0
-            ):
-                best_alpha = float(alpha)
-                best_alpha_loss = cand_loss
-                best_init_log_s = cand_log_s
+        best_init_log_s = torch.zeros(pairs, device=dev)
+        for alpha, scale, cand_loss in zip(config.alpha_grid, alpha_scales, scores[1:], strict=True):
+            if cand_loss < best_alpha_loss - 1e-12 or (abs(cand_loss - best_alpha_loss) <= 1e-12 and alpha == 0.0):
+                best_alpha, best_alpha_loss, best_init_log_s = float(alpha), cand_loss, scale
         baselines["smoothquant_alpha_val"] = best_alpha_loss
 
     log_s_param = best_init_log_s.clone().detach().requires_grad_(True)

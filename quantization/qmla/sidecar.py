@@ -35,6 +35,7 @@ import torch
 import panel_corpus as pc
 
 from .capture import (
+    DeviceSplit, split_residency_budget,
     CapturedLayerBank,
     MlaLayerGeometry,
     _canonical_json,
@@ -1149,7 +1150,7 @@ def validate_sidecar(
                 g = geom_by_layer[lid]
                 if content_prof is not None and lid in content_prof["layers"]:
                     params = bank.params.to(device)
-                    val_seqs = tuple(saved.to(device) for saved in bank.val)
+                    val_seqs = DeviceSplit(bank.val, device, budget_bytes=split_residency_budget(device))
                     check_content_identity(val_seqs, params, g)
                     identity_layers.append(lid)
                     eye = torch.eye(g.kv_lora_rank, device=device, dtype=torch.float32)
