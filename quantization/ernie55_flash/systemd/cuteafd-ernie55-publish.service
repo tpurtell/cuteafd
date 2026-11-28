@@ -1,0 +1,21 @@
+[Unit]
+After=cuteafd-ernie55-production.service
+Description=Publish and verify the sealed ERNIE 5.5 Flash K4 MC checkpoint
+ConditionPathExists=%h/Developer/quantization-runs/ernie55-flash-k4-mc/production/numerical-complete.json
+OnSuccess=cuteafd-ernie55-handoff.service
+OnFailure=cuteafd-ernie55-progress.service
+
+[Service]
+Type=oneshot
+Restart=no
+WorkingDirectory=%h/Developer/cute-worktrees/ernie55-flash-k4-mc
+Environment=PYTHONPATH=%h/Developer/cute-worktrees/ernie55-flash-k4-mc/quantization
+Environment=CUDA_VISIBLE_DEVICES=
+Environment=HF_HUB_DISABLE_XET=1
+UnsetEnvironment=HF_TOKEN HUGGING_FACE_HUB_TOKEN
+ExecCondition=/usr/bin/cmp --silent /proc/sys/kernel/random/boot_id %h/Developer/quantization-runs/ernie55-flash-k4-mc/admitted-boot-id
+StandardInput=file:%h/.cache/huggingface/token
+ExecStart=%h/Developer/quantization-runs/ernie55-flash-k4-mc/venv/bin/python -m ernie55_flash.publish --root %h/Developer/quantization-runs/ernie55-flash-k4-mc/production --output %h/Developer/quantization-runs/ernie55-flash-k4-mc/ERNIE-5.5-Flash-Preview-EXL3-K4-MC --upload-workers 16 --upload-batch-files 48
+TimeoutStartSec=infinity
+StandardOutput=append:%h/Developer/quantization-runs/ernie55-flash-k4-mc/progress-updates/publication.log
+StandardError=inherit

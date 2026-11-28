@@ -1,0 +1,8 @@
+[Unit]
+Description=Report ERNIE 5.5 Flash production progress
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/cuteafd/ernie55-progress.env
+ExecStart=/usr/bin/python3 %h/Developer/cute-worktrees/ernie55-flash-k4-mc/quantization/ernie55_flash/progress.py --production
+TimeoutStartSec=100

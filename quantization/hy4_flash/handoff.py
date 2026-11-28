@@ -30,6 +30,8 @@ class Placement:
     target: hub.PublicationTarget
     build_prefix: str
     engram: bool = False
+    keep_ref: str = KEEP_REF
+    task_intermediates: tuple[str, ...] = ()
 
     @property
     def model(self):
@@ -54,7 +56,7 @@ def _publication(root, output, layout=FLASH):
     return record, identity
 
 
-def _inventory(call, managed, files, revision, *, physical_paths=None, model=MODEL):
+def _inventory(call, managed, files, revision, *, physical_paths=None, model=MODEL, keep_ref=KEEP_REF):
     """Use native namespace metadata and read only the two small revision refs."""
     repo = nest.NAMESPACE / model
     snapshot = repo / 'snapshots' / revision
@@ -103,7 +105,7 @@ def _inventory(call, managed, files, revision, *, physical_paths=None, model=MOD
     if result.keys() != files.keys():
         raise ValueError('managed file inventory is incomplete')
     refs = repo / 'refs'
-    for directory, expected in [(refs, {'keep', 'main'}), (refs / 'keep', {Path(KEEP_REF).name})]:
+    for directory, expected in [(refs, {'keep', 'main'}), (refs / 'keep', {Path(keep_ref).name})]:
         entries = call('ls', directory)['entries']
         if {row['name'] for row in entries} != expected:
             raise ValueError('managed refs differ from pinned publication')
@@ -213,7 +215,7 @@ def _place(call, root, state_path, state, revision, files, pins, inventory, phys
     key = 'placement'
     goal = ('--place', 'hf:' + layout.target.repo_id, '--factor', '1/8',
             *(v for host in nest.TARGET_ARGS for v in ('--host', host)))
-    checks = dict(repo_id=layout.target.repo_id, evict_hosts=TARGETS, physical_paths=physical_paths, keep_ref=KEEP_REF)
+    checks = dict(repo_id=layout.target.repo_id, evict_hosts=TARGETS, physical_paths=physical_paths, keep_ref=layout.keep_ref)
     proposed = root / (key + '-proposed.json')
     raw = hub.load(proposed) if proposed.exists() else call('plan', *goal)
     nest.check_plan(raw, revision, files, **checks)
@@ -288,18 +290,18 @@ def handoff(root, output, stage_root, *, call=None, managed=nest.MANAGED, layout
             repo = stage_root / layout.model
         else:
             repo = nest.stage_snapshot(published, stage_root, repo_id=layout.target.repo_id, family=layout.target.family,
-                                       hub_blobs=True, keep_ref=KEEP_REF)
+                                       hub_blobs=True, keep_ref=layout.keep_ref)
         nest.run_job(root, state_path, state, call, 'import-job',
                      ('hf', 'import', repo, '--offline', '--no-copy'),
                      job_description=f'hf import {repo} -> {nest.NAMESPACE}',
                      importing_files=len({r['hub_oid'] for r in files.values()}))
 
         physical_paths = {}
-        imported = _inventory(call, managed, files, revision, physical_paths=physical_paths, model=layout.model)
+        imported = _inventory(call, managed, files, revision, physical_paths=physical_paths, model=layout.model, keep_ref=layout.keep_ref)
 
         def inventory():
             current_paths = {}
-            holders = _inventory(call, managed, files, revision, physical_paths=current_paths, model=layout.model)
+            holders = _inventory(call, managed, files, revision, physical_paths=current_paths, model=layout.model, keep_ref=layout.keep_ref)
             if physical_paths != current_paths:
                 raise ValueError('managed physical blob paths changed during Hy4 handoff')
             return holders
@@ -374,7 +376,7 @@ def retire(root, output, *, intermediates=(), build_root=None, engram_stage=None
         stage = _engram_staging(root, engram_stage, published['files']) if engram_stage else None
         return nest.retire(root, intermediates=intermediates, build_root=build_root, repo_id=layout.target.repo_id,
                            family=layout.target.family, build_prefix=layout.build_prefix, verified_staging=stage,
-                           placement_check='one_fabric_copy_per_file')
+                           placement_check='one_fabric_copy_per_file', task_intermediates=layout.task_intermediates)
 
 
 def run_cli(layout):

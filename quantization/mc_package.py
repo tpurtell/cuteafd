@@ -26,6 +26,32 @@ from kimi_k3.uniform_k2.storage import (
 
 DTYPES = {'BF16': 'bfloat16', 'F32': 'float32', 'F16': 'float16',
           'F8_E4M3': 'float8_e4m3fn', 'I16': 'int16', 'I32': 'int32'}
+# Families that share the strict direct-writer MUL1 contract.
+DIRECT_MUL1 = {"hy4_flash", "hy4", "ernie55_flash"}
+
+
+def check_source_shard(family, shard):
+    # ERNIE's twelve additional source tensors live outside the main index.
+    if family == "ernie55_flash" and shard == "flashindexer/flashindexer.safetensors":
+        return
+    if not shard or shard in (".", "..") or Path(shard).name != shard or any(c in shard for c in "\\\0\n\r"):
+        raise ValueError("unsafe original source shard")
+
+
+def native_direct_selection(family, compact, config):
+    """Resolve the native row layout corresponding to the compact module inventory."""
+    if family == "ernie55_flash":
+        from ernie55_flash.hca_format import original_selection
+        return original_selection(compact, config)
+    return compact
+
+
+def original_tensor_name(family, module):
+    if family == "ernie55_flash" and module.endswith(".self_attn.linear_o_group_proj"):
+        return module
+    return module + ".weight"
+
+
 PARENTS = {
     'glmf': ('GLM-5.3-Flash-EXL3-K4-Core-K6', '5d3fffe1df9c4a109bbbdafb60dc19df9fac019d'),
     'glmf-k325': ('GLM-5.3-Flash-EXL3-K4-MC', '91a8dbc9c12e790c65aa1a38c6aede6a3e23a77d'),
@@ -750,7 +776,7 @@ def _check_direct_markers(output, inv, markers, checked):
                 checked.add((filename, name))
 
 
-def _hy4_markers(inv, quantize, config, core, view):
+def _direct_mul1_markers(inv, quantize, config, core, view):
     """Require full metadata for every indexed shared expert and compact projection."""
     if any(value.get('codebook') != 'mul1' or value.get('codebook_multiplier') != MUL1
            for value in (quantize, config['quantization_config'])):
@@ -786,14 +812,15 @@ def validate(output, *, verification='full'):
     if state['identity']['schema'] != 'cuteafd-core-package-v1':
         raise ValueError('unsupported package receipt')
     family = state['identity']['family']
-    if verification == 'streaming-receipts' and (family not in ('inkling2', 'hy4_flash', 'hy4')
+    if verification == 'streaming-receipts' and (family != 'inkling2' and family not in DIRECT_MUL1
             or 'direct_expected_specs' not in state or state.get('copies') != {}):
         raise ValueError('streaming receipts require an independent direct package')
     if verification == 'streaming-receipts':
         source_names = set(state['core_tensors']['original'])
-        if family in ('hy4_flash', 'hy4'):
+        if family in DIRECT_MUL1:
+            expert_prefix = '.block_sparse_moe.experts.' if family == 'ernie55_flash' else '.mlp.experts.'
             source_names.update(n for n in state['direct_expected_specs']['original']
-                                if '.mlp.experts.' not in n)
+                                if expert_prefix not in n)
         if set(state['source_tensor_locations']) != source_names:
             raise ValueError('original streaming proof inventory is incomplete')
     for filename, receipt in state['new_shards'].items():
@@ -809,7 +836,7 @@ def validate(output, *, verification='full'):
     if family != 'ml4':
         manifest = mc_manifest.validate(load_json(output / mc_manifest.MANIFEST), output)
         _validate_direct_engram(output, manifest, state)
-    if family in ('hy4_flash', 'hy4') and (state['identity'].get('codebook') != 'mul1'
+    if family in DIRECT_MUL1 and (state['identity'].get('codebook') != 'mul1'
             or state['identity'].get('codebook_multiplier') != MUL1
             or manifest.get('exl3_codebook') != dict(name='mul1', multiplier=MUL1)):
         raise ValueError('Hy4 package, manifest and producer must agree on MUL1')
@@ -824,8 +851,8 @@ def validate(output, *, verification='full'):
             if inv['specs'] != expected or inv['mapping'] != state['direct_expected_mappings'][view]:
                 raise ValueError('direct selected index differs from committed tensor inventory')
             selected = state['direct_core_selection']
-            markers = (_hy4_markers(inv, q, load_json(output / config), selected, view)
-                       if family in ('hy4_flash', 'hy4') else {})
+            markers = (_direct_mul1_markers(inv, q, load_json(output / config), selected, view)
+                       if family in DIRECT_MUL1 else {})
             for module, geometry in selected.items():
                 if view == 'original':
                     if module in q['tensor_storage']:
@@ -875,11 +902,12 @@ def validate(output, *, verification='full'):
     if reviewed_selection is None:
         recipe, compact_selection = family_recipe(family)
         reviewed_selection = original_core_selection(family, recipe, compact_selection)
+    reviewed_selection = native_direct_selection(family, reviewed_selection, load_json(output / 'config.json'))
     original_quant = load_json(output / 'quantize_config.json')
     for module, geometry in reviewed_selection.items():
         if module in original_quant['tensor_storage']:
             raise ValueError('original view still declares quantized core: ' + module)
-        if family != 'ml4' and original_native_specs.get(module + '.weight') != (
+        if family != 'ml4' and original_native_specs.get(original_tensor_name(family, module)) != (
                 'BF16', [geometry['out_features'], geometry['in_features']]):
             raise ValueError('original view omits native core or differs from source geometry: ' + module)
         if family == 'ml4':
@@ -894,8 +922,7 @@ def validate(output, *, verification='full'):
         # Direct sources can carry unindexed, bare-name MTP tensors.
         shard = location['shard'] if isinstance(location, dict) else location
         source_name = location['source_name'] if isinstance(location, dict) else name
-        if Path(shard).name != shard:
-            raise ValueError('unsafe original source shard')
+        check_source_shard(family, shard)
         if verification == 'streaming-receipts':
             receipt = state['new_shards'][original['mapping'][name]]
             proof = receipt.get('original_tensor_proofs', {}).get(name, {})

@@ -1,0 +1,17 @@
+[Unit]
+Description=Adopt ERNIE 5.5 Flash and verify its eight-store placement
+ConditionPathExists=%h/Developer/quantization-runs/ernie55-flash-k4-mc/production/publication-complete.json
+OnSuccess=cuteafd-ernie55-cleanup.service
+OnFailure=cuteafd-ernie55-progress.service
+
+[Service]
+Type=oneshot
+Restart=no
+WorkingDirectory=%h/Developer/cute-worktrees/ernie55-flash-k4-mc
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/Developer/cute-worktrees/ernie55-flash-k4-mc/quantization
+ExecCondition=/usr/bin/cmp --silent /proc/sys/kernel/random/boot_id %h/Developer/quantization-runs/ernie55-flash-k4-mc/admitted-boot-id
+ExecStart=%h/Developer/quantization-runs/ernie55-flash-k4-mc/venv/bin/python -m ernie55_flash.handoff --root %h/Developer/quantization-runs/ernie55-flash-k4-mc/production --output %h/Developer/quantization-runs/ernie55-flash-k4-mc/ERNIE-5.5-Flash-Preview-EXL3-K4-MC
+TimeoutStartSec=infinity
+StandardOutput=append:%h/Developer/quantization-runs/ernie55-flash-k4-mc/progress-updates/handoff.log
+StandardError=inherit
