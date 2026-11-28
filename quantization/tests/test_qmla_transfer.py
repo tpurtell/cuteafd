@@ -117,6 +117,9 @@ def test_installed_mc_view_dispatches_its_core_and_shared_k4_experts(monkeypatch
     assert all(calls[f"model.layers.1.mlp.experts.237.{proj}_proj"] == 4 for proj in ("gate", "up", "down"))
     assert weights[0].shape == (reader.config.moe_intermediate_size, latent.shape[-1])
     assert weights[2].shape == weights[0].T.shape
+    assert reader.headers and reader.header_offsets
+    reader.close()
+    assert not reader.headers and not reader.header_offsets and not reader.maps
 
 
 def test_transfer_summary_requires_the_complete_measured_test_grid():
