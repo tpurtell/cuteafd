@@ -48,7 +48,7 @@ from .quantizer import (
     sylvester_hadamard,
 )
 
-FIT_CHECKPOINT_SCHEMA = "cuteafd-qmla-fit-checkpoint-v1"
+FIT_CHECKPOINT_SCHEMA = "cuteafd-qmla-fit-checkpoint-v2"
 ALPHA_INIT_GRID = (0.0, 0.125, 0.25, 0.5, 0.75, 1.0)
 DEFAULT_PROTECTION_POLICY = "sink4_local128"
 VALID_PROTECTION_POLICIES = frozenset({"sink4_local128", "none"})
@@ -111,6 +111,7 @@ class ContentFitResult:
     orth_max_err: float
     baselines: dict[str, float]
     protection_calibrated: str = DEFAULT_PROTECTION_POLICY
+    init_s: torch.Tensor | None = None  # SmoothQuant step-0 scales (identity rotation)
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,7 @@ class RopeFitResult:
     equiv_max_rel_err: float
     baselines: dict[str, float]
     protection_calibrated: str = DEFAULT_PROTECTION_POLICY
+    init_s: torch.Tensor | None = None  # SmoothQuant step-0 pair scales (zero angles)
 
 
 def protection_mask(
@@ -599,6 +601,7 @@ def fit_content_layer(
         orth_max_err=orth_err,
         baselines=baselines,
         protection_calibrated=config.protection,
+        init_s=torch.exp(best_init_log_s).detach().cpu(),
     )
 
 
@@ -750,6 +753,7 @@ def fit_rope_layer(
         equiv_max_rel_err=equiv_err,
         baselines=baselines,
         protection_calibrated=config.protection,
+        init_s=torch.exp(best_init_log_s).detach().cpu(),
     )
 
 
@@ -766,6 +770,8 @@ def save_fit_checkpoint(
         kind = "content"
         stem = f"content-c{result.bits}-layer-{result.layer_id:04d}"
         tensors = {"r": result.r_c.float(), "s": result.s_c.float()}
+        if result.init_s is not None:
+            tensors["init_s"] = result.init_s.float()
         meta = {
             "kind": kind,
             "layer_id": result.layer_id,
@@ -782,6 +788,8 @@ def save_fit_checkpoint(
         kind = "rope"
         stem = f"rope-r{result.bits}-layer-{result.layer_id:04d}"
         tensors = {"theta": result.theta.float(), "s": result.s_p.float()}
+        if result.init_s is not None:
+            tensors["init_s"] = result.init_s.float()
         meta = {
             "kind": kind,
             "layer_id": result.layer_id,
@@ -842,6 +850,7 @@ def load_fit_checkpoint(
             orth_max_err=float(meta["orth_max_err"]),
             baselines=dict(meta["baselines"]),
             protection_calibrated=str(meta["protection_calibrated"]),
+            init_s=tensors.get("init_s"),
         )
     return RopeFitResult(
         layer_id=int(meta["layer_id"]),
@@ -854,6 +863,7 @@ def load_fit_checkpoint(
         equiv_max_rel_err=float(meta["equiv_max_rel_err"]),
         baselines=dict(meta["baselines"]),
         protection_calibrated=str(meta["protection_calibrated"]),
+        init_s=tensors.get("init_s"),
     )
 
 

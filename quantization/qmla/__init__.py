@@ -2,13 +2,16 @@
 
 Provides:
 - ``capture``: mode-agnostic MLA geometry, capture adapter protocol, exact FP32
-  reference evaluators, deterministic train/val split, XXH3-128 capture storage.
+  reference evaluators, deterministic salt-versioned train/val/test split, XXH3-128
+  capture storage.
 - ``quantizer``: QuantMLA per-token asymmetric affine group-64 quantizer,
   bit-exact INT2/INT4/INT8 pack/unpack oracle, record sizing, Hadamard baseline.
 - ``fit``: function-aligned content (L_C) and RoPE (L_P) optimizers with default
   ``sink4_local128`` protection on full-history MLA layers, step-0 baselines
   (RTN / Hadamard / SmoothQuant alpha-grid), XXH3-128 fit checkpoints.
-- ``sidecar``: ``cuteafd-qmla-v1`` single-file sidecar (``mla_calibration.safetensors``
+- ``measurement``: candidate cross-tables (every width's fit and SmoothQuant init against
+  every combination), shipped-transform selection on ``val``, test-split reporting.
+- ``sidecar``: ``cuteafd-qmla-v2`` single-file sidecar (one shipped transform per path) (``mla_calibration.safetensors``
   with embedded ``__metadata__["cuteafd_qmla"]`` + full ``qmla`` section in
   ``cuteafd-mc.json`` for MC checkpoints; no separate ``mla_calibration.json``),
   single pinned 3-component panel contract, and fail-closed validators.
@@ -29,8 +32,13 @@ from .capture import (
     eval_positional_qk,
     load_layer_capture,
     rms_norm,
+    SPLIT_NAMES,
+    SPLIT_SALT,
+    check_split_description,
+    describe_splits,
     save_layer_capture,
-    split_train_val,
+    sequence_sha256,
+    split_train_val_test,
     unit_rms_norm,
 )
 from .fit import (
@@ -87,6 +95,7 @@ from .sidecar import (
     CANONICAL_CONVENTIONS,
     CANONICAL_QUANTIZER_RECIPE,
     DEFAULT_QMLA_PANEL_REVISION,
+    PROFILE_PATHS,
     PROTECTION_SCOPE,
     QMLA_BASE_COMPONENTS,
     QMLA_KNOWN_COMPONENTS,
@@ -127,6 +136,7 @@ __all__ = [
     "GROUP_SIZE",
     "INCREMENTAL_PLAN_SCHEMA",
     "MlaLayerGeometry",
+    "PROFILE_PATHS",
     "PROTECTION_SCOPE",
     "QMLA_BASE_COMPONENTS",
     "QMLA_KNOWN_COMPONENTS",
@@ -176,7 +186,12 @@ __all__ = [
     "rope_qk_loss",
     "save_fit_checkpoint",
     "save_layer_capture",
-    "split_train_val",
+    "SPLIT_NAMES",
+    "SPLIT_SALT",
+    "check_split_description",
+    "describe_splits",
+    "sequence_sha256",
+    "split_train_val_test",
     "sylvester_hadamard",
     "unit_rms_norm",
     "unpack_content_row",

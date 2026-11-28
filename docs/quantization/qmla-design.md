@@ -145,22 +145,21 @@ There is **no separate `mla_calibration.json` file**. The **only** sidecar file 
   - **Why `__metadata__` instead of a minimal `cuteafd-mc.json`:** `docs/mc-checkpoints.md` defines a repository as MC *iff* `cuteafd-mc.json` exists, and MC discovery fails closed if `cuteafd-mc.json` lacks `variants` / `shared_inventory_sha256`. Putting the metadata in `mla_calibration.safetensors`'s own safetensors `__metadata__` header preserves the MC discovery invariant cleanly, requires adding **only one file** for a calibration-only non-MC revision, and avoids a circular file-hash dependency (the embedded manifest carries `tensors_payload_sha256` over the raw tensor payload bytes after the safetensors header, while `cuteafd-mc.json["qmla"]` on MC checkpoints additionally pins the whole-file `tensors_sha256` and `tensors_bytes` of `mla_calibration.safetensors`).
   - `mla_calibration.safetensors` always writes `__metadata__["cuteafd_qmla"]` for both MC and non-MC checkpoints, so the file is self-describing and `validate_sidecar` verifies exact agreement between `cuteafd-mc.json["qmla"]` and the safetensors header on MC checkpoints.
 
-### Per-Bit-Mode Profile Design (No Single-Transform Assumption)
-Because content and RoPE objectives run QDQ at a specific bit width inside the loop, one transform set does **not** necessarily fit every width. Since the two paths are calibrated independently, we store **per-path, per-width profiles** in `mla_calibration.safetensors`:
-- Content profiles: `content.c8`, `content.c4`, `content.c2` → per calibrated layer $\ell$:
-  - `content.c{b}.layer_{l}.r`: `F32[d_c, d_c]` (orthogonal $R_C$)
-  - `content.c{b}.layer_{l}.s`: `F32[d_c]` (positive diagonal $s_C$)
-- RoPE profiles: `rope.r8`, `rope.r4` → per calibrated layer $\ell$:
-  - `rope.r{b}.layer_{l}.theta`: `F32[d_r / 2]` (planar rotation angles $\theta_i$)
-  - `rope.r{b}.layer_{l}.s`: `F32[d_r / 2]` (positive pair-tied scales $s_i$)
-- Optional `joint_overrides` (e.g., if a specific `2:4` joint fine-tune is ever produced) may override a `(C, R)` pair without duplicating other modes.
+### One Shipped Transform per Path, Selected Across Every Width (TJ, 2026-11-28)
+Calibration fits every width independently (content at 2/4/8, RoPE at 4/8), because the QDQ inside each objective is width-specific. Those per-width fits are for analysis. **The sidecar ships one content transform $(R_C, S_C)$ and one RoPE transform $(\theta, s)$ per layer, and serves them at every calibrated width.**
 
-Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\top R - I\|_\infty < 10^{-5}$) and single-rounding FP32 `kv_b_proj` absorption at load time, while remaining tiny on disk: **1.0 MiB/layer per content profile** (~36 MiB total for all 3 content + 2 RoPE profiles on Hy4-flash 12 DSA layers; ~234 MiB for 78-layer GLM 5.3 / Hy4).
+- **Candidates per layer and path:** every width's fit (`fitted:c2`, `fitted:c4`, `fitted:c8`; `fitted:r4`, `fitted:r8`) and each width's SmoothQuant init (`smoothquant:c4` is identity $R_C$ with the 4-bit alpha-grid scales; `smoothquant:r4` is zero angles with its pair scales).
+- **Selection (on `val`):** score every candidate on every combination, scoring content × RoPE pairs jointly on joint combinations. Ship the pair with the lowest **mean val ratio to RTN** over all measured combinations (`mean_val_ratio_to_rtn`). Each combination counts equally, so a 2-bit combination's larger absolute error does not outvote the 8-bit ones. This also acts as the joint guard. Per-path fits are chosen on their own objective ($\mathcal{L}_C$ with exact RoPE, $\mathcal{L}_P$ with exact content), but the reported number is the joint post-`o_proj` error. On pilot layer 21, SmoothQuant content + SmoothQuant RoPE beat fitted + fitted at 4:4. Selecting on the joint combinations catches that.
+- **Why one transform rather than per-combination references:** the runtime writes one cache coordinate system per layer. A separate transform per width or per combination would multiply sidecar bytes, load-time absorptions and cache identities for a difference the cross-table can measure first. If the measured cross-table shows one transform losing materially at some width, a per-width profile can come back as a schema change, backed by that measurement.
+- **Recorded per layer:** `profiles.<path>.selection.per_layer[l] = {candidate, chosen: fitted|smoothquant, source_bits, objective, val_score: {combination: val error}}`. A SmoothQuant choice is still a fingerprinted profile. The validator requires its rotation to be the identity (content) or its angles to be zero (RoPE).
+- **Tensors:** `content.layer_{l}.r` `F32[d_c, d_c]`, `content.layer_{l}.s` `F32[d_c]`, `rope.layer_{l}.theta` and `rope.layer_{l}.s` `F32[d_r/2]`. `profiles.content.bits` / `profiles.rope.bits` list the served widths; `supported_modes` is derived from them. A path with no profile (pure NoPE RoPE) is `null`.
 
-### Embedded `qmla` Section Schema (`schema: "cuteafd-qmla-v1"`)
+Storing `F32` keeps orthogonality validation ($\|R^\top R - I\|_\infty < 10^{-5}$) and FP32 `kv_b_proj` absorption at load time exact. On disk that is 1.0 MiB/layer for content: ~12 MiB on Hy4-flash's 12 DSA layers, ~78 MiB for 78-layer GLM 5.3 / Hy4.
+
+### Embedded `qmla` Section Schema (`schema: "cuteafd-qmla-v2"`)
 ```json
 {
-  "schema": "cuteafd-qmla-v1",
+  "schema": "cuteafd-qmla-v2",
   "artifact_status": "calibrated_unqualified",
   "protection_policy": "sink4_local128",
   "protection_scope": "full_history_mla_only",
@@ -177,7 +176,7 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
   },
   "applicable_views": ["original", "k8-compact", "k6-compact", "fp8-compact"],
   "view_transfer_validation": {
-    "original": {"equiv_max_rel_err": 1.2e-5, "c4_output_nmse_delta": 0.0002}
+    "k8-compact": {"split": "test", "reference": "k8-compact 0:0", "combinations": {"4:4": {"attn_rel_err": 0.0, "rtn_attn_rel_err": 0.0, "ratio_to_rtn": 0.0}}}
   },
   "conventions": {
     "vector_layout": "row",
@@ -219,26 +218,30 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
   ],
   "profiles": {
     "content": {
-      "c4": {
-        "bits": 4,
-        "transform_kind": "dense_orth",
-        "layers": [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41],
-        "tensors_prefix": "content.c4",
-        "protection_calibrated": "sink4_local128",
-        "validation": {"val_loss_mean": 0.0, "equiv_max_rel_err": 0.0, "orth_max_err": 0.0},
-        "profile_fingerprint": "<sha256>"
-      }
+      "bits": [2, 4, 8],
+      "transform_kind": "dense_orth",
+      "layers": [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41],
+      "tensors_prefix": "content",
+      "protection_calibrated": "sink4_local128",
+      "selection": {
+        "objective": "mean_val_ratio_to_rtn",
+        "per_layer": {
+          "21": {"candidate": "smoothquant:c4", "chosen": "smoothquant", "source_bits": 4,
+                 "objective": 0.64, "val_score": {"4:4": 0.0, "4:0": 0.0}}
+        }
+      },
+      "validation": {"equiv_max_rel_err": 0.0, "orth_max_err": 0.0, "per_layer": {}},
+      "profile_fingerprint": "<sha256>"
     },
     "rope": {
-      "r4": {
-        "bits": 4,
-        "transform_kind": "pair_so2",
-        "layers": [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41],
-        "tensors_prefix": "rope.r4",
-        "protection_calibrated": "sink4_local128",
-        "validation": {"val_loss_mean": 0.0, "equiv_max_rel_err": 0.0},
-        "profile_fingerprint": "<sha256>"
-      }
+      "bits": [4, 8],
+      "transform_kind": "pair_so2",
+      "layers": [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41],
+      "tensors_prefix": "rope",
+      "protection_calibrated": "sink4_local128",
+      "selection": {"objective": "mean_val_ratio_to_rtn", "per_layer": {}},
+      "validation": {"equiv_max_rel_err": 0.0, "per_layer": {}},
+      "profile_fingerprint": "<sha256>"
     }
   },
   "supported_modes": ["8:8", "4:8", "4:4", "2:4", "4:0", "0:4", "8:0", "0:8", "2:0"],
@@ -251,7 +254,14 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
       "exl3_standard": {"sequences": 64, "tokens": 131072, "input_ids_sha256": "<sha256>"}
     },
     "train_sequences": 128,
-    "val_sequences": 32,
+    "val_sequences": 16,
+    "test_sequences": 16,
+    "splits": {"salt": "cuteafd-qmla-split-v2", "seed": 0,
+               "train": {"count": 128, "seq_ids": ["..."], "sha256": ["..."], "digest": "<sha256>"},
+               "val": {"count": 16, "seq_ids": ["..."], "sha256": ["..."], "digest": "<sha256>"},
+               "test": {"count": 16, "seq_ids": ["..."], "sha256": ["..."], "digest": "<sha256>"}},
+    "measurement_split": "test",
+    "combination_measurements": {"4:4": {"attn_rel_err": 0.0, "rtn_attn_rel_err": 0.0, "ratio_to_rtn": 0.0}},
     "input_ids_sha256": "<sha256>",
     "renderer_template_sha256": "<sha256>",
     "thinking_mode": "high",
@@ -277,7 +287,8 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
 1. **Corpus (pinned panel revision + fixed known component set, never Standard Fidelity):** Draw deterministically from a pinned revision of `wrldsuksgo2mars/agentic-quant-panel-v2` (default `54683731eb01c7c2fa5b801a0888e029a0e1b1c7`, matching `quantization/hy4_flash/prepare_corpus.py`) over the fixed known component set `{agentic, exl3_standard, long_context}` (no arbitrary pluggable component list):
    - **Current pilot & full calibration (2 components, default):** `agentic` (chat-rendered with this checkpoint's own template) + `exl3_standard` (packed with this tokenizer under `exl3-standard-pack-v1`). Do **not** fail closed on the missing third component.
    - **Later recalibration with long context (3 components):** pass `--panel-revision <NEW_40_CHAR_SHA>` and `--components agentic,exl3_standard,long_context` once the new dataset revision carrying `long_context` (16K/32K traces, ~128K tokens per length class, plus agentic traces and long articles) lands, to exercise DSA top-k selection past 2,048 tokens.
-   - Record the exact `dataset_repo`, `dataset_revision`, and components used in `calibration_provenance`. Partition into disjoint `train` (default 128 sequences) and `val` (default 32 sequences) by prompt/row hash. Never touch the held-out Standard Fidelity panel.
+   - Record the exact `dataset_repo`, `dataset_revision`, and components used in `calibration_provenance`. Never touch the held-out Standard Fidelity panel.
+   - **Three disjoint splits** by a salt-versioned SHA256 hash of each row ID (`cuteafd-qmla-split-v2`): `train` fits transforms; `val` selects each fit's best step and the shipped transform, and nothing else; `test` produces every reported number. Defaults: full run 128 / 16 / 16, pilot 16 / 4 / 4. Each split's sequence IDs and token-ID SHA256s go into capture provenance, `calibration_provenance.splits` and the fit-checkpoint identity. A reused capture whose salt, seed, counts or membership differ refuses to load. Two-way `cuteafd-qmla-capture-v1` captures refuse outright.
 2. **Per-layer capture (Hessians alone are insufficient):** At each MLA layer $\ell$, capture:
    - Weightless normalized content latent $u_\ell = \mathrm{RMSNorm}_1(x_{c,\ell})$ (`[T, d_c]`) and native $\gamma_\ell$.
    - Absorbed content query $\bar{Q}_{C,\ell}$ (or $Q_{C,\ell}$ + `kv_b_proj`, `o_proj`, output gate, learnable sink, post-proj norm, VHA postmix) and post-RoPE positional queries $Q_{P,\ell}$ and keys $K_{P,\ell}$ (since $R_P, S_P$ commute with RoPE, post-RoPE capture avoids re-running RoPE inside the optimization loop).
@@ -290,7 +301,8 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
    - **Shared-KV layers (Mistral Large 4):** Accumulate $\mathcal{L}_C$ across all consumer layers sharing `kv_source_layer` so one $(R_C, S_C)$ optimizes every consumer jointly.
 4. **Optimizer & baseline comparison:** For each layer and bit width, run:
    - Step 0 evaluation of RTN and fixed Sylvester Hadamard (`H_512`) baselines + 99.9th-percentile scale-init grid $\alpha \in \{0, 0.125, 0.25, 0.5, 0.75, 1\}$ (gives SmoothQuant† for free).
-   - 300 steps of AdamW (Cayley orthogonal $R_C$, log-scale $S_C \in [-2,2]$, angles $\theta_i$, pair-tied log-scales $s_i \in [-2,2]$), selecting the best checkpoint on the 32-sequence validation bank every 20 steps.
+   - 300 steps of AdamW (Cayley orthogonal $R_C$, log-scale $S_C \in [-2,2]$, angles $\theta_i$, pair-tied log-scales $s_i \in [-2,2]$), selecting the best checkpoint on the `val` split every 20 steps (step 0 is the SmoothQuant init).
+   - Then build the candidate cross-table (every width's fit and SmoothQuant init against every combination) on `val`, and select one content and one RoPE transform per layer (§5). Measure the same table on `test` for the report.
    - Mandatory validators: orthogonality ($\|R^\top R - I\|_\infty < 10^{-5}$), scale finiteness & positivity, quantization-off algebraic equivalence against reference output (and 3D M-RoPE commutation where applicable), and cross-view transfer check.
 
 ---
@@ -333,7 +345,7 @@ New CuteAFD quant families are built by copying the previous family's working pi
   - `capture.py` *(mode-agnostic)*: `MlaLayerGeometry`, `CapturedSequence`, `CapturedLayerParams`, `CapturedLayerBank`, `QmlaCaptureAdapter` protocol, exact full-precision attention-output / positional-QK evaluators, deterministic train/val splitting, and sequential segment capture storage with streamed XXH3-128 receipts.
   - `quantizer.py`: paper-faithful per-token asymmetric affine group-64 quantizer (RNE ties-to-even, STE, INT2/INT4/INT8 pack/unpack + CPU numeric oracle).
   - `fit.py`: content-path Cayley orthogonal $R_C$ + log-scale $S_C$ optimizer ($\mathcal{L}_C$), RoPE-path per-pair $SO(2)$ angles + pair-tied scales optimizer ($\mathcal{L}_P$), step-0 RTN / fixed-Hadamard / SmoothQuant† $\alpha$-search baselines, shared-KV multi-consumer loss aggregation, per-layer streaming & checkpoint/resume.
-  - `sidecar.py`: `cuteafd-qmla-v1` single-file sidecar (`mla_calibration.safetensors` with embedded `__metadata__["cuteafd_qmla"]` + full `"qmla"` section inside `cuteafd-mc.json` for MC checkpoints; no separate `mla_calibration.json`), `transform_fingerprint`, and fail-closed validators (geometry, source identity, SHA256 digests, orthogonality/invertibility, quantization-off algebraic equivalence, cross-view transfer).
+  - `sidecar.py`: `cuteafd-qmla-v2` single-file sidecar (`mla_calibration.safetensors` with embedded `__metadata__["cuteafd_qmla"]` + full `"qmla"` section inside `cuteafd-mc.json` for MC checkpoints; no separate `mla_calibration.json`), `transform_fingerprint`, and fail-closed validators (geometry, source identity, SHA256 digests, orthogonality/invertibility, quantization-off algebraic equivalence, cross-view transfer).
   - `publish.py`: same-repo incremental HF revision publisher over `quantization/hub_lfs.py` (`HF_HUB_DISABLE_XET=1`), rewriting `cuteafd-mc.json` with `"qmla"` (MC) and adding `mla_calibration.safetensors` with zero weight shard re-upload.
 - **Thin family adapter (`quantization/hy4_flash/`, reference pipeline to copy):**
   - `qmla_capture.py` *(mode-agnostic)*: `Hy4FlashCaptureAdapter` wiring Hy4-flash's geometry (12 DSA + 30 SWA layers, interleaved 3D M-RoPE `[12,10,10]`, compressed-indexer group top-k masks, gated MLA, learnable sinks, `post_proj_norm`, and DFly2 target taps) into `quantization/qmla/capture.py` — reusable in both full MC causal passes and standalone incremental passes.
@@ -411,6 +423,7 @@ Physical cache accounting **includes** scales, padding, unchanged DSA indexer ca
 2. **RoPE execution:** Fuse $(\theta_i, s_i, s_i^{-1})$ directly into the existing RoPE phase/scale step (zero extra matmuls, zero weight mutations, commutes with 3D M-RoPE and YaRN/LeRoPE).
 3. **CLI composition (`--kv-cache` + `QUANT_MLA`):** Compose rather than conflict. `--kv-cache` sets the default for SWA rings, indexer keys, and MLA; `QUANT_MLA` overrides only the full-history MLA path(s) set nonzero (`0` retains `--kv-cache`). Cache identity includes the resolved per-path format.
 4. **Protection ON from the start (`[Adaptation A4]`):** `sink4_local128` is the **default** policy for every nonzero mode on **full-history MLA layers only (SWA untouched)**, in both calibration and serving (`none` is only a measured alternative). Admission, prefix marks, and CUDA graph identity account for `sink4_local128` from Phase 3 onward.
-5. **Single sidecar file (`mla_calibration.safetensors`) + `cuteafd-mc.json["qmla"]` (no `mla_calibration.json`):** The full `cuteafd-qmla-v1` manifest lives in `cuteafd-mc.json["qmla"]` for MC checkpoints (advisory, never in `required_features`, `0:0` unchanged) and in `mla_calibration.safetensors`'s `__metadata__["cuteafd_qmla"]` header for non-MC checkpoints (chosen over a minimal `cuteafd-mc.json` to preserve `docs/mc-checkpoints.md`'s MC discovery invariant and add only one file).
+5. **Single sidecar file (`mla_calibration.safetensors`) + `cuteafd-mc.json["qmla"]` (no `mla_calibration.json`):** The full `cuteafd-qmla-v2` manifest lives in `cuteafd-mc.json["qmla"]` for MC checkpoints (advisory, never in `required_features`, `0:0` unchanged) and in `mla_calibration.safetensors`'s `__metadata__["cuteafd_qmla"]` header for non-MC checkpoints (chosen over a minimal `cuteafd-mc.json` to preserve `docs/mc-checkpoints.md`'s MC discovery invariant and add only one file).
 6. **Pinned panel corpus (`[Adaptation A3]`):** No pluggable arbitrary component-list mechanism. Pilot and full calibration run immediately on the two existing components (`agentic` + `exl3_standard`) from `wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7` and record the exact revision and components used in `calibration_provenance`. A later recalibration adds the known third component `long_context` from the fixed set `{agentic, exl3_standard, long_context}` simply by changing `--panel-revision` and passing `--components agentic,exl3_standard,long_context`.
 7. **Library placement & reference pipeline:** Shared family-agnostic QMLA code lives in `quantization/qmla/` inside `cuteafd` (**no `GPTQModel` fork changes / no fork PR**); Hy4-flash in `quantization/hy4_flash/` is the end-to-end reference pipeline with pilot/full CLI flags that subsequent families copy.
+8. **Three splits, test-only reporting, one shipped transform per path:** `train` fits, `val` selects fit steps and the shipped transform, `test` produces every reported number (128 / 16 / 16 full, 16 / 4 / 4 pilot). Every width is fitted and measured for analysis. The sidecar ships one content and one RoPE transform per layer, selected jointly across all combinations on `val` (§5). The pilot fits every width and measures all nine combinations.

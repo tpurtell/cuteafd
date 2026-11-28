@@ -1,8 +1,9 @@
-"""Versioned cuteafd-qmla-v1 single-file sidecar writer, fail-closed validator, and MC integration.
+"""Versioned cuteafd-qmla-v2 single-file sidecar writer, fail-closed validator, and MC integration.
 
 There is NO separate ``mla_calibration.json`` file. The ONLY sidecar file added at a
-checkpoint root is ``mla_calibration.safetensors`` (F32 per-path/per-width profiles):
-- On MC checkpoints (have ``cuteafd-mc.json``): the full ``cuteafd-qmla-v1`` manifest lives
+checkpoint root is ``mla_calibration.safetensors`` (F32, one shipped transform per path,
+served at every calibrated width):
+- On MC checkpoints (have ``cuteafd-mc.json``): the full ``cuteafd-qmla-v2`` manifest lives
   as the optional advisory ``"qmla"`` section inside ``cuteafd-mc.json`` (never in
   ``required_features``), pinning whole-file ``tensors_sha256`` and ``tensors_bytes``.
 - On non-MC checkpoints (official / plain without ``cuteafd-mc.json``): the exact same
@@ -34,6 +35,7 @@ from .capture import (
     MlaLayerGeometry,
     _canonical_json,
     _fsync_dir,
+    check_split_description,
     eval_attention_output,
     eval_positional_qk,
 )
@@ -48,7 +50,10 @@ from .fit import (
 )
 from .quantizer import CONTENT_NONZERO_BITS, EPS_SCALE, GROUP_SIZE, ROPE_NONZERO_BITS, parse_qmla_mode
 
-QMLA_SCHEMA = "cuteafd-qmla-v1"
+QMLA_SCHEMA = "cuteafd-qmla-v2"
+PROFILE_PATHS = ("content", "rope")
+SELECTION_OBJECTIVE = "mean_val_ratio_to_rtn"
+VALID_SELECTION_KINDS = frozenset({"fitted", "smoothquant"})
 TENSORS_FILE = "mla_calibration.safetensors"
 QMLA_METADATA_KEY = "cuteafd_qmla"
 VALID_ARTIFACT_STATUSES = frozenset({"calibrated_unqualified", "runtime_qualified"})
@@ -192,10 +197,14 @@ def _validate_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:
         }
     prov["components"] = validated_components
 
-    for key in ("train_sequences", "val_sequences"):
+    splits = check_split_description(prov.get("splits"))
+    for name in ("train", "val", "test"):
+        key = f"{name}_sequences"
         val = prov.get(key)
         if type(val) is not int or val <= 0:
             raise ValueError(f"calibration_provenance.{key} must be a positive integer")
+        if val != splits[name]["count"]:
+            raise ValueError(f"calibration_provenance.{key} disagrees with its split description")
     if not _is_hex(prov.get("input_ids_sha256"), 64):
         raise ValueError("calibration_provenance.input_ids_sha256 must be a 64-char hex digest")
     for key in ("optimizer", "code_commit"):
@@ -320,19 +329,25 @@ def _read_f32_safetensors_with_metadata(
 
 def _profile_fingerprint(
     kind: str,
-    bits: int,
+    bits: Sequence[int],
     transform_kind: str,
     protection_calibrated: str,
     layers: Sequence[int],
+    selection: Mapping[str, Any],
     tensor_digests: Mapping[str, str],
 ) -> str:
+    """Bind one shipped path profile: served widths, layers, per-layer choice and tensor bytes."""
     payload = {
         "schema": QMLA_SCHEMA,
         "kind": kind,
-        "bits": bits,
+        "bits": list(bits),
         "transform_kind": transform_kind,
         "protection_calibrated": protection_calibrated,
         "layers": list(layers),
+        "chosen": {
+            lid: {"candidate": row["candidate"], "chosen": row["chosen"], "source_bits": row["source_bits"]}
+            for lid, row in sorted(selection["per_layer"].items(), key=lambda kv: int(kv[0]))
+        },
         "tensors": {k: tensor_digests[k] for k in sorted(tensor_digests)},
     }
     return _sha256_bytes(_canonical_json(payload).encode("utf-8"))
@@ -350,14 +365,8 @@ def compute_transform_fingerprint(manifest: Mapping[str, Any]) -> str:
         "conventions": manifest["conventions"],
         "quantizer_recipe": manifest["quantizer_recipe"],
         "profiles": {
-            "content": {
-                k: v["profile_fingerprint"]
-                for k, v in sorted(manifest["profiles"]["content"].items())
-            },
-            "rope": {
-                k: v["profile_fingerprint"]
-                for k, v in sorted(manifest["profiles"]["rope"].items())
-            },
+            path: (None if manifest["profiles"][path] is None else manifest["profiles"][path]["profile_fingerprint"])
+            for path in PROFILE_PATHS
         },
         "tensors_payload_sha256": manifest["tensors_payload_sha256"],
     }
@@ -389,13 +398,47 @@ def derive_supported_modes(
     return modes, reasons
 
 
+def _check_selection(path: str, selection: Mapping[str, Any], layers: Sequence[int]) -> dict[str, Any]:
+    """Validate a path's per-layer shipped-candidate record (see ``measurement.select_shipped``)."""
+    if not isinstance(selection, Mapping) or set(selection) != {"objective", "per_layer"}:
+        raise ValueError(f"{path} selection must hold objective and per_layer")
+    if selection["objective"] != SELECTION_OBJECTIVE:
+        raise ValueError(f"{path} selection objective must be {SELECTION_OBJECTIVE!r}")
+    per_layer = selection["per_layer"]
+    if not isinstance(per_layer, Mapping) or sorted(int(k) for k in per_layer) != list(layers):
+        raise ValueError(f"{path} selection must record every shipped layer")
+    width = "c" if path == "content" else "r"
+    out: dict[str, Any] = {}
+    for lid, row in per_layer.items():
+        if not isinstance(row, Mapping) or set(row) != {"candidate", "chosen", "source_bits", "objective", "val_score"}:
+            raise ValueError(f"{path} selection for layer {lid} has unexpected fields")
+        if row["chosen"] not in VALID_SELECTION_KINDS or type(row["source_bits"]) is not int:
+            raise ValueError(f"{path} selection for layer {lid} has an invalid choice")
+        if row["candidate"] != f"{row['chosen']}:{width}{row['source_bits']}":
+            raise ValueError(f"{path} selection for layer {lid} names a candidate that disagrees with its choice")
+        scores = row["val_score"]
+        if not isinstance(scores, Mapping) or not scores:
+            raise ValueError(f"{path} selection for layer {lid} needs per-combination val scores")
+        for mode, value in scores.items():
+            parse_qmla_mode(mode)
+            if not isinstance(value, (int, float)) or not value >= 0.0:
+                raise ValueError(f"{path} selection for layer {lid} has an invalid val score at {mode}")
+        if not isinstance(row["objective"], (int, float)) or not row["objective"] >= 0.0:
+            raise ValueError(f"{path} selection for layer {lid} has an invalid objective")
+        out[str(int(lid))] = dict(row)
+    return {"objective": SELECTION_OBJECTIVE, "per_layer": out}
+
+
 def write_sidecar(
     output_dir: Path | str,
     *,
     source: Mapping[str, Any],
     geometries: Sequence[MlaLayerGeometry],
-    content_profiles: Mapping[int, Sequence[ContentFitResult]],
-    rope_profiles: Mapping[int, Sequence[RopeFitResult]],
+    content_profile: Sequence[ContentFitResult],
+    rope_profile: Sequence[RopeFitResult],
+    content_bits: Sequence[int],
+    rope_bits: Sequence[int],
+    selection: Mapping[str, Mapping[str, Any] | None],
     provenance: Mapping[str, Any],
     applicable_views: Sequence[str] = ("original",),
     view_transfer_validation: Mapping[str, Any] | None = None,
@@ -404,6 +447,11 @@ def write_sidecar(
     extra_unsupported_reasons: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     """Write single-file ``mla_calibration.safetensors`` (with embedded metadata) and validate it.
+
+    Each path ships ONE transform per layer, served at every width in ``content_bits`` /
+    ``rope_bits``. A layer's transform is either a width's fit or that width's SmoothQuant
+    initialization (identity rotation or zero angles with the init scales); ``selection``
+    records which, per layer, and its val score per combination.
 
     Returns the full MC-ready ``qmla`` manifest dict (embedded manifest plus whole-file
     ``tensors_bytes`` and ``tensors_sha256``). Never writes a separate ``mla_calibration.json``.
@@ -421,124 +469,87 @@ def write_sidecar(
             raise ValueError(f"duplicate geometry for layer {g.layer_id}")
         geom_by_layer[g.layer_id] = g
 
-    if not content_profiles and not rope_profiles:
-        raise ValueError("write_sidecar requires at least one content or RoPE profile")
+    served = {"content": sorted(set(int(b) for b in content_bits)), "rope": sorted(set(int(b) for b in rope_bits))}
+    results_by_path = {
+        "content": sorted(content_profile, key=lambda r: r.layer_id),
+        "rope": sorted(rope_profile, key=lambda r: r.layer_id),
+    }
+    if not results_by_path["content"] and not results_by_path["rope"]:
+        raise ValueError("write_sidecar requires a content or RoPE profile")
+    for path, allowed in (("content", CONTENT_NONZERO_BITS), ("rope", ROPE_NONZERO_BITS)):
+        if bool(results_by_path[path]) != bool(served[path]):
+            raise ValueError(f"{path} transforms and served widths must be given together")
+        if any(b not in allowed for b in served[path]):
+            raise ValueError(f"unsupported {path} widths: {served[path]}")
+        layers = [r.layer_id for r in results_by_path[path]]
+        if len(set(layers)) != len(layers):
+            raise ValueError(f"{path} profile repeats a layer")
 
     tensors: dict[str, torch.Tensor] = {}
-    for bits in sorted(content_profiles):
-        if bits not in CONTENT_NONZERO_BITS:
-            raise ValueError(f"unsupported content profile bits: {bits}")
-        results = sorted(content_profiles[bits], key=lambda r: r.layer_id)
-        if not results:
-            raise ValueError(f"empty content profile for c{bits}")
-        prefix = f"content.c{bits}"
-        for res in results:
-            if res.protection_calibrated != protection_policy:
-                raise ValueError(
-                    f"content c{bits} layer {res.layer_id} protection_calibrated={res.protection_calibrated!r} "
-                    f"disagrees with sidecar protection_policy={protection_policy!r}"
-                )
-            if res.layer_id not in geom_by_layer:
-                raise ValueError(f"content c{bits} layer {res.layer_id} absent from geometries")
-            g = geom_by_layer[res.layer_id]
-            if res.r_c.shape != (g.kv_lora_rank, g.kv_lora_rank) or res.s_c.shape != (g.kv_lora_rank,):
-                raise ValueError(f"content c{bits} layer {res.layer_id} tensor shape mismatch")
-            tensors[f"{prefix}.layer_{res.layer_id}.r"] = res.r_c
-            tensors[f"{prefix}.layer_{res.layer_id}.s"] = res.s_c
-
-    for bits in sorted(rope_profiles):
-        if bits not in ROPE_NONZERO_BITS:
-            raise ValueError(f"unsupported RoPE profile bits: {bits}")
-        results = sorted(rope_profiles[bits], key=lambda r: r.layer_id)
-        if not results:
-            raise ValueError(f"empty RoPE profile for r{bits}")
-        prefix = f"rope.r{bits}"
-        for res in results:
-            if res.protection_calibrated != protection_policy:
-                raise ValueError(
-                    f"RoPE r{bits} layer {res.layer_id} protection_calibrated={res.protection_calibrated!r} "
-                    f"disagrees with sidecar protection_policy={protection_policy!r}"
-                )
-            if res.layer_id not in geom_by_layer:
-                raise ValueError(f"RoPE r{bits} layer {res.layer_id} absent from geometries")
-            g = geom_by_layer[res.layer_id]
-            if not g.has_rope:
-                raise ValueError(f"RoPE r{bits} cannot include NoPE layer {res.layer_id}")
-            pairs = g.qk_rope_dim // 2
-            if res.theta.shape != (pairs,) or res.s_p.shape != (pairs,):
-                raise ValueError(f"RoPE r{bits} layer {res.layer_id} tensor shape mismatch")
-            tensors[f"{prefix}.layer_{res.layer_id}.theta"] = res.theta
-            tensors[f"{prefix}.layer_{res.layer_id}.s"] = res.s_p
+    for res in results_by_path["content"]:
+        if res.protection_calibrated != protection_policy:
+            raise ValueError(
+                f"content layer {res.layer_id} protection_calibrated={res.protection_calibrated!r} "
+                f"disagrees with sidecar protection_policy={protection_policy!r}"
+            )
+        if res.layer_id not in geom_by_layer:
+            raise ValueError(f"content layer {res.layer_id} absent from geometries")
+        g = geom_by_layer[res.layer_id]
+        if res.r_c.shape != (g.kv_lora_rank, g.kv_lora_rank) or res.s_c.shape != (g.kv_lora_rank,):
+            raise ValueError(f"content layer {res.layer_id} tensor shape mismatch")
+        tensors[f"content.layer_{res.layer_id}.r"] = res.r_c
+        tensors[f"content.layer_{res.layer_id}.s"] = res.s_c
+    for res in results_by_path["rope"]:
+        if res.protection_calibrated != protection_policy:
+            raise ValueError(
+                f"RoPE layer {res.layer_id} protection_calibrated={res.protection_calibrated!r} "
+                f"disagrees with sidecar protection_policy={protection_policy!r}"
+            )
+        if res.layer_id not in geom_by_layer:
+            raise ValueError(f"RoPE layer {res.layer_id} absent from geometries")
+        g = geom_by_layer[res.layer_id]
+        if not g.has_rope:
+            raise ValueError(f"RoPE profile cannot include NoPE layer {res.layer_id}")
+        pairs = g.qk_rope_dim // 2
+        if res.theta.shape != (pairs,) or res.s_p.shape != (pairs,):
+            raise ValueError(f"RoPE layer {res.layer_id} tensor shape mismatch")
+        tensors[f"rope.layer_{res.layer_id}.theta"] = res.theta
+        tensors[f"rope.layer_{res.layer_id}.s"] = res.s_p
 
     header_tensors, ordered_payloads, tensor_digests, payload_sha256, payload_bytes = _prepare_f32_tensors(tensors)
 
-    content_meta: dict[str, Any] = {}
-    for bits in sorted(content_profiles):
-        results = sorted(content_profiles[bits], key=lambda r: r.layer_id)
-        prefix = f"content.c{bits}"
+    profiles: dict[str, Any] = {}
+    for path, transform_kind in (("content", "dense_orth"), ("rope", "pair_so2")):
+        results = results_by_path[path]
+        if not results:
+            profiles[path] = None
+            continue
         layers = [r.layer_id for r in results]
-        prof_digests = {k: v for k, v in tensor_digests.items() if k.startswith(prefix + ".")}
-        content_meta[f"c{bits}"] = {
-            "bits": bits,
-            "transform_kind": "dense_orth",
-            "layers": layers,
-            "tensors_prefix": prefix,
-            "protection_calibrated": protection_policy,
-            "validation": {
-                "val_loss_mean": float(sum(r.best_val_loss for r in results) / len(results)),
-                "equiv_max_rel_err": float(max(r.equiv_max_rel_err for r in results)),
-                "orth_max_err": float(max(r.orth_max_err for r in results)),
-                "per_layer": {
-                    str(r.layer_id): {
-                        "best_step": r.best_step,
-                        "best_val_loss": r.best_val_loss,
-                        "init_alpha": r.init_alpha,
-                        "equiv_max_rel_err": r.equiv_max_rel_err,
-                        "orth_max_err": r.orth_max_err,
-                        "baselines": r.baselines,
-                    }
-                    for r in results
-                },
+        chosen = _check_selection(path, selection.get(path) or {}, layers)
+        prof_digests = {k: v for k, v in tensor_digests.items() if k.startswith(path + ".")}
+        validation: dict[str, Any] = {
+            "equiv_max_rel_err": float(max(r.equiv_max_rel_err for r in results)),
+            "per_layer": {
+                str(r.layer_id): {"equiv_max_rel_err": r.equiv_max_rel_err, "init_alpha": r.init_alpha}
+                for r in results
             },
+        }
+        if path == "content":
+            validation["orth_max_err"] = float(max(r.orth_max_err for r in results))
+        profiles[path] = {
+            "bits": served[path],
+            "transform_kind": transform_kind,
+            "layers": layers,
+            "tensors_prefix": path,
+            "protection_calibrated": protection_policy,
+            "selection": chosen,
+            "validation": validation,
             "profile_fingerprint": _profile_fingerprint(
-                "content", bits, "dense_orth", protection_policy, layers, prof_digests
+                path, served[path], transform_kind, protection_policy, layers, chosen, prof_digests
             ),
         }
 
-    rope_meta: dict[str, Any] = {}
-    for bits in sorted(rope_profiles):
-        results = sorted(rope_profiles[bits], key=lambda r: r.layer_id)
-        prefix = f"rope.r{bits}"
-        layers = [r.layer_id for r in results]
-        prof_digests = {k: v for k, v in tensor_digests.items() if k.startswith(prefix + ".")}
-        rope_meta[f"r{bits}"] = {
-            "bits": bits,
-            "transform_kind": "pair_so2",
-            "layers": layers,
-            "tensors_prefix": prefix,
-            "protection_calibrated": protection_policy,
-            "validation": {
-                "val_loss_mean": float(sum(r.best_val_loss for r in results) / len(results)),
-                "equiv_max_rel_err": float(max(r.equiv_max_rel_err for r in results)),
-                "per_layer": {
-                    str(r.layer_id): {
-                        "best_step": r.best_step,
-                        "best_val_loss": r.best_val_loss,
-                        "init_alpha": r.init_alpha,
-                        "equiv_max_rel_err": r.equiv_max_rel_err,
-                        "baselines": r.baselines,
-                    }
-                    for r in results
-                },
-            },
-            "profile_fingerprint": _profile_fingerprint(
-                "rope", bits, "pair_so2", protection_policy, layers, prof_digests
-            ),
-        }
-
-    supported_modes, unsupported_reasons = derive_supported_modes(
-        sorted(content_profiles), sorted(rope_profiles), geometries
-    )
+    supported_modes, unsupported_reasons = derive_supported_modes(served["content"], served["rope"], geometries)
     if extra_unsupported_reasons:
         unsupported_reasons.update(extra_unsupported_reasons)
 
@@ -557,12 +568,12 @@ def write_sidecar(
         "geometry": [
             dict(
                 g.to_dict(),
-                content_enabled=any(g.layer_id in p["layers"] for p in content_meta.values()),
-                rope_enabled=any(g.layer_id in p["layers"] for p in rope_meta.values()),
+                content_enabled=profiles["content"] is not None and g.layer_id in profiles["content"]["layers"],
+                rope_enabled=profiles["rope"] is not None and g.layer_id in profiles["rope"]["layers"],
             )
             for g in sorted(geometries, key=lambda x: x.layer_id)
         ],
-        "profiles": {"content": content_meta, "rope": rope_meta},
+        "profiles": profiles,
         "supported_modes": supported_modes,
         "unsupported_modes_reason": unsupported_reasons,
         "calibration_provenance": prov,
@@ -671,86 +682,84 @@ def validate_sidecar(
             raise ValueError("QMLA manifest geometry disagrees with checkpoint geometry")
 
     expected_tensors: set[str] = set()
-    content_profiles = manifest["profiles"]["content"]
-    rope_profiles = manifest["profiles"]["rope"]
-    if not content_profiles and not rope_profiles:
+    profiles = manifest["profiles"]
+    if not isinstance(profiles, Mapping) or set(profiles) != set(PROFILE_PATHS):
+        raise ValueError(f"QMLA profiles must be keyed by path {PROFILE_PATHS}")
+    content_prof, rope_prof = profiles["content"], profiles["rope"]
+    if content_prof is None and rope_prof is None:
         raise ValueError("QMLA manifest defines no profiles")
 
     policy = manifest["protection_policy"]
     max_orth_err = 0.0
-    for key, prof in content_profiles.items():
-        bits = int(prof["bits"])
-        if key != f"c{bits}" or bits not in CONTENT_NONZERO_BITS:
-            raise ValueError(f"invalid content profile key/bits: {key}/{bits}")
+    for path, prof in profiles.items():
+        if prof is None:
+            continue
+        expected_fields = {
+            "bits", "transform_kind", "layers", "tensors_prefix", "protection_calibrated",
+            "selection", "validation", "profile_fingerprint",
+        }
+        if not isinstance(prof, Mapping) or set(prof) != expected_fields:
+            raise ValueError(f"QMLA {path} profile fields must be {sorted(expected_fields)}")
+        allowed = CONTENT_NONZERO_BITS if path == "content" else ROPE_NONZERO_BITS
+        bits = prof["bits"]
+        if (not isinstance(bits, list) or not bits or bits != sorted(set(bits))
+                or any(type(b) is not int or b not in allowed for b in bits)):
+            raise ValueError(f"invalid {path} profile served widths: {bits!r}")
+        if prof["transform_kind"] != ("dense_orth" if path == "content" else "pair_so2"):
+            raise ValueError(f"unexpected {path} transform_kind {prof['transform_kind']!r}")
         if prof.get("protection_calibrated") != policy:
-            raise ValueError(f"content profile {key} protection_calibrated disagrees with protection_policy")
-        prefix = f"content.c{bits}"
-        if prof["tensors_prefix"] != prefix:
-            raise ValueError(f"unexpected tensors_prefix for {key}")
+            raise ValueError(f"{path} profile protection_calibrated disagrees with protection_policy")
+        if prof["tensors_prefix"] != path:
+            raise ValueError(f"unexpected tensors_prefix for {path}")
         layers = [int(x) for x in prof["layers"]]
         if not layers or layers != sorted(set(layers)):
-            raise ValueError(f"content profile {key} layers must be sorted and unique")
+            raise ValueError(f"{path} profile layers must be sorted and unique")
+        if any(lid not in geom_by_layer for lid in layers):
+            raise ValueError(f"{path} profile references a layer absent from geometry")
+        selection = _check_selection(path, prof["selection"], layers)
         prof_digests: dict[str, str] = {}
         for lid in layers:
             g = geom_by_layer[lid]
-            r_name = f"{prefix}.layer_{lid}.r"
-            s_name = f"{prefix}.layer_{lid}.s"
-            expected_tensors.update((r_name, s_name))
-            if r_name not in tensors or s_name not in tensors:
-                raise ValueError(f"missing content tensors for layer {lid} profile {key}")
-            r_mat, s_vec = tensors[r_name], tensors[s_name]
-            if r_mat.shape != (g.kv_lora_rank, g.kv_lora_rank) or s_vec.shape != (g.kv_lora_rank,):
-                raise ValueError(f"content tensor shape mismatch at layer {lid} profile {key}")
-            if not bool(torch.isfinite(r_mat).all()) or not bool(torch.isfinite(s_vec).all()):
-                raise ValueError(f"non-finite content transform at layer {lid} profile {key}")
+            if path == "content":
+                names = (f"content.layer_{lid}.r", f"content.layer_{lid}.s")
+            else:
+                if not g.has_rope:
+                    raise ValueError(f"RoPE profile references NoPE layer {lid}")
+                names = (f"rope.layer_{lid}.theta", f"rope.layer_{lid}.s")
+            expected_tensors.update(names)
+            if any(n not in tensors for n in names):
+                raise ValueError(f"missing {path} tensors for layer {lid}")
+            first, s_vec = tensors[names[0]], tensors[names[1]]
+            if path == "content":
+                shape_ok = first.shape == (g.kv_lora_rank, g.kv_lora_rank) and s_vec.shape == (g.kv_lora_rank,)
+            else:
+                pairs = g.qk_rope_dim // 2
+                shape_ok = first.shape == (pairs,) and s_vec.shape == (pairs,)
+            if not shape_ok:
+                raise ValueError(f"{path} tensor shape mismatch at layer {lid}")
+            if not bool(torch.isfinite(first).all()) or not bool(torch.isfinite(s_vec).all()):
+                raise ValueError(f"non-finite {path} transform at layer {lid}")
             if not bool((s_vec > 0.0).all()):
-                raise ValueError(f"non-positive content scale at layer {lid} profile {key}")
-            eye = torch.eye(g.kv_lora_rank, dtype=torch.float32)
-            orth = float((r_mat.transpose(0, 1) @ r_mat - eye).abs().max().item())
-            max_orth_err = max(max_orth_err, orth)
-            if orth > orth_tol:
-                raise ValueError(f"content R_C orthogonality error {orth:.3e} > {orth_tol:.3e} at layer {lid} {key}")
-            prof_digests[r_name] = tensor_digests[r_name]
-            prof_digests[s_name] = tensor_digests[s_name]
-        expected_fp = _profile_fingerprint("content", bits, prof["transform_kind"], policy, layers, prof_digests)
+                raise ValueError(f"non-positive {path} scale at layer {lid}")
+            if selection["per_layer"][str(lid)]["chosen"] == "smoothquant":
+                identity = torch.eye(g.kv_lora_rank) if path == "content" else torch.zeros_like(first)
+                if not torch.equal(first, identity):
+                    raise ValueError(
+                        f"{path} layer {lid} records its SmoothQuant init but its "
+                        f"{'rotation is not the identity' if path == 'content' else 'angles are not zero'}"
+                    )
+            if path == "content":
+                eye = torch.eye(g.kv_lora_rank, dtype=torch.float32)
+                orth = float((first.transpose(0, 1) @ first - eye).abs().max().item())
+                max_orth_err = max(max_orth_err, orth)
+                if orth > orth_tol:
+                    raise ValueError(f"content R_C orthogonality error {orth:.3e} > {orth_tol:.3e} at layer {lid}")
+            prof_digests.update({n: tensor_digests[n] for n in names})
+        expected_fp = _profile_fingerprint(
+            path, bits, prof["transform_kind"], policy, layers, selection, prof_digests
+        )
         if prof["profile_fingerprint"] != expected_fp:
-            raise ValueError(f"content profile fingerprint mismatch for {key}")
-
-    for key, prof in rope_profiles.items():
-        bits = int(prof["bits"])
-        if key != f"r{bits}" or bits not in ROPE_NONZERO_BITS:
-            raise ValueError(f"invalid RoPE profile key/bits: {key}/{bits}")
-        if prof.get("protection_calibrated") != policy:
-            raise ValueError(f"RoPE profile {key} protection_calibrated disagrees with protection_policy")
-        prefix = f"rope.r{bits}"
-        if prof["tensors_prefix"] != prefix:
-            raise ValueError(f"unexpected tensors_prefix for {key}")
-        layers = [int(x) for x in prof["layers"]]
-        if not layers or layers != sorted(set(layers)):
-            raise ValueError(f"RoPE profile {key} layers must be sorted and unique")
-        prof_digests = {}
-        for lid in layers:
-            g = geom_by_layer[lid]
-            if not g.has_rope:
-                raise ValueError(f"RoPE profile {key} references NoPE layer {lid}")
-            pairs = g.qk_rope_dim // 2
-            t_name = f"{prefix}.layer_{lid}.theta"
-            s_name = f"{prefix}.layer_{lid}.s"
-            expected_tensors.update((t_name, s_name))
-            if t_name not in tensors or s_name not in tensors:
-                raise ValueError(f"missing RoPE tensors for layer {lid} profile {key}")
-            theta, s_vec = tensors[t_name], tensors[s_name]
-            if theta.shape != (pairs,) or s_vec.shape != (pairs,):
-                raise ValueError(f"RoPE tensor shape mismatch at layer {lid} profile {key}")
-            if not bool(torch.isfinite(theta).all()) or not bool(torch.isfinite(s_vec).all()):
-                raise ValueError(f"non-finite RoPE transform at layer {lid} profile {key}")
-            if not bool((s_vec > 0.0).all()):
-                raise ValueError(f"non-positive RoPE scale at layer {lid} profile {key}")
-            prof_digests[t_name] = tensor_digests[t_name]
-            prof_digests[s_name] = tensor_digests[s_name]
-        expected_fp = _profile_fingerprint("rope", bits, prof["transform_kind"], policy, layers, prof_digests)
-        if prof["profile_fingerprint"] != expected_fp:
-            raise ValueError(f"RoPE profile fingerprint mismatch for {key}")
+            raise ValueError(f"{path} profile fingerprint mismatch")
 
     if set(tensors) != expected_tensors:
         raise ValueError(
@@ -763,8 +772,8 @@ def validate_sidecar(
         raise ValueError("QMLA transform_fingerprint mismatch")
 
     expected_modes, _ = derive_supported_modes(
-        [int(p["bits"]) for p in content_profiles.values()],
-        [int(p["bits"]) for p in rope_profiles.values()],
+        content_prof["bits"] if content_prof is not None else [],
+        rope_prof["bits"] if rope_prof is not None else [],
         geoms,
     )
     for mode in manifest["supported_modes"]:
@@ -799,11 +808,9 @@ def validate_sidecar(
         with torch.no_grad():
             for lid, bank in banks_by_layer.items():
                 g = geom_by_layer[lid]
-                for key, prof in content_profiles.items():
-                    if lid not in prof["layers"]:
-                        continue
-                    r_mat = tensors[f"{prof['tensors_prefix']}.layer_{lid}.r"]
-                    s_vec = tensors[f"{prof['tensors_prefix']}.layer_{lid}.s"]
+                if content_prof is not None and lid in content_prof["layers"]:
+                    r_mat = tensors[f"content.layer_{lid}.r"]
+                    s_vec = tensors[f"content.layer_{lid}.s"]
                     w_tilde = compensate_kv_b(bank.params.kv_b_weight, bank.params.kv_norm_weight, r_mat, s_vec)
                     for seq in bank.val:
                         pred = eval_attention_output(
@@ -818,13 +825,11 @@ def validate_sidecar(
                         max_equiv_err = max(max_equiv_err, err)
                         if err > equiv_tol:
                             raise ValueError(
-                                f"content quantization-off equivalence failed at layer {lid} {key}: {err:.3e} > {equiv_tol:.3e}"
+                                f"content quantization-off equivalence failed at layer {lid}: {err:.3e} > {equiv_tol:.3e}"
                             )
-                for key, prof in rope_profiles.items():
-                    if lid not in prof["layers"]:
-                        continue
-                    theta = tensors[f"{prof['tensors_prefix']}.layer_{lid}.theta"]
-                    s_vec = tensors[f"{prof['tensors_prefix']}.layer_{lid}.s"]
+                if rope_prof is not None and lid in rope_prof["layers"]:
+                    theta = tensors[f"rope.layer_{lid}.theta"]
+                    s_vec = tensors[f"rope.layer_{lid}.s"]
                     for seq in bank.val:
                         ref_z, mask = eval_positional_qk(seq, g)
                         pred_z, _ = eval_positional_qk(
@@ -843,7 +848,7 @@ def validate_sidecar(
                         max_equiv_err = max(max_equiv_err, err)
                         if err > equiv_tol:
                             raise ValueError(
-                                f"RoPE quantization-off equivalence failed at layer {lid} {key}: {err:.3e} > {equiv_tol:.3e}"
+                                f"RoPE quantization-off equivalence failed at layer {lid}: {err:.3e} > {equiv_tol:.3e}"
                             )
 
     return {

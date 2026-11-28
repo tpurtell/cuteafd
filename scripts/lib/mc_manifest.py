@@ -135,7 +135,7 @@ def _read(root, name):
     return data
 
 
-QMLA_SCHEMA = "cuteafd-qmla-v1"
+QMLA_SCHEMA = "cuteafd-qmla-v2"
 QMLA_TENSORS_FILE = "mla_calibration.safetensors"
 QMLA_STATUSES = frozenset({"calibrated_unqualified", "runtime_qualified"})
 QMLA_PROTECTION_POLICIES = frozenset({"sink4_local128", "none"})
@@ -207,15 +207,20 @@ def validate_qmla_advisory(qmla, *, strict=False):
              "MC QMLA requires non-empty geometry")
     profiles = qmla["profiles"]
     _fields(profiles, ("content", "rope"), strict=strict)
-    _require(isinstance(profiles["content"], dict) and isinstance(profiles["rope"], dict)
-             and (bool(profiles["content"]) or bool(profiles["rope"])),
-             "MC QMLA requires at least one content or RoPE profile")
-    for section in ("content", "rope"):
-        for prof in profiles[section].values():
-            _require(isinstance(prof, dict)
-                     and prof.get("protection_calibrated") == policy
-                     and _digest(prof.get("profile_fingerprint")),
-                     f"invalid MC QMLA {section} profile")
+    _require(all(profiles[path] is None or isinstance(profiles[path], dict) for path in ("content", "rope"))
+             and (profiles["content"] is not None or profiles["rope"] is not None),
+             "MC QMLA requires one shipped content or RoPE profile")
+    for section, widths in (("content", {2, 4, 8}), ("rope", {4, 8})):
+        prof = profiles[section]
+        if prof is None:
+            continue
+        bits = prof.get("bits")
+        _require(prof.get("protection_calibrated") == policy
+                 and _digest(prof.get("profile_fingerprint"))
+                 and isinstance(bits, list) and bool(bits)
+                 and all(type(b) is int and b in widths for b in bits)
+                 and isinstance(prof.get("selection"), dict),
+                 f"invalid MC QMLA {section} profile")
     modes = qmla["supported_modes"]
     _require(isinstance(modes, list) and bool(modes)
              and all(isinstance(m, str) and QMLA_MODE_RE.fullmatch(m) and m != "0:0" for m in modes),

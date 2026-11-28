@@ -144,19 +144,23 @@ def test_capture_bank_xxh3_roundtrip_and_corruption_fail_closed(tmp_path: Path):
     bank = adapter.capture_layer(
         layer,
         sequences,
-        train_count=4,
+        train_count=3,
         val_count=2,
+        test_count=1,
         seed=7,
         provenance={"corpus": "synthetic-oracle"},
     )
-    assert len(bank.train) == 4 and len(bank.val) == 2
-    assert {s.seq_id for s in bank.train}.isdisjoint({s.seq_id for s in bank.val})
+    assert (len(bank.train), len(bank.val), len(bank.test)) == (3, 2, 1)
+    ids = [{s.seq_id for s in bank.split(name)} for name in ("train", "val", "test")]
+    assert not (ids[0] & ids[1] or ids[0] & ids[2] or ids[1] & ids[2])
 
     save_layer_capture(tmp_path, bank)
     reloaded = load_layer_capture(tmp_path, layer.index)
     assert reloaded.geometry == bank.geometry
     assert [s.seq_id for s in reloaded.train] == [s.seq_id for s in bank.train]
     assert [s.seq_id for s in reloaded.val] == [s.seq_id for s in bank.val]
+    assert [s.seq_id for s in reloaded.test] == [s.seq_id for s in bank.test]
+    assert reloaded.provenance["splits"] == bank.provenance["splits"]
     for orig, loaded in zip(bank.train, reloaded.train, strict=True):
         assert torch.equal(orig.u, loaded.u)
         assert torch.equal(orig.q_rope, loaded.q_rope)
@@ -234,3 +238,87 @@ def test_protected_replay_uses_each_query_prefix_for_content_and_rope():
             rope_key_fn=lambda k: torch.where(keep, k, rope(k)),
         )
         torch.testing.assert_close(pred[row], oracle[row], atol=2e-5, rtol=2e-5)
+
+
+def test_three_way_split_disjoint_deterministic_salt_versioned_and_refuses_reuse_mismatch(tmp_path: Path):
+    import hashlib
+    import json
+
+    from hy4_flash.qmla_run import check_reused_captures, corpus_split_description
+    from qmla.capture import (
+        CAPTURE_SCHEMA,
+        SPLIT_SALT,
+        check_split_description,
+        describe_splits,
+        split_train_val_test,
+    )
+
+    records = [(f"agentic:{i:05d}", torch.arange(i, i + 5 + i % 4)) for i in range(40)]
+    train, val, test = split_train_val_test(records, train_count=16, val_count=4, test_count=4, key_fn=lambda r: r[0])
+    ids = [[r[0] for r in part] for part in (train, val, test)]
+    assert [len(x) for x in ids] == [16, 4, 4]
+    assert not (set(ids[0]) & set(ids[1]) or set(ids[0]) & set(ids[2]) or set(ids[1]) & set(ids[2]))
+
+    # Deterministic and independent of input order; a different seed gives a different partition.
+    again = split_train_val_test(list(reversed(records)), train_count=16, val_count=4, test_count=4, key_fn=lambda r: r[0])
+    assert [[r[0] for r in part] for part in again] == ids
+    other = split_train_val_test(records, train_count=16, val_count=4, test_count=4, key_fn=lambda r: r[0], seed=1)
+    assert [[r[0] for r in part] for part in other] != ids
+
+    # The order is the versioned salt's: the v1 two-way salt orders the rows differently.
+    assert SPLIT_SALT == "cuteafd-qmla-split-v2"
+    v2 = sorted((r[0] for r in records), key=lambda k: hashlib.sha256(f"{SPLIT_SALT}:0:{k}".encode()).hexdigest())
+    v1 = sorted((r[0] for r in records), key=lambda k: hashlib.sha256(f"cuteafd-qmla-split-v1:0:{k}".encode()).hexdigest())
+    assert v2[:24] == [*ids[0], *ids[1], *ids[2]] and v1[:24] != v2[:24]
+    with pytest.raises(ValueError, match="positive"):
+        split_train_val_test(records, train_count=16, val_count=4, test_count=0)
+    with pytest.raises(ValueError, match="need at least"):
+        split_train_val_test(records[:10], train_count=8, val_count=2, test_count=1)
+
+    description = corpus_split_description(records, train_count=16, val_count=4, test_count=4, seed=0)
+    assert description["salt"] == SPLIT_SALT and description["test"]["seq_ids"] == ids[2]
+    assert description["test"]["sha256"][0] == hashlib.sha256(
+        dict(records)[ids[2][0]].contiguous().view(torch.uint8).numpy().tobytes()
+    ).hexdigest()
+    stale = json.loads(json.dumps(description))
+    stale["salt"] = "cuteafd-qmla-split-v1"
+    with pytest.raises(ValueError, match="split salt"):
+        check_split_description(stale)
+    tampered = json.loads(json.dumps(description))
+    tampered["val"]["sha256"][0] = "0" * 64
+    with pytest.raises(ValueError, match="val split digest mismatch"):
+        check_split_description(tampered)
+    overlap = describe_splits({"train": [("a", "1" * 64)], "val": [("b", "2" * 64)], "test": [("c", "3" * 64)]}, seed=0)
+    overlap["test"] = overlap["val"]
+    with pytest.raises(ValueError, match="overlaps"):
+        check_split_description(overlap)
+
+    # Capture banks carry the description; reuse refuses a split, seed or count change.
+    _, model, layer, g = _synthetic_hy4_layer(131, kind=reference.SPARSE)
+    adapter = Hy4FlashCaptureAdapter(model)
+    rows = [(f"agentic:{i:05d}", torch.randn(8 + i, 10, generator=g), None) for i in range(7)]
+    teacher = {"target_revision": "a" * 40}
+    provenance = {"dataset_revision": "b" * 40, "components": {"agentic": {}}, **teacher}
+    bank = adapter.capture_layer(layer, rows, train_count=3, val_count=2, test_count=2, provenance=provenance)
+    save_layer_capture(tmp_path, bank)
+    reloaded = {0: load_layer_capture(tmp_path, 0)}
+    resolved = {"panel_revision": "b" * 40, "components": ("agentic",),
+                "train_sequences": 3, "val_sequences": 2, "test_sequences": 2}
+    check_reused_captures(reloaded, resolved, teacher, seed=0, expected_splits=bank.provenance["splits"])
+    with pytest.raises(ValueError, match="test split count"):
+        check_reused_captures(reloaded, {**resolved, "test_sequences": 3}, teacher, seed=0)
+    with pytest.raises(ValueError, match="split seed"):
+        check_reused_captures(reloaded, resolved, teacher, seed=1)
+    reordered = adapter.capture_layer(layer, rows, train_count=3, val_count=2, test_count=2, seed=5,
+                                      provenance=provenance).provenance["splits"]
+    reordered["seed"] = 0
+    with pytest.raises(ValueError, match="split membership differs"):
+        check_reused_captures(reloaded, resolved, teacher, seed=0, expected_splits=reordered)
+
+    # A two-way capture manifest under the old schema refuses to load.
+    manifest = json.loads((tmp_path / "layer-0000.json").read_text())
+    manifest["schema"] = "cuteafd-qmla-capture-v1"
+    (tmp_path / "layer-0000.json").write_text(json.dumps(manifest))
+    assert CAPTURE_SCHEMA == "cuteafd-qmla-capture-v2"
+    with pytest.raises(ValueError, match="three-way"):
+        load_layer_capture(tmp_path, 0)

@@ -1,8 +1,14 @@
 """End-to-end Hy4-flash QMLA calibration driver (reference MLA pipeline to copy).
 
 Supports both short pilot runs (``--pilot`` or explicit ``--layers``, ``--modes``,
-``--train-sequences``, ``--val-sequences``, ``--steps``) and full 12-DSA-layer
-calibration over all principal modes.
+``--train-sequences``, ``--val-sequences``, ``--test-sequences``, ``--steps``) and full
+12-DSA-layer calibration. Both fit every width (content c2/c4/c8, RoPE r4/r8) and
+measure all nine combinations by default.
+
+Splits: ``train`` fits, ``val`` selects fit steps and the shipped transform, ``test``
+produces every reported attention error. The sidecar ships ONE content and ONE RoPE
+transform per layer, chosen on ``val`` across every combination; the report also keeps
+the per-width fits' test errors and the full candidate cross-table for analysis.
 
 Corpus contract (amended Correction 1): defaults to the TWO existing components
 ``agentic`` + ``exl3_standard`` from
@@ -40,13 +46,19 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from qmla.capture import (
+    SPLIT_NAMES,
     CapturedLayerBank,
     MlaLayerGeometry,
     _atomic_json,
+    check_split_description,
+    describe_splits,
     load_layer_capture,
     save_layer_capture,
+    sequence_sha256,
+    split_train_val_test,
 )
 from qmla.fit import (
+    _require_unprotected_tokens,
     DEFAULT_PROTECTION_POLICY,
     VALID_PROTECTION_POLICIES,
     ContentFitResult,
@@ -58,7 +70,18 @@ from qmla.fit import (
     load_fit_checkpoint,
     save_fit_checkpoint,
 )
-from qmla.measurement import inverse_max_error, measure_layer_modes, summarize_modes
+from qmla.measurement import (
+    SELECTION_OBJECTIVE,
+    inverse_max_error,
+    layer_candidates,
+    layer_rows,
+    measure_candidates,
+    measure_shipped,
+    select_shipped,
+    shipped_summary,
+    summarize_modes,
+    with_equivalence,
+)
 from qmla.quantizer import parse_qmla_mode
 from qmla.sidecar import (
     DEFAULT_QMLA_PANEL_REVISION,
@@ -74,8 +97,11 @@ from . import recipe as hy4_recipe
 from .qmla_capture import Hy4FlashCaptureAdapter
 
 DEFAULT_PILOT_LAYERS = (0, 21, 41)
-DEFAULT_PILOT_MODES = ("4:4",)
-DEFAULT_FULL_MODES = ("8:8", "4:8", "4:4", "2:4", "4:0", "0:4", "8:0", "0:8", "2:0")
+DEFAULT_FULL_MODES = ("8:8", "4:8", "4:4", "2:4", "8:0", "4:0", "2:0", "0:8", "0:4")
+# The pilot is for understanding: it fits every width and measures every combination.
+DEFAULT_PILOT_MODES = DEFAULT_FULL_MODES
+PILOT_SPLITS = (16, 4, 4)
+FULL_SPLITS = (128, 16, 16)
 
 
 def _git_head_sha(root: Path) -> str:
@@ -329,6 +355,22 @@ def load_pinned_qmla_corpus(
     return all_records, corpus_provenance
 
 
+def split_identity(banks: Mapping[int, CapturedLayerBank]) -> dict[str, Any]:
+    """The one split description every layer bank must share (checked, not assumed)."""
+    descriptions = [bank.provenance.get("splits") for bank in banks.values()]
+    first = check_split_description(descriptions[0])
+    if any(d != first for d in descriptions[1:]):
+        raise ValueError("layer captures disagree on the train/val/test split")
+    return first
+
+
+def _shipped_result(candidates, record, bank, device):
+    if record is None:
+        return None
+    pool = candidates.content if record["candidate"].split(":")[1][0] == "c" else candidates.rope
+    return with_equivalence(pool[record["candidate"]], bank, device)
+
+
 def calibrate_hy4_flash_from_banks(
     banks: Mapping[int, CapturedLayerBank],
     *,
@@ -338,13 +380,19 @@ def calibrate_hy4_flash_from_banks(
     corpus_provenance: Mapping[str, Any],
     fit_config: FitConfig = FitConfig(),
     applicable_views: Sequence[str] | None = None,
-    view_transfer_validation: Mapping[str, Any] | None = None,
+    transfer_banks: Mapping[str, Mapping[int, CapturedLayerBank]] | None = None,
     device: torch.device | str = "cpu",
     code_commit: str | None = None,
     thinking_mode: str = "high",
     renderer_template_sha256: str = "",
 ) -> dict[str, Any]:
-    """Run fit -> checkpoint/resume -> single-file sidecar -> validation from captured layer banks.
+    """Fit -> select -> single-file sidecar -> test-split report from captured layer banks.
+
+    For each layer: fit every width independently (train fits, val picks the step), build
+    candidates from every fit and its SmoothQuant init, score the full candidate table on
+    val and on test, ship the val-selected single content and RoPE transform, and report
+    test errors only. ``transfer_banks`` maps a view (e.g. ``k8-compact``) to layer banks
+    whose test split replays the calibration test sequences through that view.
 
     Shared by the production CLI driver and CPU numeric oracle tests.
     """
@@ -361,34 +409,41 @@ def calibrate_hy4_flash_from_banks(
     c_bits_list, r_bits_list = required_profile_bits(modes)
     ordered_layers = sorted(banks)
     geometries: list[MlaLayerGeometry] = [banks[lid].geometry for lid in ordered_layers]
+    splits = split_identity(banks)
 
     identity_key = fit_config_digest(
         fit_config,
         extra={
-            "fit_semantics": "causal-protection-v2",
+            "fit_semantics": "causal-protection-v3-three-way-split",
             "source": dict(source),
-            "splits": {
-                str(lid): [[(seq.seq_id, seq.seq_len) for seq in split] for split in (bank.train, bank.val)]
+            "splits": splits,
+            "seq_lens": {
+                str(lid): {name: [seq.seq_len for seq in bank.split(name)] for name in SPLIT_NAMES}
                 for lid, bank in banks.items()
             },
             "layers": ordered_layers,
-            "corpus": dict(corpus_provenance),
+            "corpus": {k: v for k, v in corpus_provenance.items() if k != "splits"},
         },
     )
 
-    content_profiles: dict[int, list[ContentFitResult]] = {b: [] for b in c_bits_list}
-    rope_profiles: dict[int, list[RopeFitResult]] = {b: [] for b in r_bits_list}
-
+    shipped_content = []
+    shipped_rope = []
+    selection_by_layer: dict[str, Any] = {}
     layer_measurements = {}
     layer_fit_details = {}
     for lid in ordered_layers:
         bank = banks[lid]
         bank.validate()
+        _require_unprotected_tokens(
+            bank.test, protection=fit_config.protection, sink_tokens=fit_config.sink_tokens,
+            recent_tokens=fit_config.recent_tokens, split_name="test",
+        )
         layer_start = time.monotonic()
-        details = {}
-        for path, widths, fit_layer, profiles in (
-            ("content", c_bits_list, fit_content_layer, content_profiles),
-            ("rope", r_bits_list if bank.geometry.has_rope else (), fit_rope_layer, rope_profiles),
+        details: dict[str, Any] = {}
+        fits: dict[str, dict[int, ContentFitResult | RopeFitResult]] = {"content": {}, "rope": {}}
+        for path, widths, fit_layer in (
+            ("content", c_bits_list, fit_content_layer),
+            ("rope", r_bits_list if bank.geometry.has_rope else (), fit_rope_layer),
         ):
             for bits in widths:
                 timing_file = ckpt_dir / f"{path}-{bits}-layer-{lid:04d}.time.json"
@@ -415,41 +470,87 @@ def calibrate_hy4_flash_from_banks(
                 if not reused:
                     save_fit_checkpoint(ckpt_dir, result, identity_key=identity_key)
                     _atomic_json(timing_file, {"identity_key": identity_key, "seconds": seconds})
-                profiles[bits].append(result)
+                fits[path][bits] = result
                 details.setdefault(path, {})[str(bits)] = {
                     "fit_seconds": seconds,
                     "reused_fit": reused,
                     "best_step": result.best_step,
-                    "before_val_loss": result.baselines["smoothquant_alpha_val"],
-                    "after_val_loss": result.best_val_loss,
-                    "baselines": result.baselines,
+                    "fitting_beat_init_on_val": result.best_step > 0,
+                    # Fit-objective losses (L_C or L_P) on the selection split; not reported errors.
+                    "val_objective": {
+                        "smoothquant_init": result.baselines["smoothquant_alpha_val"],
+                        "fitted": result.best_val_loss,
+                        **{k: v for k, v in result.baselines.items() if k != "smoothquant_alpha_val"},
+                    },
                     **errors,
                 }
-        layer_measurements[lid] = measure_layer_modes(
-            bank, bank, modes, {bits: rows[-1] for bits, rows in content_profiles.items()},
-            {bits: rows[-1] for bits, rows in rope_profiles.items() if bank.geometry.has_rope},
-            fit_config, device,
-        )
+
+        candidates = layer_candidates(bank, fits["content"], fits["rope"], fit_config)
+        val_table = measure_candidates(bank, candidates, modes, fit_config, device, split="val")
+        test_table = measure_candidates(bank, candidates, modes, fit_config, device, split="test")
+        selection = select_shipped(val_table, candidates, bank.geometry)
+        selection_by_layer[str(lid)] = selection
+        for path, sink in (("content", shipped_content), ("rope", shipped_rope)):
+            result = _shipped_result(candidates, selection[path], bank, device)
+            if result is None:
+                continue
+            for check, value in (("equiv_max_rel_err", result.equiv_max_rel_err),
+                                 ("inverse_max_abs_err", inverse_max_error(result, bank.geometry))):
+                if not math.isfinite(value) or (check == "equiv_max_rel_err" and value >= 1e-5):
+                    raise ValueError(f"shipped {path} layer {lid} {check} = {value}")
+            sink.append(result)
+        layer_measurements[lid] = layer_rows(test_table, val_table, selection, bank.geometry)
         details["fit_and_measure_wall_seconds"] = time.monotonic() - layer_start
         layer_fit_details[str(lid)] = details
 
-    rope_profiles = {b: rows for b, rows in rope_profiles.items() if rows}
     combinations = summarize_modes(layer_measurements)
+    shipped_by_layer = {
+        path: {r.layer_id: r for r in rows} for path, rows in (("content", shipped_content), ("rope", shipped_rope))
+    }
+
+    view_transfer_validation: dict[str, Any] = {}
+    for view, view_banks in (transfer_banks or {}).items():
+        by_layer = {}
+        for lid in ordered_layers:
+            tbank = view_banks.get(lid)
+            if tbank is None:
+                raise ValueError(f"{view} transfer is missing layer {lid}")
+            tbank.validate()
+            if [s.seq_id for s in tbank.test] != [s.seq_id for s in banks[lid].test]:
+                raise ValueError(f"{view} transfer must replay the calibration test sequences at layer {lid}")
+            by_layer[lid] = measure_shipped(
+                tbank, shipped_by_layer["content"].get(lid), shipped_by_layer["rope"].get(lid),
+                modes, fit_config, device,
+            )
+        per_mode: dict[str, Any] = {}
+        for lid, rows in by_layer.items():
+            for key, row in rows.items():
+                per_mode.setdefault(key, {"per_layer": {}})["per_layer"][str(lid)] = row
+        for entry in per_mode.values():
+            rows = list(entry["per_layer"].values())
+            tokens = sum(r["tokens"] for r in rows)
+            entry["layer_tokens"] = tokens
+            for field in ("attn_rel_err", "rtn_attn_rel_err", "hadamard_attn_rel_err"):
+                entry[field] = sum(r[field] * r["tokens"] for r in rows) / tokens
+            entry["ratio_to_rtn"] = entry["attn_rel_err"] / entry["rtn_attn_rel_err"] if entry["rtn_attn_rel_err"] else None
+        view_transfer_validation[view] = {"split": "test", "reference": f"{view} 0:0", "combinations": per_mode}
+
+    def path_selection(path: str) -> dict[str, Any] | None:
+        per_layer = {lid: sel[path] for lid, sel in selection_by_layer.items() if sel[path] is not None}
+        return {"objective": SELECTION_OBJECTIVE, "per_layer": per_layer} if per_layer else None
 
     sample_bank = banks[ordered_layers[0]]
     provenance: dict[str, Any] = {
         "dataset_repo": corpus_provenance["dataset_repo"],
         "dataset_revision": corpus_provenance["dataset_revision"],
         "components": corpus_provenance["components"],
-        "train_sequences": len(sample_bank.train),
-        "val_sequences": len(sample_bank.val),
+        **{f"{name}_sequences": len(sample_bank.split(name)) for name in SPLIT_NAMES},
+        "splits": splits,
         "input_ids_sha256": corpus_provenance["input_ids_sha256"],
         "renderer_template_sha256": renderer_template_sha256,
         "thinking_mode": thinking_mode,
-        "combination_measurements": {
-            key: {name: value for name, value in row.items() if name != "per_layer"}
-            for key, row in combinations.items()
-        },
+        "measurement_split": "test",
+        "combination_measurements": {key: shipped_summary(row) for key, row in combinations.items()},
         "optimizer": "adamw",
         "steps_per_path": fit_config.steps,
         "seed": fit_config.seed,
@@ -460,10 +561,16 @@ def calibrate_hy4_flash_from_banks(
         sidecar_dir,
         source=source,
         geometries=geometries,
-        content_profiles=content_profiles,
-        rope_profiles=rope_profiles,
+        content_profile=shipped_content,
+        rope_profile=shipped_rope,
+        content_bits=c_bits_list,
+        rope_bits=r_bits_list if shipped_rope else (),
+        selection={"content": path_selection("content"), "rope": path_selection("rope")},
         provenance=provenance,
-        applicable_views=applicable_views if applicable_views is not None else (source["calibrated_view"],),
+        applicable_views=(
+            applicable_views if applicable_views is not None
+            else (source["calibrated_view"], *view_transfer_validation)
+        ),
         view_transfer_validation=view_transfer_validation,
         artifact_status="calibrated_unqualified",
         protection_policy=fit_config.protection,
@@ -477,14 +584,44 @@ def calibrate_hy4_flash_from_banks(
         equiv_tol=1e-5,
         strict=True,
     )
+    fitting_beat_init = {
+        "val_objective": {
+            path: {
+                str(bits): sum(
+                    bool(layer_fit_details[str(lid)].get(path, {}).get(str(bits), {}).get("fitting_beat_init_on_val"))
+                    for lid in ordered_layers
+                )
+                for bits in widths
+            }
+            for path, widths in (("content", c_bits_list), ("rope", r_bits_list))
+        },
+        "test_attn_rel_err": {
+            key: {"layers": row["layers"], "fitted_beats_smoothquant": row["fitted_beats_smoothquant_layers"]}
+            for key, row in combinations.items()
+        },
+        "shipped_fitted_layers": {
+            path: sum(
+                1 for sel in selection_by_layer.values()
+                if sel[path] is not None and sel[path]["chosen"] == "fitted"
+            )
+            for path in ("content", "rope")
+        },
+    }
     report = {
-        "schema": "cuteafd-qmla-validation-report-v1",
+        "schema": "cuteafd-qmla-validation-report-v2",
         "artifact_status": manifest["artifact_status"],
         "protection_policy": manifest["protection_policy"],
         "protection_scope": manifest["protection_scope"],
         "source": manifest["source"],
         "layers_calibrated": ordered_layers,
+        "splits": {name: splits[name]["count"] for name in SPLIT_NAMES},
+        "measurement_split": "test",
+        "selection_split": "val",
+        "selection_objective": SELECTION_OBJECTIVE,
         "combinations": combinations,
+        "selection_by_layer": selection_by_layer,
+        "fitting_beat_init": fitting_beat_init,
+        "view_transfer_validation": view_transfer_validation,
         "fit_by_layer": layer_fit_details,
         "sidecar_bytes": manifest["tensors_bytes"],
         "fit_measure_validate_seconds": time.monotonic() - started,
@@ -494,20 +631,14 @@ def calibrate_hy4_flash_from_banks(
         ),
         "supported_modes": manifest["supported_modes"],
         "validation": validation,
-        "content_summary": {
-            k: {
-                "val_loss_mean": v["validation"]["val_loss_mean"],
-                "equiv_max_rel_err": v["validation"]["equiv_max_rel_err"],
-                "orth_max_err": v["validation"]["orth_max_err"],
-            }
-            for k, v in manifest["profiles"]["content"].items()
-        },
-        "rope_summary": {
-            k: {
-                "val_loss_mean": v["validation"]["val_loss_mean"],
-                "equiv_max_rel_err": v["validation"]["equiv_max_rel_err"],
-            }
-            for k, v in manifest["profiles"]["rope"].items()
+        "shipped_profiles": {
+            path: (None if prof is None else {
+                "bits": prof["bits"],
+                "layers": prof["layers"],
+                "chosen": {lid: row["candidate"] for lid, row in prof["selection"]["per_layer"].items()},
+                "equiv_max_rel_err": prof["validation"]["equiv_max_rel_err"],
+            })
+            for path, prof in manifest["profiles"].items()
         },
     }
     _atomic_json(output_dir / "qmla-validation-report.json", report)
@@ -542,7 +673,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Known panel components: agentic,exl3_standard (default) or agentic,exl3_standard,long_context",
     )
     parser.add_argument("--output", type=Path, required=True, help="Task output/work directory on root NVMe")
-    parser.add_argument("--pilot", action="store_true", help="Short pilot preset (layers 0,21,41; mode 4:4; 16/4 seqs; 100 steps)")
+    parser.add_argument("--pilot", action="store_true",
+                        help="Short pilot preset (layers 0,21,41; all nine modes; 16/4/4 train/val/test seqs; 100 steps)")
     parser.add_argument("--layers", default=None, help="Layer selection: 'all-dsa' or comma-separated IDs (e.g. 0,21,41)")
     parser.add_argument("--modes", default=None, help="Comma-separated QUANT_MLA modes (e.g. 4:4 or 8:8,4:8,4:4,2:4)")
     parser.add_argument(
@@ -552,7 +684,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Recent-token protection policy on full-history MLA layers (default: sink4_local128; SWA untouched)",
     )
     parser.add_argument("--train-sequences", type=int, default=None)
-    parser.add_argument("--val-sequences", type=int, default=None)
+    parser.add_argument("--val-sequences", type=int, default=None, help="Step and shipped-transform selection split")
+    parser.add_argument("--test-sequences", type=int, default=None, help="Held-out split for every reported error")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -565,17 +698,18 @@ def resolve_run_settings(args: argparse.Namespace, eligible_layers: Sequence[int
     if args.pilot:
         default_layers = ",".join(str(x) for x in DEFAULT_PILOT_LAYERS if x in eligible_layers) or str(eligible_layers[0])
         default_modes = ",".join(DEFAULT_PILOT_MODES)
-        default_train, default_val, default_steps = 16, 4, 100
+        (default_train, default_val, default_test), default_steps = PILOT_SPLITS, 100
     else:
         default_layers = "all-dsa"
         default_modes = ",".join(DEFAULT_FULL_MODES)
-        default_train, default_val, default_steps = 128, 32, 300
+        (default_train, default_val, default_test), default_steps = FULL_SPLITS, 300
 
     layers = parse_layers_arg(args.layers or default_layers, eligible_layers)
     modes = parse_modes_arg(args.modes or default_modes)
     components = parse_components_arg(args.components)
     train_n = default_train if args.train_sequences is None else int(args.train_sequences)
     val_n = default_val if args.val_sequences is None else int(args.val_sequences)
+    test_n = default_test if args.test_sequences is None else int(args.test_sequences)
     steps = default_steps if args.steps is None else int(args.steps)
     return {
         "layers": layers,
@@ -585,6 +719,7 @@ def resolve_run_settings(args: argparse.Namespace, eligible_layers: Sequence[int
         "protection": args.protection,
         "train_sequences": train_n,
         "val_sequences": val_n,
+        "test_sequences": test_n,
         "steps": steps,
     }
 
@@ -599,6 +734,55 @@ def _routed_forward(model, layer, inputs):
     return routed.split([len(x) for x in inputs])
 
 
+def corpus_split_description(
+    token_records: Sequence[tuple[str, torch.Tensor]],
+    *,
+    train_count: int,
+    val_count: int,
+    test_count: int,
+    seed: int,
+) -> dict[str, Any]:
+    """Describe the deterministic three-way split of corpus rows by ID and token-ID SHA256."""
+    parts = split_train_val_test(
+        token_records, train_count=train_count, val_count=val_count, test_count=test_count,
+        key_fn=lambda r: r[0], seed=seed,
+    )
+    return describe_splits(
+        {name: [(sid, sequence_sha256(tokens)) for sid, tokens in part] for name, part in zip(SPLIT_NAMES, parts)},
+        seed=seed,
+    )
+
+
+def check_reused_captures(
+    banks: Mapping[int, CapturedLayerBank],
+    resolved: Mapping[str, Any],
+    teacher_identity: Mapping[str, Any],
+    *,
+    seed: int,
+    expected_splits: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Refuse reused captures whose teacher, panel, seed, split counts or split membership differ."""
+    first = banks[min(banks)]
+    corpus_provenance = dict(first.provenance)
+    if any(corpus_provenance.get(key) != value for key, value in teacher_identity.items()):
+        raise ValueError("capture teacher or checkpoint identity differs from the requested run")
+    if (corpus_provenance["dataset_revision"] != resolved["panel_revision"]
+            or set(corpus_provenance["components"]) != set(resolved["components"])):
+        raise ValueError("capture panel revision or components differ from the requested run")
+    splits = split_identity(banks)
+    if splits["seed"] != seed:
+        raise ValueError(f"capture split seed {splits['seed']} differs from the requested seed {seed}")
+    for bank in banks.values():
+        if bank.provenance != corpus_provenance:
+            raise ValueError(f"capture provenance differs at layer {bank.geometry.layer_id}")
+        for name in SPLIT_NAMES:
+            if len(bank.split(name)) != resolved[f"{name}_sequences"]:
+                raise ValueError(f"capture {name} split count differs at layer {bank.geometry.layer_id}")
+    if expected_splits is not None and dict(expected_splits) != splits:
+        raise ValueError("capture split membership differs from the split of the requested corpus")
+    return corpus_provenance
+
+
 @torch.no_grad()
 def _stream_hy4_flash_captures(
     reader: hy4_forward.Reader,
@@ -608,6 +792,7 @@ def _stream_hy4_flash_captures(
     *,
     train_count: int,
     val_count: int,
+    test_count: int,
     seed: int,
     capture_dir: Path,
     provenance: dict[str, Any],
@@ -618,12 +803,14 @@ def _stream_hy4_flash_captures(
     target_set = set(target_layers)
     embedding = reader.raw(hy4_forward.reference.OUTER_NAMES[0])
 
-    from qmla.capture import split_train_val
-
-    train_items, val_items = split_train_val(
-        token_records, train_count=train_count, val_count=val_count, key_fn=lambda r: r[0], seed=seed
+    provenance = {**provenance, "splits": corpus_split_description(
+        token_records, train_count=train_count, val_count=val_count, test_count=test_count, seed=seed
+    )}
+    train_items, val_items, test_items = split_train_val_test(
+        token_records, train_count=train_count, val_count=val_count, test_count=test_count,
+        key_fn=lambda r: r[0], seed=seed,
     )
-    active = [*train_items, *val_items]
+    active = [*train_items, *val_items, *test_items]
     active = [(sid, tokens.to(reader.device)) for sid, tokens in active]
     states = [model.initial(tokens, embedding=embedding) for _, tokens in active]
     banks = {}
@@ -643,7 +830,9 @@ def _stream_hy4_flash_captures(
 
         if layer_idx in target_set:
             bank = CapturedLayerBank(adapter.geometry_for(layer_idx), adapter.layer_params(layer),
-                                     tuple(captures[:train_count]), tuple(captures[train_count:]), provenance)
+                                     tuple(captures[:train_count]),
+                                     tuple(captures[train_count:train_count + val_count]),
+                                     tuple(captures[train_count + val_count:]), provenance)
             bank.validate()
             save_layer_capture(capture_dir, bank)
             banks[layer_idx] = bank
@@ -690,36 +879,34 @@ def main(argv: Sequence[str] | None = None) -> int:
         "teacher_revision": args.base_revision if args.checkpoint_kind == "mc" else args.source_revision,
         "teacher_config_sha256": hashlib.sha256((teacher / "config.json").read_bytes()).hexdigest(),
     }
-    if args.reuse_captures is not None:
-        banks = {lid: load_layer_capture(capture_dir, lid) for lid in resolved["layers"]}
-        corpus_provenance = dict(banks[resolved["layers"][0]].provenance)
-        if any(corpus_provenance.get(key) != value for key, value in teacher_identity.items()):
-            raise ValueError("capture teacher or checkpoint identity differs from the requested run")
-        if (corpus_provenance["dataset_revision"] != resolved["panel_revision"]
-                or set(corpus_provenance["components"]) != set(resolved["components"])):
-            raise ValueError("capture panel revision or components differ from the requested run")
-        for bank in banks.values():
-            if (bank.provenance != corpus_provenance or len(bank.train) != resolved["train_sequences"]
-                    or len(bank.val) != resolved["val_sequences"]):
-                raise ValueError(f"capture provenance or split counts differ at layer {bank.geometry.layer_id}")
-    else:
-        assert args.corpus_dir is not None
+    all_records = None
+    if args.corpus_dir is not None:
         all_records, corpus_provenance = load_pinned_qmla_corpus(
             args.corpus_dir,
             panel_revision=resolved["panel_revision"],
             components=resolved["components"],
         )
+    split_counts = {f"{name}_count": resolved[f"{name}_sequences"] for name in SPLIT_NAMES}
+    if args.reuse_captures is not None:
+        banks = {lid: load_layer_capture(capture_dir, lid) for lid in resolved["layers"]}
+        corpus_provenance = check_reused_captures(
+            banks, resolved, teacher_identity, seed=args.seed,
+            expected_splits=None if all_records is None else corpus_split_description(
+                all_records, seed=args.seed, **split_counts
+            ),
+        )
+    else:
+        assert all_records is not None
         corpus_provenance.update(teacher_identity)
         banks = _stream_hy4_flash_captures(
             reader,
             adapter,
             resolved["layers"],
             all_records,
-            train_count=resolved["train_sequences"],
-            val_count=resolved["val_sequences"],
             seed=args.seed,
             capture_dir=capture_dir,
             provenance=corpus_provenance,
+            **split_counts,
         )
 
     source = {

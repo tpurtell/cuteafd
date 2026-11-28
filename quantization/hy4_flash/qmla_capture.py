@@ -21,7 +21,9 @@ from qmla.capture import (
     MlaLayerGeometry,
     QmlaCaptureAdapter,
     causal_mask,
-    split_train_val,
+    describe_splits,
+    sequence_sha256,
+    split_train_val_test,
     unit_rms_norm,
 )
 
@@ -252,34 +254,43 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
         *,
         train_count: int,
         val_count: int,
+        test_count: int,
         seed: int = 0,
         project: Project = hy4_forward.native_projection,
         provenance: dict[str, Any] | None = None,
     ) -> CapturedLayerBank:
-        """Capture a disjoint train/val CapturedLayerBank for one Hy4-flash layer."""
+        """Capture a disjoint train/val/test CapturedLayerBank for one Hy4-flash layer."""
         geom = self.geometry_for(layer.index)
         params = self.layer_params(layer)
-        train_items, val_items = split_train_val(
+        splits = split_train_val_test(
             sequences,
             train_count=train_count,
             val_count=val_count,
+            test_count=test_count,
             key_fn=lambda row: row[0],
             seed=seed,
         )
-        train_caps = tuple(
-            self.capture_sequence(inp, layer, seq_id=sid, positions=pos, project=project)[0]
-            for sid, inp, pos in train_items
+        captured = tuple(
+            tuple(
+                self.capture_sequence(inp, layer, seq_id=sid, positions=pos, project=project)[0]
+                for sid, inp, pos in items
+            )
+            for items in splits
         )
-        val_caps = tuple(
-            self.capture_sequence(inp, layer, seq_id=sid, positions=pos, project=project)[0]
-            for sid, inp, pos in val_items
+        description = describe_splits(
+            {
+                name: [(sid, sequence_sha256(inp)) for sid, inp, _ in items]
+                for name, items in zip(("train", "val", "test"), splits, strict=True)
+            },
+            seed=seed,
         )
         bank = CapturedLayerBank(
             geometry=geom,
             params=params,
-            train=train_caps,
-            val=val_caps,
-            provenance=dict(provenance or {}),
+            train=captured[0],
+            val=captured[1],
+            test=captured[2],
+            provenance={**dict(provenance or {}), "splits": description},
         )
         bank.validate()
         return bank

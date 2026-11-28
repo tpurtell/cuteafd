@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import struct
 import sys
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 import xxhash
@@ -28,7 +28,9 @@ if str(REFERENCE) not in sys.path:
 from families.hy4_common import tiled_sink_attention
 from shape_invariant import ROWS, linear
 
-CAPTURE_SCHEMA = "cuteafd-qmla-capture-v1"
+CAPTURE_SCHEMA = "cuteafd-qmla-capture-v2"
+SPLIT_SALT = "cuteafd-qmla-split-v2"
+SPLIT_NAMES = ("train", "val", "test")
 VALID_ATTENTION_KINDS = frozenset({"dsa", "swa", "full"})
 VALID_ROPE_KINDS = frozenset({"interleaved", "split_half", "unrotated_pe", "none"})
 
@@ -350,54 +352,151 @@ class CapturedLayerParams:
 
 @dataclass(frozen=True)
 class CapturedLayerBank:
-    """Disjoint train/val captures plus frozen params for one MLA layer."""
+    """Disjoint train/val/test captures plus frozen params for one MLA layer.
+
+    ``train`` fits transforms, ``val`` selects fit steps and the shipped transform, and
+    ``test`` produces every reported error. ``provenance["splits"]`` describes all three.
+    """
 
     geometry: MlaLayerGeometry
     params: CapturedLayerParams
     train: tuple[CapturedSequence, ...]
     val: tuple[CapturedSequence, ...]
+    test: tuple[CapturedSequence, ...]
     provenance: dict[str, Any]
+
+    def split(self, name: str) -> tuple[CapturedSequence, ...]:
+        if name not in SPLIT_NAMES:
+            raise ValueError(f"unknown split {name!r}")
+        return getattr(self, name)
 
     def validate(self) -> None:
         self.geometry.validate()
         self.params.validate(self.geometry)
-        if not self.train:
-            raise ValueError("CapturedLayerBank requires at least one train sequence")
-        if not self.val:
-            raise ValueError("CapturedLayerBank requires at least one val sequence")
-        train_ids = {s.seq_id for s in self.train}
-        val_ids = {s.seq_id for s in self.val}
-        if len(train_ids) != len(self.train) or len(val_ids) != len(self.val):
-            raise ValueError("duplicate seq_id within train or val split")
-        if train_ids & val_ids:
-            raise ValueError(f"train and val splits overlap: {sorted(train_ids & val_ids)[:5]}")
+        seen: dict[str, str] = {}
+        for name in SPLIT_NAMES:
+            seqs = self.split(name)
+            if not seqs:
+                raise ValueError(f"CapturedLayerBank requires at least one {name} sequence")
+            ids = [s.seq_id for s in seqs]
+            if len(set(ids)) != len(ids):
+                raise ValueError(f"duplicate seq_id within {name} split")
+            for seq_id in ids:
+                if seq_id in seen:
+                    raise ValueError(f"{name} and {seen[seq_id]} splits overlap at {seq_id!r}")
+                seen[seq_id] = name
+        check_split_description(self.provenance.get("splits"), {
+            name: [s.seq_id for s in self.split(name)] for name in SPLIT_NAMES
+        })
         hidden = int(self.params.o_proj_weight.shape[0])
-        for seq in (*self.train, *self.val):
-            seq.validate(self.geometry)
-            if seq.ref_output.shape[1] != hidden:
-                raise ValueError(f"ref_output width {seq.ref_output.shape[1]} != o_proj out {hidden}")
+        for name in SPLIT_NAMES:
+            for seq in self.split(name):
+                seq.validate(self.geometry)
+                if seq.ref_output.shape[1] != hidden:
+                    raise ValueError(f"ref_output width {seq.ref_output.shape[1]} != o_proj out {hidden}")
 
 
-def split_train_val(
+def split_train_val_test(
     items: Sequence[Any],
     *,
     train_count: int,
     val_count: int,
+    test_count: int,
     key_fn: Callable[[Any], str] | None = None,
     seed: int = 0,
-) -> tuple[list[Any], list[Any]]:
-    """Deterministically partition items into disjoint train and val slices."""
-    if train_count <= 0 or val_count <= 0:
-        raise ValueError("train_count and val_count must be positive")
-    if len(items) < train_count + val_count:
-        raise ValueError(f"need at least {train_count + val_count} items, got {len(items)}")
+) -> tuple[list[Any], list[Any], list[Any]]:
+    """Deterministically partition items into disjoint train, val and test slices.
 
-    def _order(item: Any) -> str:
-        raw = str(item) if key_fn is None else str(key_fn(item))
-        return hashlib.sha256(f"cuteafd-qmla-split-v1:{seed}:{raw}".encode("utf-8")).hexdigest()
+    Items are ordered by SHA256 over ``SPLIT_SALT``, the seed and each item's key, then
+    sliced. Changing the salt, seed, counts or the key set changes the partition, and
+    ``describe_splits`` records all of them so a reused capture can be checked.
+    """
+    counts = {"train": train_count, "val": val_count, "test": test_count}
+    for name, count in counts.items():
+        if type(count) is not int or count <= 0:
+            raise ValueError(f"{name}_count must be a positive integer")
+    total = train_count + val_count + test_count
+    if len(items) < total:
+        raise ValueError(f"need at least {total} items, got {len(items)}")
+    keys = [str(item) if key_fn is None else str(key_fn(item)) for item in items]
+    if len(set(keys)) != len(keys):
+        raise ValueError("split keys must be unique")
 
-    ordered = sorted(items, key=_order)
-    return ordered[:train_count], ordered[train_count : train_count + val_count]
+    def _order(index: int) -> str:
+        return hashlib.sha256(f"{SPLIT_SALT}:{seed}:{keys[index]}".encode("utf-8")).hexdigest()
+
+    ordered = [items[i] for i in sorted(range(len(items)), key=_order)]
+    return (
+        ordered[:train_count],
+        ordered[train_count : train_count + val_count],
+        ordered[train_count + val_count : total],
+    )
+
+
+def sequence_sha256(tensor: torch.Tensor) -> str:
+    """SHA256 of a sequence's contiguous CPU bytes (token IDs for corpus rows)."""
+    return hashlib.sha256(tensor.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()).hexdigest()
+
+
+def describe_splits(
+    splits: Mapping[str, Sequence[tuple[str, str]]],
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    """Describe three splits as ``(seq_id, content_sha256)`` rows plus a digest per split.
+
+    The description goes into capture provenance, the sidecar's calibration provenance
+    and the fit checkpoint identity, so any split change refuses a stale reuse.
+    """
+    if set(splits) != set(SPLIT_NAMES):
+        raise ValueError(f"splits must be exactly {SPLIT_NAMES}, got {sorted(splits)}")
+    out: dict[str, Any] = {"salt": SPLIT_SALT, "seed": int(seed)}
+    for name in SPLIT_NAMES:
+        rows = [(str(seq_id), str(digest)) for seq_id, digest in splits[name]]
+        out[name] = {
+            "count": len(rows),
+            "seq_ids": [seq_id for seq_id, _ in rows],
+            "sha256": [digest for _, digest in rows],
+            "digest": hashlib.sha256(_canonical_json(rows).encode("utf-8")).hexdigest(),
+        }
+    check_split_description(out)
+    return out
+
+
+def check_split_description(
+    description: Any,
+    seq_ids: Mapping[str, Sequence[str]] | None = None,
+) -> dict[str, Any]:
+    """Fail closed unless ``description`` is a current three-way split (matching ``seq_ids``)."""
+    if not isinstance(description, Mapping):
+        raise ValueError("capture provenance requires a three-way 'splits' description")
+    if description.get("salt") != SPLIT_SALT:
+        raise ValueError(
+            f"split salt {description.get('salt')!r} != {SPLIT_SALT!r}: refuse a capture split under another scheme"
+        )
+    if type(description.get("seed")) is not int:
+        raise ValueError("split description seed must be an integer")
+    if set(description) != {"salt", "seed", *SPLIT_NAMES}:
+        raise ValueError(f"split description fields must be salt, seed and {SPLIT_NAMES}")
+    seen: set[str] = set()
+    for name in SPLIT_NAMES:
+        row = description[name]
+        if not isinstance(row, Mapping) or set(row) != {"count", "seq_ids", "sha256", "digest"}:
+            raise ValueError(f"invalid {name} split description")
+        ids, digests = list(row["seq_ids"]), list(row["sha256"])
+        if type(row["count"]) is not int or row["count"] <= 0 or row["count"] != len(ids) or len(ids) != len(digests):
+            raise ValueError(f"{name} split count disagrees with its sequence rows")
+        if not all(isinstance(d, str) and len(d) == 64 for d in digests):
+            raise ValueError(f"{name} split sequence hashes must be SHA256 hex digests")
+        expected = hashlib.sha256(_canonical_json([[i, d] for i, d in zip(ids, digests)]).encode("utf-8")).hexdigest()
+        if row["digest"] != expected:
+            raise ValueError(f"{name} split digest mismatch")
+        if seen & set(ids) or len(set(ids)) != len(ids):
+            raise ValueError(f"{name} split overlaps another split or repeats a sequence")
+        seen |= set(ids)
+        if seq_ids is not None and list(seq_ids[name]) != ids:
+            raise ValueError(f"{name} split sequences disagree with the capture's split description")
+    return dict(description)
 
 
 def eval_positional_qk(
@@ -589,7 +688,8 @@ def save_layer_capture(directory: Path | str, bank: CapturedLayerBank) -> dict[s
         tensors["params.post_proj_norm_weight"] = bank.params.post_proj_norm_weight.float()
 
     split_meta: dict[str, list[dict[str, Any]]] = {}
-    for split_name, seqs in (("train", bank.train), ("val", bank.val)):
+    for split_name in SPLIT_NAMES:
+        seqs = bank.split(split_name)
         rows = []
         for idx, seq in enumerate(seqs):
             prefix = f"{split_name}.{idx:05d}."
@@ -635,7 +735,10 @@ def load_layer_capture(directory: Path | str, layer_id: int) -> CapturedLayerBan
     stem = f"layer-{layer_id:04d}"
     manifest = json.loads((directory / f"{stem}.json").read_text(encoding="utf-8"))
     if manifest.get("schema") != CAPTURE_SCHEMA:
-        raise ValueError(f"unsupported capture schema: {manifest.get('schema')!r}")
+        raise ValueError(
+            f"unsupported capture schema: {manifest.get('schema')!r} (expected {CAPTURE_SCHEMA!r}); "
+            "recapture under the three-way train/val/test split"
+        )
     geometry = MlaLayerGeometry.from_dict(manifest["geometry"])
     if geometry.layer_id != layer_id:
         raise ValueError(f"capture layer_id {geometry.layer_id} != requested {layer_id}")
@@ -651,7 +754,7 @@ def load_layer_capture(directory: Path | str, layer_id: int) -> CapturedLayerBan
         post_proj_norm_weight=tensors["params.post_proj_norm_weight"] if manifest["has_post_proj_norm"] else None,
     )
     loaded: dict[str, tuple[CapturedSequence, ...]] = {}
-    for split_name in ("train", "val"):
+    for split_name in SPLIT_NAMES:
         seqs = []
         for row in manifest["splits"][split_name]:
             prefix = f"{split_name}.{int(row['index']):05d}."
@@ -675,6 +778,7 @@ def load_layer_capture(directory: Path | str, layer_id: int) -> CapturedLayerBan
         params=params,
         train=loaded["train"],
         val=loaded["val"],
+        test=loaded["test"],
         provenance=dict(manifest.get("provenance", {})),
     )
     bank.validate()

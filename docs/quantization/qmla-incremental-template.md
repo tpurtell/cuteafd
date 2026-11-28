@@ -1,6 +1,6 @@
 # Incremental QMLA calibration template: add calibrated MLA sidecar to an existing checkpoint
 
-**Every incremental QMLA calibration brief starts from this file.** Given a `MODEL_ID` and an immutable `SOURCE_REVISION` (MC or plain/non-MC), it adds a validated `cuteafd-qmla-v1` sidecar (**one** file: `mla_calibration.safetensors`, with **no separate `mla_calibration.json`**) as a **new revision of the same Hugging Face repository**, preserving every existing weight shard, view, index, tokenizer, and asset with **zero weight shard re-uploads**.
+**Every incremental QMLA calibration brief starts from this file.** Given a `MODEL_ID` and an immutable `SOURCE_REVISION` (MC or plain/non-MC), it adds a validated `cuteafd-qmla-v2` sidecar (**one** file: `mla_calibration.safetensors`, with **no separate `mla_calibration.json`**) as a **new revision of the same Hugging Face repository**, preserving every existing weight shard, view, index, tokenizer, and asset with **zero weight shard re-uploads**.
 
 Copy this file whole, keep every section, and fill in **§9 Model addendum**. Never weaken a template rule.
 
@@ -54,7 +54,7 @@ Calibration draws deterministically from a pinned revision of `wrldsuksgo2mars/a
 ---
 
 ## 3. Pilot first (required before full run)
-Always run a short pilot first — a few representative MLA layers, a small corpus slice, and one principal mode (`4:4`, or `4:0` for pure-NoPE families) with default `--protection sink4_local128` — and report results to TJ before running all layers and modes.
+Always run a short pilot first and report its results to TJ before the full run. The pilot uses a few representative MLA layers and a small corpus slice (16 / 4 / 4 train / val / test), with default `--protection sink4_local128`. It is for understanding, so it fits every width and measures all nine combinations, just like the full run (pure-NoPE families: `8:0,4:0,2:0`).
 
 **Reference pilot command (Hy4-flash):**
 ```bash
@@ -67,13 +67,14 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
   --corpus-dir "$CORPUS_DIR" \
   --output "$WORK_ROOT/pilot" \
   --pilot
-# --pilot defaults to: --layers 0,21,41 --modes 4:4 --protection sink4_local128 --train-sequences 16 --val-sequences 4 --steps 100
+# --pilot defaults to: --layers 0,21,41 --modes 8:8,4:8,4:4,2:4,8:0,4:0,2:0,0:8,0:4 --protection sink4_local128
+#   --train-sequences 16 --val-sequences 4 --test-sequences 4 --steps 100
 ```
 
 **Pilot gates (must pass before full run):**
 - `validate_sidecar` passes with `status == "passed"` and `protection_policy == "sink4_local128"`.
 - Every pilot layer satisfies orthogonality $\|R_C^\top R_C - I\|_\infty < 10^{-5}$, strictly positive finite scales, and quantization-off algebraic equivalence `< 1e-4` relative L2.
-- Held-out validation $\mathcal{L}_C$ and $\mathcal{L}_P$ improve over step-0 RTN (and report comparison vs fixed Sylvester Hadamard and SmoothQuant† $\alpha$-search under the same protection policy).
+- Report the full test cross-table (every per-width fit and SmoothQuant init against every combination), the shipped transforms' test error per combination against RTN, fixed Hadamard and SmoothQuant†, and which candidate each layer shipped.
 - Wall time per layer and peak GPU/host RAM logged to forecast full-run ETA (Asia/Taipei).
 
 ---
@@ -95,7 +96,8 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
   --modes 8:8,4:8,4:4,2:4,4:0,0:4,8:0,0:8,2:0 \
   --protection sink4_local128 \
   --train-sequences 128 \
-  --val-sequences 32 \
+  --val-sequences 16 \
+  --test-sequences 16 \
   --steps 300
 ```
 - **Pure-NoPE models (e.g., GLM 5.3 Flash):** pass `--modes 8:0,4:0,2:0`. Any `R > 0` mode is omitted and recorded under `unsupported_modes_reason`.
@@ -105,23 +107,26 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
 
 ### Capture, fitting and validation contract (both templates)
 - **Primary forward:** use the pinned upstream **BF16 source** (the MC `original` view, or the plain checkpoint) for capture and fitting.
-- **Capture once:** capture each training and validation sequence once, and reuse its activations across every bit width. Never re-run the forward per mode.
-- **Fit per path and width, independently:** for each eligible full-history MLA layer, fit content at **2, 4 and 8 bits** (`content.c2/c4/c8`) and RoPE at **4 and 8 bits** (`rope.r4/r8`). The two paths fit independently. All fitted transforms go in the one `mla_calibration.safetensors`.
-- **Validation combinations:** the pilot evaluates **4:4**. The full run evaluates **all nine**:
+- **Three disjoint splits:** `train` fits, `val` selects fit steps and the shipped transform, `test` produces every reported number (full 128 / 16 / 16, pilot 16 / 4 / 4). Split IDs and hashes are recorded in provenance and the fit identity, and a capture reused across a split change refuses.
+- **Capture once:** capture each sequence once, and reuse its activations across every bit width. Never re-run the forward per mode.
+- **Fit per path and width, independently, for analysis:** for each eligible full-history MLA layer, fit content at **2, 4 and 8 bits** and RoPE at **4 and 8 bits**. The two paths fit independently.
+- **Ship one transform per path:** across every width's fit and every width's SmoothQuant init, ship the content × RoPE pair with the lowest mean `val` ratio to RTN over all combinations. Record the choice (`fitted|smoothquant`, source width) and its per-combination val score per layer. That single content and single RoPE transform serves every width in `mla_calibration.safetensors` (`qmla-design.md` §5).
+- **Combinations:** the pilot and the full run both evaluate **all nine**:
   - **both paths active:** 8:8, 4:8, 4:4, 2:4;
   - **single path:** 8:0, 4:0, 2:0, 0:8, 0:4. A 0 keeps that path's original cache format.
 
-  Combinations reuse fits: 2:0 and 2:4 share the same 2-bit content fit, and so on. **Always evaluate and report 2:0.**
-- **Error measurement:** every combination gets a measured attention-output error on the **same held-out validation sequences**, against matched baselines (RTN, fixed Hadamard, SmoothQuant†), with `sink4_local128` protection on.
-- **K8 transfer check (MC checkpoints):** replay **only the same 32 full-run validation sequences** through `k8-compact`. Apply the BF16-fitted transforms, and compare each combination against **K8's own 0:0 output**. Reuse those K8 captures across all nine combinations. The 128 training sequences run on BF16 only.
+  **Always evaluate and report 2:0.**
+- **Error measurement:** every reported number is measured on the **held-out test sequences only**, against matched baselines (RTN, fixed Hadamard, SmoothQuant†), with `sink4_local128` protection on.
+- **K8 transfer check (MC checkpoints):** replay **only the held-out test sequences** through `k8-compact`. Apply the shipped BF16-calibrated transforms, and compare each combination against **K8's own 0:0 output**. Reuse those K8 captures across all nine combinations. The training and val sequences run on BF16 only.
 - **Reporting:**
   - fitting time per layer, path and bit width;
-  - validation error per combination;
+  - test error per combination for (a) every per-width fit and SmoothQuant init (the cross-table) and (b) the shipped single transforms;
+  - the candidate each layer shipped, and how often fitting beat its init;
   - the total sidecar size, once.
 
   **Keep every measured result in the report, including baseline misses.**
 - **Every fitted combination is supported. There's no acceptance gate.** `supported_modes` lists every combination with a fitted profile; only structural limits are unsupported (INT2 RoPE; RoPE modes on pure-NoPE models). The quality cutoff for what to recommend is decided later, from the metrics below.
-- **One summary error number per combination, recorded in `qmla-validation-report.json` and the manifest's per-combination entry:** `attn_rel_err`, the mean over layers and held-out tokens of ‖o_q − o_ref‖² / ‖o_ref‖², where o is the post-`o_proj` attention output, o_ref is the 0:0 output of the same view, and o_q is the quantized output with protection on. Report it:
+- **One summary error number per combination, recorded in `qmla-validation-report.json` and the manifest's per-combination entry:** `attn_rel_err` of the shipped transforms, the mean over layers and held-out test tokens of ‖o_q − o_ref‖² / ‖o_ref‖², where o is the post-`o_proj` attention output, o_ref is the 0:0 output of the same view, and o_q is the quantized output with protection on. Report it:
   - per combination, alongside the same metric for RTN and fixed Hadamard, plus the ratio to RTN;
   - for the K8 transfer, as the same metric against K8's own 0:0;
   - per layer, as supporting detail.
@@ -134,10 +139,10 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
 Before any publication step:
 1. Run `qmla.validate_sidecar(sidecar_dir, expected_source=..., expected_geometries=..., banks_by_layer=..., strict=True)` to verify:
    - Single sidecar file `mla_calibration.safetensors` (no `mla_calibration.json`), self-describing `__metadata__["cuteafd_qmla"]`.
-   - Schema (`cuteafd-qmla-v1`), canonical conventions & quantizer recipe, `artifact_status == "calibrated_unqualified"`, `protection_policy == "sink4_local128"`, `protection_scope == "full_history_mla_only"`.
+   - Schema (`cuteafd-qmla-v2`), canonical conventions & quantizer recipe, `artifact_status == "calibrated_unqualified"`, `protection_policy == "sink4_local128"`, `protection_scope == "full_history_mla_only"`.
    - `tensors_payload_sha256`, `tensors_payload_bytes`, exact F32 tensor inventory, `profile_fingerprint`, and `transform_fingerprint`.
    - Orthogonality $\|R_C^\top R_C - I\|_\infty < 10^{-5}$, positive finite scales, and quantization-off numerical equivalence `< 1e-4`.
-2. **Cross-view transfer (MC checkpoints):** the required check is the K8 transfer above: the 32 validation sequences through `k8-compact`, each combination against K8's own 0:0. Other views (`k6-compact`, `fp8-compact`) are optional extra evidence on the same validation slice. Record validated views in `applicable_views` and `view_transfer_validation`. Share one sidecar across views whenever transfer validates; create a view-scoped profile only if measured necessary.
+2. **Cross-view transfer (MC checkpoints):** the required check is the K8 transfer above: the held-out test sequences through `k8-compact`, each combination against K8's own 0:0. Other views (`k6-compact`, `fp8-compact`) are optional extra evidence on the same test slice. Record validated views in `applicable_views` and `view_transfer_validation`. Share one sidecar across views whenever transfer validates; create a view-scoped profile only if measured necessary.
 3. **MC manifest check (MC checkpoints):** Confirm `attach_qmla_to_mc` + `validate_sidecar(..., mc_manifest=updated_mc)` + `mc_manifest.validate` passes with `required_features` unchanged, `shared_inventory_sha256` identical, all view fingerprints identical, exact agreement between `cuteafd-mc.json["qmla"]` and `__metadata__["cuteafd_qmla"]` (plus whole-file `tensors_sha256`/`tensors_bytes`), and `mla_calibration.safetensors` absent from every view's `weight_map`.
 
 ---
@@ -201,5 +206,5 @@ Follow `docs/quantization/brief-template.md` §12:
 - **Target modes:** `<e.g. 8:8,4:8,4:4,2:4,4:0,0:4,8:0,0:8,2:0 or 8:0,4:0,2:0 for pure NoPE>`
 - **Protection policy:** `sink4_local128` (default on full-history MLA layers; SWA untouched)
 - **Pinned corpus panel:** `wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7` (`agentic`, `exl3_standard`; later recalibration adds `long_context` via `--panel-revision <NEW_SHA> --components agentic,exl3_standard,long_context`)
-- **Pilot configuration:** `--layers <subset> --modes <one-mode> --protection sink4_local128 --train-sequences 16 --val-sequences 4 --steps 100`
+- **Pilot configuration:** `--pilot` (`--layers <subset>`, all nine modes, `--train-sequences 16 --val-sequences 4 --test-sequences 4 --steps 100`)
 - **Artifact status target:** `calibrated_unqualified` (promote to `runtime_qualified` after runtime qualification in #2909 Phases 3–5)
