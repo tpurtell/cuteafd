@@ -787,10 +787,15 @@ def adopt_roots(arms):
             arm['root'] = found.stdout.strip()
 
 
+def slot_workspace(arm):
+    """A sealed WIP slot's frozen coordinator source tree."""
+    root = arm.get('root') or str(Path.home() / '.cache/cuteafd/builds' / ('wip-' + arm.get('wip_instance', arm['instance'])))
+    return Path(root) / 'slots' / arm['slot'] / 'coordinator/workspace'
+
+
 def slot_binary(arm):
     """The smoke runner a sealed WIP slot ships: the arm's own coordinator build."""
-    root = arm.get('root') or str(Path.home() / '.cache/cuteafd/builds' / ('wip-' + arm.get('wip_instance', arm['instance'])))
-    return Path(root) / 'slots' / arm['slot'] / 'coordinator/workspace/.cuteafd-wip/cuteafd'
+    return slot_workspace(arm) / '.cuteafd-wip/cuteafd'
 
 
 def resolve_binary(binary, arm, dry=False):
@@ -1121,7 +1126,11 @@ def check_launcher_submodules(arms, arm_repos, builds, global_repo):
     Refuses rather than initializing: the worktree belongs to its owner."""
     explicit = explicit_launchers(arms, arm_repos)
     problems = []
-    for repo, names in itertools.groupby(sorted((str(explicit.get(name, global_repo)), name) for name in arms if name not in builds),
+    # A WIP slot arm's launcher is its slot's own source commit (resolve_launchers):
+    # the global checkout only when it sits at that commit and passes this same check,
+    # else a fresh checkout wip-source-checkout.sh verifies against the locks.
+    checked = [name for name in arms if name not in builds and (name in explicit or 'release' in arms[name])]
+    for repo, names in itertools.groupby(sorted((str(explicit.get(name, global_repo)), name) for name in checked),
                                          key=lambda item: item[0]):
         found = submodule_problems(repo)
         if not found:
@@ -1135,11 +1144,69 @@ def check_launcher_submodules(arms, arm_repos, builds, global_repo):
                          + '\n  '.join(problems))
 
 
+def slot_source_commit(name, arm):
+    """The commit a sealed WIP slot was built from: wip.sh's sealed
+    .cuteafd-source-revision stamp. A slot without a clean commit stamp names no
+    launcher, and serving it through another checkout's run.sh is how an A/B gets
+    flags or keys its binary never knew (#2907, #2831), so it refuses."""
+    path = slot_workspace(arm) / '.cuteafd-source-revision'
+    fix = f'pass --arm-repo {name}=PATH naming the checkout it was built from'
+    try:
+        stamp = path.read_text().strip()
+    except OSError as error:
+        raise ValueError(f"{name}: WIP slot {arm['instance']}:{arm['slot']} records no source revision "
+                         f'({path}: {error.strerror or error}); {fix}') from None
+    if not re.fullmatch(r'[0-9a-f]{40}', stamp):
+        raise ValueError(f"{name}: WIP slot {arm['instance']}:{arm['slot']} was built from {stamp!r}, "
+                         f'not a clean commit; {fix}')
+    return stamp
+
+
+def clean_checkout_at(repo, commit):
+    """Whether REPO is a clean checkout of COMMIT with its submodules at their pins."""
+    if git_head(repo) != commit:
+        return False
+    status = subprocess.run(['git', '-C', str(repo), 'status', '--porcelain', '--untracked-files=no'],
+                            capture_output=True, text=True, timeout=60)
+    return status.returncode == 0 and not status.stdout.strip() and not submodule_problems(repo)
+
+
+def slot_launcher(name, arm, global_repo, task, dry):
+    """(repo, commit) of the launcher for a WIP slot arm: a checkout of the commit
+    the slot was built from. The global --repo when it is a clean checkout of that
+    commit, else <builds>/<task>/launcher-<sha12> (reused on --resume), made the way
+    --build sources are (wip-source-checkout.sh, verified against the tree locks)."""
+    commit = slot_source_commit(name, arm)
+    if clean_checkout_at(global_repo, commit):
+        return str(global_repo), commit
+    repo = Path.home() / '.cache/cuteafd/builds' / task / ('launcher-' + commit[:12])
+    if (repo / '.git').exists():
+        if not clean_checkout_at(repo, commit):
+            raise ValueError(f'{name}: launcher checkout {repo} is not a clean checkout of {commit[:12]}; remove it or use a new --task')
+        return str(repo), commit
+    if subprocess.run(['git', '-C', str(REPO), 'cat-file', '-e', commit + '^{commit}'], capture_output=True, timeout=60).returncode:
+        raise ValueError(f'{name}: the slot\'s source commit {commit[:12]} is not in {REPO}; fetch it or pass --arm-repo {name}=PATH')
+    cmd = ['bash', str(REPO / 'scripts/build/wip-source-checkout.sh'), str(REPO), commit, str(repo)]
+    print(shlex.join(cmd))
+    if dry:
+        return str(repo), commit
+    repo.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        run(cmd, timeout=1800)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        detail = (getattr(error, 'stderr', None) or str(error)).strip()
+        raise ValueError(f'{name}: could not check out launcher {commit[:12]} at {repo}: {detail}') from None
+    if git_head(repo) != commit or not (repo / 'run.sh').is_file():
+        raise ValueError(f'{name}: launcher checkout {repo} is not at {commit[:12]} or has no run.sh')
+    return str(repo), commit
+
+
 def resolve_launchers(arms, arm_repos, builds, global_repo, state, task, dry):
     """Gives every arm the launcher checkout that serves it (recorded in the plan as
     arm['repo'] and arm['repo_commit']): a --build arm its own <builds>/<task>/source-<arm>
-    (which must be at the built revision), any other arm its --arm-repo ARM=PATH, else the
-    global --repo. Explicit and built launchers must be git checkouts holding run.sh."""
+    (which must be at the built revision), an --arm-repo ARM=PATH arm that path, a WIP
+    slot arm a checkout of the commit its slot was built from (slot_launcher), and a
+    release arm the global --repo. Every launcher must be a git checkout holding run.sh."""
     explicit = explicit_launchers(arms, arm_repos)
     if set(explicit) & set(builds):
         raise ValueError('--arm-repo refuses --build arms (their source checkout is the launcher): ' + ', '.join(sorted(set(explicit) & set(builds))))
@@ -1150,8 +1217,11 @@ def resolve_launchers(arms, arm_repos, builds, global_repo, state, task, dry):
             wanted = builds[name]
         elif name in explicit:
             repo, wanted = explicit[name], None
-        else:
+        elif 'release' in arm:
             arm['repo'], arm['repo_commit'] = str(global_repo), git_head(global_repo)
+            continue
+        else:
+            arm['repo'], arm['repo_commit'] = slot_launcher(name, arm, global_repo, task, dry)
             continue
         if not (dry and name in builds):
             if not (repo / 'run.sh').is_file():
@@ -2784,17 +2854,32 @@ def matched_requests(dest):
 
 
 def validate_matched_pairs(rows, arm_names):
+    """Fails every row of a pair whose arms' prompt token hashes differ. An arm that
+    produced no hashes (it crashed, or failed preflight) has already failed on its
+    own; the pair is then unverifiable, not a mismatch, so the arms that did produce
+    hashes keep their own results and are marked `matched_pair: unverifiable`."""
     for card, repeat in {(r['card'], r['repeat']) for r in rows if r.get('nonce_seed')}:
         pair = [r for r in rows if r['card'] == card and r['repeat'] == repeat]
         if {r['arm'] for r in pair} != set(arm_names):
             continue  # Not all arms have completed yet.
         hashes = [r.get('measured_prompt_waves', r.get('prompt_token_hashes')) for r in pair]
-        if not all(hashes) or any(h != hashes[0] for h in hashes[1:]):
-            for row in pair:
-                fail(row, 'matched pair missing or mismatched prompt token hashes', 'measurement')
+        missing = sorted(r['arm'] for r, h in zip(pair, hashes) if not h)
+        present = [(row, h) for row, h in zip(pair, hashes) if h]
+        if any(h != present[0][1] for _row, h in present[1:]):
+            for row, _h in present:
+                fail(row, 'matched pair mismatched prompt token hashes', 'measurement')
                 row['exit_code'] = row.get('exit_code') or 81
                 (Path(row['state']) / 'exit').write_text('81\n')
                 save(Path(row['state']) / 'result.json', row)
+        else:
+            for row, _h in present:
+                # A resumed arm that now has hashes clears the mark.
+                marked = dict(status='unverifiable', reason=f"{', '.join(missing)} produced no prompt token hashes") if missing else None
+                if row.get('matched_pair') != marked:
+                    row.pop('matched_pair', None)
+                    if marked:
+                        row['matched_pair'] = marked
+                    save(Path(row['state']) / 'result.json', row)
 
 
 def arm_pairs(arm_names):
@@ -2889,9 +2974,12 @@ def write_summary(state, rows, arms):
                    headline=p['pass'] == r.get('headline_pass'),
                    graph_bands=[b for part in ('sweep', 'context_load') for b in (p.get(part) or {}).get('graph_bands', [])])
               for r in rows for p in r.get('passes', [])]
+    unverifiable = [dict(card=r['card'], arm=r['arm'], repeat=r['repeat'], reason=r['matched_pair']['reason'])
+                    for r in rows if (r.get('matched_pair') or {}).get('status') == 'unverifiable']
     save(state / 'summary.json', dict(rows=rows, medians=medians, paired_deltas=paired,
                                     ab_verdict='rerun' if rerun else 'eligible', caveats=caveats, drafter_differences=drafter_changes,
-                                    **({'passes': passes} if passes else {})))
+                                    **({'passes': passes} if passes else {}),
+                                    **({'unverifiable_pairs': unverifiable} if unverifiable else {})))
     def cell(value):
         if isinstance(value, float):
             return f'{value:.4g}'
@@ -2901,6 +2989,9 @@ def write_summary(state, rows, arms):
     text = f'# wip-cards summary: {state.name}\n\n'
     failed = [r for r in rows if r['status'] != 'pass']
     text += f'{len(rows) - len(failed)} of {len(rows)} jobs passed.\n\n'
+    if unverifiable:
+        text += ('Matched pairs unverifiable (the other arm produced no prompt token hashes; these arms\' own results stand, '
+                 'unpaired): ' + ', '.join(f"{u['card']}/{u['arm']}/r{u['repeat']} ({u['reason']})" for u in unverifiable) + '.\n\n')
     warm_paths = [f"{r['card']}/{r['arm']}/r{r['repeat']}: {r['matched_panel_window']['prelude_path']}"
                   for r in rows if r.get('matched_panel_window')]
     if warm_paths:
@@ -3690,9 +3781,10 @@ def main():
                         help='maximum wait for the single serving turn, in seconds (default 21600)')
     parser.add_argument('--task', default='cards-' + time.strftime('%Y%m%d-%H%M%S'))
     parser.add_argument('--state', type=Path)
-    parser.add_argument('--repo', type=Path, default=REPO, help='launcher checkout for arms that are neither --build nor --arm-repo')
-    parser.add_argument('--arm-repo', action='append', default=[], metavar='ARM=PATH', help='launcher checkout serving this non-built arm '
-                        '(a reused slot names its matching source); --build arms serve through their own source-ARM checkout')
+    parser.add_argument('--repo', type=Path, default=REPO, help='launcher checkout for --arm-release arms; a WIP slot arm serves '
+                        'through a checkout of the commit its slot records, --build arms through their own source-ARM checkout')
+    parser.add_argument('--arm-repo', action='append', default=[], metavar='ARM=PATH', help='launcher checkout serving this non-built arm, '
+                        'overriding the slot\'s recorded source (required when the slot records none or a dirty one)')
     parser.add_argument('--binary', help='the cuteafd that runs smoke; default: cuteafd on PATH, else the arm\'s sealed '
                         'slot binary (<WIP_ROOT>/slots/<slot>/coordinator/workspace/.cuteafd-wip/cuteafd)')
     parser.add_argument('--set', action='append', default=[], metavar='CARD:KEY=VALUE')
@@ -4056,8 +4148,8 @@ def main():
     resolve_launchers(arms, args.arm_repo, builds, args.repo, state, args.task, args.dry_run)
     if args.trace:
         for name, arm in arms.items():
-            if args.dry_run and name in builds:
-                continue
+            if args.dry_run and not Path(arm['repo']).exists():
+                continue  # a --build source or slot launcher checkout a dry run does not create
             for card in cards:
                 if card.get('family') == 'deepseek_v41' and not launcher_forwards_v41_trace(Path(arm['repo'])):
                     raise ValueError(f"{card['name']}: arm {name}'s launcher {arm['repo']} does not forward SPECULATION_TRACE on the V4.1 path")
