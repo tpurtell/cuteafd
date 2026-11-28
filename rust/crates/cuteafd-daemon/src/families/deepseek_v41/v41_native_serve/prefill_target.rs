@@ -307,7 +307,18 @@ impl<'a, P: PrefillTarget<'a>, C: DraftChain<'a>> PrefillDriver for V41PrefillSt
     }
 
     fn execute(&mut self, cursor: &mut Self::Cursor, unit: &PrefillUnit<V41Unit>) -> Result<Option<RetainedScores>> {
+        // Prefill-slot graphs are proven by events on the streams they launch
+        // on, like lane cycles (lane 0's clocks); prefill runs between lane sets.
+        let scope = crate::shared::decode_graph::device::PrefillScope::open(self.lib, |f| {
+            for (pass, _) in &mut self.prefill.slots { pass.visit_graph_banks(f)?; }
+            if let Some(draft) = self.draft.as_deref_mut() { draft.visit_graph_banks(f)?; }
+            Ok(())
+        })?;
         let result = (|| self.execute_unit(cursor, unit))();
+        let result = match result {
+            Ok(output) => scope.close().map(|()| output),
+            Err(error) => { drop(scope); Err(error) }
+        };
         let measured = unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
             crate::shared::decode_graph::device::observe_completed(self.lib, |f| {
             for (pass, _) in &mut self.prefill.slots { pass.visit_graph_banks(f)?; }

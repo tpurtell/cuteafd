@@ -437,6 +437,7 @@ impl<K: Hash + Eq + Clone + std::fmt::Debug, E> GraphBank<K, E> {
     pub fn cache_lane_owner(&mut self, lane: usize) {
         if let Some(binding) = &mut self.device {
             binding.cache.lock().unwrap_or_else(|p| p.into_inner()).assign_bank_lane(binding.bank, lane);
+            binding.launches.set_lane(lane);
             binding.lane = lane;
         }
     }
@@ -828,12 +829,124 @@ mod device_tests {
         assert_eq!(bank.cached_launch(&1), Some(&42));
     }
 
+    /// Per-launch host cost of lane stream accounting (`note_lane_launch`), the
+    /// only work `decode_graph::launch` added for every family.
+    #[test]
+    #[ignore = "CPU launch accounting microbenchmark; run explicitly with --nocapture"]
+    fn lane_launch_accounting_nanoseconds() -> anyhow::Result<()> {
+        use super::super::device;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 9, 1 << 30)?;
+        library.cuda_set_device(9)?;
+        fixture.immediate_copies(&library)?;
+        let mut bank: GraphBank<usize, usize> = GraphBank::new();
+        bank.attach_device(&library, 9, 64 << 20, site())?;
+        let tally = std::sync::Arc::clone(&bank.device.as_ref().unwrap().launches);
+        let stream = 0x40usize as *mut std::ffi::c_void;
+        let n = 10_000_000u32;
+        let time = |label: &str| {
+            let started = std::time::Instant::now();
+            for _ in 0..n { device::note_lane_launch(std::hint::black_box(&tally), std::hint::black_box(stream)); }
+            println!("{label}: {:.2} ns/launch", started.elapsed().as_nanos() as f64 / f64::from(n));
+        };
+        time("no cycle open (families without lane/event cycles)");
+        let mut cycles = device::LaneCycles::register(&library, 0, 1, |visit| visit(9, "bank-test", false, &mut bank))?;
+        unsafe { cycles.begin(|_| Ok(())) }?;
+        time("lane cycle open, stream already recorded (V4.1 steady state)");
+        cycles.complete()?;
+        Ok(())
+    }
+
+    /// V4.1 lane cycles complete by events recorded on exactly the streams
+    /// their banks launched on; launches route by bank lane, not "current" lane.
+    #[test]
+    fn lane_cycles_prove_completion_by_events_on_launched_streams() -> anyhow::Result<()> {
+        use super::super::device;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 8, 1 << 30)?;
+        library.cuda_set_device(8)?;
+        fixture.immediate_copies(&library)?;
+        let mut banks: [GraphBank<usize, usize>; 2] = [GraphBank::new(), GraphBank::new()];
+        for bank in &mut banks { bank.attach_device(&library, 8, 64 << 20, site())?; }
+        let [first, second] = &mut banks;
+        let mut lane0 = device::LaneCycles::register(&library, 0, 2, |visit| visit(8, "bank-test", false, first))?;
+        let mut lane1 = device::LaneCycles::register(&library, 1, 2, |visit| visit(8, "bank-test", false, second))?;
+        let clocks = banks[0].device.as_ref().unwrap().clocks.clone();
+        let completed = |lane: usize| clocks[lane].completed.load(std::sync::atomic::Ordering::Acquire);
+        let index = |lane: usize| clocks[lane].index.load(std::sync::atomic::Ordering::Acquire);
+        let (s0, s1) = (0x10usize as *mut std::ffi::c_void, 0x20usize as *mut std::ffi::c_void);
+        let launches = |lane: usize| std::sync::Arc::clone(&banks[lane].device.as_ref().unwrap().launches);
+        let (t0, t1) = (launches(0), launches(1));
+
+        // Interleaved lanes on one thread: each launch lands in its own lane's scope.
+        unsafe { lane0.begin(|_| Ok(())) }?;
+        unsafe { lane1.begin(|_| Ok(())) }?;
+        device::note_lane_launch(&t1, s1);
+        device::note_lane_launch(&t0, s0);
+        device::note_lane_launch(&t0, s0);
+        let before = fixture.events()?.matches('R').count();
+        lane0.complete()?;
+        assert_eq!(fixture.events()?.matches('R').count(), before + 1, "lane 0 records one event: one stream");
+        assert_eq!(completed(0), 0, "completion is credited only by a later poll, never at complete()");
+        lane1.complete()?;
+        assert_eq!(fixture.events()?.matches('R').count(), before + 2);
+        // The next begin polls the (immediately complete) events and credits.
+        unsafe { lane0.begin(|_| Ok(())) }?;
+        assert_eq!(completed(0), index(0) - 1, "credit reaches exactly the proven cycle");
+        assert_eq!(completed(1), 0, "lane 1 is credited only by its own events");
+        lane0.complete()?;
+        unsafe { lane1.begin(|_| Ok(())) }?;
+        assert_eq!(completed(1), index(1) - 1);
+
+        // Abandon records and credits nothing.
+        device::note_lane_launch(&t1, s1);
+        let before = fixture.events()?.matches('R').count();
+        lane1.abandon();
+        assert_eq!(fixture.events()?.matches('R').count(), before);
+        unsafe { lane1.begin(|_| Ok(())) }?;
+        assert!(completed(1) < index(1) - 1, "an abandoned cycle is never credited by events");
+        lane1.complete()?;
+        // Proofs live on the shared clocks: a new instance for the next lane
+        // set credits the previous instance's last cycle.
+        unsafe { lane1.begin(|_| Ok(())) }?;
+        device::note_lane_launch(&t1, s1);
+        lane1.complete()?;
+        let proven = index(1);
+        drop(lane1);
+        let mut lane1 = device::LaneCycles::register(&library, 1, 2, |visit| visit(8, "bank-test", false, &mut banks[1]))?;
+        unsafe { lane1.begin(|_| Ok(())) }?;
+        assert_eq!(completed(1), proven, "the dropped instance's last proof is credited by its successor");
+        lane1.complete()?;
+
+        // A serial prefill scope proves its launches on lane 0's clocks.
+        let prefill = device::PrefillScope::open(&library, |visit| visit(8, "bank-test", false, &mut banks[0]))?;
+        device::note_lane_launch(&t0, s0);
+        prefill.close()?;
+        let proven = index(0);
+        unsafe { lane0.begin(|_| Ok(())) }?;
+        assert!(completed(0) >= proven, "prefill graphs are credited by their own events");
+        lane0.complete()?;
+
+        // A launch from another thread (a lane moved off its executor) is
+        // counted on the shared clock but recorded in no scope here: the cycle
+        // is refused, never credited.
+        unsafe { lane0.begin(|_| Ok(())) }?;
+        let t0_moved = std::sync::Arc::clone(&t0);
+        std::thread::spawn(move || device::note_lane_launch(&t0_moved, 0x30usize as *mut std::ffi::c_void)).join().unwrap();
+        let refused = lane0.complete();
+        assert!(refused.is_err(), "launches with no recorded stream must refuse credit: {refused:?}");
+        drop((lane0, lane1));
+        Ok(())
+    }
+
     #[test]
     fn cycle_handle_hit_only_round_never_visits_or_locks_banks_and_survives_reuse() -> anyhow::Result<()> {
         use super::super::device;
         let mut bank = GraphBank::<usize, usize>::new();
         bank.attach_device_for_test(-395, 64 << 20, site())?;
-        let mut cycles = device::LaneCycles::register(0, 1,
+        let mut cycles = device::LaneCycles::register_policy(0, 1,
             |visit| visit(-395, "bank-test", false, &mut bank))?;
         let cache = bank.device.as_ref().unwrap().cache.clone();
         // Keeping the controller locked makes a mutex on the boundary deadlock;
@@ -842,7 +955,7 @@ mod device_tests {
         for _ in 0..4 {
             // SAFETY: no queued work, fixture contains no captured allocations.
             unsafe { cycles.begin(|_| panic!("hit-only cycle visited banks")) }?;
-            cycles.complete();
+            cycles.complete()?;
         }
         drop(guard);
         for round in 0..3 {
@@ -852,7 +965,7 @@ mod device_tests {
             bank.cache_clear_drained();
             // SAFETY: explicit drained reuse of the same registered bank.
             unsafe { cycles.begin(|_| panic!("reused bank lost its lane handle")) }?;
-            cycles.complete();
+            cycles.complete()?;
         }
         assert_eq!(device::snapshots().into_iter().find(|row| row.device == -395).unwrap().charged, 10);
         Ok(())

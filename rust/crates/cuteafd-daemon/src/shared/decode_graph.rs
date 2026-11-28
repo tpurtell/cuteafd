@@ -138,7 +138,11 @@ pub(crate) unsafe fn launch(library: &cuteafd_ffi::NativeLibrary,
     tally: Option<&device::BankLaunches>) -> anyhow::Result<()> {
     // SAFETY: forwarded executable, stream and captured-storage contract.
     unsafe { library.cuda_graph_launch(graph, stream)?; }
-    if let Some(tally) = tally { tally.record(); }
+    if let Some(tally) = tally {
+        tally.record();
+        // Attribute the launch to its bank lane's open cycle (event proof scope).
+        device::note_lane_launch(tally, stream);
+    }
     Ok(())
 }
 
