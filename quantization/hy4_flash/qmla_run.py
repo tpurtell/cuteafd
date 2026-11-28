@@ -848,6 +848,7 @@ def load_long_eval_records(checkpoint: Path, panel_revision: str | None):
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    code_commit = _git_head_sha(Path(__file__).resolve().parents[2])
     if args.sidecar is not None and not args.long_eval:
         parser.error("--sidecar requires --long-eval")
 
@@ -971,6 +972,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         fit_config=fit_cfg,
         device=args.device,
         renderer_template_sha256=template_sha,
+        code_commit=code_commit,
     )
     if args.long_eval:
         del banks
