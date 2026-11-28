@@ -125,7 +125,9 @@ Calibration corpus provenance is not duplicated in `cuteafd-mc.json` (which stay
 strictly discovery/view metadata); it lives in each view's `quantize_config*.json`
 under `provenance` (`dataset`: `{repo_id, revision, sha256sums_sha256}`,
 `components`: per-component `{count, tokens, input_ids_sha256, token_stream_sha256}`
-over `agentic`, `exl3_standard`, and `long_context`, plus `corpus_manifest_sha256`)
+over `agentic`, `exl3_standard`, and `long_context`, with `long_context` also
+recording `mode` and `window_tokens` for weight quants' 2,048-token windows, plus
+`corpus_manifest_sha256`)
 and in the model card's recipe table. Single source of truth for the panel pin is
 `quantization/panel_corpus.py`.
 

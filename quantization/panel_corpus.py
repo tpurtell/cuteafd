@@ -11,8 +11,11 @@ Canonical calibration stream order:
    ``reproduction/pack_exl3_standard.py`` (contract ``exl3-standard-pack-v1``).
 3. ``long_context``: 16K and 32K multi-turn agentic traces (tool calls, tool
    results, optional reasoning) plus long-document QA, rendered once with the
-   checkpoint's own chat template (``add_generation_prompt=False``), unpadded,
-   one record per batch, honoring ``calibration`` vs ``heldout`` splits.
+   checkpoint's own chat template (``add_generation_prompt=False``), honoring
+   ``calibration`` vs ``heldout`` splits. Weight quants use ``windowed`` mode
+   (the default): each rendered record is cut into consecutive 2,048-token
+   windows, one unpadded window per batch, never packed across records. QMLA
+   long-context evaluation uses ``full`` mode: one unpadded record per batch.
 
 Flipping to the three-component panel once published is one edit: set
 ``THREE_COMPONENT_REVISION`` and ``THREE_COMPONENT_SHA256SUMS_SHA256`` below.
@@ -30,7 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -55,6 +58,14 @@ LONG_CONTEXT_SCHEMA = "agentic-quant-panel-v2-long-context-v1"
 EXL3_STANDARD_PACKER = "reproduction/pack_exl3_standard.py"
 EXL3_STANDARD_CONTRACT = "exl3-standard-pack-v1"
 PREPARED_SCHEMA = "cuteafd-panel-corpus-v3"
+
+LongContextMode = Literal["windowed", "full"]
+LONG_CONTEXT_MODES: tuple[str, ...] = ("windowed", "full")
+# Windowed mode: consecutive fixed windows of the rendered stream. A final
+# partial window is kept when it has at least LONG_CONTEXT_MIN_TAIL_TOKENS
+# tokens and dropped otherwise (recorded per record as dropped_tail_tokens).
+LONG_CONTEXT_WINDOW_TOKENS = 2048
+LONG_CONTEXT_MIN_TAIL_TOKENS = 256
 
 # Disjoint rendered-token bounds per length class ([0.70x, 1.35x] of 16,384 / 32,768).
 LONG_CONTEXT_LENGTH_BOUNDS: dict[str, tuple[int, int]] = {
@@ -353,36 +364,72 @@ def render_long_context_record(
     return raw, entry
 
 
+def _check_long_context_mode(mode: str) -> str:
+    if mode not in LONG_CONTEXT_MODES:
+        raise ValueError(f"unknown long_context mode {mode!r}; allowed: {LONG_CONTEXT_MODES}")
+    return mode
+
+
+def window_long_context_ids(ids: Sequence[int]) -> tuple[list[list[int]], int]:
+    """Cut a rendered stream into consecutive windows; return ``(windows, dropped_tail_tokens)``."""
+    size = LONG_CONTEXT_WINDOW_TOKENS
+    windows = [list(ids[i:i + size]) for i in range(0, len(ids), size)]
+    dropped = 0
+    if windows and len(windows[-1]) < LONG_CONTEXT_MIN_TAIL_TOKENS:
+        dropped = len(windows.pop())
+    return windows, dropped
+
+
 def tokenize_long_context_rows(
     rows: Sequence[Mapping[str, Any]],
     tokenizer: Any,
     *,
     chat_kwargs: Mapping[str, Any] | None = None,
     max_context: int | None = None,
+    mode: LongContextMode = "windowed",
 ) -> tuple[array, list[int], dict[str, Any]]:
-    flat, offsets, records, seqs, seen = array("q"), [0], [], [], set()
+    """Render each record once; emit full records or their 2,048-token windows."""
+    _check_long_context_mode(mode)
+    flat, offsets, records, seqs, sources, seen = array("q"), [0], [], [], [], set()
     stream, by_class = hashlib.sha256(), {}
     for row in rows:
         ids, entry = render_long_context_record(row, tokenizer, chat_kwargs=chat_kwargs, max_context=max_context)
         if entry["id"] in seen:
             raise ValueError(f"duplicate long_context record id: {entry['id']}")
         seen.add(entry["id"])
-        flat.extend(ids)
-        offsets.append(len(flat))
-        seqs.append(ids)
-        stream.update(canonical({"id": entry["id"], "input_ids": ids}) + b"\n")
-        records.append(entry)
+        if mode == "full":
+            pieces = [(entry, ids)]
+        else:
+            windows, dropped = window_long_context_ids(ids)
+            sources.append(dict(id=entry["id"], tokens=entry["tokens"], input_ids_sha256=entry["input_ids_sha256"],
+                                content_sha256=entry["content_sha256"], windows=len(windows),
+                                dropped_tail_tokens=dropped))
+            pieces = [(dict(id=f"{entry['id']}/w{i:02d}", component="long_context", split=entry["split"],
+                            length_class=entry["length_class"], record_id=entry["id"], window=i,
+                            start=i * LONG_CONTEXT_WINDOW_TOKENS, tokens=len(w),
+                            input_ids_sha256=ids_sha256(w)), w)
+                      for i, w in enumerate(windows)]
         b = by_class.setdefault(entry["length_class"], {"count": 0, "tokens": 0})
-        b["count"] += 1
-        b["tokens"] += entry["tokens"]
+        for piece, piece_ids in pieces:
+            flat.extend(piece_ids)
+            offsets.append(len(flat))
+            seqs.append(piece_ids)
+            stream.update(canonical({"id": piece["id"], "input_ids": piece_ids}) + b"\n")
+            records.append(piece)
+            b["count"] += 1
+            b["tokens"] += piece["tokens"]
     if not records:
         raise ValueError("empty tokenized long_context split")
-    return flat, offsets, dict(
+    report = dict(
         records=records, count=len(records), tokens=len(flat),
         shortest=min(r["tokens"] for r in records), longest=max(r["tokens"] for r in records),
         input_ids_sha256=component_input_ids_sha256(seqs),
-        token_stream_sha256=stream.hexdigest(), length_classes=by_class,
+        token_stream_sha256=stream.hexdigest(), length_classes=by_class, mode=mode,
     )
+    if mode == "windowed":
+        report.update(window_tokens=LONG_CONTEXT_WINDOW_TOKENS, min_tail_tokens=LONG_CONTEXT_MIN_TAIL_TOKENS,
+                      sources=sources)
+    return flat, offsets, report
 
 
 def _read_sha256sums(root: Path) -> dict[str, str]:
@@ -552,11 +599,17 @@ def prepare_panel_corpus(
     panel_revision: str | None = None,
     panel_sha256sums: str | None = None,
     tokenizer: Any = None,
+    long_context_mode: LongContextMode = "windowed",
 ) -> dict[str, Any]:
-    """Prepare and attest a 2- or 3-component calibration corpus on disk."""
+    """Prepare and attest a 2- or 3-component calibration corpus on disk.
+
+    ``long_context_mode="windowed"`` (weight quants) stores 2,048-token windows;
+    ``"full"`` (QMLA long-context evaluation) stores whole rendered records.
+    """
     import torch
     from transformers import PreTrainedTokenizerFast
 
+    _check_long_context_mode(long_context_mode)
     source, corpus, output = Path(source).absolute(), Path(corpus).absolute(), Path(output).absolute()
     if source.name != source_revision or output.exists():
         raise ValueError("require the pinned source and a fresh corpus directory")
@@ -575,7 +628,9 @@ def prepare_panel_corpus(
     contract_dict = dict(contract) if contract is not None else dict(
         renderer="native-chat-template", raw_calibration=EXL3_STANDARD_CONTRACT,
         batch_size=1, packing=False, order="dataset", **dict(chat_kwargs),
-        **({"long_context": LONG_CONTEXT_SCHEMA} if "long_context" in active else {}),
+        **({"long_context": LONG_CONTEXT_SCHEMA, "long_context_mode": long_context_mode,
+            **({"long_context_window_tokens": LONG_CONTEXT_WINDOW_TOKENS} if long_context_mode == "windowed" else {})}
+           if "long_context" in active else {}),
     )
     manifest: dict[str, Any] = dict(
         schema=schema, status="passed", contract=contract_dict, dataset=panel["dataset"],
@@ -606,13 +661,13 @@ def prepare_panel_corpus(
                 manifest["components"]["exl3_standard"] = std_meta
             if "long_context" in active and split in LONG_CONTEXT_SPLITS:
                 lc_ids, lc_off, lc_rep = tokenize_long_context_rows(
-                    panel["long_context_rows"][split], tokenizer, chat_kwargs=chat_kwargs, max_context=max_context)
+                    panel["long_context_rows"][split], tokenizer, chat_kwargs=chat_kwargs, max_context=max_context,
+                    mode=long_context_mode)
                 lc_seqs = [lc_ids[lc_off[i]:lc_off[i + 1]].tolist() for i in range(len(lc_rep["records"]))]
                 _append_to_split(ids, offsets, report, lc_rep["records"], lc_seqs)
-                summary = dict(count=lc_rep["count"], tokens=lc_rep["tokens"],
-                               input_ids_sha256=lc_rep["input_ids_sha256"],
-                               token_stream_sha256=lc_rep["token_stream_sha256"],
-                               length_classes=lc_rep["length_classes"])
+                summary = {k: lc_rep[k] for k in (
+                    "count", "tokens", "input_ids_sha256", "token_stream_sha256", "length_classes",
+                    "mode", "window_tokens", "min_tail_tokens", "sources") if k in lc_rep}
                 if split == "calibration":
                     manifest["components"]["long_context"] = dict(schema=LONG_CONTEXT_SCHEMA, **summary)
                 else:
@@ -630,7 +685,8 @@ def prepare_panel_corpus(
             raise ValueError("source tokenizer changed during preparation")
         atomic_json(stage / "manifest.json", manifest)
         for split in manifest["splits"]:
-            load_token_records(stage, split, schema=schema, contract=contract_dict, dataset=panel["dataset"], full=full)
+            load_token_records(stage, split, schema=schema, contract=contract_dict, dataset=panel["dataset"], full=full,
+                               long_context_mode=long_context_mode)
         stage.rename(output)
         fsync_directory(output.parent)
     finally:
@@ -655,7 +711,26 @@ def _record_component(row: Mapping[str, Any], index: int, manifest: Mapping[str,
     return "agentic"
 
 
-def _verify_components(records: list[dict[str, Any]], manifest: Mapping[str, Any], split: str, *, require_components, full) -> None:
+def _verify_long_context(records: list[dict[str, Any]], info: Mapping[str, Any], split: str, mode: str) -> None:
+    if info.get("mode") != mode:
+        raise ValueError(f"prepared long_context mode {info.get('mode')!r} differs from requested {mode!r}")
+    lc = [r for r in records if r["component"] == "long_context"]
+    if any(r.get("split", split) != split for r in lc):
+        raise ValueError(f"long_context record from another split found in {split!r}")
+    if mode != "windowed":
+        return
+    if info.get("window_tokens") != LONG_CONTEXT_WINDOW_TOKENS or info.get("min_tail_tokens") != LONG_CONTEXT_MIN_TAIL_TOKENS:
+        raise ValueError("prepared long_context window contract differs")
+    for i, r in enumerate(lc):
+        n = len(r["input_ids"])
+        last = i + 1 == len(lc) or lc[i + 1].get("record_id") != r.get("record_id")
+        if r.get("record_id") is None or not (n == LONG_CONTEXT_WINDOW_TOKENS or (
+                last and LONG_CONTEXT_MIN_TAIL_TOKENS <= n < LONG_CONTEXT_WINDOW_TOKENS)):
+            raise ValueError(f"{r['id']}: long_context window has {n} tokens outside the window contract")
+
+
+def _verify_components(records: list[dict[str, Any]], manifest: Mapping[str, Any], split: str, *, require_components, full,
+                       long_context_mode: str = "windowed") -> None:
     comps = manifest.get("components")
     if not isinstance(comps, Mapping) or not comps:
         if require_components is not None:
@@ -679,6 +754,9 @@ def _verify_components(records: list[dict[str, Any]], manifest: Mapping[str, Any
         missing = [c for c in COMPONENT_ORDER if c in require_components and c not in comps]
         if missing:
             raise ValueError(f"prepared corpus missing required components: {missing}")
+
+    if "long_context" in comps and split in LONG_CONTEXT_SPLITS:
+        _verify_long_context(records, comps["long_context"], split, _check_long_context_mode(long_context_mode))
 
     if split == "calibration":
         cursor = 0
@@ -721,8 +799,13 @@ def load_token_records(
     dataset: Mapping[str, Any] | None = None,
     require_components: Sequence[str] | None = None,
     full: bool | None = None,
+    long_context_mode: LongContextMode = "windowed",
 ) -> list[dict[str, Any]]:
-    """Verify a prepared split and return ordered records with component tags."""
+    """Verify a prepared split and return ordered records with component tags.
+
+    ``long_context_mode`` must match the prepared corpus: ``"windowed"`` (default,
+    weight quants) or ``"full"`` (QMLA long-context evaluation).
+    """
     import torch
     from safetensors.torch import load_file
 
@@ -756,8 +839,9 @@ def load_token_records(
             raise ValueError("prepared record token identity differs")
         stream.update(canonical({"id": row["id"], "input_ids": ids}) + b"\n")
         entry = dict(id=row["id"], component=_record_component(row, idx, manifest, split), input_ids=ids)
-        if "length_class" in row:
-            entry["length_class"] = row["length_class"]
+        for key in ("length_class", "split", "record_id", "window"):
+            if key in row:
+                entry[key] = row[key]
         result.append(entry)
 
     if (report["count"] != len(records) or report["tokens"] != flat.numel()
@@ -766,7 +850,8 @@ def load_token_records(
             or report["token_stream_sha256"] != stream.hexdigest()):
         raise ValueError("prepared split token summary differs")
 
-    _verify_components(result, manifest, split, require_components=require_components, full=full)
+    _verify_components(result, manifest, split, require_components=require_components, full=full,
+                       long_context_mode=long_context_mode)
     return result
 
 
@@ -779,13 +864,14 @@ def load_token_batches(
     dataset: Mapping[str, Any] | None = None,
     require_components: Sequence[str] | None = None,
     full: bool | None = None,
+    long_context_mode: LongContextMode = "windowed",
 ):
-    """Yield unpadded CPU batches (one record per batch) in canonical order."""
+    """Yield unpadded CPU batches (one record or window per batch) in canonical order."""
     import torch
 
     for row in load_token_records(
         root, split, schema=schema, contract=contract, dataset=dataset,
-        require_components=require_components, full=full,
+        require_components=require_components, full=full, long_context_mode=long_context_mode,
     ):
         ids = torch.tensor([row["input_ids"]], dtype=torch.int64)
         yield dict(id=row["id"], component=row["component"], input_ids=ids, attention_mask=torch.ones_like(ids))
@@ -800,13 +886,14 @@ def load_component_records(
     contract: Mapping[str, Any] | None = None,
     dataset: Mapping[str, Any] | None = None,
     full: bool | None = None,
+    long_context_mode: LongContextMode = "windowed",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Load selected components and frozen provenance (importable by MC and QMLA)."""
     root = Path(root)
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     all_records = load_token_records(
         root, split, schema=schema, contract=contract, dataset=dataset,
-        require_components=components, full=full,
+        require_components=components, full=full, long_context_mode=long_context_mode,
     )
     wanted = set(components) if components is not None else {r["component"] for r in all_records}
     filtered = [r for r in all_records if r["component"] in wanted]
@@ -819,6 +906,9 @@ def load_component_records(
                 tokens=sum(len(r["input_ids"]) for r in rows),
                 input_ids_sha256=component_input_ids_sha256(r["input_ids"] for r in rows),
             )
+            if comp == "long_context":
+                info = manifest["components"]["long_context"]
+                comp_prov[comp].update({k: info[k] for k in ("mode", "window_tokens") if k in info})
     combined_sha = hashlib.sha256(
         "\n".join(f"{k}:{comp_prov[k]['input_ids_sha256']}" for k in COMPONENT_ORDER if k in comp_prov).encode()
     ).hexdigest()
@@ -840,6 +930,7 @@ def main() -> None:
     parser.add_argument("--panel-revision", default=None)
     parser.add_argument("--components", default=None)
     parser.add_argument("--subset", action="store_true")
+    parser.add_argument("--long-context-mode", choices=LONG_CONTEXT_MODES, default="windowed")
     parser.add_argument("--reasoning-effort", default=None)
     parser.add_argument("--date-string", default=None)
     args = parser.parse_args()
@@ -854,6 +945,7 @@ def main() -> None:
         args.source, args.corpus, args.output, source_repo=args.source_repo,
         source_revision=args.source.resolve().name, chat_kwargs=chat,
         components=comps, full=not args.subset, panel_revision=args.panel_revision,
+        long_context_mode=args.long_context_mode,
     )
     print(json.dumps(dict(
         dataset=manifest["dataset"], component_order=manifest["component_order"],

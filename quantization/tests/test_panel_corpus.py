@@ -163,12 +163,14 @@ def test_renderer_one_pass_and_fail_closed():
         pc.render_long_context_record(dict(t16, content_sha256="0" * 64), tok, chat_kwargs=chat)
 
 
-def _stage_three_component_panel(tmp_path: Path, revision: str) -> Path:
+def _stage_three_component_panel(tmp_path: Path, revision: str, traces: dict[str, list[dict]] | None = None) -> Path:
     base_v2 = _require_snapshot("datasets--wrldsuksgo2mars--agentic-quant-panel-v2", pc.TWO_COMPONENT_REVISION)
-    t16_cal = _load_raw_trace("lc-16k-cal-01.json")
-    t16_hold = dict(_load_raw_trace("lc-16k-cal-06.json"), id="lc-16k-hold-test", split="heldout", group="wiki:heldout-test")
-    t32_cal = _load_raw_trace("lc-32k-cal-01.json")
-    t32_hold = dict(_load_raw_trace("lc-32k-cal-03.json"), id="lc-32k-hold-test", split="heldout", group="agentic:heldout-test")
+    if traces is None:
+        t16_cal = _load_raw_trace("lc-16k-cal-01.json")
+        t16_hold = dict(_load_raw_trace("lc-16k-cal-06.json"), id="lc-16k-hold-test", split="heldout", group="wiki:heldout-test")
+        t32_cal = _load_raw_trace("lc-32k-cal-01.json")
+        t32_hold = dict(_load_raw_trace("lc-32k-cal-03.json"), id="lc-32k-hold-test", split="heldout", group="agentic:heldout-test")
+        traces = {"16k": [t16_cal, t16_hold], "32k": [t32_cal, t32_hold]}
 
     stage = tmp_path / revision
     stage.mkdir(parents=True)
@@ -179,7 +181,7 @@ def _stage_three_component_panel(tmp_path: Path, revision: str) -> Path:
     lc_dir = stage / "long_context"
     lc_dir.mkdir()
     subsets_meta, all_rows = {}, []
-    for cls, rows in (("16k", [t16_cal, t16_hold]), ("32k", [t32_cal, t32_hold])):
+    for cls, rows in traces.items():
         jl = lc_dir / f"{cls}.jsonl"
         jl.write_text("".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in rows), encoding="utf-8")
         subsets_meta[cls] = {"file": f"long_context/{cls}.jsonl", "sha256": pc.sha256_file(jl), "records": len(rows)}
@@ -257,6 +259,8 @@ def _write_prepared(out_dir: Path, *, dataset, contract, vocab_size, cal_parts, 
         cal_items.extend((rid, comp, ids) for rid, ids in rows)
         components[comp] = dict(count=len(rows), tokens=sum(len(i) for _, i in rows),
                                 input_ids_sha256=pc.component_input_ids_sha256(i for _, i in rows))
+        if comp == "long_context":
+            components[comp]["mode"] = "full"
     hold_items = []
     for comp, rows in hold_parts:
         hold_items.extend((rid, comp, ids) for rid, ids in rows)
@@ -302,14 +306,17 @@ def test_prepared_loader_order_splits_hashes_and_full_check(tmp_path, monkeypatc
                                 ("long_context", [(t16_hold["id"], lc_hold_ids)])])
 
     monkeypatch.setattr(pc, "THREE_COMPONENT_REVISION", rev3)
-    cal_recs = pc.load_token_records(dir3, "calibration", contract=contract3, dataset=ds3, full=True)
+    cal_recs = pc.load_token_records(dir3, "calibration", contract=contract3, dataset=ds3, long_context_mode="full", full=True)
     assert [r["component"] for r in cal_recs] == ["agentic", "exl3_standard", "long_context"]
     assert t16_hold["id"] not in {r["id"] for r in cal_recs}
-    assert [r["id"] for r in pc.load_token_records(dir3, "heldout", contract=contract3, dataset=ds3)] == [ag_hold["id"], t16_hold["id"]]
+    assert [r["id"] for r in pc.load_token_records(dir3, "heldout", contract=contract3, dataset=ds3, long_context_mode="full")] == [ag_hold["id"], t16_hold["id"]]
 
-    batches = list(pc.load_token_batches(dir3, "calibration", contract=contract3, dataset=ds3, full=True))
+    batches = list(pc.load_token_batches(dir3, "calibration", contract=contract3, dataset=ds3, long_context_mode="full", full=True))
+    # A full-record corpus never loads as windowed calibration.
+    with pytest.raises(ValueError, match="mode 'full' differs from requested 'windowed'"):
+        pc.load_token_records(dir3, "calibration", contract=contract3, dataset=ds3, full=True)
     assert [tuple(b["input_ids"].shape) for b in batches] == [(1, len(r["input_ids"])) for r in cal_recs]
-    _, prov = pc.load_component_records(dir3, "calibration", contract=contract3, dataset=ds3, full=True)
+    _, prov = pc.load_component_records(dir3, "calibration", contract=contract3, dataset=ds3, long_context_mode="full", full=True)
     assert prov["component_order"] == ["agentic", "exl3_standard", "long_context"]
     assert prov["components"]["long_context"]["input_ids_sha256"] == pc.component_input_ids_sha256([lc_cal_ids])
 
@@ -318,7 +325,7 @@ def test_prepared_loader_order_splits_hashes_and_full_check(tmp_path, monkeypatc
     bad["components"]["long_context"]["input_ids_sha256"] = "0" * 64
     (dir3 / "manifest.json").write_bytes(pc.canonical(bad))
     with pytest.raises(ValueError, match="input_ids_sha256 differs"):
-        pc.load_token_records(dir3, "calibration", contract=contract3, dataset=ds3)
+        pc.load_token_records(dir3, "calibration", contract=contract3, dataset=ds3, long_context_mode="full")
 
     # 2-component prepared corpus loads pre-rev3, fails closed on full=True post-rev3.
     ds2 = {"repo_id": pc.PANEL_REPO, "revision": pc.TWO_COMPONENT_REVISION}
@@ -341,3 +348,136 @@ def test_panel_corpus_two_component_read_matches_frozen_hy4_flash_loader():
     assert loaded["agentic_rows"] == hy4_rows
     assert loaded["agentic_provenance"] == hy4_prov
     assert loaded["components"] == ("agentic", "exl3_standard")
+
+
+# Real traces whose Hy4 tails cover both sides of the tail rule:
+# lc-16k-cal-01 (15,088 tokens, 752-token tail kept), lc-16k-cal-07 (16,587, 203 dropped),
+# lc-16k-hold-02 (14,416, 80 dropped).
+WINDOW_TRACES = {
+    "16k": ["lc-16k-cal-01.json", "lc-16k-cal-07.json", "lc-16k-hold-02.json"],
+    "32k": ["lc-32k-cal-01.json", "lc-32k-hold-01.json"],
+}
+HY4 = ("models--tencent--Hy4", "c10c0de5b6f850703fb0a90e65d1c32b558b9167")
+HY4_CHAT = dict(reasoning_effort="high", date_string="2026-11-22")
+
+
+def _window_traces() -> dict[str, list[dict]]:
+    return {cls: [_load_raw_trace(name) for name in names] for cls, names in WINDOW_TRACES.items()}
+
+
+def _assert_window_contract(windows: list[list[int]], rendered: list[int]) -> None:
+    W, tail = pc.LONG_CONTEXT_WINDOW_TOKENS, pc.LONG_CONTEXT_MIN_TAIL_TOKENS
+    assert W == 2048 and tail == 256
+    assert all(len(w) == W for w in windows[:-1])
+    assert len(windows[-1]) == W or tail <= len(windows[-1]) < W
+    joined = [t for w in windows for t in w]
+    dropped = len(rendered) - len(joined)
+    assert joined == rendered[:len(joined)]
+    assert dropped == (len(rendered) % W if len(rendered) % W < tail else 0)
+
+
+@pytest.mark.parametrize("family,repo_dir,revision,chat_kwargs,trust", FAMILY_TOKENIZERS)
+def test_windowed_rows_reproduce_rendered_stream(family, repo_dir, revision, chat_kwargs, trust):
+    _, tok = _load_real_tokenizer(repo_dir, revision, trust)
+    rows = [r for rs in _window_traces().values() for r in rs]
+    rendered = {r["id"]: pc.render_long_context_record(r, tok, chat_kwargs=chat_kwargs)[0] for r in rows}
+
+    flat, offsets, rep = pc.tokenize_long_context_rows(rows, tok, chat_kwargs=chat_kwargs)
+    assert rep["mode"] == "windowed" and rep["window_tokens"] == 2048 and rep["min_tail_tokens"] == 256
+    seqs = [flat[a:b].tolist() for a, b in zip(offsets, offsets[1:])]
+    for src in rep["sources"]:
+        mine = [s for s, r in zip(seqs, rep["records"]) if r["record_id"] == src["id"]]
+        recs = [r for r in rep["records"] if r["record_id"] == src["id"]]
+        assert [r["window"] for r in recs] == list(range(len(mine))) == list(range(src["windows"]))
+        assert [r["start"] for r in recs] == [i * 2048 for i in range(len(mine))]
+        assert src["tokens"] == len(rendered[src["id"]])
+        assert src["dropped_tail_tokens"] == len(rendered[src["id"]]) - sum(map(len, mine))
+        _assert_window_contract(mine, rendered[src["id"]])
+    assert rep["input_ids_sha256"] == pc.component_input_ids_sha256(seqs)
+
+    # Full mode keeps whole rendered records for QMLA long-context evaluation.
+    f_flat, f_off, f_rep = pc.tokenize_long_context_rows(rows, tok, chat_kwargs=chat_kwargs, mode="full")
+    assert f_rep["mode"] == "full" and "sources" not in f_rep
+    assert [f_flat[a:b].tolist() for a, b in zip(f_off, f_off[1:])] == [rendered[r["id"]] for r in rows]
+    with pytest.raises(ValueError, match="unknown long_context mode"):
+        pc.tokenize_long_context_rows(rows, tok, chat_kwargs=chat_kwargs, mode="packed")
+
+
+def _prepare(stage: Path, out: Path, **kw) -> dict:
+    snap = _require_snapshot(*HY4)
+    chat = dict(tokenize=True, add_generation_prompt=True, return_dict=False, padding=False, truncation=False, **HY4_CHAT)
+    return pc.prepare_panel_corpus(snap, stage, out, source_repo="tencent/Hy4", source_revision=snap.name,
+                                   chat_kwargs=chat, **kw)
+
+
+def test_prepare_windowed_default_splits_identity_and_full_mode(tmp_path, monkeypatch):
+    _, tok = _load_real_tokenizer(*HY4, False)
+    traces = _window_traces()
+    rows = [r for rs in traces.values() for r in rs]
+    rendered = {r["id"]: pc.render_long_context_record(r, tok, chat_kwargs=HY4_CHAT)[0] for r in rows}
+    hold_ids = {r["id"] for r in rows if r["split"] == "heldout"}
+
+    rev3 = "d" * 40
+    stage = _stage_three_component_panel(tmp_path / "panel", rev3, traces)
+    monkeypatch.setattr(pc, "THREE_COMPONENT_REVISION", rev3)
+    monkeypatch.setattr(pc, "THREE_COMPONENT_SHA256SUMS_SHA256", pc.sha256_file(stage / "SHA256SUMS"))
+
+    m1 = _prepare(stage, tmp_path / "w1")
+    lc = m1["components"]["long_context"]
+    assert m1["contract"]["long_context_mode"] == "windowed" and m1["contract"]["long_context_window_tokens"] == 2048
+    assert lc["mode"] == "windowed" and lc["window_tokens"] == 2048 and lc["min_tail_tokens"] == 256
+    assert lc["heldout"]["mode"] == "windowed"
+    assert [s["id"] for s in lc["sources"]] == ["lc-16k-cal-01", "lc-16k-cal-07", "lc-32k-cal-01"]
+    assert [s["id"] for s in lc["heldout"]["sources"]] == ["lc-16k-hold-02", "lc-32k-hold-01"]
+    by_src = {s["id"]: s for s in lc["sources"] + lc["heldout"]["sources"]}
+    assert by_src["lc-16k-cal-01"]["dropped_tail_tokens"] == 0
+    assert by_src["lc-16k-cal-07"]["dropped_tail_tokens"] == len(rendered["lc-16k-cal-07"]) % 2048 > 0
+    assert by_src["lc-16k-hold-02"]["dropped_tail_tokens"] == len(rendered["lc-16k-hold-02"]) % 2048 > 0
+
+    for split in ("calibration", "heldout"):
+        recs = [r for r in pc.load_token_records(tmp_path / "w1", split, full=True) if r["component"] == "long_context"]
+        for rid in {r["record_id"] for r in recs}:
+            _assert_window_contract([r["input_ids"] for r in recs if r["record_id"] == rid], rendered[rid])
+        assert {r["split"] for r in recs} == {split}
+        if split == "calibration":
+            cal_recs = recs
+            assert pc.component_input_ids_sha256(r["input_ids"] for r in recs) == lc["input_ids_sha256"]
+        else:
+            assert pc.component_input_ids_sha256(r["input_ids"] for r in recs) == lc["heldout"]["input_ids_sha256"]
+
+    # No heldout window enters calibration, by record identity or by token content.
+    assert not {r["record_id"] for r in cal_recs} & hold_ids
+    cal_windows = {tuple(r["input_ids"]) for r in cal_recs}
+    for rid in hold_ids:
+        ids = rendered[rid]
+        assert not any(tuple(ids[i:i + 2048]) in cal_windows for i in range(0, len(ids), 2048))
+    batches = [b for b in pc.load_token_batches(tmp_path / "w1", "calibration", full=True) if b["component"] == "long_context"]
+    assert [tuple(b["input_ids"].shape) for b in batches] == [(1, len(r["input_ids"])) for r in cal_recs]
+    _, prov = pc.load_component_records(tmp_path / "w1", "calibration", full=True)
+    assert prov["components"]["long_context"]["mode"] == "windowed"
+    assert prov["components"]["long_context"]["window_tokens"] == 2048
+    assert prov["components"]["long_context"]["input_ids_sha256"] == lc["input_ids_sha256"]
+
+    # Identity is stable across preparations.
+    m2 = _prepare(stage, tmp_path / "w2", long_context_mode="windowed")
+    assert m2["components"] == m1["components"] and m2["contract"] == m1["contract"]
+    assert {k: m2["splits"][k]["token_stream_sha256"] for k in m2["splits"]} == {
+        k: m1["splits"][k]["token_stream_sha256"] for k in m1["splits"]}
+
+    # Full mode keeps whole records for QMLA evaluation; modes never cross-load.
+    mf = _prepare(stage, tmp_path / "full", long_context_mode="full")
+    assert mf["contract"]["long_context_mode"] == "full" and "long_context_window_tokens" not in mf["contract"]
+    hold_full = [r for r in pc.load_token_records(tmp_path / "full", "heldout", long_context_mode="full")
+                 if r["component"] == "long_context"]
+    assert [r["input_ids"] for r in hold_full] == [rendered["lc-16k-hold-02"], rendered["lc-32k-hold-01"]]
+    with pytest.raises(ValueError, match="mode 'full' differs from requested 'windowed'"):
+        pc.load_token_records(tmp_path / "full", "heldout")
+    with pytest.raises(ValueError, match="mode 'windowed' differs from requested 'full'"):
+        pc.load_token_records(tmp_path / "w1", "calibration", long_context_mode="full")
+
+    # A tampered window length fails closed.
+    bad = json.loads((tmp_path / "w1/manifest.json").read_text(encoding="utf-8"))
+    bad["components"]["long_context"]["window_tokens"] = 4096
+    (tmp_path / "w1/manifest.json").write_bytes(pc.canonical(bad))
+    with pytest.raises(ValueError, match="window contract differs"):
+        pc.load_token_records(tmp_path / "w1", "calibration")
