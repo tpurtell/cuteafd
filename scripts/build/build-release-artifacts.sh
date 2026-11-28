@@ -343,9 +343,10 @@ for release_family in "${release_family_list[@]}"; do
     *:nvfp4|*:nvfp4a4|*:mxfp8) release_package="fp8-${release_family%%:*}-${release_family#*:}" ;;
     *) continue ;;
   esac
-  # GLM 5.3 Flash's NVFP4 dense MLP runs on the coordinator only (fp8_moe.cmake
-  # skips it in the Spark build).
-  [[ "$role" == expert && "$release_family" == glmfdense:* ]] && continue
+  # GLM 5.3 Flash's NVFP4 dense MLP and Inkling 2 Mini (TP1 coordinator-only,
+  # 0 Sparks) run on the coordinator only; fp8_moe.cmake skips both in the
+  # Spark build, so the expert role has no package to stage.
+  [[ "$role" == expert && ( "$release_family" == glmfdense:* || "$release_family" == inkling2_mini:* ) ]] && continue
   mkdir -p "$output_dir/fp8"
   # A FAMILY:nvfp4 entry also builds the default W4A4 sibling (fp8_moe.cmake).
   release_packages=("$release_package")
