@@ -239,16 +239,30 @@ impl<'a> LayerStaging<'a> {
 }
 /// A per-step host wait for a stream's queued work (the sampling sync, a
 /// draft round): under `--host-wait block` it polls one blocking-sync event
-/// per device, recorded on the stream, for `BLOCK_SPIN`, then sleeps on it;
-/// under `spin` it is a
-/// stream synchronize, which the context's default scheduling spins.
+/// per device, recorded on the stream, either for `BLOCK_SPIN` then sleeping
+/// on it ([`Self::new`]) or paced via [`cuteafd_transport::wait_policy::WaitPace`]
+/// ([`Self::paced`]); under `spin` it is a stream synchronize, which the
+/// context's default scheduling spins.
 pub(crate) struct BlockingWait<'a> {
     library: &'a NativeLibrary,
-    events: Vec<(i32, *mut std::ffi::c_void)>,
+    paced: bool,
+    counters: Option<&'static cuteafd_transport::wait_policy::WaitPaceCounters>,
+    events: Vec<(i32, *mut std::ffi::c_void, Option<cuteafd_transport::wait_policy::WaitPace>)>,
 }
 
 impl<'a> BlockingWait<'a> {
-    pub(crate) fn new(library: &'a NativeLibrary) -> Self { Self { library, events: Vec::new() } }
+    pub(crate) fn new(library: &'a NativeLibrary) -> Self {
+        Self { library, paced: false, counters: None, events: Vec::new() }
+    }
+
+    /// Opt-in paced wait (used by `TokenSelector` for recurring decode token
+    /// landing waits): each device slot keeps its own [`WaitPace`] state.
+    pub(crate) fn paced(
+        library: &'a NativeLibrary,
+        counters: Option<&'static cuteafd_transport::wait_policy::WaitPaceCounters>,
+    ) -> Self {
+        Self { library, paced: true, counters, events: Vec::new() }
+    }
 
     /// Waits until everything queued on `stream` so far has completed.
     ///
@@ -262,21 +276,30 @@ impl<'a> BlockingWait<'a> {
             // SAFETY: forwarded from this function's contract.
             return unsafe { self.library.cuda_stream_synchronize(stream) };
         }
-        let event = match self.events.iter().find(|(owner, _)| *owner == device) {
-            Some(&(_, event)) => event,
+        let (event, pace) = match self.events.iter_mut().find(|(owner, _, _)| *owner == device) {
+            Some(&mut (_, event, ref mut pace)) => (event, pace),
             None => {
                 let event = self.library.cuda_event_create_blocking()?;
-                self.events.push((device, event));
-                event
+                let pace = self.paced.then(|| match self.counters {
+                    Some(counters) => cuteafd_transport::wait_policy::WaitPace::with_counters(counters),
+                    None => cuteafd_transport::wait_policy::WaitPace::new(),
+                });
+                self.events.push((device, event, pace));
+                let last = self.events.last_mut().expect("pushed blocking event");
+                (last.1, &mut last.2)
             }
         };
         // SAFETY: the event belongs to the current device, as does `stream`
-        // (the caller's contract); it lives until this wait drops. Polls it
-        // for the first `BLOCK_SPIN` (10 ms: every per-layer decode wait
-        // completes within that, and the wake-up of a blocking sync would be
-        // on the critical path), then sleeps in the driver.
+        // (the caller's contract); it lives until this wait drops.
         unsafe {
             self.library.cuda_event_record(event, stream)?;
+            if let Some(pace) = pace.as_mut() {
+                return pace.wait_for(
+                    cuteafd_transport::wait_policy::HostWait::Block,
+                    || self.library.cuda_event_query(event),
+                    || self.library.cuda_event_synchronize(event),
+                );
+            }
             if cuteafd_transport::wait_policy::spin_window(|| self.library.cuda_event_query(event))? { return Ok(()); }
             self.library.cuda_event_synchronize(event)
         }
@@ -285,7 +308,7 @@ impl<'a> BlockingWait<'a> {
 
 impl Drop for BlockingWait<'_> {
     fn drop(&mut self) {
-        for &(device, event) in &self.events {
+        for &(device, event, _) in &self.events {
             let previous = self.library.cuda_get_device();
             let _ = self.library.cuda_set_device(device);
             // SAFETY: created by this wait on `device`; synchronizing retires

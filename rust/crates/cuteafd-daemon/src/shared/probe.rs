@@ -142,6 +142,7 @@ pub(crate) fn graph_capture_stats(stats: &mut serde_json::Value) {
         decoding,
     );
     stats["exchange"] = crate::shared::spark_waves::exchange_stats::GLOBAL.snapshot();
+    stats["token_wait"] = serde_json::json!(crate::shared::token_io::wait_stats());
 }
 
 fn record_graph_captures(stats: &mut serde_json::Value, total: u64, sites: Vec<(String, u64)>,
@@ -300,6 +301,20 @@ mod graph_capture_tests {
         for key in ["busy_ns_total", "idle_ns_total", "units_total"] {
             assert_eq!(exchange["expert_prefill_units"][key].as_array().unwrap().len(),
                 cuteafd_core::MAX_SPARK_WORLD);
+        }
+        let token_wait = &stats["token_wait"];
+        for key in [
+            "waits",
+            "paced_sleeps",
+            "late_wakes",
+            "fallback_blocks",
+            "restabilises",
+            "sleep_ns",
+            "spin_ns",
+            "late_wake_slice_ns_sum",
+            "late_wake_slice_ns_max",
+        ] {
+            assert!(token_wait[key].is_u64(), "missing token_wait.{key}");
         }
         // Going idle drops active_decode back to 0 (never latched).
         let mut idle = serde_json::json!({"active": 0});

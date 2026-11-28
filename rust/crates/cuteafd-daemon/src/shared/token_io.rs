@@ -718,6 +718,16 @@ pub(crate) type RowResult = std::result::Result<Selected, TargetSamplingError>;
 
 
 
+/// Always-on cumulative counters for `TokenSelector::wait_landed` pacing,
+/// published in `/v1/stats` under `token_wait`.
+static TOKEN_WAIT_COUNTERS: cuteafd_transport::wait_policy::WaitPaceCounters =
+    cuteafd_transport::wait_policy::WaitPaceCounters::new();
+
+/// Snapshot of cumulative token-landing wait counters for `/v1/stats`.
+pub(crate) fn wait_stats() -> cuteafd_transport::wait_policy::WaitPaceStats {
+    TOKEN_WAIT_COUNTERS.snapshot()
+}
+
 /// Selects next tokens from device logits (see the module docs).
 pub(crate) struct TokenSelector<'a> {
     library: &'a NativeLibrary,
@@ -818,7 +828,7 @@ impl<'a> TokenSelector<'a> {
     pub fn new(library: &'a NativeLibrary, placement: SelectPlacement, vocab: usize, capacity: usize) -> Result<Self> {
         ensure!(capacity > 0 && vocab > 0, "token selector of {capacity} rows x {vocab}");
         Ok(Self { library, placement, vocab, capacity, out: DeviceAllocation::new(library, capacity * 12, Tag::workspace("shared/token-out"))?,
-            landing: HostAllocation::new(library, capacity * 12, Tag::staging("shared/token-out"))?, wave: None, landed: crate::shared::memory::BlockingWait::new(library), counts: [0; 3] })
+            landing: HostAllocation::new(library, capacity * 12, Tag::staging("shared/token-out"))?, wave: None, landed: crate::shared::memory::BlockingWait::paced(library, Some(&TOKEN_WAIT_COUNTERS)), counts: [0; 3] })
     }
 
     /// Waits until `stream` passed the work queued on it so far (the
@@ -1311,6 +1321,30 @@ mod tests {
         let wait = memory.split("pub(crate) unsafe fn wait(").nth(1).unwrap().split("impl Drop for BlockingWait").next().unwrap();
         assert!(wait.find("cuda_stream_device(stream)").unwrap() < wait.find("cuda_event_create_blocking()").unwrap());
         assert!(!wait.contains("cuda_get_device()"));
+    }
+
+    #[test]
+    fn token_wait_pacing_is_scoped_to_token_selector_and_preserves_spin_policy() {
+        let memory = include_str!("memory.rs");
+        let wait = memory.split("pub(crate) unsafe fn wait(").nth(1).unwrap().split("impl Drop for BlockingWait").next().unwrap();
+        // HostWait::Spin must return cuda_stream_synchronize before touching events or WaitPace.
+        let spin_pos = wait.find("HostWait::Spin").unwrap();
+        let sync_pos = wait.find("cuda_stream_synchronize(stream)").unwrap();
+        let event_pos = wait.find("cuda_event_create_blocking()").unwrap();
+        let pace_pos = wait.find("pace.wait_for(").unwrap();
+        assert!(spin_pos < sync_pos && sync_pos < event_pos && event_pos < pace_pos);
+
+        // TokenSelector opts in to paced BlockingWait; all other BlockingWait call sites stay unpaced.
+        let token_io = include_str!("token_io.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(token_io.contains("BlockingWait::paced(library, Some(&TOKEN_WAIT_COUNTERS))"));
+        for (name, src) in [
+            ("v41_backbone_router.rs", include_str!("../families/deepseek_v41/v41_backbone_router.rs")),
+            ("mimo_v2/dflash.rs", include_str!("../families/mimo_v2/dflash.rs")),
+            ("speculation/dflash.rs", include_str!("speculation/dflash.rs")),
+            ("speculation/block_dspark.rs", include_str!("speculation/block_dspark.rs")),
+        ] {
+            assert!(!src.contains("BlockingWait::paced"), "{name} must keep unpaced BlockingWait::new");
+        }
     }
 
     #[test]
