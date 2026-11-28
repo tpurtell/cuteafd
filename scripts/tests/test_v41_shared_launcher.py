@@ -136,6 +136,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
             "--prefill-reserve-rows", value("--prefill-reserve-rows")] if role == "coordinator" else [])
         if role == "coordinator":
             expected_command.append("--expert-usage")
+            expected_command += ["--decode-graphs", "true"]
             # Serve admits resident weights against the planner's budget (captures
             # predate passing it and fell back to the 80 GiB default).
             assert len(planned_budget) == 1, where
@@ -199,7 +200,7 @@ def test_shared_launcher_matches_the_private_v41_path(case: str, tmp_root) -> No
                       "--deployment-peers", command[command.index("--peers") + 1]]
         expected[expected.index("--rtx"):expected.index("--rtx")] = additions
         index = expected.index("--available-sparks") + 2
-        expected[index:index] = ["--mapped-scale-preload-gib", "0", "--config", "/run/cuteafd-plan.config"]
+        expected[index:index] = ["--mapped-scale-preload-gib", "0", "--config", "/run/cuteafd-plan.config", "--decode-graphs", "on"]
         enabled = command[command.index("--rtx-gpus") + 1] == "2" and "--dspark" in command
         available = int(expected[expected.index("--available-sparks") + 1])
         normalized = (f"TP2_DSPARK_EXPERTS={'on' if enabled else 'off'}\nSPECULATOR=dspark\n"

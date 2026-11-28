@@ -1186,7 +1186,7 @@ for pair in 'LOOP_ABORT_RUN:--loop-abort-run' 'LOOP_ABORT_COPIES:--loop-abort-co
 done
 [[ -z "${PREFILL_PACKING:-}" ]] || args+=(--prefill-packing "$PREFILL_PACKING")
 [[ -z "$v41_decode_lanes" ]] || args+=(--decode-lanes "$resolved_decode_lanes")
-if [[ $v41_decode_graphs == on ]]; then args+=(--decode-graphs true); else args+=(--decode-graphs false); fi
+if [[ ${v41_decode_graphs:-on} == on ]]; then args+=(--decode-graphs true); else args+=(--decode-graphs false); fi
 [[ ( -z "$v41_decode_rows" || "$v41_decode_rows" == auto ) && "$resolved_decode_rows" == 64 ]] || args+=(--decode-rows "$resolved_decode_rows")
 [[ -z "${V41_PREFILL_WAVES:-}" ]] || args+=(--prefill-waves "$V41_PREFILL_WAVES")
 # DECODE_SHARE: as for every family (the engine's default 0.2; 0 prefills whole prompts).

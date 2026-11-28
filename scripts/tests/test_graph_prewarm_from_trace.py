@@ -2031,7 +2031,7 @@ def test_launcher_passes_one_typed_decode_graphs_flag_to_plan_and_serve():
     launcher = (SCRIPT.parents[2] / "scripts/launch/run-family.sh").read_text()
     assert 'v41_decode_graphs="$(get DECODE_GRAPHS on)"' in launcher
     assert 'count_args+=(--decode-graphs "$v41_decode_graphs")' in launcher
-    assert 'if [[ $v41_decode_graphs == on ]]; then args+=(--decode-graphs true); else args+=(--decode-graphs false); fi' in launcher
+    assert 'if [[ ${v41_decode_graphs:-on} == on ]]; then args+=(--decode-graphs true); else args+=(--decode-graphs false); fi' in launcher
     assert 'decode_graphs="$(get DECODE_GRAPHS on)"' in launcher
     assert 'plan_draft_args+=(--decode-graphs "$decode_graphs"' in launcher
     flagged = launcher.split('\ndecode_graphs="$(get DECODE_GRAPHS on)"', 1)[1].split("\nesac\n", 2)[1]

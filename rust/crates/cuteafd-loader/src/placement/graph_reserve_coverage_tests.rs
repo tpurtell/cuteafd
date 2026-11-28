@@ -368,15 +368,15 @@ fn six_newly_wired_families_shipping_cards_match_pre_change_reserves_on_and_zero
         // 4. MiniMax M3.1: shipping 1x + 3 Sparks and 2x + 6 Sparks.
         assert!(smoke_cards.contains(&("minimax_m3".into(), 1, 3)));
         assert!(smoke_cards.contains(&("minimax_m3".into(), 2, 6)));
-        for (gpus, attention, wire) in [
-            (1, AttentionPlacement::Heads, None),
-            (2, AttentionPlacement::Heads, None),
-            (2, AttentionPlacement::Layers, Some(crate::families::minimax_m3::execution::WirePrecision::F32)),
+        for (gpus, attention, wire, expected) in [
+            (1, AttentionPlacement::Heads, None, &[88_080_384u64][..]),
+            (2, AttentionPlacement::Heads, None, &[168u64 << 20, 132u64 << 20][..]),
+            (2, AttentionPlacement::Layers, Some(crate::families::minimax_m3::execution::WirePrecision::F32), &[128u64 << 20, 88u64 << 20][..]),
         ] {
             for rank in 0..gpus {
                 let on = crate::families::minimax_m3::admission::graph_policy(gpus, 16, rank, attention, wire, true).unwrap();
-                assert!(on.bytes > 0);
-                assert_eq!(on.bytes, envelope_bytes(GraphFamily::MiniMax, gpus, rank));
+                assert_eq!(on.bytes, expected[rank], "MiniMax {gpus}x {attention:?} rank {rank}");
+                assert!(on.bytes > 0 && on.bytes <= envelope_bytes(GraphFamily::MiniMax, gpus, rank));
                 let off = crate::families::minimax_m3::admission::graph_policy(gpus, 16, rank, attention, wire, false).unwrap();
                 assert_eq!(off, disabled(rank));
             }
