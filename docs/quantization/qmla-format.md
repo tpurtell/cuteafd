@@ -66,7 +66,7 @@ Every `(layer, path, serving_width)` selection carries an explicit `kind` in `{"
 
 **Per-width kind freedom:** `full` is a normal per-layer outcome at **any** supported width (including 8 bits), just as `identity` and `scale_only` are valid outcomes at any width. Loaders must dispatch every `(layer, path, width)` by its recorded `kind` without assuming a fixed kind per bit width.
 
-**Why `1e-6`:** It is $>1000\times$ smaller than BF16 half-ULP ($\approx 3.9\times 10^{-3}$) and INT8 step size ($\ge 1/255 \approx 3.9\times 10^{-3}$), so collapsing a near-identity transform changes no quantized representation; simultaneously it absorbs FP32 Cayley/$\exp(0)$ roundoff ($\text{few}\times 10^{-7}$) while remaining $10\times$ tighter than the orthogonality gate ($10^{-5}$). Fixed Sylvester Hadamard is a calibration measurement baseline only and is never shipped.
+**Why `1e-6`:** It is $>1000\times$ smaller than BF16 half-ULP ($\approx 3.9\times 10^{-3}$) and INT8 step size ($\ge 1/255 \approx 3.9\times 10^{-3}$), so collapsing a near-identity transform changes no quantized representation; simultaneously it absorbs FP32 Cayley/$\exp(0)$ roundoff ($\text{few}\times 10^{-7}$) while remaining $10\times$ tighter than the orthogonality gate ($10^{-5}$). Candidates are scored only at their own fitted width.
 
 ### Exact Tensor Names, Dtypes, Shapes, and Aliasing Policy
 
@@ -373,11 +373,7 @@ Every quantized path uses **per-token asymmetric affine quantization** with grou
         "layer_tokens": 163625,
         "attn_rel_err": 0.0011,
         "rtn_attn_rel_err": 0.0020,
-        "v2_shared_attn_rel_err": 0.0012,
-        "hadamard_attn_rel_err": 0.0019,
-        "ratio_to_rtn": 0.55,
-        "v2_shared_ratio_to_rtn": 0.60,
-        "ratio_to_v2_shared": 0.917
+        "ratio_to_rtn": 0.55
       }
     },
     "input_ids_sha256": "<64-hex-sha256>",

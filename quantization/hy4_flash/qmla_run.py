@@ -7,7 +7,7 @@ Supports both short pilot runs (``--pilot`` or explicit ``--layers``, ``--modes`
   width (plus step-0 SmoothQuant inits and ``identity``), persisting every candidate and
   its val/test scores for the duration of the run so selection can be rerun without refitting.
 - Splits: ``train`` fits, ``val`` selects fit steps and per-width transforms, ``test``
-  produces every reported attention error against identity and the v2 shared policy.
+  produces every reported attention error against identity.
 - Sidecar: ships one selection per ``(layer, path, serving_width)`` with explicit kind
   (``identity`` | ``scale_only`` | ``full``) in one ``mla_calibration.safetensors`` file
   (no separate ``mla_calibration.json``).

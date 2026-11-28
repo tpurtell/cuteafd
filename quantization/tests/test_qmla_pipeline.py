@@ -66,7 +66,6 @@ from qmla import (
     resolve_mode_transforms,
     resolve_qmla_panel,
     save_fit_checkpoint,
-    sylvester_hadamard,
     unpack_content_row,
     unpack_joint_record,
     unpack_rope_row,
@@ -340,8 +339,6 @@ def test_quantizer_rne_pack_unpack_bit_exact_and_record_sizes():
     with pytest.raises(ValueError, match="NoPE"):
         record_bytes_for_mode(4, 4, d_r=0)
 
-    h = sylvester_hadamard(64)
-    torch.testing.assert_close(h @ h.T, torch.eye(64), atol=1e-6, rtol=1e-6)
 
 
 def test_rope_pair_transform_commutes_with_3d_interleaved_mrope_and_split_half():
@@ -571,10 +568,7 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
         assert set(layer_rows) == {"0", "5"}
         assert metrics["layer_tokens"] == test_tokens
         assert metrics["ratio_to_rtn"] == pytest.approx(metrics["attn_rel_err"] / metrics["rtn_attn_rel_err"])
-        assert metrics["v2_shared_ratio_to_rtn"] == pytest.approx(
-            metrics["v2_shared_attn_rel_err"] / metrics["rtn_attn_rel_err"]
-        )
-        for name in ("attn_rel_err", "v2_shared_attn_rel_err", "rtn_attn_rel_err", "hadamard_attn_rel_err"):
+        for name in ("attn_rel_err", "rtn_attn_rel_err"):
             expected = sum(row[name] * row["tokens"] for row in layer_rows.values()) / metrics["layer_tokens"]
             assert metrics[name] == pytest.approx(expected)
             assert metrics[name] == manifest["calibration_provenance"]["combination_measurements"][mode][name]
@@ -585,7 +579,7 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
             assert row["shipped_cell"] == expected_cell
             assert row["attn_rel_err"] == row["cells"][expected_cell]
             # Cross-table: identity + fitted + scale_fitted + smoothquant per active path.
-            n_content = 7 if cb else 1  # identity + 2 widths x (fitted, scale_fitted, smoothquant)
+            n_content = 4 if cb else 1  # identity + direct fitted, scale_fitted, smoothquant
             n_rope = 4 if rb else 1     # identity + 1 width x (fitted, scale_fitted, smoothquant)
             assert len(row["cells"]) == n_content * n_rope
         assert set(metrics["cross_table"]) == set(next(iter(layer_rows.values()))["cells"])
@@ -868,12 +862,12 @@ def test_pure_nope_sidecar_disallows_nonzero_rope_modes_and_rejects_unknown_comp
 
 
 def _val_table(rows):
-    return {key: {"tokens": 10, "rtn": rtn, "hadamard": rtn, "cells": cells} for key, (rtn, cells) in rows.items()}
+    return {key: {"tokens": 10, "rtn": rtn, "cells": cells} for key, (rtn, cells) in rows.items()}
 
 
-def test_per_width_selection_picks_best_per_width_and_compares_against_v2_shared():
-    """Per-width selection lets 8-bit pick identity/scale_only while 2/4-bit pick full fits, beating v2 shared."""
-    from qmla.measurement import LayerCandidates, layer_rows, select_per_width, select_shared_v2
+def test_per_width_selection_scores_only_direct_width_candidates():
+    """Per-width selection lets 8-bit pick identity/scale_only while 2/4-bit pick their own full fits."""
+    from qmla.measurement import LayerCandidates, layer_rows, select_per_width, table_cells, pair_id
 
     geom = MlaLayerGeometry(
         layer_id=21, kv_source_layer=21, kind="dsa", heads=2,
@@ -898,11 +892,7 @@ def test_per_width_selection_picks_best_per_width_and_compares_against_v2_shared
 
     def cells(mode, fn):
         cb, rb = map(int, mode.split(":"))
-        if cb and not rb:
-            return {c: fn(mode, c, None) for c in candidates.content}
-        if rb and not cb:
-            return {r: fn(mode, None, r) for r in candidates.rope}
-        return {f"{c}+{r}": fn(mode, c, r) for c in candidates.content for r in candidates.rope}
+        return {pair_id(c, r): fn(mode, c, r) for c, r in table_cells(candidates, geom, (cb, rb))}
 
     # Mode-dependent errors mirroring GLM Flash + Hy4-flash measurements:
     # - 2:0 and 4:0 / 4:4 strongly favor fitted:c4 (and fitted:r4 at 4-bit RoPE);
@@ -931,27 +921,24 @@ def test_per_width_selection_picks_best_per_width_and_compares_against_v2_shared
     modes = ("2:0", "4:0", "8:0", "0:4", "0:8", "4:4", "8:8")
     val = _val_table({m: (err(m, "identity" if int(m.split(":")[0]) else None, "identity" if int(m.split(":")[1]) else None), cells(m, err)) for m in modes})
     sel_v3 = select_per_width(val, candidates, geom)
-    sel_v2 = select_shared_v2(val, candidates, geom)
 
-    assert sel_v3["content"]["2"]["candidate"] == "fitted:c4" and sel_v3["content"]["2"]["kind"] == "full"
-    assert sel_v3["content"]["2"]["source_bits"] == 4
+    assert sel_v3["content"]["2"]["candidate"] == "fitted:c2" and sel_v3["content"]["2"]["kind"] == "full"
+    assert sel_v3["content"]["2"]["source_bits"] == 2
     assert sel_v3["content"]["4"]["candidate"] == "fitted:c4" and sel_v3["content"]["4"]["kind"] == "full"
     assert sel_v3["content"]["8"]["candidate"] == "identity" and sel_v3["content"]["8"]["kind"] == "identity"
     assert sel_v3["content"]["8"]["source_bits"] is None
     assert sel_v3["rope"]["4"]["candidate"] == "fitted:r4" and sel_v3["rope"]["4"]["kind"] == "full"
     assert sel_v3["rope"]["8"]["candidate"] == "scale_fitted:r8" and sel_v3["rope"]["8"]["kind"] == "scale_only"
 
-    # Legacy v2 shared selection picks one content transform across all widths, hurting 8:0.
-    assert sel_v2["content"]["candidate"] == "fitted:c4"
+    assert set(val["2:0"]["cells"]) == {"identity", "fitted:c2"}
+    assert set(val["8:8"]["cells"]) == {f"{c}+{r}" for c in ("identity", "fitted:c8", "scale_fitted:c8") for r in ("identity", "scale_fitted:r8")}
     test = _val_table({m: (val[m]["rtn"], cells(m, lambda mo, c, r: err(mo, c, r) * 1.05)) for m in modes})
-    rows = layer_rows(test, val, sel_v3, geom, v2_selection=sel_v2)
+    rows = layer_rows(test, val, sel_v3, geom)
     assert rows["8:0"]["shipped_cell"] == "identity"
-    assert rows["8:0"]["v2_shared_cell"] == "fitted:c4"
-    assert rows["8:0"]["attn_rel_err"] < rows["8:0"]["v2_shared_attn_rel_err"]
     assert rows["8:8"]["shipped_cell"] == "identity+scale_fitted:r8"
     assert rows["8:8"]["shipped_kinds"] == {"content": "identity", "rope": "scale_only"}
     assert rows["4:4"]["shipped_cell"] == "fitted:c4+fitted:r4"
-    assert rows["2:0"]["shipped_cell"] == "fitted:c4"
+    assert rows["2:0"]["shipped_cell"] == "fitted:c2"
 
 
 def test_kind_classification_v3_aliasing_loader_resolution_and_fail_closed(tmp_path: Path):
@@ -967,8 +954,8 @@ def test_kind_classification_v3_aliasing_loader_resolution_and_fail_closed(tmp_p
     assert classify_content_kind(eye, ones) == "identity"
     assert classify_content_kind(eye + 5e-7, ones + 5e-7) == "identity"  # within 1e-6 tol
     assert classify_content_kind(eye + 5e-7, ones * 1.1) == "scale_only"
-    assert classify_content_kind(sylvester_hadamard(d_c), ones) == "full"
-    assert classify_content_kind(sylvester_hadamard(d_c), ones * 1.2) == "full"
+    assert classify_content_kind(torch.eye(d_c).roll(1, dims=0), ones) == "full"
+    assert classify_content_kind(torch.eye(d_c).roll(1, dims=0), ones * 1.2) == "full"
 
     zeros = torch.zeros(pairs)
     ones_r = torch.ones(pairs)
@@ -991,7 +978,7 @@ def test_kind_classification_v3_aliasing_loader_resolution_and_fail_closed(tmp_p
     # scale_only), so pin a deterministic non-identity orthogonal rotation: this fixture tests
     # classification and aliasing, not fit quality.
     if classify_content_kind(fc0_full.r_c, fc0_full.s_c) != "full":
-        fc0_full = replace(fc0_full, r_c=sylvester_hadamard(d_c), s_c=torch.linspace(0.9, 1.1, d_c),
+        fc0_full = replace(fc0_full, r_c=torch.eye(d_c).roll(1, dims=0), s_c=torch.linspace(0.9, 1.1, d_c),
                            orth_max_err=0.0, equiv_max_rel_err=1e-7)
     fc0_collapsed_id = replace(fc0_full, bits=8, r_c=eye + 2e-7, s_c=ones + 2e-7, best_step=0, orth_max_err=4e-7, equiv_max_rel_err=0.0)
     fc5_scale = fit_content_layer(bank5, 4, cfg, fit_mode="scale_only")
@@ -1013,7 +1000,7 @@ def test_kind_classification_v3_aliasing_loader_resolution_and_fail_closed(tmp_p
                 fr5_scale = patched
 
     content_selections = {
-        2: {0: fc0_full, 5: fc5_scale},
+        2: {0: replace(fc0_full, bits=2), 5: replace(fc5_scale, bits=2)},
         4: {0: fc0_full, 5: fc5_scale},  # identical to width 2 -> must alias!
         8: {0: fc0_collapsed_id, 5: fc5_id},
     }
@@ -1024,8 +1011,8 @@ def test_kind_classification_v3_aliasing_loader_resolution_and_fail_closed(tmp_p
     selection_meta = {
         "content": {
             "2": {
-                "0": {"candidate": "fitted:c4", "source_bits": 4, "val_score": {"2:0": 0.02, "2:4": 0.021}},
-                "5": {"candidate": "scale_fitted:c4", "source_bits": 4, "val_score": {"2:0": 0.03, "2:4": 0.031}},
+                "0": {"candidate": "fitted:c2", "source_bits": 2, "val_score": {"2:0": 0.02, "2:4": 0.021}},
+                "5": {"candidate": "scale_fitted:c2", "source_bits": 2, "val_score": {"2:0": 0.03, "2:4": 0.031}},
             },
             "4": {
                 "0": {"candidate": "fitted:c4", "source_bits": 4, "val_score": {"4:0": 0.002, "4:4": 0.0025}},
@@ -1114,7 +1101,7 @@ def test_kind_classification_v3_aliasing_loader_resolution_and_fail_closed(tmp_p
 
     # Mutating a layer's source_candidate without updating width_fingerprint fails.
     bad_fp = json.loads(json.dumps(embedded))
-    bad_fp["profiles"]["content"]["widths"]["8"]["per_layer"]["0"]["source_candidate"] = "identity"
+    bad_fp["profiles"]["content"]["widths"]["8"]["per_layer"]["0"]["source_candidate"] = "scale_fitted:c8"
     _write_f32_safetensors_with_metadata(path, header, ordered, bad_fp)
     with pytest.raises(ValueError, match="width_fingerprint mismatch"):
         validate_sidecar(tmp_path, strict=True)
@@ -1221,8 +1208,8 @@ def test_v3_persists_all_candidates_resumes_reselects_and_rejects_v2_checkpoints
         "smoothquant:r4", "smoothquant:r8",
     }
     assert c_cands["fitted:c8"]["source_bits"] == 8 and c_cands["scale_fitted:c8"]["fit_mode"] == "scale_only"
-    assert set(ctable["layers"]["0"]["val_table"]["8:0"]["cells"]) == set(c_cands)
-    assert set(ctable["layers"]["0"]["test_table"]["8:0"]["cells"]) == set(c_cands)
+    assert set(ctable["layers"]["0"]["val_table"]["8:0"]["cells"]) == {"identity", "fitted:c8", "scale_fitted:c8", "smoothquant:c8"}
+    assert set(ctable["layers"]["0"]["test_table"]["8:0"]["cells"]) == {"identity", "fitted:c8", "scale_fitted:c8", "smoothquant:c8"}
 
     # Re-running into out1 resumes every persisted v3 candidate with zero refitting.
     res2 = calibrate_hy4_flash_from_banks(

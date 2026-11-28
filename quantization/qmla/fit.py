@@ -11,8 +11,7 @@ with ``protection="none"`` available as the measured unprotected alternative:
 - RoPE path: per-frequency-pair SO(2) angles theta_i and pair-tied positive scales s_i
   (Q'_P = Q_P R_P S_P^-1, K'_P = K_P R_P S_P), trained by causal positional-QK
   reconstruction L_P (Eq. 10).
-- Step-0 baselines: RTN on the native cached latent, fixed Sylvester Hadamard
-  (QuaRot-style / gr8 comparison), and 99.9th-percentile SmoothQuant-style alpha grid.
+- Step-0 baselines: RTN on the native cached latent and 99.9th-percentile SmoothQuant-style alpha grid.
 - Sequential per-layer checkpointing with streamed XXH3-128 receipts for resume.
 """
 from __future__ import annotations
@@ -49,7 +48,6 @@ from .quantizer import (
     GROUP_SIZE,
     ROPE_NONZERO_BITS,
     qdq_asymmetric_group,
-    sylvester_hadamard,
 )
 
 FIT_CHECKPOINT_SCHEMA = "cuteafd-qmla-fit-checkpoint-v3"
@@ -100,7 +98,7 @@ class FitConfig:
     anchor: float = 1e-4
     warmup_frac: float = 0.1
     grad_clip: float = 1.0
-    val_every: int = 20
+    val_every: int = 50
     log_scale_bound: float = 2.0
     group_size: int = GROUP_SIZE
     eps_scale: float = EPS_SCALE
@@ -689,8 +687,6 @@ def fit_content_layer(
         a_j = content_stats(bank.train, params, dev)
         base_r = None if fit_mode == "scale_only" else eye
         arms = [("rtn_native_val", base_r, ones)]
-        if (d_c & (d_c - 1)) == 0:
-            arms.append(("hadamard_val", sylvester_hadamard(d_c, device=dev), ones))
         alpha_scales = [_init_log_scales(a_j, alpha, config.log_scale_bound) for alpha in config.alpha_grid]
         arms += [(f"alpha:{alpha}", base_r, scale.exp()) for alpha, scale in zip(config.alpha_grid, alpha_scales)]
         values = [[] for _ in arms]

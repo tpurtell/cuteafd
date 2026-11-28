@@ -227,19 +227,17 @@ class _BucketAcc:
     tokens: int = 0
     shipped: float = 0.0
     rtn: float = 0.0
-    hadamard: float = 0.0
 
-    def add(self, tokens: int, shipped: float, rtn: float, hadamard: float) -> None:
+    def add(self, tokens: int, shipped: float, rtn: float) -> None:
         self.tokens += tokens
         self.shipped += shipped
         self.rtn += rtn
-        self.hadamard += hadamard
 
     def summary(self) -> dict[str, Any]:
-        s, r, h = self.shipped / self.tokens, self.rtn / self.tokens, self.hadamard / self.tokens
+        s, r = self.shipped / self.tokens, self.rtn / self.tokens
         return {
-            "tokens": self.tokens, "attn_rel_err": s, "rtn_attn_rel_err": r, "hadamard_attn_rel_err": h,
-            "ratio_to_rtn": s / r if r > 0.0 else None, "hadamard_ratio_to_rtn": h / r if r > 0.0 else None,
+            "tokens": self.tokens, "attn_rel_err": s, "rtn_attn_rel_err": r,
+            "ratio_to_rtn": s / r if r > 0.0 else None,
         }
 
 
@@ -319,21 +317,20 @@ class LongContextEvaluator:
             r_arm = self.rope_arms[rb][lid] if (rb and geometry.has_rope) else NATIVE_ROPE
             s_err = _run(c_arm, r_arm)
             r_err = _run("rtn", NATIVE_ROPE)
-            h_err = _run("hadamard", NATIVE_ROPE) if cb else r_err
 
             lb = self._layer_stats.setdefault(mkey, {}).setdefault(lid, {})
             sb = self._split_stats.setdefault(mkey, {}).setdefault(split, {})
             for bname, mask in bmasks.items():
                 n = int(mask.sum().item())
                 if n:
-                    vals = (n, float(s_err[mask].sum().item()), float(r_err[mask].sum().item()), float(h_err[mask].sum().item()))
+                    vals = (n, float(s_err[mask].sum().item()), float(r_err[mask].sum().item()))
                     targets = [lb, sb]
                     if split == "heldout":
                         targets.append(self._heldout_layer_stats.setdefault(mkey, {}).setdefault(lid, {}))
                     for tgt in targets:
                         tgt.setdefault(bname, _BucketAcc()).add(*vals)
                         tgt.setdefault("__all__", _BucketAcc()).add(*vals)
-            del s_err, r_err, h_err
+            del s_err, r_err
         seq_len = seq_dev.seq_len
         del seq_dev, bmasks
         if dev.type == "cuda" and seq_len >= 4096:
@@ -402,13 +399,13 @@ class LongContextEvaluator:
             for lid in sorted(per_layer_raw):
                 lb = per_layer_raw[lid]
                 a = lb["__all__"]
-                overall.add(a.tokens, a.shipped, a.rtn, a.hadamard)
+                overall.add(a.tokens, a.shipped, a.rtn)
                 row = {**a.summary(), "by_position_bucket": {}}
                 for bname in names:
                     if bname in lb:
                         b = lb[bname]
                         row["by_position_bucket"][bname] = b.summary()
-                        overall_b.setdefault(bname, _BucketAcc()).add(b.tokens, b.shipped, b.rtn, b.hadamard)
+                        overall_b.setdefault(bname, _BucketAcc()).add(b.tokens, b.shipped, b.rtn)
                 per_layer_out[str(lid)] = row
 
             summary = overall.summary()

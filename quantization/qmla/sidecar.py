@@ -628,10 +628,10 @@ def write_sidecar(
                 if not isinstance(lmeta, Mapping):
                     raise ValueError(f"selection_meta[{path!r}][{bkey!r}][{str(lid)!r}] missing")
                 src_cand = str(lmeta["candidate"])
-                parse_candidate_id(src_cand)
+                _, candidate_path, candidate_width = parse_candidate_id(src_cand)
                 src_bits = lmeta.get("source_bits")
-                if src_bits is not None and type(src_bits) is not int:
-                    raise ValueError(f"{path} width {b} layer {lid} source_bits must be int or None")
+                if src_bits != candidate_width or candidate_width not in (None, b) or candidate_path not in (None, path):
+                    raise ValueError(f"{path} width {b} layer {lid} candidate must match its direct width")
                 val_score = lmeta.get("val_score")
                 if not isinstance(val_score, Mapping) or not val_score:
                     raise ValueError(f"{path} width {b} layer {lid} needs non-empty val_score")
@@ -1007,9 +1007,9 @@ def validate_sidecar(
                 if kind not in VALID_TRANSFORM_KINDS:
                     raise ValueError(f"{path} width {b} layer {lid} invalid kind {kind!r}")
                 actual_counts[kind] += 1
-                parse_candidate_id(str(row["source_candidate"]))
-                if row["source_bits"] is not None and type(row["source_bits"]) is not int:
-                    raise ValueError(f"{path} width {b} layer {lid} invalid source_bits")
+                _, candidate_path, candidate_width = parse_candidate_id(str(row["source_candidate"]))
+                if row["source_bits"] != candidate_width or candidate_width not in (None, b) or candidate_path not in (None, path):
+                    raise ValueError(f"{path} width {b} layer {lid} candidate must match its direct width")
                 if not isinstance(row["val_score"], Mapping) or not row["val_score"]:
                     raise ValueError(f"{path} width {b} layer {lid} requires non-empty val_score")
                 for mk, mv in row["val_score"].items():

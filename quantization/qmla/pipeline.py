@@ -60,7 +60,6 @@ from qmla.measurement import (
     measure_shipped,
     parse_candidate_id,
     select_per_width,
-    select_shared_v2,
     shipped_summary,
     summarize_modes,
     with_equivalence,
@@ -77,7 +76,7 @@ PILOT_SPLITS = (16, 4, 4)
 # Full runs split all calibration rows train/val/test = 60/30/10.
 FULL_SPLIT_FRACTIONS = (0.6, 0.3, 0.1)
 VALIDATION_REPORT_SCHEMA = "cuteafd-qmla-validation-report-v3"
-CANDIDATE_TABLE_SCHEMA = "cuteafd-qmla-candidate-table-v3"
+CANDIDATE_TABLE_SCHEMA = "cuteafd-qmla-candidate-table-v4"
 
 
 def _git_head_sha(root: Path) -> str:
@@ -298,7 +297,7 @@ def compute_fit_identity_key(
         fit_config,
         extra={
             "schema": FIT_CHECKPOINT_SCHEMA,
-            "fit_semantics": "three-way-split-post-norm-fp64-validation-rotation-v3",
+            "fit_semantics": "three-way-split-direct-width-bf16-input-v4",
             "conventions": CANONICAL_CONVENTIONS,
             "source": dict(source),
             "splits": splits,
@@ -404,7 +403,6 @@ def calibrate_from_banks(
         "rope": {str(b): {} for b in r_bits_list} if (r_bits_list and has_any_rope) else None,
     }
     selection_by_layer: dict[str, Any] = {}
-    v2_selection_by_layer: dict[str, Any] = {}
     layer_measurements = {}
     layer_fit_details = {}
     persisted_layers: dict[str, Any] = {}
@@ -478,9 +476,7 @@ def calibrate_from_banks(
         val_table = measure_candidates(bank, candidates, modes, fit_config, device, split="val")
         test_table = measure_candidates(bank, candidates, modes, fit_config, device, split="test")
         selection = select_per_width(val_table, candidates, bank.geometry)
-        v2_selection = select_shared_v2(val_table, candidates, bank.geometry)
         selection_by_layer[str(lid)] = selection
-        v2_selection_by_layer[str(lid)] = v2_selection
 
         persisted_layers[str(lid)] = {
             "geometry": bank.geometry.to_dict(),
@@ -491,7 +487,6 @@ def calibrate_from_banks(
             "val_table": val_table,
             "test_table": test_table,
             "selection_v3": selection,
-            "selection_v2_shared": v2_selection,
         }
 
         if selection["content"] is not None:
@@ -531,7 +526,7 @@ def calibrate_from_banks(
                 }
 
         layer_measurements[lid] = layer_rows(
-            test_table, val_table, selection, bank.geometry, v2_selection=v2_selection
+            test_table, val_table, selection, bank.geometry
         )
         details["fit_and_measure_wall_seconds"] = time.monotonic() - layer_start
         layer_fit_details[str(lid)] = details
@@ -646,7 +641,6 @@ def calibrate_from_banks(
         "fit_budget": fit_budget_json,
         "combinations": combinations,
         "selection_by_layer": selection_by_layer,
-        "v2_shared_selection_by_layer": v2_selection_by_layer,
         "fit_by_layer": layer_fit_details,
         "sidecar_bytes": manifest["tensors_bytes"],
         "fit_measure_validate_seconds": time.monotonic() - started,
@@ -730,7 +724,6 @@ def reselect_from_persisted_candidates(
         "rope": {str(b): {} for b in r_bits_list} if (r_bits_list and has_any_rope) else None,
     }
     selection_by_layer: dict[str, Any] = {}
-    v2_selection_by_layer: dict[str, Any] = {}
     layer_measurements = {}
 
     for lid, geom in zip(ordered_layers, geometries, strict=True):
@@ -763,9 +756,7 @@ def reselect_from_persisted_candidates(
         val_table = lentry["val_table"]
         test_table = lentry["test_table"]
         selection = selector(val_table, candidates, geom)
-        v2_selection = select_shared_v2(val_table, candidates, geom)
         selection_by_layer[str(lid)] = selection
-        v2_selection_by_layer[str(lid)] = v2_selection
 
         if selection["content"] is not None:
             for bkey, rec in selection["content"].items():
@@ -787,7 +778,7 @@ def reselect_from_persisted_candidates(
                     "source_bits": rec["source_bits"],
                     "val_score": rec["val_score"],
                 }
-        layer_measurements[lid] = layer_rows(test_table, val_table, selection, geom, v2_selection=v2_selection)
+        layer_measurements[lid] = layer_rows(test_table, val_table, selection, geom)
 
     combinations = summarize_modes(layer_measurements)
     provenance = dict(table["provenance"])
@@ -825,7 +816,6 @@ def reselect_from_persisted_candidates(
         "validation": validation,
         "combinations": combinations,
         "selection_by_layer": selection_by_layer,
-        "v2_shared_selection_by_layer": v2_selection_by_layer,
         "sidecar_dir": str(sidecar_dir),
     }
 

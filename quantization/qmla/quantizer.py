@@ -351,13 +351,3 @@ def unpack_joint_record(
         unpack_content_row(c_codes + c_meta, d_c, c_bits, group_size=group_size),
         unpack_rope_row(r_codes + r_meta, d_r, r_bits, group_size=group_size),
     )
-
-
-def sylvester_hadamard(dim: int, *, device: torch.device | str = "cpu", dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Normalized Sylvester Hadamard matrix H_dim (H @ H^T = I) for power-of-two dim."""
-    if dim <= 0 or (dim & (dim - 1)) != 0:
-        raise ValueError(f"Sylvester Hadamard requires a power-of-two dimension, got {dim}")
-    h = torch.ones((1, 1), device=device, dtype=dtype)
-    while h.shape[0] < dim:
-        h = torch.cat((torch.cat((h, h), dim=1), torch.cat((h, -h), dim=1)), dim=0)
-    return h * (dim ** -0.5)

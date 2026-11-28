@@ -45,7 +45,6 @@ from qmla import (
     position_bucket_masks,
     qdq_asymmetric_group,
     rms_norm,
-    sylvester_hadamard,
 )
 from qmla.capture import linear
 from qmla.measurement import layer_candidates
@@ -214,7 +213,6 @@ def test_tiled_and_compact_mask_match_dense_oracle_all_arms_and_tile_edges():
     fc, fr = fit_content_layer(bank, 4, cfg), fit_rope_layer(bank, 4, cfg)
     cands = layer_candidates(bank, {4: fc}, {4: fr}, cfg)
     sq_c, sq_r = cands.content["smoothquant:c4"], cands.rope["smoothquant:r4"]
-    had, ones = sylvester_hadamard(geom.kv_lora_rank), torch.ones(geom.kv_lora_rank)
 
     qdq = lambda fn, bits, dt: (lambda x: qdq_asymmetric_group(fn(x), bits, scale_dtype=dt, ste=False))
     c_hooks = lambda r, s: {
@@ -232,7 +230,6 @@ def test_tiled_and_compact_mask_match_dense_oracle_all_arms_and_tile_edges():
         "teacher": {},
         "rtn": {"content_fn": qdq(native_c, 4, "BF16"), "exact_content_fn": native_c,
                 "rope_key_fn": qdq(lambda k: k, 4, "F32"), "exact_rope_key_fn": lambda k: k},
-        "hadamard": {**c_hooks(had, ones), "rope_key_fn": qdq(lambda k: k, 4, "F32"), "exact_rope_key_fn": lambda k: k},
         "smoothquant": {**c_hooks(sq_c.r_c, sq_c.s_c), **r_hooks(sq_r.theta, sq_r.s_p)},
         "fitted": {**c_hooks(fc.r_c, fc.s_c), **r_hooks(fr.theta, fr.s_p)},
     }
@@ -464,8 +461,6 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path, monkeypatc
         assert set(row["per_layer"]) == {"0", "2"}
         assert row["rtn_attn_rel_err"] > 0
         assert row["ratio_to_rtn"] == pytest.approx(row["attn_rel_err"] / row["rtn_attn_rel_err"])
-        if mkey == "0:4":
-            assert row["hadamard_attn_rel_err"] == pytest.approx(row["rtn_attn_rel_err"])
 
     updated = attach_long_context_eval(out_dir, long_eval, manifest=manifest)
     assert "combinations" in updated and updated["long_context_eval"] == long_eval

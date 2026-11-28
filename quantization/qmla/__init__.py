@@ -5,12 +5,11 @@ Provides:
   reference evaluators, deterministic salt-versioned train/val/test split, XXH3-128
   capture storage.
 - ``quantizer``: QuantMLA per-token asymmetric affine group-64 quantizer,
-  bit-exact INT2/INT4/INT8 pack/unpack oracle, record sizing, Hadamard baseline.
+  bit-exact INT2/INT4/INT8 pack/unpack oracle, record sizing.
 - ``fit``: function-aligned content (L_C) and RoPE (L_P) optimizers (``full`` and
   ``scale_only`` fit modes), default ``sink4_local128`` protection, kind classification
   (``identity`` | ``scale_only`` | ``full``), XXH3-128 fit checkpoints.
-- ``measurement``: candidate cross-tables, per-width selection on ``val``, v2 shared-policy
-  comparison baseline, and held-out ``test`` reporting.
+- ``measurement``: candidate cross-tables, direct-width selection on ``val`` and held-out ``test`` reporting.
 - ``sidecar``: ``cuteafd-qmla-v3`` single-file sidecar (``mla_calibration.safetensors``
   with embedded ``__metadata__["cuteafd_qmla"]`` + full ``qmla`` section in
   ``cuteafd-mc.json`` for MC checkpoints; per-width selections, explicit kinds, per-layer
@@ -120,7 +119,6 @@ from .quantizer import (
     qdq_asymmetric_group,
     quantize_params_asymmetric,
     record_bytes_for_mode,
-    sylvester_hadamard,
     unpack_content_row,
     unpack_joint_record,
     unpack_rope_row,
@@ -268,7 +266,6 @@ __all__ = [
     "save_fit_checkpoint",
     "sequence_sha256",
     "split_train_val_test",
-    "sylvester_hadamard",
     "unit_rms_norm",
     "unpack_content_row",
     "unpack_joint_record",
