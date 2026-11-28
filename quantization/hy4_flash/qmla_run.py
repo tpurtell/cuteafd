@@ -27,8 +27,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
+import resource
 import subprocess
+import time
 import sys
 import time
 from typing import Any, Mapping, Sequence
@@ -56,6 +59,7 @@ from qmla.fit import (
     load_fit_checkpoint,
     save_fit_checkpoint,
 )
+from qmla.measurement import inverse_max_error, measure_layer_modes, summarize_modes
 from qmla.quantizer import parse_qmla_mode
 from qmla.sidecar import (
     DEFAULT_QMLA_PANEL_REVISION,
@@ -334,7 +338,7 @@ def calibrate_hy4_flash_from_banks(
     modes: Sequence[tuple[int, int]],
     corpus_provenance: Mapping[str, Any],
     fit_config: FitConfig = FitConfig(),
-    applicable_views: Sequence[str] = ("original", "k8-compact", "k6-compact", "fp8-compact"),
+    applicable_views: Sequence[str] | None = None,
     view_transfer_validation: Mapping[str, Any] | None = None,
     device: torch.device | str = "cpu",
     code_commit: str | None = None,
@@ -345,6 +349,7 @@ def calibrate_hy4_flash_from_banks(
 
     Shared by the production CLI driver and CPU numeric oracle tests.
     """
+    started = time.monotonic()
     if not banks:
         raise ValueError("calibrate_hy4_flash_from_banks requires at least one CapturedLayerBank")
     fit_config.validate()
@@ -361,7 +366,12 @@ def calibrate_hy4_flash_from_banks(
     identity_key = fit_config_digest(
         fit_config,
         extra={
-            "source_revision": source["revision"],
+            "fit_semantics": "causal-protection-v2",
+            "source": dict(source),
+            "splits": {
+                str(lid): [[(seq.seq_id, seq.seq_len) for seq in split] for split in (bank.train, bank.val)]
+                for lid, bank in banks.items()
+            },
             "layers": ordered_layers,
             "corpus": dict(corpus_provenance),
         },
@@ -370,35 +380,62 @@ def calibrate_hy4_flash_from_banks(
     content_profiles: dict[int, list[ContentFitResult]] = {b: [] for b in c_bits_list}
     rope_profiles: dict[int, list[RopeFitResult]] = {b: [] for b in r_bits_list}
 
+    layer_measurements = {}
+    layer_fit_details = {}
     for lid in ordered_layers:
         bank = banks[lid]
         bank.validate()
-        for c_bits in c_bits_list:
-            cached = load_fit_checkpoint(
-                ckpt_dir, kind="content", bits=c_bits, layer_id=lid, identity_key=identity_key
-            )
-            if cached is not None:
-                assert isinstance(cached, ContentFitResult)
-                res_c = cached
-            else:
-                res_c = fit_content_layer(bank, c_bits, fit_config, device=device)
-                save_fit_checkpoint(ckpt_dir, res_c, identity_key=identity_key)
-            content_profiles[c_bits].append(res_c)
-
-        if bank.geometry.has_rope:
-            for r_bits in r_bits_list:
-                cached = load_fit_checkpoint(
-                    ckpt_dir, kind="rope", bits=r_bits, layer_id=lid, identity_key=identity_key
-                )
-                if cached is not None:
-                    assert isinstance(cached, RopeFitResult)
-                    res_r = cached
+        layer_start = time.monotonic()
+        details = {}
+        for path, widths, fit_layer, profiles in (
+            ("content", c_bits_list, fit_content_layer, content_profiles),
+            ("rope", r_bits_list if bank.geometry.has_rope else (), fit_rope_layer, rope_profiles),
+        ):
+            for bits in widths:
+                timing_file = ckpt_dir / f"{path}-{bits}-layer-{lid:04d}.time.json"
+                result = load_fit_checkpoint(ckpt_dir, kind=path, bits=bits, layer_id=lid, identity_key=identity_key)
+                reused = result is not None
+                if reused:
+                    timing = json.loads(timing_file.read_text()) if timing_file.is_file() else {}
+                    seconds = timing.get("seconds") if timing.get("identity_key") == identity_key else None
                 else:
-                    res_r = fit_rope_layer(bank, r_bits, fit_config, device=device)
-                    save_fit_checkpoint(ckpt_dir, res_r, identity_key=identity_key)
-                rope_profiles[r_bits].append(res_r)
+                    fit_start = time.monotonic()
+                    result = fit_layer(bank, bits, fit_config, device=device)
+                    seconds = time.monotonic() - fit_start
+                inverse_error = inverse_max_error(result, bank.geometry)
+                errors = {"inverse_max_abs_err": inverse_error, "equiv_max_rel_err": result.equiv_max_rel_err}
+                if isinstance(result, ContentFitResult):
+                    errors["orth_max_err"] = result.orth_max_err
+                for check, value in errors.items():
+                    if not math.isfinite(value):
+                        raise ValueError(f"nonfinite {path} {bits}-bit layer {lid} {check}")
+                    if check in ("equiv_max_rel_err", "orth_max_err") and value >= 1e-5:
+                        raise ValueError(f"{path} {bits}-bit layer {lid} {check} = {value} (requires <1e-5)")
+                if not all(math.isfinite(value) for value in (result.best_val_loss, *result.baselines.values())):
+                    raise ValueError(f"nonfinite {path} {bits}-bit layer {lid} validation loss")
+                if not reused:
+                    save_fit_checkpoint(ckpt_dir, result, identity_key=identity_key)
+                    _atomic_json(timing_file, {"identity_key": identity_key, "seconds": seconds})
+                profiles[bits].append(result)
+                details.setdefault(path, {})[str(bits)] = {
+                    "fit_seconds": seconds,
+                    "reused_fit": reused,
+                    "best_step": result.best_step,
+                    "before_val_loss": result.baselines["smoothquant_alpha_val"],
+                    "after_val_loss": result.best_val_loss,
+                    "baselines": result.baselines,
+                    **errors,
+                }
+        layer_measurements[lid] = measure_layer_modes(
+            bank, bank, modes, {bits: rows[-1] for bits, rows in content_profiles.items()},
+            {bits: rows[-1] for bits, rows in rope_profiles.items() if bank.geometry.has_rope},
+            fit_config, device,
+        )
+        details["fit_and_measure_wall_seconds"] = time.monotonic() - layer_start
+        layer_fit_details[str(lid)] = details
 
     rope_profiles = {b: rows for b, rows in rope_profiles.items() if rows}
+    combinations = summarize_modes(layer_measurements)
 
     sample_bank = banks[ordered_layers[0]]
     provenance: dict[str, Any] = {
@@ -410,6 +447,10 @@ def calibrate_hy4_flash_from_banks(
         "input_ids_sha256": corpus_provenance["input_ids_sha256"],
         "renderer_template_sha256": renderer_template_sha256,
         "thinking_mode": thinking_mode,
+        "combination_measurements": {
+            key: {name: value for name, value in row.items() if name != "per_layer"}
+            for key, row in combinations.items()
+        },
         "optimizer": "adamw",
         "steps_per_path": fit_config.steps,
         "seed": fit_config.seed,
@@ -423,7 +464,7 @@ def calibrate_hy4_flash_from_banks(
         content_profiles=content_profiles,
         rope_profiles=rope_profiles,
         provenance=provenance,
-        applicable_views=applicable_views,
+        applicable_views=applicable_views if applicable_views is not None else (source["calibrated_view"],),
         view_transfer_validation=view_transfer_validation,
         artifact_status="calibrated_unqualified",
         protection_policy=fit_config.protection,
@@ -434,6 +475,7 @@ def calibrate_hy4_flash_from_banks(
         expected_source={"repo": source["repo"], "revision": source["revision"], "family": source["family"]},
         expected_geometries=geometries,
         banks_by_layer=banks,
+        equiv_tol=1e-5,
         strict=True,
     )
     report = {
@@ -443,6 +485,14 @@ def calibrate_hy4_flash_from_banks(
         "protection_scope": manifest["protection_scope"],
         "source": manifest["source"],
         "layers_calibrated": ordered_layers,
+        "combinations": combinations,
+        "fit_by_layer": layer_fit_details,
+        "sidecar_bytes": manifest["tensors_bytes"],
+        "fit_measure_validate_seconds": time.monotonic() - started,
+        "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+        "process_peak_cuda_allocated_bytes": (
+            torch.cuda.max_memory_allocated(torch.device(device)) if torch.device(device).type == "cuda" else None
+        ),
         "supported_modes": manifest["supported_modes"],
         "validation": validation,
         "content_summary": {

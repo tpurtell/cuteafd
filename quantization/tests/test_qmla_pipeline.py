@@ -25,6 +25,7 @@ from hy4_flash.qmla_run import (
     parse_modes_arg,
     resolve_run_settings,
 )
+from qmla.measurement import _token_relative_squares
 from qmla import (
     DEFAULT_PROTECTION_POLICY,
     DEFAULT_QMLA_PANEL_REVISION,
@@ -377,6 +378,14 @@ def test_default_sink4_local128_protection_fit_and_none_alternative(tmp_path: Pa
         load_fit_checkpoint(tmp_path, kind="content", bits=2, layer_id=0, identity_key="stale-identity")
 
 
+def test_attention_error_weights_tokens_equally():
+    rng = torch.Generator().manual_seed(715)
+    ref = torch.randn(3, 12, generator=rng)
+    gains = torch.arange(1., 4.).view(-1, 1)
+    err = _token_relative_squares(ref * gains, ref)
+    torch.testing.assert_close(err, (gains[:, 0] - 1).square())
+
+
 def test_hy4_flash_two_component_default_single_file_sidecar_mc_section_and_incremental_publish(tmp_path: Path):
     """End-to-end cassowary path: 2-component default (agentic+exl3_standard), sink4_local128, single mla_calibration.safetensors + cuteafd-mc.json['qmla']."""
     _, _, _, _, bank0 = _make_skewed_hy4_bank(201, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=24)
@@ -425,6 +434,20 @@ def test_hy4_flash_two_component_default_single_file_sidecar_mc_section_and_incr
     assert (sidecar_dir / "mla_calibration.safetensors").is_file()
     assert not (sidecar_dir / "mla_calibration.json").exists()
     assert result["manifest"]["artifact_status"] == "calibrated_unqualified"
+    assert result["manifest"]["applicable_views"] == ["original"]
+    report = result["report"]
+    assert report["sidecar_bytes"] == (sidecar_dir / "mla_calibration.safetensors").stat().st_size
+    assert set(report["combinations"]) == {"4:4", "2:4"}
+    for mode, metrics in report["combinations"].items():
+        layer_rows = metrics["per_layer"]
+        assert set(layer_rows) == {"0", "5"}
+        assert metrics["layer_tokens"] == sum(s.seq_len for bank in [bank0, bank5] for s in bank.val)
+        assert metrics["ratio_to_rtn"] == pytest.approx(metrics["attn_rel_err"] / metrics["rtn_attn_rel_err"])
+        for name in ("attn_rel_err", "rtn_attn_rel_err", "hadamard_attn_rel_err", "smoothquant_attn_rel_err"):
+            expected = sum(row[name] * row["tokens"] for row in layer_rows.values()) / metrics["layer_tokens"]
+            assert metrics[name] == pytest.approx(expected)
+            assert metrics[name] == result["manifest"]["calibration_provenance"]["combination_measurements"][mode][name]
+    assert report["fit_by_layer"]["0"]["content"]["2"]["fit_seconds"] > 0
     assert result["manifest"]["protection_policy"] == "sink4_local128"
     assert result["manifest"]["protection_scope"] == PROTECTION_SCOPE
     assert sorted(result["manifest"]["supported_modes"]) == sorted(["4:0", "2:0", "0:4", "4:4", "2:4"])
