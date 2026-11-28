@@ -23,10 +23,10 @@ Every deviation from the QuantMLA paper is explicitly marked **`[Adaptation]`**.
 - **Equivalence gate (Appendix C.5):** Quantization-disabled forward equivalence is verified before any quantized evaluation.
 
 ### CuteAFD Adaptations
-1. **`[Adaptation A1 — Sidecar storage + load-time UK/UV absorption + write-side forward transform]`:** The paper fuses $(R_C, S_C, R_P, S_P)$ offline by mutating checkpoint weights (`kv_a_proj_with_mqa`, `kv_a_layernorm`, `kv_b_proj`, `q_b_proj`). CuteAFD keeps all checkpoint shards and MC views (`original`, `k8-compact`, `k6-compact`, `fp8-compact`, native FP8/NVFP4) **byte-for-byte immutable** and stores transforms in a compact root sidecar (`mla_calibration.safetensors` + `mla_calibration.json`). At load time we absorb $\Gamma R_C S_C^{-1}$ into `W_UK`/`W_UV` (zero history-row inverse cost on decode); at write time we apply one forward transform per newly produced token (§2) and fuse the tiny per-pair RoPE phase/scale directly into the RoPE step (§3). On uncompressed BF16 `original` views, load-time producer folding into `kv_a_proj_with_mqa` remains an optional zero-overhead optimization using the exact same `unit_rms` sidecar.
+1. **`[Adaptation A1 — Single sidecar file + load-time UK/UV absorption + write-side forward transform]`:** The paper fuses $(R_C, S_C, R_P, S_P)$ offline by mutating checkpoint weights (`kv_a_proj_with_mqa`, `kv_a_layernorm`, `kv_b_proj`, `q_b_proj`). CuteAFD keeps all checkpoint shards and MC views (`original`, `k8-compact`, `k6-compact`, `fp8-compact`, native FP8/NVFP4) **byte-for-byte immutable** and stores transforms in one compact root sidecar file (`mla_calibration.safetensors`), with its metadata in `cuteafd-mc.json["qmla"]` for MC checkpoints (or in `mla_calibration.safetensors`'s `__metadata__` header for non-MC checkpoints; §5). At load time we absorb $\Gamma R_C S_C^{-1}$ into `W_UK`/`W_UV` (zero history-row inverse cost on decode); at write time we apply one forward transform per newly produced token (§2) and fuse the tiny per-pair RoPE phase/scale directly into the RoPE step (§3). On uncompressed BF16 `original` views, load-time producer folding into `kv_a_proj_with_mqa` remains an optional zero-overhead optimization using the exact same `unit_rms` sidecar.
 2. **`[Adaptation A2 — Orthogonal --quant-mla C:R CLI contract]`:** Exposes independent integer widths per path (`0:0`, `8:8`, `4:8`, `4:4`, `2:4`, `4:0`, `0:4`, `8:0`, `0:8`), where `0` retains the family's existing native cache representation (FP8 or BF16 per `--kv-cache`) rather than forcing BF16.
-3. **`[Adaptation A3 — CuteAFD quant corpus & pluggable long-context components]`:** Calibrates on the pinned quant panel `wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb` (`agentic` chat-rendered with the checkpoint's own template + `exl3_standard`), never WikiText-2 alone and never the held-out Standard Fidelity panel. The corpus component list is data-driven (CLI/recipe, never hard-coded) so an optional long-context bank (e.g., 16K/32K traces, agentic traces, long articles) can be plugged in by `name + repo + revision` alongside `agentic` and `exl3_standard` without blocking runs that use only the base two components. Captures match each family's exact masks, sparse DSA top-k selection, SWA windows, learnable sinks, output gates, post-proj norm, VHA postmix, and M-RoPE / YaRN / LeRoPE positions.
-4. **`[Adaptation A4 — Prefix-cache-safe protection & SWA exclusion]`:** The paper's `sink4/local128` BF16 side buffers exclude shared-prefix ownership (Appendix C.5). CuteAFD treats protection as an explicit measured-only policy (`none` vs `sink4_local128`) applying to **full-history MLA layers only, never SWA**: start with uniform unprotected pages for `8:*`, `4:8`, `4:4`, `4:0`, `0:4` and enable `sink4_local128` in the exact prefix mark only where measured necessary (expected for `2:4`, optional for `4:4`). SWA layers (e.g., Hy4-flash's 30 bounded SWA-512 rings) are untouched by QMLA and retain their `--kv-cache` format (§4).
+3. **`[Adaptation A3 — Single pinned 3-component CuteAFD quant panel]`:** Calibrates on one pinned revision of `wrldsuksgo2mars/agentic-quant-panel-v2` carrying all **three** fixed components: `agentic` (chat-rendered with the checkpoint's own template), `exl3_standard` (packed with this tokenizer), and the third long-context bank (16K/32K traces, agentic traces, long articles) — never WikiText-2 alone and never the held-out Standard Fidelity panel. No ad-hoc component-list CLI mechanism exists: one pinned revision constant and the third component's name are filled in once the bank lands, and production runs fail closed until present (§6). Captures match each family's exact masks, sparse DSA top-k selection, SWA windows, learnable sinks, output gates, post-proj norm, VHA postmix, and M-RoPE / YaRN / LeRoPE positions.
+4. **`[Adaptation A4 — Default sink4/local128 protection in both calibration and serving; SWA untouched]`:** The paper calibrates unprotected and enables `sink4/local128` BF16 protection only at evaluation (and leaves shared-prefix ownership outside scope, Appendix C.5). CuteAFD enables **`sink4_local128` by default from the start in both calibration and runtime** for every nonzero `QUANT_MLA` mode on **full-history MLA layers only (never SWA)**: recent rows are already kept unquantized to form/quantize extending blocks properly, and calibrating with `sink4_local128` active avoids spending transform capacity on sink/recent tokens that are never quantized at runtime. `none` is retained only as a measured opt-in alternative if protection later proves unnecessary. Admission, exact prefix marks, and CUDA graph identity account for `sink4_local128` from Phase 3 onward. SWA layers (e.g., Hy4-flash's 30 bounded SWA-512 rings) are completely untouched by QMLA and retain their `--kv-cache` format (§4).
 5. **`[Adaptation A5 — Multi-family MLA extensions]`:** Explicitly handles pure-NoPE MLA (`glm5_flash`), unrotated 64-dim PE slots (`kimi_k3`/`kimi_k31`), alternating RoPE/NoPE + cross-layer KV sharing + scalable softmax (`mistral_large4`), 3D interleaved M-RoPE (`hy4_flash`/`hy4`), EXL3-quantized `kv_b_proj` in Hy4 compact views (already dequantized to absorbed BF16 at load), and target-KV-sharing drafters (Hy4/Hy4-flash DFly2).
 
 ---
@@ -102,13 +102,13 @@ $$R_i(\phi_{i,m}) R_i(\theta_i) (s_i I_2) = R_i(\phi_{i,m} + \theta_i) (s_i I_2)
 2. **Uncalibrated fixed Sylvester Hadamard (`H_512`):** `gr8` KV4 baseline (`416 B/tok`: 512 INT4 sym `[-7..7]` g32 + 16×FP16 scales + 64 BF16 RoPE, measured +0.010–0.0145 KL vs FP8 on GLM-5.3) and `QuaRot†` (post-RoPE Hadamard on `4:4`).
 3. **RTN** (untransformed asymmetric affine INT) and **SmoothQuant†** (scale-only $\alpha$-search, produced automatically at step 0 of our scale-init search).
 
-### Recent-Token and Sink Protection (`[Adaptation A4]`)
-- **Paper policy:** Keeps $P_L = \{0,\dots,\min(4,L)-1\} \cup \{\max(0,L-128),\dots,L-1\}$ in BF16 (132 rows × 1,152 B = 152 KiB/layer/request), while still writing packed integer records for every token at insertion so window eviction requires zero re-quantization. On DeepSeek-V2-Lite MMLU C4R4 (Table 3), `sink4/local128` adds +1.64 pts on top of the +4.41 pts from content+RoPE transforms.
-- **CuteAFD design:**
-  - Always calibrate **unprotected** (paper rule).
-  - At runtime, protection is an explicit measured-only policy (`none` vs `sink4_local128`) tracked in admission, prefix identity, and graph keys, applying to **full-history MLA layers only, never SWA**:
-    - **Start with `none`** for `8:*`, `4:8`, `4:4`, `4:0`, `0:4`. Uniform page records preserve zero-copy `RefPagePool` sharing, `ContextSplit` parity pages, and zero mark growth.
-    - **Enable `sink4_local128`** where fidelity requires it (expected for `2:4`; optional fallback for `4:4`): every token still writes its packed integer record into `RefPagePool`, while each active sequence (and each exact **prefix mark**) holds the 4 sink + 128 recent BF16 rows (~1.7 MiB/mark for Hy4-flash's 12 DSA layers, ~11.2 MiB/mark for 78-layer GLM 5.3 — identical mechanism to Hy4-flash's existing 512-row SWA prefix mark). Attention merges protected BF16 + quantized history under a single global softmax (Eq. 39).
+### Recent-Token and Sink Protection (`[Adaptation A4]` — Default ON from the Start)
+- **Paper policy:** Keeps $P_L = \{0,\dots,\min(4,L)-1\} \cup \{\max(0,L-128),\dots,L-1\}$ in BF16 (132 rows × 1,152 B = 152,064 B/layer/request), while still writing packed integer records for every token at insertion so window eviction requires zero re-quantization. On DeepSeek-V2-Lite MMLU C4R4 (Table 3), `sink4/local128` adds +1.64 pts on top of the +4.41 pts from content+RoPE transforms. The paper calibrates *unprotected* and enables `sink4/local128` only at evaluation.
+- **CuteAFD design (`[Adaptation A4]`):**
+  - **`sink4_local128` is ON by default for every nonzero `QUANT_MLA` mode** on **full-history MLA layers only, never SWA** — in **both calibration and runtime**.
+  - **Why:** The extending block already keeps recent rows unquantized before finalizing/quantizing blocks, so protecting the 4 sink + 128 recent tokens aligns runtime execution with natural block staging, avoids wasting learned transform capacity on sink/recent outliers that are never read quantized at runtime, and delivers the paper's full +1.64-pt protection gain from day one.
+  - **`none` is only a measured alternative:** If later measurements show a mode/family meets its fidelity bar without protection, `protection_policy: "none"` can be tested and recorded explicitly as a measured alternative.
+  - **Prefix-cache & admission accounting (from Phase 3 onward):** Every token still writes its packed integer record into `RefPagePool` at insertion (keeping shared prefix pages self-contained and compatible with `ContextSplit` parity pages), while each active sequence and each exact **prefix mark** holds the 4 sink + 128 recent BF16 rows (`152,064 B` per full-history MLA layer: **1.74 MiB/seq** for Hy4-flash's 12 DSA layers, **1.60 MiB/seq** for GLM 5.3 Flash's 11 NoPE MLA layers, **11.31 MiB/seq** for 78-layer GLM 5.3 / Hy4 — identical mechanism to Hy4-flash's existing 512-row SWA prefix mark). Attention merges protected BF16 + quantized history under a single global softmax (Eq. 39). Admission, prefix identity, and CUDA graph identity account for `sink4_local128` from the first runtime.
   - **SWA layers (e.g., Hy4-flash's 30 SWA-512 rings):** SWA rings are bounded per-sequence circular rings (640 rows/seq/layer), not context-scaling full-history pools. **SWA is untouched by QMLA** — SWA rings keep their `--kv-cache` format and never use `sink4_local128` protection. QMLA applies to full-history MLA layers (Hy4-flash's 12 DSA layers).
 
 ### Scale and Packing Scheme (Paper-Faithful, 16-Byte Aligned)
@@ -135,12 +135,18 @@ Every quantized path uses per-token asymmetric affine quantization with group si
 
 ---
 
-## 5. Sidecar Schema (`mla_calibration.json` + `mla_calibration.safetensors`)
+## 5. Sidecar Schema (`mla_calibration.safetensors` + `cuteafd-mc.json["qmla"]`)
 
-Placed at the checkpoint root, **never indexed** in any `model*.safetensors.index.json` (so plain loaders and `0:0` ignore them cleanly). On MC checkpoints, `cuteafd-mc.json` carries an optional **advisory** `"qmla"` pointer (never in `required_features`, matching `engram_fp8` in `docs/mc-checkpoints.md`). Non-MC checkpoints carry the two root files directly.
+There is **no separate `mla_calibration.json` file**. The **only** sidecar file added at the checkpoint root is `mla_calibration.safetensors`, **never indexed** in any `model*.safetensors.index.json` (so plain loaders and `0:0` ignore it completely).
+
+### Where the QMLA Manifest Lives (MC vs. Non-MC Checkpoints)
+- **MC checkpoints (have `cuteafd-mc.json`):** The entire QMLA manifest lives as an optional, advisory **`"qmla"` section inside `cuteafd-mc.json`** (same pattern as `engram_fp8` and `exl3_codebook` in `docs/mc-checkpoints.md`; **never** in `required_features`). All existing `cuteafd-mc.json` fields (`schema`, `source`, `original_core_dtype`, `shared_inventory_sha256`, `variants`, `exl3_codebook`, `engram_fp8`) stay byte-for-byte unchanged, and every existing MC validator continues to pass. A checkpoint without `"qmla"` or without `mla_calibration.safetensors` serves `0:0` unchanged.
+- **Non-MC checkpoints (official / plain checkpoints without `cuteafd-mc.json`):** The exact same canonical QMLA manifest JSON is embedded in `mla_calibration.safetensors`'s **`__metadata__["cuteafd_qmla"]`** header (zero extra JSON files!).
+  - **Why `__metadata__` instead of a minimal `cuteafd-mc.json`:** `docs/mc-checkpoints.md` defines a repository as MC *iff* `cuteafd-mc.json` exists, and MC discovery fails closed if `cuteafd-mc.json` lacks `variants` / `shared_inventory_sha256`. Putting the metadata in `mla_calibration.safetensors`'s own safetensors `__metadata__` header preserves the MC discovery invariant cleanly, requires adding **only one file** for a calibration-only non-MC revision, and avoids a circular file-hash dependency (the embedded manifest carries `tensors_payload_sha256` over the raw tensor payload bytes after the safetensors header, while `cuteafd-mc.json["qmla"]` on MC checkpoints additionally pins the whole-file `tensors_sha256` and `tensors_bytes` of `mla_calibration.safetensors`).
+  - `mla_calibration.safetensors` always writes `__metadata__["cuteafd_qmla"]` for both MC and non-MC checkpoints, so the file is self-describing and `validate_sidecar` verifies exact agreement between `cuteafd-mc.json["qmla"]` and the safetensors header on MC checkpoints.
 
 ### Per-Bit-Mode Profile Design (No Single-Transform Assumption)
-Because content and RoPE objectives run QDQ at a specific bit width inside the loop, one transform set does **not** necessarily fit every width. Since the two paths are calibrated independently, we store **per-path, per-width profiles** in one safetensors file:
+Because content and RoPE objectives run QDQ at a specific bit width inside the loop, one transform set does **not** necessarily fit every width. Since the two paths are calibrated independently, we store **per-path, per-width profiles** in `mla_calibration.safetensors`:
 - Content profiles: `content.c8`, `content.c4`, `content.c2` → per calibrated layer $\ell$:
   - `content.c{b}.layer_{l}.r`: `F32[d_c, d_c]` (orthogonal $R_C$)
   - `content.c{b}.layer_{l}.s`: `F32[d_c]` (positive diagonal $s_C$)
@@ -151,11 +157,13 @@ Because content and RoPE objectives run QDQ at a specific bit width inside the l
 
 Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\top R - I\|_\infty < 10^{-5}$) and single-rounding FP32 `kv_b_proj` absorption at load time, while remaining tiny on disk: **1.0 MiB/layer per content profile** (~36 MiB total for all 3 content + 2 RoPE profiles on Hy4-flash 12 DSA layers; ~234 MiB for 78-layer GLM 5.3 / Hy4).
 
-### Manifest Schema (`mla_calibration.json`, `schema: "cuteafd-qmla-v1"`)
+### Embedded `qmla` Section Schema (`schema: "cuteafd-qmla-v1"`)
 ```json
 {
   "schema": "cuteafd-qmla-v1",
   "artifact_status": "calibrated_unqualified",
+  "protection_policy": "sink4_local128",
+  "protection_scope": "full_history_mla_only",
   "source": {
     "repo": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
     "revision": "<40-char-sha>",
@@ -165,7 +173,7 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
     "model_type": "hy_v4_flash",
     "config_sha256": "<sha256>",
     "checkpoint_kind": "mc",
-    "calibrated_view": "k8-compact"
+    "calibrated_view": "original"
   },
   "applicable_views": ["original", "k8-compact", "k6-compact", "fp8-compact"],
   "view_transfer_validation": {
@@ -216,7 +224,7 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
         "transform_kind": "dense_orth",
         "layers": [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41],
         "tensors_prefix": "content.c4",
-        "protection_calibrated": "none",
+        "protection_calibrated": "sink4_local128",
         "validation": {"val_loss_mean": 0.0, "equiv_max_rel_err": 0.0, "orth_max_err": 0.0},
         "profile_fingerprint": "<sha256>"
       }
@@ -227,7 +235,7 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
         "transform_kind": "pair_so2",
         "layers": [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41],
         "tensors_prefix": "rope.r4",
-        "protection_calibrated": "none",
+        "protection_calibrated": "sink4_local128",
         "validation": {"val_loss_mean": 0.0, "equiv_max_rel_err": 0.0},
         "profile_fingerprint": "<sha256>"
       }
@@ -236,24 +244,13 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
   "supported_modes": ["8:8", "4:8", "4:4", "2:4", "4:0", "0:4", "8:0", "0:8", "2:0"],
   "unsupported_modes_reason": {"*:2": "INT2 RoPE is not supported"},
   "calibration_provenance": {
-    "components": [
-      {
-        "name": "agentic",
-        "repo": "wrldsuksgo2mars/agentic-quant-panel-v2",
-        "revision": "54683731eb01c7c2fa5b801a0888e029a0e1b1c7",
-        "sequences": 96,
-        "tokens": 73728,
-        "input_ids_sha256": "<sha256>"
-      },
-      {
-        "name": "exl3_standard",
-        "repo": "wrldsuksgo2mars/agentic-quant-panel-v2",
-        "revision": "54683731eb01c7c2fa5b801a0888e029a0e1b1c7",
-        "sequences": 64,
-        "tokens": 131072,
-        "input_ids_sha256": "<sha256>"
-      }
-    ],
+    "dataset_repo": "wrldsuksgo2mars/agentic-quant-panel-v2",
+    "dataset_revision": "<pinned-new-revision-sha>",
+    "components": {
+      "agentic": {"sequences": 64, "tokens": 49152, "input_ids_sha256": "<sha256>"},
+      "exl3_standard": {"sequences": 32, "tokens": 65536, "input_ids_sha256": "<sha256>"},
+      "<long_context_component>": {"sequences": 32, "tokens": 262144, "input_ids_sha256": "<sha256>"}
+    },
     "train_sequences": 128,
     "val_sequences": 32,
     "input_ids_sha256": "<sha256>",
@@ -265,21 +262,24 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
     "code_commit": "<sha>"
   },
   "tensors_file": "mla_calibration.safetensors",
-  "tensors_sha256": "<sha256>",
+  "tensors_payload_sha256": "<sha256>",
+  "tensors_bytes": 37748736,
+  "tensors_sha256": "<sha256-in-cuteafd-mc-json-only>",
   "transform_fingerprint": "<sha256>"
 }
 ```
 - **Shared across views:** One sidecar is shared across `original`, `k8-compact`, `k6-compact`, and `fp8-compact` whenever cross-view transfer validation passes (recorded in `applicable_views` and `view_transfer_validation`). If any view requires separate transforms, it gets an explicit view-scoped manifest entry rather than silent reuse.
-- **`transform_fingerprint`:** Canonical SHA256 over `(schema, source.base_revision, geometry, conventions, quantizer_recipe, profiles, tensors_sha256)`. Binds runtime graph & prefix cache identity to exact learned coordinates, independent of bit width alone.
+- **`transform_fingerprint`:** Canonical SHA256 over `(schema, protection_policy, source.base_revision, geometry, conventions, quantizer_recipe, profiles, tensors_payload_sha256)`. Binds runtime graph & prefix cache identity to exact learned coordinates and protection policy, independent of bit width alone.
 
 ---
 
 ## 6. Calibration Procedure
 
-1. **Corpus & pluggable components:** Draw deterministically from a data-driven list of pinned corpus components (specified via CLI/recipe, never hard-coded), **never** from the held-out Standard Fidelity panel:
-   - Default base components: `agentic` (chat-rendered with this checkpoint's own template) and `exl3_standard` (packed with this tokenizer) from `wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7`.
-   - Optional pluggable components (e.g., the long-context bank of 16K/32K traces, ~128K tokens per length class, plus agentic traces and long articles) attach identically by `name + repo + revision` and are recorded per component in `calibration_provenance.components`, directly exercising DSA top-k selection past the 2,048-token cutoff. Runs never block on optional components: the pipeline runs cleanly with just the base two components.
-   - Partition into disjoint `train` (default 128 sequences) and `val` (default 32 sequences) by prompt/row hash.
+1. **Corpus (single pinned 3-component revision, never Standard Fidelity):** Draw deterministically from one pinned revision of `wrldsuksgo2mars/agentic-quant-panel-v2` containing all **three** fixed components:
+   - `agentic` (chat-rendered with this checkpoint's own template, matching `quantization/hy4_flash/prepare_corpus.py`),
+   - `exl3_standard` (packed with this tokenizer under `exl3-standard-pack-v1`), and
+   - the third long-context bank (`QMLA_LONG_CONTEXT_COMPONENT`, 16K/32K traces, ~128K tokens per length class, plus agentic traces and long articles) to exercise DSA top-k selection past 2,048 tokens.
+   - **Fail-closed constant pair:** `QMLA_PANEL_REVISION` and `QMLA_LONG_CONTEXT_COMPONENT` live as one clearly named constant pair in `quantization/qmla/sidecar.py` to fill in once the new dataset revision is published. Production calibration fails closed with a clear error naming those missing constants rather than silently calibrating on only two components. Partition into disjoint `train` (default 128 sequences) and `val` (default 32 sequences) by prompt/row hash. Never touch the held-out Standard Fidelity panel.
 2. **Per-layer capture (Hessians alone are insufficient):** At each MLA layer $\ell$, capture:
    - Weightless normalized content latent $u_\ell = \mathrm{RMSNorm}_1(x_{c,\ell})$ (`[T, d_c]`) and native $\gamma_\ell$.
    - Absorbed content query $\bar{Q}_{C,\ell}$ (or $Q_{C,\ell}$ + `kv_b_proj`, `o_proj`, output gate, learnable sink, post-proj norm, VHA postmix) and post-RoPE positional queries $Q_{P,\ell}$ and keys $K_{P,\ell}$ (since $R_P, S_P$ commute with RoPE, post-RoPE capture avoids re-running RoPE inside the optimization loop).
@@ -312,14 +312,14 @@ Storing `F32` in the sidecar guarantees exact orthogonality validation ($\|R^\to
 - **Fail-closed rules (never silent fallback):**
   - Non-MLA family with `--quant-mla != 0:0`: fail closed naming the family.
   - Pure-NoPE MLA family (`glm5_flash`) with `R > 0`: fail closed (`qk_rope_dim == 0; use R=0`).
-  - Missing `mla_calibration.json` / `.safetensors`, mismatched `source` / `config_sha256`, or missing requested `c{C}` / `r{R}` profile: fail closed with the exact missing file/profile (never fall back to `0:0` or RTN).
+  - Missing `cuteafd-mc.json["qmla"]` (or `__metadata__["cuteafd_qmla"]` on non-MC) / missing `mla_calibration.safetensors`, mismatched `source` / `config_sha256`, or missing requested `c{C}` / `r{R}` profile: fail closed with the exact missing file/profile (never fall back to `0:0` or RTN).
   - Unqualified runtime family/mode combination: fail closed naming the unimplemented kernel/family limitation.
 
 ### Arena Ownership, Graph Identity, Prefix Identity, and Speculators
-- **Packed arenas (AGENTS.md):** All QMLA transform tensors (`M_C = R_C S_C`, RoPE `theta / s / s_inv`) live in **one named packed device arena per coordinator GPU** (`qmla.transforms.<gpu>`), inventoried and charged once by admission. Load-time `kv_b_proj` compensation writes directly into the existing absorbed `W_UK`/`W_UV` arena slots via bounded transient scratch (zero permanent BF16 duplicate).
-- **Coordinate identity vs. bit width:** Cache identity is `(resolved_content_format, resolved_rope_format, base_kv_cache, protection_policy, transform_fingerprint)` — **never** bit width alone.
-- **Prefix cache & host cache (`cuteafd-hostcache`, `RefPagePool`):** Include the full cache identity tuple in page-pool / host-cache namespace hashing so incompatible calibrations or modes can never collide. Exact prefix restore copies packed pages (and `sink4/local128` mark bytes if enabled) byte-for-byte.
-- **CUDA graph identity:** Graph keys include `(qmla_mode, protection_policy, record_bytes, transform_fingerprint)`. Because transform tensors live in a fixed packed arena, graph pointers remain invariant across requests.
+- **Packed arenas (AGENTS.md):** All QMLA transform tensors (`M_C = R_C S_C`, RoPE `theta / s / s_inv`) live in **one named packed device arena per coordinator GPU** (`qmla.transforms.<gpu>`), inventoried and charged once by admission. Load-time `kv_b_proj` compensation writes directly into the existing absorbed `W_UK`/`W_UV` arena slots via bounded transient scratch (zero permanent BF16 duplicate). Active `sink4_local128` BF16 protection buffers live in one named per-rank arena and inside the existing prefix mark arena (full-history MLA layers only, never SWA), charged once by admission from the first runtime.
+- **Coordinate identity vs. bit width:** Cache identity is `(resolved_content_format, resolved_rope_format, base_kv_cache, protection_policy, transform_fingerprint)` — **never** bit width alone. `protection_policy` defaults to `"sink4_local128"` for every nonzero mode.
+- **Prefix cache & host cache (`cuteafd-hostcache`, `RefPagePool`):** Include the full cache identity tuple in page-pool / host-cache namespace hashing so incompatible calibrations, modes, or protection policies can never collide. Exact prefix restore copies packed pages plus the `sink4_local128` BF16 mark bytes byte-for-byte.
+- **CUDA graph identity:** Graph keys include `(qmla_mode, protection_policy, record_bytes, transform_fingerprint)`. Because transform tensors and protection buffers live in fixed packed arenas, graph pointers remain invariant across requests.
 - **Speculative consumers:**
   - *Target-KV-sharing drafters* (`hy4_flash` / `hy4` DFly2): read the same QMLA target KV pages (zero BF16 duplicate); load-time absorption compensates DFly2's `kv_b_proj` with its tapped target layer's $(\Gamma_\ell, R_{C,\ell}, S_{C,\ell})$ and applies $(R_{P,\ell}, S_{P,\ell}^{-1})$ to DFly2's RoPE queries.
   - *Independent-KV drafters* (external DFlash2 on GLM 5.3 / GLM 5.3 Flash / Kimi; ML4 `mtp_dspark`): keep their own KV cache governed by `--draft-kv-cache`, completely independent of target `--quant-mla`.
@@ -335,8 +335,8 @@ New CuteAFD quant families are built by copying the previous family's working pi
   - `capture.py` *(mode-agnostic)*: `MlaLayerGeometry`, `CapturedSequence`, `CapturedLayerParams`, `CapturedLayerBank`, `QmlaCaptureAdapter` protocol, exact full-precision attention-output / positional-QK evaluators, deterministic train/val splitting, and sequential segment capture storage with streamed XXH3-128 receipts.
   - `quantizer.py`: paper-faithful per-token asymmetric affine group-64 quantizer (RNE ties-to-even, STE, INT2/INT4/INT8 pack/unpack + CPU numeric oracle).
   - `fit.py`: content-path Cayley orthogonal $R_C$ + log-scale $S_C$ optimizer ($\mathcal{L}_C$), RoPE-path per-pair $SO(2)$ angles + pair-tied scales optimizer ($\mathcal{L}_P$), step-0 RTN / fixed-Hadamard / SmoothQuant† $\alpha$-search baselines, shared-KV multi-consumer loss aggregation, per-layer streaming & checkpoint/resume.
-  - `sidecar.py`: `cuteafd-qmla-v1` manifest + `mla_calibration.safetensors` writer, `transform_fingerprint`, advisory `cuteafd-mc.json` integration, and fail-closed validators (geometry, source identity, SHA256 digests, orthogonality/invertibility, quantization-off algebraic equivalence, cross-view transfer).
-  - `publish.py`: same-repo incremental HF revision publisher over `quantization/hub_lfs.py` (`HF_HUB_DISABLE_XET=1`), preserving all existing weight shards/indexes/views/tokenizer without re-uploading shards, plus pilot/full CLI helpers.
+  - `sidecar.py`: `cuteafd-qmla-v1` single-file sidecar (`mla_calibration.safetensors` with embedded `__metadata__["cuteafd_qmla"]` + full `"qmla"` section inside `cuteafd-mc.json` for MC checkpoints; no separate `mla_calibration.json`), `transform_fingerprint`, and fail-closed validators (geometry, source identity, SHA256 digests, orthogonality/invertibility, quantization-off algebraic equivalence, cross-view transfer).
+  - `publish.py`: same-repo incremental HF revision publisher over `quantization/hub_lfs.py` (`HF_HUB_DISABLE_XET=1`), rewriting `cuteafd-mc.json` with `"qmla"` (MC) and adding `mla_calibration.safetensors` with zero weight shard re-upload.
 - **Thin family adapter (`quantization/hy4_flash/`, reference pipeline to copy):**
   - `qmla_capture.py` *(mode-agnostic)*: `Hy4FlashCaptureAdapter` wiring Hy4-flash's geometry (12 DSA + 30 SWA layers, interleaved 3D M-RoPE `[12,10,10]`, compressed-indexer group top-k masks, gated MLA, learnable sinks, `post_proj_norm`, and DFly2 target taps) into `quantization/qmla/capture.py` — reusable in both full MC causal passes and standalone incremental passes.
   - `qmla_run.py` / `qmla_publish.py`: CLI driver exposing `--pilot` / `--layers` / `--train-sequences` / `--val-sequences` / `--modes` for short pilots and full runs, invoking `quantization/qmla/` for fit/validate/sidecar/publish.
@@ -349,7 +349,7 @@ Current engine audit reveals concrete duplication across MLA families that runti
 | Area | Current Duplication | Consolidation Proposal | Regression Risk & Boundary |
 |---|---|---|---|
 | **MLA cache format & sizing** | `cuteafd_core::MlaCacheFormat` (Kimi/GLM/draft) vs `hy4_common::Hy4KvCache` (identical 1152/656 B!) vs `KvLayout::Glm52Compressed*` (`kv_cache/config.rs`). | Introduce one `MlaCacheSpec` + `QmlaMode` + `QmlaProtection` in `cuteafd-core/src/kv_cache/mla.rs` providing single-source record bytes, offsets, alignment, and identity keys for all RoPE & NoPE MLA modes. | **Low.** `0:0` maps directly to existing record bytes; unit-tested bit-for-bit against all existing constants. |
-| **QMLA sidecar loader & validator** | Does not exist yet. | Single `cuteafd-loader/src/formats/qmla.rs` module reading `mla_calibration.json` + `.safetensors`, validating schema/digests/orthogonality/geometry and building the packed `qmla.transforms.<gpu>` arena plan. | **Zero** on `0:0` (not invoked unless `--quant-mla != 0:0`). |
+| **QMLA sidecar loader & validator** | Does not exist yet. | Single `cuteafd-loader/src/formats/qmla.rs` module reading `cuteafd-mc.json["qmla"]` (MC) or `mla_calibration.safetensors` `__metadata__["cuteafd_qmla"]` (non-MC), validating schema/digests/orthogonality/geometry and building the packed `qmla.transforms.<gpu>` arena plan. | **Zero** on `0:0` (not invoked unless `--quant-mla != 0:0`). |
 | **`kv_b_proj` UK/UV absorption** | Implemented three times: `cuteafd-loader/src/formats/mla.rs`, `native/shared/cuda/fp8_load_quant.h` (`absorb_uk/uv`), and `hy4_common/weights.rs` (`pack_kv_b_absorbed`). | One shared `absorb_kv_b_compensated` (CPU F32 oracle + GPU load kernel) applying optional $\Gamma R_C S_C^{-1}$ before splitting into `W_UK`/`W_UV` arena slots. | **Low.** `0:0` bypasses compensation identically; tested bit-exact against existing `pack_kv_b_absorbed`. |
 | **Pack/unpack & b12x MLA kernels** | `native/shared/cuda/kv_cache.cu` + `third_party/sparkinfer/b12x/attention/_shared/mla/{traits,kv_cache,decode_math,prefill_mg}.py`. | Add `QmlaContentCodec`/`QmlaRopeCodec` trait specializations and fused write/dequant primitives in `b12x.attention._shared.mla` + `kv_cache.cu` (upstreamed to `sparkinfer-glmrt` master). | **Low** when guarded as distinct `const_expr` traits so existing `0:0` PTX/SASS is unchanged. |
 | **Per-family execution loops & scheduling** | Each family has real structural differences (Hy4-flash SWA-512 + Engram + DFly2; GLM Flash KDA + NoPE; Kimi AttnRes + unrotated PE; ML4 KV sharing + ssmax + no q-LoRA; ERNIE HCA + VHA). | **Do NOT rewrite or unify family attention blocks.** Keep small per-family `MlaGeometryDescriptor` adapters calling the shared sidecar loader, UK/UV compensator, and `b12x` kernels. | **Avoids fake uniformity** and keeps regression surface strictly bounded. |
@@ -360,20 +360,20 @@ Current engine audit reveals concrete duplication across MLA families that runti
 
 ## 9. Expected Costs, Family Matrix, and Verification Plan
 
-### Expected Memory & Capacity Savings (at 128K Context, Unprotected Uniform Pages)
-Physical cache accounting **includes** scales, padding, and unchanged DSA indexer caches (`index_k`: 132 B/tok full or 33 B/tok 4-token-pooled), and excludes fixed workspaces/SWA rings:
+### Expected Memory & Capacity Savings (at 128K Context, Including Default `sink4_local128` Protection)
+Physical cache accounting **includes** scales, padding, unchanged DSA indexer caches (`index_k`: 132 B/tok full or 33 B/tok 4-token-pooled), **and** the default per-sequence `sink4_local128` BF16 protection buffer on full-history MLA layers (`132 × (d_c + d_r) × 2 B` per MLA layer: `152,064 B/L` RoPE, `135,168 B/L` NoPE), and excludes fixed workspaces/SWA rings:
 
-| Family (MLA layers counted) | `0:0` BF16 (KV+idx) | `0:0` FP8 (KV+idx) | `4:4` (or `4:0` NoPE) | `2:4` (or `2:0` NoPE) | 128K pool: FP8 → `4:4`/`4:0` → `2:4`/`2:0` |
-|---|---:|---:|---:|---:|---|
-| **Hy4-flash** (12 DSA; 30 SWA native) | 1,185 B/L | 689 B/L | **353 B/L** | **225 B/L** | 1.01 GiB → **0.52 GiB (1.95×)** → **0.33 GiB (3.06×)** |
-| **GLM 5.3 Flash** (11 NoPE MLA; 34 KDA) | 1,057 B/L | 561 B/L | **321 B/L** (`4:0`) | **193 B/L** (`2:0`) | 0.75 GiB → **0.43 GiB (1.75×)** → **0.26 GiB (2.91×)** |
-| **GLM 5.3** (78 MLA; 21 full idx) | 1,188 B/L avg | 692 B/L avg | **356 B/L avg** | **228 B/L avg** | 6.58 GiB → **3.39 GiB (1.95×)** → **2.17 GiB (3.04×)** |
-| **Hy4** (78 MLA; 21 full idx) | 1,188 B/L avg | 692 B/L avg | **356 B/L avg** | **228 B/L avg** | 6.58 GiB → **3.39 GiB (1.95×)** → **2.17 GiB (3.04×)** |
-| **Kimi K3 / K3.1 Pro** (24 MLA; K3.1 24 idx) | 1,284 B/L | 788 B/L | **452 B/L** | **324 B/L** | 2.31 GiB → **1.32 GiB (1.74×)** → **0.95 GiB (2.43×)** |
-| **Mistral Large 4** (63 owned: 54 RoPE + 9 NoPE; 44 idx) | 1,226 B/L avg | 730 B/L avg | **408 B/L avg** | **280 B/L avg** | 5.61 GiB → **3.13 GiB (1.79×)** → **2.15 GiB (2.61×)** |
-| **ERNIE 5.5 Flash** (6 MLA-DSA; 37 HCA native) | 1,284 B/L | 788 B/L | **452 B/L** | **324 B/L** | 0.58 GiB → **0.33 GiB (1.74×)** → **0.24 GiB (2.43×)** |
+| Family (full-history MLA layers) | `0:0` BF16 (KV+idx) | `0:0` FP8 (KV+idx) | `4:4` (or `4:0` NoPE) | `2:4` (or `2:0` NoPE) | Default `sink4_local128` / seq | 128K total (1 seq): FP8 → `4:4`/`4:0` → `2:4`/`2:0` |
+|---|---:|---:|---:|---:|---:|---|
+| **Hy4-flash** (12 DSA; 30 SWA native) | 1,185 B/L | 689 B/L | **353 B/L** | **225 B/L** | +1.74 MiB | 1.01 GiB → **0.52 GiB (1.94×)** → **0.33 GiB (3.04×)** |
+| **GLM 5.3 Flash** (11 NoPE MLA; 34 KDA) | 1,057 B/L | 561 B/L | **321 B/L** (`4:0`) | **193 B/L** (`2:0`) | +1.42 MiB | 0.75 GiB → **0.43 GiB (1.74×)** → **0.26 GiB (2.89×)** |
+| **GLM 5.3** (78 MLA; 21 full idx) | 1,188 B/L avg | 692 B/L avg | **356 B/L avg** | **228 B/L avg** | +11.31 MiB | 6.58 GiB → **3.40 GiB (1.94×)** → **2.18 GiB (3.02×)** |
+| **Hy4** (78 MLA; 21 full idx) | 1,188 B/L avg | 692 B/L avg | **356 B/L avg** | **228 B/L avg** | +11.31 MiB | 6.58 GiB → **3.40 GiB (1.94×)** → **2.18 GiB (3.02×)** |
+| **Kimi K3 / K3.1 Pro** (24 MLA; K3.1 24 idx) | 1,284 B/L | 788 B/L | **452 B/L** | **324 B/L** | +3.48 MiB | 2.31 GiB → **1.33 GiB (1.74×)** → **0.95 GiB (2.42×)** |
+| **Mistral Large 4** (63 owned: 54 RoPE + 9 NoPE; 44 idx) | 1,226 B/L avg | 730 B/L avg | **408 B/L avg** | **280 B/L avg** | +8.99 MiB | 5.61 GiB → **3.14 GiB (1.79×)** → **2.16 GiB (2.60×)** |
+| **ERNIE 5.5 Flash** (6 MLA-DSA; 37 HCA native) | 1,284 B/L | 788 B/L | **452 B/L** | **324 B/L** | +0.87 MiB | 0.58 GiB → **0.33 GiB (1.74×)** → **0.24 GiB (2.42×)** |
 
-*(With `sink4_local128` enabled: add 152 KiB × `mla_layers` per active sequence/mark — e.g. +1.78 MiB/seq on Hy4-flash, +11.6 MiB/seq on GLM 5.3 — negligible at 128K context.)*
+*(At short contexts e.g. 4K tokens, `sink4_local128` is ~3.2% of BF16 per active sequence; each prefix mark adds the same per-sequence protection footprint. `none` saves that per-sequence/mark footprint if later measured unnecessary.)*
 
 ### Expected Latency & Load-Time Costs
 - **Load time:** Sidecar read (36–234 MiB from NVMe/SparkNest: <0.2 s) + GPU FP32 `kv_b_proj` absorption ($H(d_{\text{nope}}+d_v) \times d_c \times d_c$ per layer: ~0.05–0.3 s across 78 layers on RTX). Negligible vs. 30–60 s model readiness.
@@ -412,6 +412,7 @@ Physical cache accounting **includes** scales, padding, and unchanged DSA indexe
 1. **Content path default:** Calibrate in `unit_rms` space ($z_C = u R_C S_C$, $\widetilde{W}_{\text{kv\_b}} = W_{\text{kv\_b}} \Gamma R_C S_C^{-1}$) with runtime write-side $u M_C$ + load-time UK/UV absorption on every core view (`original`, `k8`, `k6`, `fp8`); producer folding into BF16 `kv_a_proj_with_mqa` is only an optional BF16-original fast path using the exact same sidecar.
 2. **RoPE execution:** Fuse $(\theta_i, s_i, s_i^{-1})$ directly into the existing RoPE phase/scale step (zero extra matmuls, zero weight mutations, commutes with 3D M-RoPE and YaRN/LeRoPE).
 3. **CLI composition (`--kv-cache` + `QUANT_MLA`):** Compose rather than conflict. `--kv-cache` sets the default for SWA rings, indexer keys, and MLA; `QUANT_MLA` overrides only the full-history MLA path(s) set nonzero (`0` retains `--kv-cache`). Cache identity includes the resolved per-path format.
-4. **Protection & SWA:** SWA is untouched by QMLA (Hy4-flash's 30 SWA-512 rings stay native per `--kv-cache`). `sink4_local128` is a measured-only policy applying to full-history MLA layers only, never SWA.
-5. **Sidecar schema (`cuteafd-qmla-v1`) & pluggable corpus:** Root `mla_calibration.json` + `mla_calibration.safetensors` (F32 per-path/per-width profiles, advisory `"qmla"` pointer in `cuteafd-mc.json` never in `required_features`, `artifact_status: "calibrated_unqualified" | "runtime_qualified"`). `calibration_provenance.components` is a data-driven list of pinned `{name, repo, revision, ...}` entries so an optional long-context bank (16K/32K) plugs in cleanly alongside `agentic` and `exl3_standard` without blocking base runs.
-6. **Library placement & reference pipeline:** Shared family-agnostic QMLA code lives in `quantization/qmla/` inside `cuteafd` (**no `GPTQModel` fork changes / no fork PR**); Hy4-flash in `quantization/hy4_flash/` is the end-to-end reference pipeline with pilot/full CLI flags that subsequent families copy.
+4. **Protection ON from the start (`[Adaptation A4]`):** `sink4_local128` is the **default** policy for every nonzero mode on **full-history MLA layers only (SWA untouched)**, in both calibration and serving (`none` is only a measured alternative). Admission, prefix marks, and CUDA graph identity account for `sink4_local128` from Phase 3 onward.
+5. **Single sidecar file (`mla_calibration.safetensors`) + `cuteafd-mc.json["qmla"]` (no `mla_calibration.json`):** The full `cuteafd-qmla-v1` manifest lives in `cuteafd-mc.json["qmla"]` for MC checkpoints (advisory, never in `required_features`, `0:0` unchanged) and in `mla_calibration.safetensors`'s `__metadata__["cuteafd_qmla"]` header for non-MC checkpoints (chosen over a minimal `cuteafd-mc.json` to preserve `docs/mc-checkpoints.md`'s MC discovery invariant and add only one file).
+6. **Single pinned 3-component corpus (`[Adaptation A3]`):** No component-list mechanism. Calibration uses all three fixed components (`agentic`, `exl3_standard`, and the long-context bank) from one pinned revision of `wrldsuksgo2mars/agentic-quant-panel-v2`. The unpublished new revision and third component name live as one constant pair (`QMLA_PANEL_REVISION`, `QMLA_LONG_CONTEXT_COMPONENT`) and fail closed until filled in.
+7. **Library placement & reference pipeline:** Shared family-agnostic QMLA code lives in `quantization/qmla/` inside `cuteafd` (**no `GPTQModel` fork changes / no fork PR**); Hy4-flash in `quantization/hy4_flash/` is the end-to-end reference pipeline with pilot/full CLI flags that subsequent families copy.
