@@ -679,14 +679,14 @@ def _stream_hy4_flash_captures(
     )
     active = [*train_items, *val_items, *test_items]
     active = [(sid, tokens.to(reader.device)) for sid, tokens in active]
-    states = [model.initial(tokens, embedding=embedding) for _, tokens in active]
+    states = deque(model.initial(tokens, embedding=embedding) for _, tokens in active)
     banks = {}
     for layer_idx in range(max_layer + 1):
         started = time.monotonic()
         layer = model.load_layer(layer_idx)
-        captures, mlp_args = [], []
-        for (seq_id, tokens), state in zip(active, states, strict=True):
-            residual, attention_post, attn_in = model.attention_start(state, tokens, layer)
+        captures, mlp_args = [], deque()
+        for seq_id, tokens in active:
+            residual, attention_post, attn_in = model.attention_start(states.popleft(), tokens, layer)
             if layer_idx in target_set:
                 cap, attn_out, _ = adapter.capture_sequence(attn_in, layer, seq_id=seq_id)
                 captures.append(cap)
@@ -694,6 +694,7 @@ def _stream_hy4_flash_captures(
                 attn_out, _ = model.attention(attn_in, layer)
             if layer_idx < max_layer:
                 mlp_args.append(model.mlp_start(residual, attention_post, attn_out, layer))
+            del residual, attention_post, attn_in, attn_out
 
         if layer_idx in target_set:
             bank = CapturedLayerBank(adapter.geometry_for(layer_idx), adapter.layer_params(layer),
@@ -707,8 +708,9 @@ def _stream_hy4_flash_captures(
             routed = [None] * len(mlp_args)
             if model.config.mlp_layer_types[layer_idx] == "sparse":
                 routed = _routed_forward(model, layer, [args[2] for args in mlp_args])
-            states = [model.mlp_finish(*args, layer, result)
-                      for args, result in zip(mlp_args, routed, strict=True)]
+            for result in routed:
+                states.append(model.mlp_finish(*mlp_args.popleft(), layer, result))
+            del routed, result
         print(json.dumps({"phase": "capture", "completed_layer": layer_idx,
                           "seconds": time.monotonic() - started}), flush=True)
         del layer
