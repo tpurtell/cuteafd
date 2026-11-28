@@ -59,7 +59,7 @@ Always run a short pilot first and report its results to TJ before the full run.
 
 **Reference pilot command (Hy4-flash):**
 ```bash
-PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
+MIMALLOC_PURGE_DELAY=0 PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
   "$VENV/bin/python" -m hy4_flash.qmla_run \
   --checkpoint "$SNAPSHOT_DIR" \
   --source-repo "$MODEL_ID" \
@@ -85,7 +85,7 @@ Once the pilot passes, run all eligible MLA layers and target modes. Use `--reus
 
 **Reference full command (Hy4-flash):**
 ```bash
-PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
+MIMALLOC_PURGE_DELAY=0 PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
   "$VENV/bin/python" -m hy4_flash.qmla_run \
   --checkpoint "$SNAPSHOT_DIR" \
   --source-repo "$MODEL_ID" \
@@ -110,6 +110,7 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
 - **Primary forward.** Load the pinned MC checkpoint’s `original` view through the MC runtime. Use the core and all experts from that view, including the serialized K4 EXL3 experts alongside the BF16 core on Hy4-flash. The upstream BF16 repo in `cuteafd-mc.json["source"]` is provenance only. For a plain checkpoint, load its own weights. Record the source revision and view. Use this forward’s own `0:0` outputs as the reference for fitting, validation and test.
 - **Content coordinates:** fit and quantize the checkpoint's native weighted cache latent $c$ ($c=\mathrm{BF16}(u\Gamma)$ at a BF16 output boundary). Use $z_C=c R_C S_C$ on writes and $\widetilde W_{kv_b}=W_{kv_b} R_C S_C^{-1}$ in consumers, including target-sharing drafters. Every view applies the transform after weighted RMSNorm. This preserves the producer's rounding even for an identity rotation.
 - **Three disjoint splits:** `train` fits, `val` selects fit steps and the shipped transform, `test` produces every reported number (full 128 / 16 / 16, pilot 16 / 4 / 4). Split IDs and hashes are recorded in provenance and the fit identity, and a capture reused across a split change refuses.
+- On PyTorch builds with mimalloc, set `MIMALLOC_PURGE_DELAY=0` before the Python process starts so freeing a capture returns its anonymous pages to the OS. With Docker, pass `-e MIMALLOC_PURGE_DELAY=0` to the container. Log `qmla.capture.layer_memory_bytes(device)` after releasing each layer. On GB10, use `system_total - system_available` to track unified memory pressure alongside process RSS and CUDA allocations.
 - **Capture once:** capture each sequence once, and reuse its activations across every bit width. Reuse requires the same checkpoint revision and the same executed view; discard captures from an upstream BF16 forward.
 - **Fit per path and width, independently, for analysis:** for each eligible full-history MLA layer, fit content at **2, 4 and 8 bits** and RoPE at **4 and 8 bits**. The two paths fit independently.
 - **Ship one transform per path:** across every width's fit and every width's SmoothQuant init, ship the content × RoPE pair with the lowest mean `val` ratio to RTN over all combinations. Record the choice (`fitted|smoothquant`, source width) and its per-combination val score per layer. That single content and single RoPE transform serves every width in `mla_calibration.safetensors` (`qmla-design.md` §5).
