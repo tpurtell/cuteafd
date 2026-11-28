@@ -119,7 +119,7 @@ pub const ENVELOPES: &[(GraphFamily, usize, &[u64])] = &[
     (GraphFamily::Qwen4, 1, &[134 * MIB]),
     (GraphFamily::Qwen4, 2, &[116 * MIB, 120 * MIB]),
     (GraphFamily::Hy4Flash, 1, &[192 * MIB]),
-    (GraphFamily::Hy4Flash, 2, &[220 * MIB, 208 * MIB]),
+    (GraphFamily::Hy4Flash, 2, &[1760 * MIB, 1660 * MIB]),
     (GraphFamily::Hy4, 1, &[324 * MIB]),
     (GraphFamily::Hy4, 2, &[344 * MIB, 334 * MIB]),
     (GraphFamily::Inkling2, 1, &[398 * MIB]),
