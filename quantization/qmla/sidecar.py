@@ -1171,7 +1171,8 @@ def validate_sidecar(
                             native_output_errors.append(drift)
                 if rope_prof is not None and lid in rope_prof["layers"]:
                     for kind, theta, s_vec in unique_rope_checks.get(lid, {}).values():
-                        for seq in bank.val:
+                        for saved in bank.val:
+                            seq = saved.to("cpu")
                             ref_z, mask = eval_positional_qk(seq, g)
                             if kind == "scale_only":
                                 q_fn = lambda q: apply_rope_scale_only(q, s_vec, rope_kind=g.rope_kind, inverse_scale=True)
