@@ -166,11 +166,13 @@ All of this is in [daemon/shared/serve/lanes.rs](../../rust/crates/cuteafd-daemo
   ([transport/wait_policy.rs:115](../../rust/crates/cuteafd-transport/src/wait_policy.rs#L115)).
   It works as follows:
   - Under `--host-wait block` (the default), a pending stretch spins for
-    `BLOCK_SPIN` = 10 ms (`:92`), then sleeps `BLOCK_SLEEP` = 20 µs per poll
-    (`:94`). A completed poll restarts the spin.
-  - Why 10 ms: every per-layer decode wait ends inside that window, so decode
-    never pays a wake-up. The earlier 250 µs window cost Kimi BF16 max C8
-    0.91× (#731).
+    `BLOCK_SPIN` = 50 ms, then sleeps `BLOCK_SLEEP` = 20 µs per poll. A
+    completed poll restarts the spin.
+  - Why 50 ms: every per-layer decode wait, and the end-of-step token-landing
+    wait, ends inside that window, so decode never pays a wake-up. At 10 ms,
+    graphed Hy4-flash 2× RTX + 4 Sparks C1 reached the token wait with ~15 ms
+    left and slept on most steps (#2922). The earlier 250 µs window cost Kimi
+    BF16 max C8 0.91× (#731).
   - `spin` never sleeps.
   - Both modes park after 30 s idle (`:1-21`).
 

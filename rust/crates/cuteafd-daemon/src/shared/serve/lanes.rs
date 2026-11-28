@@ -86,7 +86,7 @@ impl LaneSet {
 
 /// Lanes wait by yielding (stream queries, reply and commit polls), so the
 /// executor re-polls at once: `--host-wait spin` keeps that; under `block` a
-/// pending stretch spins for its first [`BLOCK_SPIN`] (10 ms: every
+/// pending stretch spins for its first [`BLOCK_SPIN`] (50 ms: every
 /// per-layer wait ends within it, and they are the critical path), then sleeps
 /// [`BLOCK_SLEEP`] per poll. A poll that completes restarts the spin.
 ///
