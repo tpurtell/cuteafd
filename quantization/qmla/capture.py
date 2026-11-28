@@ -419,7 +419,7 @@ class CapturedLayerParams:
 
     def validate(self, geometry: MlaLayerGeometry) -> None:
         geometry.validate()
-        if self.attention_arithmetic not in ("f32_tiled", "bf16_eager", "bf16_sdpa"):
+        if self.attention_arithmetic not in ("f32_tiled", "f32_tiled_bf16_cache", "bf16_eager", "bf16_sdpa"):
             raise ValueError(f"unsupported attention arithmetic {self.attention_arithmetic!r}")
         if self.kv_norm_weight.shape != (geometry.kv_lora_rank,):
             raise ValueError(f"kv_norm_weight shape {tuple(self.kv_norm_weight.shape)} != ({geometry.kv_lora_rank},)")
@@ -643,7 +643,7 @@ def cached_content(u: torch.Tensor, params: CapturedLayerParams) -> torch.Tensor
     The FP32 reference adapters retain their native weighted FP32 product.
     """
     c = u.float() * params.kv_norm_weight.float()
-    return c.bfloat16().float() if params.attention_arithmetic.startswith("bf16_") else c
+    return c if params.attention_arithmetic == "f32_tiled" else c.bfloat16().float()
 
 
 def _native_bf16_output(seq, params, geom, latent, kv_b_override, exact_content_fn,

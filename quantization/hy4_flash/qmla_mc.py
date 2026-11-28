@@ -80,6 +80,13 @@ class MCReader(forward.reference.Checkpoint):
 
 
 class MCModel(forward.Model):
+    attention_arithmetic = "f32_tiled_bf16_cache"
+
+    @staticmethod
+    def cache_weighted_content(weighted):
+        # mla_rank_norm_pack writes the weighted normalized content once to the BF16 cache.
+        return weighted.to(torch.bfloat16).float()
+
     def routed_expert_weights(self, index, latent, layer):
         prefix = layer.prefix + f"mlp.experts.{index}."
         width = latent.shape[-1]

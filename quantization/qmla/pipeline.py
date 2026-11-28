@@ -321,7 +321,7 @@ def calibrate_from_banks(
         "thinking_mode": thinking_mode,
         "measurement_reference": f"{source['calibrated_view']} 0:0",
         **{k: corpus_provenance[k] for k in ("forward_view_fingerprint", "forward_revision",
-           "forward_config_sha256", "capture_forward") if k in corpus_provenance},
+           "forward_config_sha256", "forward_attention_arithmetic", "capture_input_trajectory", "capture_forward") if k in corpus_provenance},
         "measurement_split": "test",
         "combination_measurements": {key: shipped_summary(row) for key, row in combinations.items()},
         "optimizer": "adamw",
@@ -388,6 +388,7 @@ def calibrate_from_banks(
         "protection_scope": manifest["protection_scope"],
         "source": manifest["source"],
         "measurement_reference": provenance["measurement_reference"],
+        **{key: provenance[key] for key in ("forward_attention_arithmetic", "capture_input_trajectory") if key in provenance},
         "layers_calibrated": ordered_layers,
         "splits": {name: splits[name]["count"] for name in SPLIT_NAMES},
         "measurement_split": "test",
@@ -554,6 +555,9 @@ def check_reused_captures(
     if splits["seed"] != seed:
         raise ValueError(f"capture split seed {splits['seed']} differs from the requested seed {seed}")
     for bank in banks.values():
+        if ("forward_attention_arithmetic" in teacher_identity
+                and bank.params.attention_arithmetic != teacher_identity["forward_attention_arithmetic"]):
+            raise ValueError(f"capture content cache arithmetic differs at layer {bank.geometry.layer_id}")
         if bank.provenance != corpus_provenance:
             raise ValueError(f"capture provenance differs at layer {bank.geometry.layer_id}")
         for name in SPLIT_NAMES:

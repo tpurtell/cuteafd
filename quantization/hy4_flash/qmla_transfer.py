@@ -23,6 +23,7 @@ def run(checkpoint, corpus_dir, output, device):
     adapter = Hy4FlashCaptureAdapter(MCModel(reader))
     return run_view_transfer(
         checkpoint, corpus_dir, output, device, repo=recipe.TARGET_REPO, reader=reader,
+        expected_attention_arithmetic=MCModel.attention_arithmetic,
         load_corpus=load_pinned_qmla_corpus, evaluate=partial(run_hy4_flash_long_eval, adapter),
     )
 

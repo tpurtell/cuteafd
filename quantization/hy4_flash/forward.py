@@ -128,6 +128,13 @@ def _with_sink(query, key, value, allowed, sink):
 
 
 class Model:
+    attention_arithmetic = "f32_tiled"
+
+    @staticmethod
+    def cache_weighted_content(weighted):
+        """Return the content operand read by kv_b on this forward path."""
+        return weighted
+
     def __init__(self, reader):
         self.reader = reader
         self.config = reader.config
@@ -158,7 +165,7 @@ class Model:
         q = reference.norm(q, w[p + "q_a_layernorm.weight"], c.rms_norm_eps)
         kv, kr = layer.project(p + "kv_a_proj_with_mqa", inputs, project).split(
             [c.kv_lora_rank, rope], dim=-1)
-        kv = reference.norm(kv, w[p + "kv_a_layernorm.weight"], c.rms_norm_eps)
+        kv = self.cache_weighted_content(reference.norm(kv, w[p + "kv_a_layernorm.weight"], c.rms_norm_eps))
         gate = layer.project(p + "linear_gate", inputs, project).sigmoid()
         return AttentionFirst(q, kv, kr, gate)
 

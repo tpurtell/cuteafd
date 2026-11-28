@@ -53,7 +53,8 @@ def summarize_transfer(measured, identity, test_tokens):
             "combinations": result, "wall_seconds": measured["wall_seconds"]}
 
 
-def run_view_transfer(checkpoint, corpus_dir, output, device, *, repo, reader, load_corpus, evaluate):
+def run_view_transfer(checkpoint, corpus_dir, output, device, *, repo, reader, load_corpus, evaluate,
+                      expected_attention_arithmetic=None):
     """Verify the frozen test set, call the family replay, and attach its validated measurements."""
     sidecar = output / "sidecar"
     report_path = output / "qmla-validation-report.json"
@@ -70,6 +71,9 @@ def run_view_transfer(checkpoint, corpus_dir, output, device, *, repo, reader, l
     if reader.source != {"repo": source["base_repo"], "revision": source["base_revision"]}:
         raise ValueError("MC base differs from the calibration teacher")
     provenance = manifest["calibration_provenance"]
+    if (expected_attention_arithmetic is not None
+            and provenance.get("forward_attention_arithmetic") != expected_attention_arithmetic):
+        raise ValueError("transfer requires transforms fitted with the MC native content cache")
     fingerprint = provenance.get("forward_view_fingerprint") or provenance.get("capture_forward", {}).get("view_fingerprint")
     if fingerprint != reader.original_fingerprint:
         raise ValueError("transfer requires transforms fitted on this MC original view")

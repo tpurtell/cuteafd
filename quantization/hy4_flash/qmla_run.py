@@ -89,6 +89,7 @@ def _routed_forward(model, layer, inputs):
     return routed.split([len(x) for x in inputs])
 
 
+@torch.no_grad()
 def _stream_hy4_flash_captures(
     reader: hy4_forward.Reader,
     adapter: Hy4FlashCaptureAdapter,
@@ -297,6 +298,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ValueError("MC snapshot or upstream source identity differs from the calibration request")
         model = MCModel(reader)
         forward_identity["forward_view_fingerprint"] = reader.variant["fingerprint"]
+        forward_identity["forward_attention_arithmetic"] = model.attention_arithmetic
     else:
         reader = hy4_forward.Reader(checkpoint, device=args.device)
         model = hy4_forward.Model(reader)
@@ -306,9 +308,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     # Standalone --long-eval against an existing --sidecar (no refitting).
     if args.sidecar is not None:
         sidecar_manifest, _, _ = load_sidecar_transforms(args.sidecar, strict=True)
-        if (args.checkpoint_kind == "mc" and sidecar_manifest["calibration_provenance"].get("forward_view_fingerprint")
-                != forward_identity["forward_view_fingerprint"]):
-            raise ValueError("sidecar was not fitted on this MC original view")
+        if args.checkpoint_kind == "mc":
+            calibration = sidecar_manifest["calibration_provenance"]
+            for key in ("forward_view_fingerprint", "forward_attention_arithmetic"):
+                if calibration.get(key) != forward_identity[key]:
+                    raise ValueError(f"MC original sidecar {key} differs from the requested forward")
         expected_source = {
             "repo": args.source_repo,
             "revision": args.source_revision,

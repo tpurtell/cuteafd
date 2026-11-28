@@ -121,6 +121,7 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
         w = layer.weights
         p = "self_attn."
         params = CapturedLayerParams(
+            attention_arithmetic=self.model.attention_arithmetic,
             kv_norm_weight=w[p + "kv_a_layernorm.weight"].detach().float().cpu(),
             kv_b_weight=w[p + "kv_b_proj.weight"].detach().float().cpu(),
             o_proj_weight=w[p + "o_proj.weight"].detach().float().cpu(),
@@ -171,7 +172,7 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
             [c.kv_lora_rank, rope], dim=-1
         )
         u = unit_rms_norm(kv_raw, c.rms_norm_eps)
-        kv = u * w[p + "kv_a_layernorm.weight"].to(device=device, dtype=torch.float32)
+        kv = self.model.cache_weighted_content(u * w[p + "kv_a_layernorm.weight"].to(device=device, dtype=torch.float32))
         gate = layer.project(p + "linear_gate", inputs, project).sigmoid()
 
         # Stage 2: expand queries and apply exact 1D or 3D interleaved M-RoPE.
