@@ -829,6 +829,35 @@ mod device_tests {
         assert_eq!(bank.cached_launch(&1), Some(&42));
     }
 
+    /// Per-launch host cost of lane stream accounting (`note_lane_launch`), the
+    /// only work `decode_graph::launch` added for every family.
+    #[test]
+    #[ignore = "CPU launch accounting microbenchmark; run explicitly with --nocapture"]
+    fn lane_launch_accounting_nanoseconds() -> anyhow::Result<()> {
+        use super::super::device;
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 9, 1 << 30)?;
+        library.cuda_set_device(9)?;
+        fixture.immediate_copies(&library)?;
+        let mut bank: GraphBank<usize, usize> = GraphBank::new();
+        bank.attach_device(&library, 9, 64 << 20, site())?;
+        let tally = std::sync::Arc::clone(&bank.device.as_ref().unwrap().launches);
+        let stream = 0x40usize as *mut std::ffi::c_void;
+        let n = 10_000_000u32;
+        let time = |label: &str| {
+            let started = std::time::Instant::now();
+            for _ in 0..n { device::note_lane_launch(std::hint::black_box(&tally), std::hint::black_box(stream)); }
+            println!("{label}: {:.2} ns/launch", started.elapsed().as_nanos() as f64 / f64::from(n));
+        };
+        time("no cycle open (families without lane/event cycles)");
+        let mut cycles = device::LaneCycles::register(&library, 0, 1, |visit| visit(9, "bank-test", false, &mut bank))?;
+        unsafe { cycles.begin(|_| Ok(())) }?;
+        time("lane cycle open, stream already recorded (V4.1 steady state)");
+        cycles.complete()?;
+        Ok(())
+    }
+
     /// V4.1 lane cycles complete by events recorded on exactly the streams
     /// their banks launched on; launches route by bank lane, not "current" lane.
     #[test]
