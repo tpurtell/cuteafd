@@ -239,13 +239,10 @@ impl<'a> GlmEngine<'a> {
             let last = index + 1 == layers.len();
             let att_slot = slot(index, false, 0);
             let ffn_slot = slot(index, true, 0);
-            let split_core_down = Self::core_split(layer0, "down");
 
             // 1. Rank 0 Phase 0 (`sub = 0`): wait for prev FFN (Rank 1 already pushed it) and run attention.
             if let Some(before) = index.checked_sub(1) {
-                if !self.shared_zero_elided(before, &layers[before]) {
-                    exchange.wait(0, slot(before, true, 0))?;
-                }
+                exchange.wait(0, slot(before, true, 0))?;
             }
             let key0 = Self::local_key(index, 0, t, tables, layer0.full_indexer, prev_r0, false);
             self.replay_on(0, key0, || {
@@ -360,66 +357,28 @@ impl<'a> GlmEngine<'a> {
                 }
             } else if self.tp2_layer(index) && self.tp2_routes_replicated() {
                 let pair = self.tp2.as_ref().context("TP2 experts")?;
-                if split_core_down {
-                    // One-way 1->0 split-core shared FFN: Rank 1 publishes its retained core
-                    // partial immediately and enters TP2 experts without waiting on Rank 0.
-                    exchange.wait(1, att_slot)?;
-                    let key1_pre = Self::local_key(index, 3, t, &ranked[1], false, Previous::First, false);
-                    self.replay_on(1, key1_pre, || {
-                        self.projection_norm(1, index, 0, w1, layer1, "o", layer1.ptr("post_norm")?,
-                            rows, w1.delta.buffer.ptr, self.recv(1, att_slot)?)?;
-                        self.shared_on_local(1, index, w1, layer1, rows, "m64")?;
-                        self.core_zero_shared(1, w1, t)
-                    })?;
-                    self.publish_projection(1, index, 0, w1, layer1, "down", t)?;
-                    let key1_moe = Self::local_key(index, 4, t, &ranked[1], false, Previous::First, false);
-                    self.replay_on(1, key1_moe, || {
-                        self.moe_front_on(1, index, w1, layer1, t)?;
-                        self.tp2_rank_local(pair, 1, index, 0, w1, t)
-                    })?;
-                    self.tp2_publish(pair, 1, index, 0, w1, t)?;
+                exchange.wait(1, att_slot)?;
+                let key1 = Self::local_key(index, 3, t, &ranked[1], false, Previous::First, false);
+                self.replay_on(1, key1, || {
+                    self.projection_norm(1, index, 0, w1, layer1, "o", layer1.ptr("post_norm")?,
+                        rows, w1.delta.buffer.ptr, self.recv(1, att_slot)?)?;
+                    self.shared_on_local(1, index, w1, layer1, rows, "m64")?;
+                    self.moe_front_on(1, index, w1, layer1, t)?;
+                    self.tp2_rank_local(pair, 1, index, 0, w1, t)
+                })?;
+                self.tp2_publish(pair, 1, index, 0, w1, t)?;
 
-                    exchange.wait(0, att_slot)?;
-                    let key0_pre = Self::local_key(index, 3, t, tables, false, Previous::First, false);
-                    self.replay_on(0, key0_pre, || {
-                        self.projection_norm(0, index, 0, w, layer0, "o", layer0.ptr("post_norm")?,
-                            rows, w.delta.buffer.ptr, self.recv(0, att_slot)?)?;
-                        self.moe_front_on(0, index, w, layer0, t)?;
-                        self.shared_on_local(0, index, w, layer0, rows, "m64")
-                    })?;
-                    exchange.wait(0, ffn_slot)?;
-                    let key0_moe = Self::local_key(index, 4, t, tables, false, Previous::First, false);
-                    self.replay_on(0, key0_moe, || {
-                        self.reduce_projection(0, index, 0, w, layer0, "down", t, w.shared.buffer)?;
-                        self.tp2_rank_local(pair, 0, index, 0, w, t)
-                    })?;
-                    if !last {
-                        self.tp2_publish(pair, 0, index, 0, w, t)?;
-                    }
-                } else {
-                    exchange.wait(1, att_slot)?;
-                    let key1 = Self::local_key(index, 3, t, &ranked[1], false, Previous::First, false);
-                    self.replay_on(1, key1, || {
-                        self.projection_norm(1, index, 0, w1, layer1, "o", layer1.ptr("post_norm")?,
-                            rows, w1.delta.buffer.ptr, self.recv(1, att_slot)?)?;
-                        self.shared_on_local(1, index, w1, layer1, rows, "m64")?;
-                        self.moe_front_on(1, index, w1, layer1, t)?;
-                        self.tp2_rank_local(pair, 1, index, 0, w1, t)
-                    })?;
-                    self.tp2_publish(pair, 1, index, 0, w1, t)?;
-
-                    exchange.wait(0, att_slot)?;
-                    let key0 = Self::local_key(index, 3, t, tables, false, Previous::First, false);
-                    self.replay_on(0, key0, || {
-                        self.projection_norm(0, index, 0, w, layer0, "o", layer0.ptr("post_norm")?,
-                            rows, w.delta.buffer.ptr, self.recv(0, att_slot)?)?;
-                        self.moe_front_on(0, index, w, layer0, t)?;
-                        self.shared_on_local(0, index, w, layer0, rows, "m64")?;
-                        self.tp2_rank_local(pair, 0, index, 0, w, t)
-                    })?;
-                    if !last {
-                        self.tp2_publish(pair, 0, index, 0, w, t)?;
-                    }
+                exchange.wait(0, att_slot)?;
+                let key0 = Self::local_key(index, 3, t, tables, false, Previous::First, false);
+                self.replay_on(0, key0, || {
+                    self.projection_norm(0, index, 0, w, layer0, "o", layer0.ptr("post_norm")?,
+                        rows, w.delta.buffer.ptr, self.recv(0, att_slot)?)?;
+                    self.moe_front_on(0, index, w, layer0, t)?;
+                    self.shared_on_local(0, index, w, layer0, rows, "m64")?;
+                    self.tp2_rank_local(pair, 0, index, 0, w, t)
+                })?;
+                if !last {
+                    self.tp2_publish(pair, 0, index, 0, w, t)?;
                 }
             } else if self.tp2_layer(index) {
                 // Broadcast-route or route-checking TP2 fallback (eager).
@@ -442,11 +401,7 @@ impl<'a> GlmEngine<'a> {
                         rows, w1.delta.buffer.ptr, self.recv(1, att_slot)?)?;
                     self.shared_on_local(1, index, w1, layer1, rows, "m64")
                 })?;
-                if split_core_down {
-                    self.publish_projection(1, index, 0, w1, layer1, "down", t)?;
-                } else {
-                    exchange.push(1, ffn_slot, w1.shared.buffer.ptr, bytes)?;
-                }
+                exchange.push(1, ffn_slot, w1.shared.buffer.ptr, bytes)?;
                 if !last {
                     if let Some(l2) = self.peer()?.l2.as_ref() {
                         self.on(1, || l2.issue(self.library, index, self.stream_of(1)))?;
@@ -461,7 +416,7 @@ impl<'a> GlmEngine<'a> {
                     self.moe_front(index, w, layer0, t)
                 })?;
                 if self.skip.is_some() {
-                    let ranks = self.moe_skip_one_way(w, index, layer0, t, "m64")?;
+                    let ranks = self.moe_skip(w, index, layer0, t, "m64")?;
                     self.reduce(self.skip.as_ref().context("skip intake")?.pointers(), w, ranks, t)?;
                 } else {
                     let _range = crate::shared::probe::verify_timing::range(Some(self.library),
@@ -469,7 +424,7 @@ impl<'a> GlmEngine<'a> {
                     let (transport, _) = experts.as_mut()
                         .with_context(|| format!("layer {index} is an MoE layer; pass Spark peers for its routed experts"))?;
                     let waves = transport.exchange()?;
-                    let wave_slot = self.moe_exchange_one_way(w, index, layer0, t, "m64", true, waves)?;
+                    let wave_slot = self.moe_exchange(w, index, layer0, t, "m64", true, waves)?;
                     // SAFETY: the wave landed on GPU 0's stream; shared and delta are live views.
                     unsafe {
                         waves.reduce(wave_slot, w.shared.buffer.ptr.cast(),
@@ -496,9 +451,7 @@ impl<'a> GlmEngine<'a> {
 
         // 5. Terminal tail on Rank 0: wait for Rank 1's last FFN push, run final norm + tap + head.
         if let Some(last) = layers.len().checked_sub(1) {
-            if !self.shared_zero_elided(last, &layers[last]) {
-                exchange.wait(0, slot(last, true, 0))?;
-            }
+            exchange.wait(0, slot(last, true, 0))?;
         }
         let tail_key = Self::local_key(layers.len(), 0, t, tables, false, prev_r0, head);
         let tail_segment = || -> Result<()> {
@@ -541,32 +494,23 @@ mod tests {
         let source = include_str!("local_graph.rs");
         let body = source.split_once("#[cfg(test)]").unwrap().0;
         let mut count = 0usize;
-        let mut captures_core_zero = false;
         for part in body.split("self.replay_on(").skip(1) {
             let Some((_, after_arrow)) = part.split_once("|| {") else { continue };
             count += 1;
             let closure = after_arrow.split_once("})?;").unwrap().0;
-            if closure.contains("core_zero_shared") {
-                captures_core_zero = true;
-            }
             for forbidden in [
                 "exchange.push", "exchange.wait", "exchange.push_to", "publish_projection",
                 "tp2_publish", "tp2_pair", "push_query", "wait_query", "push_candidates",
                 "wait_candidates", "push_partial", "wait_partial", "meet_shared_core",
-                "shared_on(", "shared_on_rank0_one_way", "moe_exchange", "moe_skip",
+                "core_zero_shared", "shared_on(", "moe_exchange", "moe_skip",
             ] {
                 assert!(!closure.contains(forbidden),
                     "rank-local capture closure #{count} unexpectedly contains {forbidden}");
             }
         }
         assert!(count >= 10, "expected rank-local inline replay_on sites in local_graph.rs, found {count}");
-        assert!(captures_core_zero,
-            "split-core rank-1 core_zero_shared must stay inside capture (no per-layer eager memset launch)");
-        let native = include_str!("../../../../../../../native/shared/src/cuteafd_native.cc");
-        let sig = native.split_once("transferable_signature(").unwrap().1
-            .split_once("cuteafd_cuda_graph_capture_source(").unwrap().0;
-        assert!(sig.contains("kind == cudaGraphNodeTypeMemset") && sig.contains("cudaGraphMemsetNodeGetParams"),
-            "1D same-device memset nodes captured by core_zero_shared must be donor-transferable");
+        assert!(!body.contains("split_core_down"),
+            "MoE local decode graph must keep each rank's shared partial in w.shared without split_core_down");
     }
 
     #[test]
@@ -588,151 +532,122 @@ mod tests {
         ];
 
         for is_context in [false, true] {
-            for split_core in [false, true] {
-                let mut s = HostSchedule::default();
-                let capture_point = |s: &mut HostSchedule, label: &str| {
-                    // Worst-case cudaGraphInstantiate / cudaGraphExecUpdate may sync either GPU:
-                    // every queued wait on both streams must already be matched.
-                    s.sync(0, format!("capture {label} sync gpu0"));
-                    s.sync(1, format!("capture {label} sync gpu1"));
-                };
-                let stage_r1 = |s: &mut HostSchedule, index: usize, full_indexer: bool| {
-                    if index == 0 {
-                        s.wait(1, "main", DIRECT, "L0 direct");
-                    } else {
-                        s.wait(1, "main", slot(index - 1, true, 0), format!("L{index} r1 wait prev ffn"));
+            let mut s = HostSchedule::default();
+            let capture_point = |s: &mut HostSchedule, label: &str| {
+                // Worst-case cudaGraphInstantiate / cudaGraphExecUpdate may sync either GPU:
+                // every queued wait on both streams must already be matched.
+                s.sync(0, format!("capture {label} sync gpu0"));
+                s.sync(1, format!("capture {label} sync gpu1"));
+            };
+            let stage_r1 = |s: &mut HostSchedule, index: usize, full_indexer: bool| {
+                if index == 0 {
+                    s.wait(1, "main", DIRECT, "L0 direct");
+                } else {
+                    s.wait(1, "main", slot(index - 1, true, 0), format!("L{index} r1 wait prev ffn"));
+                }
+                capture_point(s, &format!("L{index} r1 sub0"));
+                if is_context {
+                    let cs = index % 2;
+                    s.push(1, "ctx_q", cs, format!("L{index} r1 push q"));
+                    if full_indexer { s.push(1, "ctx_c", cs, format!("L{index} r1 push cand")); }
+                } else {
+                    s.push(1, "main", slot(index, false, 0), format!("L{index} r1 push o"));
+                }
+            };
+
+            // Run two consecutive steps to prove cross-step parity slot safety as well.
+            for step in 0..2 {
+                s.push(0, "main", DIRECT, format!("step{step} direct"));
+                stage_r1(&mut s, 0, layers[0].1);
+
+                for (index, &(mode, full_indexer)) in layers.iter().enumerate() {
+                    let last = index + 1 == layers.len();
+                    let att = slot(index, false, 0);
+                    let ffn = slot(index, true, 0);
+                    if index > 0 {
+                        s.wait(0, "main", slot(index - 1, true, 0), format!("step{step} L{index} r0 wait prev ffn"));
                     }
-                    capture_point(s, &format!("L{index} r1 sub0"));
+                    capture_point(&mut s, &format!("step{step} L{index} r0 sub0"));
+
                     if is_context {
                         let cs = index % 2;
-                        s.push(1, "ctx_q", cs, format!("L{index} r1 push q"));
-                        if full_indexer { s.push(1, "ctx_c", cs, format!("L{index} r1 push cand")); }
-                    } else {
-                        s.push(1, "main", slot(index, false, 0), format!("L{index} r1 push o"));
-                    }
-                };
+                        s.push(0, "ctx_q", cs, format!("step{step} L{index} r0 push q"));
+                        if full_indexer {
+                            s.push(0, "ctx_c", cs, format!("step{step} L{index} r0 push cand"));
+                            s.wait(1, "ctx_c", cs, format!("step{step} L{index} r1 wait cand"));
+                            s.wait(1, "ctx_q", cs, format!("step{step} L{index} r1 wait q"));
+                            capture_point(&mut s, &format!("step{step} L{index} r1 sub1"));
+                            s.push(1, "ctx_p", cs, format!("step{step} L{index} r1 push partial"));
 
-                // Run two consecutive steps to prove cross-step parity slot safety as well.
-                for step in 0..2 {
-                    s.push(0, "main", DIRECT, format!("step{step} direct"));
-                    stage_r1(&mut s, 0, layers[0].1);
-
-                    for (index, &(mode, full_indexer)) in layers.iter().enumerate() {
-                        let last = index + 1 == layers.len();
-                        let att = slot(index, false, 0);
-                        let ffn = slot(index, true, 0);
-                        let prev_elided = index > 0 && matches!(layers[index - 1].0, Mode::Spark) && split_core;
-                        if index > 0 && !prev_elided {
-                            s.wait(0, "main", slot(index - 1, true, 0), format!("step{step} L{index} r0 wait prev ffn"));
-                        }
-                        capture_point(&mut s, &format!("step{step} L{index} r0 sub0"));
-
-                        if is_context {
-                            let cs = index % 2;
-                            s.push(0, "ctx_q", cs, format!("step{step} L{index} r0 push q"));
-                            if full_indexer {
-                                s.push(0, "ctx_c", cs, format!("step{step} L{index} r0 push cand"));
-                                s.wait(1, "ctx_c", cs, format!("step{step} L{index} r1 wait cand"));
-                                s.wait(1, "ctx_q", cs, format!("step{step} L{index} r1 wait q"));
-                                capture_point(&mut s, &format!("step{step} L{index} r1 sub1"));
-                                s.push(1, "ctx_p", cs, format!("step{step} L{index} r1 push partial"));
-
-                                s.wait(0, "ctx_c", cs, format!("step{step} L{index} r0 wait cand"));
-                                s.wait(0, "ctx_q", cs, format!("step{step} L{index} r0 wait q"));
-                                capture_point(&mut s, &format!("step{step} L{index} r0 sub1"));
-                                s.push(0, "ctx_p", cs, format!("step{step} L{index} r0 push partial"));
-                            } else {
-                                s.wait(1, "ctx_q", cs, format!("step{step} L{index} r1 wait q"));
-                                s.push(1, "ctx_p", cs, format!("step{step} L{index} r1 push partial"));
-                                s.wait(0, "ctx_q", cs, format!("step{step} L{index} r0 wait q"));
-                                s.push(0, "ctx_p", cs, format!("step{step} L{index} r0 push partial"));
-                            }
-                            s.wait(1, "ctx_p", cs, format!("step{step} L{index} r1 wait partial"));
-                            capture_point(&mut s, &format!("step{step} L{index} r1 sub2"));
-                            s.push(1, "main", att, format!("step{step} L{index} r1 push o"));
-
-                            s.wait(0, "ctx_p", cs, format!("step{step} L{index} r0 wait partial"));
-                            capture_point(&mut s, &format!("step{step} L{index} r0 sub2"));
-                            s.push(0, "main", att, format!("step{step} L{index} r0 push o"));
+                            s.wait(0, "ctx_c", cs, format!("step{step} L{index} r0 wait cand"));
+                            s.wait(0, "ctx_q", cs, format!("step{step} L{index} r0 wait q"));
+                            capture_point(&mut s, &format!("step{step} L{index} r0 sub1"));
+                            s.push(0, "ctx_p", cs, format!("step{step} L{index} r0 push partial"));
                         } else {
-                            s.push(0, "main", att, format!("step{step} L{index} r0 push o"));
+                            s.wait(1, "ctx_q", cs, format!("step{step} L{index} r1 wait q"));
+                            s.push(1, "ctx_p", cs, format!("step{step} L{index} r1 push partial"));
+                            s.wait(0, "ctx_q", cs, format!("step{step} L{index} r0 wait q"));
+                            s.push(0, "ctx_p", cs, format!("step{step} L{index} r0 push partial"));
                         }
+                        s.wait(1, "ctx_p", cs, format!("step{step} L{index} r1 wait partial"));
+                        capture_point(&mut s, &format!("step{step} L{index} r1 sub2"));
+                        s.push(1, "main", att, format!("step{step} L{index} r1 push o"));
 
-                        match mode {
-                            Mode::Dense => {
-                                s.wait(1, "main", att, format!("step{step} L{index} r1 wait o"));
-                                capture_point(&mut s, &format!("step{step} L{index} r1 dense"));
-                                s.push(1, "main", ffn, format!("step{step} L{index} r1 push dense"));
+                        s.wait(0, "ctx_p", cs, format!("step{step} L{index} r0 wait partial"));
+                        capture_point(&mut s, &format!("step{step} L{index} r0 sub2"));
+                        s.push(0, "main", att, format!("step{step} L{index} r0 push o"));
+                    } else {
+                        s.push(0, "main", att, format!("step{step} L{index} r0 push o"));
+                    }
 
-                                s.wait(0, "main", att, format!("step{step} L{index} r0 wait o"));
-                                capture_point(&mut s, &format!("step{step} L{index} r0 dense"));
-                                if !last {
-                                    s.push(0, "main", ffn, format!("step{step} L{index} r0 push dense"));
-                                }
-                            }
-                            Mode::Tp2Replicated => {
-                                if split_core {
-                                    s.wait(1, "main", att, format!("step{step} L{index} r1 wait o"));
-                                    capture_point(&mut s, &format!("step{step} L{index} r1 tp2 pre"));
-                                    s.push(1, "core", ffn, format!("step{step} L{index} r1 push core"));
-                                    capture_point(&mut s, &format!("step{step} L{index} r1 tp2 moe"));
-                                    s.push(1, "main", ffn, format!("step{step} L{index} r1 push tp2"));
+                    match mode {
+                        Mode::Dense => {
+                            s.wait(1, "main", att, format!("step{step} L{index} r1 wait o"));
+                            capture_point(&mut s, &format!("step{step} L{index} r1 dense"));
+                            s.push(1, "main", ffn, format!("step{step} L{index} r1 push dense"));
 
-                                    s.wait(0, "main", att, format!("step{step} L{index} r0 wait o"));
-                                    capture_point(&mut s, &format!("step{step} L{index} r0 tp2 pre"));
-                                    s.wait(0, "core", ffn, format!("step{step} L{index} r0 wait core"));
-                                    capture_point(&mut s, &format!("step{step} L{index} r0 tp2 moe"));
-                                    if !last {
-                                        s.push(0, "main", ffn, format!("step{step} L{index} r0 push tp2"));
-                                    }
-                                } else {
-                                    s.wait(1, "main", att, format!("step{step} L{index} r1 wait o"));
-                                    capture_point(&mut s, &format!("step{step} L{index} r1 tp2"));
-                                    s.push(1, "main", ffn, format!("step{step} L{index} r1 push tp2"));
-
-                                    s.wait(0, "main", att, format!("step{step} L{index} r0 wait o"));
-                                    capture_point(&mut s, &format!("step{step} L{index} r0 tp2"));
-                                    if !last {
-                                        s.push(0, "main", ffn, format!("step{step} L{index} r0 push tp2"));
-                                    }
-                                }
-                            }
-                            Mode::Spark => {
-                                s.wait(1, "main", att, format!("step{step} L{index} r1 wait o"));
-                                capture_point(&mut s, &format!("step{step} L{index} r1 spark shared"));
-                                if split_core {
-                                    s.push(1, "core", ffn, format!("step{step} L{index} r1 push core"));
-                                } else {
-                                    s.push(1, "main", ffn, format!("step{step} L{index} r1 push shared"));
-                                }
-                                s.wait(0, "main", att, format!("step{step} L{index} r0 wait o"));
-                                capture_point(&mut s, &format!("step{step} L{index} r0 spark front"));
-                                if split_core {
-                                    s.wait(0, "core", ffn, format!("step{step} L{index} r0 wait core"));
-                                }
-                                if !last {
-                                    s.push(0, "main", ffn, format!("step{step} L{index} r0 push spark"));
-                                }
+                            s.wait(0, "main", att, format!("step{step} L{index} r0 wait o"));
+                            capture_point(&mut s, &format!("step{step} L{index} r0 dense"));
+                            if !last {
+                                s.push(0, "main", ffn, format!("step{step} L{index} r0 push dense"));
                             }
                         }
+                        Mode::Tp2Replicated => {
+                            s.wait(1, "main", att, format!("step{step} L{index} r1 wait o"));
+                            capture_point(&mut s, &format!("step{step} L{index} r1 tp2"));
+                            s.push(1, "main", ffn, format!("step{step} L{index} r1 push tp2"));
 
-                        if !last {
-                            stage_r1(&mut s, index + 1, layers[index + 1].1);
+                            s.wait(0, "main", att, format!("step{step} L{index} r0 wait o"));
+                            capture_point(&mut s, &format!("step{step} L{index} r0 tp2"));
+                            if !last {
+                                s.push(0, "main", ffn, format!("step{step} L{index} r0 push tp2"));
+                            }
+                        }
+                        Mode::Spark => {
+                            s.wait(1, "main", att, format!("step{step} L{index} r1 wait o"));
+                            capture_point(&mut s, &format!("step{step} L{index} r1 spark shared"));
+                            s.push(1, "main", ffn, format!("step{step} L{index} r1 push shared"));
+                            s.wait(0, "main", att, format!("step{step} L{index} r0 wait o"));
+                            capture_point(&mut s, &format!("step{step} L{index} r0 spark front"));
+                            if !last {
+                                s.push(0, "main", ffn, format!("step{step} L{index} r0 push spark"));
+                            }
                         }
                     }
 
-                    let last = layers.len() - 1;
-                    let last_elided = matches!(layers[last].0, Mode::Spark) && split_core;
-                    if !last_elided {
-                        s.wait(0, "main", slot(last, true, 0), format!("step{step} tail r0 wait last ffn"));
+                    if !last {
+                        stage_r1(&mut s, index + 1, layers[index + 1].1);
                     }
-                    capture_point(&mut s, &format!("step{step} tail"));
                 }
 
-                assert_eq!(check_host(&s), Ok(()), "deadlock for context={is_context} split_core={split_core}");
-                assert_eq!(order::check_submission_faults(&s.streams()), Ok(()),
-                    "submission fault for context={is_context} split_core={split_core}");
+                let last = layers.len() - 1;
+                s.wait(0, "main", slot(last, true, 0), format!("step{step} tail r0 wait last ffn"));
+                capture_point(&mut s, &format!("step{step} tail"));
             }
+
+            assert_eq!(check_host(&s), Ok(()), "deadlock for context={is_context}");
+            assert_eq!(order::check_submission_faults(&s.streams()), Ok(()),
+                "submission fault for context={is_context}");
         }
     }
 }

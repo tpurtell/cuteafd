@@ -1785,12 +1785,11 @@ impl<'a> GlmEngine<'a> {
                 None => self.weights.norm.buffer.ptr,
             };
             if let Some(w1) = w1 {
-                if !layer.dense && !self.tp2_layer(index)
-                    && (index + 1 < layers.len() || Self::core_split(layer, "down")) {
+                if !layer.dense && !self.tp2_layer(index) && index + 1 < layers.len() {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes)?;
                 }
                 self.peer_post(index, 0, w1, rows, bytes)?;
-                if !self.shared_zero_elided(index, &layers[index]) { self.exchange()?.wait(0, ffn)?; }
+                self.exchange()?.wait(0, ffn)?;
                 if self.tp2_layer(index) { self.tp2_norm(0, w, weight, index, 0, rows)?; }
                 else { self.ffn_norm(0, index, 0, w, layer, weight, rows,
                     w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
@@ -1944,7 +1943,7 @@ impl<'a> GlmEngine<'a> {
             self.publish_projection(1, index, lane, w1, layer, "down", scalar_rows(rows)?)
         } else {
             self.shared_on(1, index, w1, layer, rows, cap)?;
-            if self.tp2_layer(index) || self.shared_zero_elided(index, layer) { Ok(()) }
+            if self.tp2_layer(index) { Ok(()) }
             else { exchange.push(1, ffn, w1.shared.buffer.ptr, bytes) }
         }
     }
@@ -2111,7 +2110,7 @@ impl<'a> GlmEngine<'a> {
         }
     }
 
-    fn shared_on(&self, rank: usize, index: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>,
+    pub(super) fn shared_on(&self, rank: usize, index: usize, w: &Workspace<'_>, layer: &GlmLayer<'_>,
         rows: Scalar, cap: &str) -> Result<()> {
         if let Some(native) = self.native_experts.get(rank) {
             let Scalar::I32(rows) = rows else { anyhow::bail!("EXLR8 shared rows must be I32"); };
@@ -2119,8 +2118,7 @@ impl<'a> GlmEngine<'a> {
             self.on(rank, || native.shared(self.library, index, execution, w.x.buffer,
                 w.shared.buffer, rows as usize, self.stream_of(rank)))
         } else {
-            self.ffn_on(rank, w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)?;
-            self.meet_shared_core(rank, index, w, layer, scalar_rows(rows)?)
+            self.ffn_on(rank, w, layer, self.cfg.moe_intermediate, cap, w.shared.buffer.ptr, rows)
         }
     }
 
@@ -2183,20 +2181,8 @@ impl<'a> GlmEngine<'a> {
     /// host never waits: the reduce that follows on the stream reads the
     /// planes once the worker landed them, then marks them consumed.
     #[allow(clippy::too_many_arguments)]
-    fn moe_exchange(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
+    pub(super) fn moe_exchange(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
         transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<usize> {
-        self.moe_exchange_with_shared(w, index, layer, t, cap, decode, transport, false)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn moe_exchange_one_way(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize,
-        cap: &str, decode: bool, transport: &mut crate::shared::spark_waves::Waves<'_>) -> Result<usize> {
-        self.moe_exchange_with_shared(w, index, layer, t, cap, decode, transport, true)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn moe_exchange_with_shared(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str, decode: bool,
-        transport: &mut crate::shared::spark_waves::Waves<'_>, one_way_shared: bool) -> Result<usize> {
         ensure!(transport.ranks() <= MAX_RANKS, "{} Spark ranks exceed the reduction planes", transport.ranks());
         let (h, topk, bf16) = (self.cfg.hidden, self.cfg.topk, self.spark_bf16);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk, if bf16 { h * 2 } else { h + h / 32 })?;
@@ -2211,11 +2197,7 @@ impl<'a> GlmEngine<'a> {
         };
         self.exchange_host.borrow_mut()[0] += timer.elapsed().as_secs_f64();
         // The shared expert runs on the GPU while the worker posts and the Sparks compute.
-        if one_way_shared {
-            self.shared_on_rank0_one_way(index, w.lane, w, layer, Scalar::I32(t as i32), cap)?;
-        } else {
-            self.shared_on(0, index, w, layer, Scalar::I32(t as i32), cap)?;
-        }
+        self.shared_on_local(0, index, w, layer, Scalar::I32(t as i32), cap)?;
         if decode {
             self.prefetch(index)?;
         }
@@ -2229,18 +2211,9 @@ impl<'a> GlmEngine<'a> {
     /// the skip intake's pinned staging (a host-mode wave's cost).
     /// With CUTEAFD_EMULATE_EXCHANGE_US a decode step waits that long after
     /// the shared expert (and the L2 prefetch) as a Spark exchange would.
-    fn moe_skip(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<usize> {
-        self.moe_skip_with_shared(w, index, layer, t, cap, false)
-    }
-
-    pub(super) fn moe_skip_one_way(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<usize> {
-        self.moe_skip_with_shared(w, index, layer, t, cap, true)
-    }
-
-    fn moe_skip_with_shared(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str,
-        one_way_shared: bool) -> Result<usize> {
+    pub(super) fn moe_skip(&self, w: &Workspace<'_>, index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<usize> {
         let skip = self.skip.as_ref().context("routed experts are not skipped")?;
-        self.moe_stage_with_shared(w, index, layer, t, cap, one_way_shared)?;
+        self.moe_stage(w, index, layer, t, cap)?;
         if cap == "m64" {
             let mark = crate::shared::l2_prefetch::exchange_mark(self.library, self.stream)?;
             self.prefetch(index)?;
@@ -2278,11 +2251,6 @@ impl<'a> GlmEngine<'a> {
     /// skip benchmark (a host-mode exchange's cost) and the EXLR8 wire
     /// golden use it; serving goes through [`Self::moe_exchange`].
     pub(super) fn moe_stage(&self, w: &Workspace<'_>, layer_index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str) -> Result<()> {
-        self.moe_stage_with_shared(w, layer_index, layer, t, cap, false)
-    }
-
-    fn moe_stage_with_shared(&self, w: &Workspace<'_>, layer_index: usize, layer: &GlmLayer<'_>, t: usize, cap: &str,
-        one_way_shared: bool) -> Result<()> {
         let (h, topk) = (self.cfg.hidden, self.cfg.topk);
         let layout = crate::shared::experts::staging::RouteStaging::new(t, topk,
             if self.spark_bf16 { h * 2 } else { h + h / 32 })?;
@@ -2330,11 +2298,7 @@ impl<'a> GlmEngine<'a> {
             });
         }
         // The shared expert runs on the GPU while the host sends and the Sparks compute.
-        if one_way_shared {
-            self.shared_on_rank0_one_way(layer_index, w.lane, w, layer, Scalar::I32(t as i32), cap)
-        } else {
-            self.shared_on(0, layer_index, w, layer, Scalar::I32(t as i32), cap)
-        }
+        self.shared_on_local(0, layer_index, w, layer, Scalar::I32(t as i32), cap)
     }
 
     /// A prefill unit's wave on the link's transport worker: the routes and
@@ -2572,12 +2536,12 @@ impl<'a> GlmEngine<'a> {
             };
             if split {
                 let ffn = slot_of(index, true, slot);
-                if routed && (index + 1 < layers.len() || Self::core_split(&layers[index], "down")) {
+                if routed && index + 1 < layers.len() {
                     self.exchange()?.push(0, ffn, w.delta.buffer.ptr, bytes_of_unit(unit))?;
                 }
                 self.peer_post(index, slot, peer_workspaces.as_ref().context("peer workspaces")?.get(slot)?,
                     rows, bytes_of_unit(unit))?;
-                if !self.shared_zero_elided(index, &layers[index]) { self.exchange()?.wait(0, ffn)?; }
+                self.exchange()?.wait(0, ffn)?;
                 if self.tp2_layer(index) { self.tp2_norm(0, w, weight, index, slot, rows)?; }
                 else { self.ffn_norm(0, index, slot, w, &layers[index], weight, rows,
                     w.delta.buffer.ptr, self.recv(0, ffn)?)?; }
@@ -3435,10 +3399,10 @@ mod native_decode_order_tests {
             }
         }
         // Bind the modeled seam to local_graph.rs: Rank 1's next-layer staging always runs
-        // after Rank 0's Spark exchange / shared-core completion so no peer wait is unmatched.
+        // after Rank 0's Spark exchange completion so no peer wait is unmatched.
         let local = include_str!("engine/local_graph.rs");
-        let exchange = local.find("self.moe_exchange_one_way(").unwrap();
-        let skip = local.find("self.moe_skip_one_way(").unwrap();
+        let exchange = local.find("self.moe_exchange(").unwrap();
+        let skip = local.find("self.moe_skip(").unwrap();
         let stage_next = local.find("self.local_stage_rank1_attention(index + 1,").unwrap();
         assert!(skip < stage_next && exchange < stage_next);
     }

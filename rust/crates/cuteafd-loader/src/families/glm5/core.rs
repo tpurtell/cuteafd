@@ -222,8 +222,13 @@ pub use crate::formats::native_attention::{NativeLayout, NativeProjection};
 
 pub fn native_output(layout: &NativeLayout) -> cuteafd_ffi::draft_projection::ProjectionOutput {
     use cuteafd_ffi::draft_projection::ProjectionOutput;
-    if layout.split == CoreSplit::Input && layout.ranks > 1 { ProjectionOutput::F32 }
-    else { ProjectionOutput::Bf16 }
+    if layout.split == CoreSplit::Input && layout.ranks > 1
+        && !layout.stem.contains("shared_experts.")
+    {
+        ProjectionOutput::F32
+    } else {
+        ProjectionOutput::Bf16
+    }
 }
 
 /// Executable metadata-selected roles, with explicit block padding.
@@ -570,7 +575,9 @@ impl CoreCharges {
         let attention_partial_bytes = if native.iter().flatten().any(|w|
             w.split == CoreSplit::Input && w.ranks > 1) { 4 } else { 2 };
         let down_partial_bytes = if native.iter().flatten().any(|w|
-            (w.stem.ends_with(".w2") || w.stem.ends_with(".down_proj")) && w.split == CoreSplit::Input && w.ranks > 1) { 4 } else { 2 };
+            (w.stem.ends_with(".w2") || w.stem.ends_with(".down_proj"))
+                && !w.stem.contains("shared_experts.")
+                && w.split == CoreSplit::Input && w.ranks > 1) { 4 } else { 2 };
         let split = bodies.iter().flatten().any(|w| w.side == TrellisSide::Input)
             || attention_partial_bytes == 4;
         let has_fused = |weight: &CoreWeightLayout| {
@@ -725,6 +732,11 @@ mod tests {
                     assert_eq!(selected.programs, [expected]);
                     assert_eq!(selected.fp8_scratch_bytes, if fp8 { 256 } else { 0 });
                 }
+            }
+            for stem in ["model.layers.3.mlp.shared_experts.down_proj", "layers.3.shared_experts.w2"] {
+                let layout = NativeLayout { stem: stem.into(),
+                    shape: [6144, 1024], fp8, rank: 0, ranks: 2, split: CoreSplit::Input };
+                assert_eq!(native_output(&layout), ProjectionOutput::Bf16);
             }
         }
         Ok(())
@@ -1091,7 +1103,8 @@ mod tests {
                 }
                 if ranks == 2 {
                     assert!(charges.programs.iter().any(|name| name == "native_attention_n6144_k12288_m4096_f32"));
-                    assert!(charges.programs.iter().any(|name| name == "native_attention_n6144_k3072_m4096_f32"));
+                    assert!(charges.programs.iter().any(|name| name == "native_attention_n6144_k3072_m4096"));
+                    assert!(!charges.programs.iter().any(|name| name == "native_attention_n6144_k3072_m4096_f32"));
                 }
             }
         }

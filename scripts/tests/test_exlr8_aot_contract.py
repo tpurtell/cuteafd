@@ -157,12 +157,10 @@ def test_local_tp2_input_contract_is_independent_of_partial_dtype():
     tp2 = (glm / "engine/tp2.rs").read_text()
     assert tp2.count("if pair.uses_fp8_input()") == 2
     assert "self.ffn(" not in tp2
-    # Only K6 startup priming bypasses the shared peer meet; EXLR8 keeps it.
-    prime = tp2.split('if Self::core_split(layer, "down") {', 1)[1]
-    native, ordinary = prime.split("} else {", 1)
-    assert "self.ffn_on(rank, w, layer" in native
-    assert "self.shared_on(rank, pair.layers[0]" in ordinary
-    assert tp2.count("self.ffn_on(") == 1
+    # MoE shared_on is strictly rank-local (no mid-FFN core meet), so startup
+    # priming calls shared_on directly for both K6/native and EXLR8.
+    assert "self.ffn_on(" not in tp2
+    assert "self.shared_on(rank, pair.layers[0]" in tp2
     assert "self.shared_on(0, layer" in tp2
     layers = (glm / "engine/layers.rs").read_text()
     assert "e.shared_on(0, index" in layers

@@ -16,7 +16,6 @@ pub(crate) struct CorePrograms<'a> {
     native_fp8: [[cuteafd_ffi::native_attention::Fp8Projections<'a>; 2]; 2],
     native_scratch: [usize; 2],
     native_programs: Vec<String>,
-    pub f32_add: cuteafd_ffi::F32Add<'a>,
     pub add: Bf16F32Add<'a>,
     pub narrow: F32Bf16Narrow<'a>,
     pub copy: V41PeerCopy<'a>,
@@ -108,7 +107,6 @@ impl<'a> CorePrograms<'a> {
             cuteafd_loader::families::glm5::core::CoreStageLayout::new(cfg, unit, ranks, owned)?];
         ensure!(admitted.stages.as_ref() == Some(&stages), "GLM K6 loaded BF16 stages differ from admission");
         Ok(Some(Self { projections, layouts, stages, native_bf16, native_fp8, native_scratch, native_programs,
-            f32_add: programs.library().f32_add()?,
             add: programs.library().bf16_f32_add()?, narrow: programs.library().f32_bf16_narrow()?, copy: programs.library().v41_peer_copy()? }))
     }
     /// Include native input/core/output policy entries, including split-K's
@@ -310,7 +308,7 @@ mod tests {
     }
 
     #[test]
-    fn split_shared_core_widens_bf16_then_transforms_and_contributes_once() {
+    fn moe_shared_down_skips_pre_egress_core_exchange_and_improves_fp32_parity() {
         let narrow = |x: f32| {
             let bits = x.to_bits();
             f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
@@ -327,99 +325,50 @@ mod tests {
             }
             x
         };
-        let mut extra_rounding_changes = 0;
-        let mut retained_rounding_changes = 0;
+        let mut old_sq_err = 0.0f64;
+        let mut new_sq_err = 0.0f64;
         for row in 0..8 {
-            let first = (0..128).map(|n| (((n * 37 + row * 13) % 257) as f32 - 128.0) / 29.0).collect::<Vec<_>>();
-            let second = (0..128).map(|n| (((n * 61 + row * 17) % 251) as f32 - 125.0) / 31.0).collect::<Vec<_>>();
+            let c0 = (0..128).map(|n| (((n * 37 + row * 13) % 257) as f32 - 128.0) / 29.0).collect::<Vec<_>>();
+            let c1 = (0..128).map(|n| (((n * 61 + row * 17) % 251) as f32 - 125.0) / 31.0).collect::<Vec<_>>();
             let scales = (0..128).map(|n| (n % 7 + 1) as f32 / 16.0).collect::<Vec<_>>();
-            // Wire retention narrows each F32 core with RNE. Widen those BF16
-            // values for the rank-ordered F32 sum and only then apply H128/svh.
-            let full_precision = h128(first.iter().zip(&second).map(|(a, b)| a + b).collect());
-            let first = first.into_iter().map(narrow).collect::<Vec<_>>();
-            let second = second.into_iter().map(narrow).collect::<Vec<_>>();
-            let reference = h128(first.iter().zip(&second).map(|(a, b)| a + b).collect());
-            let shared = reference.iter().zip(&scales).map(|(x, s)| narrow(x * s)).collect::<Vec<_>>();
-            let reduced = first.iter().zip(&second).map(|(a, b)| a + b).collect::<Vec<_>>();
-            let actual = h128(reduced).iter().zip(&scales).map(|(x, s)| narrow(x * s)).collect::<Vec<_>>();
-            assert_eq!(actual, shared);
-            let a = h128(first);
-            let b = h128(second);
+            let r0 = (0..128).map(|n| (((n * 19 + row * 7) % 101) as f32 - 50.0) / 11.0).collect::<Vec<_>>();
+            let r1 = (0..128).map(|n| (((n * 23 + row * 11) % 97) as f32 - 48.0) / 11.0).collect::<Vec<_>>();
+            // Exact FP32 reference: r0 + r1 + H128(c0 + c1) * svh.
+            let s_fp32 = h128(c0.iter().zip(&c1).map(|(a, b)| a + b).collect())
+                .into_iter().zip(&scales).map(|(x, s)| x * s).collect::<Vec<_>>();
+            // Old path narrowed c0/c1 to BF16 before H128, then exchanged and zeroed rank 1.
+            let s_old = h128(c0.iter().map(|&v| narrow(v)).zip(c1.iter().map(|&v| narrow(v)))
+                .map(|(a, b)| a + b).collect())
+                .into_iter().zip(&scales).map(|(x, s)| narrow(x * s)).collect::<Vec<_>>();
+            // New path runs H128/svh per rank in F32 before narrowing to BF16 once.
+            let s0_new = h128(c0).into_iter().zip(&scales).map(|(x, s)| narrow(x * s)).collect::<Vec<_>>();
+            let s1_new = h128(c1).into_iter().zip(&scales).map(|(x, s)| narrow(x * s)).collect::<Vec<_>>();
             for n in 0..128 {
-                retained_rounding_changes += usize::from(narrow(full_precision[n] * scales[n]).to_bits() != shared[n].to_bits());
-                let routed = narrow(((n * 19 + row) % 101) as f32 / 11.0);
-                let single = narrow(routed + shared[n]);
-                let rank0 = narrow(routed + actual[n]);
-                let rank1_shared = 0.0f32;
-                assert_eq!(narrow(rank0 + rank1_shared).to_bits(), single.to_bits());
-                let lossy = narrow(narrow(a[n] * scales[n]) + narrow(b[n] * scales[n]));
-                extra_rounding_changes += usize::from(lossy.to_bits() != shared[n].to_bits());
+                let ref_val = r0[n] + r1[n] + s_fp32[n];
+                let old_val = narrow(narrow(r0[n] + s_old[n]) + narrow(r1[n]));
+                let new_val = narrow(narrow(r0[n] + s0_new[n]) + narrow(r1[n] + s1_new[n]));
+                old_sq_err += f64::from(old_val - ref_val).powi(2);
+                new_sq_err += f64::from(new_val - ref_val).powi(2);
             }
         }
-        assert!(retained_rounding_changes > 0, "fixture must detect BF16 core retention");
-        assert!(extra_rounding_changes > 0, "fixture must detect per-rank BF16 egress");
-        // This algebraic test is not a substitute for the native GPU golden.
+        assert!(new_sq_err <= old_sq_err, "per-rank F32 H128/svh egress must not worsen RMS error");
         let source = include_str!("engine/native_dense.rs");
-        let meet = source.split("fn meet_shared_core(").nth(1).unwrap()
-            .split("/// Input-side projections").next().unwrap();
-        assert!(meet.contains("if !Self::core_split(layer, \"down\") { return Ok(()); }"));
-        assert!(meet.contains("if rank == 0") && meet.contains("cuda_zero_bytes_async"));
-        assert!(meet.contains("else if self.shared_zero_elided(index, layer)"));
-        let policy = source.split("fn shared_zero_elided(").nth(1).unwrap()
-            .split("/// Native cores").next().unwrap();
-        assert!(policy.contains("!layer.dense && Self::core_split(layer, \"down\") && !self.tp2_layer(index)"));
+        let split = source.split("fn core_split(").nth(1).unwrap()
+            .split("fn core_received(").next().unwrap();
+        assert!(split.contains("if !layer.dense && key == \"down\""),
+            "MoE shared_experts.down must never trigger pre-FFN core exchange");
+        assert!(!source.contains("fn meet_shared_core(") && !source.contains("fn core_zero_shared("),
+            "redundant MoE shared-core meet and rank-1 zeroing must be removed");
         let reduce = source.split("fn reduce_projection(").nth(1).unwrap()
             .split("/// The caller").next().unwrap();
         assert!(reduce.contains("if rank == 0 { (local, peer) } else { (peer, local) }"));
         assert!(reduce.contains(".reduced(&programs.add"));
         let producer = source.split("fn core_linear(").nth(1).unwrap()
             .split("pub(super) fn core_producer").next().unwrap();
+        assert!(producer.contains("if Self::core_split(layer, key)"));
+        assert!(producer.contains("projection.local_partial("));
         assert!(producer.contains("dense_trellis::retain_partial(&programs.narrow, core, retained,"));
-        assert!(producer.contains("rows * weights.shape[0], stream)"));
         assert!(!producer.contains("copy_d2d_async"));
-    }
-
-    #[test]
-    fn one_delta_norm_removes_only_the_known_zero_add() {
-        let narrow = |x: f32| {
-            if x.is_nan() { return x; }
-            let bits = x.to_bits();
-            f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff0000)
-        };
-        let mut signed_zero_differences = 0;
-        for bits in 0..=u16::MAX {
-            let delta = f32::from_bits(u32::from(bits) << 16);
-            if delta.is_nan() {
-                // NaN payload propagation is not an exactness contract.
-                assert!((delta + 0.0).is_nan());
-                continue;
-            }
-            let old_delta = narrow(delta + 0.0);
-            if delta != 0.0 { assert_eq!(old_delta.to_bits(), delta.to_bits()); }
-            for residual in [-0.0f32, 0.0, -1.0, 1.0, f32::from_bits(0x00010000)] {
-                let old = narrow(residual + old_delta);
-                let elided = narrow(residual + delta);
-                if old.to_bits() != elided.to_bits() {
-                    assert_eq!(delta.to_bits(), (-0.0f32).to_bits());
-                    assert_eq!(residual.to_bits(), (-0.0f32).to_bits());
-                    assert_eq!(old.to_bits(), 0.0f32.to_bits());
-                    assert_eq!(elided.to_bits(), (-0.0f32).to_bits());
-                    signed_zero_differences += 1;
-                }
-            }
-        }
-        assert_eq!(signed_zero_differences, 1);
-        let native = include_str!("engine/native_dense.rs");
-        let norm = native.split("fn ffn_norm(").nth(1).unwrap()
-            .split("pub(super) fn meet_shared_core").next().unwrap();
-        assert!(norm.contains("if self.shared_zero_elided(index, layer) { 1 } else { 2 }"));
-        let engine = include_str!("engine.rs");
-        assert_eq!(engine.matches("if !self.shared_zero_elided(index, &layers[index]) { self.exchange()?.wait(0, ffn)?; }").count(), 2);
-        let local = include_str!("engine/local_graph.rs");
-        assert!(local.contains("if !self.shared_zero_elided(before, &layers[before]) {"));
-        let owned = include_str!("engine/layers.rs");
-        assert!(owned.contains("rank == 1 || !e.shared_zero_elided(index, self.layer(rank, index))"));
-        assert!(owned.contains("rank == 1 && e.shared_zero_elided(index, layer) { continue; }"));
     }
 
     #[test]
@@ -438,13 +387,11 @@ mod tests {
         assert!(receive.contains("let bytes = rows * self.cfg.hidden * element_bytes;"));
         let publish = native.split("pub(super) fn publish_projection").nth(1).unwrap()
             .split("fn reduce_projection(").next().unwrap();
-        assert!(publish.contains("if layer.attention_native.contains_key(key) { 4 } else { 2 }"));
-        assert!(publish.contains("self.core_received(1 - rank, at, rows, element_bytes)?.ptr, rows * self.cfg.hidden * element_bytes)"));
+        assert!(publish.contains("self.exchange()?.push_partial_to(rank, at, core.buffer, w.delta.buffer, dst.ptr, rows * self.cfg.hidden)"));
         let reduction = native.split("fn reduce_projection(").nth(1).unwrap()
             .split("pub(super) fn projection_norm").next().unwrap();
+        assert!(reduction.contains("self.exchange()?.reduce_partial_narrow_on("));
         assert!(reduction.contains("if rank == 0 { (local, peer) } else { (peer, local) }"));
-        assert!(reduction.find("programs.f32_add.launch").unwrap()
-            < reduction.find("programs.narrow.launch").unwrap());
     }
 
     #[test]

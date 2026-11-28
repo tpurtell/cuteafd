@@ -145,9 +145,7 @@ impl<'a> GlmEngine<'a> {
         let head = full_layers && tables[0].decode && rows == wanted;
         let last_join = bindings[0].pending_join[0].take();
         if let Some(last) = last_join {
-            if !self.shared_zero_elided(last, &self.weights.layers[last]) {
-                self.exchange()?.wait(0, slot(last, true, 0))?;
-            }
+            self.exchange()?.wait(0, slot(last, true, 0))?;
         }
         if bindings[0].decode_graphed() && head {
             let key = owned_segment_key(
@@ -341,9 +339,7 @@ impl Bindings<'_, '_, '_, '_, '_> {
     fn join(&self, index: usize) -> Result<()> {
         let e = self.engine;
         for rank in 0..2 {
-            if rank == 1 || !e.shared_zero_elided(index, self.layer(rank, index)) {
-                e.exchange()?.wait(rank, slot(index, true, self.lane))?;
-            }
+            e.exchange()?.wait(rank, slot(index, true, self.lane))?;
             let weight = if let Some(next) = e.weights.layers.get(index + 1) { next.ptr("input_norm")? }
                 else { e.weights.norm.buffer.ptr };
             let weight = if rank == 1 {
@@ -393,9 +389,7 @@ impl LayerKernels for Bindings<'_, '_, '_, '_, '_> {
         let w = self.work[rank];
         let prev_join = if self.decode_graphed() { self.pending_join[rank].take() } else { None };
         if let Some(prev) = prev_join {
-            if rank == 1 || !e.shared_zero_elided(prev, self.layer(rank, prev)) {
-                e.exchange()?.wait(rank, slot(prev, true, self.lane))?;
-            }
+            e.exchange()?.wait(rank, slot(prev, true, self.lane))?;
         }
         self.segment(rank, index, GlmOwnedPhase::Attention, prev_join.is_some(), || {
             let rows = Scalar::I32(self.rows() as i32);
@@ -441,65 +435,30 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
             ensure!(self.pending_join[1].is_none(), "unconsumed rank-1 FfnJoin before begin_ffn");
             let next_needs_r1 = self.next_owner(index) == Some(1);
             if let Some(prev) = join0 {
-                if !e.shared_zero_elided(prev, self.layer(0, prev)) {
-                    e.exchange()?.wait(0, slot(prev, true, self.lane))?;
-                }
+                e.exchange()?.wait(0, slot(prev, true, self.lane))?;
             }
-            let split_core_down = GlmEngine::core_split(layer, "down");
             if !layer.dense && e.tp2_layer(index) && e.tp2_routes_replicated() {
                 let pair = e.tp2.as_ref().context("TP2")?;
-                if split_core_down {
-                    self.segment(1, index, GlmOwnedPhase::FfnFront, false, || {
-                        if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
-                        e.shared_on_local(1, index, w1, layer1, rows, self.cap())?;
-                        e.core_zero_shared(1, w1, rows_count)
-                    })?;
-                    e.publish_projection(1, index, self.lane, w1, layer1, "down", rows_count)?;
-                    self.segment(1, index, GlmOwnedPhase::Tp2Expert, false, || {
-                        e.moe_front_on(1, index, w1, layer1, rows_count)?;
-                        e.tp2_rank_local(pair, 1, index, self.lane, w1, rows_count)
-                    })?;
-                    e.tp2_publish(pair, 1, index, self.lane, w1, rows_count)?;
+                self.segment(1, index, GlmOwnedPhase::FfnFront, false, || {
+                    if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
+                    e.shared_on_local(1, index, w1, layer1, rows, self.cap())?;
+                    e.moe_front_on(1, index, w1, layer1, rows_count)?;
+                    e.tp2_rank_local(pair, 1, index, self.lane, w1, rows_count)
+                })?;
+                e.tp2_publish(pair, 1, index, self.lane, w1, rows_count)?;
 
-                    self.segment(0, index, GlmOwnedPhase::FfnFront, join0.is_some(), || {
-                        if let Some(prev) = join0 {
-                            self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
-                            self.tap_drafter_local(prev)?;
-                        }
-                        if let Some((l, res)) = adopt0 { self.adopt_local(0, l, res)?; }
-                        e.moe_front(index, w, layer, rows_count)?;
-                        e.shared_on_local(0, index, w, layer, rows, self.cap())
-                    })?;
-                    e.exchange()?.wait(0, slot(index, true, self.lane))?;
-                    self.segment(0, index, GlmOwnedPhase::Tp2Expert, false, || {
-                        e.reduce_projection(0, index, self.lane, w, layer, "down", rows_count, w.shared.buffer)?;
-                        e.tp2_rank_local(pair, 0, index, self.lane, w, rows_count)
-                    })?;
-                    if next_needs_r1 {
-                        e.tp2_publish(pair, 0, index, self.lane, w, rows_count)?;
+                self.segment(0, index, GlmOwnedPhase::FfnFront, join0.is_some(), || {
+                    if let Some(prev) = join0 {
+                        self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
+                        self.tap_drafter_local(prev)?;
                     }
-                } else {
-                    self.segment(1, index, GlmOwnedPhase::FfnFront, false, || {
-                        if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
-                        e.shared_on_local(1, index, w1, layer1, rows, self.cap())?;
-                        e.moe_front_on(1, index, w1, layer1, rows_count)?;
-                        e.tp2_rank_local(pair, 1, index, self.lane, w1, rows_count)
-                    })?;
-                    e.tp2_publish(pair, 1, index, self.lane, w1, rows_count)?;
-
-                    self.segment(0, index, GlmOwnedPhase::FfnFront, join0.is_some(), || {
-                        if let Some(prev) = join0 {
-                            self.ffn_join_local(0, prev, layer.ptr("input_norm")?)?;
-                            self.tap_drafter_local(prev)?;
-                        }
-                        if let Some((l, res)) = adopt0 { self.adopt_local(0, l, res)?; }
-                        e.moe_front(index, w, layer, rows_count)?;
-                        e.shared_on_local(0, index, w, layer, rows, self.cap())?;
-                        e.tp2_rank_local(pair, 0, index, self.lane, w, rows_count)
-                    })?;
-                    if next_needs_r1 {
-                        e.tp2_publish(pair, 0, index, self.lane, w, rows_count)?;
-                    }
+                    if let Some((l, res)) = adopt0 { self.adopt_local(0, l, res)?; }
+                    e.moe_front(index, w, layer, rows_count)?;
+                    e.shared_on_local(0, index, w, layer, rows, self.cap())?;
+                    e.tp2_rank_local(pair, 0, index, self.lane, w, rows_count)
+                })?;
+                if next_needs_r1 {
+                    e.tp2_publish(pair, 0, index, self.lane, w, rows_count)?;
                 }
                 return Ok(Ticket::Complete);
             }
@@ -545,11 +504,7 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                 if let Some((l, res)) = adopt1 { self.adopt_local(1, l, res)?; }
                 e.shared_on_local(1, index, w1, layer1, rows, self.cap())
             })?;
-            if split_core_down {
-                e.publish_projection(1, index, self.lane, w1, layer1, "down", rows_count)?;
-            } else {
-                e.exchange()?.push(1, slot(index, true, self.lane), w1.shared.buffer.ptr, rows_count * e.cfg.hidden * 2)?;
-            }
+            e.exchange()?.push(1, slot(index, true, self.lane), w1.shared.buffer.ptr, rows_count * e.cfg.hidden * 2)?;
             if let Some(l2) = &e.peer()?.l2 {
                 e.on(1, || l2.issue(e.library, index, e.stream_of(1)))?;
             }
@@ -562,12 +517,12 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                 e.moe_front(index, w, layer, rows_count)
             })?;
             let real = self.tables[0].exchange_rows;
-            if e.skip.is_some() { return Ok(Ticket::Skip(e.moe_skip_one_way(w, index, layer, real, self.cap())?)); }
+            if e.skip.is_some() { return Ok(Ticket::Skip(e.moe_skip(w, index, layer, real, self.cap())?)); }
             let execution = e.layer_execution.as_ref().context("layer execution")?;
             ensure!(execution.waves.borrow()[self.lane].is_none(), "previous Spark wave is still live");
             let cap = self.cap();
             let (pending, ticket) = match &mut self.transport {
-                Transport::Serial(Some((link, _))) => (PendingWave::Landed(e.moe_exchange_one_way(w, index, layer, real, cap, true,
+                Transport::Serial(Some((link, _))) => (PendingWave::Landed(e.moe_exchange(w, index, layer, real, cap, true,
                     link.exchange()?)?), Ticket::Spark),
                 _ => anyhow::bail!("GLM MoE layer {index} needs Spark peers"),
             };
@@ -656,7 +611,6 @@ impl PipelineKernels for Bindings<'_, '_, '_, '_, '_> {
                 let w = self.work[rank];
                 let layer = self.layer(rank, index);
                 if layer.dense { e.publish_projection(rank, index, self.lane, w, layer, "down", self.rows())?; }
-                else if rank == 1 && e.shared_zero_elided(index, layer) { continue; }
                 else {
                     let out = if rank == 0 { w.delta.buffer.ptr } else { w.shared.buffer.ptr };
                     e.exchange()?.push(rank, slot(index, true, self.lane), out, bytes)?;
@@ -822,21 +776,9 @@ mod tests {
                     schedule.wait(1, "routes", at, "TP2 routes");
                 }
                 2 => {
-                    if self.trace.k6 {
-                        let at = slot(layer, true, self.lane);
-                        schedule.push_to(1, "main", at, 1, "K6 shared core");
-                        schedule.wait_for(1, "main", at, 1, "K6 shared meet");
-                    }
                     schedule.sync(0, "Spark route staging");
                 }
                 _ => (),
-            }
-            if self.trace.k6 && layer % 3 != 0 {
-                let at = slot(layer, true, self.lane);
-                for rank in 0..if layer % 3 == 1 { 2 } else { 1 } {
-                    schedule.push_to(rank, "main", at, 1, "K6 shared core");
-                    schedule.wait_for(rank, "main", at, 1, "K6 shared meet");
-                }
             }
             if layer % 3 == 1 {
                 for rank in 0..2 { schedule.push(rank, "main", slot(layer, true, self.lane), "FFN publication"); }
@@ -849,13 +791,12 @@ mod tests {
             let mut schedule = self.trace.schedule.borrow_mut();
             let at = slot(layer, true, self.lane);
             let dense_core = self.trace.k6 && layer % 3 == 0;
-            let zero_elided = self.trace.k6 && layer % 3 == 2;
             if layer % 3 != 1 {
-                for rank in 0..if zero_elided { 1 } else { 2 } {
+                for rank in 0..2 {
                     schedule.push_to(rank, "main", at, usize::from(dense_core), "FFN publication");
                 }
             }
-            for rank in if zero_elided { 1 } else { 0 }..2 {
+            for rank in 0..2 {
                 schedule.wait_for(rank, "main", at, usize::from(dense_core), "FFN join");
             }
             schedule.sync(0, "layer diagnostic download");
@@ -973,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn k6_meet_precedes_routed_publication_on_each_existing_ffn_slot() {
+    fn k6_dense_core_and_moe_routed_publications_stay_disjoint_on_ffn_slots() {
         use crate::shared::peer_split::order::Op;
         for first in [0, 1] {
             for (lanes, lane_order) in [(1, LaneOrder::Independent),
@@ -987,23 +928,19 @@ mod tests {
                 order::check(&schedule).unwrap();
                 for rank in 0..2 {
                     let stream = &schedule.streams[rank];
-                    let cores = stream.iter().filter(|(_, label)| label == "K6 shared core").count();
-                    assert_eq!(cores, 3 * lanes * 8, "all MoE layers meet, including the terminal layer");
                     for at in (1..4 * lanes).step_by(2) {
                         let publications = stream.iter().filter_map(|(op, _)| match op {
                             Op::Push(flag) if flag.exchange == "main" && flag.slot == at => Some(flag.target),
                             _ => None,
                         }).collect::<Vec<_>>();
                         assert!(!publications.is_empty());
-                        assert!(publications.windows(2).any(|pair| pair == [1, 0]),
-                            "the native F32 suffix precedes the ordinary routed prefix");
+                        assert!(publications.contains(&1) && publications.contains(&0),
+                            "dense core target 1 and MoE FFN target 0 must both complete cleanly");
                     }
                 }
-                // A consumer cannot skip the first sequence just because the
-                // following routed publication uses a different destination.
                 let mut crossed = schedule.clone();
                 let (op, _) = crossed.streams[1].iter_mut()
-                    .find(|(_, label)| label == "K6 shared meet").unwrap();
+                    .find(|(op, _)| matches!(op, Op::Wait(flag) if flag.target == 1)).unwrap();
                 let Op::Wait(flag) = op else { unreachable!() };
                 flag.target = 0;
                 assert!(order::check(&crossed).unwrap_err().to_string().contains("crossed destination"));
@@ -1029,7 +966,6 @@ mod tests {
         let source = include_str!("layers.rs");
         let body = source.split_once("#[cfg(test)]").unwrap().0;
         let mut count = 0usize;
-        let mut captures_core_zero = false;
         let mut captures_adopt = false;
         for part in body.split("self.segment(").skip(1) {
             count += 1;
@@ -1037,30 +973,25 @@ mod tests {
             let closure = after_arrow.split_once("})?;")
                 .or_else(|| after_arrow.split_once("\n        })"))
                 .unwrap().0;
-            if closure.contains("core_zero_shared") {
-                captures_core_zero = true;
-            }
             if closure.contains("adopt_local") {
                 captures_adopt = true;
             }
             for forbidden in [
                 "exchange()?.push", "exchange()?.wait", "publish_projection", "tp2_publish",
-                "tp2_rank(", "meet_shared_core", "shared_on(", "moe_exchange", "moe_skip",
+                "tp2_rank(", "meet_shared_core", "core_zero_shared", "shared_on(", "moe_exchange", "moe_skip",
             ] {
                 assert!(!closure.contains(forbidden),
                     "layers.rs segment closure #{count} unexpectedly contains {forbidden}");
             }
         }
-        assert!(count >= 8, "expected rank-local segment captures in layers.rs, found {count}");
-        assert!(captures_core_zero,
-            "split-core rank-1 core_zero_shared must stay inside FfnFront capture");
+        assert!(count >= 6, "expected rank-local segment captures in layers.rs, found {count}");
         assert!(captures_adopt,
             "layers adopt_local must stay inside FfnFront capture");
+        assert!(!body.contains("split_core_down"),
+            "layers.rs MoE decode must not split TP2 segments for a pre-FFN shared core exchange");
         let native = include_str!("../../../../../../../native/shared/src/cuteafd_native.cc");
         let sig = native.split_once("transferable_signature(").unwrap().1
             .split_once("cuteafd_cuda_graph_capture_source(").unwrap().0;
-        assert!(sig.contains("kind == cudaGraphNodeTypeMemset") && sig.contains("cudaGraphMemsetNodeGetParams"),
-            "1D same-device memset nodes captured by core_zero_shared must be donor-transferable");
         assert!(sig.contains("kind == cudaGraphNodeTypeMemcpy") && sig.contains("cudaGraphMemcpyNodeGetParams"),
             "1D same-device D2D memcpy nodes captured by adopt_local must be donor-transferable");
 
@@ -1070,111 +1001,80 @@ mod tests {
         enum Kind { Dense, Tp2, Spark }
         let kinds = [Kind::Dense, Kind::Tp2, Kind::Tp2, Kind::Spark, Kind::Spark, Kind::Tp2];
         for first in [0usize, 1] {
-            for split_core in [false, true] {
-                let mut s = HostSchedule::default();
-                let capture = |s: &mut HostSchedule, label: &str| {
-                    s.sync(0, format!("capture {label} sync gpu0"));
-                    s.sync(1, format!("capture {label} sync gpu1"));
-                };
-                let owners: Vec<usize> = (0..kinds.len()).map(|l| first ^ ((l / 2) % 2)).collect();
-                for step in 0..2 {
-                    if owners[0] == 1 {
-                        s.push(0, "main", DIRECT, format!("step{step} entry 0->1"));
-                        s.wait(1, "main", DIRECT, format!("step{step} entry wait 1"));
-                    }
-                    let mut pending_join = [None::<usize>; 2];
-                    let mut hop_ord = [0usize; 2];
-                    for (layer, &kind) in kinds.iter().enumerate() {
-                        let owner = owners[layer];
-                        let peer = 1 - owner;
-                        let next_needs_r1 = owners.get(layer + 1).copied() == Some(1);
-                        let ffn = slot(layer, true, 0);
-
-                        // owned(layer, owner): wait deferred join if any, then capture Attention.
-                        if let Some(prev) = pending_join[owner].take() {
-                            let prev_elided = matches!(kinds[prev], Kind::Spark) && split_core;
-                            if owner == 1 || !prev_elided {
-                                s.wait(owner, "main", slot(prev, true, 0), format!("step{step} L{layer} attn wait prev"));
-                            }
-                        }
-                        capture(&mut s, &format!("step{step} L{layer} attn r{owner}"));
-
-                        // AfterAttention hop: owner -> peer.
-                        let hslot = hop_ord[peer] % 2;
-                        hop_ord[peer] += 1;
-                        s.push(owner, "hop", hslot, format!("step{step} L{layer} hop push"));
-                        s.wait(peer, "hop", hslot, format!("step{step} L{layer} hop land"));
-
-                        // begin_ffn: wait deferred join0 if owner == 1.
-                        let join0 = pending_join[0].take();
-                        assert!(pending_join[1].is_none());
-                        if let Some(prev) = join0 {
-                            let prev_elided = matches!(kinds[prev], Kind::Spark) && split_core;
-                            if !prev_elided {
-                                s.wait(0, "main", slot(prev, true, 0), format!("step{step} L{layer} r0 ffn wait prev"));
-                            }
-                        }
-                        match kind {
-                            Kind::Dense => {
-                                capture(&mut s, &format!("step{step} L{layer} r1 dense"));
-                                s.push(1, "main", ffn, format!("step{step} L{layer} r1 push dense"));
-                                capture(&mut s, &format!("step{step} L{layer} r0 dense"));
-                                if next_needs_r1 {
-                                    s.push(0, "main", ffn, format!("step{step} L{layer} r0 push dense"));
-                                }
-                            }
-                            Kind::Tp2 => {
-                                if split_core {
-                                    capture(&mut s, &format!("step{step} L{layer} r1 tp2 pre"));
-                                    s.push(1, "core", ffn, format!("step{step} L{layer} r1 push core"));
-                                    capture(&mut s, &format!("step{step} L{layer} r1 tp2 moe"));
-                                    s.push(1, "main", ffn, format!("step{step} L{layer} r1 push tp2"));
-                                    capture(&mut s, &format!("step{step} L{layer} r0 tp2 pre"));
-                                    s.wait(0, "core", ffn, format!("step{step} L{layer} r0 wait core"));
-                                    capture(&mut s, &format!("step{step} L{layer} r0 tp2 moe"));
-                                    if next_needs_r1 {
-                                        s.push(0, "main", ffn, format!("step{step} L{layer} r0 push tp2"));
-                                    }
-                                } else {
-                                    capture(&mut s, &format!("step{step} L{layer} r1 tp2"));
-                                    s.push(1, "main", ffn, format!("step{step} L{layer} r1 push tp2"));
-                                    capture(&mut s, &format!("step{step} L{layer} r0 tp2"));
-                                    if next_needs_r1 {
-                                        s.push(0, "main", ffn, format!("step{step} L{layer} r0 push tp2"));
-                                    }
-                                }
-                            }
-                            Kind::Spark => {
-                                capture(&mut s, &format!("step{step} L{layer} r1 spark shared"));
-                                if split_core {
-                                    s.push(1, "core", ffn, format!("step{step} L{layer} r1 push core"));
-                                } else {
-                                    s.push(1, "main", ffn, format!("step{step} L{layer} r1 push shared"));
-                                }
-                                capture(&mut s, &format!("step{step} L{layer} r0 spark front"));
-                                if split_core {
-                                    s.wait(0, "core", ffn, format!("step{step} L{layer} r0 wait core"));
-                                }
-                                if next_needs_r1 {
-                                    s.push(0, "main", ffn, format!("step{step} L{layer} r0 push spark"));
-                                }
-                            }
-                        }
-                        pending_join[0] = Some(layer);
-                        if next_needs_r1 { pending_join[1] = Some(layer); }
-                    }
-                    // Terminal Head on GPU 0.
-                    let last = pending_join[0].take().unwrap();
-                    let last_elided = matches!(kinds[last], Kind::Spark) && split_core;
-                    if !last_elided {
-                        s.wait(0, "main", slot(last, true, 0), format!("step{step} head wait last"));
-                    }
-                    capture(&mut s, &format!("step{step} head"));
+            let mut s = HostSchedule::default();
+            let capture = |s: &mut HostSchedule, label: &str| {
+                s.sync(0, format!("capture {label} sync gpu0"));
+                s.sync(1, format!("capture {label} sync gpu1"));
+            };
+            let owners: Vec<usize> = (0..kinds.len()).map(|l| first ^ ((l / 2) % 2)).collect();
+            for step in 0..2 {
+                if owners[0] == 1 {
+                    s.push(0, "main", DIRECT, format!("step{step} entry 0->1"));
+                    s.wait(1, "main", DIRECT, format!("step{step} entry wait 1"));
                 }
-                assert_eq!(check_host(&s), Ok(()), "layers deadlock first={first} split_core={split_core}");
-                assert_eq!(order::check_submission_faults(&s.streams()), Ok(()),
-                    "layers submission fault first={first} split_core={split_core}");
+                let mut pending_join = [None::<usize>; 2];
+                let mut hop_ord = [0usize; 2];
+                for (layer, &kind) in kinds.iter().enumerate() {
+                    let owner = owners[layer];
+                    let peer = 1 - owner;
+                    let next_needs_r1 = owners.get(layer + 1).copied() == Some(1);
+                    let ffn = slot(layer, true, 0);
+
+                    // owned(layer, owner): wait deferred join if any, then capture Attention.
+                    if let Some(prev) = pending_join[owner].take() {
+                        s.wait(owner, "main", slot(prev, true, 0), format!("step{step} L{layer} attn wait prev"));
+                    }
+                    capture(&mut s, &format!("step{step} L{layer} attn r{owner}"));
+
+                    // AfterAttention hop: owner -> peer.
+                    let hslot = hop_ord[peer] % 2;
+                    hop_ord[peer] += 1;
+                    s.push(owner, "hop", hslot, format!("step{step} L{layer} hop push"));
+                    s.wait(peer, "hop", hslot, format!("step{step} L{layer} hop land"));
+
+                    // begin_ffn: wait deferred join0 if owner == 1.
+                    let join0 = pending_join[0].take();
+                    assert!(pending_join[1].is_none());
+                    if let Some(prev) = join0 {
+                        s.wait(0, "main", slot(prev, true, 0), format!("step{step} L{layer} r0 ffn wait prev"));
+                    }
+                    match kind {
+                        Kind::Dense => {
+                            capture(&mut s, &format!("step{step} L{layer} r1 dense"));
+                            s.push(1, "main", ffn, format!("step{step} L{layer} r1 push dense"));
+                            capture(&mut s, &format!("step{step} L{layer} r0 dense"));
+                            if next_needs_r1 {
+                                s.push(0, "main", ffn, format!("step{step} L{layer} r0 push dense"));
+                            }
+                        }
+                        Kind::Tp2 => {
+                            capture(&mut s, &format!("step{step} L{layer} r1 tp2"));
+                            s.push(1, "main", ffn, format!("step{step} L{layer} r1 push tp2"));
+                            capture(&mut s, &format!("step{step} L{layer} r0 tp2"));
+                            if next_needs_r1 {
+                                s.push(0, "main", ffn, format!("step{step} L{layer} r0 push tp2"));
+                            }
+                        }
+                        Kind::Spark => {
+                            capture(&mut s, &format!("step{step} L{layer} r1 spark shared"));
+                            s.push(1, "main", ffn, format!("step{step} L{layer} r1 push shared"));
+                            capture(&mut s, &format!("step{step} L{layer} r0 spark front"));
+                            if next_needs_r1 {
+                                s.push(0, "main", ffn, format!("step{step} L{layer} r0 push spark"));
+                            }
+                        }
+                    }
+                    pending_join[0] = Some(layer);
+                    if next_needs_r1 { pending_join[1] = Some(layer); }
+                }
+                // Terminal Head on GPU 0.
+                let last = pending_join[0].take().unwrap();
+                s.wait(0, "main", slot(last, true, 0), format!("step{step} head wait last"));
+                capture(&mut s, &format!("step{step} head"));
             }
+            assert_eq!(check_host(&s), Ok(()), "layers deadlock first={first}");
+            assert_eq!(order::check_submission_faults(&s.streams()), Ok(()),
+                "layers submission fault first={first}");
         }
     }
 
