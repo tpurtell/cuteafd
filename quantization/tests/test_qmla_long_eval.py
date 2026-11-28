@@ -283,10 +283,11 @@ def test_position_buckets_boundaries_and_aggregation():
         dtype=torch.int64,
     )
     seq, _, _ = adapter.capture_sequence(raw_inputs[0][1][:24], layer, seq_id="depth", positions=multi_pos, compact_mask=True)
+    from qmla import ResolvedContentTransform, ResolvedRopeTransform
     ev = LongContextEvaluator(
         modes=((4, 4),),
-        content_transforms={0: (torch.eye(geom.kv_lora_rank), torch.ones(geom.kv_lora_rank))},
-        rope_transforms={0: (torch.zeros(geom.qk_rope_dim // 2), torch.ones(geom.qk_rope_dim // 2))},
+        content_transforms={4: {0: ResolvedContentTransform(0, 4, "identity", None, None, "identity", None, {})}},
+        rope_transforms={4: {0: ResolvedRopeTransform(0, 4, "identity", None, None, "identity", None, {})}},
         config=FitConfig(protection="sink4_local128", sink_tokens=2, recent_tokens=4),
     )
     ev.evaluate_layer_sequence(seq, params, geom, split="heldout", device="cpu")
@@ -295,6 +296,11 @@ def test_position_buckets_boundaries_and_aggregation():
     assert [row["by_position_bucket"][k]["tokens"] for k in row["by_position_bucket"]] == [3, 3, 3, 3, 3, 9]
     weighted = sum(b["attn_rel_err"] * b["tokens"] for b in row["by_position_bucket"].values()) / row["layer_tokens"]
     assert row["attn_rel_err"] == pytest.approx(weighted)
+    assert rep["headline_modes"] == ["4:0", "2:4", "8:0", "8:8", "4:8"]
+    assert set(rep["headline_table_by_position_bucket"]) == {"0-2k", "2k-4k", "4k-8k", "8k-16k", "16k-32k", "32k+"}
+    for bkt, brows in rep["headline_table_by_position_bucket"].items():
+        assert [r["mode"] for r in brows] == ["4:0", "2:4", "8:0", "8:8", "4:8"]
+        assert ":0` means RoPE is kept unquantized" in rep["headline_table_by_position_bucket_markdown"][bkt]
 
 
 def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
@@ -396,7 +402,8 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
         corpus_provenance=prov, fit_config=FitConfig(steps=4, val_every=2, seed=0, sink_tokens=2, recent_tokens=6),
     )
     manifest, c_tf, r_tf = load_sidecar_transforms(cal_res["sidecar_dir"], strict=True)
-    assert set(c_tf) == {0, 2} and set(r_tf) == {0, 2}
+    assert set(c_tf) == {4} and set(c_tf[4]) == {0, 2}
+    assert set(r_tf) == {4} and set(r_tf[4]) == {0, 2}
 
     # Expose quantized history beyond the deployed four sinks and 128 recent keys.
     long_records = [
@@ -409,6 +416,17 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
         expected_source={"repo": source["repo"], "revision": source["revision"], "family": "hy4_flash"},
     )
     assert long_eval["schema"] == LONG_EVAL_SCHEMA
+    assert long_eval["headline_modes"] == ["4:0", "2:4", "8:0", "8:8", "4:8"]
+    assert [r["mode"] for r in long_eval["headline_table"]] == ["4:0", "2:4", "8:0", "8:8", "4:8"]
+    long_hl = {r["mode"]: r for r in long_eval["headline_table"]}
+    assert long_hl["4:0"]["supported"] is True and long_hl["4:0"]["per_layer_spread"]["layers"] == 2
+    assert long_hl["2:4"]["supported"] is False and long_hl["2:4"]["status"] == "n/a"
+    assert ":0` means RoPE is kept unquantized" in long_eval["headline_table_markdown"]
+    assert "0-2k" in long_eval["headline_table_by_position_bucket"]
+    bkt0 = long_eval["headline_table_by_position_bucket"]["0-2k"]
+    bkt0_by_mode = {r["mode"]: r for r in bkt0}
+    assert bkt0_by_mode["4:0"]["supported"] is True and bkt0_by_mode["4:0"]["per_layer_spread"]["layers"] == 2
+    assert ":0` means RoPE is kept unquantized" in long_eval["headline_table_by_position_bucket_markdown"]["0-2k"]
     assert long_eval["layers_evaluated"] == [0, 2]
     assert long_eval["dsa_selection_drift"]["structural_zero"] is True
     assert long_eval["dsa_selection_drift"]["sparse_layers"] == [0, 2]

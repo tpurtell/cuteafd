@@ -49,12 +49,36 @@ from .quantizer import (
     sylvester_hadamard,
 )
 
-FIT_CHECKPOINT_SCHEMA = "cuteafd-qmla-fit-checkpoint-v2"
+FIT_CHECKPOINT_SCHEMA = "cuteafd-qmla-fit-checkpoint-v3"
 ALPHA_INIT_GRID = (0.0, 0.125, 0.25, 0.5, 0.75, 1.0)
 DEFAULT_PROTECTION_POLICY = "sink4_local128"
 VALID_PROTECTION_POLICIES = frozenset({"sink4_local128", "none"})
 DEFAULT_SINK_TOKENS = 4
 DEFAULT_RECENT_TOKENS = 128
+
+# Explicit transform kind classification tolerances (cuteafd-qmla-v3).
+# Both sit >1000x below BF16 half-ULP (~3.9e-3) and INT8 step size (>=3.9e-3),
+# while absorbing FP32 Cayley/exp(0) roundoff (~few x 1e-7) and staying 10x tighter
+# than the orthogonality gate (1e-5).
+ROTATION_IDENTITY_TOL = 1e-6
+SCALE_IDENTITY_TOL = 1e-6
+VALID_TRANSFORM_KINDS = frozenset({"identity", "scale_only", "full"})
+VALID_FIT_MODES = frozenset({"full", "scale_only"})
+VALID_CHECKPOINT_MODES = frozenset({"full", "scale_only", "smoothquant"})
+# Default v3 fitting budget: fit BOTH full and scale_only across every calibrated width
+# (plus step-0 SmoothQuant inits). Never blanket-skip 8-bit full fitting: Hy4-flash layer 25
+# gained 10.9% beyond scale-only on 8-bit RoPE (vs 0.7% median).
+DEFAULT_FIT_BUDGET: dict[str, dict[int, tuple[str, ...]]] = {
+    "content": {
+        2: ("full", "scale_only"),
+        4: ("full", "scale_only"),
+        8: ("full", "scale_only"),
+    },
+    "rope": {
+        4: ("full", "scale_only"),
+        8: ("full", "scale_only"),
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -113,6 +137,7 @@ class ContentFitResult:
     baselines: dict[str, float]
     protection_calibrated: str = DEFAULT_PROTECTION_POLICY
     init_s: torch.Tensor | None = None  # SmoothQuant step-0 scales (identity rotation)
+    fit_mode: str = "full"  # "full" | "scale_only"
 
 
 @dataclass(frozen=True)
@@ -128,6 +153,69 @@ class RopeFitResult:
     baselines: dict[str, float]
     protection_calibrated: str = DEFAULT_PROTECTION_POLICY
     init_s: torch.Tensor | None = None  # SmoothQuant step-0 pair scales (zero angles)
+    fit_mode: str = "full"  # "full" | "scale_only"
+
+
+def classify_content_kind(
+    r_c: torch.Tensor | None,
+    s_c: torch.Tensor | None,
+    *,
+    rot_tol: float = ROTATION_IDENTITY_TOL,
+    scale_tol: float = SCALE_IDENTITY_TOL,
+) -> str:
+    """Classify a content transform into ``identity`` | ``scale_only`` | ``full``.
+
+    Any transform whose rotation is within ``rot_tol`` (L_inf) of I and whose scales
+    are within ``scale_tol`` (L_inf) of 1 is ``identity``, regardless of which optimizer
+    produced it. A non-unit scale with identity rotation is ``scale_only``; any
+    non-identity rotation is ``full``.
+    """
+    if r_c is None:
+        rot_is_id = True
+    else:
+        rf = r_c.detach().float()
+        eye = torch.eye(rf.shape[0], device=rf.device, dtype=torch.float32)
+        rot_is_id = float((rf - eye).abs().max().item()) <= rot_tol
+    if s_c is None:
+        scale_is_id = True
+    else:
+        sf = s_c.detach().float()
+        scale_is_id = float((sf - 1.0).abs().max().item()) <= scale_tol
+    if rot_is_id and scale_is_id:
+        return "identity"
+    if rot_is_id:
+        return "scale_only"
+    return "full"
+
+
+def classify_rope_kind(
+    theta: torch.Tensor | None,
+    s_p: torch.Tensor | None,
+    *,
+    rot_tol: float = ROTATION_IDENTITY_TOL,
+    scale_tol: float = SCALE_IDENTITY_TOL,
+) -> str:
+    """Classify a RoPE pair transform into ``identity`` | ``scale_only`` | ``full``.
+
+    Angles are wrapped to ``(-pi, pi]`` via ``atan2(sin(theta), cos(theta))`` so
+    exact 2*pi multiples also classify as zero rotation.
+    """
+    if theta is None:
+        rot_is_id = True
+    else:
+        tf = theta.detach().float()
+        wrapped = torch.atan2(torch.sin(tf), torch.cos(tf))
+        rot_is_id = float(wrapped.abs().max().item()) <= rot_tol
+    if s_p is None:
+        scale_is_id = True
+    else:
+        sf = s_p.detach().float()
+        scale_is_id = float((sf - 1.0).abs().max().item()) <= scale_tol
+    if rot_is_id and scale_is_id:
+        return "identity"
+    if rot_is_id:
+        return "scale_only"
+    return "full"
 
 
 def protection_mask(
@@ -193,6 +281,11 @@ def apply_content_forward(c: torch.Tensor, r_c: torch.Tensor, s_c: torch.Tensor)
     return torch.matmul(c.float(), r_c.float()) * s_c.float()
 
 
+def apply_content_scale_only(c: torch.Tensor, s_c: torch.Tensor) -> torch.Tensor:
+    """Row-vector scale-only content transform z_C = c * s_C (no dense rotation)."""
+    return c.float() * s_c.float()
+
+
 def compensate_kv_b(
     kv_b_weight: torch.Tensor,
     r_c: torch.Tensor,
@@ -200,6 +293,34 @@ def compensate_kv_b(
 ) -> torch.Tensor:
     """Compensate HF-layout kv_b_proj [out, d_c]: W_tilde = W_kv_b @ R_C @ diag(1/s_C)."""
     return torch.matmul(kv_b_weight.float(), r_c.float()) * (1.0 / s_c.float()).unsqueeze(0)
+
+
+def compensate_kv_b_scale_only(
+    kv_b_weight: torch.Tensor,
+    s_c: torch.Tensor,
+) -> torch.Tensor:
+    """Compensate HF-layout kv_b_proj [out, d_c] for scale_only: W_tilde = W_kv_b @ diag(1/s_C)."""
+    return kv_b_weight.float() * (1.0 / s_c.float()).unsqueeze(0)
+
+
+def apply_rope_scale_only(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    rope_kind: str,
+    inverse_scale: bool = False,
+) -> torch.Tensor:
+    """Apply pair-tied RoPE scales without rotation (``scale_only`` kind)."""
+    xf = x.float()
+    g = (1.0 / scale.float()) if inverse_scale else scale.float()
+    if rope_kind in ("interleaved", "unrotated_pe"):
+        x0 = xf[..., 0::2] * g
+        x1 = xf[..., 1::2] * g
+        return torch.stack((x0, x1), dim=-1).flatten(-2)
+    if rope_kind == "split_half":
+        half = xf.shape[-1] // 2
+        return torch.cat((xf[..., :half] * g, xf[..., half:] * g), dim=-1)
+    raise ValueError(f"apply_rope_scale_only unsupported for rope_kind={rope_kind!r}")
 
 
 def apply_rope_pair_transform(
@@ -251,7 +372,7 @@ def content_output_loss(
     seqs: Sequence[CapturedSequence],
     params: CapturedLayerParams,
     geometry: MlaLayerGeometry,
-    r_c: torch.Tensor,
+    r_c: torch.Tensor | None,
     s_c: torch.Tensor,
     bits: int,
     *,
@@ -270,10 +391,16 @@ def content_output_loss(
     all_groups = [(params, geometry, seqs), *extra_consumers]
     losses: list[torch.Tensor] = []
     for c_params, c_geom, c_seqs in all_groups:
-        w_tilde = compensate_kv_b(c_params.kv_b_weight, r_c, s_c)
+        if r_c is None:
+            w_tilde = compensate_kv_b_scale_only(c_params.kv_b_weight, s_c)
 
-        def exact_content(c):
-            return apply_content_forward(c, r_c, s_c)
+            def exact_content(c):
+                return apply_content_scale_only(c, s_c)
+        else:
+            w_tilde = compensate_kv_b(c_params.kv_b_weight, r_c, s_c)
+
+            def exact_content(c):
+                return apply_content_forward(c, r_c, s_c)
 
         def quantized_content(c):
             return qdq_asymmetric_group(
@@ -293,7 +420,7 @@ def content_output_loss(
 def rope_qk_loss(
     seqs: Sequence[CapturedSequence],
     geometry: MlaLayerGeometry,
-    theta: torch.Tensor,
+    theta: torch.Tensor | None,
     s_p: torch.Tensor,
     bits: int,
     *,
@@ -311,6 +438,8 @@ def rope_qk_loss(
     losses: list[torch.Tensor] = []
 
     def _q_fn(qp: torch.Tensor) -> torch.Tensor:
+        if theta is None:
+            return apply_rope_scale_only(qp, s_p, rope_kind=geometry.rope_kind, inverse_scale=True)
         return apply_rope_pair_transform(qp, theta, s_p, rope_kind=geometry.rope_kind, inverse_scale=True)
 
     for seq in seqs:
@@ -318,7 +447,10 @@ def rope_qk_loss(
             raise ValueError("missing q_rope/k_rope for RoPE layer")
         q, k = seq.q_rope.float().transpose(0, 1), seq.k_rope.float()
         qt = _q_fn(q)
-        kt = apply_rope_pair_transform(k, theta, s_p, rope_kind=geometry.rope_kind, inverse_scale=False)
+        if theta is None:
+            kt = apply_rope_scale_only(k, s_p, rope_kind=geometry.rope_kind, inverse_scale=False)
+        else:
+            kt = apply_rope_pair_transform(k, theta, s_p, rope_kind=geometry.rope_kind, inverse_scale=False)
         kq = qdq_asymmetric_group(
             kt, bits, group_size=group_size, scale_dtype="F32", eps=eps_scale, ste=ste
         ) if quantize else kt
@@ -469,10 +601,13 @@ def fit_content_layer(
     *,
     device: torch.device | str = "cpu",
     extra_consumers: Sequence[CapturedLayerBank] = (),
+    fit_mode: str = "full",
 ) -> ContentFitResult:
-    """Fit orthogonal R_C and positive scale S_C for one MLA layer at bit width ``bits``."""
+    """Fit orthogonal R_C and positive scale S_C (or scale_only S_C with R_C=I) for one MLA layer."""
     if bits not in CONTENT_NONZERO_BITS:
         raise ValueError(f"fit_content_layer requires bits in {sorted(CONTENT_NONZERO_BITS)}, got {bits}")
+    if fit_mode not in VALID_FIT_MODES:
+        raise ValueError(f"invalid fit_mode {fit_mode!r}; expected one of {sorted(VALID_FIT_MODES)}")
     config.validate()
     bank.validate()
     _require_unprotected_tokens(
@@ -512,7 +647,7 @@ def fit_content_layer(
     with torch.no_grad():
         baselines["rtn_native_val"] = float(
             content_output_loss(
-                val_seqs, params, geom, eye, ones, bits,
+                val_seqs, params, geom, None if fit_mode == "scale_only" else eye, ones, bits,
                 group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
                 extra_consumers=extra_val, **prot_kwargs,
             ).item()
@@ -536,7 +671,7 @@ def fit_content_layer(
             cand_log_s = _init_log_scales(a_j, alpha, config.log_scale_bound)
             cand_loss = float(
                 content_output_loss(
-                    val_seqs, params, geom, eye, torch.exp(cand_log_s), bits,
+                    val_seqs, params, geom, None if fit_mode == "scale_only" else eye, torch.exp(cand_log_s), bits,
                     group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
                     extra_consumers=extra_val, **prot_kwargs,
                 ).item()
@@ -550,15 +685,19 @@ def fit_content_layer(
                 best_init_log_s = cand_log_s
         baselines["smoothquant_alpha_val"] = best_alpha_loss
 
-    skew_param = torch.zeros((d_c, d_c), device=dev, dtype=torch.float32, requires_grad=True)
     log_s_param = best_init_log_s.clone().detach().requires_grad_(True)
-    optimizer = torch.optim.AdamW(
-        [
+    if fit_mode == "full":
+        skew_param = torch.zeros((d_c, d_c), device=dev, dtype=torch.float32, requires_grad=True)
+        opt_params = [
             {"params": [skew_param], "lr": config.content_rot_lr},
             {"params": [log_s_param], "lr": config.content_scale_lr},
-        ],
-        weight_decay=0.0,
-    )
+        ]
+        clip_params = [skew_param, log_s_param]
+    else:
+        skew_param = None
+        opt_params = [{"params": [log_s_param], "lr": config.content_scale_lr}]
+        clip_params = [log_s_param]
+    optimizer = torch.optim.AdamW(opt_params, weight_decay=0.0)
 
     best_step = 0
     best_val_loss = best_alpha_loss
@@ -570,52 +709,76 @@ def fit_content_layer(
 
     for step in range(1, config.steps + 1):
         lr_mult = _cosine_lr_factor(step - 1, config.steps, config.warmup_frac)
-        optimizer.param_groups[0]["lr"] = config.content_rot_lr * lr_mult
-        optimizer.param_groups[1]["lr"] = config.content_scale_lr * lr_mult
+        if fit_mode == "full":
+            optimizer.param_groups[0]["lr"] = config.content_rot_lr * lr_mult
+            optimizer.param_groups[1]["lr"] = config.content_scale_lr * lr_mult
+        else:
+            optimizer.param_groups[0]["lr"] = config.content_scale_lr * lr_mult
 
         perm = torch.randperm(n_train, generator=gen)[: min(config.batch_size, n_train)].tolist()
         batch = tuple(train_seqs[i] for i in perm)
         batch_extra = tuple((ep, eg, tuple(es[i % len(es)] for i in perm)) for ep, eg, es in extra_train)
 
         optimizer.zero_grad(set_to_none=True)
-        r_c = cayley_orthogonal(skew_param)
         log_s = log_s_param.clamp(-config.log_scale_bound, config.log_scale_bound)
         s_c = torch.exp(log_s)
-        loss = content_output_loss(
-            batch, params, geom, r_c, s_c, bits,
-            group_size=config.group_size, eps_scale=config.eps_scale, ste=True,
-            extra_consumers=batch_extra, **prot_kwargs,
-        )
-        if config.anchor > 0.0:
-            reg = config.anchor * ((r_c - eye).pow(2).sum() / d_c + log_s.pow(2).mean())
-            loss = loss + reg
+        if fit_mode == "full":
+            assert skew_param is not None
+            r_c = cayley_orthogonal(skew_param)
+            loss = content_output_loss(
+                batch, params, geom, r_c, s_c, bits,
+                group_size=config.group_size, eps_scale=config.eps_scale, ste=True,
+                extra_consumers=batch_extra, **prot_kwargs,
+            )
+            if config.anchor > 0.0:
+                reg = config.anchor * ((r_c - eye).pow(2).sum() / d_c + log_s.pow(2).mean())
+                loss = loss + reg
+        else:
+            loss = content_output_loss(
+                batch, params, geom, None, s_c, bits,
+                group_size=config.group_size, eps_scale=config.eps_scale, ste=True,
+                extra_consumers=batch_extra, **prot_kwargs,
+            )
+            if config.anchor > 0.0:
+                loss = loss + config.anchor * log_s.pow(2).mean()
         loss.backward()
         if config.grad_clip > 0.0:
-            torch.nn.utils.clip_grad_norm_([skew_param, log_s_param], config.grad_clip)
+            torch.nn.utils.clip_grad_norm_(clip_params, config.grad_clip)
         optimizer.step()
         with torch.no_grad():
             log_s_param.clamp_(-config.log_scale_bound, config.log_scale_bound)
 
         if step % config.val_every == 0 or step == config.steps:
             with torch.no_grad():
-                # Score the FP32 rotation that will ship. A single-precision solve
-                # at production rank can lose orthogonality before the FP32 cast.
-                r_eval = cayley_orthogonal(skew_param.double()).to(skew_param.dtype)
                 s_eval = torch.exp(log_s_param.clamp(-config.log_scale_bound, config.log_scale_bound))
-                val_loss = float(
-                    content_output_loss(
-                        val_seqs, params, geom, r_eval, s_eval, bits,
-                        group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
-                        extra_consumers=extra_val, **prot_kwargs,
-                    ).item()
-                )
+                if fit_mode == "full":
+                    assert skew_param is not None
+                    # Score the FP32 rotation that will ship. A single-precision solve
+                    # at production rank can lose orthogonality before the FP32 cast.
+                    r_eval = cayley_orthogonal(skew_param.double()).to(skew_param.dtype)
+                    val_loss = float(
+                        content_output_loss(
+                            val_seqs, params, geom, r_eval, s_eval, bits,
+                            group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
+                            extra_consumers=extra_val, **prot_kwargs,
+                        ).item()
+                    )
+                else:
+                    r_eval = eye
+                    val_loss = float(
+                        content_output_loss(
+                            val_seqs, params, geom, None, s_eval, bits,
+                            group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
+                            extra_consumers=extra_val, **prot_kwargs,
+                        ).item()
+                    )
                 if math.isfinite(val_loss) and val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_step = step
                     best_r = r_eval.detach().clone()
                     best_s = s_eval.detach().clone()
 
-    orth_err = float((best_r.transpose(0, 1) @ best_r - eye).abs().max().item())
+    orth_err = 0.0 if fit_mode == "scale_only" else float((best_r.transpose(0, 1) @ best_r - eye).abs().max().item())
     equiv_err = _check_content_equivalence(val_seqs, params, geom, best_r, best_s)
     return ContentFitResult(
         layer_id=geom.layer_id,
@@ -630,6 +793,7 @@ def fit_content_layer(
         baselines=baselines,
         protection_calibrated=config.protection,
         init_s=torch.exp(best_init_log_s).detach().cpu(),
+        fit_mode=fit_mode,
     )
 
 
@@ -639,10 +803,13 @@ def fit_rope_layer(
     config: FitConfig = FitConfig(),
     *,
     device: torch.device | str = "cpu",
+    fit_mode: str = "full",
 ) -> RopeFitResult:
-    """Fit per-frequency-pair SO(2) angles theta_i and pair-tied scales s_i for one MLA layer."""
+    """Fit per-frequency-pair SO(2) angles theta_i and pair-tied scales s_i (or scale_only s_i with theta=0)."""
     if bits not in ROPE_NONZERO_BITS:
         raise ValueError(f"fit_rope_layer requires bits in {sorted(ROPE_NONZERO_BITS)}, got {bits}")
+    if fit_mode not in VALID_FIT_MODES:
+        raise ValueError(f"invalid fit_mode {fit_mode!r}; expected one of {sorted(VALID_FIT_MODES)}")
     config.validate()
     bank.validate()
     geom = bank.geometry
@@ -680,7 +847,7 @@ def fit_rope_layer(
     with torch.no_grad():
         baselines["rtn_val"] = float(
             rope_qk_loss(
-                val_seqs, geom, zeros, ones, bits,
+                val_seqs, geom, None if fit_mode == "scale_only" else zeros, ones, bits,
                 group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs,
             ).item()
         )
@@ -699,7 +866,7 @@ def fit_rope_layer(
             cand_log_s = _init_log_scales(a_pair, alpha, config.log_scale_bound)
             cand_loss = float(
                 rope_qk_loss(
-                    val_seqs, geom, zeros, torch.exp(cand_log_s), bits,
+                    val_seqs, geom, None if fit_mode == "scale_only" else zeros, torch.exp(cand_log_s), bits,
                     group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs,
                 ).item()
             )
@@ -711,15 +878,19 @@ def fit_rope_layer(
                 best_init_log_s = cand_log_s
         baselines["smoothquant_alpha_val"] = best_alpha_loss
 
-    theta_param = torch.zeros(pairs, device=dev, dtype=torch.float32, requires_grad=True)
     log_s_param = best_init_log_s.clone().detach().requires_grad_(True)
-    optimizer = torch.optim.AdamW(
-        [
+    if fit_mode == "full":
+        theta_param = torch.zeros(pairs, device=dev, dtype=torch.float32, requires_grad=True)
+        opt_params = [
             {"params": [theta_param], "lr": config.rope_angle_lr},
             {"params": [log_s_param], "lr": config.rope_scale_lr},
-        ],
-        weight_decay=0.0,
-    )
+        ]
+        clip_params = [theta_param, log_s_param]
+    else:
+        theta_param = None
+        opt_params = [{"params": [log_s_param], "lr": config.rope_scale_lr}]
+        clip_params = [log_s_param]
+    optimizer = torch.optim.AdamW(opt_params, weight_decay=0.0)
 
     best_step = 0
     best_val_loss = best_alpha_loss
@@ -731,8 +902,11 @@ def fit_rope_layer(
 
     for step in range(1, config.steps + 1):
         lr_mult = _cosine_lr_factor(step - 1, config.steps, config.warmup_frac)
-        optimizer.param_groups[0]["lr"] = config.rope_angle_lr * lr_mult
-        optimizer.param_groups[1]["lr"] = config.rope_scale_lr * lr_mult
+        if fit_mode == "full":
+            optimizer.param_groups[0]["lr"] = config.rope_angle_lr * lr_mult
+            optimizer.param_groups[1]["lr"] = config.rope_scale_lr * lr_mult
+        else:
+            optimizer.param_groups[0]["lr"] = config.rope_scale_lr * lr_mult
 
         perm = torch.randperm(n_train, generator=gen)[: min(config.batch_size, n_train)].tolist()
         batch = tuple(train_seqs[i] for i in perm)
@@ -740,16 +914,25 @@ def fit_rope_layer(
         optimizer.zero_grad(set_to_none=True)
         log_s = log_s_param.clamp(-config.log_scale_bound, config.log_scale_bound)
         s_p = torch.exp(log_s)
-        loss = rope_qk_loss(
-            batch, geom, theta_param, s_p, bits,
-            group_size=config.group_size, eps_scale=config.eps_scale, ste=True, **prot_kwargs,
-        )
-        if config.anchor > 0.0:
-            reg = config.anchor * (theta_param.pow(2).mean() + log_s.pow(2).mean())
-            loss = loss + reg
+        if fit_mode == "full":
+            assert theta_param is not None
+            loss = rope_qk_loss(
+                batch, geom, theta_param, s_p, bits,
+                group_size=config.group_size, eps_scale=config.eps_scale, ste=True, **prot_kwargs,
+            )
+            if config.anchor > 0.0:
+                reg = config.anchor * (theta_param.pow(2).mean() + log_s.pow(2).mean())
+                loss = loss + reg
+        else:
+            loss = rope_qk_loss(
+                batch, geom, None, s_p, bits,
+                group_size=config.group_size, eps_scale=config.eps_scale, ste=True, **prot_kwargs,
+            )
+            if config.anchor > 0.0:
+                loss = loss + config.anchor * log_s.pow(2).mean()
         loss.backward()
         if config.grad_clip > 0.0:
-            torch.nn.utils.clip_grad_norm_([theta_param, log_s_param], config.grad_clip)
+            torch.nn.utils.clip_grad_norm_(clip_params, config.grad_clip)
         optimizer.step()
         with torch.no_grad():
             log_s_param.clamp_(-config.log_scale_bound, config.log_scale_bound)
@@ -757,16 +940,27 @@ def fit_rope_layer(
         if step % config.val_every == 0 or step == config.steps:
             with torch.no_grad():
                 s_eval = torch.exp(log_s_param.clamp(-config.log_scale_bound, config.log_scale_bound))
-                val_loss = float(
-                    rope_qk_loss(
-                        val_seqs, geom, theta_param, s_eval, bits,
-                        group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs,
-                    ).item()
-                )
+                if fit_mode == "full":
+                    assert theta_param is not None
+                    val_loss = float(
+                        rope_qk_loss(
+                            val_seqs, geom, theta_param, s_eval, bits,
+                            group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs,
+                        ).item()
+                    )
+                    theta_eval = theta_param
+                else:
+                    val_loss = float(
+                        rope_qk_loss(
+                            val_seqs, geom, None, s_eval, bits,
+                            group_size=config.group_size, eps_scale=config.eps_scale, ste=False, **prot_kwargs,
+                        ).item()
+                    )
+                    theta_eval = zeros
                 if math.isfinite(val_loss) and val_loss < best_val_loss:
                     best_val_loss = val_loss
                     best_step = step
-                    best_theta = theta_param.detach().clone()
+                    best_theta = theta_eval.detach().clone()
                     best_s = s_eval.detach().clone()
 
     equiv_err = _check_rope_equivalence(val_seqs, geom, best_theta, best_s)
@@ -782,7 +976,16 @@ def fit_rope_layer(
         baselines=baselines,
         protection_calibrated=config.protection,
         init_s=torch.exp(best_init_log_s).detach().cpu(),
+        fit_mode=fit_mode,
     )
+
+
+def fit_checkpoint_stem(kind: str, bits: int, layer_id: int, *, fit_mode: str = "full") -> str:
+    if fit_mode not in VALID_CHECKPOINT_MODES:
+        raise ValueError(f"invalid fit_mode {fit_mode!r}; expected one of {sorted(VALID_CHECKPOINT_MODES)}")
+    prefix = "c" if kind == "content" else "r"
+    tag = "scale" if fit_mode == "scale_only" else fit_mode
+    return f"{kind}-{tag}-{prefix}{bits}-layer-{layer_id:04d}"
 
 
 def save_fit_checkpoint(
@@ -791,17 +994,23 @@ def save_fit_checkpoint(
     *,
     identity_key: str,
 ) -> dict[str, Any]:
-    """Save one layer+bit-width fit checkpoint with streamed XXH3-128 receipt."""
+    """Save one v3 candidate fit checkpoint (full, scale_only, or smoothquant) with XXH3-128 receipt."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    fit_mode = result.fit_mode
+    if fit_mode not in VALID_CHECKPOINT_MODES:
+        raise ValueError(f"invalid fit_mode {fit_mode!r}; expected one of {sorted(VALID_CHECKPOINT_MODES)}")
     if isinstance(result, ContentFitResult):
         kind = "content"
-        stem = f"content-c{result.bits}-layer-{result.layer_id:04d}"
+        stem = fit_checkpoint_stem(kind, result.bits, result.layer_id, fit_mode=fit_mode)
+        classified_kind = classify_content_kind(result.r_c, result.s_c)
         tensors = {"r": result.r_c.float(), "s": result.s_c.float()}
         if result.init_s is not None:
             tensors["init_s"] = result.init_s.float()
         meta = {
             "kind": kind,
+            "fit_mode": fit_mode,
+            "classified_kind": classified_kind,
             "layer_id": result.layer_id,
             "bits": result.bits,
             "best_step": result.best_step,
@@ -814,12 +1023,15 @@ def save_fit_checkpoint(
         }
     else:
         kind = "rope"
-        stem = f"rope-r{result.bits}-layer-{result.layer_id:04d}"
+        stem = fit_checkpoint_stem(kind, result.bits, result.layer_id, fit_mode=fit_mode)
+        classified_kind = classify_rope_kind(result.theta, result.s_p)
         tensors = {"theta": result.theta.float(), "s": result.s_p.float()}
         if result.init_s is not None:
             tensors["init_s"] = result.init_s.float()
         meta = {
             "kind": kind,
+            "fit_mode": fit_mode,
+            "classified_kind": classified_kind,
             "layer_id": result.layer_id,
             "bits": result.bits,
             "best_step": result.best_step,
@@ -847,20 +1059,24 @@ def load_fit_checkpoint(
     bits: int,
     layer_id: int,
     identity_key: str,
+    fit_mode: str = "full",
 ) -> ContentFitResult | RopeFitResult | None:
-    """Reload a verified fit checkpoint, returning None if absent and failing on mismatch."""
+    """Reload a verified v3 fit checkpoint (rejecting any legacy schema or identity mismatch)."""
     directory = Path(directory)
-    prefix = "c" if kind == "content" else "r"
-    stem = f"{kind}-{prefix}{bits}-layer-{layer_id:04d}"
+    stem = fit_checkpoint_stem(kind, bits, layer_id, fit_mode=fit_mode)
     receipt_path = directory / f"{stem}.json"
     if not receipt_path.exists():
         return None
     record = json.loads(receipt_path.read_text(encoding="utf-8"))
     if record.get("schema") != FIT_CHECKPOINT_SCHEMA:
-        raise ValueError(f"unsupported fit checkpoint schema: {record.get('schema')!r}")
+        raise ValueError(
+            f"unsupported fit checkpoint schema: {record.get('schema')!r} (expected {FIT_CHECKPOINT_SCHEMA!r})"
+        )
     if record.get("identity_key") != identity_key:
         raise ValueError(f"fit checkpoint identity mismatch for {stem}: refuse stale resume")
     meta = record["meta"]
+    if meta.get("fit_mode") != fit_mode:
+        raise ValueError(f"fit checkpoint {stem} fit_mode={meta.get('fit_mode')!r} != requested {fit_mode!r}")
     payload = record["payload"]
     tensors = _read_safetensors_verified(
         directory / payload["file"], int(payload["bytes"]), str(payload["xxh3_128"])
@@ -879,6 +1095,7 @@ def load_fit_checkpoint(
             baselines=dict(meta["baselines"]),
             protection_calibrated=str(meta["protection_calibrated"]),
             init_s=tensors.get("init_s"),
+            fit_mode=fit_mode,
         )
     return RopeFitResult(
         layer_id=int(meta["layer_id"]),
@@ -892,6 +1109,7 @@ def load_fit_checkpoint(
         baselines=dict(meta["baselines"]),
         protection_calibrated=str(meta["protection_calibrated"]),
         init_s=tensors.get("init_s"),
+        fit_mode=fit_mode,
     )
 
 

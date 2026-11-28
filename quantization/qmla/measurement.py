@@ -1,16 +1,24 @@
-"""Candidate cross-tables, shipped-transform selection and held-out attention errors.
+"""Candidate cross-tables, per-width selection, v2 comparison and held-out attention errors.
 
-Every width's fit (``fitted:c4``) and its SmoothQuant initialization (``smoothquant:c4``)
-is a candidate transform for its path. ``measure_candidates`` scores every candidate
-(and every content x RoPE candidate pair on joint combinations) against every
-requested combination on one split, beside the RTN and fixed-Hadamard baselines.
-``select_shipped`` picks one content and one RoPE transform per layer on ``val``;
-reported numbers come from the same table measured on ``test``.
+In QMLA v3, each layer × path has a candidate pool containing:
+- ``identity`` (always present; exact native coordinates, zero transform work);
+- full fits ``fitted:c{b}`` / ``fitted:r{b}`` (for every width with a full fit, including
+  any already-produced 8-bit full fit checkpoints);
+- scale-only fits ``scale_fitted:c{b}`` / ``scale_fitted:r{b}`` (the default 8-bit budget);
+- step-0 SmoothQuant alpha-grid initializations ``smoothquant:c{b}`` / ``smoothquant:r{b}``.
+
+``measure_candidates`` scores every candidate cell (and every content × RoPE pair on joint
+combinations) on one split beside the identity (RTN) and fixed-Hadamard baselines.
+``select_per_width`` picks one transform per ``(layer, path, serving_width)`` on ``val``,
+classifies each winner's explicit kind (``identity`` | ``scale_only`` | ``full``) from its
+actual tensors, and ``select_shared_v2`` computes the old v2 single-transform-per-path
+policy on the same ``val`` table for direct comparison on held-out ``test``.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from functools import partial
+import itertools
 import math
 from typing import Any, Mapping, Sequence
 
@@ -20,33 +28,54 @@ from .capture import CapturedLayerBank, cached_content, eval_attention_output
 from .fit import (
     ContentFitResult,
     FitConfig,
+    ROTATION_IDENTITY_TOL,
     RopeFitResult,
+    SCALE_IDENTITY_TOL,
     _check_content_equivalence,
     _check_rope_equivalence,
     _init_log_scales,
     _quantile_999,
     apply_content_forward,
+    apply_content_scale_only,
     apply_rope_pair_transform,
+    apply_rope_scale_only,
+    classify_content_kind,
+    classify_rope_kind,
     compensate_kv_b,
+    compensate_kv_b_scale_only,
 )
 from .quantizer import qdq_asymmetric_group, sylvester_hadamard
 
-SELECTION_OBJECTIVE = "mean_val_ratio_to_rtn"
-CANDIDATE_KINDS = ("fitted", "smoothquant")
+SELECTION_OBJECTIVE = "per_width_mean_val_ratio_to_rtn"
+V2_SELECTION_OBJECTIVE = "mean_val_ratio_to_rtn"
+HEADLINE_DEPLOYMENT_MODES: tuple[str, ...] = ("4:0", "2:4", "8:0", "8:8", "4:8")
+CANDIDATE_KINDS = ("identity", "fitted", "scale_fitted", "smoothquant")
+KIND_SIMPLICITY_RANK = {"identity": 0, "scale_only": 1, "full": 2}
 NATIVE_ROPE = "native"
+_TIE_REL_TOL = 1e-12
 
 
-def candidate_id(kind: str, path: str, bits: int) -> str:
-    if kind not in CANDIDATE_KINDS or path not in ("content", "rope"):
-        raise ValueError(f"invalid candidate {kind!r}/{path!r}")
+def candidate_id(kind: str, path: str | None = None, bits: int | None = None) -> str:
+    if kind == "identity":
+        return "identity"
+    if kind not in CANDIDATE_KINDS or path not in ("content", "rope") or bits is None:
+        raise ValueError(f"invalid candidate {kind!r}/{path!r}/{bits!r}")
     return f"{kind}:{'c' if path == 'content' else 'r'}{int(bits)}"
 
 
-def parse_candidate_id(cid: str) -> tuple[str, str, int]:
-    kind, _, width = cid.partition(":")
-    if kind not in CANDIDATE_KINDS or len(width) < 2 or width[0] not in "cr" or not width[1:].isdigit():
+def parse_candidate_id(cid: str) -> tuple[str, str | None, int | None]:
+    if cid == "identity":
+        return "identity", None, None
+    kind, sep, width = cid.partition(":")
+    if (
+        not sep
+        or kind not in ("fitted", "scale_fitted", "smoothquant")
+        or len(width) < 2
+        or width[0] not in "cr"
+        or not width[1:].isdigit()
+    ):
         raise ValueError(f"invalid candidate id {cid!r}")
-    return kind, "content" if width[0] == "c" else "rope", int(width[1:])
+    return kind, ("content" if width[0] == "c" else "rope"), int(width[1:])
 
 
 def pair_id(content: str | None, rope: str | None) -> str:
@@ -66,7 +95,7 @@ def combo_key(mode: tuple[int, int]) -> str:
 
 @dataclass(frozen=True)
 class LayerCandidates:
-    """Candidate transforms for one layer, keyed by ``candidate_id`` in a fixed order."""
+    """Candidate transforms for one layer, keyed by ``candidate_id`` in deterministic order."""
 
     content: dict[str, ContentFitResult]
     rope: dict[str, RopeFitResult]
@@ -91,40 +120,121 @@ def _init_scale(fit, stats_fn, bank, config) -> torch.Tensor:
     return _init_log_scales(stats_fn(bank, "cpu"), fit.init_alpha, config.log_scale_bound).exp()
 
 
+def _identity_content_result(layer_id: int, d_c: int, protection: str) -> ContentFitResult:
+    return ContentFitResult(
+        layer_id=layer_id,
+        bits=0,
+        r_c=torch.eye(d_c, dtype=torch.float32),
+        s_c=torch.ones(d_c, dtype=torch.float32),
+        best_step=0,
+        best_val_loss=0.0,
+        init_alpha=0.0,
+        equiv_max_rel_err=0.0,
+        orth_max_err=0.0,
+        baselines={},
+        protection_calibrated=protection,
+        init_s=torch.ones(d_c, dtype=torch.float32),
+        fit_mode="scale_only",
+    )
+
+
+def _identity_rope_result(layer_id: int, pairs: int, protection: str) -> RopeFitResult:
+    return RopeFitResult(
+        layer_id=layer_id,
+        bits=0,
+        theta=torch.zeros(pairs, dtype=torch.float32),
+        s_p=torch.ones(pairs, dtype=torch.float32),
+        best_step=0,
+        best_val_loss=0.0,
+        init_alpha=0.0,
+        equiv_max_rel_err=0.0,
+        baselines={},
+        protection_calibrated=protection,
+        init_s=torch.ones(pairs, dtype=torch.float32),
+        fit_mode="scale_only",
+    )
+
+
 def layer_candidates(
     bank: CapturedLayerBank,
     content_fits: Mapping[int, ContentFitResult],
     rope_fits: Mapping[int, RopeFitResult],
     config: FitConfig,
+    *,
+    content_scale_fits: Mapping[int, ContentFitResult] | None = None,
+    rope_scale_fits: Mapping[int, RopeFitResult] | None = None,
 ) -> LayerCandidates:
-    """Every width's fit plus the SmoothQuant initialization it started from.
+    """Build the full candidate pool for one layer.
 
-    A SmoothQuant candidate is the fit's step 0: identity rotation (or zero angles) and
-    the width's best alpha-grid scales, as recorded by the fit (``init_s``). Its
-    ``equiv_max_rel_err`` is NaN until ``with_equivalence`` measures it.
+    Includes:
+    - ``identity`` (always present for each active path);
+    - full fits ``fitted:c{b}`` / ``fitted:r{b}``;
+    - scale-only fits ``scale_fitted:c{b}`` / ``scale_fitted:r{b}``;
+    - step-0 SmoothQuant initializations ``smoothquant:c{b}`` / ``smoothquant:r{b}``.
     """
+    c_scale = dict(content_scale_fits or {})
+    r_scale = dict(rope_scale_fits or {})
     content: dict[str, ContentFitResult] = {}
     rope: dict[str, RopeFitResult] = {}
     d_c = bank.geometry.kv_lora_rank
-    for bits in sorted(content_fits):
-        content[candidate_id("fitted", "content", bits)] = content_fits[bits]
-    for bits in sorted(content_fits):
-        fit = content_fits[bits]
-        content[candidate_id("smoothquant", "content", bits)] = replace(
-            fit, r_c=torch.eye(d_c), s_c=_init_scale(fit, _content_stats, bank, config), best_step=0,
-            best_val_loss=fit.baselines["smoothquant_alpha_val"], equiv_max_rel_err=math.nan, orth_max_err=0.0,
-        )
-    if rope_fits and bank.geometry.has_rope:
+    lid = bank.geometry.layer_id
+
+    if content_fits or c_scale:
+        content["identity"] = _identity_content_result(lid, d_c, config.protection)
+        for bits in sorted(content_fits):
+            content[candidate_id("fitted", "content", bits)] = content_fits[bits]
+        for bits in sorted(c_scale):
+            content[candidate_id("scale_fitted", "content", bits)] = c_scale[bits]
+        for bits in sorted(set(content_fits) | set(c_scale)):
+            fit = content_fits.get(bits) or c_scale[bits]
+            content[candidate_id("smoothquant", "content", bits)] = replace(
+                fit,
+                r_c=torch.eye(d_c, dtype=torch.float32),
+                s_c=_init_scale(fit, _content_stats, bank, config),
+                best_step=0,
+                best_val_loss=fit.baselines["smoothquant_alpha_val"],
+                equiv_max_rel_err=math.nan,
+                orth_max_err=0.0,
+                fit_mode="scale_only",
+            )
+
+    if (rope_fits or r_scale) and bank.geometry.has_rope:
+        pairs = bank.geometry.qk_rope_dim // 2
+        rope["identity"] = _identity_rope_result(lid, pairs, config.protection)
         for bits in sorted(rope_fits):
             rope[candidate_id("fitted", "rope", bits)] = rope_fits[bits]
-        for bits in sorted(rope_fits):
-            fit = rope_fits[bits]
+        for bits in sorted(r_scale):
+            rope[candidate_id("scale_fitted", "rope", bits)] = r_scale[bits]
+        for bits in sorted(set(rope_fits) | set(r_scale)):
+            fit = rope_fits.get(bits) or r_scale[bits]
             scale = _init_scale(fit, _rope_stats, bank, config)
             rope[candidate_id("smoothquant", "rope", bits)] = replace(
-                fit, theta=torch.zeros_like(scale), s_p=scale, best_step=0,
-                best_val_loss=fit.baselines["smoothquant_alpha_val"], equiv_max_rel_err=math.nan,
+                fit,
+                theta=torch.zeros_like(scale),
+                s_p=scale,
+                best_step=0,
+                best_val_loss=fit.baselines["smoothquant_alpha_val"],
+                equiv_max_rel_err=math.nan,
+                fit_mode="scale_only",
             )
     return LayerCandidates(content=content, rope=rope)
+
+
+def candidate_kind(path: str, cid: str, result: Any) -> str:
+    """Classify a candidate's actual transform kind from its tensors (never blindly by name)."""
+    if result is None:
+        # Lightweight test stub fallback when tensors are absent.
+        ckind, _, _ = parse_candidate_id(cid)
+        if ckind == "identity":
+            return "identity"
+        if ckind in ("scale_fitted", "smoothquant"):
+            return "scale_only"
+        return "full"
+    if hasattr(result, "kind"):
+        return str(result.kind)
+    if path == "content":
+        return classify_content_kind(result.r_c, result.s_c, rot_tol=ROTATION_IDENTITY_TOL, scale_tol=SCALE_IDENTITY_TOL)
+    return classify_rope_kind(result.theta, result.s_p, rot_tol=ROTATION_IDENTITY_TOL, scale_tol=SCALE_IDENTITY_TOL)
 
 
 def with_equivalence(result, bank: CapturedLayerBank, device):
@@ -133,10 +243,16 @@ def with_equivalence(result, bank: CapturedLayerBank, device):
         return result
     seqs = tuple(seq.to(device) for seq in bank.val)
     if isinstance(result, ContentFitResult):
+        kind = classify_content_kind(result.r_c, result.s_c)
+        if kind == "identity":
+            return replace(result, equiv_max_rel_err=0.0, orth_max_err=0.0)
         err = _check_content_equivalence(
             seqs, bank.params.to(device), bank.geometry, result.r_c.to(device), result.s_c.to(device)
         )
     else:
+        kind = classify_rope_kind(result.theta, result.s_p)
+        if kind == "identity":
+            return replace(result, equiv_max_rel_err=0.0)
         err = _check_rope_equivalence(seqs, bank.geometry, result.theta.to(device), result.s_p.to(device))
     return replace(result, equiv_max_rel_err=err)
 
@@ -158,10 +274,19 @@ def _token_relative_squares(pred, ref):
 
 
 class _Scorer:
-    """Score one layer's split under arbitrary content/RoPE arms at a given combination."""
+    """Score one layer's split under arbitrary content/RoPE arms with kind-specific execution."""
 
-    def __init__(self, bank: CapturedLayerBank | None, split: str | None, config: FitConfig, device,
-                 *, geom=None, params=None, seqs=()):
+    def __init__(
+        self,
+        bank: CapturedLayerBank | None,
+        split: str | None,
+        config: FitConfig,
+        device,
+        *,
+        geom=None,
+        params=None,
+        seqs=(),
+    ):
         if bank is not None:
             geom = bank.geometry
             params = bank.params
@@ -181,38 +306,66 @@ class _Scorer:
         self._kv_b: dict[str, torch.Tensor] = {}
 
     def content_hooks(self, bits: int, arm) -> dict[str, Any]:
-        """``arm`` is ``"rtn"``, ``"hadamard"`` or ``(cache_key, ContentFitResult)``."""
+        """``arm`` is ``"rtn"``, ``"hadamard"``, or ``(cache_key, ContentFitResult | ResolvedContentTransform)``."""
         if not bits:
             return {}
         params = self.params
         hooks: dict[str, Any] = {}
         if arm == "rtn":
             exact = lambda c: c
-        else:
-            if arm == "hadamard":
-                if self.hadamard is None:
-                    raise ValueError("fixed Hadamard needs a power-of-two kv_lora_rank")
-                key, rotation, scale = "hadamard", self.hadamard, torch.ones(self.geom.kv_lora_rank, device=self.device)
-            else:
-                key, result = arm
-                rotation, scale = result.r_c.to(self.device), result.s_c.to(self.device)
+        elif arm == "hadamard":
+            if self.hadamard is None:
+                raise ValueError("fixed Hadamard needs a power-of-two kv_lora_rank")
+            key, rotation, scale = "hadamard", self.hadamard, torch.ones(self.geom.kv_lora_rank, device=self.device)
             exact = partial(apply_content_forward, r_c=rotation, s_c=scale)
             if key not in self._kv_b:
                 self._kv_b[key] = compensate_kv_b(params.kv_b_weight, rotation, scale)
             hooks["kv_b_override"] = self._kv_b[key]
+        else:
+            key, result = arm
+            kind = (
+                result.kind
+                if hasattr(result, "kind")
+                else classify_content_kind(result.r_c, result.s_c)
+            )
+            if kind == "identity":
+                exact = lambda c: c
+            elif kind == "scale_only":
+                scale = result.s_c.to(self.device)
+                exact = partial(apply_content_scale_only, s_c=scale)
+                if key not in self._kv_b:
+                    self._kv_b[key] = compensate_kv_b_scale_only(params.kv_b_weight, scale)
+                hooks["kv_b_override"] = self._kv_b[key]
+            else:
+                rotation, scale = result.r_c.to(self.device), result.s_c.to(self.device)
+                exact = partial(apply_content_forward, r_c=rotation, s_c=scale)
+                if key not in self._kv_b:
+                    self._kv_b[key] = compensate_kv_b(params.kv_b_weight, rotation, scale)
+                hooks["kv_b_override"] = self._kv_b[key]
         hooks["content_fn"] = _quantized(exact, bits, "BF16", self.config)
         if self.protection:
             hooks["exact_content_fn"] = exact
         return hooks
 
     def rope_hooks(self, bits: int, arm) -> dict[str, Any]:
-        """``arm`` is ``NATIVE_ROPE`` (RTN and the Hadamard arm) or a ``RopeFitResult``."""
+        """``arm`` is ``NATIVE_ROPE`` or a ``RopeFitResult`` / ``ResolvedRopeTransform``."""
         if not bits or not self.geom.has_rope:
             return {}
         if arm == NATIVE_ROPE:
-            # A full Hadamard would mix positional frequencies, so the Hadamard arm uses native RoPE.
+            kind = "identity"
+        else:
+            kind = (
+                arm.kind
+                if hasattr(arm, "kind")
+                else classify_rope_kind(arm.theta, arm.s_p)
+            )
+        if kind == "identity":
             exact = lambda x: x
             hooks: dict[str, Any] = {}
+        elif kind == "scale_only":
+            scale = arm.s_p.to(self.device)
+            exact = partial(apply_rope_scale_only, scale=scale, rope_kind=self.geom.rope_kind)
+            hooks = {"rope_query_fn": partial(exact, inverse_scale=True)}
         else:
             theta, scale = arm.theta.to(self.device), arm.s_p.to(self.device)
             exact = partial(apply_rope_pair_transform, theta=theta, scale=scale, rope_kind=self.geom.rope_kind)
@@ -265,29 +418,27 @@ def measure_candidates(
     *,
     split: str,
 ) -> dict[str, dict[str, Any]]:
-    """Score every candidate cell plus RTN and fixed Hadamard for every combination on ``split``.
-
-    Joint combinations score every content x RoPE pair; single-path combinations score each
-    candidate of the quantized path. A combination that quantizes nothing at this layer
-    (a RoPE-only combination on a NoPE layer) is omitted.
-    """
+    """Score every candidate cell plus RTN (identity) and fixed Hadamard on ``split``."""
     scorer = _Scorer(bank, split, config, device)
     table: dict[str, dict[str, Any]] = {}
     for mode in modes:
         if not layer_quantizes(bank.geometry, mode):
             continue
-        cb, _ = mode
+        cb, rb = mode
+        rope_on = bool(rb) and bank.geometry.has_rope
         rtn = scorer.score(mode, "rtn", NATIVE_ROPE)
         row: dict[str, Any] = {
             "tokens": scorer.tokens,
             "rtn": rtn,
-            # Hadamard rotates content only, so on RoPE-only combinations it is RTN.
             "hadamard": scorer.score(mode, "hadamard", NATIVE_ROPE) if cb else rtn,
             "cells": {},
         }
         for c, r in table_cells(candidates, bank.geometry, mode):
+            if (c is None or c == "identity") and (r is None or r == "identity"):
+                row["cells"][pair_id(c, r)] = rtn
+                continue
             content_arm = (c, candidates.content[c]) if c is not None else "rtn"
-            rope_arm = candidates.rope[r] if r is not None else NATIVE_ROPE
+            rope_arm = candidates.rope[r] if (r is not None and rope_on) else NATIVE_ROPE
             row["cells"][pair_id(c, r)] = scorer.score(mode, content_arm, rope_arm)
         table[combo_key(mode)] = row
     return table
@@ -302,26 +453,187 @@ def _mode_of(key: str) -> tuple[int, int]:
     return int(c), int(r)
 
 
-def select_shipped(
+def _is_strictly_better(val: float, tie: tuple[Any, ...], best_val: float, best_tie: tuple[Any, ...]) -> bool:
+    tol = _TIE_REL_TOL * max(1.0, abs(best_val))
+    if val < best_val - tol:
+        return True
+    if abs(val - best_val) <= tol and tie < best_tie:
+        return True
+    return False
+
+
+def select_per_width(
     val_table: Mapping[str, Mapping[str, Any]],
     candidates: LayerCandidates,
     geometry,
 ) -> dict[str, Any]:
-    """Pick the (content, RoPE) candidate pair with the lowest mean val ratio to RTN.
+    """Select one transform per ``(path, serving_width)`` minimizing mean val ratio to RTN.
 
-    The mean runs over every measured combination at this layer, so each width counts
-    equally: a 2-bit combination's larger absolute error does not outvote the 8-bit ones.
-    Content-only combinations depend on the content candidate alone and RoPE-only ones on
-    the RoPE candidate alone; joint combinations score the pair together, which is what
-    the per-path fits cannot see.
+    Because content width selections ``c_w`` are conditionally independent once the RoPE
+    width selections ``(r_4, r_8)`` are fixed, exact global minimization over all serving
+    widths runs in milliseconds while preserving joint content × RoPE interaction checks.
+
+    Ties (within ``1e-12`` relative tolerance) prefer simpler transform kinds
+    (``identity < scale_only < full``), then natural training width (``source_bits == width``),
+    then lexicographic candidate ID.
     """
+    if not val_table:
+        raise ValueError(f"layer {geometry.layer_id} has no measured combination to select on")
+
+    mode_rows = [(_mode_of(k), k, row) for k, row in sorted(val_table.items())]
+    for (_, key, row) in mode_rows:
+        if not row["rtn"] > 0.0:
+            raise ValueError(f"layer {geometry.layer_id} {key} RTN val error is not positive")
+
+    content_bits = sorted({cb for (cb, _), _, _ in mode_rows if cb > 0})
+    rope_bits = sorted({rb for (_, rb), _, _ in mode_rows if rb > 0}) if geometry.has_rope else []
+    content_ids = list(candidates.content) if content_bits else []
+    rope_ids = list(candidates.rope) if rope_bits else []
+    if content_bits and not content_ids:
+        raise ValueError(f"layer {geometry.layer_id} needs content candidates for widths {content_bits}")
+    if rope_bits and not rope_ids:
+        raise ValueError(f"layer {geometry.layer_id} needs RoPE candidates for widths {rope_bits}")
+
+    c_kinds = {cid: candidate_kind("content", cid, candidates.content[cid]) for cid in content_ids}
+    r_kinds = {rid: candidate_kind("rope", rid, candidates.rope[rid]) for rid in rope_ids}
+    c_src_bits = {cid: parse_candidate_id(cid)[2] for cid in content_ids}
+    r_src_bits = {rid: parse_candidate_id(rid)[2] for rid in rope_ids}
+
+    modes_by_cb: dict[int, list[tuple[tuple[int, int], str, Mapping[str, Any]]]] = {cb: [] for cb in content_bits}
+    rope_only_modes: list[tuple[tuple[int, int], str, Mapping[str, Any]]] = []
+    for entry in mode_rows:
+        (cb, rb), _, _ = entry
+        if cb > 0:
+            modes_by_cb[cb].append(entry)
+        elif rb > 0 and geometry.has_rope:
+            rope_only_modes.append(entry)
+
+    rope_combos = list(itertools.product(rope_ids, repeat=len(rope_bits))) if rope_bits else [()]
+    best_obj = float("inf")
+    best_tie: tuple[Any, ...] = ()
+    best_c_map: dict[int, str] = {}
+    best_r_map: dict[int, str] = {}
+    n_modes = len(mode_rows)
+
+    for r_tuple in rope_combos:
+        r_map = dict(zip(rope_bits, r_tuple))
+        total_ratio = 0.0
+        for (_, rb), _, row in rope_only_modes:
+            total_ratio += _cell(row, None, r_map[rb]) / row["rtn"]
+
+        c_map: dict[int, str] = {}
+        for cb in content_bits:
+            cb_entries = modes_by_cb[cb]
+            best_c_sum = float("inf")
+            best_c_tie: tuple[Any, ...] = ()
+            best_cid = content_ids[0]
+            for cid in content_ids:
+                s = 0.0
+                for (_, rb), _, row in cb_entries:
+                    r_pick = r_map[rb] if (rb > 0 and geometry.has_rope) else None
+                    s += _cell(row, cid, r_pick) / row["rtn"]
+                c_tie = (
+                    KIND_SIMPLICITY_RANK[c_kinds[cid]],
+                    0 if cid == "identity" else 1,
+                    0 if c_src_bits[cid] == cb else 1,
+                    cid,
+                )
+                if not math.isfinite(best_c_sum) or _is_strictly_better(s, c_tie, best_c_sum, best_c_tie):
+                    best_c_sum = s
+                    best_c_tie = c_tie
+                    best_cid = cid
+            c_map[cb] = best_cid
+            total_ratio += best_c_sum
+
+        obj = total_ratio / n_modes
+        total_rank = sum(KIND_SIMPLICITY_RANK[c_kinds[c_map[cb]]] for cb in content_bits) + sum(
+            KIND_SIMPLICITY_RANK[r_kinds[r_map[rb]]] for rb in rope_bits
+        )
+        non_explicit_id = sum(0 if c_map[cb] == "identity" else 1 for cb in content_bits) + sum(
+            0 if r_map[rb] == "identity" else 1 for rb in rope_bits
+        )
+        mismatches = sum(0 if c_src_bits[c_map[cb]] == cb else 1 for cb in content_bits) + sum(
+            0 if r_src_bits[r_map[rb]] == rb else 1 for rb in rope_bits
+        )
+        tie = (
+            total_rank,
+            non_explicit_id,
+            mismatches,
+            tuple(c_map[cb] for cb in content_bits),
+            tuple(r_map[rb] for rb in rope_bits),
+        )
+        if not math.isfinite(best_obj) or _is_strictly_better(obj, tie, best_obj, best_tie):
+            best_obj = obj
+            best_tie = tie
+            best_c_map = c_map
+            best_r_map = r_map
+
+    content_out: dict[str, Any] | None = None
+    if content_bits:
+        content_out = {}
+        for cb in content_bits:
+            cid = best_c_map[cb]
+            scores = {}
+            ratios = []
+            for (_, rb), key, row in modes_by_cb[cb]:
+                r_pick = best_r_map[rb] if (rb > 0 and geometry.has_rope) else None
+                val_err = _cell(row, cid, r_pick)
+                scores[key] = val_err
+                ratios.append(val_err / row["rtn"])
+            content_out[str(cb)] = {
+                "candidate": cid,
+                "kind": c_kinds[cid],
+                "source_bits": c_src_bits[cid],
+                "val_score": scores,
+                "width_mean_val_ratio_to_rtn": sum(ratios) / len(ratios),
+            }
+
+    rope_out: dict[str, Any] | None = None
+    if rope_bits:
+        rope_out = {}
+        for rb in rope_bits:
+            rid = best_r_map[rb]
+            scores = {}
+            ratios = []
+            for (cb, m_rb), key, row in mode_rows:
+                if m_rb != rb:
+                    continue
+                c_pick = best_c_map[cb] if cb > 0 else None
+                val_err = _cell(row, c_pick, rid)
+                scores[key] = val_err
+                ratios.append(val_err / row["rtn"])
+            rope_out[str(rb)] = {
+                "candidate": rid,
+                "kind": r_kinds[rid],
+                "source_bits": r_src_bits[rid],
+                "val_score": scores,
+                "width_mean_val_ratio_to_rtn": sum(ratios) / len(ratios),
+            }
+
+    return {
+        "objective": SELECTION_OBJECTIVE,
+        "overall_objective": best_obj,
+        "content": content_out,
+        "rope": rope_out,
+    }
+
+
+def select_shared_v2(
+    val_table: Mapping[str, Mapping[str, Any]],
+    candidates: LayerCandidates,
+    geometry,
+) -> dict[str, Any]:
+    """Legacy v2 single-transform-per-path selector, kept strictly as a report comparison baseline."""
     if not val_table:
         raise ValueError(f"layer {geometry.layer_id} has no measured combination to select on")
     uses_content = any(_mode_of(k)[0] for k in val_table)
     uses_rope = any(_mode_of(k)[1] for k in val_table) and geometry.has_rope
     content_ids: list[str | None] = list(candidates.content) if uses_content else [None]
     rope_ids: list[str | None] = list(candidates.rope) if uses_rope else [None]
-    best: tuple[float, str | None, str | None] | None = None
+    best_obj = float("inf")
+    best_tie: tuple[Any, ...] = ()
+    c_best: str | None = None
+    r_best: str | None = None
     objectives: dict[str, float] = {}
     for c in content_ids:
         for r in rope_ids:
@@ -335,15 +647,19 @@ def select_shipped(
                 ratios.append(_cell(row, cell_c, cell_r) / row["rtn"])
             objective = sum(ratios) / len(ratios)
             objectives[pair_id(c, r)] = objective
-            if best is None or objective < best[0]:
-                best = (objective, c, r)
-    assert best is not None
-    _, c_best, r_best = best
+            c_rank = KIND_SIMPLICITY_RANK[candidate_kind("content", c, candidates.content[c])] if c is not None else 0
+            r_rank = KIND_SIMPLICITY_RANK[candidate_kind("rope", r, candidates.rope[r])] if r is not None else 0
+            tie = (c_rank + r_rank, str(c or ""), str(r or ""))
+            if not math.isfinite(best_obj) or _is_strictly_better(objective, tie, best_obj, best_tie):
+                best_obj = objective
+                best_tie = tie
+                c_best, r_best = c, r
 
     def path_record(path: str, cid: str | None) -> dict[str, Any] | None:
         if cid is None:
             return None
-        kind, _, bits = parse_candidate_id(cid)
+        ckind, _, bits = parse_candidate_id(cid)
+        pool = candidates.content if path == "content" else candidates.rope
         val_score = {}
         for key, row in val_table.items():
             cb, rb = _mode_of(key)
@@ -351,27 +667,19 @@ def select_shipped(
                 val_score[key] = _cell(row, c_best if cb else None, r_best if rb and geometry.has_rope else None)
         return {
             "candidate": cid,
-            "chosen": kind,
+            "chosen": ckind,
+            "kind": candidate_kind(path, cid, pool[cid]),
             "source_bits": bits,
-            "objective": objectives[pair_id(c_best, r_best)],
+            "objective": best_obj,
             "val_score": val_score,
         }
 
     return {
-        "objective": SELECTION_OBJECTIVE,
+        "objective": V2_SELECTION_OBJECTIVE,
         "content": path_record("content", c_best),
         "rope": path_record("rope", r_best),
         "pair_objectives": objectives,
     }
-
-
-def natural_cell(kind: str, mode: tuple[int, int], geometry) -> tuple[str | None, str | None]:
-    """The cell a combination's own widths give: e.g. ``fitted:c4+fitted:r4`` at 4:4."""
-    cb, rb = mode
-    return (
-        candidate_id(kind, "content", cb) if cb else None,
-        candidate_id(kind, "rope", rb) if rb and geometry.has_rope else None,
-    )
 
 
 def layer_rows(
@@ -379,61 +687,55 @@ def layer_rows(
     val_table: Mapping[str, Mapping[str, Any]],
     selection: Mapping[str, Any],
     geometry,
+    *,
+    v2_selection: Mapping[str, Any] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Per-combination test rows for one layer: shipped, per-width fitted, SmoothQuant, baselines."""
-    shipped_c = selection["content"]["candidate"] if selection["content"] else None
-    shipped_r = selection["rope"]["candidate"] if selection["rope"] else None
+    """Per-combination held-out test rows for one layer: v3 shipped, v2 shared, identity, Hadamard."""
     rows = {}
     for key, row in test_table.items():
-        mode = _mode_of(key)
-        cb, rb = mode
+        cb, rb = _mode_of(key)
         rope_on = bool(rb) and geometry.has_rope
-        shipped = (shipped_c if cb else None, shipped_r if rope_on else None)
-        fitted = natural_cell("fitted", mode, geometry)
-        smooth = natural_cell("smoothquant", mode, geometry)
-        out = {
+        c_sel = selection["content"][str(cb)] if cb else None
+        r_sel = selection["rope"][str(rb)] if rope_on else None
+        shipped = (c_sel["candidate"] if c_sel else None, r_sel["candidate"] if r_sel else None)
+        if v2_selection is not None:
+            v2_c = v2_selection["content"]["candidate"] if (cb and v2_selection["content"]) else None
+            v2_r = v2_selection["rope"]["candidate"] if (rope_on and v2_selection["rope"]) else None
+            v2_cell = (v2_c, v2_r)
+            v2_err = _cell(row, *v2_cell)
+            v2_cell_id = pair_id(*v2_cell)
+        else:
+            v2_err = _cell(row, *shipped)
+            v2_cell_id = pair_id(*shipped)
+
+        rows[key] = {
             "tokens": row["tokens"],
             "attn_rel_err": _cell(row, *shipped),
-            "per_width_fitted_attn_rel_err": _cell(row, *fitted),
-            "smoothquant_attn_rel_err": _cell(row, *smooth),
+            "v2_shared_attn_rel_err": v2_err,
             "rtn_attn_rel_err": row["rtn"],
             "hadamard_attn_rel_err": row["hadamard"],
             "shipped_cell": pair_id(*shipped),
-            # The per-combination guard: which of this combination's own fitted/init cells wins on val.
-            "guard_val": {
-                pair_id(c, r): _cell(val_table[key], c, r)
-                for c in ((fitted[0], smooth[0]) if cb else (None,))
-                for r in ((fitted[1], smooth[1]) if rope_on else (None,))
+            "shipped_kinds": {
+                "content": c_sel["kind"] if c_sel else None,
+                "rope": r_sel["kind"] if r_sel else None,
             },
+            "v2_shared_cell": v2_cell_id,
+            "val_cells": dict(val_table[key]["cells"]),
             "cells": dict(row["cells"]),
         }
-        out["guard_choice"] = min(out["guard_val"], key=out["guard_val"].get)
-        out["guard_attn_rel_err"] = _cell(row, *_split_pair(out["guard_choice"]))
-        out["fitted_beats_smoothquant"] = out["per_width_fitted_attn_rel_err"] < out["smoothquant_attn_rel_err"]
-        rows[key] = out
     return rows
-
-
-def _split_pair(pid: str) -> tuple[str | None, str | None]:
-    if "+" in pid:
-        c, r = pid.split("+")
-        return c, r
-    _, path, _ = parse_candidate_id(pid)
-    return (pid, None) if path == "content" else (None, pid)
 
 
 REPORTED_ERRORS = (
     "attn_rel_err",
-    "per_width_fitted_attn_rel_err",
-    "smoothquant_attn_rel_err",
-    "guard_attn_rel_err",
+    "v2_shared_attn_rel_err",
     "rtn_attn_rel_err",
     "hadamard_attn_rel_err",
 )
 
 
 def summarize_modes(by_layer: Mapping[Any, Mapping[str, Mapping[str, Any]]]) -> dict[str, dict[str, Any]]:
-    """Token-weighted test summaries per combination over layers, plus the cross-table."""
+    """Token-weighted test summaries per combination over layers, plus the full candidate cross-table."""
     summaries: dict[str, dict[str, Any]] = {}
     for layer, modes in by_layer.items():
         for key, row in modes.items():
@@ -446,15 +748,13 @@ def summarize_modes(by_layer: Mapping[Any, Mapping[str, Mapping[str, Any]]]) -> 
         for field in REPORTED_ERRORS:
             summary[field] = sum(row[field] * row["tokens"] for row in rows) / tokens
         rtn = summary["rtn_attn_rel_err"]
-        for field, ratio in (
-            ("attn_rel_err", "ratio_to_rtn"),
-            ("per_width_fitted_attn_rel_err", "per_width_fitted_ratio_to_rtn"),
-            ("smoothquant_attn_rel_err", "smoothquant_ratio_to_rtn"),
-            ("hadamard_attn_rel_err", "hadamard_ratio_to_rtn"),
-        ):
-            summary[ratio] = summary[field] / rtn if rtn else None
-        summary["fitted_beats_smoothquant_layers"] = sum(bool(row["fitted_beats_smoothquant"]) for row in rows)
+        v2 = summary["v2_shared_attn_rel_err"]
+        summary["ratio_to_rtn"] = summary["attn_rel_err"] / rtn if rtn else None
+        summary["v2_shared_ratio_to_rtn"] = v2 / rtn if rtn else None
+        summary["ratio_to_v2_shared"] = summary["attn_rel_err"] / v2 if v2 else None
+        summary["hadamard_ratio_to_rtn"] = summary["hadamard_attn_rel_err"] / rtn if rtn else None
         summary["layers"] = len(rows)
+
         cross: dict[str, dict[str, Any]] = {}
         for row in rows:
             for cell, err in row["cells"].items():
@@ -468,46 +768,219 @@ def summarize_modes(by_layer: Mapping[Any, Mapping[str, Mapping[str, Any]]]) -> 
                 "ratio_to_rtn": (e["weighted"] / e["tokens"]) / rtn if rtn else None,
                 "layers": e["layers"],
             }
-            for cell, e in cross.items()
+            for cell, e in sorted(cross.items())
         }
     return summaries
 
 
 def shipped_summary(summary: Mapping[str, Any]) -> dict[str, Any]:
-    """The per-combination numbers the sidecar manifest carries (test split, shipped transforms)."""
+    """The per-combination held-out test numbers carried in the sidecar manifest."""
     return {
         "layer_tokens": summary["layer_tokens"],
         "attn_rel_err": summary["attn_rel_err"],
         "rtn_attn_rel_err": summary["rtn_attn_rel_err"],
+        "v2_shared_attn_rel_err": summary["v2_shared_attn_rel_err"],
         "hadamard_attn_rel_err": summary["hadamard_attn_rel_err"],
-        "smoothquant_attn_rel_err": summary["smoothquant_attn_rel_err"],
-        "per_width_fitted_attn_rel_err": summary["per_width_fitted_attn_rel_err"],
         "ratio_to_rtn": summary["ratio_to_rtn"],
+        "v2_shared_ratio_to_rtn": summary["v2_shared_ratio_to_rtn"],
+        "ratio_to_v2_shared": summary["ratio_to_v2_shared"],
     }
+
+
+def _layer_spread(per_layer: Mapping[str, Mapping[str, Any]]) -> dict[str, Any] | None:
+    """Compute per-layer median, best (lowest ratio), and worst (highest ratio) improvement vs identity."""
+    entries: list[tuple[float, int, float, float]] = []
+    for lid_str, row in per_layer.items():
+        rtn = float(row["rtn_attn_rel_err"])
+        err = float(row["attn_rel_err"])
+        if rtn > 0.0:
+            entries.append((err / rtn, int(lid_str), err, rtn))
+    if not entries:
+        return None
+    entries.sort(key=lambda item: (item[0], item[1]))
+    n = len(entries)
+    mid = n // 2
+    med_ratio = entries[mid][0] if (n % 2 == 1) else 0.5 * (entries[mid - 1][0] + entries[mid][0])
+    best_r, best_lid, best_err, best_rtn = entries[0]
+    worst_r, worst_lid, worst_err, worst_rtn = entries[-1]
+    return {
+        "layers": n,
+        "median": {
+            "ratio_to_rtn": med_ratio,
+            "error_reduction_pct": (1.0 - med_ratio) * 100.0,
+        },
+        "best": {
+            "layer_id": best_lid,
+            "ratio_to_rtn": best_r,
+            "error_reduction_pct": (1.0 - best_r) * 100.0,
+            "attn_rel_err": best_err,
+            "rtn_attn_rel_err": best_rtn,
+        },
+        "worst": {
+            "layer_id": worst_lid,
+            "ratio_to_rtn": worst_r,
+            "error_reduction_pct": (1.0 - worst_r) * 100.0,
+            "attn_rel_err": worst_err,
+            "rtn_attn_rel_err": worst_rtn,
+        },
+    }
+
+
+def _unsupported_reason_for_mode(
+    mode: str,
+    unsupported_reasons: Mapping[str, str] | None,
+    profiles: Mapping[str, Mapping[str, Any] | None] | None,
+) -> str:
+    c_bits, r_bits = _mode_of(mode)
+    reasons = unsupported_reasons or {}
+    if mode in reasons:
+        return str(reasons[mode])
+    if r_bits > 0 and f"*:{r_bits}" in reasons:
+        return str(reasons[f"*:{r_bits}"])
+    if r_bits > 0 and profiles is not None and profiles.get("rope") is None:
+        return "model MLA layers have no RoPE key cache (qk_rope_dim=0)"
+    return "mode not evaluated in this run"
+
+
+def build_headline_table(
+    combinations: Mapping[str, Mapping[str, Any]],
+    profiles: Mapping[str, Mapping[str, Any] | None] | None = None,
+    *,
+    modes: Sequence[str] = HEADLINE_DEPLOYMENT_MODES,
+    unsupported_reasons: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build the leading held-out test headline table for deployment modes ``4:0, 2:4, 8:0, 8:8, 4:8``.
+
+    Every supported row reflects ONE end-to-end joint post-``o_proj`` measurement combining
+    each layer's selected content transform at the content width with its selected RoPE
+    transform at the RoPE width (never per-path errors summed). Unsupported modes (such as
+    RoPE modes on pure-NoPE models) are emitted explicitly as ``n/a`` with the reason.
+    """
+    rows: list[dict[str, Any]] = []
+    c_prof = profiles.get("content") if profiles else None
+    r_prof = profiles.get("rope") if profiles else None
+    for mode in modes:
+        c_bits, r_bits = _mode_of(mode)
+        if mode not in combinations:
+            rows.append({
+                "mode": mode,
+                "supported": False,
+                "status": "n/a",
+                "reason": _unsupported_reason_for_mode(mode, unsupported_reasons, profiles),
+                "layer_tokens": None,
+                "rtn_attn_rel_err": None,
+                "attn_rel_err": None,
+                "ratio_to_rtn": None,
+                "error_reduction_vs_identity_pct": None,
+                "v2_shared_attn_rel_err": None,
+                "ratio_to_v2_shared": None,
+                "error_reduction_vs_v2_shared_pct": None,
+                "per_layer_spread": None,
+                "kind_counts": {"content": None, "rope": None},
+            })
+            continue
+        entry = combinations[mode]
+        ratio_id = entry.get("ratio_to_rtn")
+        ratio_v2 = entry.get("ratio_to_v2_shared")
+        per_layer = entry.get("per_layer")
+        rows.append({
+            "mode": mode,
+            "supported": True,
+            "status": "measured",
+            "reason": None,
+            "layer_tokens": entry.get("layer_tokens", entry.get("tokens")),
+            "rtn_attn_rel_err": entry["rtn_attn_rel_err"],
+            "attn_rel_err": entry["attn_rel_err"],
+            "ratio_to_rtn": ratio_id,
+            "error_reduction_vs_identity_pct": None if ratio_id is None else (1.0 - ratio_id) * 100.0,
+            "v2_shared_attn_rel_err": entry.get("v2_shared_attn_rel_err"),
+            "ratio_to_v2_shared": ratio_v2,
+            "error_reduction_vs_v2_shared_pct": None if ratio_v2 is None else (1.0 - ratio_v2) * 100.0,
+            "per_layer_spread": _layer_spread(per_layer) if isinstance(per_layer, Mapping) else None,
+            "kind_counts": {
+                "content": (
+                    dict(c_prof["widths"][str(c_bits)]["kind_counts"])
+                    if (c_bits > 0 and c_prof is not None and str(c_bits) in c_prof.get("widths", {})) else None
+                ),
+                "rope": (
+                    dict(r_prof["widths"][str(r_bits)]["kind_counts"])
+                    if (r_bits > 0 and r_prof is not None and str(r_bits) in r_prof.get("widths", {})) else None
+                ),
+            },
+        })
+    return rows
+
+
+HEADLINE_TABLE_CAPTION = (
+    "*Joint end-to-end post-`o_proj` attention error on held-out test, combining each layer's "
+    "selected content transform at the content width with its selected RoPE transform at the RoPE "
+    "width (never per-path numbers added together). `:0` means RoPE is kept unquantized (native format).*"
+)
+
+
+def format_headline_table(rows: Sequence[Mapping[str, Any]], *, caption: str = HEADLINE_TABLE_CAPTION) -> str:
+    """Render the held-out headline table (with per-layer spread and caption) as GitHub markdown."""
+    lines = [
+        "| Mode (C:R) | Identity (RTN) | Shipped (v3) | Ratio | Reduction | Per-layer spread (median / best / worst) |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    for row in rows:
+        if not row.get("supported", True):
+            reason = row.get("reason") or "not supported"
+            lines.append(f"| `{row['mode']}` | n/a | n/a | n/a | n/a | n/a ({reason}) |")
+            continue
+        r_id = "—" if row["ratio_to_rtn"] is None else f"{row['ratio_to_rtn']:.4f}x"
+        red = "—" if row["error_reduction_vs_identity_pct"] is None else f"{row['error_reduction_vs_identity_pct']:+.1f}%"
+        spread = row.get("per_layer_spread")
+        if spread is not None:
+            med = f"{spread['median']['ratio_to_rtn']:.3f}x ({spread['median']['error_reduction_pct']:+.1f}%)"
+            best = (
+                f"L{spread['best']['layer_id']} {spread['best']['ratio_to_rtn']:.3f}x "
+                f"({spread['best']['error_reduction_pct']:+.1f}%)"
+            )
+            worst = (
+                f"L{spread['worst']['layer_id']} {spread['worst']['ratio_to_rtn']:.3f}x "
+                f"({spread['worst']['error_reduction_pct']:+.1f}%)"
+            )
+            spread_str = f"{med} / {best} / {worst}"
+        else:
+            spread_str = "—"
+        lines.append(
+            f"| `{row['mode']}` | {row['rtn_attn_rel_err']:.6g} | {row['attn_rel_err']:.6g} | "
+            f"{r_id} | {red} | {spread_str} |"
+        )
+    if caption:
+        lines.append("")
+        lines.append(caption)
+    return "\n".join(lines)
 
 
 @torch.no_grad()
 def measure_shipped(
     bank: CapturedLayerBank,
-    content: ContentFitResult | None,
-    rope: RopeFitResult | None,
+    content_by_width: Mapping[int, Any] | None,
+    rope_by_width: Mapping[int, Any] | None,
     modes: Sequence[tuple[int, int]],
     config: FitConfig,
     device: torch.device | str,
 ) -> dict[str, dict[str, Any]]:
-    """Shipped transforms vs RTN and Hadamard on ``bank.test`` (e.g. a K8 transfer bank).
-
-    Errors are against the bank's own 0:0 reference outputs.
-    """
+    """Score per-width shipped transforms vs identity (RTN) and Hadamard on ``bank.test``."""
     scorer = _Scorer(bank, "test", config, device)
+    c_map = content_by_width or {}
+    r_map = rope_by_width or {}
     rows = {}
     for mode in modes:
         if not layer_quantizes(bank.geometry, mode):
             continue
         cb, rb = mode
-        if cb and content is None or rb and bank.geometry.has_rope and rope is None:
-            raise ValueError(f"combination {combo_key(mode)} needs a shipped transform for each quantized path")
-        fitted = scorer.score(mode, ("shipped", content) if cb else "rtn", rope if rb and rope is not None else NATIVE_ROPE)
+        rope_on = bool(rb) and bank.geometry.has_rope
+        if cb and cb not in c_map:
+            raise ValueError(f"combination {combo_key(mode)} missing shipped content transform for width {cb}")
+        if rope_on and rb not in r_map:
+            raise ValueError(f"combination {combo_key(mode)} missing shipped RoPE transform for width {rb}")
+        c_arm = (f"shipped_c{cb}", c_map[cb]) if cb else "rtn"
+        r_arm = r_map[rb] if rope_on else NATIVE_ROPE
+        fitted = scorer.score(mode, c_arm, r_arm)
         rtn = scorer.score(mode, "rtn", NATIVE_ROPE)
         rows[combo_key(mode)] = {
             "tokens": scorer.tokens,
@@ -519,17 +992,28 @@ def measure_shipped(
     return rows
 
 
-def inverse_max_error(result, geometry):
+def inverse_max_error(result, geometry) -> float:
     """Maximum elementwise error of forward and inverse coordinate transforms on a basis."""
     if isinstance(result, ContentFitResult):
-        r = result.r_c.float()
+        kind = classify_content_kind(result.r_c, result.s_c)
+        if kind == "identity":
+            return 0.0
         s = result.s_c.float()
+        if kind == "scale_only":
+            return float((s * (1.0 / s) - 1.0).abs().max().item())
+        r = result.r_c.float()
         identity = torch.eye(len(s), device=s.device)
         roundtrip = (r * s) @ (r.T / s[:, None])
-    else:
-        identity = torch.eye(geometry.qk_rope_dim, device=result.theta.device)
-        forward = apply_rope_pair_transform(identity, result.theta, result.s_p, rope_kind=geometry.rope_kind)
-        roundtrip = apply_rope_pair_transform(
-            forward, -result.theta, result.s_p, inverse_scale=True, rope_kind=geometry.rope_kind
-        )
-    return float((roundtrip - identity).abs().max())
+        return float((roundtrip - identity).abs().max().item())
+    kind = classify_rope_kind(result.theta, result.s_p)
+    if kind == "identity":
+        return 0.0
+    if kind == "scale_only":
+        s = result.s_p.float()
+        return float((s * (1.0 / s) - 1.0).abs().max().item())
+    identity = torch.eye(geometry.qk_rope_dim, device=result.theta.device)
+    forward = apply_rope_pair_transform(identity, result.theta, result.s_p, rope_kind=geometry.rope_kind)
+    roundtrip = apply_rope_pair_transform(
+        forward, -result.theta, result.s_p, inverse_scale=True, rope_kind=geometry.rope_kind
+    )
+    return float((roundtrip - identity).abs().max().item())

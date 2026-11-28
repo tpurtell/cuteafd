@@ -30,20 +30,28 @@ from hy4_flash.qmla_run import (
 )
 from qmla.measurement import _token_relative_squares
 from qmla import (
+    DEFAULT_FIT_BUDGET,
     DEFAULT_PROTECTION_POLICY,
     PROTECTION_SCOPE,
     QMLA_BASE_COMPONENTS,
     QMLA_KNOWN_COMPONENTS,
+    QMLA_SCHEMA,
+    ROTATION_IDENTITY_TOL,
+    SCALE_IDENTITY_TOL,
     FitConfig,
     MlaLayerGeometry,
     apply_rope_pair_transform,
     attach_qmla_to_mc,
+    classify_content_kind,
+    classify_rope_kind,
+    compute_mode_selection_fingerprint,
     content_output_loss,
     eval_attention_output,
     fit_config_digest,
     fit_content_layer,
     fit_rope_layer,
     load_fit_checkpoint,
+    load_sidecar_transforms,
     pack_content_row,
     pack_joint_record,
     pack_rope_row,
@@ -54,6 +62,7 @@ from qmla import (
     qdq_asymmetric_group,
     read_sidecar_manifest,
     record_bytes_for_mode,
+    resolve_mode_transforms,
     resolve_qmla_panel,
     save_fit_checkpoint,
     sylvester_hadamard,
@@ -112,24 +121,26 @@ def _splits(train, val, test, seed=0):
     )
 
 
-def _selection(path, results, chosen="fitted"):
+def _selection_meta(path, width_results, chosen="fitted"):
     width = "c" if path == "content" else "r"
-    return {
-        "objective": "mean_val_ratio_to_rtn",
-        "per_layer": {
+    out = {}
+    for bits, results in width_results.items():
+        out[str(bits)] = {
             str(r.layer_id): {
-                "candidate": f"{chosen}:{width}{r.bits}", "chosen": chosen, "source_bits": r.bits,
-                "objective": 0.5, "val_score": {f"{r.bits}:0" if path == "content" else f"0:{r.bits}": 0.01},
+                "candidate": "identity" if chosen == "identity" else f"{chosen}:{width}{r.bits}",
+                "source_bits": None if chosen == "identity" else r.bits,
+                "val_score": {f"{bits}:0" if path == "content" else f"0:{bits}": 0.01},
             }
             for r in results
-        },
-    }
+        }
+    return out
 
 
 def _content_only(res):
     return {
-        "content_profile": [res], "rope_profile": [], "content_bits": [res.bits], "rope_bits": [],
-        "selection": {"content": _selection("content", [res]), "rope": None},
+        "content_selections": {res.bits: {res.layer_id: res}},
+        "rope_selections": None,
+        "selection_meta": {"content": _selection_meta("content", {res.bits: [res]}), "rope": None},
     }
 
 
@@ -527,11 +538,15 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
     assert report["splits"] == {"train": 2, "val": 1, "test": 1}
     assert set(report["combinations"]) == {"4:4", "2:4", "4:0", "0:4"}
 
-    # One shipped profile per path, serving every calibrated width.
+    # Per-width selections in cuteafd-qmla-v3.
+    assert manifest["schema"] == QMLA_SCHEMA == "cuteafd-qmla-v3"
     assert manifest["profiles"]["content"]["bits"] == [2, 4]
     assert manifest["profiles"]["rope"]["bits"] == [4]
     shipped = {
-        path: {lid: row["candidate"] for lid, row in manifest["profiles"][path]["selection"]["per_layer"].items()}
+        path: {
+            bkey: {lid: row["source_candidate"] for lid, row in wdata["per_layer"].items()}
+            for bkey, wdata in manifest["profiles"][path]["widths"].items()
+        }
         for path in ("content", "rope")
     }
     test_tokens = sum(s.seq_len for bank in [bank0, bank5] for s in bank.test)
@@ -540,27 +555,25 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
         assert set(layer_rows) == {"0", "5"}
         assert metrics["layer_tokens"] == test_tokens
         assert metrics["ratio_to_rtn"] == pytest.approx(metrics["attn_rel_err"] / metrics["rtn_attn_rel_err"])
-        for name in ("attn_rel_err", "per_width_fitted_attn_rel_err", "rtn_attn_rel_err",
-                     "hadamard_attn_rel_err", "smoothquant_attn_rel_err"):
+        assert metrics["v2_shared_ratio_to_rtn"] == pytest.approx(
+            metrics["v2_shared_attn_rel_err"] / metrics["rtn_attn_rel_err"]
+        )
+        for name in ("attn_rel_err", "v2_shared_attn_rel_err", "rtn_attn_rel_err", "hadamard_attn_rel_err"):
             expected = sum(row[name] * row["tokens"] for row in layer_rows.values()) / metrics["layer_tokens"]
             assert metrics[name] == pytest.approx(expected)
             assert metrics[name] == manifest["calibration_provenance"]["combination_measurements"][mode][name]
         cb, rb = parse_qmla_mode(mode)
         for lid, row in layer_rows.items():
-            # The shipped cell is the selected content/RoPE candidate, and its test error is that cell.
-            expected_cell = "+".join(c for c in (shipped["content"][lid] if cb else None,
-                                                 shipped["rope"][lid] if rb else None) if c)
+            expected_cell = "+".join(c for c in (shipped["content"][str(cb)][lid] if cb else None,
+                                                 shipped["rope"][str(rb)][lid] if rb else None) if c)
             assert row["shipped_cell"] == expected_cell
             assert row["attn_rel_err"] == row["cells"][expected_cell]
-            fitted = "+".join(c for c in (f"fitted:c{cb}" if cb else None, f"fitted:r{rb}" if rb else None) if c)
-            assert row["per_width_fitted_attn_rel_err"] == row["cells"][fitted]
-            # Cross-table: every candidate of each quantized path (all widths, fitted + init).
-            n_content = 4 if cb else 1
-            n_rope = 2 if rb else 1
+            # Cross-table: identity + fitted + scale_fitted + smoothquant per active path.
+            n_content = 7 if cb else 1  # identity + 2 widths x (fitted, scale_fitted, smoothquant)
+            n_rope = 4 if rb else 1     # identity + 1 width x (fitted, scale_fitted, smoothquant)
             assert len(row["cells"]) == n_content * n_rope
         assert set(metrics["cross_table"]) == set(next(iter(layer_rows.values()))["cells"])
         transfer = report["view_transfer_validation"]["k8-compact"]["combinations"][mode]
-        # The transfer bank here is the calibration bank itself: same test sequences, same 0:0.
         assert transfer["attn_rel_err"] == pytest.approx(metrics["attn_rel_err"])
         assert transfer["rtn_attn_rel_err"] == pytest.approx(metrics["rtn_attn_rel_err"])
 
@@ -571,7 +584,8 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
     assert prov["measurement_split"] == "test"
     assert prov["splits"] == bank0.provenance["splits"]
     assert prov["test_sequences"] == 1 and prov["splits"]["test"]["seq_ids"] == [s.seq_id for s in bank0.test]
-    assert report["fit_by_layer"]["0"]["content"]["2"]["fit_seconds"] > 0
+    assert report["fit_by_layer"]["0"]["content"]["2"]["full"]["fit_seconds"] > 0
+    assert report["fit_by_layer"]["0"]["content"]["2"]["scale_only"]["fit_seconds"] > 0
     assert manifest["protection_policy"] == "sink4_local128"
     assert manifest["protection_scope"] == PROTECTION_SCOPE
     assert sorted(manifest["supported_modes"]) == sorted(["4:0", "2:0", "0:4", "4:4", "2:4"])
@@ -844,101 +858,176 @@ def _val_table(rows):
     return {key: {"tokens": 10, "rtn": rtn, "hadamard": rtn, "cells": cells} for key, (rtn, cells) in rows.items()}
 
 
-def test_selection_picks_lowest_val_candidate_across_combinations_and_guard_records_choice():
-    """One shipped transform per path: the candidate pair best across every combination on val."""
-    from qmla.measurement import LayerCandidates, layer_rows, select_shipped
+def test_per_width_selection_picks_best_per_width_and_compares_against_v2_shared():
+    """Per-width selection lets 8-bit pick identity/scale_only while 2/4-bit pick full fits, beating v2 shared."""
+    from qmla.measurement import LayerCandidates, layer_rows, select_per_width, select_shared_v2
 
     geom = MlaLayerGeometry(
         layer_id=21, kv_source_layer=21, kind="dsa", heads=2,
         kv_lora_rank=64, qk_nope_dim=8, qk_rope_dim=8, v_head_dim=8, rope_kind="interleaved",
     )
+    # Include a full-fit candidate at 8-bit whose tensors collapsed to identity:
+    # tie-breaking must prefer explicit identity and classify both as kind="identity".
     candidates = LayerCandidates(
-        content={c: None for c in ("fitted:c4", "fitted:c8", "smoothquant:c4", "smoothquant:c8")},
-        rope={r: None for r in ("fitted:r4", "smoothquant:r4")},
+        content={
+            "identity": SimpleNamespace(kind="identity"),
+            "fitted:c2": SimpleNamespace(kind="full"),
+            "fitted:c4": SimpleNamespace(kind="full"),
+            "scale_fitted:c8": SimpleNamespace(kind="scale_only"),
+            "fitted:c8": SimpleNamespace(kind="identity"),
+        },
+        rope={
+            "identity": SimpleNamespace(kind="identity"),
+            "fitted:r4": SimpleNamespace(kind="full"),
+            "scale_fitted:r8": SimpleNamespace(kind="scale_only"),
+        },
     )
 
     def cells(mode, fn):
-        if mode == "8:0":
-            return {c: fn(c, None) for c in candidates.content}
-        if mode == "0:4":
-            return {r: fn(None, r) for r in candidates.rope}
-        return {f"{c}+{r}": fn(c, r) for c in candidates.content for r in candidates.rope}
+        cb, rb = map(int, mode.split(":"))
+        if cb and not rb:
+            return {c: fn(mode, c, None) for c in candidates.content}
+        if rb and not cb:
+            return {r: fn(mode, None, r) for r in candidates.rope}
+        return {f"{c}+{r}": fn(mode, c, r) for c in candidates.content for r in candidates.rope}
 
-    # Per-path fits look best alone, but fitted:c4 + fitted:r4 interact badly at 4:4 while
-    # SmoothQuant RoPE does not; fitted:c8 wins 8:0 by a hair and loses 4:4 by a lot.
-    def err(c, r):
-        base = {"fitted:c4": 0.010, "fitted:c8": 0.009, "smoothquant:c4": 0.012, "smoothquant:c8": 0.0125}.get(c, 0.0)
-        rope = {"fitted:r4": 0.001, "smoothquant:r4": 0.002}.get(r, 0.0)
-        joint = 0.008 if (c, r) == ("fitted:c4", "fitted:r4") else 0.0
-        if c == "fitted:c8" and r is not None:
-            joint += 0.02
-        return base + rope + joint
+    # Mode-dependent errors mirroring GLM Flash + Hy4-flash measurements:
+    # - 2:0 and 4:0 / 4:4 strongly favor fitted:c4 (and fitted:r4 at 4-bit RoPE);
+    # - 8:0 favors identity (fitted:c4 is 6.7% worse at 8-bit);
+    # - 0:8 / 8:8 favors scale_fitted:r8 on RoPE and identity on content.
+    rtn_by_mode = {"2:0": 0.04, "4:0": 0.001, "8:0": 2.5e-5, "0:4": 0.01, "0:8": 1e-4, "4:4": 0.011, "8:8": 1.2e-4}
 
-    val = _val_table({m: (0.02, cells(m, err)) for m in ("4:4", "8:0", "0:4")})
-    selection = select_shipped(val, candidates, geom)
-    assert selection["content"]["candidate"] == "fitted:c4" and selection["content"]["chosen"] == "fitted"
-    assert selection["rope"]["candidate"] == "smoothquant:r4" and selection["rope"]["chosen"] == "smoothquant"
-    assert selection["content"]["source_bits"] == 4 and selection["rope"]["source_bits"] == 4
-    # Recorded val scores are the chosen pair's cells on every combination the path takes part in.
-    assert selection["content"]["val_score"] == {
-        "4:4": pytest.approx(err("fitted:c4", "smoothquant:r4")), "8:0": pytest.approx(err("fitted:c4", None)),
-    }
-    assert selection["rope"]["val_score"] == {
-        "4:4": pytest.approx(err("fitted:c4", "smoothquant:r4")), "0:4": pytest.approx(err(None, "smoothquant:r4")),
-    }
-    best = min(selection["pair_objectives"].values())
-    assert selection["content"]["objective"] == best == selection["pair_objectives"]["fitted:c4+smoothquant:r4"]
-    # Each combination counts equally (mean ratio to RTN), not by absolute error.
-    assert best == pytest.approx(sum(
-        err(*pair) / 0.02 for pair in (("fitted:c4", "smoothquant:r4"), ("fitted:c4", None), (None, "smoothquant:r4"))
-    ) / 3)
+    def err(mode, c, r):
+        cb, rb = map(int, mode.split(":"))
+        c_mult = {
+            2: {"identity": 1.0, "fitted:c2": 0.90, "fitted:c4": 0.80, "scale_fitted:c8": 0.98, "fitted:c8": 1.0},
+            4: {"identity": 1.0, "fitted:c2": 0.91, "fitted:c4": 0.82, "scale_fitted:c8": 0.98, "fitted:c8": 1.0},
+            8: {"identity": 1.0, "fitted:c2": 1.09, "fitted:c4": 1.07, "scale_fitted:c8": 1.01, "fitted:c8": 1.0},
+        }
+        r_mult = {
+            4: {"identity": 1.0, "fitted:r4": 0.57, "scale_fitted:r8": 0.64},
+            8: {"identity": 1.0, "fitted:r4": 0.65, "scale_fitted:r8": 0.62},
+        }
+        val = 0.0
+        if cb:
+            val += rtn_by_mode[f"{cb}:0"] * c_mult[cb][c]
+        if rb:
+            val += rtn_by_mode[f"0:{rb}"] * r_mult[rb][r]
+        return val
 
-    # The per-combination guard sees only that combination's own fitted/init cells and records each score.
-    test = _val_table({m: (0.02, cells(m, lambda c, r: err(c, r) * 1.1)) for m in ("4:4", "8:0", "0:4")})
-    rows = layer_rows(test, val, selection, geom)
-    guard = rows["4:4"]["guard_val"]
-    assert set(guard) == {"fitted:c4+fitted:r4", "fitted:c4+smoothquant:r4",
-                          "smoothquant:c4+fitted:r4", "smoothquant:c4+smoothquant:r4"}
-    assert rows["4:4"]["guard_choice"] == "fitted:c4+smoothquant:r4" == min(guard, key=guard.get)
-    assert rows["8:0"]["guard_val"] == {"fitted:c8": pytest.approx(0.009), "smoothquant:c8": pytest.approx(0.0125)}
-    assert rows["8:0"]["guard_choice"] == "fitted:c8"
-    assert rows["4:4"]["shipped_cell"] == "fitted:c4+smoothquant:r4"
-    assert rows["4:4"]["attn_rel_err"] == pytest.approx(err("fitted:c4", "smoothquant:r4") * 1.1)
-    assert rows["4:4"]["per_width_fitted_attn_rel_err"] == pytest.approx(err("fitted:c4", "fitted:r4") * 1.1)
-    assert not rows["4:4"]["fitted_beats_smoothquant"]
-    assert rows["8:0"]["shipped_cell"] == "fitted:c4"
+    modes = ("2:0", "4:0", "8:0", "0:4", "0:8", "4:4", "8:8")
+    val = _val_table({m: (err(m, "identity" if int(m.split(":")[0]) else None, "identity" if int(m.split(":")[1]) else None), cells(m, err)) for m in modes})
+    sel_v3 = select_per_width(val, candidates, geom)
+    sel_v2 = select_shared_v2(val, candidates, geom)
+
+    assert sel_v3["content"]["2"]["candidate"] == "fitted:c4" and sel_v3["content"]["2"]["kind"] == "full"
+    assert sel_v3["content"]["2"]["source_bits"] == 4
+    assert sel_v3["content"]["4"]["candidate"] == "fitted:c4" and sel_v3["content"]["4"]["kind"] == "full"
+    assert sel_v3["content"]["8"]["candidate"] == "identity" and sel_v3["content"]["8"]["kind"] == "identity"
+    assert sel_v3["content"]["8"]["source_bits"] is None
+    assert sel_v3["rope"]["4"]["candidate"] == "fitted:r4" and sel_v3["rope"]["4"]["kind"] == "full"
+    assert sel_v3["rope"]["8"]["candidate"] == "scale_fitted:r8" and sel_v3["rope"]["8"]["kind"] == "scale_only"
+
+    # Legacy v2 shared selection picks one content transform across all widths, hurting 8:0.
+    assert sel_v2["content"]["candidate"] == "fitted:c4"
+    test = _val_table({m: (val[m]["rtn"], cells(m, lambda mo, c, r: err(mo, c, r) * 1.05)) for m in modes})
+    rows = layer_rows(test, val, sel_v3, geom, v2_selection=sel_v2)
+    assert rows["8:0"]["shipped_cell"] == "identity"
+    assert rows["8:0"]["v2_shared_cell"] == "fitted:c4"
+    assert rows["8:0"]["attn_rel_err"] < rows["8:0"]["v2_shared_attn_rel_err"]
+    assert rows["8:8"]["shipped_cell"] == "identity+scale_fitted:r8"
+    assert rows["8:8"]["shipped_kinds"] == {"content": "identity", "rope": "scale_only"}
+    assert rows["4:4"]["shipped_cell"] == "fitted:c4+fitted:r4"
+    assert rows["2:0"]["shipped_cell"] == "fitted:c4"
 
 
-def test_sidecar_validates_mixed_fitted_and_smoothquant_shipped_profiles(tmp_path: Path):
-    """A layer may ship its SmoothQuant init (identity rotation, init scales) beside fitted layers."""
+def test_kind_classification_v3_aliasing_loader_resolution_and_fail_closed(tmp_path: Path):
+    """Test kind classification tolerances, collapsing full->identity/scale_only, aliasing, and loader resolution."""
+    from dataclasses import replace
     from qmla import write_sidecar
-    from qmla.measurement import layer_candidates, with_equivalence
+    from qmla.sidecar import _read_f32_safetensors_with_metadata, _write_f32_safetensors_with_metadata
 
+    # 1. Kind classification rules (including a full fit that collapses to identity or scale_only).
+    d_c, pairs = 64, 32
+    eye = torch.eye(d_c)
+    ones = torch.ones(d_c)
+    assert classify_content_kind(eye, ones) == "identity"
+    assert classify_content_kind(eye + 5e-7, ones + 5e-7) == "identity"  # within 1e-6 tol
+    assert classify_content_kind(eye + 5e-7, ones * 1.1) == "scale_only"
+    assert classify_content_kind(sylvester_hadamard(d_c), ones) == "full"
+    assert classify_content_kind(sylvester_hadamard(d_c), ones * 1.2) == "full"
+
+    zeros = torch.zeros(pairs)
+    ones_r = torch.ones(pairs)
+    assert classify_rope_kind(zeros, ones_r) == "identity"
+    assert classify_rope_kind(zeros + 2.0 * torch.pi, ones_r) == "identity"  # 2*pi wraps to 0
+    assert classify_rope_kind(zeros + 5e-7, ones_r * 1.25) == "scale_only"
+    assert classify_rope_kind(zeros + 0.05, ones_r) == "full"
+
+    # 2. Build a realistic mixed-kind v3 sidecar across widths {2, 4, 8} content and {4, 8} RoPE:
+    # - layer 0: c2 & c4 share the EXACT same full fit (must alias to one slot t0!), c8 is a full-fit
+    #   object that collapsed to identity (within 1e-6 tol -> recorded as kind="identity", 0 tensors!).
+    # - layer 5: c2 & c4 share a scale_only transform (slot t0, .s only!), c8 is identity.
+    # - RoPE: r4 is full (slot t0), r8 is scale_only (slot t1).
     _, _, _, _, bank0 = _make_skewed_hy4_bank(611, layer_id=0, seqs=4, base_seq_len=24, shared_seed=4)
     _, _, _, _, bank5 = _make_skewed_hy4_bank(613, layer_id=5, seqs=4, base_seq_len=24, shared_seed=4)
     cfg = FitConfig(steps=6, val_every=3, seed=0, sink_tokens=2, recent_tokens=6)
-    picks = {}
-    for bank, kind in ((bank0, "fitted"), (bank5, "smoothquant")):
-        fc = fit_content_layer(bank, 4, cfg)
-        fr = fit_rope_layer(bank, 4, cfg)
-        cands = layer_candidates(bank, {4: fc}, {4: fr}, cfg)
-        picks[bank.geometry.layer_id] = (
-            with_equivalence(cands.content[f"{kind}:c4"], bank, "cpu"),
-            with_equivalence(cands.rope[f"{kind}:r4"], bank, "cpu"),
-            kind,
-        )
-    init_c = picks[5][0]
-    assert torch.equal(init_c.r_c, torch.eye(64)) and init_c.equiv_max_rel_err < 1e-5
-    assert torch.equal(picks[5][1].theta, torch.zeros(32))
 
-    def selection(path, index):
-        width = "c" if path == "content" else "r"
-        return {"objective": "mean_val_ratio_to_rtn", "per_layer": {
-            str(lid): {"candidate": f"{kind}:{width}4", "chosen": kind, "source_bits": 4, "objective": 0.7,
-                       "val_score": {"4:4": 0.01, "4:0" if path == "content" else "0:4": 0.02}}
-            for lid, (*_, kind) in picks.items()
-        }}
+    fc0_full = fit_content_layer(bank0, 4, cfg, fit_mode="full")
+    fc0_collapsed_id = replace(fc0_full, bits=8, r_c=eye + 2e-7, s_c=ones + 2e-7, best_step=0, orth_max_err=4e-7, equiv_max_rel_err=0.0)
+    fc5_scale = fit_content_layer(bank5, 4, cfg, fit_mode="scale_only")
+    if classify_content_kind(fc5_scale.r_c, fc5_scale.s_c) == "identity":
+        s_nonunit = torch.linspace(0.85, 1.15, d_c)
+        fc5_scale = replace(fc5_scale, r_c=eye, s_c=s_nonunit, equiv_max_rel_err=1e-7)
+    fc5_id = replace(fc5_scale, bits=8, r_c=eye, s_c=ones, best_step=0, equiv_max_rel_err=0.0)
 
+    fr0_full = fit_rope_layer(bank0, 4, cfg, fit_mode="full")
+    fr5_full = fit_rope_layer(bank5, 4, cfg, fit_mode="full")
+    fr0_scale = fit_rope_layer(bank0, 8, cfg, fit_mode="scale_only")
+    fr5_scale = fit_rope_layer(bank5, 8, cfg, fit_mode="scale_only")
+    for name_var, res in (("fr0_scale", fr0_scale), ("fr5_scale", fr5_scale)):
+        if classify_rope_kind(res.theta, res.s_p) == "identity":
+            patched = replace(res, theta=zeros, s_p=torch.linspace(0.8, 1.2, pairs), equiv_max_rel_err=1e-7)
+            if name_var == "fr0_scale":
+                fr0_scale = patched
+            else:
+                fr5_scale = patched
+
+    content_selections = {
+        2: {0: fc0_full, 5: fc5_scale},
+        4: {0: fc0_full, 5: fc5_scale},  # identical to width 2 -> must alias!
+        8: {0: fc0_collapsed_id, 5: fc5_id},
+    }
+    rope_selections = {
+        4: {0: fr0_full, 5: fr5_full},
+        8: {0: fr0_scale, 5: fr5_scale},
+    }
+    selection_meta = {
+        "content": {
+            "2": {
+                "0": {"candidate": "fitted:c4", "source_bits": 4, "val_score": {"2:0": 0.02, "2:4": 0.021}},
+                "5": {"candidate": "scale_fitted:c4", "source_bits": 4, "val_score": {"2:0": 0.03, "2:4": 0.031}},
+            },
+            "4": {
+                "0": {"candidate": "fitted:c4", "source_bits": 4, "val_score": {"4:0": 0.002, "4:4": 0.0025}},
+                "5": {"candidate": "scale_fitted:c4", "source_bits": 4, "val_score": {"4:0": 0.003, "4:4": 0.0035}},
+            },
+            "8": {
+                "0": {"candidate": "fitted:c8", "source_bits": 8, "val_score": {"8:0": 1e-5, "8:8": 1.1e-5}},
+                "5": {"candidate": "identity", "source_bits": None, "val_score": {"8:0": 1e-5, "8:8": 1.1e-5}},
+            },
+        },
+        "rope": {
+            "4": {
+                "0": {"candidate": "fitted:r4", "source_bits": 4, "val_score": {"0:4": 0.001, "4:4": 0.0025}},
+                "5": {"candidate": "fitted:r4", "source_bits": 4, "val_score": {"0:4": 0.001, "4:4": 0.0035}},
+            },
+            "8": {
+                "0": {"candidate": "scale_fitted:r8", "source_bits": 8, "val_score": {"0:8": 1e-5, "8:8": 1.1e-5}},
+                "5": {"candidate": "scale_fitted:r8", "source_bits": 8, "val_score": {"0:8": 1e-5, "8:8": 1.1e-5}},
+            },
+        },
+    }
     provenance = {
         **_synthetic_panel_provenance(), "train_sequences": 2, "val_sequences": 1, "test_sequences": 1,
         "splits": bank0.provenance["splits"], "optimizer": "adamw", "steps_per_path": 6, "seed": 0,
@@ -946,67 +1035,319 @@ def test_sidecar_validates_mixed_fitted_and_smoothquant_shipped_profiles(tmp_pat
     }
     source = {"repo": "o/r", "revision": "1" * 40, "family": "hy4_flash", "model_type": "hy_v4_flash",
               "config_sha256": "2" * 64, "checkpoint_kind": "plain", "calibrated_view": "original"}
+
     manifest = write_sidecar(
         tmp_path,
         source=source,
         geometries=[bank0.geometry, bank5.geometry],
-        content_profile=[picks[0][0], picks[5][0]],
-        rope_profile=[picks[0][1], picks[5][1]],
-        content_bits=[2, 4],
-        rope_bits=[4],
-        selection={"content": selection("content", 0), "rope": selection("rope", 1)},
+        content_selections=content_selections,
+        rope_selections=rope_selections,
+        selection_meta=selection_meta,
         provenance=provenance,
     )
-    assert set(manifest["profiles"]) == {"content", "rope"}
-    assert manifest["profiles"]["content"]["bits"] == [2, 4]
-    assert sorted(manifest["supported_modes"]) == sorted(["2:0", "4:0", "0:4", "2:4", "4:4"])
-    chosen = {lid: row["chosen"] for lid, row in manifest["profiles"]["content"]["selection"]["per_layer"].items()}
-    assert chosen == {"0": "fitted", "5": "smoothquant"}
-    validate_sidecar(tmp_path, banks_by_layer={0: bank0, 5: bank5}, equiv_tol=1e-5, strict=True)
+    assert manifest["schema"] == "cuteafd-qmla-v3"
+    # Collapsed full fit at c8 layer 0 MUST be recorded as identity with zero tensors!
+    c8_l0 = manifest["profiles"]["content"]["widths"]["8"]["per_layer"]["0"]
+    assert c8_l0["kind"] == "identity" and c8_l0["tensors"] == {}
+    assert c8_l0["source_candidate"] == "fitted:c8" and c8_l0["source_bits"] == 8
+    # Exact per-layer aliasing: c2 and c4 layer 0 share content.layer_0.t0.{r,s}, layer 5 shares content.layer_5.t0.s!
+    c2_l0 = manifest["profiles"]["content"]["widths"]["2"]["per_layer"]["0"]
+    c4_l0 = manifest["profiles"]["content"]["widths"]["4"]["per_layer"]["0"]
+    assert c2_l0["kind"] == "full" and c2_l0["tensors"] == c4_l0["tensors"] == {
+        "r": "content.layer_0.t0.r", "s": "content.layer_0.t0.s",
+    }
+    c2_l5 = manifest["profiles"]["content"]["widths"]["2"]["per_layer"]["5"]
+    c4_l5 = manifest["profiles"]["content"]["widths"]["4"]["per_layer"]["5"]
+    assert c2_l5["kind"] == "scale_only" and c2_l5["tensors"] == c4_l5["tensors"] == {
+        "s": "content.layer_5.t0.s",
+    }
+    # Expected stored tensor count:
+    # content: layer 0 t0 (r, s) + layer 5 t0 (s) = 3 tensors (0 for c8!)
+    # rope: layer 0 t0 (theta, s) + t1 (s) + layer 5 t0 (theta, s) + t1 (s) = 6 tensors
+    val_res = validate_sidecar(tmp_path, banks_by_layer={0: bank0, 5: bank5}, equiv_tol=1e-5, strict=True)
+    assert val_res["stored_tensors"] == 9
 
-    # A SmoothQuant choice must carry an identity rotation.
-    from dataclasses import replace
+    # 3. Loader-side resolution of active selections to tensors + mode_selection_fingerprint.
+    sel_44 = resolve_mode_transforms(tmp_path, "4:4", strict=True)
+    assert sel_44.content[0].kind == "full" and sel_44.content[0].r_c is not None and sel_44.content[0].s_c is not None
+    assert sel_44.content[5].kind == "scale_only" and sel_44.content[5].r_c is None and sel_44.content[5].s_c is not None
+    assert sel_44.rope[0].kind == "full" and sel_44.rope[0].theta is not None and sel_44.rope[0].s_p is not None
 
-    rotated_init = replace(picks[5][0], r_c=sylvester_hadamard(64))
-    with pytest.raises(ValueError, match="rotation is not the identity"):
-        write_sidecar(
-            tmp_path / "bad", source=source, geometries=[bank0.geometry, bank5.geometry],
-            content_profile=[picks[0][0], rotated_init], rope_profile=[picks[0][1], picks[5][1]],
-            content_bits=[2, 4], rope_bits=[4], selection={"content": selection("content", 0), "rope": selection("rope", 1)},
-            provenance=provenance,
-        )
+    sel_88 = resolve_mode_transforms(tmp_path, "8:8", strict=True)
+    assert sel_88.content[0].kind == "identity" and sel_88.content[0].r_c is None and sel_88.content[0].s_c is None
+    assert sel_88.content[5].kind == "identity" and sel_88.content[5].r_c is None and sel_88.content[5].s_c is None
+    assert sel_88.rope[0].kind == "scale_only" and sel_88.rope[0].theta is None and sel_88.rope[0].s_p is not None
+    assert sel_44.mode_selection_fingerprint != sel_88.mode_selection_fingerprint
+    assert sel_44.mode_selection_fingerprint == compute_mode_selection_fingerprint(manifest, "4:4")
 
-    # Changing the recorded choice without its tensors breaks the profile fingerprint.
-    from qmla.sidecar import _read_f32_safetensors_with_metadata, _write_f32_safetensors_with_metadata
+    with pytest.raises(ValueError, match="INT2 RoPE"):
+        resolve_mode_transforms(tmp_path, "4:2")
 
+    # 4. Fail-closed checks: tampering with kind or fingerprint or basis must fail validation.
     path = tmp_path / "mla_calibration.safetensors"
     raw = path.read_bytes()
     _, _, _, _, embedded, tensors, _ = _read_f32_safetensors_with_metadata(path)
-    embedded["profiles"]["content"]["selection"]["per_layer"]["5"].update(
-        candidate="fitted:c4", chosen="fitted"
-    )
-    header, ordered = {}, []
-    import json, struct
-    hlen = struct.unpack("<Q", raw[:8])[0]
+    import struct as _struct
+    hlen = _struct.unpack("<Q", raw[:8])[0]
     base = 8 + hlen
-    for name, spec in json.loads(raw[8:base]).items():
-        if name == "__metadata__":
-            continue
-        header[name] = spec
-    for name in sorted(header):
-        start, end = header[name]["data_offsets"]
-        ordered.append((name, raw[base + start: base + end]))
-    _write_f32_safetensors_with_metadata(path, header, ordered, embedded)
-    with pytest.raises(ValueError, match="content profile fingerprint mismatch"):
-        validate_sidecar(tmp_path, strict=True)
-    # A reader must reject a self-consistent sidecar using the previous basis even in non-strict mode.
-    from qmla.sidecar import compute_transform_fingerprint
+    header = {k: v for k, v in json.loads(raw[8:base]).items() if k != "__metadata__"}
+    ordered = [(name, raw[base + header[name]["data_offsets"][0] : base + header[name]["data_offsets"][1]]) for name in sorted(header)]
 
-    _, _, _, _, legacy, _, _ = _read_f32_safetensors_with_metadata(path)
-    legacy["profiles"] = manifest["profiles"]
+    # Mutating a layer's source_candidate without updating width_fingerprint fails.
+    bad_fp = json.loads(json.dumps(embedded))
+    bad_fp["profiles"]["content"]["widths"]["8"]["per_layer"]["0"]["source_candidate"] = "identity"
+    _write_f32_safetensors_with_metadata(path, header, ordered, bad_fp)
+    with pytest.raises(ValueError, match="width_fingerprint mismatch"):
+        validate_sidecar(tmp_path, strict=True)
+
+    # Declaring kind="full" on an identity rotation tensor fails kind consistency!
+    bad_kind_tensors = dict(tensors)
+    bad_kind_tensors["content.layer_0.t0.r"] = torch.eye(d_c)
+    from qmla.sidecar import _prepare_f32_tensors, compute_transform_fingerprint
+    h2, o2, td2, psha2, pbytes2 = _prepare_f32_tensors(bad_kind_tensors)
+    bad_kind_m = json.loads(json.dumps(embedded))
+    bad_kind_m["tensors_payload_sha256"] = psha2
+    bad_kind_m["tensors_payload_bytes"] = pbytes2
+    bad_kind_m["transform_fingerprint"] = compute_transform_fingerprint(bad_kind_m)
+    _write_f32_safetensors_with_metadata(path, h2, o2, bad_kind_m)
+    with pytest.raises(ValueError, match="declared full but tensors classify as"):
+        validate_sidecar(tmp_path, strict=True)
+
+    # Legacy unit_rms basis rejected even in non-strict mode.
+    legacy = json.loads(json.dumps(embedded))
     legacy["conventions"].update(content_basis_space="unit_rms", content_forward_formula="u @ R_C @ diag(s_C)",
                                  content_inverse_formula="diag(1/s_C) @ R_C^T @ diag(gamma)")
     legacy["transform_fingerprint"] = compute_transform_fingerprint(legacy)
     _write_f32_safetensors_with_metadata(path, header, ordered, legacy)
     with pytest.raises(ValueError, match="post_norm contract"):
         validate_sidecar(tmp_path, strict=False)
+
+
+def test_v3_persists_all_candidates_resumes_reselects_and_rejects_v2_checkpoints(tmp_path: Path):
+    """v3 fits full + scale_only at every width, persists all candidates + SmoothQuant + scores, reselects without refit, and rejects v2 checkpoints."""
+    from qmla.pipeline import (
+        CANDIDATE_TABLE_SCHEMA,
+        compute_fit_identity_key,
+        reselect_from_persisted_candidates,
+    )
+
+    _, _, _, _, bank0 = _make_skewed_hy4_bank(701, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=24, shared_seed=11)
+    source = {
+        "repo": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
+        "revision": "a" * 40,
+        "base_repo": "tencent/Hy4-flash",
+        "base_revision": "b" * 40,
+        "family": "hy4_flash",
+        "model_type": "hy_v4_flash",
+        "config_sha256": "c" * 64,
+        "checkpoint_kind": "mc",
+        "calibrated_view": "original",
+    }
+    prov = _synthetic_panel_provenance()
+    cfg = FitConfig(steps=4, val_every=2, seed=0, protection="sink4_local128", sink_tokens=2, recent_tokens=6)
+    out1 = tmp_path / "v3-run1"
+    modes = ((8, 8), (4, 8), (4, 4), (2, 4), (8, 0), (4, 0), (2, 0), (0, 8), (0, 4))
+
+    res1 = calibrate_hy4_flash_from_banks(
+        {0: bank0},
+        output_dir=out1,
+        source=source,
+        modes=modes,
+        corpus_provenance=prov,
+        fit_config=cfg,
+    )
+    f0 = res1["report"]["fit_by_layer"]["0"]
+    ckpt_dir = out1 / "fit-checkpoints"
+    # Default budget fits BOTH full and scale_only at every width (including 8-bit content & 8-bit RoPE).
+    # Headline table leads qmla-validation-report.json in canonical deployment mode order (4:0, 2:4, 8:0, 8:8, 4:8).
+    rep1 = res1["report"]
+    assert list(rep1.keys())[:4] == ["schema", "headline_modes", "headline_table", "headline_table_markdown"]
+    assert [r["mode"] for r in rep1["headline_table"]] == ["4:0", "2:4", "8:0", "8:8", "4:8"]
+    assert ":0` means RoPE is kept unquantized" in rep1["headline_table_markdown"]
+    assert "post-`o_proj`" in rep1["headline_table_markdown"]
+    for hrow in rep1["headline_table"]:
+        m = hrow["mode"]
+        assert hrow["supported"] is True and hrow["status"] == "measured"
+        assert hrow["attn_rel_err"] == pytest.approx(rep1["combinations"][m]["attn_rel_err"])
+        assert hrow["error_reduction_vs_identity_pct"] == pytest.approx((1.0 - hrow["ratio_to_rtn"]) * 100.0)
+        spread = hrow["per_layer_spread"]
+        assert spread is not None and spread["layers"] == 1
+        assert spread["best"]["layer_id"] == 0 and spread["worst"]["layer_id"] == 0
+        assert spread["median"]["ratio_to_rtn"] == pytest.approx(spread["best"]["ratio_to_rtn"])
+        assert f"`{m}`" in rep1["headline_table_markdown"]
+    for bits in (2, 4, 8):
+        assert set(f0["content"][str(bits)]) == {"full", "scale_only"}
+        for tag in ("full", "scale", "smoothquant"):
+            assert (ckpt_dir / f"content-{tag}-c{bits}-layer-0000.json").is_file()
+            assert (ckpt_dir / f"content-{tag}-c{bits}-layer-0000.safetensors").is_file()
+    for bits in (4, 8):
+        assert set(f0["rope"][str(bits)]) == {"full", "scale_only"}
+        for tag in ("full", "scale", "smoothquant"):
+            assert (ckpt_dir / f"rope-{tag}-r{bits}-layer-0000.json").is_file()
+            assert (ckpt_dir / f"rope-{tag}-r{bits}-layer-0000.safetensors").is_file()
+
+    # Candidate table persists all candidates, training-width provenance, and full val/test tables.
+    ctable = json.loads((out1 / "candidate-table.json").read_text())
+    assert ctable["schema"] == CANDIDATE_TABLE_SCHEMA
+    c_cands = ctable["layers"]["0"]["candidates"]["content"]
+    r_cands = ctable["layers"]["0"]["candidates"]["rope"]
+    assert set(c_cands) == {
+        "identity", "fitted:c2", "fitted:c4", "fitted:c8",
+        "scale_fitted:c2", "scale_fitted:c4", "scale_fitted:c8",
+        "smoothquant:c2", "smoothquant:c4", "smoothquant:c8",
+    }
+    assert set(r_cands) == {
+        "identity", "fitted:r4", "fitted:r8",
+        "scale_fitted:r4", "scale_fitted:r8",
+        "smoothquant:r4", "smoothquant:r8",
+    }
+    assert c_cands["fitted:c8"]["source_bits"] == 8 and c_cands["scale_fitted:c8"]["fit_mode"] == "scale_only"
+    assert set(ctable["layers"]["0"]["val_table"]["8:0"]["cells"]) == set(c_cands)
+    assert set(ctable["layers"]["0"]["test_table"]["8:0"]["cells"]) == set(c_cands)
+
+    # Re-running into out1 resumes every persisted v3 candidate with zero refitting.
+    res2 = calibrate_hy4_flash_from_banks(
+        {0: bank0},
+        output_dir=out1,
+        source=source,
+        modes=modes,
+        corpus_provenance=prov,
+        fit_config=cfg,
+    )
+    f0_2 = res2["report"]["fit_by_layer"]["0"]
+    for bits in (2, 4, 8):
+        assert f0_2["content"][str(bits)]["full"]["reused_fit"] is True
+        assert f0_2["content"][str(bits)]["scale_only"]["reused_fit"] is True
+    for bits in (4, 8):
+        assert f0_2["rope"][str(bits)]["full"]["reused_fit"] is True
+        assert f0_2["rope"][str(bits)]["scale_only"]["reused_fit"] is True
+    assert res2["manifest"]["transform_fingerprint"] == res1["manifest"]["transform_fingerprint"]
+
+    # Re-running selection from persisted candidates alone (no captures!) reproduces the exact sidecar.
+    reselect_dir = tmp_path / "reselect-same"
+    rs1 = reselect_from_persisted_candidates(out1, output_dir=reselect_dir)
+    assert rs1["validation"]["status"] == "passed"
+    assert rs1["manifest"]["transform_fingerprint"] == res1["manifest"]["transform_fingerprint"]
+
+    # Alternative policy (e.g., force identity at 8-bit on both paths) emits a new valid v3 sidecar without refitting.
+    from qmla.measurement import select_per_width
+
+    def force_identity_at_8(val_table, candidates, geometry):
+        sel = select_per_width(val_table, candidates, geometry)
+        sel["content"]["8"] = {
+            "candidate": "identity",
+            "kind": "identity",
+            "source_bits": None,
+            "val_score": {k: val_table[k]["rtn"] for k in val_table if k.startswith("8:")},
+            "width_mean_val_ratio_to_rtn": 1.0,
+        }
+        sel["rope"]["8"] = {
+            "candidate": "identity",
+            "kind": "identity",
+            "source_bits": None,
+            "val_score": {k: val_table[k]["rtn"] for k in val_table if k.endswith(":8")},
+            "width_mean_val_ratio_to_rtn": 1.0,
+        }
+        return sel
+
+    reselect_alt = tmp_path / "reselect-alt"
+    rs_alt = reselect_from_persisted_candidates(out1, output_dir=reselect_alt, selector=force_identity_at_8)
+    assert rs_alt["validation"]["status"] == "passed"
+    assert rs_alt["manifest"]["profiles"]["content"]["widths"]["8"]["per_layer"]["0"]["kind"] == "identity"
+    assert rs_alt["manifest"]["profiles"]["rope"]["widths"]["8"]["per_layer"]["0"]["kind"] == "identity"
+
+    # Legacy v2 fit checkpoints are strictly rejected (no v2 backward compatibility).
+    id_key = compute_fit_identity_key({0: bank0}, source=source, corpus_provenance=prov, fit_config=cfg)
+    legacy_dir = tmp_path / "legacy-v2-ckpt"
+    legacy_dir.mkdir()
+    sample_v3 = json.loads((ckpt_dir / "content-full-c4-layer-0000.json").read_text())
+    sample_v3["schema"] = "cuteafd-qmla-fit-checkpoint-v2"
+    (legacy_dir / "content-full-c4-layer-0000.json").write_text(json.dumps(sample_v3))
+    with pytest.raises(ValueError, match="unsupported fit checkpoint schema"):
+        load_fit_checkpoint(legacy_dir, kind="content", bits=4, layer_id=0, identity_key=id_key, fit_mode="full")
+
+
+def test_headline_table_per_layer_spread_and_pure_nope_na_rows(tmp_path: Path):
+    """Headline table reports joint end-to-end post-o_proj error, per-layer spread, :0 caption, and NoPE n/a rows."""
+    from qmla import CapturedLayerBank, CapturedLayerParams, CapturedSequence, HEADLINE_TABLE_CAPTION
+    from qmla.pipeline import calibrate_from_banks
+
+    def _nope_bank(seed: int, layer_id: int) -> CapturedLayerBank:
+        g = torch.Generator().manual_seed(seed)
+        d_c, heads, nope, vdim, hidden = 64, 2, 8, 8, 12
+        geom = MlaLayerGeometry(
+            layer_id=layer_id, kv_source_layer=layer_id, kind="dsa", heads=heads,
+            kv_lora_rank=d_c, qk_nope_dim=nope, qk_rope_dim=0, v_head_dim=vdim, rope_kind="none",
+        )
+        kv_norm = torch.ones(d_c)
+        kv_norm[0] = 6.0 if layer_id == 3 else 10.0
+        params = CapturedLayerParams(
+            kv_norm_weight=kv_norm,
+            kv_b_weight=torch.randn(heads * (nope + vdim), d_c, generator=g),
+            o_proj_weight=torch.randn(hidden, heads * vdim, generator=g),
+        )
+
+        def _seq(sid: str, t: int) -> CapturedSequence:
+            u = torch.randn(t, d_c, generator=g)
+            q_nope = torch.randn(t, heads, nope, generator=g)
+            stub = CapturedSequence(
+                seq_id=sid, positions=torch.arange(t, dtype=torch.int64),
+                u=u, q_nope=q_nope, q_rope=None, k_rope=None, allowed_mask=None, gate=None,
+                ref_output=torch.zeros(t, hidden),
+            )
+            return CapturedSequence(
+                seq_id=sid, positions=stub.positions, u=u, q_nope=q_nope,
+                q_rope=None, k_rope=None, allowed_mask=None, gate=None,
+                ref_output=eval_attention_output(stub, params, geom),
+            )
+
+        return CapturedLayerBank(
+            geometry=geom,
+            params=params,
+            train=tuple(_seq(f"tr_{i}", 24) for i in range(2)),
+            val=(_seq("va_0", 24),),
+            test=(_seq("te_0", 24),),
+            provenance={**_synthetic_panel_provenance(), "splits": _splits(["tr_0", "tr_1"], ["va_0"], ["te_0"])},
+        )
+
+    banks = {3: _nope_bank(803, 3), 7: _nope_bank(807, 7)}
+    source = {
+        "repo": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1",
+        "revision": "5" * 40,
+        "family": "glm5_flash",
+        "model_type": "glm5_next",
+        "config_sha256": "6" * 64,
+        "checkpoint_kind": "mc",
+        "calibrated_view": "original",
+    }
+    res = calibrate_from_banks(
+        banks,
+        output_dir=tmp_path / "nope-v3",
+        source=source,
+        modes=((8, 0), (4, 0), (2, 0)),
+        corpus_provenance=_synthetic_panel_provenance(),
+        fit_config=FitConfig(steps=4, val_every=2, seed=0, protection="sink4_local128", sink_tokens=2, recent_tokens=6),
+    )
+    report = res["report"]
+    assert [row["mode"] for row in report["headline_table"]] == ["4:0", "2:4", "8:0", "8:8", "4:8"]
+    by_mode = {row["mode"]: row for row in report["headline_table"]}
+
+    for mode in ("4:0", "8:0"):
+        row = by_mode[mode]
+        assert row["supported"] is True and row["status"] == "measured" and row["reason"] is None
+        spread = row["per_layer_spread"]
+        assert spread is not None and spread["layers"] == 2
+        assert {spread["best"]["layer_id"], spread["worst"]["layer_id"]} == {3, 7}
+        assert spread["best"]["ratio_to_rtn"] <= spread["median"]["ratio_to_rtn"] <= spread["worst"]["ratio_to_rtn"]
+        assert spread["median"]["ratio_to_rtn"] == pytest.approx(
+            0.5 * (spread["best"]["ratio_to_rtn"] + spread["worst"]["ratio_to_rtn"])
+        )
+
+    for mode in ("2:4", "8:8", "4:8"):
+        row = by_mode[mode]
+        assert row["supported"] is False and row["status"] == "n/a"
+        assert "qk_rope_dim=0" in (row["reason"] or "")
+        assert row["attn_rel_err"] is None and row["per_layer_spread"] is None
+        assert f"| `{mode}` | n/a | n/a | n/a | n/a | n/a (" in report["headline_table_markdown"]
+
+    assert HEADLINE_TABLE_CAPTION in report["headline_table_markdown"]

@@ -13,7 +13,16 @@ import torch
 
 from .capture import CapturedLayerParams, CapturedSequence, MlaLayerGeometry, ROWS, eval_attention_output
 from .fit import DEFAULT_PROTECTION_POLICY, FitConfig
-from .measurement import NATIVE_ROPE, _Scorer, _token_relative_squares, combo_key, layer_quantizes
+from .measurement import (
+    HEADLINE_DEPLOYMENT_MODES,
+    NATIVE_ROPE,
+    _Scorer,
+    _token_relative_squares,
+    build_headline_table,
+    combo_key,
+    format_headline_table,
+    layer_quantizes,
+)
 
 LONG_EVAL_SCHEMA = "cuteafd-qmla-long-eval-v1"
 LONG_CONTEXT_EVAL_SPLITS: tuple[str, ...] = ("heldout", "calibration")
@@ -145,18 +154,30 @@ class _BucketAcc:
 
 
 class LongContextEvaluator:
-    """Streaming per-layer long-context evaluator reusing ``measurement._Scorer``."""
+    """Streaming per-layer long-context evaluator reusing ``measurement._Scorer`` for v3 per-width selections."""
 
     def __init__(
-        self, *, modes: Sequence[tuple[int, int]],
-        content_transforms: Mapping[int, tuple[torch.Tensor, torch.Tensor]],
-        rope_transforms: Mapping[int, tuple[torch.Tensor, torch.Tensor]],
-        protection_policy: str = DEFAULT_PROTECTION_POLICY, config: FitConfig | None = None,
-        dsa_indexer_note: str = "", buckets: Sequence[tuple[str, int, int | None]] = DEFAULT_POSITION_BUCKETS,
+        self,
+        *,
+        modes: Sequence[tuple[int, int]],
+        content_transforms: Mapping[int, Mapping[int, Any]],
+        rope_transforms: Mapping[int, Mapping[int, Any]],
+        protection_policy: str = DEFAULT_PROTECTION_POLICY,
+        config: FitConfig | None = None,
+        dsa_indexer_note: str = "",
+        buckets: Sequence[tuple[str, int, int | None]] = DEFAULT_POSITION_BUCKETS,
+        profiles: Mapping[str, Mapping[str, Any] | None] | None = None,
+        unsupported_modes_reason: Mapping[str, str] | None = None,
     ) -> None:
         self.modes = tuple(modes)
-        self.content_arms = {lid: SimpleNamespace(r_c=r, s_c=s) for lid, (r, s) in content_transforms.items()}
-        self.rope_arms = {lid: SimpleNamespace(theta=t, s_p=s) for lid, (t, s) in rope_transforms.items()}
+        self.content_arms: dict[int, dict[int, Any]] = {
+            int(bits): dict(layers) for bits, layers in content_transforms.items()
+        }
+        self.rope_arms: dict[int, dict[int, Any]] = {
+            int(bits): dict(layers) for bits, layers in rope_transforms.items()
+        }
+        self.profiles = profiles
+        self.unsupported_modes_reason = dict(unsupported_modes_reason or {})
         self.config = config if config is not None else FitConfig(protection=protection_policy)
         self.dsa_indexer_note = dsa_indexer_note or (
             "DSA compressed indexer reads only layer input x and q_norm (indexer keys stay native); "
@@ -203,8 +224,9 @@ class LongContextEvaluator:
                     raise ValueError(f"non-finite long-eval error at layer {lid} mode {mkey} seq {seq.seq_id}")
                 return err
 
-            s_err = _run(("shipped", self.content_arms[lid]) if cb else "rtn",
-                         self.rope_arms[lid] if (rb and geometry.has_rope) else NATIVE_ROPE)
+            c_arm = (f"shipped_c{cb}", self.content_arms[cb][lid]) if cb else "rtn"
+            r_arm = self.rope_arms[rb][lid] if (rb and geometry.has_rope) else NATIVE_ROPE
+            s_err = _run(c_arm, r_arm)
             r_err = _run("rtn", NATIVE_ROPE)
             h_err = _run("hadamard", NATIVE_ROPE) if cb else r_err
 
@@ -251,9 +273,42 @@ class LongContextEvaluator:
             )
             combinations[mkey] = summary
 
+        headline_overall = build_headline_table(
+            combinations,
+            self.profiles,
+            unsupported_reasons=self.unsupported_modes_reason,
+        )
+        headline_by_bucket: dict[str, list[dict[str, Any]]] = {}
+        for bname in names:
+            bucket_combos: dict[str, dict[str, Any]] = {}
+            for mkey, summary in combinations.items():
+                if bname not in summary["by_position_bucket"]:
+                    continue
+                b_overall = summary["by_position_bucket"][bname]
+                b_per_layer = {
+                    lid_s: lrow["by_position_bucket"][bname]
+                    for lid_s, lrow in summary["per_layer"].items()
+                    if bname in lrow["by_position_bucket"]
+                }
+                bucket_combos[mkey] = {**b_overall, "layer_tokens": b_overall["tokens"], "per_layer": b_per_layer}
+            if bucket_combos:
+                headline_by_bucket[bname] = build_headline_table(
+                    bucket_combos,
+                    self.profiles,
+                    unsupported_reasons=self.unsupported_modes_reason,
+                )
+
         dev = torch.device(device)
         return {
-            "schema": LONG_EVAL_SCHEMA, "transform_scope": "shipped_single_transform_per_path",
+            "schema": LONG_EVAL_SCHEMA,
+            "headline_modes": list(HEADLINE_DEPLOYMENT_MODES),
+            "headline_table": headline_overall,
+            "headline_table_markdown": format_headline_table(headline_overall),
+            "headline_table_by_position_bucket": headline_by_bucket,
+            "headline_table_by_position_bucket_markdown": {
+                bname: format_headline_table(rows) for bname, rows in headline_by_bucket.items()
+            },
+            "transform_scope": "per_width_selected_transforms",
             "transform_fingerprint": transform_fingerprint, "protection_policy": self.config.protection,
             "query_tile_rows": ROWS,
             "position_buckets": [{"name": n, "start": s, "end": e} for n, s, e in self.buckets],

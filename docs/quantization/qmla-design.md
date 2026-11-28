@@ -1,6 +1,7 @@
 # CuteAFD QMLA Design: Shared Calibrated MLA Cache Compression
 
-**Status:** Phase 0 design **confirmed by TJ** (2026-11-28, tracking [#2909](https://github.com/tpurtell/cuteafd/issues/2909), target **v8**, not for v7).  
+**Status:** Phase 0 design **confirmed by TJ** (2026-11-28, tracking [#2909](https://github.com/tpurtell/cuteafd/issues/2909), target **v8**, not for v7). Revised to **`cuteafd-qmla-v3`** (per-width selections, explicit kinds, public tensor spec).  
+**Normative tensor & sidecar contract:** [`docs/quantization/qmla-format.md`](qmla-format.md). This document holds the design rationale and runtime architecture; `qmla-format.md` is the self-contained normative format contract.  
 **Primary reference:** *QuantMLA: Function-Aligned Dual-Path Quantization for Low-Bit MLA KV Caching*, Su et al., 2026-09 ([arXiv:2609.36760](https://arxiv.org/abs/2609.36760)).  
 **Comparison baseline:** `gr8` fixed-Hadamard INT4 MLA (`KV4.md`, Sylvester $H_{512}$, 416 B/tok).
 
@@ -122,151 +123,44 @@ Every quantized path uses per-token asymmetric affine quantization with group si
 
 ---
 
-## 5. Sidecar Schema (`mla_calibration.safetensors` + `cuteafd-mc.json["qmla"]`)
+## 5. Per-Width Transform Selection, Explicit Kinds, and Sidecar Schema (`cuteafd-qmla-v3`)
 
-There is **no separate `mla_calibration.json` file**. The **only** sidecar file added at the checkpoint root is `mla_calibration.safetensors`, **never indexed** in any `model*.safetensors.index.json` (so plain loaders and `0:0` ignore it completely).
+The normative binary layout, tensor naming, math, JSON schema, and consumer validation rules live in [`docs/quantization/qmla-format.md`](qmla-format.md).
 
-### Where the QMLA Manifest Lives (MC vs. Non-MC Checkpoints)
-- **MC checkpoints (have `cuteafd-mc.json`):** The entire QMLA manifest lives as an optional, advisory **`"qmla"` section inside `cuteafd-mc.json`** (same pattern as `engram_fp8` and `exl3_codebook` in `docs/mc-checkpoints.md`; **never** in `required_features`). All existing `cuteafd-mc.json` fields (`schema`, `source`, `original_core_dtype`, `shared_inventory_sha256`, `variants`, `exl3_codebook`, `engram_fp8`) stay byte-for-byte unchanged, and every existing MC validator continues to pass. A checkpoint without `"qmla"` or without `mla_calibration.safetensors` serves `0:0` unchanged.
-- **Non-MC checkpoints (official / plain checkpoints without `cuteafd-mc.json`):** The exact same canonical QMLA manifest JSON is embedded in `mla_calibration.safetensors`'s **`__metadata__["cuteafd_qmla"]`** header (zero extra JSON files!).
-  - **Why `__metadata__` instead of a minimal `cuteafd-mc.json`:** `docs/mc-checkpoints.md` defines a repository as MC *iff* `cuteafd-mc.json` exists, and MC discovery fails closed if `cuteafd-mc.json` lacks `variants` / `shared_inventory_sha256`. Putting the metadata in `mla_calibration.safetensors`'s own safetensors `__metadata__` header preserves the MC discovery invariant cleanly, requires adding **only one file** for a calibration-only non-MC revision, and avoids a circular file-hash dependency (the embedded manifest carries `tensors_payload_sha256` over the raw tensor payload bytes after the safetensors header, while `cuteafd-mc.json["qmla"]` on MC checkpoints additionally pins the whole-file `tensors_sha256` and `tensors_bytes` of `mla_calibration.safetensors`).
-  - `mla_calibration.safetensors` always writes `__metadata__["cuteafd_qmla"]` for both MC and non-MC checkpoints, so the file is self-describing and `validate_sidecar` verifies exact agreement between `cuteafd-mc.json["qmla"]` and the safetensors header on MC checkpoints.
+### Design Rationale: Per-Width Selection and Explicit Kinds
 
-### One Shipped Transform per Path, Selected Across Every Width (TJ, 2026-11-28)
-Calibration fits every width independently (content at 2/4/8, RoPE at 4/8), because the QDQ inside each objective is width-specific. Those per-width fits are for analysis. **The sidecar ships one content transform $(R_C, S_C)$ and one RoPE transform $(\theta, s)$ per layer, and serves them at every calibrated width.**
+Sharing one transform across all serving widths hurts high-bit serving: low-bit rotations that cut 2- and 4-bit error by 16–18% can add ~6–7% error at 8 bits where identity or scale-only is optimal, while isolated layers still benefit significantly from full 8-bit rotation (up to ~11% beyond scale-only). Selecting independently per **(layer, path, serving width)** with explicit execution kinds (`identity` | `scale_only` | `full`) captures the gain at every width without paying unnecessary rotation work or storage.
 
-- **Candidates per layer and path:** every width's fit (`fitted:c2`, `fitted:c4`, `fitted:c8`; `fitted:r4`, `fitted:r8`) and each width's SmoothQuant init (`smoothquant:c4` is identity $R_C$ with the 4-bit alpha-grid scales; `smoothquant:r4` is zero angles with its pair scales).
-- **Selection (on `val`):** score every candidate on every combination, scoring content × RoPE pairs jointly on joint combinations. Ship the pair with the lowest **mean val ratio to RTN** over all measured combinations (`mean_val_ratio_to_rtn`). Each combination counts equally, so a 2-bit combination's larger absolute error does not outvote the 8-bit ones. This also acts as the joint guard. Per-path fits are chosen on their own objective ($\mathcal{L}_C$ with exact RoPE, $\mathcal{L}_P$ with exact content), but the reported number is the joint post-`o_proj` error. On pilot layer 21, SmoothQuant content + SmoothQuant RoPE beat fitted + fitted at 4:4. Selecting on the joint combinations catches that.
-- **Why one transform rather than per-combination references:** the runtime writes one cache coordinate system per layer. A separate transform per width or per combination would multiply sidecar bytes, load-time absorptions and cache identities for a difference the cross-table can measure first. If the measured cross-table shows one transform losing materially at some width, a per-width profile can come back as a schema change, backed by that measurement.
-- **Recorded per layer:** `profiles.<path>.selection.per_layer[l] = {candidate, chosen: fitted|smoothquant, source_bits, objective, val_score: {combination: val error}}`. A SmoothQuant choice is still a fingerprinted profile. The validator requires its rotation to be the identity (content) or its angles to be zero (RoPE).
-- **Tensors:** `content.layer_{l}.r` `F32[d_c, d_c]`, `content.layer_{l}.s` `F32[d_c]`, `rope.layer_{l}.theta` and `rope.layer_{l}.s` `F32[d_r/2]`. `profiles.content.bits` / `profiles.rope.bits` list the served widths; `supported_modes` is derived from them. A path with no profile (pure NoPE RoPE) is `null`.
+### Selection Policy, Fitting Budget, and Candidate Persistence
 
-Storing `F32` keeps orthogonality validation ($\|R^\top R - I\|_\infty < 10^{-5}$) and FP32 `kv_b_proj` absorption at load time exact. On disk that is 1.0 MiB/layer for content: ~12 MiB on Hy4-flash's 12 DSA layers, ~78 MiB for 78-layer GLM 5.3 / Hy4.
-
-### Embedded `qmla` Section Schema (`schema: "cuteafd-qmla-v2"`)
-```json
-{
-  "schema": "cuteafd-qmla-v2",
-  "artifact_status": "calibrated_unqualified",
-  "protection_policy": "sink4_local128",
-  "protection_scope": "full_history_mla_only",
-  "source": {
-    "repo": "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
-    "revision": "<40-char-sha>",
-    "base_repo": "tencent/Hy4-flash",
-    "base_revision": "<40-char-sha>",
-    "family": "hy4_flash",
-    "model_type": "hy_v4_flash",
-    "config_sha256": "<sha256>",
-    "checkpoint_kind": "mc",
-    "calibrated_view": "original"
-  },
-  "applicable_views": ["original", "k8-compact", "k6-compact", "fp8-compact"],
-  "view_transfer_validation": {
-    "k8-compact": {"split": "test", "reference": "k8-compact 0:0", "combinations": {"4:4": {"attn_rel_err": 0.0, "rtn_attn_rel_err": 0.0, "ratio_to_rtn": 0.0}}}
-  },
-  "conventions": {
-    "vector_layout": "row",
-    "content_basis_space": "post_norm",
-    "content_forward_formula": "c @ R_C @ diag(s_C)",
-    "content_inverse_formula": "diag(1/s_C) @ R_C^T",
-    "rope_angle_sign": "right_row_phi_plus_theta",
-    "rope_forward_key_formula": "k_rope @ R_P(theta) @ diag(s_P_pair)",
-    "rope_query_compensation_formula": "q_rope @ R_P(theta) @ diag(1/s_P_pair)",
-    "storage_dtype": "F32"
-  },
-  "quantizer_recipe": {
-    "scheme": "affine_asymmetric_per_token",
-    "group_size": 64,
-    "rounding": "rne",
-    "content_scale_dtype": "BF16",
-    "content_zp_dtype": "U8",
-    "rope_scale_dtype": "F32",
-    "rope_zp_dtype": "F32",
-    "eps_scale": 1e-8,
-    "pack_order": "lsb_first"
-  },
-  "geometry": [
-    {
-      "layer_id": 0,
-      "kv_source_layer": 0,
-      "kind": "dsa",
-      "heads": 32,
-      "kv_lora_rank": 512,
-      "qk_nope_dim": 192,
-      "qk_rope_dim": 64,
-      "v_head_dim": 256,
-      "rope_kind": "interleaved",
-      "mrope_section": [12, 10, 10],
-      "content_enabled": true,
-      "rope_enabled": true,
-      "shared_consumers": [0]
-    }
-  ],
-  "profiles": {
-    "content": {
-      "bits": [2, 4, 8],
-      "transform_kind": "dense_orth",
-      "layers": [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41],
-      "tensors_prefix": "content",
-      "protection_calibrated": "sink4_local128",
-      "selection": {
-        "objective": "mean_val_ratio_to_rtn",
-        "per_layer": {
-          "21": {"candidate": "smoothquant:c4", "chosen": "smoothquant", "source_bits": 4,
-                 "objective": 0.64, "val_score": {"4:4": 0.0, "4:0": 0.0}}
-        }
-      },
-      "validation": {"equivalence_metric": "expanded_kv_rel_l2", "equiv_max_rel_err": 0.0, "orth_max_err": 0.0, "per_layer": {}},
-      "profile_fingerprint": "<sha256>"
-    },
-    "rope": {
-      "bits": [4, 8],
-      "transform_kind": "pair_so2",
-      "layers": [0, 1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41],
-      "tensors_prefix": "rope",
-      "protection_calibrated": "sink4_local128",
-      "selection": {"objective": "mean_val_ratio_to_rtn", "per_layer": {}},
-      "validation": {"equiv_max_rel_err": 0.0, "per_layer": {}},
-      "profile_fingerprint": "<sha256>"
-    }
-  },
-  "supported_modes": ["8:8", "4:8", "4:4", "2:4", "4:0", "0:4", "8:0", "0:8", "2:0"],
-  "unsupported_modes_reason": {"*:2": "INT2 RoPE is not supported"},
-  "calibration_provenance": {
-    "dataset_repo": "wrldsuksgo2mars/agentic-quant-panel-v3",
-    "dataset_revision": "e3ac6ee6126f469e37ddf879a6cb2dccc10c6c99",
-    "components": {
-      "agentic": {"sequences": 1426, "tokens": 1097388, "input_ids_sha256": "<sha256>"},
-      "exl3_standard": {"sequences": 250, "tokens": 512000, "input_ids_sha256": "<sha256>"},
-      "long_context": {"sequences": 118, "tokens": 231947, "input_ids_sha256": "<sha256>", "mode": "windowed", "window_tokens": 2048}
-    },
-    "train_sequences": 128,
-    "val_sequences": 16,
-    "test_sequences": 16,
-    "splits": {"salt": "cuteafd-qmla-split-v2", "seed": 0,
-               "train": {"count": 128, "seq_ids": ["..."], "sha256": ["..."], "digest": "<sha256>"},
-               "val": {"count": 16, "seq_ids": ["..."], "sha256": ["..."], "digest": "<sha256>"},
-               "test": {"count": 16, "seq_ids": ["..."], "sha256": ["..."], "digest": "<sha256>"}},
-    "measurement_split": "test",
-    "combination_measurements": {"4:4": {"attn_rel_err": 0.0, "rtn_attn_rel_err": 0.0, "ratio_to_rtn": 0.0}},
-    "input_ids_sha256": "<sha256>",
-    "renderer_template_sha256": "<sha256>",
-    "thinking_mode": "high",
-    "optimizer": "adamw",
-    "steps_per_path": 300,
-    "seed": 0,
-    "code_commit": "<sha>"
-  },
-  "tensors_file": "mla_calibration.safetensors",
-  "tensors_payload_sha256": "<sha256>",
-  "tensors_bytes": 37748736,
-  "tensors_sha256": "<sha256-in-cuteafd-mc-json-only>",
-  "transform_fingerprint": "<sha256>"
-}
-```
-- **Shared across views:** One sidecar is shared across `original`, `k8-compact`, `k6-compact`, and `fp8-compact` whenever cross-view transfer validation passes (recorded in `applicable_views` and `view_transfer_validation`). If any view requires separate transforms, it gets an explicit view-scoped manifest entry rather than silent reuse.
-- **`transform_fingerprint`:** Canonical SHA256 over `(schema, protection_policy, source.base_revision, geometry, conventions, quantizer_recipe, profiles, tensors_payload_sha256)`. Binds runtime graph & prefix cache identity to exact learned coordinates and protection policy, independent of bit width alone.
+1. **Per `(layer, path, serving_width)` selection:**
+   - Content selections are shipped for **2, 4, and 8 bits** (`profiles.content.widths["2"|"4"|"8"]`).
+   - RoPE selections are shipped for **4 and 8 bits** (`profiles.rope.widths["4"|"8"]`) wherever RoPE exists. Pure-NoPE models (`glm5_flash`, `qk_rope_dim == 0`) keep `profiles.rope: null` and record `*:4` and `*:8` explicitly in `unsupported_modes_reason`.
+   - A serving mode `C:R` combines the `C`-bit content selection and `R`-bit RoPE selection.
+2. **Explicit execution kinds (`identity` | `scale_only` | `full`):**
+   - Every `(layer, path, width)` entry records its explicit `kind` so inference does only the work the kind requires:
+     - `identity`: no transform work on write, no `kv_b_proj` or $Q_P$ compensation, **zero tensors stored**;
+     - `scale_only`: elementwise channel/pair scaling only (no dense rotation matmul, no extra phase angle), **only `.s` stored**;
+     - `full`: learned rotation + scales (`.r` + `.s` for content; `.theta` + `.s` for RoPE).
+   - **Kind classification rule:** A candidate whose tensors satisfy $\|R_C - I\|_\infty \le 10^{-6}$ (or $\max_i|\operatorname{atan2}(\sin\theta_i, \cos\theta_i)| \le 10^{-6}$ rad for RoPE) **and** $\|s - \mathbf{1}\|_\infty \le 10^{-6}$ is classified and stored as `identity`, regardless of which optimizer produced it. If rotation is within $10^{-6}$ of identity and scales deviate by $> 10^{-6}$, it is classified and stored as `scale_only`. Otherwise it is `full`.
+   - **Justification for `1e-6`:** More than $1000\times$ below BF16 half-ULP ($\approx 3.9\times 10^{-3}$) and INT8 quantization step size ($\ge 3.9\times 10^{-3}$), so collapsing near-identity tensors cannot affect quantized codes; simultaneously absorbs FP32 Cayley/$\exp(0)$ roundoff ($\text{few}\times 10^{-7}$) while staying $10\times$ tighter than the $10^{-5}$ orthogonality gate. Fixed Sylvester Hadamard remains strictly a calibration measurement baseline and is never shipped.
+3. **Default fitting budget (fit both `full` and `scale_only` across every width):**
+   - Default budget (`DEFAULT_FIT_BUDGET`): run **both** a `full` fit (rotation + scales) **and** a `scale_only` fit (fixed identity rotation / zero angles, log-scales only) for every calibrated width (`c2, c4, c8` and `r4, r8`, including 8-bit), alongside each width's step-0 SmoothQuant init and `identity`.
+   - Every layer × width scores `identity` and every candidate of that path (`fitted:*`, `scale_fitted:*`, `smoothquant:*`, across all widths) at its intended serving width. `full` is a normal per-layer outcome at any width whenever it wins on `val`, while layers where rotation does not pay cleanly ship `scale_only` or `identity`.
+4. **Full candidate persistence (for the duration of the run; cleaned after publish):**
+   - Every candidate fitted during a run (`full`, `scale_only`, and `smoothquant` per width and layer) is persisted under `<output>/fit-checkpoints/` using schema `cuteafd-qmla-fit-checkpoint-v3` with streamed XXH3-128 receipts.
+   - Every candidate's metadata, training-width provenance (`fit_mode`, `source_bits`, `classified_kind`), and full `val` and `test` tables are written to `<output>/candidate-table.json` (`cuteafd-qmla-candidate-table-v3`) alongside `qmla-validation-report.json` (`cuteafd-qmla-validation-report-v3`).
+   - Selection policies can therefore be rerun offline with `reselect_from_persisted_candidates(run_dir)` — emitting a fresh validated sidecar with **zero refitting and zero captures**.
+   - Candidate checkpoints exist only for the duration of the calibration run; once the new HF revision is published, verified, and imported into SparkNest, unselected candidate fits and capture banks are deleted, keeping only the small JSON receipts (`qmla-validation-report.json`, `candidate-table.json`, transfer/publish receipts, and logs).
+5. **Selection on `val` and reporting on `test`:**
+   - Selection runs strictly on the `val` split (`per_width_mean_val_ratio_to_rtn`). Because content width selections $c_2, c_4, c_8$ are conditionally independent given the RoPE selections $(r_4, r_8)$, exact global minimization over all serving widths takes $<1\text{ ms}$ per layer while catching joint content $\times$ RoPE interactions. Ties within $10^{-12}$ relative tolerance prefer simpler kinds (`identity < scale_only < full`), then explicit `identity`, then natural training width (`source_bits == width`).
+   - Held-out `test` reporting (`qmla-validation-report.json` and final summaries) **leads with a headline table** (`headline_table` / `headline_table_markdown`) for deployment modes **`4:0`, `2:4`, `8:0`, `8:8`, `4:8`**. Every supported row comes from **one end-to-end joint post-`o_proj` measurement** combining each layer's selected content transform at the content width with its selected RoPE transform at the RoPE width (never per-path errors added together), reporting identity (RTN) attention error, shipped attention error, improvement as ratio (`ratio_to_rtn`) and `%` (`error_reduction_vs_identity_pct`), and **per-layer spread (median, best, worst)**. Pure-NoPE models emit RoPE modes (`2:4`, `8:8`, `4:8`) explicitly as `n/a` with the structural `qk_rope_dim=0` reason, with `4:0` and `8:0` as the measured headline rows. The table caption explicitly states that `:0` means RoPE is kept unquantized (native format). Full per-combination and per-layer candidate scores (`combinations[mode].per_layer[lid].cells` and `candidate-table.json`) follow alongside fixed Hadamard (`ratio_to_rtn`, `hadamard_ratio_to_rtn`).
+6. **Single shard, exact per-layer aliasing, and MC embedding:**
+   - All layers, widths, and paths ship in **one `mla_calibration.safetensors` shard** at the checkpoint root (never indexed in `model*.safetensors.index.json`; no `mla_calibration.json`).
+   - Within each `(path, layer)`, widths that select byte-identical F32 tensors of the same kind alias to the same canonical slot (`{path}.layer_{l}.t{k}.{r|theta|s}`, policy `exact_per_layer_f32_dedup`).
+   - MC checkpoints mirror the full manifest under `cuteafd-mc.json["qmla"]` (advisory, never in `required_features`) plus whole-file `tensors_sha256` and `tensors_bytes`, cross-checked against `__metadata__["cuteafd_qmla"]`. Non-MC checkpoints rely solely on `__metadata__["cuteafd_qmla"]`. See [`qmla-format.md`](qmla-format.md) §§2, 3, 6, 7 for the complete schema and validation contract.
+   - **Shared across views:** One sidecar is shared across `original`, `k8-compact`, `k6-compact`, and `fp8-compact` whenever cross-view transfer validation passes (`applicable_views` and `view_transfer_validation`).
+   - **Schema versioning:** `cuteafd-qmla-v3` is the sole supported schema; loaders fail closed on earlier schemas.
 
 ---
 
@@ -288,16 +182,17 @@ Storing `F32` keeps orthogonality validation ($\|R^\top R - I\|_\infty < 10^{-5}
    - **Incremental update (Phase 2).** Use the same original-view forward for the existing MC checkpoint. Record the forward’s repo, revision and view. Training, selection and test use the frozen outputs captured on their respective sequences.
    - **Per-layer streaming & recovery:** Optimize all requested bit-width profiles (`c8, c4, c2` and `r8, r4`) from the same captured layer tensors, write a per-layer sequential checkpoint segment with streamed XXH3-128 receipt (`brief-template.md` §7), and free the layer's activation buffers before moving to layer $\ell+1$.
    - **Shared-KV layers (Mistral Large 4):** Accumulate $\mathcal{L}_C$ across all consumer layers sharing `kv_source_layer` so one $(R_C, S_C)$ optimizes every consumer jointly.
-4. **Optimizer & baseline comparison:** For each layer and bit width, run:
-   - Step 0 evaluation of RTN and fixed Sylvester Hadamard (`H_512`) baselines + 99.9th-percentile scale-init grid $\alpha \in \{0, 0.125, 0.25, 0.5, 0.75, 1\}$ (gives SmoothQuant† for free).
-   - 300 steps of AdamW (Cayley orthogonal $R_C$, log-scale $S_C \in [-2,2]$, angles $\theta_i$, pair-tied log-scales $s_i \in [-2,2]$), selecting the best checkpoint on the `val` split every 20 steps (step 0 is the SmoothQuant init).
-   - Then build the candidate cross-table (every width's fit and SmoothQuant init against every combination) on `val`, and select one content and one RoPE transform per layer (§5). Measure the same table on `test` for the report.
-   - Mandatory validators: orthogonality ($\|R^\top R - I\|_\infty < 10^{-5}$), scale finiteness & positivity, byte-identical identity replay, quantization-off algebraic equivalence for learned transforms (and 3D M-RoPE commutation where applicable), and cross-view transfer check. For K8, apply the original-fitted transforms to the same held-out test sequences on `k8-compact` and measure every combination against K8’s own `0:0`.
+4. **Optimizer, candidate persistence & baseline comparison (v3 default fitting budget):** For each layer:
+   - Step 0 evaluation of identity (RTN) and fixed Sylvester Hadamard (`H_512`) baselines + 99.9th-percentile scale-init grid $\alpha \in \{0, 0.125, 0.25, 0.5, 0.75, 1\}$ (gives SmoothQuant† for free).
+   - **Full fits** (300 steps of AdamW over Cayley orthogonal $R_C$ + log-scale $S_C \in [-2,2]$, or RoPE angles $\theta_i$ + pair-tied log-scales $s_i \in [-2,2]$) AND **scale-only fits** (300 steps of AdamW over log-scales only, fixed identity rotation / zero angles) for **every calibrated width** (`c2, c4, c8` and `r4, r8`), selecting the best checkpoint on `val` every 20 steps.
+   - Persist **every** candidate (`full`, `scale_only`, and `smoothquant` per width and layer) under `<output>/fit-checkpoints/` (`cuteafd-qmla-fit-checkpoint-v3`, XXH3-128 receipts) and write the complete val/test candidate table to `<output>/candidate-table.json` (`cuteafd-qmla-candidate-table-v3`), so interrupted v3 runs resume cleanly and selection policies can be rerun via `reselect_from_persisted_candidates` with zero refitting.
+   - Build the candidate cross-table (`identity`, full fits, scale-only fits, SmoothQuant inits) on `val` and select per `(layer, path, serving_width)` (§5), classifying each winner's kind (`identity` | `scale_only` | `full`). Measure the same table on `test` for the report, including the old v2 shared policy for comparison.
+   - Mandatory validators: orthogonality ($\|R^\top R - I\|_\infty \le 10^{-5}$), scale finiteness & positivity, canonical kind consistency (`1e-6` thresholds), byte-identical identity replay, quantization-off algebraic equivalence for every unique non-identity transform (and 3D M-RoPE commutation where applicable), and cross-view transfer check (`k8-compact` against K8’s own `0:0`).
 5. **Long-context evaluation (16K and 32K, `--long-eval`):** Full-length records run on the same calibration view and their errors use its own `0:0` output. Run `qmla_run.py --long-eval` after fitting or pass an existing `--sidecar` for standalone evaluation.
    - **Why:** Past ~2K tokens, three effects appear that 2K-only captures cannot test: DSA top-k pruning (past `candidate_topk = 2048`), low-frequency RoPE rotation at 16K–32K+ positions, and vanishing protection coverage (`sink4_local128` protects 6.5% at 2K vs 0.4% at 32K).
-   - **Chunked attention & compact DSA masks:** Evaluation runs forward-only, streaming layer by layer and freeing each capture immediately after scoring, reusing the same 128-row tiled `eval_attention_output` (`tiled_sink_attention` with per-query `sink4_local128` protection) and `measurement._Scorer` hooks across the calibration view’s native reference, shipped transforms, RTN, and fixed Hadamard. For GLM Flash native BF16 replay, each query tile spans the full native key dimension and masks future or unselected keys. Truncating the key dimension changes numerical reduction order. Long captures store compact DSA `SparseSelection` group IDs (`int32[T, group_topk]`, 64 MiB at 32K) instead of dense `[T, T]` boolean masks (1 GiB + 8 GiB index temp).
+   - **Chunked attention & compact DSA masks:** Evaluation runs forward-only, streaming layer by layer and freeing each capture immediately after scoring, reusing the same 128-row tiled `eval_attention_output` (`tiled_sink_attention` with per-query `sink4_local128` protection) and `measurement._Scorer` kind-specific hooks across the calibration view’s native reference, per-width selected transforms, RTN, and fixed Hadamard. For GLM Flash native BF16 replay, each query tile spans the full native key dimension and masks future or unselected keys. Truncating the key dimension changes numerical reduction order. Long captures store compact DSA `SparseSelection` group IDs (`int32[T, group_topk]`, 64 MiB at 32K) instead of dense `[T, T]` boolean masks (1 GiB + 8 GiB index temp).
    - **DSA selection drift:** On Hy4-flash, `compressed_indexer` (`index_projections(x, q_norm, ...)`) reads only layer input `x` and `q_a_proj(x)` — quantized MLA latents `c` and `k_rope` never feed it, and indexer keys stay native. Within a layer, DSA selection drift is therefore **structurally zero** (overlap `1.0` by construction); cross-layer residual propagation is out of scope for per-layer evaluation.
-   - **Position curve & report:** Full-length 16K/32K `long_context` records are rendered from the pinned v3 snapshot (local HF cache) through `quantization/panel_corpus.py` in `full` mode, `heldout` then `calibration` splits, with the corpus's chat kwargs. Results land in `qmla-validation-report.json["long_context_eval"]` for the shipped single transform per path beside RTN and Hadamard, both overall and bucketed by query position (`0-2k`, `2k-4k`, `4k-8k`, `8k-16k`, `16k-32k`, `32k+`).
+   - **Position curve & report:** Full-length 16K/32K `long_context` records are rendered from the pinned v3 snapshot (local HF cache) through `quantization/panel_corpus.py` in `full` mode, `heldout` then `calibration` splits, with the corpus's chat kwargs. Results land in `qmla-validation-report.json["long_context_eval"]` (`transform_scope: "per_width_selected_transforms"`), leading with the **same headline table** (`4:0`, `2:4`, `8:0`, `8:8`, `4:8` with identity error, shipped error, ratio, `%` reduction, per-layer median/best/worst spread, `:0` caption, and `n/a` + reason for unsupported/NoPE modes) both **overall** (`headline_table` / `headline_table_markdown`) and **per position bucket** (`headline_table_by_position_bucket`: `0-2k`, `2k-4k`, `4k-8k`, `8k-16k`, `16k-32k`, `32k+`), followed by full per-combination results beside RTN and Hadamard.
 
 ---
 
@@ -319,13 +214,20 @@ Storing `F32` keeps orthogonality validation ($\|R^\top R - I\|_\infty < 10^{-5}
   - Missing `cuteafd-mc.json["qmla"]` (or `__metadata__["cuteafd_qmla"]` on non-MC) / missing `mla_calibration.safetensors`, mismatched `source` / `config_sha256`, or missing requested `c{C}` / `r{R}` profile: fail closed with the exact missing file/profile (never fall back to `0:0` or RTN).
   - Unqualified runtime family/mode combination: fail closed naming the unimplemented kernel/family limitation.
 
-### Arena Ownership, Graph Identity, Prefix Identity, and Speculators
-- **Packed arenas (AGENTS.md):** All QMLA transform tensors (`M_C = R_C S_C`, RoPE `theta / s / s_inv`) live in **one named packed device arena per coordinator GPU** (`qmla.transforms.<gpu>`), inventoried and charged once by admission. Load-time `kv_b_proj` compensation writes directly into the existing absorbed `W_UK`/`W_UV` arena slots via bounded transient scratch (zero permanent BF16 duplicate). Active `sink4_local128` BF16 protection buffers live in one named per-rank arena and inside the existing prefix mark arena (full-history MLA layers only, never SWA), charged once by admission from the first runtime.
-- **Coordinate identity vs. bit width:** Cache identity is `(resolved_content_format, resolved_rope_format, base_kv_cache, protection_policy, transform_fingerprint)` — **never** bit width alone. `protection_policy` defaults to `"sink4_local128"` for every nonzero mode.
-- **Prefix cache & host cache (`cuteafd-hostcache`, `RefPagePool`):** Include the full cache identity tuple in page-pool / host-cache namespace hashing so incompatible calibrations, modes, or protection policies can never collide. Exact prefix restore copies packed pages plus the `sink4_local128` BF16 mark bytes byte-for-byte.
-- **CUDA graph identity:** Graph keys include `(qmla_mode, protection_policy, record_bytes, transform_fingerprint)`. Because transform tensors and protection buffers live in fixed packed arenas, graph pointers remain invariant across requests.
+### Active-Mode Resolution, Kind-Specific Execution, Arena Ownership, and Cache Identity
+Priorities, in order: **inference speed, resident memory, efficient loading, efficient publishing**.
+
+- **Loader resolution:** Given active mode `C:R` (nonzero), the loader validates `mla_calibration.safetensors` (and `cuteafd-mc.json["qmla"]` on MC), checks `C:R ∈ supported_modes`, and resolves only the active `(layer, path, width)` entries (`profiles.content.widths["C"]` when `C > 0`; `profiles.rope.widths["R"]` when `R > 0`) via their explicit `tensors` maps — reading only the safetensors slices needed for `C:R` (unused widths stay unread on disk).
+- **Kind-specific execution & load-time compensation:**
+  - `identity`: **zero** write-side transform work, **zero** `kv_b_proj` or $Q_P$ compensation, **zero** GPU arena bytes. The cache-write kernel quantizes $c$ or $K_P$ directly from native coordinates.
+  - `scale_only`: **no dense rotation GEMV/GEMM** and **no extra phase angle**. Content write multiplies $c$ elementwise by `s_C` (1 KiB BF16 / 2 KiB F32 per layer, fused into the quantizer kernel), and `kv_b_proj` load-time compensation divides columns by `s_C` elementwise. RoPE multiplies pair $i$ by `s_i` / `s_i^{-1}` inside the existing RoPE step.
+  - `full`: content write applies pre-multiplied $M_C = R_C \mathrm{Diag}(s_C)$ (BF16, 512 KiB/layer) and `kv_b_proj` absorbs $R_C \mathrm{Diag}(s_C^{-1})$ in FP32 before head packing; RoPE adds $\theta_i$ to $\phi_{i,m}$ and scales by $s_i$ / $s_i^{-1}$.
+- **Packed arenas (AGENTS.md):** Only the **active mode's** non-identity transforms are materialized into **one named packed device arena per coordinator GPU** (`qmla.transforms.<gpu>`), inventoried and charged once by admission (`identity` layers reserve 0 B; `scale_only` layers reserve only `s`; `full` layers reserve `M_C` or `theta`/`s`/`s_inv`). Load-time `kv_b_proj` compensation writes directly into the existing absorbed `W_UK`/`W_UV` arena slots via bounded transient scratch (zero permanent BF16 duplicate). Active `sink4_local128` BF16 protection buffers live in one named per-rank arena and inside the existing prefix mark arena (full-history MLA layers only, never SWA), charged once by admission from the first runtime.
+- **Coordinate identity vs. bit width:** Active cache identity is `(resolved_content_format, resolved_rope_format, base_kv_cache, protection_policy, mode_selection_fingerprint)` — **never** bit width alone. `mode_selection_fingerprint` binds the exact per-layer kinds, tensor bindings, and tensor byte digests of the active `C`-bit content and `R`-bit RoPE width selections (`width_fingerprint`s in `qmla-format.md` §6). `protection_policy` defaults to `"sink4_local128"` for every nonzero mode.
+- **Prefix cache & host cache (`cuteafd-hostcache`, `RefPagePool`):** Include the full cache identity tuple (with `mode_selection_fingerprint`) in page-pool / host-cache namespace hashing so incompatible calibrations, modes, kinds, or protection policies can never collide. Exact prefix restore copies packed pages plus the `sink4_local128` BF16 mark bytes byte-for-byte.
+- **CUDA graph identity:** Graph keys include `(qmla_mode, protection_policy, record_bytes, mode_selection_fingerprint)` (which fixes every layer's `identity` / `scale_only` / `full` dispatch kernel). Because transform tensors and protection buffers live in fixed packed arenas, graph pointers remain invariant across requests.
 - **Speculative consumers:**
-  - *Target-KV-sharing drafters* (`hy4_flash` / `hy4` DFly2): read the same QMLA target KV pages (zero BF16 duplicate); load-time absorption compensates DFly2's `kv_b_proj` with its tapped target layer's $R_{C,\ell} S_{C,\ell}^{-1}$ and applies $(R_{P,\ell}, S_{P,\ell}^{-1})$ to DFly2's RoPE queries.
+  - *Target-KV-sharing drafters* (`hy4_flash` / `hy4` DFly2): read the same QMLA target KV pages (zero BF16 duplicate); load-time absorption applies the active selection's exact kind (`identity` = no-op, `scale_only` = column scale $s_C^{-1}$, `full` = $R_{C,\ell} S_{C,\ell}^{-1}$) to DFly2's `kv_b_proj` and the active RoPE kind to DFly2's RoPE queries.
   - *Independent-KV drafters* (external DFlash2 on GLM 5.3 / GLM 5.3 Flash / Kimi; ML4 `mtp_dspark`): keep their own KV cache governed by `--draft-kv-cache`, completely independent of target `--quant-mla`.
 
 ---
@@ -339,7 +241,7 @@ New CuteAFD quant families are built by copying the previous family's working pi
   - `capture.py` *(mode-agnostic)*: `MlaLayerGeometry`, `CapturedSequence`, `CapturedLayerParams`, `CapturedLayerBank`, `QmlaCaptureAdapter` protocol, exact full-precision attention-output / positional-QK evaluators, deterministic train/val splitting, and sequential segment capture storage with streamed XXH3-128 receipts.
   - `quantizer.py`: paper-faithful per-token asymmetric affine group-64 quantizer (RNE ties-to-even, STE, INT2/INT4/INT8 pack/unpack + CPU numeric oracle).
   - `fit.py`: content-path Cayley orthogonal $R_C$ + log-scale $S_C$ optimizer ($\mathcal{L}_C$), RoPE-path per-pair $SO(2)$ angles + pair-tied scales optimizer ($\mathcal{L}_P$), step-0 RTN / fixed-Hadamard / SmoothQuant† $\alpha$-search baselines, shared-KV multi-consumer loss aggregation, per-layer streaming & checkpoint/resume.
-  - `sidecar.py`: `cuteafd-qmla-v2` single-file sidecar (`mla_calibration.safetensors` with embedded `__metadata__["cuteafd_qmla"]` + full `"qmla"` section inside `cuteafd-mc.json` for MC checkpoints; no separate `mla_calibration.json`), `transform_fingerprint`, and fail-closed validators (geometry, source identity, SHA256 digests, orthogonality/invertibility, quantization-off algebraic equivalence, cross-view transfer).
+  - `sidecar.py`: `cuteafd-qmla-v3` single-file sidecar (`mla_calibration.safetensors` with embedded `__metadata__["cuteafd_qmla"]` + full `"qmla"` section inside `cuteafd-mc.json` for MC checkpoints; per-width selections, explicit `identity`/`scale_only`/`full` kinds, exact per-layer F32 slot aliasing, `resolve_mode_transforms`, `mode_selection_fingerprint`, and fail-closed validators).
   - `publish.py`: same-repo incremental HF revision publisher over `quantization/hub_lfs.py` (`HF_HUB_DISABLE_XET=1`), rewriting `cuteafd-mc.json` with `"qmla"` (MC) and adding `mla_calibration.safetensors` with zero weight shard re-upload.
 - **Thin family adapter (`quantization/hy4_flash/`, reference pipeline to copy):**
   - `qmla_capture.py` *(mode-agnostic)*: `Hy4FlashCaptureAdapter` wiring Hy4-flash's geometry (12 DSA + 30 SWA layers, interleaved 3D M-RoPE `[12,10,10]`, compressed-indexer group top-k masks, gated MLA, learnable sinks, `post_proj_norm`, and DFly2 target taps) into `quantization/qmla/capture.py` — reusable in both full MC causal passes and standalone incremental passes.
@@ -417,7 +319,7 @@ Physical cache accounting **includes** scales, padding, unchanged DSA indexer ca
 2. **RoPE execution:** Fuse $(\theta_i, s_i, s_i^{-1})$ directly into the existing RoPE phase/scale step (zero extra matmuls, zero weight mutations, commutes with 3D M-RoPE and YaRN/LeRoPE).
 3. **CLI composition (`--kv-cache` + `QUANT_MLA`):** Compose rather than conflict. `--kv-cache` sets the default for SWA rings, indexer keys, and MLA; `QUANT_MLA` overrides only the full-history MLA path(s) set nonzero (`0` retains `--kv-cache`). Cache identity includes the resolved per-path format.
 4. **Protection ON from the start (`[Adaptation A4]`):** `sink4_local128` is the **default** policy for every nonzero mode on **full-history MLA layers only (SWA untouched)**, in both calibration and serving (`none` is only a measured alternative). Admission, prefix marks, and CUDA graph identity account for `sink4_local128` from Phase 3 onward.
-5. **Single sidecar file (`mla_calibration.safetensors`) + `cuteafd-mc.json["qmla"]` (no `mla_calibration.json`):** The full `cuteafd-qmla-v2` manifest lives in `cuteafd-mc.json["qmla"]` for MC checkpoints (advisory, never in `required_features`, `0:0` unchanged) and in `mla_calibration.safetensors`'s `__metadata__["cuteafd_qmla"]` header for non-MC checkpoints (chosen over a minimal `cuteafd-mc.json` to preserve `docs/mc-checkpoints.md`'s MC discovery invariant and add only one file).
+5. **Single sidecar file (`mla_calibration.safetensors`) + `cuteafd-mc.json["qmla"]` (no `mla_calibration.json`):** The full `cuteafd-qmla-v3` manifest lives in `cuteafd-mc.json["qmla"]` for MC checkpoints (advisory, never in `required_features`, `0:0` unchanged) and in `mla_calibration.safetensors`'s `__metadata__["cuteafd_qmla"]` header for non-MC checkpoints. Normative contract: [`docs/quantization/qmla-format.md`](qmla-format.md).
 6. **Pinned panel corpus (`[Adaptation A3]`):** `quantization/panel_corpus.py` owns the pin; QMLA has none of its own. Full calibration uses all three components (`agentic`, `exl3_standard`, `long_context`) from `wrldsuksgo2mars/agentic-quant-panel-v3@e3ac6ee6126f469e37ddf879a6cb2dccc10c6c99` and records the exact revision and components in `calibration_provenance`; a pilot may use a subset. `agentic-quant-panel-v2@54683731eb` stays pinned for past runs.
 7. **Library placement & reference pipeline:** Shared family-agnostic QMLA code lives in `quantization/qmla/` inside `cuteafd` (**no `GPTQModel` fork changes / no fork PR**); Hy4-flash in `quantization/hy4_flash/` is the end-to-end reference pipeline with pilot/full CLI flags that subsequent families copy.
-8. **Three splits, test-only reporting, one shipped transform per path:** `train` fits, `val` selects fit steps and the shipped transform, `test` produces every reported number (128 / 16 / 16 full, 16 / 4 / 4 pilot). Every width is fitted and measured for analysis. The sidecar ships one content and one RoPE transform per layer, selected jointly across all combinations on `val` (§5). The pilot fits every width and measures all nine combinations.
+8. **Three splits, full candidate persistence, per-width selection with explicit kinds:** `train` fits, `val` selects fit steps and per-width transforms, `test` produces every reported number (128 / 16 / 16 full, 16 / 4 / 4 pilot). Default fitting budget runs both `full` and `scale_only` fits across every calibrated width (`c2, c4, c8`, `r4, r8`, including 8-bit) and persists every candidate (`full`, `scale_only`, `smoothquant`) plus its val/test table (`candidate-table.json`) for the duration of the run so selection can be rerun without refitting before publish (then deletes candidates and captures after verified publish and import). Each `(layer, path, serving_width)` selection carries an explicit kind (`identity` | `scale_only` | `full`, `1e-6` collapse tolerances), exact per-layer F32 tensor aliasing across widths, and per-width fingerprints bound into runtime cache identity (§5, §7, `qmla-format.md`).

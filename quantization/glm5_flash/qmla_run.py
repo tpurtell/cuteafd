@@ -137,17 +137,22 @@ def capture_banks(source, adapter, records, settings, capture_dir, provenance, s
 def run_evaluation(source, adapter, sidecar_path, records, corpus_meta, *, expected_source, device,
                    layers=None, modes=None, phase="long_eval"):
     """Score native long-context records or the compact view's frozen test records layer-major."""
-    manifest, content, rope = load_sidecar_transforms(sidecar_path, expected_source=expected_source, strict=True)
-    layers = sorted(content) if layers is None else tuple(layers)
-    if set(layers) - set(content):
+    manifest, content_by_width, rope_by_width = load_sidecar_transforms(
+        sidecar_path, expected_source=expected_source, strict=True
+    )
+    sidecar_layers = sorted(manifest["profiles"]["content"]["layers"])
+    layers = sidecar_layers if layers is None else tuple(layers)
+    if set(layers) - set(sidecar_layers):
         raise ValueError("evaluation requested a layer missing from the sidecar")
     if modes is None:
         modes = parse_modes_arg(",".join(manifest["supported_modes"]))
     if any(f"{c}:{r}" not in manifest["supported_modes"] for c, r in modes):
         raise ValueError("evaluation requested a mode missing from the sidecar")
-    evaluator = LongContextEvaluator(modes=modes, content_transforms=content, rope_transforms=rope,
+    evaluator = LongContextEvaluator(modes=modes, content_transforms=content_by_width, rope_transforms=rope_by_width,
                                      protection_policy=manifest["protection_policy"],
-                                     dsa_indexer_note=adapter.dsa_indexer_note)
+                                     dsa_indexer_note=adapter.dsa_indexer_note,
+                                     profiles=manifest["profiles"],
+                                     unsupported_modes_reason=manifest["unsupported_modes_reason"])
     start = time.monotonic()
     seqs = [(r.seq_id, r.input_ids) for r in records]
     for _ in stream_layers(source, adapter, layers, seqs, device, phase=phase,
@@ -207,13 +212,15 @@ def main(argv=None):
         banks = capture_banks(source, adapter, records, settings, args.output / "captures", prov, args.seed, args.device)
     result = calibrate_from_banks(banks, output_dir=args.output, source=source_id, modes=settings["modes"],
                                   corpus_provenance=prov, fit_config=FitConfig(steps=settings["steps"], seed=args.seed,
-                                  protection=settings["protection"]), device=args.device, renderer_template_sha256=template_hash,
+                                  protection=settings["protection"]),
+                                  device=args.device, renderer_template_sha256=template_hash,
                                   thinking_mode="enabled (served template default, effective reasoning effort max)",
                                   code_commit=code_sha)
     del banks
     if args.long_eval:
         long_context_eval(source, adapter, checkpoint, source_id, result["sidecar_dir"], args, settings)
-    print(json.dumps({"status": result["validation"]["status"], "sidecar_dir": result["sidecar_dir"],
+    print(json.dumps({"headline_table": result["report"]["headline_table"],
+                      "status": result["validation"]["status"], "sidecar_dir": result["sidecar_dir"],
                       "layers": settings["layers"], "supported_modes": result["manifest"]["supported_modes"]}), flush=True)
     return 0
 

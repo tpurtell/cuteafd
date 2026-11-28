@@ -2,13 +2,15 @@
 
 Supports both short pilot runs (``--pilot`` or explicit ``--layers``, ``--modes``,
 ``--train-sequences``, ``--val-sequences``, ``--test-sequences``, ``--steps``) and full
-12-DSA-layer calibration. Both fit every width (content c2/c4/c8, RoPE r4/r8) and
-measure all nine combinations by default.
-
-Splits: ``train`` fits, ``val`` selects fit steps and the shipped transform, ``test``
-produces every reported attention error. The sidecar ships ONE content and ONE RoPE
-transform per layer, chosen on ``val`` across every combination; the report also keeps
-the per-width fits' test errors and the full candidate cross-table for analysis.
+12-DSA-layer calibration. Under QMLA v3 (``cuteafd-qmla-v3``):
+- Default fitting budget: fits BOTH ``full`` and ``scale_only`` across every calibrated
+  width (plus step-0 SmoothQuant inits and ``identity``), persisting every candidate and
+  its val/test scores for the duration of the run so selection can be rerun without refitting.
+- Splits: ``train`` fits, ``val`` selects fit steps and per-width transforms, ``test``
+  produces every reported attention error against identity and the v2 shared policy.
+- Sidecar: ships one selection per ``(layer, path, serving_width)`` with explicit kind
+  (``identity`` | ``scale_only`` | ``full``) in one ``mla_calibration.safetensors`` file
+  (no separate ``mla_calibration.json``).
 
 Corpus contract: ``quantization/panel_corpus.py`` owns the panel pin. The default is
 ``wrldsuksgo2mars/agentic-quant-panel-v3`` with all three components (``agentic``,
@@ -18,10 +20,10 @@ output (windowed ``long_context``, 2,048-token windows), loaded and verified thr
 ``panel_corpus.load_component_records``. ``--long-eval`` renders full-length 16K/32K
 ``long_context`` records from the pinned panel snapshot in the local HF cache.
 
-Protection default (Correction 2): ``--protection sink4_local128`` is enabled by
-default on full-history MLA layers only (Hy4-flash's 30 SWA-512 layers are untouched).
+Protection default: ``--protection sink4_local128`` is enabled by default on full-history
+MLA layers only (Hy4-flash's 30 SWA-512 layers are untouched).
 
-Outputs (Correction 3 — no separate ``mla_calibration.json``):
+Outputs:
 - ``<output>/sidecar/mla_calibration.safetensors`` (self-describing with embedded
   ``__metadata__["cuteafd_qmla"]``, ``artifact_status="calibrated_unqualified"``)
 - ``<output>/qmla-validation-report.json``
@@ -182,10 +184,12 @@ def run_hy4_flash_long_eval(
     started = time.monotonic()
     dev = torch.device(device)
     model = adapter.model
-    manifest, content_by_layer, rope_by_layer = load_sidecar_transforms(
+    manifest, content_by_width, rope_by_width = load_sidecar_transforms(
         sidecar_path, expected_source=expected_source, strict=True,
     )
-    sidecar_layers = sorted(set(content_by_layer) | set(rope_by_layer))
+    c_layers = set(manifest["profiles"]["content"]["layers"]) if manifest["profiles"]["content"] is not None else set()
+    r_layers = set(manifest["profiles"]["rope"]["layers"]) if manifest["profiles"]["rope"] is not None else set()
+    sidecar_layers = sorted(c_layers | r_layers)
     target_layers = tuple(sorted(sidecar_layers if layers is None else layers))
     missing = [lid for lid in target_layers if lid not in set(sidecar_layers)]
     if missing:
@@ -202,10 +206,12 @@ def run_hy4_flash_long_eval(
 
     evaluator = LongContextEvaluator(
         modes=eval_modes,
-        content_transforms=content_by_layer,
-        rope_transforms=rope_by_layer,
+        content_transforms=content_by_width,
+        rope_transforms=rope_by_width,
         protection_policy=manifest["protection_policy"],
         dsa_indexer_note=adapter.dsa_indexer_note,
+        profiles=manifest["profiles"],
+        unsupported_modes_reason=manifest["unsupported_modes_reason"],
     )
 
     max_layer = max(target_layers)
@@ -425,6 +431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         attach_long_context_eval(args.output, long_eval, manifest=result["manifest"])
     print(
         json.dumps({
+            "headline_table": result["report"]["headline_table"],
             "status": result["validation"]["status"],
             "artifact_status": result["manifest"]["artifact_status"],
             "protection_policy": result["manifest"]["protection_policy"],

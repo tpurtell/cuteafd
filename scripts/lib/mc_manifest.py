@@ -135,11 +135,12 @@ def _read(root, name):
     return data
 
 
-QMLA_SCHEMA = "cuteafd-qmla-v2"
+QMLA_SCHEMA = "cuteafd-qmla-v3"
 QMLA_TENSORS_FILE = "mla_calibration.safetensors"
 QMLA_STATUSES = frozenset({"calibrated_unqualified", "runtime_qualified"})
 QMLA_PROTECTION_POLICIES = frozenset({"sink4_local128", "none"})
 QMLA_PROTECTION_SCOPE = "full_history_mla_only"
+QMLA_TRANSFORM_KINDS = frozenset({"identity", "scale_only", "full"})
 QMLA_MODE_RE = re.compile(r"^(0|2|4|8):(0|4|8)$")
 
 
@@ -182,8 +183,9 @@ def validate_qmla_advisory(qmla, *, strict=False):
     _require(qmla["protection_scope"] == QMLA_PROTECTION_SCOPE, "invalid MC QMLA protection_scope")
     _require(qmla["tensors_file"] == QMLA_TENSORS_FILE, "noncanonical MC QMLA tensors_file")
     _require(
-        type(qmla["tensors_payload_bytes"]) is int and qmla["tensors_payload_bytes"] > 0
-        and type(qmla["tensors_bytes"]) is int and qmla["tensors_bytes"] >= qmla["tensors_payload_bytes"],
+        type(qmla["tensors_payload_bytes"]) is int and qmla["tensors_payload_bytes"] >= 0
+        and type(qmla["tensors_bytes"]) is int and qmla["tensors_bytes"] > 0
+        and qmla["tensors_bytes"] >= qmla["tensors_payload_bytes"],
         "invalid MC QMLA tensor byte sizes",
     )
     _require(
@@ -219,12 +221,24 @@ def validate_qmla_advisory(qmla, *, strict=False):
         if prof is None:
             continue
         bits = prof.get("bits")
+        width_map = prof.get("widths")
         _require(prof.get("protection_calibrated") == policy
                  and _digest(prof.get("profile_fingerprint"))
                  and isinstance(bits, list) and bool(bits)
                  and all(type(b) is int and b in widths for b in bits)
-                 and isinstance(prof.get("selection"), dict),
+                 and isinstance(width_map, dict)
+                 and set(width_map.keys()) == {str(b) for b in bits},
                  f"invalid MC QMLA {section} profile")
+        for bkey, wentry in width_map.items():
+            _require(isinstance(wentry, dict)
+                     and _digest(wentry.get("width_fingerprint"))
+                     and isinstance(wentry.get("kind_counts"), dict)
+                     and isinstance(wentry.get("per_layer"), dict)
+                     and bool(wentry["per_layer"])
+                     and all(isinstance(row, dict) and row.get("kind") in QMLA_TRANSFORM_KINDS
+                             and isinstance(row.get("tensors"), dict)
+                             for row in wentry["per_layer"].values()),
+                     f"invalid MC QMLA {section} width {bkey} selection")
     modes = qmla["supported_modes"]
     _require(isinstance(modes, list) and bool(modes)
              and all(isinstance(m, str) and QMLA_MODE_RE.fullmatch(m) and m != "0:0" for m in modes),

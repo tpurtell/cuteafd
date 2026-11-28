@@ -51,8 +51,21 @@ def test_transfer_matches_ordered_test_tokens_and_preserves_sidecar(tmp_path):
     assert attached == attach_view_transfer(path, "k8-compact", section)
     after, actual_c, actual_r = load_sidecar_transforms(path)
     assert after["transform_fingerprint"] == before["transform_fingerprint"]
-    for old, new in zip((*content[0], *rope[0]), (*actual_c[0], *actual_r[0]), strict=True):
-        assert torch.equal(old, new)
+    assert set(actual_c) == set(content) and set(actual_r) == set(rope)
+    for w in content:
+        c0, c1 = content[w][0], actual_c[w][0]
+        assert c0.kind == c1.kind and c0.tensor_names == c1.tensor_names
+        if c0.r_c is not None:
+            assert torch.equal(c0.r_c, c1.r_c)
+        if c0.s_c is not None:
+            assert torch.equal(c0.s_c, c1.s_c)
+    for w in rope:
+        r0, r1 = rope[w][0], actual_r[w][0]
+        assert r0.kind == r1.kind and r0.tensor_names == r1.tensor_names
+        if r0.theta is not None:
+            assert torch.equal(r0.theta, r1.theta)
+        if r0.s_p is not None:
+            assert torch.equal(r0.s_p, r1.s_p)
 
 
 @pytest.mark.parametrize("view", ["original", "k8-compact"])
