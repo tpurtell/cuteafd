@@ -4,7 +4,8 @@ All multi-turn samples and tokenizers are read directly from disk (never inline
 fixture transcripts):
 - Raw traces: ``~/.cache/cuteafd/builds/long-context-bank/raw_traces/*.json``
 - Real checkpoints: local HF hub cache (Hy4, GLM 5.3, Kimi K3.1)
-- Base v2 panel: local HF hub cache (``wrldsuksgo2mars/agentic-quant-panel-v2``)
+- Panels: local HF hub cache (``wrldsuksgo2mars/agentic-quant-panel-v3`` and
+  ``wrldsuksgo2mars/agentic-quant-panel-v2``)
 """
 from __future__ import annotations
 
@@ -56,33 +57,61 @@ def _load_real_tokenizer(repo_dir: str, revision: str, trust_remote_code: bool):
     return snap, AutoTokenizer.from_pretrained(snap, local_files_only=True, trust_remote_code=trust_remote_code)
 
 
-def test_default_policy_two_versus_three_switch(monkeypatch):
-    assert pc.THREE_COMPONENT_REVISION is None
-    assert pc.resolve_panel_policy() == (pc.PANEL_REPO, pc.TWO_COMPONENT_REVISION, ("agentic", "exl3_standard"))
-    assert pc.default_panel_revision() == pc.TWO_COMPONENT_REVISION
-    assert pc.default_components() == ("agentic", "exl3_standard")
+V2 = pc.V2_PANEL
+V3 = pc.V3_PANEL
+V2_DIR = "datasets--wrldsuksgo2mars--agentic-quant-panel-v2"
+V3_DIR = "datasets--wrldsuksgo2mars--agentic-quant-panel-v3"
 
-    with pytest.raises(ValueError, match="not present in two-component"):
-        pc.resolve_panel_policy(panel_revision=pc.TWO_COMPONENT_REVISION, components=pc.COMPONENT_ORDER)
 
-    rev3 = "a" * 40
-    monkeypatch.setattr(pc, "THREE_COMPONENT_REVISION", rev3)
-    assert pc.default_panel_revision() == rev3
+def test_default_policy_v3_three_components_and_frozen_v2():
+    assert V3 == ("wrldsuksgo2mars/agentic-quant-panel-v3", "e3ac6ee6126f469e37ddf879a6cb2dccc10c6c99",
+                  "c504793259a6ea0e323e6e4e95d347ecd585d79dc80f67529b4c4b325ea05a7f", pc.COMPONENT_ORDER)
+    assert V2 == ("wrldsuksgo2mars/agentic-quant-panel-v2", "54683731eb01c7c2fa5b801a0888e029a0e1b1c7",
+                  "23f07f7dbe7b8248a09891b6ae2475371f4653e499a9b8f930e267ff3d5c6d57", pc.BASE_COMPONENTS)
+    assert pc.resolve_panel_policy() == (V3.repo_id, V3.revision, pc.COMPONENT_ORDER)
+    assert pc.default_panel_revision() == V3.revision
     assert pc.default_components() == pc.COMPONENT_ORDER
-    assert pc.resolve_panel_policy() == (pc.PANEL_REPO, rev3, pc.COMPONENT_ORDER)
+    assert pc.default_dataset() == dict(repo_id=V3.repo_id, revision=V3.revision, sha256sums_sha256=V3.sha256sums_sha256)
 
-    # Full run with only 2 components fails closed once rev3 is published.
+    # Frozen v2 runs still resolve exactly as before: v2 repo, two components.
+    assert pc.resolve_panel_policy(panel_revision=V2.revision) == (V2.repo_id, V2.revision, pc.BASE_COMPONENTS)
+    with pytest.raises(ValueError, match="not present in two-component"):
+        pc.resolve_panel_policy(panel_revision=V2.revision, components=pc.COMPONENT_ORDER)
+
+    # A full v3 run with only two components fails closed.
     with pytest.raises(ValueError, match="full calibration requires all three"):
-        pc.resolve_panel_policy(panel_revision=rev3, components=("agentic", "exl3_standard"), full=True)
-    with pytest.raises(ValueError, match="full calibration requires all three"):
-        pc.resolve_panel_policy(panel_revision=pc.TWO_COMPONENT_REVISION, full=True)
+        pc.resolve_panel_policy(components=("agentic", "exl3_standard"), full=True)
+    with pytest.raises(ValueError, match="unknown panel revision"):
+        pc.resolve_panel_policy(panel_revision="a" * 40)
 
     # Pilot subset still allowed and canonicalizes component order.
-    assert pc.resolve_panel_policy(panel_revision=rev3, components=("long_context", "agentic"), full=False) == (
-        pc.PANEL_REPO, rev3, ("agentic", "long_context")
+    assert pc.resolve_panel_policy(components=("long_context", "agentic"), full=False) == (
+        V3.repo_id, V3.revision, ("agentic", "long_context")
     )
     with pytest.raises(ValueError, match="unknown panel component"):
         pc.resolve_panel_policy(components=("agentic", "unknown"), full=False)
+
+
+def test_read_published_v3_and_v2_panels():
+    v3 = _require_snapshot(V3_DIR, V3.revision)
+    v2 = _require_snapshot(V2_DIR, V2.revision)
+    loaded3 = pc.read_panel(v3)
+    assert loaded3["dataset"] == pc.default_dataset()
+    assert loaded3["components"] == pc.COMPONENT_ORDER
+    assert loaded3["long_context_manifest"]["schema"] == pc.LONG_CONTEXT_SCHEMA == "agentic-quant-panel-v3-long-context-v1"
+    rows = loaded3["long_context_rows"]
+    assert [(len(rows[s]), sorted({r["length_class"] for r in rows[s]})) for s in ("calibration", "heldout")] == [
+        (12, ["16k", "32k"]), (4, ["16k", "32k"])]
+
+    loaded2 = pc.read_panel(v2, panel_revision=V2.revision)
+    assert loaded2["dataset"] == dict(repo_id=V2.repo_id, revision=V2.revision, sha256sums_sha256=V2.sha256sums_sha256)
+    assert loaded2["components"] == pc.BASE_COMPONENTS and loaded2["long_context_rows"] is None
+    # v3's agentic component is byte-identical to v2's.
+    assert loaded3["agentic_rows"] == loaded2["agentic_rows"]
+    assert loaded3["agentic_provenance"] == loaded2["agentic_provenance"]
+    # A snapshot never attests under the other panel's pin.
+    with pytest.raises(ValueError, match="require the pinned"):
+        pc.read_panel(v2)
 
 
 FAMILY_TOKENIZERS = [
@@ -164,7 +193,7 @@ def test_renderer_one_pass_and_fail_closed():
 
 
 def _stage_three_component_panel(tmp_path: Path, revision: str, traces: dict[str, list[dict]] | None = None) -> Path:
-    base_v2 = _require_snapshot("datasets--wrldsuksgo2mars--agentic-quant-panel-v2", pc.TWO_COMPONENT_REVISION)
+    base_v2 = _require_snapshot(V2_DIR, V2.revision)
     if traces is None:
         t16_cal = _load_raw_trace("lc-16k-cal-01.json")
         t16_hold = dict(_load_raw_trace("lc-16k-cal-06.json"), id="lc-16k-hold-test", split="heldout", group="wiki:heldout-test")
@@ -204,14 +233,14 @@ def _stage_three_component_panel(tmp_path: Path, revision: str, traces: dict[str
     return stage
 
 
-def test_read_panel_v2_three_components_and_split_disjointness(tmp_path, monkeypatch):
-    rev3 = "b" * 40
-    stage = _stage_three_component_panel(tmp_path, rev3)
+def test_read_panel_three_components_and_split_disjointness(tmp_path):
+    # Staged under v3's revision with selected traces; its SHA256SUMS digest is passed explicitly.
+    stage = _stage_three_component_panel(tmp_path, V3.revision)
     sums_sha = pc.sha256_file(stage / "SHA256SUMS")
-    monkeypatch.setattr(pc, "THREE_COMPONENT_REVISION", rev3)
-    monkeypatch.setattr(pc, "THREE_COMPONENT_SHA256SUMS_SHA256", sums_sha)
+    with pytest.raises(ValueError, match="SHA256SUMS digest mismatch"):
+        pc.read_panel(stage)
 
-    loaded = pc.read_panel_v2(stage)
+    loaded = pc.read_panel(stage, panel_sha256sums=sums_sha)
     assert loaded["components"] == pc.COMPONENT_ORDER
     assert [r["id"] for r in loaded["long_context_rows"]["calibration"]] == ["lc-16k-cal-01", "lc-32k-cal-01"]
     assert [r["id"] for r in loaded["long_context_rows"]["heldout"]] == ["lc-16k-hold-test", "lc-32k-hold-test"]
@@ -231,9 +260,8 @@ def test_read_panel_v2_three_components_and_split_disjointness(tmp_path, monkeyp
     sums["long_context/16k.jsonl"] = pc.sha256_file(jl16)
     sums["long_context/manifest.json"] = pc.sha256_file(stage / "long_context/manifest.json")
     (stage / "SHA256SUMS").write_text("".join(f"{d}  {n}\n" for n, d in sorted(sums.items())), encoding="utf-8")
-    monkeypatch.setattr(pc, "THREE_COMPONENT_SHA256SUMS_SHA256", pc.sha256_file(stage / "SHA256SUMS"))
     with pytest.raises(ValueError, match="splits overlap"):
-        pc.read_panel_v2(stage)
+        pc.read_panel(stage, panel_sha256sums=pc.sha256_file(stage / "SHA256SUMS"))
 
 
 def _write_prepared(out_dir: Path, *, dataset, contract, vocab_size, cal_parts, hold_parts):
@@ -278,7 +306,7 @@ def _write_prepared(out_dir: Path, *, dataset, contract, vocab_size, cal_parts, 
     (out_dir / "manifest.json").write_bytes(pc.canonical(manifest))
 
 
-def test_prepared_loader_order_splits_hashes_and_full_check(tmp_path, monkeypatch):
+def test_prepared_loader_order_splits_hashes_and_full_check(tmp_path):
     snap, tok = _load_real_tokenizer("models--tencent--Hy4", "c10c0de5b6f850703fb0a90e65d1c32b558b9167", False)
     chat = dict(reasoning_effort="high", date_string="2026-11-22")
     max_ctx = pc.max_context_from_config(snap)
@@ -288,15 +316,14 @@ def test_prepared_loader_order_splits_hashes_and_full_check(tmp_path, monkeypatc
     lc_cal_ids, _ = pc.render_long_context_record(t16_cal, tok, chat_kwargs=chat, max_context=max_ctx)
     lc_hold_ids, _ = pc.render_long_context_record(t16_hold, tok, chat_kwargs=chat, max_context=max_ctx)
 
-    v2 = _require_snapshot("datasets--wrldsuksgo2mars--agentic-quant-panel-v2", pc.TWO_COMPONENT_REVISION)
+    v2 = _require_snapshot(V2_DIR, V2.revision)
     ag_cal = json.loads((v2 / "calibration.jsonl").read_text(encoding="utf-8").splitlines()[0])
     ag_hold = json.loads((v2 / "heldout.jsonl").read_text(encoding="utf-8").splitlines()[0])
     ag_cal_ids = tok.apply_chat_template([dict(role="user", content=ag_cal["prompt"])], tokenize=True, add_generation_prompt=True, return_dict=False, **chat)
     ag_hold_ids = tok.apply_chat_template([dict(role="user", content=ag_hold["prompt"])], tokenize=True, add_generation_prompt=True, return_dict=False, **chat)
     std_ids = tok.encode(json.loads((v2 / "exl3_standard/segments.jsonl").read_text(encoding="utf-8").splitlines()[0])["text"], add_special_tokens=False)[:2048]
 
-    rev3 = "c" * 40
-    ds3, contract3 = {"repo_id": pc.PANEL_REPO, "revision": rev3}, {"renderer": "native-chat-template", "packing": False}
+    ds3, contract3 = {"repo_id": V3.repo_id, "revision": V3.revision}, {"renderer": "native-chat-template", "packing": False}
     dir3 = tmp_path / "prepared-3"
     _write_prepared(dir3, dataset=ds3, contract=contract3, vocab_size=len(tok),
                     cal_parts=[("agentic", [(ag_cal["id"], ag_cal_ids)]),
@@ -305,7 +332,6 @@ def test_prepared_loader_order_splits_hashes_and_full_check(tmp_path, monkeypatc
                     hold_parts=[("agentic", [(ag_hold["id"], ag_hold_ids)]),
                                 ("long_context", [(t16_hold["id"], lc_hold_ids)])])
 
-    monkeypatch.setattr(pc, "THREE_COMPONENT_REVISION", rev3)
     cal_recs = pc.load_token_records(dir3, "calibration", contract=contract3, dataset=ds3, long_context_mode="full", full=True)
     assert [r["component"] for r in cal_recs] == ["agentic", "exl3_standard", "long_context"]
     assert t16_hold["id"] not in {r["id"] for r in cal_recs}
@@ -327,22 +353,23 @@ def test_prepared_loader_order_splits_hashes_and_full_check(tmp_path, monkeypatc
     with pytest.raises(ValueError, match="input_ids_sha256 differs"):
         pc.load_token_records(dir3, "calibration", contract=contract3, dataset=ds3, long_context_mode="full")
 
-    # 2-component prepared corpus loads pre-rev3, fails closed on full=True post-rev3.
-    ds2 = {"repo_id": pc.PANEL_REPO, "revision": pc.TWO_COMPONENT_REVISION}
-    dir2 = tmp_path / "prepared-2"
-    _write_prepared(dir2, dataset=ds2, contract=contract3, vocab_size=len(tok),
-                    cal_parts=[("agentic", [(ag_cal["id"], ag_cal_ids)]), ("exl3_standard", [("exl3_standard/000", std_ids)])],
-                    hold_parts=[("agentic", [(ag_hold["id"], ag_hold_ids)])])
+    # A two-component v3 corpus fails closed on a full run; a frozen v2 corpus still loads as full.
+    two = dict(cal_parts=[("agentic", [(ag_cal["id"], ag_cal_ids)]), ("exl3_standard", [("exl3_standard/000", std_ids)])],
+               hold_parts=[("agentic", [(ag_hold["id"], ag_hold_ids)])])
+    dir3_two = tmp_path / "prepared-3-two"
+    _write_prepared(dir3_two, dataset=ds3, contract=contract3, vocab_size=len(tok), **two)
     with pytest.raises(ValueError, match="full calibration requires all three"):
-        pc.load_token_records(dir2, "calibration", contract=contract3, dataset=ds2, full=True)
-    assert len(pc.load_token_records(dir2, "calibration", contract=contract3, dataset=ds2, full=False)) == 2
-    monkeypatch.setattr(pc, "THREE_COMPONENT_REVISION", None)
+        pc.load_token_records(dir3_two, "calibration", contract=contract3, dataset=ds3, full=True)
+    assert len(pc.load_token_records(dir3_two, "calibration", contract=contract3, dataset=ds3, full=False)) == 2
+    ds2 = {"repo_id": V2.repo_id, "revision": V2.revision}
+    dir2 = tmp_path / "prepared-2"
+    _write_prepared(dir2, dataset=ds2, contract=contract3, vocab_size=len(tok), **two)
     assert len(pc.load_token_records(dir2, "calibration", contract=contract3, dataset=ds2, full=True)) == 2
 
 
 def test_panel_corpus_two_component_read_matches_frozen_hy4_flash_loader():
-    base_v2 = _require_snapshot("datasets--wrldsuksgo2mars--agentic-quant-panel-v2", pc.TWO_COMPONENT_REVISION)
-    loaded = pc.read_panel_v2(base_v2)
+    base_v2 = _require_snapshot(V2_DIR, V2.revision)
+    loaded = pc.read_panel(base_v2, panel_revision=V2.revision)
     hy4_rows, hy4_prov = hy4_flash_corpus.read_v2(base_v2)
     assert loaded["dataset"] == hy4_flash_corpus.DATASET
     assert loaded["agentic_rows"] == hy4_rows
@@ -410,19 +437,17 @@ def _prepare(stage: Path, out: Path, **kw) -> dict:
                                    chat_kwargs=chat, **kw)
 
 
-def test_prepare_windowed_default_splits_identity_and_full_mode(tmp_path, monkeypatch):
+def test_prepare_windowed_default_splits_identity_and_full_mode(tmp_path):
     _, tok = _load_real_tokenizer(*HY4, False)
     traces = _window_traces()
     rows = [r for rs in traces.values() for r in rs]
     rendered = {r["id"]: pc.render_long_context_record(r, tok, chat_kwargs=HY4_CHAT)[0] for r in rows}
     hold_ids = {r["id"] for r in rows if r["split"] == "heldout"}
 
-    rev3 = "d" * 40
-    stage = _stage_three_component_panel(tmp_path / "panel", rev3, traces)
-    monkeypatch.setattr(pc, "THREE_COMPONENT_REVISION", rev3)
-    monkeypatch.setattr(pc, "THREE_COMPONENT_SHA256SUMS_SHA256", pc.sha256_file(stage / "SHA256SUMS"))
+    stage = _stage_three_component_panel(tmp_path / "panel", V3.revision, traces)
+    sums = dict(panel_sha256sums=pc.sha256_file(stage / "SHA256SUMS"))
 
-    m1 = _prepare(stage, tmp_path / "w1")
+    m1 = _prepare(stage, tmp_path / "w1", **sums)
     lc = m1["components"]["long_context"]
     assert m1["contract"]["long_context_mode"] == "windowed" and m1["contract"]["long_context_window_tokens"] == 2048
     assert lc["mode"] == "windowed" and lc["window_tokens"] == 2048 and lc["min_tail_tokens"] == 256
@@ -459,13 +484,13 @@ def test_prepare_windowed_default_splits_identity_and_full_mode(tmp_path, monkey
     assert prov["components"]["long_context"]["input_ids_sha256"] == lc["input_ids_sha256"]
 
     # Identity is stable across preparations.
-    m2 = _prepare(stage, tmp_path / "w2", long_context_mode="windowed")
+    m2 = _prepare(stage, tmp_path / "w2", long_context_mode="windowed", **sums)
     assert m2["components"] == m1["components"] and m2["contract"] == m1["contract"]
     assert {k: m2["splits"][k]["token_stream_sha256"] for k in m2["splits"]} == {
         k: m1["splits"][k]["token_stream_sha256"] for k in m1["splits"]}
 
     # Full mode keeps whole records for QMLA evaluation; modes never cross-load.
-    mf = _prepare(stage, tmp_path / "full", long_context_mode="full")
+    mf = _prepare(stage, tmp_path / "full", long_context_mode="full", **sums)
     assert mf["contract"]["long_context_mode"] == "full" and "long_context_window_tokens" not in mf["contract"]
     hold_full = [r for r in pc.load_token_records(tmp_path / "full", "heldout", long_context_mode="full")
                  if r["component"] == "long_context"]

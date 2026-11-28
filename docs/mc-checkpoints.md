@@ -129,7 +129,9 @@ over `agentic`, `exl3_standard`, and `long_context`, with `long_context` also
 recording `mode` and `window_tokens` for weight quants' 2,048-token windows, plus
 `corpus_manifest_sha256`)
 and in the model card's recipe table. Single source of truth for the panel pin is
-`quantization/panel_corpus.py`.
+`quantization/panel_corpus.py`: new quants calibrate on
+`wrldsuksgo2mars/agentic-quant-panel-v3@e3ac6ee612` (all three components);
+`wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb` stays pinned for past runs.
 
 Unknown schema versions or variant names, duplicate variants/tensor names,
 invalid hashes, unsafe filenames and incomplete views still fail closed. Core bits
