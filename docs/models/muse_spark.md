@@ -1,8 +1,7 @@
 # Muse Spark
 
 The v7 MC cards use K8 compact on 1 RTX + 4 Sparks and 2 RTX + 6 Sparks.
-Original, K6 compact and FP8 compact comparisons use the same two-RTX
-layout.
+V7 drops the original, K6 compact and FP8 compact comparison (TJ 2026-11-28); its last cards stay pinned in the [comparison matrix](../../scripts/bench/release-smoke-v7-mc-compact.json)'s retired list.
 
 Automatic KV sizing uses the shared 2M-token target on every card, including
 32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;
