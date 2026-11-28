@@ -30,6 +30,8 @@ class Placement:
     target: hub.PublicationTarget
     build_prefix: str
     engram: bool = False
+    adoption_host: str = ADOPTION_HOST
+    keep_ref: str = KEEP_REF
 
     @property
     def model(self):
@@ -54,7 +56,7 @@ def _publication(root, output, layout=FLASH):
     return record, identity
 
 
-def _inventory(call, managed, files, revision, *, physical_paths=None, model=MODEL):
+def _inventory(call, managed, files, revision, *, physical_paths=None, model=MODEL, keep_ref=KEEP_REF):
     """Use native namespace metadata and read only the two small revision refs."""
     repo = nest.NAMESPACE / model
     snapshot = repo / 'snapshots' / revision
@@ -103,7 +105,7 @@ def _inventory(call, managed, files, revision, *, physical_paths=None, model=MOD
     if result.keys() != files.keys():
         raise ValueError('managed file inventory is incomplete')
     refs = repo / 'refs'
-    for directory, expected in [(refs, {'keep', 'main'}), (refs / 'keep', {Path(KEEP_REF).name})]:
+    for directory, expected in [(refs, {'keep', 'main'}), (refs / 'keep', {Path(keep_ref).name})]:
         entries = call('ls', directory)['entries']
         if {row['name'] for row in entries} != expected:
             raise ValueError('managed refs differ from pinned publication')
@@ -118,11 +120,11 @@ def _inventory(call, managed, files, revision, *, physical_paths=None, model=MOD
     return result
 
 
-def _check_layout(holders, files, pins):
+def _check_layout(holders, files, pins, adoption_host=ADOPTION_HOST):
     dist = dict.fromkeys(nest.TARGETS, 0)
     counted = set()
     for name, hosts in holders.items():
-        placed = hosts - {ADOPTION_HOST}
+        placed = hosts - {adoption_host}
         if name in pins:
             if placed != {PIN_HOST}:
                 raise ValueError('FP8 Engram pin differs: ' + name)
@@ -213,7 +215,7 @@ def _place(call, root, state_path, state, revision, files, pins, inventory, phys
     key = 'placement'
     goal = ('--place', 'hf:' + layout.target.repo_id, '--factor', '1/8',
             *(v for host in nest.TARGET_ARGS for v in ('--host', host)))
-    checks = dict(repo_id=layout.target.repo_id, evict_hosts=TARGETS, physical_paths=physical_paths, keep_ref=KEEP_REF)
+    checks = dict(repo_id=layout.target.repo_id, evict_hosts=TARGETS, physical_paths=physical_paths, keep_ref=layout.keep_ref)
     proposed = root / (key + '-proposed.json')
     raw = hub.load(proposed) if proposed.exists() else call('plan', *goal)
     nest.check_plan(raw, revision, files, **checks)
@@ -237,7 +239,7 @@ def _place(call, root, state_path, state, revision, files, pins, inventory, phys
             nest.check_plan(shown, revision, files, skipped=skipped, **checks)
             if shown != expected:
                 raise ValueError('native plan changes differ from the reviewed operations')
-            _check_layout(_project(shown, inventory(), files, physical_paths, layout.model), files, pins)
+            _check_layout(_project(shown, inventory(), files, physical_paths, layout.model), files, pins, layout.adoption_host)
             atomic_json(reviewed, shown)
             if not operations:
                 return None
@@ -288,18 +290,18 @@ def handoff(root, output, stage_root, *, call=None, managed=nest.MANAGED, layout
             repo = stage_root / layout.model
         else:
             repo = nest.stage_snapshot(published, stage_root, repo_id=layout.target.repo_id, family=layout.target.family,
-                                       hub_blobs=True, keep_ref=KEEP_REF)
+                                       hub_blobs=True, keep_ref=layout.keep_ref)
         nest.run_job(root, state_path, state, call, 'import-job',
                      ('hf', 'import', repo, '--offline', '--no-copy'),
                      job_description=f'hf import {repo} -> {nest.NAMESPACE}',
                      importing_files=len({r['hub_oid'] for r in files.values()}))
 
         physical_paths = {}
-        imported = _inventory(call, managed, files, revision, physical_paths=physical_paths, model=layout.model)
+        imported = _inventory(call, managed, files, revision, physical_paths=physical_paths, model=layout.model, keep_ref=layout.keep_ref)
 
         def inventory():
             current_paths = {}
-            holders = _inventory(call, managed, files, revision, physical_paths=current_paths, model=layout.model)
+            holders = _inventory(call, managed, files, revision, physical_paths=current_paths, model=layout.model, keep_ref=layout.keep_ref)
             if physical_paths != current_paths:
                 raise ValueError('managed physical blob paths changed during Hy4 handoff')
             return holders
@@ -317,19 +319,19 @@ def handoff(root, output, stage_root, *, call=None, managed=nest.MANAGED, layout
         if pins:
             _pin(call, root, state_path, state, files, pins, revision, imported)
         holders = inventory()
-        if any(PIN_HOST not in holders[n] or not holders[n] <= {PIN_HOST, ADOPTION_HOST} for n in pins):
+        if any(PIN_HOST not in holders[n] or not holders[n] <= {PIN_HOST, layout.adoption_host} for n in pins):
             raise ValueError('FP8 Engram files are not exclusively pinned plus the adoption copy')
         _place(call, root, state_path, state, revision, files, pins, inventory, physical_paths, layout)
         placed = inventory()
-        distribution = _check_layout(placed, files, pins)
+        distribution = _check_layout(placed, files, pins, layout.adoption_host)
         save_inventory('placement-after.json', placed)
         record = dict(schema=layout.schema, status='passed', identity=identity,
             repo_id=layout.target.repo_id, revision=revision, files=len(files), copied_bytes=0,
             stage_root=str(stage_root), targets=list(nest.TARGETS), distribution_bytes=distribution,
             pinned_host=PIN_HOST if pins else None, pinned_files=sorted(pins), pinned_bytes=sum(files[n]['bytes'] for n in pins),
             managed_snapshot=str(Path(managed) / layout.model / 'snapshots' / revision),
-            one_fabric_copy_per_file=True, adoption_host=ADOPTION_HOST,
-            retained_adoption_files=sum(ADOPTION_HOST in hosts for hosts in placed.values()),
+            one_fabric_copy_per_file=True, adoption_host=layout.adoption_host,
+            retained_adoption_files=sum(layout.adoption_host in hosts for hosts in placed.values()),
             time=datetime.now(timezone.utc).isoformat())
         atomic_json(marker, record)
         return record
