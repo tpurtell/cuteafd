@@ -812,6 +812,7 @@ struct RankRuntime<'a> {
     programs: Hy4Programs<'a>,
     mla_splits: MlaSplitPlan,
     weights: Hy4RankWeights<'a>,
+    l2_prefetch: Option<crate::shared::l2_prefetch::L2Prefetch>,
     cache: Rc<Hy4CacheRank<'a>>,
     shared: SharedScratch<'a>,
     context_staging: Option<ContextStaging<'a>>,
@@ -2062,6 +2063,7 @@ impl<'a> Hy4Engine<'a> {
                 programs: progs,
                 mla_splits,
                 weights,
+                l2_prefetch: None,
                 cache,
                 shared,
                 context_staging,
@@ -2313,6 +2315,42 @@ impl<'a> Hy4Engine<'a> {
 
     pub(crate) fn gpus(&self) -> usize {
         self.ranks.len()
+    }
+
+    /// Configure decode-exchange L2 prefetch per coordinator rank from the
+    /// runtime `cudaDevAttrL2CacheSize` / `cudaDevAttrMultiProcessorCount`
+    /// query on each rank's device. Defaults to `"auto"` (3/4 of device L2).
+    pub(crate) fn configure_l2_prefetch(
+        &mut self,
+        args: &crate::shared::l2_prefetch::L2PrefetchArgs,
+    ) -> Result<()> {
+        let layers = self.cfg.layers;
+        for r in &mut self.ranks {
+            let order = r.weights.decode_read_order(layers);
+            r.l2_prefetch = r.device.run(|| {
+                let Some(budget) =
+                    args.budget(r.device.library, crate::shared::l2_prefetch::GLM_DEFAULT)?
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(crate::shared::l2_prefetch::L2Prefetch::new(
+                    r.device.library,
+                    budget,
+                    &order,
+                )?))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn prefetch_l2(&self, layer: usize) -> Result<()> {
+        for r in &self.ranks {
+            if let Some(l2) = &r.l2_prefetch {
+                r.device
+                    .run(|| l2.issue(r.device.library, layer, r.stream.raw))?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn attach_spark(&mut self, link: SparkLink<'a>, onboarded_layers: Vec<usize>) {
@@ -5231,6 +5269,7 @@ impl<'a> Hy4Engine<'a> {
                 priority: ReadPriority,
                 kind: ExpertV2SourceKind,
                 single_wave: bool,
+                single_unit: bool,
                 head_mode: F,
                 on_tile: &'p mut dyn FnMut(&Unit, usize, DeviceLogits) -> Result<()>,
                 active: Vec<Option<ActiveBatch>>,
@@ -5380,6 +5419,9 @@ impl<'a> Hy4Engine<'a> {
                     if !batch.graphed {
                         self.engine.record_expert_usage(layer, batch)?;
                     }
+                    if self.kind == ExpertV2SourceKind::Decode && self.single_unit {
+                        self.engine.prefetch_l2(layer)?;
+                    }
                     Ok(Some(ticket))
                 }
                 fn land_experts(
@@ -5456,6 +5498,7 @@ impl<'a> Hy4Engine<'a> {
                 priority,
                 kind,
                 single_wave,
+                single_unit: units.len() == 1,
                 head_mode,
                 on_tile,
                 active: (0..run_waves).map(|_| None).collect(),
@@ -5752,8 +5795,10 @@ mod tests {
         let router = hook.find("run_moe_frontend(layer, batch, false)").unwrap();
         let send = hook.find("waves.send(").unwrap();
         let shared = hook.find("run_spark_shared_ffn(layer, batch)").unwrap();
-        assert!(router < send && send < shared);
+        let prefetch = hook.find("prefetch_l2(layer)").unwrap();
+        assert!(router < send && send < shared && shared < prefetch);
         assert!(prod.contains("GraphSection::SparkShared"));
+        assert!(hook.contains("self.kind == ExpertV2SourceKind::Decode && self.single_unit"));
     }
 
     #[test]

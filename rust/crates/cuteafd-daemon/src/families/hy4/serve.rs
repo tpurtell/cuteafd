@@ -102,6 +102,8 @@ pub(crate) struct ServeArgs {
     #[command(flatten)]
     pub decode_share: crate::shared::prefill_share::DecodeShareArgs,
     #[command(flatten)]
+    pub l2: crate::shared::l2_prefetch::L2PrefetchArgs,
+    #[command(flatten)]
     pub loop_abort: crate::shared::loop_abort::LoopAbortArgs,
     #[command(flatten)]
     pub token_io: TokenIoArgs,
@@ -1095,6 +1097,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
             if let Some(link) = spark_link {
                 engine.attach_spark(link, onboarded_layers.clone());
             }
+            engine.configure_l2_prefetch(&worker_args.l2)?;
             engine.configure_expert_usage(
                 inputs.expert_usage.as_ref(),
                 worker_args.expert_usage_reader.clone(),

@@ -99,6 +99,18 @@ impl<'a> Hy4NativeLinear<'a> {
         }
     }
 
+    /// Resident device ranges in read order for decode-exchange L2 prefetch.
+    pub(crate) fn ranges(&self) -> Vec<crate::shared::l2_prefetch::Range> {
+        match self {
+            Self::Trellis { weights, .. } => [weights.suh.buffer, weights.payload.buffer, weights.svh.buffer]
+                .map(|b| (b.ptr.cast_const(), b.bytes))
+                .to_vec(),
+            Self::Fp8 { payload, scales, .. } => [payload.buffer, scales.buffer]
+                .map(|b| (b.ptr.cast_const(), b.bytes))
+                .to_vec(),
+        }
+    }
+
     fn fp8_launch(
         &self,
         rows: usize,
@@ -211,6 +223,10 @@ pub(crate) struct Hy4NativeCore<'a> {
 impl<'a> Hy4NativeCore<'a> {
     pub(crate) fn get(&self, stem: &str) -> Option<&Hy4NativeLinear<'a>> {
         self.linears.get(stem)
+    }
+
+    pub(crate) fn ranges(&self, stem: &str) -> Option<Vec<crate::shared::l2_prefetch::Range>> {
+        self.linears.get(stem).map(Hy4NativeLinear::ranges)
     }
 
     pub(crate) fn is_empty(&self) -> bool {

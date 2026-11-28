@@ -143,3 +143,132 @@ pub(crate) fn kv_b_absorbed_ptrs(
     ensure!(buf.bytes == uk_bytes + uv_bytes, "kv_b_proj absorbed view size mismatch");
     Ok((buf.ptr, buf.ptr.cast::<u8>().wrapping_add(uk_bytes).cast()))
 }
+
+/// Per-layer decode L2 prefetch ranges for Hy4 / Hy4-flash.
+///
+/// Prioritizes the three large attention projections (`q_b_proj`, `linear_gate`,
+/// `o_proj`) in execution order before smaller attention, indexer, router and
+/// FFN operands:
+/// - On 1x RTX (128 MiB L2, 96 MiB auto budget) Hy4 K8 `q_b_proj` (32 MiB) and
+///   `linear_gate` (64 of 96 MiB) warm without being evicted before use; putting
+///   `o_proj` ahead of `linear_gate` would let `linear_gate`'s 96 MiB sweep evict
+///   it before `o_proj` launches.
+/// - On 2x RTX (TP2) and Hy4-flash, `q_b_proj` + `linear_gate` leave room in the
+///   runtime L2 budget to warm `o_proj` (and remaining layer operands) as well.
+pub(crate) fn layer_prefetch_ranges(
+    layer: usize,
+    extra_after_attention: &[&str],
+    mut resolve: impl FnMut(&str) -> Vec<crate::shared::l2_prefetch::Range>,
+) -> Vec<crate::shared::l2_prefetch::Range> {
+    let p = format!("model.layers.{layer}");
+    let mut out = Vec::new();
+    for suffix in [
+        "self_attn.q_b_proj",
+        "self_attn.linear_gate",
+        "self_attn.o_proj",
+        "self_attn.q_a_proj",
+        "self_attn.kv_a_proj_with_mqa",
+        "self_attn.kv_b_proj",
+    ] {
+        out.extend(resolve(&format!("{p}.{suffix}")));
+    }
+    for suffix in extra_after_attention {
+        out.extend(resolve(&format!("{p}.{suffix}")));
+    }
+    for suffix in [
+        "mlp.gate",
+        "mlp.shared_experts.gate_proj",
+        "mlp.shared_experts.up_proj",
+        "mlp.shared_experts.down_proj",
+        "mlp.gate_proj",
+        "mlp.up_proj",
+        "mlp.down_proj",
+    ] {
+        out.extend(resolve(&format!("{p}.{suffix}")));
+    }
+    out
+}
+
+/// Final-layer decode L2 prefetch ranges: `hc_head_fn` (when resident on this
+/// rank) followed by the vocabulary head (`lm_head`).
+pub(crate) fn head_prefetch_ranges(
+    mut resolve: impl FnMut(&str) -> Vec<crate::shared::l2_prefetch::Range>,
+) -> Vec<crate::shared::l2_prefetch::Range> {
+    let mut out = Vec::new();
+    out.extend(resolve("model.hc_head.hc_head_fn"));
+    out.extend(resolve("lm_head"));
+    out
+}
+
+/// Build the full `0..layers` decode L2 prefetch schedule: after layer `i`'s
+/// Spark exchange, warm layer `i + 1` or, after the final layer, the head.
+pub(crate) fn decode_prefetch_order(
+    layers: usize,
+    extra_after_attention: &[&str],
+    mut resolve: impl FnMut(&str) -> Vec<crate::shared::l2_prefetch::Range>,
+) -> Vec<Vec<crate::shared::l2_prefetch::Range>> {
+    (0..layers)
+        .map(|i| {
+            if i + 1 < layers {
+                layer_prefetch_ranges(i + 1, extra_after_attention, &mut resolve)
+            } else {
+                head_prefetch_ranges(&mut resolve)
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shared::l2_prefetch::{prefix, Range};
+    use std::ffi::c_void;
+
+    fn at(offset: usize) -> *const c_void {
+        (0x2000_0000usize + offset) as *const c_void
+    }
+
+    #[test]
+    fn decode_prefetch_order_prioritizes_qb_gate_o_and_head() {
+        let mib = 1usize << 20;
+        let resolve = |stem: &str| -> Vec<Range> {
+            match stem {
+                "model.layers.1.self_attn.q_b_proj" => vec![(at(1), 32 * mib)],
+                "model.layers.1.self_attn.linear_gate" => vec![(at(2), 96 * mib)],
+                "model.layers.1.self_attn.o_proj" => vec![(at(3), 96 * mib)],
+                "model.layers.1.self_attn.q_a_proj" => vec![(at(4), 12 * mib)],
+                "model.layers.1.self_attn.kv_b_proj" => vec![(at(5), 28 * mib)],
+                "model.hc_head.hc_head_fn" => vec![(at(6), 384 << 10)],
+                "lm_head" => vec![(at(7), 708 * mib)],
+                _ => Vec::new(),
+            }
+        };
+        let order = decode_prefetch_order(2, &[], resolve);
+        assert_eq!(order.len(), 2);
+        // After layer 0 -> layer 1: 96 MiB budget takes all of q_b (32 MiB) + 64 MiB of linear_gate.
+        assert_eq!(prefix(&order[0], 96 * mib), vec![(at(1), 32 * mib), (at(2), 64 * mib)]);
+        // After layer 1 (last) -> hc_head_fn (384 KiB) + remainder of lm_head.
+        assert_eq!(
+            prefix(&order[1], 96 * mib),
+            vec![(at(6), 384 << 10), (at(7), 96 * mib - (384 << 10))]
+        );
+    }
+
+    #[test]
+    fn decode_prefetch_order_reaches_o_proj_on_tp2_and_flash() {
+        let mib = 1usize << 20;
+        let resolve = |stem: &str| -> Vec<Range> {
+            match stem {
+                "model.layers.1.self_attn.q_b_proj" => vec![(at(1), 16 * mib)],
+                "model.layers.1.self_attn.linear_gate" => vec![(at(2), 48 * mib)],
+                "model.layers.1.self_attn.o_proj" => vec![(at(3), 48 * mib)],
+                _ => Vec::new(),
+            }
+        };
+        let order = decode_prefetch_order(2, &[], resolve);
+        assert_eq!(
+            prefix(&order[0], 96 * mib),
+            vec![(at(1), 16 * mib), (at(2), 48 * mib), (at(3), 32 * mib)]
+        );
+    }
+}

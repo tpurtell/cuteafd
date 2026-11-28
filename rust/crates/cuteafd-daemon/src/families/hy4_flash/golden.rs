@@ -108,6 +108,8 @@ pub(crate) struct GoldenArgs {
     /// Compare serial greedy continuation to forced multi-row verify with those same tokens.
     #[arg(long, requires = "resume_at", conflicts_with = "resume_dfly2")]
     pub(crate) resume_verify: bool,
+    #[command(flatten)]
+    pub(crate) l2: crate::shared::l2_prefetch::L2PrefetchArgs,
 }
 
 fn load_published_hy4_reference(root: &Path, vocab: usize) -> Result<cuteafd_bench::reference::Reference> {
@@ -386,6 +388,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         )?;
         engine.attach_spark(link, Vec::new());
     }
+    engine.configure_l2_prefetch(&args.l2)?;
 
     if args.resume_dfly2 {
         use cuteafd_loader::families::hy4_flash::{draft, Hy4DflyConfig};
