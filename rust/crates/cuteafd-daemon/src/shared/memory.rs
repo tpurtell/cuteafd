@@ -238,13 +238,15 @@ impl<'a> LayerStaging<'a> {
     pub(crate) fn region_bytes(&self) -> usize { self.region }
 }
 /// A per-step host wait for a stream's queued work (the sampling sync, a
-/// draft round): under `--host-wait block` it polls one blocking-sync event
-/// per device, recorded on the stream, for `BLOCK_SPIN`, then sleeps on it;
-/// under `spin` it is a
-/// stream synchronize, which the context's default scheduling spins.
+/// draft round): under `--host-wait block` it records one blocking-sync event
+/// per device and paces via [`cuteafd_transport::wait_policy::WaitPace`]
+/// (sleeping through the quiet prefix of decode-scale waits, spinning across
+/// completion, and falling back to `cudaEventSynchronize` past `BLOCK_SPIN`);
+/// under `spin` it is a stream synchronize, which the context's default
+/// scheduling spins.
 pub(crate) struct BlockingWait<'a> {
     library: &'a NativeLibrary,
-    events: Vec<(i32, *mut std::ffi::c_void)>,
+    events: Vec<(i32, *mut std::ffi::c_void, cuteafd_transport::wait_policy::WaitPace)>,
 }
 
 impl<'a> BlockingWait<'a> {
@@ -262,30 +264,33 @@ impl<'a> BlockingWait<'a> {
             // SAFETY: forwarded from this function's contract.
             return unsafe { self.library.cuda_stream_synchronize(stream) };
         }
-        let event = match self.events.iter().find(|(owner, _)| *owner == device) {
-            Some(&(_, event)) => event,
+        let (event, pace) = match self.events.iter_mut().find(|(owner, _, _)| *owner == device) {
+            Some(&mut (_, event, ref mut pace)) => (event, pace),
             None => {
                 let event = self.library.cuda_event_create_blocking()?;
-                self.events.push((device, event));
-                event
+                self.events.push((device, event, cuteafd_transport::wait_policy::WaitPace::new()));
+                let last = self.events.last_mut().expect("pushed blocking event");
+                (last.1, &mut last.2)
             }
         };
         // SAFETY: the event belongs to the current device, as does `stream`
-        // (the caller's contract); it lives until this wait drops. Polls it
-        // for the first `BLOCK_SPIN` (10 ms: every per-layer decode wait
-        // completes within that, and the wake-up of a blocking sync would be
-        // on the critical path), then sleeps in the driver.
+        // (the caller's contract); it lives until this wait drops. Paces
+        // recurring waits so the quiet prefix sleeps, the completion edge spins
+        // hot (avoiding blocking-sync wake-up lag), and longer waits still sleep
+        // in the driver via `cudaEventSynchronize`.
         unsafe {
             self.library.cuda_event_record(event, stream)?;
-            if cuteafd_transport::wait_policy::spin_window(|| self.library.cuda_event_query(event))? { return Ok(()); }
-            self.library.cuda_event_synchronize(event)
+            pace.wait(
+                || self.library.cuda_event_query(event),
+                || self.library.cuda_event_synchronize(event),
+            )
         }
     }
 }
 
 impl Drop for BlockingWait<'_> {
     fn drop(&mut self) {
-        for &(device, event) in &self.events {
+        for &(device, event, _) in &self.events {
             let previous = self.library.cuda_get_device();
             let _ = self.library.cuda_set_device(device);
             // SAFETY: created by this wait on `device`; synchronizing retires

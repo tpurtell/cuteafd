@@ -109,6 +109,92 @@ pub fn spin_window<E>(mut ready: impl FnMut() -> Result<bool, E>) -> Result<bool
     }
 }
 
+/// Lead time before expected completion when [`WaitPace`] ends its sleep phase
+/// and enters the hot spin phase. Waking 3 ms early brings the core out of
+/// shallow C-states / back to boost clocks before the GPU finishes while
+/// leaving 7 ms of positive-jitter headroom inside [`BLOCK_SPIN`].
+const PACE_SPIN_MARGIN: Duration = Duration::from_millis(3);
+/// Sleep slice during [`WaitPace`]'s quiet prefix. Short enough that a sudden
+/// transition from a longer step to a shorter one catches completion promptly
+/// and snaps the estimate down on the first step.
+const PACE_SLICE: Duration = Duration::from_micros(100);
+/// Upper bound on paced wait durations. Waits longer than this (large prefill
+/// units) skip pacing and fall through cleanly to the blocking fallback.
+const MAX_PACE_WINDOW: Duration = Duration::from_millis(200);
+/// EMA weight for steady-state updates inside the spin window.
+const PACE_EMA_WEIGHT: f64 = 0.25;
+
+/// Adaptive sleep-then-spin schedule for recurring host waits under
+/// [`HostWait::Block`] (e.g., per-step sampling syncs in `BlockingWait`).
+///
+/// A fixed spin-first window burns [`BLOCK_SPIN`] (10 ms) of CPU on a 15–60 ms
+/// graphed decode step and then sleeps in `cudaEventSynchronize` across the
+/// completion edge, paying OS wake-up and C-state/frequency-ramp latency on the
+/// critical path. Pacing sleeps through the quiet prefix in [`PACE_SLICE`]
+/// steps, wakes [`PACE_SPIN_MARGIN`] before expected completion to catch the
+/// event in a hot spin, and still falls back to `block` if spinning exceeds
+/// [`BLOCK_SPIN`].
+#[derive(Default, Debug, Clone, Copy)]
+pub struct WaitPace {
+    mean_secs: Option<f64>,
+}
+
+impl WaitPace {
+    pub const fn new() -> Self { Self { mean_secs: None } }
+
+    fn sleep_budget(&self) -> Duration {
+        let Some(mean) = self.mean_secs else { return Duration::ZERO };
+        let mean = Duration::from_secs_f64(mean.max(0.0));
+        if mean <= PACE_SPIN_MARGIN || mean > MAX_PACE_WINDOW {
+            return Duration::ZERO;
+        }
+        mean.saturating_sub(PACE_SPIN_MARGIN)
+    }
+
+    fn record(&mut self, elapsed: Duration, finished_in_sleep: bool, fell_back: bool) {
+        let sample = elapsed.as_secs_f64();
+        self.mean_secs = Some(match self.mean_secs {
+            None => sample,
+            Some(_) if finished_in_sleep || fell_back => sample,
+            Some(mean) => mean + PACE_EMA_WEIGHT * (sample - mean),
+        });
+    }
+
+    /// Waits for `ready` under [`HostWait::Block`]: fast poll, optional paced
+    /// sleep prefix, bounded [`BLOCK_SPIN`] spin across completion, then
+    /// `block` as the OS-blocking fallback.
+    pub fn wait<E>(
+        &mut self,
+        mut ready: impl FnMut() -> Result<bool, E>,
+        block: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        if ready()? {
+            self.record(Duration::ZERO, false, false);
+            return Ok(());
+        }
+        let started = Instant::now();
+        let sleep_until = self.sleep_budget();
+        if !sleep_until.is_zero() {
+            loop {
+                let elapsed = started.elapsed();
+                if elapsed >= sleep_until { break; }
+                std::thread::sleep((sleep_until - elapsed).min(PACE_SLICE));
+                if ready()? {
+                    self.record(started.elapsed(), true, false);
+                    return Ok(());
+                }
+            }
+        }
+        if spin_window(&mut ready)? {
+            self.record(started.elapsed(), false, false);
+            return Ok(());
+        }
+        block()?;
+        self.record(started.elapsed(), false, true);
+        Ok(())
+    }
+}
+
 /// A bounded backoff for one host wait on the critical path: under
 /// [`HostWait::Spin`] it always spins; under [`HostWait::Block`] it spins for
 /// [`BLOCK_SPIN`], then sleeps [`BLOCK_SLEEP`] per pass. The spin restarts on
@@ -216,6 +302,75 @@ mod tests {
         assert!(started.elapsed() >= BLOCK_SPIN, "spins the full window before blocking");
         // Errors from the poll propagate at once.
         assert_eq!(spin_window(|| Err::<bool, _>("poll failed")), Err("poll failed"));
+    }
+
+    #[test]
+    fn wait_pace_sleeps_prefix_spins_completion_and_adapts() {
+        let mut pace = WaitPace::new();
+        assert_eq!(pace.sleep_budget(), Duration::ZERO);
+
+        // Short waits (<= PACE_SPIN_MARGIN) never sleep.
+        pace.record(Duration::from_millis(2), false, false);
+        assert_eq!(pace.sleep_budget(), Duration::ZERO);
+
+        // Decode-scale waits (> 3 ms, <= 200 ms) sleep up to (mean - 3 ms).
+        pace.record(Duration::from_millis(15), false, true);
+        assert_eq!(pace.sleep_budget(), Duration::from_millis(12));
+
+        // Steady 15 ms wait finishes inside the hot spin window without blocking
+        // and with far fewer polls than spinning the full 15 ms.
+        let started = Instant::now();
+        let mut polls = 0usize;
+        let mut blocked = false;
+        pace.wait(
+            || {
+                polls += 1;
+                Ok::<_, ()>(started.elapsed() >= Duration::from_millis(15))
+            },
+            || {
+                blocked = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!blocked, "steady paced wait must catch completion in spin without blocking");
+        assert!(polls > 1 && polls < 500_000, "unexpected poll count {polls}");
+
+        // Early completion during the sleep prefix snaps the estimate down at once.
+        pace.record(Duration::from_millis(50), false, true);
+        assert_eq!(pace.sleep_budget(), Duration::from_millis(47));
+        let started = Instant::now();
+        let mut blocked = false;
+        pace.wait(
+            || Ok::<_, ()>(started.elapsed() >= Duration::from_millis(2)),
+            || {
+                blocked = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(!blocked);
+        assert!(
+            pace.sleep_budget() < Duration::from_millis(5),
+            "early completion must snap mean down, got budget {:?}",
+            pace.sleep_budget()
+        );
+
+        // Large prefill-scale waits (> MAX_PACE_WINDOW) disable pacing.
+        pace.record(Duration::from_millis(500), false, true);
+        assert_eq!(pace.sleep_budget(), Duration::ZERO);
+
+        // Unready waits past BLOCK_SPIN fall back to the blocking callback.
+        let mut blocked = false;
+        let mut pace = WaitPace::new();
+        pace.wait(|| Ok::<_, ()>(false), || { blocked = true; Ok(()) }).unwrap();
+        assert!(blocked, "past BLOCK_SPIN must invoke blocking fallback");
+
+        // Poll errors propagate immediately.
+        assert_eq!(
+            pace.wait(|| Err::<bool, _>("query failed"), || Ok(())),
+            Err("query failed")
+        );
     }
 
     #[test]

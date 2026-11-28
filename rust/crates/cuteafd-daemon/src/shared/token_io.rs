@@ -1311,6 +1311,7 @@ mod tests {
         let wait = memory.split("pub(crate) unsafe fn wait(").nth(1).unwrap().split("impl Drop for BlockingWait").next().unwrap();
         assert!(wait.find("cuda_stream_device(stream)").unwrap() < wait.find("cuda_event_create_blocking()").unwrap());
         assert!(!wait.contains("cuda_get_device()"));
+        assert!(wait.contains("pace.wait("), "BlockingWait must pace recurring waits before falling back to cudaEventSynchronize");
     }
 
     #[test]
