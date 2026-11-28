@@ -438,6 +438,26 @@ impl<'a> NativeRtxTensors<'a> {
             .collect::<Result<_>>()?;
         Ok(Self { tensors, resident_bytes: arena.layout().bytes(), mapped_embedding: None })
     }
+    pub(crate) fn compressor_fixture(library: &'a NativeLibrary, layer: usize, ratio: usize) -> Result<Self> {
+        let mut specs = vec![
+            (format!("layers.{layer}.attn.compressor.wkv.weight"), 512 * 10240),
+            (format!("layers.{layer}.attn.compressor.norm.weight"), 512 * 2),
+        ];
+        if ratio == 2 {
+            specs.push((format!("layers.{layer}.attn.compressor.wgate.weight"), 512 * 10240));
+        }
+        specs.push((format!("layers.{layer}.attn.indexer.wk.weight"), 128 * 512 * 2));
+        specs.push((format!("layers.{layer}.attn.indexer.k_norm.weight"), 128 * 2));
+        let layout = cuteafd_loader::serving_capacity::WeightArenaLayout::new("v41-compressor-fixture",
+            specs.iter().map(|(name, bytes)| (name.clone(), *bytes)))?;
+        let arena = DeviceWeightArena::new(Device { library, id: library.cuda_get_device()? }, layout,
+            ArenaTag::weights("v41/compressor-fixture"))?;
+        let tensors = specs.into_iter().map(|(name, bytes)| {
+            let view = arena.view(&name, bytes)?;
+            Ok((name, DeviceAllocation::from_allocation(view)))
+        }).collect::<Result<_>>()?;
+        Ok(Self { tensors, resident_bytes: arena.layout().bytes(), mapped_embedding: None })
+    }
     /// Every resident tensor (golden digests).
     pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
         for (name, allocation) in &self.tensors { f(format!("{prefix}{name}"), allocation.buffer); }

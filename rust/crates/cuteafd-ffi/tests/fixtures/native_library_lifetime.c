@@ -552,12 +552,13 @@ int cuteafd_alloc_managed_device_buffer(size_t bytes, struct device_buffer *out,
     return 0;
 }
 
-/* Opt-in through HC initialization. Only the HC regression models capture:
- * recorded HC operations/copies do not execute, including rejected records. */
-static int hc_fixture, hc_recording;
+/* Opt-in through HC or V4.1 compressor initialization. Only those regressions
+ * model capture: recorded operations/copies do not execute, including rejected
+ * records. */
+static int hc_fixture, compressor_fixture, hc_recording;
 static void *hc_capture_stream;
 static int hc_is_recording(void *stream) {
-    return hc_fixture && hc_recording && hc_capture_stream == stream;
+    return (hc_fixture || compressor_fixture) && hc_recording && hc_capture_stream == stream;
 }
 static int capture_status;
 void fixture_configure_capture(int status) { capture_status = status; }
@@ -1425,10 +1426,81 @@ int cuteafd_v41_dspark_cache_write_fp8(const uint16_t *src, const void *writes,
     return 0;
 }
 int cuteafd_cuda_graph_begin_capture(void *stream) {
-    if (hc_fixture && capture_status == 12) return 1;
-    if (hc_fixture) { hc_recording = 1; hc_capture_stream = stream; }
+    if ((hc_fixture || compressor_fixture) && capture_status == 12) return 1;
+    if (hc_fixture || compressor_fixture) { hc_recording = 1; hc_capture_stream = stream; }
     return 0;
 }
+/* Deterministic CPU stand-ins for V4.1 compressor eager/capture tests. */
+int cuteafd_v41_compressor_create(void *w, uint64_t b, void **o) { (void)w; (void)b; compressor_fixture = 1; *o = (void *)(uintptr_t)0xC047; return 0; }
+int cuteafd_v41_compressor_destroy(void *h) { (void)h; return 0; }
+int cuteafd_v41_backbone_frequencies(const uint64_t *p, float *o, int r, int l, void *s) {
+    if (hc_is_recording(s)) return 0;
+    for (int i = 0; i < r; ++i) for (int j = 0; j < 64; ++j) o[i * 64 + j] = (float)((p[i] * 131 + (uint64_t)l * 17 + (uint64_t)j) & 0xff);
+    return 0;
+}
+int cuteafd_v41_compressor_project(void *h, const uint16_t *x, const uint16_t *w, void *o, int r, int ratio, void *s) {
+    (void)h; (void)w;
+    if (hc_is_recording(s)) return 0;
+    for (int i = 0; i < r; ++i) for (int j = 0; j < 512; ++j) {
+        if (ratio == 2) ((float *)o)[i * 512 + j] = (float)(x[i * 5120] + j);
+        else ((uint16_t *)o)[i * 512 + j] = (uint16_t)(x[i * 5120] + j);
+    }
+    return 0;
+}
+int cuteafd_v41_compressor_pool(const float *kv, const float *sc, const float *pk, const float *ps,
+        const uint64_t *pred, const uint16_t *nw, uint16_t *o, int r, int sl, void *s) {
+    (void)sc; (void)pk; (void)ps; (void)nw; (void)sl;
+    if (hc_is_recording(s)) return 0;
+    for (int i = 0; i < r; ++i) {
+        uint16_t b = (uint16_t)((uint32_t)kv[i * 512] ^ (uint32_t)(pred[i] & 0xff));
+        for (int j = 0; j < 512; ++j) o[i * 512 + j] = (uint16_t)(b + j * 3);
+    }
+    return 0;
+}
+int cuteafd_v41_index_key_project(void *h, const uint16_t *x, const uint16_t *w, uint16_t *o, int r, void *s) {
+    (void)h; (void)w;
+    if (hc_is_recording(s)) return 0;
+    for (int i = 0; i < r; ++i) for (int j = 0; j < 128; ++j) o[i * 128 + j] = (uint16_t)(x[i * 512] + j);
+    return 0;
+}
+int cuteafd_v41_attention_norm(const uint16_t *x, const uint16_t *w, const float *f, uint16_t *o, int r, int c, void *s) {
+    (void)w;
+    if (hc_is_recording(s)) return 0;
+    for (int i = 0; i < r; ++i) {
+        uint32_t fq = f ? (uint32_t)f[i * 64] : 0;
+        for (int j = 0; j < c; ++j) o[i * c + j] = (uint16_t)(x[i * c] ^ fq ^ (uint32_t)(j * 7));
+    }
+    return 0;
+}
+int cuteafd_v41_index_pack(const uint16_t *x, uint8_t *p, uint8_t *sc, int r, void *s) {
+    if (hc_is_recording(s)) return 0;
+    for (int i = 0; i < r; ++i) {
+        uint32_t b = x[i * 128];
+        for (int j = 0; j < 64; ++j) p[i * 64 + j] = (uint8_t)((b + (uint32_t)j * 5) & 0xff);
+        for (int j = 0; j < 4; ++j) sc[i * 4 + j] = (uint8_t)((b + (uint32_t)j * 11) & 0xff);
+    }
+    return 0;
+}
+int cuteafd_v41_compressed_kv_pack(const uint16_t *x, const float *f, uint8_t *v, uint8_t *sc, int r, void *s) {
+    if (hc_is_recording(s)) return 0;
+    for (int i = 0; i < r; ++i) {
+        uint32_t b = (uint32_t)x[i * 512] ^ (f ? (uint32_t)f[i * 64] : 0);
+        for (int j = 0; j < 256; ++j) v[i * 256 + j] = (uint8_t)((b + (uint32_t)j * 13) & 0xff);
+        for (int j = 0; j < 32; ++j) sc[i * 32 + j] = (uint8_t)((b + (uint32_t)j * 19) & 0xff);
+    }
+    return 0;
+}
+int cuteafd_v41_index_store(const uint8_t *p, const uint8_t *sc, const uint64_t *d, uint8_t *c, uint8_t *cs, int r, uint64_t cap, void *s) { (void)p; (void)sc; (void)d; (void)c; (void)cs; (void)r; (void)cap; (void)s; return 0; }
+int cuteafd_v41_compressed_kv_store(const uint8_t *v, const uint8_t *sc, const uint64_t *d, uint8_t *c, uint8_t *cs, int r, uint64_t cap, void *s) { (void)v; (void)sc; (void)d; (void)c; (void)cs; (void)r; (void)cap; (void)s; return 0; }
+int cuteafd_v41_index_weights_project(void *h, const uint16_t *x, const uint16_t *w, uint16_t *o, int r, void *s) { (void)h; (void)x; (void)w; (void)o; (void)r; (void)s; return 1; }
+int cuteafd_v41_index_query_prepare(const uint16_t *x, const float *f, const uint16_t *w, uint8_t *p, uint8_t *sc, uint16_t *sw, int r, void *s) { (void)x; (void)f; (void)w; (void)p; (void)sc; (void)sw; (void)r; (void)s; return 1; }
+int cuteafd_v41_dspark_terminal_layout(const uint16_t *r, const float *p, uint16_t *o, float *op, int req, void *s) { (void)r; (void)p; (void)o; (void)op; (void)req; (void)s; return 1; }
+int cuteafd_v41_dspark_embed(const uint16_t *t, const int32_t *tok, uint16_t *r, float *p, int req, void *s) { (void)t; (void)tok; (void)r; (void)p; (void)req; (void)s; return 1; }
+int cuteafd_v41_target_embed(const uint16_t *t, const int32_t *tok, uint16_t *r, float *p, int req, void *s) { (void)t; (void)tok; (void)r; (void)p; (void)req; (void)s; return 1; }
+int cuteafd_v41_dspark_tap(const uint16_t *i, uint16_t *o, int r, int d, void *s) { (void)i; (void)o; (void)r; (void)d; (void)s; return 1; }
+int cuteafd_v41_dspark_frequencies(const uint64_t *p, float *o, int r, void *s) { (void)p; (void)o; (void)r; (void)s; return 1; }
+int cuteafd_v41_attention_kv(const uint16_t *i, const uint16_t *w, const float *f, uint16_t *o, int r, void *s) { (void)i; (void)w; (void)f; (void)o; (void)r; (void)s; return 1; }
+int cuteafd_v41_attention_rope(const uint16_t *i, const float *f, uint16_t *o, int r, int h, int d, void *s) { (void)i; (void)f; (void)o; (void)r; (void)h; (void)d; (void)s; return 1; }
 /* Deterministic dependency markers, not BF16/CUDA numerical emulation. */
 int cuteafd_v41_hc_project_initialize(void) { hc_fixture = 1; return 0; }
 int cuteafd_v41_hc_begin(void *residual, void *projection, void *scale, void *base,

@@ -1196,18 +1196,18 @@ impl<'w, 'a> CompressorWave<'w, 'a> {
         match (launched, captured) {
             (Ok(()), Ok((graph, nodes, width, spans, _))) => {
                 self.insert_graph(graph, prepared.rows, state.owner, ticket, nodes as u64, width, spans)?;
-                self.ready = Some(prepared);
-                Ok(())
             }
             (Err(error), Ok((graph, ..))) => {
                 unsafe {
                     self.stream().library.cuda_graph_exec_destroy(graph)?;
                 }
-                Err(error)
+                return Err(error);
             }
-            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => Ok(()),
-            (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Err(error)) if cuteafd_ffi::is_small_graph(&error) => {},
+            (Err(error), Err(_)) | (Ok(()), Err(error)) => return Err(error),
         }
+        self.ready = Some(prepared);
+        Ok(())
     }
     /// # Safety
     /// Same input contract as execute; state owner and live rows match capture.
@@ -1412,7 +1412,13 @@ impl<'a> CompressorState<'a> {
 }
 
 #[cfg(test)]
-impl CompressorWeights<'_> {
+impl<'a> CompressorWeights<'a> {
+    pub(crate) fn fixture(library: &'a NativeLibrary, layer: usize) -> Result<Self> {
+        let ratio = ratio(layer)?;
+        let names = Self::names(layer)?;
+        let tensors = NativeRtxTensors::compressor_fixture(library, layer, ratio)?;
+        Ok(Self { library, tensors, layer, ratio, names })
+    }
     pub(crate) fn visit(&self, prefix: &str, f: &mut dyn FnMut(String, cuteafd_ffi::CuteafdDeviceBuffer)) {
         self.tensors.visit(prefix, f);
     }
@@ -1422,8 +1428,103 @@ impl CompressorWeights<'_> {
 mod cold_capture_tests {
     use super::*;
     use crate::shared::decode_graph::CacheAttached;
-    use crate::families::deepseek_v41::v41_attention_query::AttentionQueryWeights;
+    use crate::families::deepseek_v41::v41_attention_query::{AttentionQueryOutput, AttentionQueryWeights};
     use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
+
+    fn read_output_bytes(library: &NativeLibrary, output: &CompressorOutput<'_>) -> Result<Vec<Vec<u8>>> {
+        [
+            output.buffer,
+            output.index_key,
+            output.index_packed,
+            output.index_scales,
+            output.kv_values,
+            output.kv_scales,
+        ]
+        .into_iter()
+        .map(|buffer| {
+            let mut bytes = vec![0u8; buffer.bytes];
+            library.copy_d2h_quiescent(&mut bytes, buffer)?;
+            Ok(bytes)
+        })
+        .collect()
+    }
+
+    /// Regression test for #2914: when `CompressorWave::capture` hits the
+    /// `is_small_graph` eager-fallback arm (which also handles `GraphCacheEager`
+    /// after a rejected donor update under tight reserve), `execute_query` must
+    /// keep `ready` published so `output`, `index_proposal` and `validate_batch`
+    /// succeed and match an eager `execute` reference.
+    #[test]
+    fn execute_query_publishes_ready_output_on_is_small_graph_fallback() -> Result<()> {
+        let fixture = cuteafd_ffi::native_library_lifetime_fixture::Fixture::build_for_tests()?;
+        let library = fixture.load()?;
+        fixture.configure_memory(&library, 0, 1 << 30)?;
+        fixture.immediate_copies(&library)?;
+        let site = |name: &'static str| Site {
+            name,
+            cycle: Cycle::Decode,
+            preference: Preference::Capture,
+            bootstrap: 10,
+            basis: Basis::Bytes,
+            spans_devices: false,
+        };
+        let mut synth_device = -291_400i32;
+
+        for layer in [2usize, 20usize] {
+            let weights = CompressorWeights::fixture(&library, layer)?;
+            let mut state = CompressorState::new(&library, layer, 4, 8, usize::MAX)?;
+            let leases = [
+                state.begin_request(0, 101)?,
+                state.begin_request(1, 102)?,
+                state.begin_request(2, 103)?,
+                state.begin_request(3, 104)?,
+            ];
+            let chunks = [
+                CompressorChunk { lease: leases[0], position: 0, tokens: 2 },
+                CompressorChunk { lease: leases[1], position: 0, tokens: 2 },
+                CompressorChunk { lease: leases[2], position: 0, tokens: 2 },
+                CompressorChunk { lease: leases[3], position: 0, tokens: 2 },
+            ];
+            let tokens: Vec<u64> = chunks
+                .iter()
+                .flat_map(|c| c.position..c.position + u64::from(c.tokens))
+                .collect();
+            let input_bytes: Vec<u8> = (0..tokens.len() * 5120)
+                .flat_map(|i| (((i * 29 + layer * 13) % 251) as u16).to_ne_bytes())
+                .collect();
+            let query_hidden = DeviceAllocation::new(&library, input_bytes.len(), crate::shared::memory::TEST)?;
+            library.copy_h2d(query_hidden.buffer, &input_bytes)?;
+            let query = AttentionQueryOutput::for_test(layer, query_hidden.buffer, &tokens)?;
+
+            // Eager reference via direct `execute`.
+            let mut reference = weights.wave(16, usize::MAX)?;
+            library.copy_h2d(reference.input(), &input_bytes)?;
+            // SAFETY: CPU fixture owns initialized inputs for this call.
+            let expected = unsafe {
+                let output = reference.execute(&state, &chunks)?;
+                read_output_bytes(&library, &output)?
+            };
+            assert!(expected[0].iter().any(|&b| b != 0));
+
+            // `execute_query` -> `capture` -> `is_small_graph` eager fallback.
+            let mut wave = weights.wave(16, usize::MAX)?;
+            wave.retained_graphs.attach_device_for_test(synth_device, 100, site("Compressor.2914.eager"))?;
+            synth_device -= 1;
+            fixture.configure_capture(&library, cuteafd_ffi::CUTEAFD_STATUS_GRAPH_TOO_SMALL)?;
+            // SAFETY: CPU fixture owns initialized query/cache operands for this call.
+            let result = unsafe { wave.execute_query(&state, &chunks, &query) };
+            fixture.configure_capture(&library, 0)?;
+            let actual = read_output_bytes(&library, &result?)?;
+            assert!(wave.ready.is_some(), "ready must stay published after is_small_graph fallback");
+            assert!(wave.selected_graph().is_none(), "eager fallback must not retain a graph");
+            assert_eq!(actual, expected, "eager fallback output differs from eager reference on layer {layer}");
+            wave.validate_batch(&state, &chunks)?;
+            for lease in leases {
+                assert_eq!(wave.index_proposal(&state, lease)?.source_layer, layer);
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires V4.1 checkpoint, AOT native library and CUDA GPU"]

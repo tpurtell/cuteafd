@@ -230,6 +230,25 @@ impl AttentionQueryOutput<'_> {
         self.binding()?;
         Ok(self.tokens)
     }
+    #[cfg(test)]
+    pub(crate) fn for_test<'a>(layer: usize, hidden: CuteafdDeviceBuffer, tokens: &'a [u64]) -> Result<AttentionQueryOutput<'a>> {
+        let binding = QueryBinding::new(layer)?;
+        Ok(AttentionQueryOutput {
+            binding: Some(binding),
+            tokens,
+            layer,
+            rows: tokens.len(),
+            hidden,
+            raw_rank: CuteafdDeviceBuffer::default(),
+            normalized_rank: CuteafdDeviceBuffer::default(),
+            projected: CuteafdDeviceBuffer::default(),
+            qb_scratch: None,
+            rotated: CuteafdDeviceBuffer::default(),
+            positions: CuteafdDeviceBuffer::default(),
+            frequencies: CuteafdDeviceBuffer::default(),
+            _owner: PhantomData,
+        })
+    }
 }
 /// The attention query's stream, GEMM scratch and outputs
 /// (`shared::memory::row_window` contract). Every output buffer (hidden,
