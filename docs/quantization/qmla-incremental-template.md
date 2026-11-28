@@ -55,8 +55,8 @@ Before capturing any activation:
 
 ---
 
-## 3. Pilot first (required before full run)
-Always run a short pilot first and report its results to TJ before the full run. The pilot uses a few representative MLA layers and a small corpus slice (16 / 4 / 4 train / val / test), with default `--protection sink4_local128`. It is for understanding, so it fits every width and measures all nine combinations, just like the full run (pure-NoPE families: `8:0,4:0,2:0`).
+## 3. Pilot gate (before full run)
+Run a short pilot over representative MLA layers and a small corpus slice (16 / 4 / 4 train / val / test) with default `--protection sink4_local128` as an automatic gate before the full run (or verify the same gates inline on the first layers). It fits every width and measures all nine combinations, just like the full run (pure-NoPE families: `8:0,4:0,2:0`). Passing all pilot gates proceeds automatically to §4; failing any gate stops cleanly with a failure report.
 
 **Reference pilot command (Hy4-flash):**
 ```bash
@@ -82,7 +82,7 @@ MIMALLOC_PURGE_DELAY=0 PYTHONPATH="$PWD/quantization:$PWD/third_party/transforme
 ---
 
 ## 4. Full calibration (unattended, streaming per-layer, resumable)
-Run the full calibration in **ONE `systemd-run --user` resume-on-restart unit** (`Restart=on-failure`, `RestartSec=30`, non-restarting exit code on hard gate failures) chaining **preflight → capture → fit → select → validate → `--long-eval` → K8 transfer → headline table & sidecar emit → dry-run publish audit**, with **automatic gates** and **one confirmation pause just before live publish**. Once confirmed, chain live publish → SparkNest import/pin → post-publish cleanup → final report.
+Run the full calibration end-to-end in **ONE `systemd-run --user` resume-on-restart unit** (`Restart=on-failure`, `RestartSec=30`, non-restarting exit code on hard gate failures) chaining **preflight → capture → fit → select → validate → `--long-eval` → K8 transfer → headline table & sidecar emit → dry-run publish audit → live publish (approved in the brief) → SparkNest import/pin → post-publish cleanup → final report**. Every phase gates automatically and stops only on a failed bar or integrity violation.
 
 **Reference full command (`hy4_flash` pattern):**
 ```bash
@@ -172,8 +172,8 @@ Verify the dry-run receipt reports:
   - MC repo: `mla_calibration.safetensors`, rewritten `cuteafd-mc.json` (with `"qmla"`), and optional `qmla-validation-report.json` / `README.md`.
   - Non-MC repo: `mla_calibration.safetensors` (self-describing `__metadata__["cuteafd_qmla"]`), and optional `qmla-validation-report.json` / `README.md` (no `cuteafd-mc.json` created).
 
-2. **Commit new revision (single confirmation gate before live publish):**
-Stop cleanly after the dry-run audit to confirm with TJ before publishing. Once confirmed, re-run without `--dry-run`, piping the HF token over stdin. `publish_incremental_revision` guards on `parent_commit=SOURCE_REVISION` (refuses if head moved) and verifies after commit that every preserved shard blob and size at `new_revision` is byte-identical to `SOURCE_REVISION`.
+2. **Commit new revision (automatic after dry-run audit passes; publishing approved in the brief):**
+Immediately after the dry-run receipt verifies `reuploaded_shard_bytes == 0` and exact `uploaded_files`, re-run without `--dry-run`, piping the HF token over stdin. `publish_incremental_revision` guards on `parent_commit=SOURCE_REVISION` (refuses if head moved) and verifies after commit that every preserved shard blob and size at `new_revision` is byte-identical to `SOURCE_REVISION`.
 
 3. **SparkNest import, pin, and post-publish cleanup (`brief-template.md` §§10 & 12):**
    - Stage a hard-link HF cache with the Hub OIDs as blob names, run `nest hf import --offline --no-copy`, update `refs/main` and `refs/keep/<name>` (`printf %s`, no trailing newline), place via `nest plan`, and verify `nest ls --json`.
