@@ -164,7 +164,7 @@ def _synthetic_sparse_bank(seed: int, *, seq_len: int = 261, candidate_topk: int
         "self_attn.q_a_layernorm.weight": torch.ones(q_rank),
         "self_attn.q_b_proj.weight": rand(heads * (nope + d_r), q_rank),
         "self_attn.kv_a_proj_with_mqa.weight": kv_a,
-        "self_attn.kv_a_layernorm.weight": 1 + 0.1 * rand(d_c),
+        "self_attn.kv_a_layernorm.weight": torch.ones(d_c),
         "self_attn.kv_b_proj.weight": rand(heads * (nope + vdim), d_c),
         "self_attn.linear_gate.weight": rand(heads * vdim, hidden),
         "self_attn.o_proj.weight": rand(hidden, heads * vdim),
@@ -334,7 +334,7 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
             "self_attn.q_a_proj.weight": rand(q_rank, hidden) * 0.2, "self_attn.q_a_layernorm.weight": torch.ones(q_rank),
             "self_attn.q_b_proj.weight": rand(h * (nope + d_r), q_rank) * 0.2,
             "self_attn.kv_a_proj_with_mqa.weight": rand(d_c + d_r, hidden) * 0.2,
-            "self_attn.kv_a_layernorm.weight": 1 + 0.1 * rand(d_c), "self_attn.kv_b_proj.weight": rand(h * (nope + vdim), d_c) * 0.2,
+            "self_attn.kv_a_layernorm.weight": torch.ones(d_c), "self_attn.kv_b_proj.weight": rand(h * (nope + vdim), d_c) * 0.2,
             "self_attn.linear_gate.weight": rand(h * vdim, hidden) * 0.2, "self_attn.o_proj.weight": rand(hidden, h * vdim) * 0.2,
             "self_attn.post_proj_norm.weight": torch.ones(hidden), "self_attn.learnable_sink_param": rand(h) * 0.1,
         }
