@@ -181,7 +181,7 @@ def calibrate_from_banks(
     identity_key = fit_config_digest(
         fit_config,
         extra={
-            "fit_semantics": "causal-protection-v3-three-way-split",
+            "fit_semantics": "three-way-split-post-norm-fp64-validation-rotation",
             "conventions": CANONICAL_CONVENTIONS,
             "source": dict(source),
             "splits": splits,
