@@ -895,8 +895,38 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" \
         script = (ROOT / "scripts/build/build-release-artifacts.sh").read_text()
         self.assertIn('-DCUTEAFD_ENABLE_V41_LOCAL_EXPERT_AOT="$coordinator_aot"', script)
         self.assertIn('-DCUTEAFD_ENABLE_V41_TP2_EXPERT_AOT="$coordinator_aot"', script)
-        self.assertIn('"cuteafd_v41_local_expert_info"', script)
-        self.assertIn('"cuteafd_v41_tp2_expert_info"', script)
+        self.assertIn("grep -qx 'cuteafd_v41_local_expert_info'", script)
+        self.assertIn("grep -qx 'cuteafd_v41_tp2_expert_info'", script)
+        # CPU-only export containers have no libcuda.so.1: read symbols, never load the library.
+        abi_check = script.split("Automatic RTX placement requires", 1)[1].split("install -m 0644", 1)[0]
+        self.assertIn("nm -D --defined-only", abi_check)
+        self.assertNotIn("ctypes", abi_check)
+
+    def test_coordinator_abi_check_reads_symbols_without_loading(self) -> None:
+        import shutil
+        import subprocess
+        if shutil.which("cc") is None or shutil.which("nm") is None:
+            self.skipTest("needs cc and nm")
+        script = (ROOT / "scripts/build/build-release-artifacts.sh").read_text()
+        check = script.split("Automatic RTX placement requires the full local-expert ABI in release images.\n", 1)[1]
+        check = check.split("  install -m 0644", 1)[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for name, body in (("good", "void cuteafd_v41_local_expert_info(void){}\nvoid cuteafd_v41_tp2_expert_info(void){}\n"),
+                               ("bad", "void cuteafd_v41_local_expert_info(void){}\n")):
+                src = out / f"{name}.c"
+                src.write_text(body)
+                lib_dir = out / name
+                lib_dir.mkdir()
+                subprocess.run(["cc", "-shared", "-fPIC", "-o", str(lib_dir / "libcuteafd_native.so"), str(src),
+                                "-Wl,--allow-shlib-undefined", "-Wl,--no-as-needed"], check=True)
+            good = subprocess.run(["bash", "-c", "set -euo pipefail\n" + check],
+                                  env={**os.environ, "output_dir": str(out / "good")}, capture_output=True, text=True)
+            self.assertEqual(good.returncode, 0, good.stderr)
+            bad = subprocess.run(["bash", "-c", "set -euo pipefail\n" + check],
+                                 env={**os.environ, "output_dir": str(out / "bad")}, capture_output=True, text=True)
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertIn("lacks cuteafd_v41_tp2_expert_info", bad.stderr)
 
     def test_invalid_direct_overrides_fail_before_external_checks(self) -> None:
         with tempfile.TemporaryDirectory() as home:
