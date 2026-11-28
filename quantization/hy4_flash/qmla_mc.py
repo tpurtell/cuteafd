@@ -40,6 +40,13 @@ class MCReader(forward.reference.Checkpoint):
         self.index = json.loads((self.snapshot / self.variant["index"]).read_bytes())["weight_map"]
         self.core = frozenset(self.variant["core_tensors"])
 
+    def close(self):
+        super().close()
+        # Each layer's expert shards bring thousands of parsed tensor descriptors.
+        # Retire those alongside their mappings; raw() reloads both on demand.
+        self.headers.clear()
+        self.header_offsets.clear()
+
     def reconstruct(self, module, shape, bits):
         packed = {suffix: self.raw(f"{module}.{suffix}") for suffix in recipe.SUFFIXES}
         if packed["trellis"].shape[-1] != bits * 16:

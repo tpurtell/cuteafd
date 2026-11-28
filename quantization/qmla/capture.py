@@ -74,6 +74,25 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     _fsync_dir(path.parent)
 
 
+def layer_memory_bytes(device: torch.device | str) -> dict[str, int]:
+    """Layer-boundary footprint. System available memory includes reclaimable file cache."""
+    keys = {"VmRSS": "rss", "RssAnon": "rss_anon", "RssFile": "rss_file",
+            "MemAvailable": "system_available", "MemTotal": "system_total"}
+    result = {}
+    for path in (Path("/proc/self/status"), Path("/proc/meminfo")):
+        if path.is_file():
+            for line in path.read_text().splitlines():
+                label, _, value = line.partition(":")
+                if label in keys:
+                    result[keys[label]] = int(value.split()[0]) * 1024
+    dev = torch.device(device)
+    if dev.type == "cuda":
+        result.update(cuda_allocated=torch.cuda.memory_allocated(dev),
+                      cuda_reserved=torch.cuda.memory_reserved(dev),
+                      cuda_peak_allocated=torch.cuda.max_memory_allocated(dev))
+    return result
+
+
 def unit_rms_norm(x: torch.Tensor, eps: float) -> torch.Tensor:
     """Weightless RMSNorm_1(x) in FP32: x / sqrt(mean(x^2) + eps)."""
     xf = x.float()
@@ -807,7 +826,7 @@ def _write_safetensors_streamed(path: Path, tensors: dict[str, torch.Tensor]) ->
     return {"file": path.name, "bytes": total_bytes, "xxh3_128": hasher.hexdigest()}
 
 
-def _read_safetensors_verified(path: Path, expected_bytes: int, expected_xxh3: str) -> dict[str, torch.Tensor]:
+def _verified_mapping(path: Path, expected_bytes: int, expected_xxh3: str) -> mmap.mmap:
     path = Path(path)
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"capture payload missing or symlink: {path}")
@@ -821,6 +840,11 @@ def _read_safetensors_verified(path: Path, expected_bytes: int, expected_xxh3: s
     actual_xxh3 = xxhash.xxh3_128_hexdigest(raw)
     if actual_xxh3 != expected_xxh3:
         raise ValueError(f"capture payload XXH3-128 mismatch: {actual_xxh3} != {expected_xxh3}")
+    return raw
+
+
+def _mapped_tensors(raw: mmap.mmap) -> dict[str, torch.Tensor]:
+    size = len(raw)
     header_len = struct.unpack_from("<Q", raw)[0]
     base = 8 + header_len
     header = json.loads(raw[8:base])
@@ -838,6 +862,10 @@ def _read_safetensors_verified(path: Path, expected_bytes: int, expected_xxh3: s
         else:
             result[name] = torch.empty(spec["shape"], dtype=dtype)
     return result
+
+
+def _read_safetensors_verified(path: Path, expected_bytes: int, expected_xxh3: str) -> dict[str, torch.Tensor]:
+    return _mapped_tensors(_verified_mapping(path, expected_bytes, expected_xxh3))
 
 
 def save_layer_capture(directory: Path | str, bank: CapturedLayerBank) -> dict[str, Any]:
@@ -912,9 +940,10 @@ def load_layer_capture(directory: Path | str, layer_id: int) -> CapturedLayerBan
     if geometry.layer_id != layer_id:
         raise ValueError(f"capture layer_id {geometry.layer_id} != requested {layer_id}")
     payload = manifest["payload"]
-    tensors = _read_safetensors_verified(
+    raw = _verified_mapping(
         directory / payload["file"], int(payload["bytes"]), str(payload["xxh3_128"])
     )
+    tensors = _mapped_tensors(raw)
     params = CapturedLayerParams(
         attention_arithmetic=manifest.get("attention_arithmetic", "f32_tiled"),
         kv_norm_weight=tensors["params.kv_norm_weight"],
@@ -952,6 +981,10 @@ def load_layer_capture(directory: Path | str, layer_id: int) -> CapturedLayerBan
         provenance=dict(manifest.get("provenance", {})),
     )
     bank.validate()
+    # Verification touched every page of this private file mapping. Leave the
+    # validated tensors demand-paged until a consumer actually uses this layer.
+    if hasattr(mmap, "MADV_DONTNEED"):
+        raw.madvise(mmap.MADV_DONTNEED)
     return bank
 
 

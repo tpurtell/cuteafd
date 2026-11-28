@@ -41,7 +41,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from qmla.capture import CapturedLayerBank, SPLIT_NAMES, load_layer_capture, save_layer_capture, split_train_val_test
+from qmla.capture import CapturedLayerBank, SPLIT_NAMES, layer_memory_bytes, load_layer_capture, save_layer_capture, split_train_val_test
 from qmla.fit import FitConfig
 from qmla.long_eval import LongContextEvaluator, LongContextRecord, load_long_context_records, panel_snapshot_dir
 from qmla.quantizer import parse_qmla_mode
@@ -118,7 +118,7 @@ def _stream_hy4_flash_captures(
     active = [*train_items, *val_items, *test_items]
     active = [(sid, tokens.to(reader.device)) for sid, tokens in active]
     states = deque(model.initial(tokens, embedding=embedding) for _, tokens in active)
-    banks = {}
+    del embedding
     for layer_idx in range(max_layer + 1):
         started = time.monotonic()
         layer = model.load_layer(layer_idx)
@@ -141,7 +141,6 @@ def _stream_hy4_flash_captures(
                                      tuple(captures[train_count + val_count:]), provenance)
             save_layer_capture(capture_dir, bank)
             del bank, captures, cap
-            banks[layer_idx] = load_layer_capture(capture_dir, layer_idx)
         if mlp_args:
             routed = [None] * len(mlp_args)
             if model.config.mlp_layer_types[layer_idx] == "sparse":
@@ -149,10 +148,12 @@ def _stream_hy4_flash_captures(
             for result in routed:
                 states.append(model.mlp_finish(*mlp_args.popleft(), layer, result))
             del routed, result
-        print(json.dumps({"phase": "capture", "completed_layer": layer_idx,
-                          "seconds": time.monotonic() - started}), flush=True)
         del layer
-    return banks
+        reader.close()
+        print(json.dumps({"phase": "capture", "completed_layer": layer_idx,
+                          "seconds": time.monotonic() - started,
+                          "memory_bytes": layer_memory_bytes(reader.device)}), flush=True)
+    return {lid: load_layer_capture(capture_dir, lid) for lid in sorted(target_set)}
 
 
 @torch.no_grad()
@@ -213,6 +214,7 @@ def run_hy4_flash_long_eval(
     active = [(rec, rec.input_ids.to(dev)) for rec in records]
     states = deque(model.initial(tokens, embedding=embedding) for _, tokens in active)
 
+    del embedding
     for layer_idx in range(max_layer + 1):
         layer_start = time.monotonic()
         layer = model.load_layer(layer_idx)
@@ -244,12 +246,12 @@ def run_hy4_flash_long_eval(
                 states.append(model.mlp_finish(*mlp_args.popleft(), layer, result))
             del routed, result
         evaluator.release_layer_cache()
+        del layer, params
         print(
             json.dumps({"phase": phase, "completed_layer": layer_idx, "evaluated": is_target,
-                        "seconds": time.monotonic() - layer_start}),
+                        "seconds": time.monotonic() - layer_start, "memory_bytes": layer_memory_bytes(dev)}),
             flush=True,
         )
-        del layer
 
     result = evaluator.finalize(
         corpus_meta=corpus_meta,
