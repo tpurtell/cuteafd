@@ -108,35 +108,6 @@ def model_card(path, engram, *, k6_drafter_bits, selection, identity, view_bytes
     dataset = identity['dataset']
     agentic = identity['components']['agentic']
     standard = identity['components']['exl3_standard']
-    long_context = identity['components'].get('long_context')
-    total_tokens = agentic['tokens'] + standard['tokens'] + (long_context['tokens'] if long_context else 0)
-    if long_context:
-        panel_prose = (
-            "The second component uses the standard ExLlamaV3 raw-text and random-token packing. "
-            "The third component adds 16K and 32K multi-turn agentic traces (tool calls, tool results, "
-            "and reasoning) plus long-document QA rendered once with Hy4's own chat template, exercising "
-            "DSA selection beyond the top-2,048 cutoff."
-        )
-        cal_order = (
-            f"{agentic['count']:,} agentic prompts ({agentic['tokens']:,} tokens), then "
-            f"{standard['count']:,} standard rows ({standard['tokens']:,} tokens), then "
-            f"{long_context['count']:,} long-context traces ({long_context['tokens']:,} tokens)"
-        )
-        extra_hash_rows = (
-            f"\n| Long-context input ID SHA256 | `{long_context['input_ids_sha256']}` |"
-            if 'input_ids_sha256' in long_context else ""
-        )
-    else:
-        panel_prose = (
-            "The second component uses the standard ExLlamaV3 raw-text and random-token packing. "
-            "The 2,709-token DSA and SWA-wrap witnesses checked reference parity separately. "
-            "Calibration does not exercise DSA selection beyond the top-2,048 cutoff."
-        )
-        cal_order = (
-            f"{agentic['count']:,} agentic prompts ({agentic['tokens']:,} tokens), then "
-            f"{standard['count']:,} standard rows ({standard['tokens']:,} tokens)"
-        )
-        extra_hash_rows = ""
     gib = {view: count / (1 << 30) for view, count in view_bytes.items()}
     text = f"""---
 library_name: cuteafd
@@ -171,7 +142,10 @@ the BF16 Engram tables. The FP8 alternate adds {fp8_gib:.2f} GiB to disk.
 Source `{recipe.BASE_REPO}@{recipe.BASE_REVISION}`. The panel includes
 token-budgeted real source code, worked mathematics, function-call schemas
 and multilingual text. Hy4's own chat template rendered the agentic prompts
-with high reasoning effort. {panel_prose}
+with high reasoning effort. The second component uses the standard ExLlamaV3
+raw-text and random-token packing. The 2,709-token DSA and SWA-wrap witnesses
+checked reference parity separately. Calibration does not exercise DSA selection
+beyond the top-2,048 cutoff.
 
 One causal pass propagated the serialized K8 core and K4 expert reconstructions.
 K6 used the same core Hessians. DFly2 used the target hidden states, KV and
@@ -184,9 +158,9 @@ indexer selections at layers 25, 29, 33, 37 and 41.
 | Search | Seed {identity['seed']}, sigma {identity['sigma']}, checked FP64 Hadamard congruence |
 | Hessian | At most 128 rows per FP32 product, FP64 sum, FP32 storage |
 | Panel | `{dataset['repo_id']}@{dataset['revision']}` |
-| Calibration order | {cal_order} |
-| Total calibration | {total_tokens:,} tokens |
-| Standard input ID SHA256 | `{standard['input_ids_sha256']}` |{extra_hash_rows}
+| Calibration order | {agentic['count']:,} agentic prompts ({agentic['tokens']:,} tokens), then {standard['count']:,} standard rows ({standard['tokens']:,} tokens) |
+| Total calibration | {agentic['tokens'] + standard['tokens']:,} tokens |
+| Standard input ID SHA256 | `{standard['input_ids_sha256']}` |
 | Routed recovery | Keep all natural rows. Below 1,024, fill from ranks 17–32 in rank and corpus order, normalizing hypothetical gamma over 15 native routes plus the candidate. Fill any remaining deficit with raw-XTX identity observations. |
 | Causal combine | Ordered FP32 sum on the GPU over native routes only |
 | Replay | Decode serialized trellis and scales to BF16 and promote to FP32 |

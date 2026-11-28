@@ -22,8 +22,7 @@ from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import panel_corpus as pc
-from hy4 import export as hy4_export
-from hy4_flash import export as hy4_flash_export, prepare_corpus as hy4_flash_corpus
+from hy4_flash import prepare_corpus as hy4_flash_corpus
 
 RAW_TRACES_DIR = Path.home() / ".cache/cuteafd/builds/long-context-bank/raw_traces"
 
@@ -334,28 +333,11 @@ def test_prepared_loader_order_splits_hashes_and_full_check(tmp_path, monkeypatc
     assert len(pc.load_token_records(dir2, "calibration", contract=contract3, dataset=ds2, full=True)) == 2
 
 
-def test_hy4_flash_uses_single_source_and_model_cards_record_three_components(tmp_path):
-    assert hy4_flash_corpus.PANEL_REVISION == pc.default_panel_revision()
-    assert hy4_flash_corpus.DATASET == pc.default_dataset()
+def test_panel_corpus_two_component_read_matches_frozen_hy4_flash_loader():
     base_v2 = _require_snapshot("datasets--wrldsuksgo2mars--agentic-quant-panel-v2", pc.TWO_COMPONENT_REVISION)
-    rows, prov = hy4_flash_corpus.read_v2(base_v2)
-    assert len(rows["calibration"]) == prov["splits"]["calibration"]["summary"]["records"]
-
-    identity3 = dict(
-        codebook="mul1", codebook_multiplier=0x83DCD12D, seed=787, sigma=0.025,
-        code={"fork": "a" * 40}, dataset={"repo_id": pc.PANEL_REPO, "revision": "d" * 40},
-        components=dict(agentic=dict(count=1426, tokens=1_080_000, input_ids_sha256="1" * 64),
-                        exl3_standard=dict(count=250, tokens=512_000, input_ids_sha256="2" * 64),
-                        long_context=dict(count=12, tokens=256_000, input_ids_sha256="3" * 64)),
-    )
-    view_bytes = {"original": 10 << 30, "k8-compact": 9 << 30, "k6-compact": 8 << 30}
-    flash_card = hy4_flash_export.model_card(
-        tmp_path / "flash.md", {"proof": {"layer1": {"mismatch_count": 0, "rows": 100}}},
-        k6_drafter_bits=6, selection={"lm_head": {}}, identity=identity3, view_bytes=view_bytes,
-    ).read_text(encoding="utf-8")
-    assert "1,848,000 tokens" in flash_card and "12 long-context traces (256,000 tokens)" in flash_card and "3" * 64 in flash_card
-
-    full_card = hy4_export.model_card(
-        tmp_path / "full.md", None, k6_drafter_bits=6, selection={"lm_head": {}}, identity=identity3, view_bytes=view_bytes,
-    ).read_text(encoding="utf-8")
-    assert "256,000 tokens (12 traces)" in full_card
+    loaded = pc.read_panel_v2(base_v2)
+    hy4_rows, hy4_prov = hy4_flash_corpus.read_v2(base_v2)
+    assert loaded["dataset"] == hy4_flash_corpus.DATASET
+    assert loaded["agentic_rows"] == hy4_rows
+    assert loaded["agentic_provenance"] == hy4_prov
+    assert loaded["components"] == ("agentic", "exl3_standard")

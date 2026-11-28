@@ -552,7 +552,6 @@ def prepare_panel_corpus(
     panel_revision: str | None = None,
     panel_sha256sums: str | None = None,
     tokenizer: Any = None,
-    long_witness_fn=None,
 ) -> dict[str, Any]:
     """Prepare and attest a 2- or 3-component calibration corpus on disk."""
     import torch
@@ -627,11 +626,6 @@ def prepare_panel_corpus(
                 metadata=dict(schema=schema, split=split), hash_algorithm="sha256")
             manifest["splits"][split] = dict(report, file=path.name, sha256=receipt["sha256"])
 
-        if long_witness_fn is not None:
-            witness = long_witness_fn(tokenizer, chat_kwargs)
-            atomic_json(stage / "long-context-smoke.json", witness)
-            manifest["long_context_smoke"] = dict(file="long-context-smoke.json", tokens=witness["tokens"],
-                                                  sha256=sha256_file(stage / "long-context-smoke.json"), hessian_eligible=False)
         if identity != {name: sha256_file(source / name) for name in assets}:
             raise ValueError("source tokenizer changed during preparation")
         atomic_json(stage / "manifest.json", manifest)
