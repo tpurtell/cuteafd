@@ -151,9 +151,15 @@ def load_pinned_qmla_corpus(
     components: Sequence[str] | None = None,
     full: bool = True,
 ) -> tuple[list[tuple[str, torch.Tensor]], dict[str, Any]]:
-    """Load a prepared ``panel_corpus`` calibration split through ``load_component_records``."""
+    """Load a prepared ``panel_corpus`` calibration split's fitting rows through ``load_component_records``.
+
+    QMLA fits on the base components only (default ``QMLA_BASE_COMPONENTS``); ``full``
+    still requires the prepared corpus itself to be complete.
+    """
     dataset_repo, dataset_revision, component_names = resolve_qmla_panel(
-        panel_revision=panel_revision, components=components, full=full
+        panel_revision=panel_revision,
+        components=QMLA_BASE_COMPONENTS if components is None else components,
+        full=False,
     )
     pin = panel_corpus.panel_pin(dataset_revision)
     rows, prov = panel_corpus.load_component_records(

@@ -253,10 +253,14 @@ def test_panel_resolution_via_panel_corpus_defaults_to_v3_three_components():
 
 
 def test_load_pinned_qmla_corpus_from_real_v3_and_v2_panels(tmp_path: Path):
-    """Fitting loads v3 windowed long_context through panel_corpus.load_component_records; v2 still loads."""
+    """Fitting loads the base components of a full v3 corpus; long_context windows load only on request."""
     prep3 = _prepare_hy4f(tmp_path / "v3", V3)
     manifest = json.loads((prep3 / "manifest.json").read_text())
-    recs, prov = load_pinned_qmla_corpus(prep3)
+    base, base_prov = load_pinned_qmla_corpus(prep3, full=True)
+    assert list(base_prov["components"]) == list(QMLA_BASE_COMPONENTS)
+    assert not any(sid.startswith("lc-") for sid, _ in base)
+    assert len(base) == sum(manifest["components"][c]["count"] for c in QMLA_BASE_COMPONENTS)
+    recs, prov = load_pinned_qmla_corpus(prep3, components=QMLA_KNOWN_COMPONENTS)
     assert (prov["dataset_repo"], prov["dataset_revision"]) == (V3.repo_id, V3.revision)
     assert list(prov["components"]) == list(QMLA_KNOWN_COMPONENTS)
     for comp in QMLA_KNOWN_COMPONENTS:
@@ -274,7 +278,7 @@ def test_load_pinned_qmla_corpus_from_real_v3_and_v2_panels(tmp_path: Path):
     # A full-length (QMLA eval) corpus never loads for fitting.
     full_dir = _prepare_hy4f(tmp_path / "v3-full", V3, long_context_mode="full")
     with pytest.raises(ValueError, match="mode 'full' differs from requested 'windowed'"):
-        load_pinned_qmla_corpus(full_dir)
+        load_pinned_qmla_corpus(full_dir, components=QMLA_KNOWN_COMPONENTS)
 
     # Frozen two-component v2 corpora still load and verify under their own pin.
     prep2 = _prepare_hy4f(tmp_path / "v2", V2)
