@@ -4121,42 +4121,23 @@ impl<'a> Hy4Engine<'a> {
             }
 
             // (c) Dual h0 + h32 partials over each rank's parity-owned local pages.
+            // Runs eagerly (2 kernels) between ContextExchange hops to avoid per-graph entry/exit bubbles.
             for rank in 0..2 {
                 let r = &self.ranks[rank];
                 let q_ptr = assembled_q[rank];
                 let kv_buf = kv_caches[rank];
                 let decode_attn = batch.decode_attention;
-                if batch.graphed {
-                    r.graphs.run(
-                        GraphKey::new(layer, rows, GraphSection::DsaPartial),
-                        &r.stream,
-                        || {
-                            r.device.run(|| {
-                                r.dsa_attn_context_partials(
-                                    rank,
-                                    q_ptr,
-                                    kv_buf,
-                                    wave_slot,
-                                    0,
-                                    c_rows,
-                                    decode_attn,
-                                )
-                            })
-                        },
-                    )?;
-                } else {
-                    r.device.run(|| {
-                        r.dsa_attn_context_partials(
-                            rank,
-                            q_ptr,
-                            kv_buf,
-                            wave_slot,
-                            chunk_start,
-                            c_rows,
-                            decode_attn,
-                        )
-                    })?;
-                }
+                r.device.run(|| {
+                    r.dsa_attn_context_partials(
+                        rank,
+                        q_ptr,
+                        kv_buf,
+                        wave_slot,
+                        chunk_start,
+                        c_rows,
+                        decode_attn,
+                    )
+                })?;
             }
 
             // (d) Partial exchange: push peer's 32-head partial + base-2 LSE, wait for ours.
@@ -4179,33 +4160,19 @@ impl<'a> Hy4Engine<'a> {
             let recv_p = [recv_p0, recv_p1];
             let recv_l = [recv_l0, recv_l1];
 
-            // (e) Combine GPU0-then-GPU1 partials with learnable sink; fuse gate_uv + o_proj when graphed.
+            // (e) Combine GPU0-then-GPU1 partials with learnable sink; stays eager (3 kernels total
+            // with gate_uv + o_proj) between ContextExchange::wait_partial and PeerExchange::push.
             for rank in 0..2 {
                 let r = &self.ranks[rank];
                 let rp = recv_p[rank];
                 let rl = recv_l[rank];
-                if batch.graphed {
-                    r.graphs.run(
-                        GraphKey::new(layer, rows, GraphSection::DsaAttnOut),
-                        &r.stream,
-                        || {
-                            r.device.run(|| {
-                                r.dsa_context_combine(rank, p, rp, rl, 0, rows)?;
-                                r.dsa_context_gate_uv_o(p, layer, rows)
-                            })
-                        },
-                    )?;
-                } else {
-                    r.device
-                        .run(|| r.dsa_context_combine(rank, p, rp, rl, chunk_start, c_rows))?;
-                }
+                r.device
+                    .run(|| r.dsa_context_combine(rank, p, rp, rl, chunk_start, c_rows))?;
             }
         }
 
-        if !batch.graphed {
-            for r in &self.ranks {
-                r.device.run(|| r.dsa_context_gate_uv_o(p, layer, rows))?;
-            }
+        for r in &self.ranks {
+            r.device.run(|| r.dsa_context_gate_uv_o(p, layer, rows))?;
         }
         if full_idx.is_some() {
             self.capture_draft_recall_context_split(layer, batch)?;
@@ -4698,6 +4665,11 @@ impl<'a> Hy4Engine<'a> {
                                 r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale)?;
                             } else if rank == 0 {
                                 r.moe_router(&p, wave_slot, rows, routed_scale)?;
+                            } else {
+                                // TP2 Spark-routed rank 1 does not run the router or Spark send;
+                                // fuse its shared FFN into `SparkRouter` (matching GLM 5.3) so it
+                                // overlaps rank 0's router + Spark RTT in one graph executable.
+                                r.shared_ffn(&p, gpus, wave_slot, rows)?;
                             }
                             if rank == 0 {
                                 r.record_expert_usage_local(
@@ -4746,19 +4718,19 @@ impl<'a> Hy4Engine<'a> {
 
     /// Enqueue the shared FFN after the Spark request has been staged, before landing its reply.
     ///
-    /// On TP1 graphed decode, launches eagerly in the Spark RDMA round-trip shadow (matching GLM 5.3's
-    /// `moe_exchange`) to eliminate a separate per-layer executable while keeping full overlap.
+    /// On graphed decode (both TP1 and TP2), rank 0 launches eagerly in the Spark RDMA round-trip
+    /// shadow (matching GLM 5.3's `moe_exchange`) to eliminate a separate per-layer executable
+    /// while keeping full overlap. On TP2 graphed decode, rank 1 already fused its shared FFN
+    /// into `SparkRouter`, so only rank 0 runs here.
     fn run_spark_shared_ffn(&self, layer: usize, batch: &ActiveBatch) -> Result<()> {
         let p = format!("model.layers.{layer}");
         let rows = batch.rows;
         let gpus = self.ranks.len();
-        for r in &self.ranks {
-            let work = || r.device.run(|| r.shared_ffn(&p, gpus, batch.wave_slot, rows));
-            if batch.graphed && gpus == 2 {
-                r.graphs.run(GraphKey::new(layer, rows, GraphSection::SparkShared), &r.stream, work)?;
-            } else {
-                work()?;
+        for (rank, r) in self.ranks.iter().enumerate() {
+            if batch.graphed && rank == 1 {
+                continue;
             }
+            r.device.run(|| r.shared_ffn(&p, gpus, batch.wave_slot, rows))?;
         }
         Ok(())
     }
@@ -5338,7 +5310,7 @@ impl<'a> Hy4Engine<'a> {
                         .and_then(Option::as_mut)
                         .context("Hy4 send_experts without active unit")?;
                     self.engine.run_moe_frontend(layer, batch, false)?;
-                    if self.engine.ranks.len() == 2 && self.engine.prefill_waves > 1 {
+                    if self.engine.ranks.len() == 2 && !self.single_wave {
                         let exchange = self.engine.peer_exchange()?;
                         exchange.signal(1, DIRECT)?;
                         exchange.wait(0, DIRECT)?;
@@ -5797,7 +5769,7 @@ mod tests {
         let shared = hook.find("run_spark_shared_ffn(layer, batch)").unwrap();
         let prefetch = hook.find("prefetch_l2(layer)").unwrap();
         assert!(router < send && send < shared && shared < prefetch);
-        assert!(prod.contains("GraphSection::SparkShared"));
+        assert!(!prod.contains("GraphSection::SparkShared"));
         assert!(hook.contains("self.kind == ExpertV2SourceKind::Decode && self.single_unit"));
     }
 
@@ -5819,10 +5791,6 @@ mod tests {
         assert!(!tp1_spark.contains("GraphSection::DsaAttnOut"));
         assert!(!tp1_spark.contains("GraphSection::SparkRouter"));
 
-        let shared = prod.split("fn run_spark_shared_ffn(").nth(1).unwrap()
-            .split("fn finish_ffn_combine_and_post(").next().unwrap();
-        assert!(shared.contains("if batch.graphed && gpus == 2"));
-
         let finish = prod.split("fn finish_ffn_combine_and_post(").nth(1).unwrap()
             .split("fn run_layer_local_ffn(").next().unwrap();
         assert!(finish.contains("if batch.can_defer_ffn {\n            batch.prev_ffn_deferred = Some(deferred_ffn);"));
@@ -5835,6 +5803,35 @@ mod tests {
             super::super::graphs::tp1_spark_layer_sections(true, false),
             &[super::GraphSection::DsaSpark]
         );
+    }
+
+    #[test]
+    fn tp2_spark_decode_eliminates_redundant_graph_boundaries_and_single_wave_barrier() {
+        let prod = include_str!("execution.rs").split("#[cfg(test)]").next().unwrap();
+        let frontend = prod.split("fn run_moe_frontend(").nth(1).unwrap()
+            .split("fn run_spark_shared_ffn(").next().unwrap();
+        let graphed_frontend = frontend.split("if batch.graphed {").nth(1).unwrap()
+            .split("return Ok(());").next().unwrap();
+        assert!(graphed_frontend.contains("r.shared_ffn(&p, gpus, wave_slot, rows)?;"),
+            "TP2 graphed SparkRouter must fuse rank-1 shared_ffn");
+
+        let shared = prod.split("fn run_spark_shared_ffn(").nth(1).unwrap()
+            .split("fn finish_ffn_combine_and_post(").next().unwrap();
+        assert!(shared.contains("if batch.graphed && rank == 1"),
+            "TP2 graphed run_spark_shared_ffn must skip rank 1 after SparkRouter fusion");
+        assert!(!shared.contains("r.graphs.run("),
+            "rank-0 shared_ffn must launch eagerly in the Spark RDMA shadow");
+
+        let send = prod.split("fn send_experts(").nth(1).unwrap()
+            .split("fn land_experts(").next().unwrap();
+        assert!(send.contains("if self.engine.ranks.len() == 2 && !self.single_wave"),
+            "single-wave decode must not emit the multi-wave DIRECT PEER_SLOT_ATTN barrier");
+        assert!(!send.contains("self.engine.prefill_waves > 1"));
+
+        let ctx_body = prod.split("fn run_dsa_context_split_body(").nth(1).unwrap()
+            .split("fn capture_draft_recall_context_split(").next().unwrap();
+        assert!(!ctx_body.contains("r.graphs.run("),
+            "short ContextSplit DSA hops stay eager between PeerExchange/ContextExchange boundaries");
     }
 
 }

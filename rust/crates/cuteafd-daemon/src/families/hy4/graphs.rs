@@ -29,18 +29,14 @@ pub(crate) enum Section {
     /// + optional full-indexer `index_post` & `index_topk_decode` + `mla_dsa_decode` + sink/UV + o_proj
     /// + post-attn iHC + router.
     DsaSpark,
-    /// 2-GPU ContextSplit DSA dual partials (h0 + h32 over parity-owned local pages).
-    DsaPartial,
     /// TP1 local DSA post-indexer: `mla_dsa_decode` + sink/UV + o_proj + post-attn + Dense/MoE+EXL3+post-FFN.
     DsaLocalPost,
     /// DSA attention output only (TP2 before peer reduce).
     DsaAttnOut,
     /// Post-attn iHC + Dense/MoE frontend (TP2 local/dense; includes TP2 local EXL3 when onboarded).
     FfnFrontend,
-    /// Spark-routed post-attention and router, before request staging (TP2).
+    /// Spark-routed post-attention + router on rank 0, or post-attention + shared FFN on rank 1 (TP2).
     SparkRouter,
-    /// Shared expert FFN launched after staging, ahead of the landed wait (TP2; TP1 runs eagerly in the RDMA shadow).
-    SparkShared,
     /// Post-FFN combine + iHC post (non-deferred fallback).
     FfnFinish,
     /// Rank-0 final layer post-FFN combine + iHC post + terminal `hc_head`.
@@ -311,12 +307,10 @@ mod tests {
                     Section::DsaFullPre,
                     Section::DsaSharedPre,
                     Section::DsaSpark,
-                    Section::DsaPartial,
                     Section::DsaLocalPost,
                     Section::DsaAttnOut,
                     Section::FfnFrontend,
                     Section::SparkRouter,
-                    Section::SparkShared,
                     Section::FfnFinish,
                     Section::Tail,
                 ] {
