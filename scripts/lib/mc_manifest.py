@@ -159,7 +159,6 @@ def validate_qmla_advisory(qmla, *, strict=False):
             "protection_scope",
             "source",
             "applicable_views",
-            "view_transfer_validation",
             "conventions",
             "quantizer_recipe",
             "geometry",
@@ -199,8 +198,7 @@ def validate_qmla_advisory(qmla, *, strict=False):
     views = qmla["applicable_views"]
     _require(isinstance(views, list) and bool(views) and all(_text(v) for v in views),
              "MC QMLA requires applicable_views")
-    _require(isinstance(qmla["view_transfer_validation"], dict)
-             and isinstance(qmla["conventions"], dict)
+    _require(isinstance(qmla["conventions"], dict)
              and isinstance(qmla["quantizer_recipe"], dict)
              and isinstance(qmla["unsupported_modes_reason"], dict),
              "invalid MC QMLA metadata sections")

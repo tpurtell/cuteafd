@@ -359,7 +359,6 @@ def calibrate_from_banks(
     fit_config: FitConfig = FitConfig(),
     fit_budget: Mapping[str, Mapping[int, str | Sequence[str]]] | None = None,
     applicable_views: Sequence[str] | None = None,
-    transfer_banks: Mapping[str, Mapping[int, CapturedLayerBank]] | None = None,
     device: torch.device | str = "cpu",
     code_commit: str | None = None,
     thinking_mode: str = "high",
@@ -537,34 +536,6 @@ def calibrate_from_banks(
 
     combinations = summarize_modes(layer_measurements)
 
-    view_transfer_validation: dict[str, Any] = {}
-    for view, view_banks in (transfer_banks or {}).items():
-        by_layer = {}
-        for lid in ordered_layers:
-            tbank = view_banks.get(lid)
-            if tbank is None:
-                raise ValueError(f"{view} transfer is missing layer {lid}")
-            tbank.validate()
-            if [s.seq_id for s in tbank.test] != [s.seq_id for s in banks[lid].test]:
-                raise ValueError(f"{view} transfer must replay the calibration test sequences at layer {lid}")
-            c_layer = {w: layers[lid] for w, layers in content_selections.items() if lid in layers}
-            r_layer = {w: layers[lid] for w, layers in rope_selections.items() if lid in layers}
-            by_layer[lid] = measure_shipped(tbank, c_layer, r_layer, modes, fit_config, device)
-        per_mode: dict[str, Any] = {}
-        for lid, rows in by_layer.items():
-            for key, row in rows.items():
-                per_mode.setdefault(key, {"per_layer": {}})["per_layer"][str(lid)] = row
-        for entry in per_mode.values():
-            rows = list(entry["per_layer"].values())
-            tokens = sum(r["tokens"] for r in rows)
-            entry["layer_tokens"] = tokens
-            for field in ("attn_rel_err", "rtn_attn_rel_err", "hadamard_attn_rel_err"):
-                entry[field] = sum(r[field] * r["tokens"] for r in rows) / tokens
-            entry["ratio_to_rtn"] = (
-                entry["attn_rel_err"] / entry["rtn_attn_rel_err"] if entry["rtn_attn_rel_err"] else None
-            )
-        view_transfer_validation[view] = {"split": "test", "reference": f"{view} 0:0", "combinations": per_mode}
-
     fit_budget_json = {
         path: {str(b): list(active_budget[path][b]) for b in widths}
         for path, widths in (("content", c_bits_list), ("rope", r_bits_list if has_any_rope else ()))
@@ -602,7 +573,9 @@ def calibrate_from_banks(
     }
 
     resolved_views = (
-        list(applicable_views) if applicable_views is not None else [source["calibrated_view"], *view_transfer_validation]
+        list(applicable_views)
+        if applicable_views is not None
+        else (["all"] if source.get("checkpoint_kind") == "mc" else [source["calibrated_view"]])
     )
     candidate_table_doc = {
         "schema": CANDIDATE_TABLE_SCHEMA,
@@ -627,7 +600,6 @@ def calibrate_from_banks(
         selection_meta=selection_meta,
         provenance=provenance,
         applicable_views=resolved_views,
-        view_transfer_validation=view_transfer_validation,
         artifact_status="calibrated_unqualified",
         protection_policy=fit_config.protection,
     )
@@ -672,7 +644,6 @@ def calibrate_from_banks(
         "combinations": combinations,
         "selection_by_layer": selection_by_layer,
         "v2_shared_selection_by_layer": v2_selection_by_layer,
-        "view_transfer_validation": view_transfer_validation,
         "fit_by_layer": layer_fit_details,
         "sidecar_bytes": manifest["tensors_bytes"],
         "fit_measure_validate_seconds": time.monotonic() - started,
@@ -828,7 +799,7 @@ def reselect_from_persisted_candidates(
         rope_selections=rope_selections if rope_selections else None,
         selection_meta=selection_meta,
         provenance=provenance,
-        applicable_views=(source["calibrated_view"],),
+        applicable_views=table.get("applicable_views"),
         artifact_status="calibrated_unqualified",
         protection_policy=policy,
     )
@@ -1033,16 +1004,41 @@ def attach_long_context_eval(
     *,
     manifest: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Attach ``long_context_eval`` into ``<output>/qmla-validation-report.json`` atomically."""
+    """Attach ``long_context_eval`` into ``<output>/qmla-validation-report.json`` and rebuild the combined short+long headline table."""
     output_dir = Path(output_dir).resolve()
     report_path = output_dir / "qmla-validation-report.json"
     if report_path.is_file():
-        report = json.loads(report_path.read_text(encoding="utf-8"))
+        existing = json.loads(report_path.read_text(encoding="utf-8"))
+        if "combinations" in existing:
+            profiles = manifest["profiles"] if manifest is not None else existing.get("shipped_profiles")
+            reasons = manifest["unsupported_modes_reason"] if manifest is not None else None
+            combined_headline = build_headline_table(
+                existing["combinations"],
+                profiles,
+                long_combinations=long_eval_section.get("combinations"),
+                unsupported_reasons=reasons,
+            )
+            combined_md = format_headline_table(combined_headline)
+        else:
+            combined_headline = long_eval_section.get("headline_table")
+            combined_md = long_eval_section.get("headline_table_markdown")
+        report: dict[str, Any] = {
+            "schema": existing.get("schema", VALIDATION_REPORT_SCHEMA),
+            "headline_modes": list(HEADLINE_DEPLOYMENT_MODES),
+            "headline_table": combined_headline,
+            "headline_table_markdown": combined_md,
+        }
+        for k, v in existing.items():
+            if k not in report:
+                report[k] = v
     else:
         if manifest is None:
             raise ValueError("manifest is required when creating a new qmla-validation-report.json")
         report = {
             "schema": VALIDATION_REPORT_SCHEMA,
+            "headline_modes": list(HEADLINE_DEPLOYMENT_MODES),
+            "headline_table": long_eval_section.get("headline_table"),
+            "headline_table_markdown": long_eval_section.get("headline_table_markdown"),
             "artifact_status": manifest["artifact_status"],
             "protection_policy": manifest["protection_policy"],
             "protection_scope": manifest["protection_scope"],

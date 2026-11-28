@@ -194,6 +194,9 @@ class Model:
         expanded = layer.project(p + "kv_b_proj", kv, project)
         k, v = expanded.reshape(len(expanded), h, nope + vdim).split([nope, vdim], dim=-1)
         keys = torch.cat((k, kr.unsqueeze(1).expand(-1, h, -1)), dim=-1)
+        if not torch.is_grad_enabled():
+            v = v.contiguous()
+            del expanded, k
         return q, keys, v, kr, w[p + "learnable_sink_param"]
 
     def attention_output_inputs(self, inputs, first, layer, project=native_projection,
@@ -214,9 +217,11 @@ class Model:
             stop = min(start + rows, len(inputs))
             first_key = max(0, start + 1 - c.sliding_window) if kind == reference.SLIDING else 0
             width = start + rows - first_key
-            query = F.pad(q[start:stop], (0, 0, 0, 0, 0, rows - (stop - start)))
-            keys = F.pad(k[first_key:stop], (0, 0, 0, 0, 0, width - (stop - first_key)))
-            values = F.pad(v[first_key:stop], (0, 0, 0, 0, 0, width - (stop - first_key)))
+            q_pad = rows - (stop - start)
+            kv_pad = width - (stop - first_key)
+            query = F.pad(q[start:stop], (0, 0, 0, 0, 0, q_pad)) if q_pad else q[start:stop]
+            keys = F.pad(k[first_key:stop], (0, 0, 0, 0, 0, kv_pad)) if kv_pad else k[first_key:stop]
+            values = F.pad(v[first_key:stop], (0, 0, 0, 0, 0, kv_pad)) if kv_pad else v[first_key:stop]
             key_id = torch.arange(first_key, start + rows, device=inputs.device)
             query_id = torch.arange(start, start + rows, device=inputs.device)
             distance = query_id[:, None] - key_id
@@ -285,14 +290,19 @@ class Model:
         down = layer.weights[reference.EXPERTS[1]][index].to(latent.device, dtype=latent.dtype)
         return (*fused.chunk(2, dim=0), down)
 
-    def expert(self, index, latent, layer, project=native_projection):
-        gate, up, down = self.routed_expert_weights(index, latent, layer)
+    def expert_with_weights(self, index, latent, layer, weights, project=native_projection):
+        gate_w, up_w, down_w = weights
         prefix = layer.prefix + f"mlp.experts.{index}."
-        gate = project(prefix + "gate_proj", latent, gate)
-        up = project(prefix + "up_proj", latent, up)
+        gate = project(prefix + "gate_proj", latent, gate_w)
+        up = project(prefix + "up_proj", latent, up_w)
         limit = self.config.swiglu_limit
         activated = F.silu(gate.clamp_max(limit)) * up.clamp(-limit, limit)
-        return project(prefix + "down_proj", activated, down)
+        return project(prefix + "down_proj", activated, down_w)
+
+    def expert(self, index, latent, layer, project=native_projection):
+        return self.expert_with_weights(
+            index, latent, layer, self.routed_expert_weights(index, latent, layer), project=project
+        )
 
     @staticmethod
     def expert_rows(ids, gamma, expert):

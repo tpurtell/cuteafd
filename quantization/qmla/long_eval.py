@@ -32,6 +32,96 @@ DEFAULT_POSITION_BUCKETS: tuple[tuple[str, int, int | None], ...] = (
 )
 
 
+def _proc_meminfo_bytes() -> dict[str, int]:
+    out: dict[str, int] = {}
+    path = Path("/proc/meminfo")
+    if not path.is_file():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        label, _, value = line.partition(":")
+        if label in ("MemTotal", "MemAvailable"):
+            parts = value.split()
+            if parts and parts[0].isdigit():
+                out[label] = int(parts[0]) * 1024
+    return out
+
+
+def available_device_memory_bytes(device: torch.device | str) -> int | None:
+    """Usable memory for sizing bounded long-eval groups (MemAvailable on GB10/CPU, CUDA free on discrete GPUs)."""
+    dev = torch.device(device)
+    meminfo = _proc_meminfo_bytes()
+    if dev.type != "cuda":
+        return meminfo.get("MemAvailable")
+    if not torch.cuda.is_available():
+        return meminfo.get("MemAvailable")
+    try:
+        props = torch.cuda.get_device_properties(dev)
+        mem_total = meminfo.get("MemTotal", 0)
+        is_unified = bool(
+            getattr(props, "is_integrated", False)
+            or (props.major == 12 and props.minor == 1)
+            or (mem_total > 0 and props.total_memory >= int(0.85 * mem_total))
+        )
+        if is_unified:
+            return meminfo.get("MemAvailable")
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(dev)
+        return int(free_bytes)
+    except Exception:
+        return None
+
+
+def group_long_context_records(
+    records: Sequence["LongContextRecord"],
+    *,
+    device: torch.device | str,
+    bytes_per_token: int,
+    reserve_bytes: int,
+    safety_fraction: float = 0.20,
+    available_bytes: int | None = None,
+    max_group_tokens: int | None = None,
+    max_group_records: int | None = None,
+) -> list[list["LongContextRecord"]]:
+    """Partition long-context records into memory-bounded groups preserving record order.
+
+    Sizes the group token budget from ``available_device_memory_bytes(device)`` (CUDA free
+    memory on discrete GPUs; ``MemAvailable`` on unified-memory GB10/CPU). Defaults to ONE
+    record per group whenever available memory cannot be determined or falls below reserve.
+    """
+    if not records:
+        return []
+    if max_group_records is not None and max_group_records <= 1:
+        return [[rec] for rec in records]
+
+    token_budget = max_group_tokens
+    if token_budget is None:
+        avail = available_device_memory_bytes(device) if available_bytes is None else available_bytes
+        if avail is None or bytes_per_token <= 0 or safety_fraction <= 0.0:
+            return [[rec] for rec in records]
+        usable = int((avail - reserve_bytes) * safety_fraction)
+        if usable <= 0:
+            return [[rec] for rec in records]
+        token_budget = usable // bytes_per_token
+        if token_budget <= 0:
+            return [[rec] for rec in records]
+
+    groups: list[list[LongContextRecord]] = []
+    cur: list[LongContextRecord] = []
+    cur_tokens = 0
+    for rec in records:
+        n = int(rec.input_ids.numel())
+        exceeds_tokens = bool(cur) and token_budget > 0 and (cur_tokens + n > token_budget)
+        exceeds_count = bool(cur) and max_group_records is not None and (len(cur) >= max_group_records)
+        if exceeds_tokens or exceeds_count:
+            groups.append(cur)
+            cur = []
+            cur_tokens = 0
+        cur.append(rec)
+        cur_tokens += n
+    if cur:
+        groups.append(cur)
+    return groups
+
+
 def _panel_corpus():
     quant_root = str(Path(__file__).resolve().parents[1])
     if quant_root not in sys.path:
@@ -239,6 +329,11 @@ class LongContextEvaluator:
                     for tgt in (lb.setdefault(bname, _BucketAcc()), lb.setdefault("__all__", _BucketAcc()),
                                 sb.setdefault(bname, _BucketAcc()), sb.setdefault("__all__", _BucketAcc())):
                         tgt.add(*vals)
+            del s_err, r_err, h_err
+        seq_len = seq_dev.seq_len
+        del seq_dev, bmasks
+        if dev.type == "cuda" and seq_len >= 4096:
+            torch.cuda.empty_cache()
 
     def finalize(self, *, corpus_meta: Mapping[str, Any], transform_fingerprint: str,
                  wall_seconds: float, device: torch.device | str) -> dict[str, Any]:

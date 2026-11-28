@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+import gc
 import hashlib
 import json
 from pathlib import Path
@@ -45,7 +46,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from qmla.capture import CapturedLayerBank, SPLIT_NAMES, layer_memory_bytes, load_layer_capture, save_layer_capture, split_train_val_test
 from qmla.fit import FitConfig
-from qmla.long_eval import LongContextEvaluator, LongContextRecord, load_long_context_records, panel_snapshot_dir
+from qmla.long_eval import (
+    LongContextEvaluator,
+    LongContextRecord,
+    group_long_context_records,
+    load_long_context_records,
+    panel_snapshot_dir,
+)
 from qmla.quantizer import parse_qmla_mode
 from qmla.sidecar import load_sidecar_transforms
 
@@ -59,6 +66,12 @@ DEFAULT_PILOT_LAYERS = (0, 21, 41)
 DEFAULT_FULL_MODES = ("8:8", "4:8", "4:4", "2:4", "8:0", "4:0", "2:0", "0:8", "0:4")
 # The pilot is for understanding: it fits every width and measures every combination.
 DEFAULT_PILOT_MODES = DEFAULT_FULL_MODES
+HY4_LONG_EVAL_RESERVE_BYTES = 32 * 1024**3
+
+
+def _hy4_long_eval_bytes_per_token(config: Any) -> int:
+    # Account for FP32 HC state ([T, hc_mult, hidden]) + MLP input + routed expert intermediates.
+    return int(4 * config.hc_mult * config.hidden_size * 4)
 
 
 from qmla.pipeline import (
@@ -82,13 +95,18 @@ def resolve_run_settings(args, eligible_layers):
 
 
 def _routed_forward(model, layer, inputs):
-    """Read each expert once for all sequences; keep the reference's expert-ID sum order."""
-    latent, ids, gamma = model.moe_route(torch.cat(inputs), layer)
-    routed = torch.zeros_like(latent)
-    for expert in ids.unique(sorted=True).tolist():
-        rows, weights = model.expert_rows(ids, gamma, expert)
-        routed[rows] += model.expert(expert, latent[rows], layer) * weights[:, None]
-    return routed.split([len(x) for x in inputs])
+    """Read each expert once for all sequences in the group while preserving per-sequence arithmetic."""
+    per_seq = [model.moe_route(x, layer) for x in inputs]
+    routed = [torch.zeros_like(latent) for latent, _, _ in per_seq]
+    active_experts = sorted({int(e) for _, ids, _ in per_seq for e in ids.unique().tolist()})
+    for expert in active_experts:
+        weights = model.routed_expert_weights(expert, per_seq[0][0], layer)
+        for idx, (latent, ids, gamma) in enumerate(per_seq):
+            rows, w = model.expert_rows(ids, gamma, expert)
+            if rows.numel():
+                routed[idx][rows] += model.expert_with_weights(expert, latent[rows], layer, weights) * w[:, None]
+        del weights
+    return routed
 
 
 @torch.no_grad()
@@ -153,6 +171,8 @@ def _stream_hy4_flash_captures(
             del routed, result
         del layer
         reader.close()
+        if reader.device.type == "cuda":
+            torch.cuda.empty_cache()
         print(json.dumps({"phase": "capture", "completed_layer": layer_idx,
                           "seconds": time.monotonic() - started,
                           "memory_bytes": layer_memory_bytes(reader.device)}), flush=True)
@@ -172,12 +192,15 @@ def run_hy4_flash_long_eval(
     expected_source: Mapping[str, Any] | None = None,
     embedding: torch.Tensor | None = None,
     phase: str = "long_eval",
+    max_group_tokens: int | None = None,
+    max_group_records: int | None = None,
 ) -> dict[str, Any]:
     """Forward-only streaming long-context (16K/32K) evaluation against a shipped QMLA sidecar.
 
-    Streams one layer at a time matching ``_stream_hy4_flash_captures``, capturing compact DSA
-    group IDs (never ``[T, T]`` bool masks), evaluating shipped / RTN / Hadamard per sequence
-    at each target layer, and freeing every capture immediately after scoring.
+    Evaluates records in memory-bounded groups (sized from CUDA free memory on discrete GPUs
+    or MemAvailable on unified-memory GB10; defaults to 1 record per group when unsure),
+    advancing each group through all target layers, freeing device state and CUDA cache
+    between groups, and producing results identical to all-at-once evaluation.
     """
     if not records:
         raise ValueError("run_hy4_flash_long_eval requires at least one LongContextRecord")
@@ -216,49 +239,71 @@ def run_hy4_flash_long_eval(
 
     max_layer = max(target_layers)
     target_set = set(target_layers)
-    if embedding is None:
-        embedding = model.reader.raw(hy4_forward.reference.OUTER_NAMES[0])
-    active = [(rec, rec.input_ids.to(dev)) for rec in records]
-    states = deque(model.initial(tokens, embedding=embedding) for _, tokens in active)
+    groups = group_long_context_records(
+        records,
+        device=dev,
+        bytes_per_token=_hy4_long_eval_bytes_per_token(model.config),
+        reserve_bytes=HY4_LONG_EVAL_RESERVE_BYTES,
+        max_group_tokens=max_group_tokens,
+        max_group_records=max_group_records,
+    )
 
-    del embedding
-    for layer_idx in range(max_layer + 1):
-        layer_start = time.monotonic()
-        layer = model.load_layer(layer_idx)
-        is_target = layer_idx in target_set
-        params = adapter.layer_params(layer) if is_target else None
-        geom = adapter.geometry_for(layer_idx) if is_target else None
-        # Replace each HC state as it advances. The full long-context panel carries
-        # about 15 GiB of HC state per generation on Hy4-flash.
-        mlp_args = deque()
-        for rec, tokens in active:
-            residual, attention_post, attn_in = model.attention_start(states.popleft(), tokens, layer)
-            if is_target:
-                assert params is not None and geom is not None
-                cap, attn_out, _ = adapter.capture_sequence(
-                    attn_in, layer, seq_id=rec.seq_id, compact_mask=True, capture_device=dev,
-                )
-                evaluator.evaluate_layer_sequence(cap, params, geom, split=rec.split, device=dev)
-                del cap
-            else:
-                attn_out, _ = model.attention(attn_in, layer)
-            if layer_idx < max_layer:
-                mlp_args.append(model.mlp_start(residual, attention_post, attn_out, layer))
-            del residual, attention_post, attn_in, attn_out
-        if mlp_args:
-            routed = [None] * len(mlp_args)
-            if model.config.mlp_layer_types[layer_idx] == "sparse":
-                routed = _routed_forward(model, layer, [args[2] for args in mlp_args])
-            for result in routed:
-                states.append(model.mlp_finish(*mlp_args.popleft(), layer, result))
-            del routed, result
-        evaluator.release_layer_cache()
-        del layer, params
-        print(
-            json.dumps({"phase": phase, "completed_layer": layer_idx, "evaluated": is_target,
-                        "seconds": time.monotonic() - layer_start, "memory_bytes": layer_memory_bytes(dev)}),
-            flush=True,
-        )
+    for group_idx, group_records in enumerate(groups):
+        batch_emb = model.reader.raw(hy4_forward.reference.OUTER_NAMES[0]) if embedding is None else embedding
+        active = [(rec, rec.input_ids.to(dev)) for rec in group_records]
+        states = deque(model.initial(tokens, embedding=batch_emb) for _, tokens in active)
+        del batch_emb
+        if hasattr(model.reader, "close"):
+            model.reader.close()
+
+        for layer_idx in range(max_layer + 1):
+            layer_start = time.monotonic()
+            layer = model.load_layer(layer_idx)
+            is_target = layer_idx in target_set
+            params = adapter.layer_params(layer) if is_target else None
+            geom = adapter.geometry_for(layer_idx) if is_target else None
+            mlp_args = deque()
+            for rec, tokens in active:
+                residual, attention_post, attn_in = model.attention_start(states.popleft(), tokens, layer)
+                if is_target:
+                    assert params is not None and geom is not None
+                    cap, attn_out, _ = adapter.capture_sequence(
+                        attn_in, layer, seq_id=rec.seq_id, compact_mask=True, capture_device=dev,
+                    )
+                    if layer_idx < max_layer:
+                        mlp_args.append(model.mlp_start(residual, attention_post, attn_out, layer))
+                    # Free attention-block inputs/residuals before running the 3x-mode evaluation sweep.
+                    del residual, attention_post, attn_in, attn_out
+                    evaluator.evaluate_layer_sequence(cap, params, geom, split=rec.split, device=dev)
+                    del cap
+                else:
+                    attn_out, _ = model.attention(attn_in, layer)
+                    if layer_idx < max_layer:
+                        mlp_args.append(model.mlp_start(residual, attention_post, attn_out, layer))
+                    del residual, attention_post, attn_in, attn_out
+            if mlp_args:
+                routed = [None] * len(mlp_args)
+                if model.config.mlp_layer_types[layer_idx] == "sparse":
+                    routed = _routed_forward(model, layer, [args[2] for args in mlp_args])
+                for result in routed:
+                    states.append(model.mlp_finish(*mlp_args.popleft(), layer, result))
+                del routed, result
+            evaluator.release_layer_cache()
+            del layer, params, mlp_args
+            if hasattr(model.reader, "close"):
+                model.reader.close()
+            if dev.type == "cuda":
+                torch.cuda.empty_cache()
+            print(
+                json.dumps({"phase": phase, "group": group_idx + 1, "groups": len(groups),
+                            "completed_layer": layer_idx, "evaluated": is_target,
+                            "seconds": time.monotonic() - layer_start, "memory_bytes": layer_memory_bytes(dev)}),
+                flush=True,
+            )
+        del states, active
+        gc.collect()
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
 
     result = evaluator.finalize(
         corpus_meta=corpus_meta,
@@ -415,8 +460,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         renderer_template_sha256=template_sha,
         code_commit=code_commit,
     )
+    final_report = result["report"]
     if args.long_eval:
         del banks
+        gc.collect()
+        if torch.device(args.device).type == "cuda":
+            torch.cuda.empty_cache()
         long_records, long_corpus_meta = load_long_eval_records(checkpoint, resolved["panel_revision"])
         long_eval = run_hy4_flash_long_eval(
             adapter,
@@ -428,10 +477,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             modes=resolved["modes"],
             expected_source={"repo": source["repo"], "revision": source["revision"], "family": "hy4_flash"},
         )
-        attach_long_context_eval(args.output, long_eval, manifest=result["manifest"])
+        final_report = attach_long_context_eval(args.output, long_eval, manifest=result["manifest"])
     print(
         json.dumps({
-            "headline_table": result["report"]["headline_table"],
+            "headline_table": final_report["headline_table"],
+            "headline_table_markdown": final_report["headline_table_markdown"],
             "status": result["validation"]["status"],
             "artifact_status": result["manifest"]["artifact_status"],
             "protection_policy": result["manifest"]["protection_policy"],

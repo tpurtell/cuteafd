@@ -519,7 +519,6 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
         modes=modes,
         corpus_provenance=_synthetic_panel_provenance(),
         fit_config=FitConfig(steps=6, val_every=3, seed=0, protection="sink4_local128", sink_tokens=2, recent_tokens=6),
-        transfer_banks={"k8-compact": {0: bank0, 5: bank5}},
     )
     sidecar_dir = Path(result["sidecar_dir"])
     assert (sidecar_dir / "mla_calibration.safetensors").is_file()
@@ -531,7 +530,7 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
     assert manifest["profiles"]["content"]["validation"]["equivalence_metric"] == "expanded_kv_rel_l2"
     assert result["validation"]["content_identity_verified_layers"] == [0, 5]
     assert result["validation"]["max_content_native_output_rel_err"] >= 0
-    assert manifest["applicable_views"] == ["original", "k8-compact"]
+    assert manifest["applicable_views"] == ["all"]
     report = result["report"]
     assert report["sidecar_bytes"] == (sidecar_dir / "mla_calibration.safetensors").stat().st_size
     assert report["measurement_split"] == "test" and report["selection_split"] == "val"
@@ -573,9 +572,6 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
             n_rope = 4 if rb else 1     # identity + 1 width x (fitted, scale_fitted, smoothquant)
             assert len(row["cells"]) == n_content * n_rope
         assert set(metrics["cross_table"]) == set(next(iter(layer_rows.values()))["cells"])
-        transfer = report["view_transfer_validation"]["k8-compact"]["combinations"][mode]
-        assert transfer["attn_rel_err"] == pytest.approx(metrics["attn_rel_err"])
-        assert transfer["rtn_attn_rel_err"] == pytest.approx(metrics["rtn_attn_rel_err"])
 
     # Reported numbers are test-only: none of the calibration test tokens fed selection.
     test_ids = {s.seq_id for bank in [bank0, bank5] for s in bank.test}

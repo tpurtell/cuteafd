@@ -757,9 +757,15 @@ def eval_attention_output(
             kp = rope_key_fn(kp)
         query = torch.cat((query, qp), dim=-1)
         keys = torch.cat((keys, kp[:, None, :].expand(-1, h, -1)), dim=-1)
+        if not torch.is_grad_enabled():
+            values = values.contiguous()
+            del expanded
         if exact_keys is not None:
             exact_kp = exact_rope_key_fn(seq.k_rope.float()) if exact_rope_key_fn is not None else kp
             exact_keys = torch.cat((exact_keys, exact_kp[:, None, :].expand(-1, h, -1)), dim=-1)
+            if not torch.is_grad_enabled() and exact_values is not None:
+                exact_values = exact_values.contiguous()
+                del exact_kv
 
     tile_mask = None
     if seq.allowed_mask is not None:
@@ -779,7 +785,9 @@ def eval_attention_output(
         tile_mask=tile_mask,
         exact_keys=exact_keys, exact_values=exact_values, sink_tokens=sink_tokens, recent_tokens=recent_tokens,
     )
+    del query, keys, values, exact_keys, exact_values
     out = linear(attended, params.o_proj_weight.float())
+    del attended
     if params.post_proj_norm_weight is not None:
         out = rms_norm(out, params.post_proj_norm_weight.float(), geometry.rms_norm_eps)
     return out

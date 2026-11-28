@@ -38,9 +38,8 @@ def verify_release(args):
             or report["validation"]["tensors_sha256"] != manifest["tensors_sha256"]
             or report["long_context_eval"]["transform_fingerprint"] != manifest["transform_fingerprint"]
             or report["long_context_eval"]["layers_evaluated"] != layers
-            or set(report["long_context_eval"]["combinations"]) != set(MODES)
-            or manifest["view_transfer_validation"]["k8-compact"]["transform_fingerprint"] != manifest["transform_fingerprint"]):
-        raise ValueError("full validated sidecar, matching long evaluation and actual K8 transfer are required")
+            or set(report["long_context_eval"]["combinations"]) != set(MODES)):
+        raise ValueError("full validated cuteafd-qmla-v3 sidecar and matching long evaluation are required")
 
 
 def main(argv=None):

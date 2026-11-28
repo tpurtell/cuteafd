@@ -195,20 +195,7 @@ Every quantized path uses **per-token asymmetric affine quantization** with grou
     "checkpoint_kind": "mc",
     "calibrated_view": "original"
   },
-  "applicable_views": ["original", "k8-compact"],
-  "view_transfer_validation": {
-    "k8-compact": {
-      "view": "k8-compact",
-      "split": "test",
-      "reference": "k8-compact 0:0",
-      "source_revision": "<40-hex-commit-sha>",
-      "transform_fingerprint": "<64-hex-sha256>",
-      "test_digest": "<64-hex-sha256>",
-      "combinations": {
-        "4:4": {"attn_rel_err": 0.0012, "rtn_attn_rel_err": 0.0020, "hadamard_attn_rel_err": 0.0019, "ratio_to_rtn": 0.60, "layer_tokens": 163625}
-      }
-    }
-  },
+  "applicable_views": ["all"],
   "conventions": {
     "vector_layout": "row",
     "content_basis_space": "post_norm",
@@ -411,6 +398,7 @@ Every quantized path uses **per-token asymmetric affine quantization** with grou
 
 ### Field Reference & Digests
 - `artifact_status`: `"calibrated_unqualified"` after offline calibration; promoted to `"runtime_qualified"` only after end-to-end runtime fidelity, long-context, and speed gates pass.
+- `applicable_views`: Calibrations are fitted and validated on the MC `original` view and apply to every core view of that checkpoint (`["all"]` on MC checkpoints; `["original"]` on plain checkpoints).
 - `source_candidate` / `source_bits`: training-width provenance for the selected transform (`"identity"` with `source_bits: null`, `"fitted:c4"` with `source_bits: 4`, `"scale_fitted:r8"` with `source_bits: 8`, `"smoothquant:c4"` with `source_bits: 4`, etc.). Note that a `fitted:c8` whose tensors fall within `1e-6` of identity still has `kind: "identity"` and `tensors: {}`.
 - `tensors_payload_sha256`: SHA-256 of the raw tensor payload section of `mla_calibration.safetensors` (bytes starting immediately after the 8-byte header length + safetensors header).
 - `width_fingerprint`: SHA-256 of canonical JSON (`sort_keys=True, separators=(",", ":")`) over `{schema, path, bits, protection_calibrated, layers, per_layer: {lid: {kind, tensors, source_candidate, source_bits}}, tensors: {name: sha256(raw_f32_bytes)}}`.
@@ -450,20 +438,20 @@ A loader or validator consuming `mla_calibration.safetensors` MUST verify all of
 
 ## 9. HF Model Card Note Template
 
-When publishing a checkpoint revision that includes `mla_calibration.safetensors`, include the following section in the repository's `README.md`, replacing `<PINNED_COMMIT_SHA>` with the commit on `tpurtell/cuteafd` carrying this specification and populating the headline table directly from `qmla-validation-report.json["headline_table_markdown"]` (on pure-NoPE models such as GLM Flash, keep `2:4`, `8:8`, and `4:8` explicitly listed as `n/a` with the structural `qk_rope_dim=0` reason, with `4:0` and `8:0` as the measured headline rows):
+When publishing a checkpoint revision that includes `mla_calibration.safetensors`, include the following section in the repository's `README.md`, replacing `<PINNED_COMMIT_SHA>` with the commit on `tpurtell/cuteafd` carrying this specification and populating the combined short-vs-long headline table directly from `qmla-validation-report.json["headline_table_markdown"]` (on pure-NoPE models such as GLM Flash, keep `2:4`, `8:8`, and `4:8` explicitly listed as `n/a` with the structural `qk_rope_dim=0` reason, with `4:0` and `8:0` as the measured headline rows):
 
 ```markdown
 ### Calibrated MLA KV Cache (`mla_calibration.safetensors`)
 
-This checkpoint includes an optional `cuteafd-qmla-v3` calibration sidecar (`mla_calibration.safetensors`, never indexed in `model*.safetensors.index.json`; mirrored in `cuteafd-mc.json["qmla"]` on MC checkpoints) providing per-width, per-layer MLA cache-compression transforms (`identity`, `scale_only`, or `full`) for low-bit KV serving without modifying any model weight shard. Loaders that do not enable QMLA ignore the file and run standard `0:0` attention unchanged. See the self-contained tensor and math specification at [`docs/quantization/qmla-format.md`](https://github.com/tpurtell/cuteafd/blob/<PINNED_COMMIT_SHA>/docs/quantization/qmla-format.md).
+This checkpoint includes an optional `cuteafd-qmla-v3` calibration sidecar (`mla_calibration.safetensors`, never indexed in `model*.safetensors.index.json`; mirrored in `cuteafd-mc.json["qmla"]` on MC checkpoints) providing per-width, per-layer MLA cache-compression transforms (`identity`, `scale_only`, or `full`) fitted on the `original` view and applicable to every core view of this checkpoint without modifying any model weight shard. Loaders that do not enable QMLA ignore the file and run standard `0:0` attention unchanged. See the self-contained tensor and math specification at [`docs/quantization/qmla-format.md`](https://github.com/tpurtell/cuteafd/blob/<PINNED_COMMIT_SHA>/docs/quantization/qmla-format.md).
 
-| Mode (C:R) | Identity (RTN) | Shipped (v3) | Ratio | Reduction | Per-layer spread (median / best / worst) |
-|---|---:|---:|---:|---:|---|
-| `4:0` | `<rtn>` | `<v3>` | `<ratio>x` | `<pct>%` | `<med> / L<best> / L<worst>` |
-| `2:4` | `<rtn or n/a>` | `<v3 or n/a>` | `<ratio or n/a>` | `<pct or n/a>` | `<spread or n/a (reason)>` |
-| `8:0` | `<rtn>` | `<v3>` | `<ratio>x` | `<pct>%` | `<med> / L<best> / L<worst>` |
-| `8:8` | `<rtn or n/a>` | `<v3 or n/a>` | `<ratio or n/a>` | `<pct or n/a>` | `<spread or n/a (reason)>` |
-| `4:8` | `<rtn or n/a>` | `<v3 or n/a>` | `<ratio or n/a>` | `<pct or n/a>` | `<spread or n/a (reason)>` |
+| Mode (C:R) | Short Identity | Short Shipped | Short Impr. | Long Identity | Long Shipped | Long Impr. | Long/Short Impr. | Short Spread (med / best / worst) |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `4:0` | `<s_rtn>` | `<s_v3>` | `<s_pct>%` | `<l_rtn>` | `<l_v3>` | `<l_pct>%` | `<l/s>x` | `<med> / L<best> / L<worst>` |
+| `2:4` | `<s_rtn or n/a>` | `<s_v3 or n/a>` | `<s_pct or n/a>` | `<l_rtn or n/a>` | `<l_v3 or n/a>` | `<l_pct or n/a>` | `<l/s or n/a>` | `<spread or n/a (reason)>` |
+| `8:0` | `<s_rtn>` | `<s_v3>` | `<s_pct>%` | `<l_rtn>` | `<l_v3>` | `<l_pct>%` | `<l/s>x` | `<med> / L<best> / L<worst>` |
+| `8:8` | `<s_rtn or n/a>` | `<s_v3 or n/a>` | `<s_pct or n/a>` | `<l_rtn or n/a>` | `<l_v3 or n/a>` | `<l_pct or n/a>` | `<l/s or n/a>` | `<spread or n/a (reason)>` |
+| `4:8` | `<s_rtn or n/a>` | `<s_v3 or n/a>` | `<s_pct or n/a>` | `<l_rtn or n/a>` | `<l_v3 or n/a>` | `<l_pct or n/a>` | `<l/s or n/a>` | `<spread or n/a (reason)>` |
 
-*Joint end-to-end post-`o_proj` attention error on held-out test, combining each layer's selected content transform at the content width with its selected RoPE transform at the RoPE width (never per-path numbers added together). `:0` means RoPE is kept unquantized (native format).*
+*Joint end-to-end post-`o_proj` attention error combining each layer's selected content transform at the content width with its selected RoPE transform at the RoPE width (never per-path numbers added together). Short = held-out test split; Long = full-length long-eval (overall); Long/Short = ratio of long improvement % to short improvement %. `:0` means RoPE is kept unquantized (native format).*
 ```

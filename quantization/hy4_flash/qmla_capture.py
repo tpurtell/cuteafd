@@ -181,13 +181,20 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
         cos, sin = _rope_phase(positions, rope, base, section)
         q_full = layer.project(p + "q_b_proj", q_norm, project).reshape(seq_len, h, nope + rope)
         q_nope, q_rope_raw = q_full.split([nope, rope], dim=-1)
+        q_nope = q_nope.contiguous()
         q_rope = self.model.rotate(q_rope_raw, cos, sin)
+        del q_full, q_rope_raw
         q_rot = torch.cat((q_nope, q_rope), dim=-1)
         kr_rot = self.model.rotate(kr_raw.unsqueeze(1), cos, sin).squeeze(1)
+        del kv_raw, kr_raw, cos, sin
 
         expanded = layer.project(p + "kv_b_proj", kv, project)
         k_nope, v = expanded.reshape(seq_len, h, nope + vdim).split([nope, vdim], dim=-1)
+        v = v.contiguous()
         keys = torch.cat((k_nope, kr_rot.unsqueeze(1).expand(-1, h, -1)), dim=-1)
+        del expanded, k_nope
+        if not capture_tap:
+            del kv
         sink = w[p + "learnable_sink_param"]
 
         # Stage 3: exact causal / SWA / compressed-indexer DSA mask and attention (128-row tiles).
@@ -195,6 +202,7 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
         if indexed:
             rope_arg = positions if positions.ndim == 2 else None
             iq, ik, iw = reference.index_projections(inputs, q_norm, w, c, slot_pos, base, rope_arg)
+        del q_a, q_norm
 
         ratio = c.compressed_indexer_compress_ratio
         rows = reference.ROWS
@@ -210,9 +218,11 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
             stop = min(start + rows, seq_len)
             first_key = max(0, start + 1 - c.sliding_window) if kind == reference.SLIDING else 0
             width = start + rows - first_key
-            query = F.pad(q_rot[start:stop], (0, 0, 0, 0, 0, rows - (stop - start)))
-            key_tile = F.pad(keys[first_key:stop], (0, 0, 0, 0, 0, width - (stop - first_key)))
-            val_tile = F.pad(v[first_key:stop], (0, 0, 0, 0, 0, width - (stop - first_key)))
+            q_pad = rows - (stop - start)
+            kv_pad = width - (stop - first_key)
+            query = F.pad(q_rot[start:stop], (0, 0, 0, 0, 0, q_pad)) if q_pad else q_rot[start:stop]
+            key_tile = F.pad(keys[first_key:stop], (0, 0, 0, 0, 0, kv_pad)) if kv_pad else keys[first_key:stop]
+            val_tile = F.pad(v[first_key:stop], (0, 0, 0, 0, 0, kv_pad)) if kv_pad else v[first_key:stop]
             key_id = torch.arange(first_key, start + rows, device=device)
             query_id = torch.arange(start, start + rows, device=device)
             distance = query_id[:, None] - key_id

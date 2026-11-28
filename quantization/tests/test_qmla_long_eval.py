@@ -303,7 +303,7 @@ def test_position_buckets_boundaries_and_aggregation():
         assert ":0` means RoPE is kept unquantized" in rep["headline_table_by_position_bucket_markdown"][bkt]
 
 
-def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
+def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """End-to-end streaming long-eval over dense+MoE+SWA+DSA layers with real sidecar and report attachment."""
     g = torch.Generator().manual_seed(601)
     rand = lambda *shape: torch.randn(*shape, generator=g)
@@ -374,9 +374,11 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
 
     layers_map = {i: _make_layer(i) for i in range(3)}
     embedding = rand(vocab, hidden) * 0.2
+    close_calls = [0]
     reader = SimpleNamespace(
         device=torch.device("cpu"), config=config,
         load_layer=lambda idx: layers_map[idx], raw=lambda _name: embedding,
+        close=lambda: close_calls.__setitem__(0, close_calls[0] + 1),
     )
     adapter = Hy4FlashCaptureAdapter(Model(reader), include_swa=False)
     cal_inputs = [(f"cal_{i:02d}", torch.randn(36 + (i % 3), hidden, generator=g), None) for i in range(4)]
@@ -414,7 +416,30 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
         adapter, sidecar_path=cal_res["sidecar_dir"], records=long_records,
         corpus_meta={"source_kind": "prepared_panel_corpus", "sequences": 2, "tokens": 416}, device="cpu",
         expected_source={"repo": source["repo"], "revision": source["revision"], "family": "hy4_flash"},
+        max_group_records=len(long_records),
     )
+    # Bounded-group evaluation (1 record per group) must be IDENTICAL to all-at-once evaluation
+    # while bounding concurrent HC/MLP/routed residency on unified-memory GB10 hosts.
+    close_calls[0] = 0
+    long_eval_grouped = run_hy4_flash_long_eval(
+        adapter, sidecar_path=cal_res["sidecar_dir"], records=long_records,
+        corpus_meta={"source_kind": "prepared_panel_corpus", "sequences": 2, "tokens": 416}, device="cpu",
+        expected_source={"repo": source["repo"], "revision": source["revision"], "family": "hy4_flash"},
+        max_group_records=1,
+    )
+    assert close_calls[0] >= 2 * (3 + 1)  # closed after initial embed + every layer in both groups
+    assert long_eval_grouped["combinations"] == long_eval["combinations"]
+    assert long_eval_grouped["headline_table"] == long_eval["headline_table"]
+    assert long_eval_grouped["headline_table_by_position_bucket"] == long_eval["headline_table_by_position_bucket"]
+
+    # Memory-aware grouping defaults to 1 record per group when available memory is unknown or below reserve.
+    from qmla import group_long_context_records
+    import qmla.long_eval as qmla_long_eval
+
+    assert len(group_long_context_records(long_records, device="cpu", bytes_per_token=100_000, reserve_bytes=10**9, available_bytes=5 * 10**8)) == 2
+    assert len(group_long_context_records(long_records, device="cpu", bytes_per_token=1024, reserve_bytes=0, available_bytes=10**9)) == 1
+    monkeypatch.setattr(qmla_long_eval, "available_device_memory_bytes", lambda _dev: None)
+    assert len(group_long_context_records(long_records, device="cpu", bytes_per_token=100_000, reserve_bytes=0)) == 2
     assert long_eval["schema"] == LONG_EVAL_SCHEMA
     assert long_eval["headline_modes"] == ["4:0", "2:4", "8:0", "8:8", "4:8"]
     assert [r["mode"] for r in long_eval["headline_table"]] == ["4:0", "2:4", "8:0", "8:8", "4:8"]
@@ -439,8 +464,23 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
         if mkey == "0:4":
             assert row["hadamard_attn_rel_err"] == pytest.approx(row["rtn_attn_rel_err"])
 
-    updated = attach_long_context_eval(out_dir, long_eval)
+    updated = attach_long_context_eval(out_dir, long_eval, manifest=manifest)
     assert "combinations" in updated and updated["long_context_eval"] == long_eval
+    # Combined short vs long headline table leads qmla-validation-report.json after attaching long_context_eval.
+    assert list(updated.keys())[:4] == ["schema", "headline_modes", "headline_table", "headline_table_markdown"]
+    assert "Short Identity" in updated["headline_table_markdown"]
+    assert "Long Identity" in updated["headline_table_markdown"]
+    assert "Long/Short Impr." in updated["headline_table_markdown"]
+    upd_hl = {r["mode"]: r for r in updated["headline_table"]}
+    row_40 = upd_hl["4:0"]
+    assert row_40["supported"] is True and row_40["short"] is not None and row_40["long"] is not None
+    assert row_40["short"]["attn_rel_err"] == pytest.approx(cal_res["report"]["combinations"]["4:0"]["attn_rel_err"])
+    assert row_40["long"]["attn_rel_err"] == pytest.approx(long_eval["combinations"]["4:0"]["attn_rel_err"])
+    if abs(row_40["short"]["error_reduction_pct"]) > 1e-12:
+        assert row_40["long_to_short_improvement_ratio"] == pytest.approx(
+            row_40["long"]["error_reduction_pct"] / row_40["short"]["error_reduction_pct"]
+        )
+    assert upd_hl["2:4"]["supported"] is False and upd_hl["2:4"]["status"] == "n/a"
     standalone_dir = tmp_path / "standalone"
     attach_long_context_eval(standalone_dir, long_eval, manifest=manifest)
     assert json.loads((standalone_dir / "qmla-validation-report.json").read_text())["long_context_eval"] == long_eval

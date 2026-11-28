@@ -842,19 +842,34 @@ def _unsupported_reason_for_mode(
     return "mode not evaluated in this run"
 
 
+def _short_or_long_block(entry: Mapping[str, Any]) -> dict[str, Any]:
+    ratio_id = entry.get("ratio_to_rtn")
+    per_layer = entry.get("per_layer")
+    return {
+        "layer_tokens": entry.get("layer_tokens", entry.get("tokens")),
+        "rtn_attn_rel_err": entry["rtn_attn_rel_err"],
+        "attn_rel_err": entry["attn_rel_err"],
+        "ratio_to_rtn": ratio_id,
+        "error_reduction_pct": None if ratio_id is None else (1.0 - ratio_id) * 100.0,
+        "per_layer_spread": _layer_spread(per_layer) if isinstance(per_layer, Mapping) else None,
+    }
+
+
 def build_headline_table(
     combinations: Mapping[str, Mapping[str, Any]],
     profiles: Mapping[str, Mapping[str, Any] | None] | None = None,
     *,
+    long_combinations: Mapping[str, Mapping[str, Any]] | None = None,
     modes: Sequence[str] = HEADLINE_DEPLOYMENT_MODES,
     unsupported_reasons: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build the leading held-out test headline table for deployment modes ``4:0, 2:4, 8:0, 8:8, 4:8``.
+    """Build the leading headline table for deployment modes ``4:0, 2:4, 8:0, 8:8, 4:8``.
 
-    Every supported row reflects ONE end-to-end joint post-``o_proj`` measurement combining
-    each layer's selected content transform at the content width with its selected RoPE
-    transform at the RoPE width (never per-path errors summed). Unsupported modes (such as
-    RoPE modes on pure-NoPE models) are emitted explicitly as ``n/a`` with the reason.
+    Shows short-context (held-out test) and long-context (full-length long-eval overall)
+    side by side with the long-to-short improvement ratio when ``long_combinations`` is
+    supplied. Every supported entry comes from ONE end-to-end joint post-``o_proj``
+    measurement combining each layer's selected content and RoPE transforms (never
+    per-path errors summed). Unsupported/NoPE modes are emitted explicitly as ``n/a``.
     """
     rows: list[dict[str, Any]] = []
     c_prof = profiles.get("content") if profiles else None
@@ -867,6 +882,9 @@ def build_headline_table(
                 "supported": False,
                 "status": "n/a",
                 "reason": _unsupported_reason_for_mode(mode, unsupported_reasons, profiles),
+                "short": None,
+                "long": None,
+                "long_to_short_improvement_ratio": None,
                 "layer_tokens": None,
                 "rtn_attn_rel_err": None,
                 "attn_rel_err": None,
@@ -880,23 +898,37 @@ def build_headline_table(
             })
             continue
         entry = combinations[mode]
-        ratio_id = entry.get("ratio_to_rtn")
+        short_block = _short_or_long_block(entry)
+        long_block = (
+            _short_or_long_block(long_combinations[mode])
+            if (long_combinations is not None and mode in long_combinations)
+            else None
+        )
+        short_imp = short_block["error_reduction_pct"]
+        long_imp = None if long_block is None else long_block["error_reduction_pct"]
+        if short_imp is not None and long_imp is not None and abs(short_imp) > 1e-12:
+            l2s_ratio: float | None = long_imp / short_imp
+        else:
+            l2s_ratio = None
+        ratio_id = short_block["ratio_to_rtn"]
         ratio_v2 = entry.get("ratio_to_v2_shared")
-        per_layer = entry.get("per_layer")
         rows.append({
             "mode": mode,
             "supported": True,
             "status": "measured",
             "reason": None,
-            "layer_tokens": entry.get("layer_tokens", entry.get("tokens")),
-            "rtn_attn_rel_err": entry["rtn_attn_rel_err"],
-            "attn_rel_err": entry["attn_rel_err"],
+            "short": short_block,
+            "long": long_block,
+            "long_to_short_improvement_ratio": l2s_ratio,
+            "layer_tokens": short_block["layer_tokens"],
+            "rtn_attn_rel_err": short_block["rtn_attn_rel_err"],
+            "attn_rel_err": short_block["attn_rel_err"],
             "ratio_to_rtn": ratio_id,
-            "error_reduction_vs_identity_pct": None if ratio_id is None else (1.0 - ratio_id) * 100.0,
+            "error_reduction_vs_identity_pct": short_imp,
             "v2_shared_attn_rel_err": entry.get("v2_shared_attn_rel_err"),
             "ratio_to_v2_shared": ratio_v2,
             "error_reduction_vs_v2_shared_pct": None if ratio_v2 is None else (1.0 - ratio_v2) * 100.0,
-            "per_layer_spread": _layer_spread(per_layer) if isinstance(per_layer, Mapping) else None,
+            "per_layer_spread": short_block["per_layer_spread"],
             "kind_counts": {
                 "content": (
                     dict(c_prof["widths"][str(c_bits)]["kind_counts"])
@@ -912,43 +944,75 @@ def build_headline_table(
 
 
 HEADLINE_TABLE_CAPTION = (
-    "*Joint end-to-end post-`o_proj` attention error on held-out test, combining each layer's "
-    "selected content transform at the content width with its selected RoPE transform at the RoPE "
-    "width (never per-path numbers added together). `:0` means RoPE is kept unquantized (native format).*"
+    "*Joint end-to-end post-`o_proj` attention error combining each layer's selected content "
+    "transform at the content width with its selected RoPE transform at the RoPE width (never "
+    "per-path numbers added together). Short = held-out test split; Long = full-length long-eval "
+    "(overall); Long/Short = ratio of long improvement % to short improvement %. `:0` means RoPE "
+    "is kept unquantized (native format).*"
 )
 
 
+def _format_spread(spread: Mapping[str, Any] | None) -> str:
+    if spread is None:
+        return "—"
+    med = f"{spread['median']['ratio_to_rtn']:.3f}x ({spread['median']['error_reduction_pct']:+.1f}%)"
+    best = (
+        f"L{spread['best']['layer_id']} {spread['best']['ratio_to_rtn']:.3f}x "
+        f"({spread['best']['error_reduction_pct']:+.1f}%)"
+    )
+    worst = (
+        f"L{spread['worst']['layer_id']} {spread['worst']['ratio_to_rtn']:.3f}x "
+        f"({spread['worst']['error_reduction_pct']:+.1f}%)"
+    )
+    return f"{med} / {best} / {worst}"
+
+
 def format_headline_table(rows: Sequence[Mapping[str, Any]], *, caption: str = HEADLINE_TABLE_CAPTION) -> str:
-    """Render the held-out headline table (with per-layer spread and caption) as GitHub markdown."""
-    lines = [
-        "| Mode (C:R) | Identity (RTN) | Shipped (v3) | Ratio | Reduction | Per-layer spread (median / best / worst) |",
-        "|---|---:|---:|---:|---:|---|",
-    ]
-    for row in rows:
-        if not row.get("supported", True):
-            reason = row.get("reason") or "not supported"
-            lines.append(f"| `{row['mode']}` | n/a | n/a | n/a | n/a | n/a ({reason}) |")
-            continue
-        r_id = "—" if row["ratio_to_rtn"] is None else f"{row['ratio_to_rtn']:.4f}x"
-        red = "—" if row["error_reduction_vs_identity_pct"] is None else f"{row['error_reduction_vs_identity_pct']:+.1f}%"
-        spread = row.get("per_layer_spread")
-        if spread is not None:
-            med = f"{spread['median']['ratio_to_rtn']:.3f}x ({spread['median']['error_reduction_pct']:+.1f}%)"
-            best = (
-                f"L{spread['best']['layer_id']} {spread['best']['ratio_to_rtn']:.3f}x "
-                f"({spread['best']['error_reduction_pct']:+.1f}%)"
+    """Render the headline table as GitHub markdown (combined short vs long when long is present)."""
+    has_long = any(row.get("long") is not None for row in rows)
+    if has_long:
+        lines = [
+            "| Mode (C:R) | Short Identity | Short Shipped | Short Impr. | Long Identity | Long Shipped | Long Impr. | Long/Short Impr. | Short Spread (med / best / worst) |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+        ]
+        for row in rows:
+            if not row.get("supported", True):
+                reason = row.get("reason") or "not supported"
+                lines.append(f"| `{row['mode']}` | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a ({reason}) |")
+                continue
+            s = row.get("short") or row
+            l = row.get("long")
+            s_imp = s.get("error_reduction_pct", row.get("error_reduction_vs_identity_pct"))
+            s_imp_s = "—" if s_imp is None else f"{s_imp:+.1f}%"
+            if l is not None:
+                l_id_s = f"{l['rtn_attn_rel_err']:.6g}"
+                l_sh_s = f"{l['attn_rel_err']:.6g}"
+                l_imp = l.get("error_reduction_pct")
+                l_imp_s = "—" if l_imp is None else f"{l_imp:+.1f}%"
+            else:
+                l_id_s = l_sh_s = l_imp_s = "—"
+            l2s = row.get("long_to_short_improvement_ratio")
+            l2s_s = "—" if l2s is None else f"{l2s:.2f}x"
+            lines.append(
+                f"| `{row['mode']}` | {s['rtn_attn_rel_err']:.6g} | {s['attn_rel_err']:.6g} | {s_imp_s} | "
+                f"{l_id_s} | {l_sh_s} | {l_imp_s} | {l2s_s} | {_format_spread(s.get('per_layer_spread'))} |"
             )
-            worst = (
-                f"L{spread['worst']['layer_id']} {spread['worst']['ratio_to_rtn']:.3f}x "
-                f"({spread['worst']['error_reduction_pct']:+.1f}%)"
+    else:
+        lines = [
+            "| Mode (C:R) | Identity (RTN) | Shipped (v3) | Ratio | Reduction | Per-layer spread (median / best / worst) |",
+            "|---|---:|---:|---:|---:|---|",
+        ]
+        for row in rows:
+            if not row.get("supported", True):
+                reason = row.get("reason") or "not supported"
+                lines.append(f"| `{row['mode']}` | n/a | n/a | n/a | n/a | n/a ({reason}) |")
+                continue
+            r_id = "—" if row["ratio_to_rtn"] is None else f"{row['ratio_to_rtn']:.4f}x"
+            red = "—" if row["error_reduction_vs_identity_pct"] is None else f"{row['error_reduction_vs_identity_pct']:+.1f}%"
+            lines.append(
+                f"| `{row['mode']}` | {row['rtn_attn_rel_err']:.6g} | {row['attn_rel_err']:.6g} | "
+                f"{r_id} | {red} | {_format_spread(row.get('per_layer_spread'))} |"
             )
-            spread_str = f"{med} / {best} / {worst}"
-        else:
-            spread_str = "—"
-        lines.append(
-            f"| `{row['mode']}` | {row['rtn_attn_rel_err']:.6g} | {row['attn_rel_err']:.6g} | "
-            f"{r_id} | {red} | {spread_str} |"
-        )
     if caption:
         lines.append("")
         lines.append(caption)

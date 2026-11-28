@@ -1,6 +1,7 @@
 """Fit the GLM 5.3 Flash MUL1 target's content-only MLA cache calibration."""
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 from pathlib import Path
@@ -11,7 +12,12 @@ import torch
 from qmla.capture import (CapturedLayerBank, SPLIT_NAMES, load_layer_capture, save_layer_capture,
                           split_train_val_test)
 from qmla.fit import FitConfig
-from qmla.long_eval import LongContextEvaluator, load_long_context_records, panel_snapshot_dir
+from qmla.long_eval import (
+    LongContextEvaluator,
+    group_long_context_records,
+    load_long_context_records,
+    panel_snapshot_dir,
+)
 from qmla.pipeline import (_git_head_sha, attach_long_context_eval, build_run_parser, calibrate_from_banks,
                            check_reused_captures, corpus_split_description, load_pinned_qmla_corpus,
                            parse_modes_arg, resolve_settings)
@@ -114,6 +120,8 @@ def stream_layers(source, adapter, layers, records, device, *, long_eval=None, p
             if long_eval is not None:
                 evaluator.release_layer_cache()
         del captured, params
+        if torch.device(device).type == "cuda":
+            torch.cuda.empty_cache()
         print(json.dumps(dict(phase=phase, completed_layer=index,
                               seconds=time.monotonic() - started)), flush=True)
 
@@ -135,8 +143,9 @@ def capture_banks(source, adapter, records, settings, capture_dir, provenance, s
 
 
 def run_evaluation(source, adapter, sidecar_path, records, corpus_meta, *, expected_source, device,
-                   layers=None, modes=None, phase="long_eval"):
-    """Score native long-context records or the compact view's frozen test records layer-major."""
+                   layers=None, modes=None, phase="long_eval",
+                   max_group_tokens=None, max_group_records=None):
+    """Score native long-context records in memory-bounded groups layer-major."""
     manifest, content_by_width, rope_by_width = load_sidecar_transforms(
         sidecar_path, expected_source=expected_source, strict=True
     )
@@ -154,10 +163,25 @@ def run_evaluation(source, adapter, sidecar_path, records, corpus_meta, *, expec
                                      profiles=manifest["profiles"],
                                      unsupported_modes_reason=manifest["unsupported_modes_reason"])
     start = time.monotonic()
-    seqs = [(r.seq_id, r.input_ids) for r in records]
-    for _ in stream_layers(source, adapter, layers, seqs, device, phase=phase,
-                           long_eval=(evaluator, {r.seq_id: r.split for r in records})):
-        pass
+    cfg = source.config
+    bytes_per_token = int(4 * cfg["hc_mult"] * cfg["hidden_size"] * 2)
+    groups = group_long_context_records(
+        records,
+        device=device,
+        bytes_per_token=bytes_per_token,
+        reserve_bytes=24 * 1024**3,
+        max_group_tokens=max_group_tokens,
+        max_group_records=max_group_records,
+    )
+    dev = torch.device(device)
+    for group_records in groups:
+        seqs = [(r.seq_id, r.input_ids) for r in group_records]
+        for _ in stream_layers(source, adapter, layers, seqs, device, phase=phase,
+                               long_eval=(evaluator, {r.seq_id: r.split for r in group_records})):
+            pass
+        gc.collect()
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
     return evaluator.finalize(corpus_meta=corpus_meta, transform_fingerprint=manifest["transform_fingerprint"],
                               device=device, wall_seconds=time.monotonic()-start)
 
@@ -169,7 +193,7 @@ def long_context_eval(source, adapter, checkpoint, source_id, path, args, settin
                              layers=settings["layers"] if args.layers else None,
                              modes=settings["modes"] if args.modes else None)
     manifest, _, _ = load_sidecar_transforms(path, expected_source=source_id, strict=True)
-    attach_long_context_eval(args.output, section, manifest=manifest)
+    return attach_long_context_eval(args.output, section, manifest=manifest)
 
 
 def main(argv=None):
@@ -217,9 +241,14 @@ def main(argv=None):
                                   thinking_mode="enabled (served template default, effective reasoning effort max)",
                                   code_commit=code_sha)
     del banks
+    final_report = result["report"]
     if args.long_eval:
-        long_context_eval(source, adapter, checkpoint, source_id, result["sidecar_dir"], args, settings)
-    print(json.dumps({"headline_table": result["report"]["headline_table"],
+        gc.collect()
+        if torch.device(args.device).type == "cuda":
+            torch.cuda.empty_cache()
+        final_report = long_context_eval(source, adapter, checkpoint, source_id, result["sidecar_dir"], args, settings)
+    print(json.dumps({"headline_table": final_report["headline_table"],
+                      "headline_table_markdown": final_report["headline_table_markdown"],
                       "status": result["validation"]["status"], "sidecar_dir": result["sidecar_dir"],
                       "layers": settings["layers"], "supported_modes": result["manifest"]["supported_modes"]}), flush=True)
     return 0

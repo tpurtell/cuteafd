@@ -108,7 +108,6 @@ _EMBEDDED_REQUIRED_FIELDS = frozenset({
     "protection_scope",
     "source",
     "applicable_views",
-    "view_transfer_validation",
     "conventions",
     "quantizer_recipe",
     "geometry",
@@ -542,8 +541,7 @@ def write_sidecar(
     rope_selections: Mapping[int, Mapping[int, RopeFitResult]] | None,
     selection_meta: Mapping[str, Mapping[str, Mapping[str, Mapping[str, Any]]] | None],
     provenance: Mapping[str, Any],
-    applicable_views: Sequence[str] = ("original",),
-    view_transfer_validation: Mapping[str, Any] | None = None,
+    applicable_views: Sequence[str] | None = None,
     artifact_status: str = "calibrated_unqualified",
     protection_policy: str = DEFAULT_PROTECTION_POLICY,
     extra_unsupported_reasons: Mapping[str, str] | None = None,
@@ -790,14 +788,18 @@ def write_sidecar(
 
     prov = _validate_provenance(provenance)
 
+    resolved_views = (
+        list(applicable_views)
+        if applicable_views is not None
+        else (["all"] if source.get("checkpoint_kind") == "mc" else [str(source.get("calibrated_view", "original"))])
+    )
     embedded_manifest: dict[str, Any] = {
         "schema": QMLA_SCHEMA,
         "artifact_status": artifact_status,
         "protection_policy": protection_policy,
         "protection_scope": PROTECTION_SCOPE,
         "source": dict(source),
-        "applicable_views": list(applicable_views),
-        "view_transfer_validation": dict(view_transfer_validation or {}),
+        "applicable_views": resolved_views,
         "conventions": dict(CANONICAL_CONVENTIONS),
         "quantizer_recipe": dict(CANONICAL_QUANTIZER_RECIPE),
         "geometry": [
@@ -1320,34 +1322,6 @@ def resolve_mode_transforms(
         content=dict(content_by_width[c_bits]) if c_bits > 0 else {},
         rope=dict(rope_by_width[r_bits]) if r_bits > 0 else {},
     )
-
-
-def attach_view_transfer(sidecar_path_or_dir: Path | str, view: str, measurement: Mapping[str, Any]) -> dict[str, Any]:
-    """Atomically add a measured transfer view while preserving the fitted payload and fingerprint."""
-    path = _resolve_sidecar_path(sidecar_path_or_dir)
-    validate_sidecar(path, strict=True)
-    _, _, payload_hash, _, manifest, tensors, _ = _read_f32_safetensors_with_metadata(path)
-    provenance = manifest["calibration_provenance"]
-    if (
-        measurement.get("view") != view
-        or measurement.get("reference") != f"{view} 0:0"
-        or measurement.get("split") != "test"
-        or measurement.get("test_digest") != provenance["splits"]["test"]["digest"]
-        or measurement.get("source_revision") != manifest["source"]["revision"]
-        or measurement.get("transform_fingerprint") != manifest["transform_fingerprint"]
-        or set(measurement.get("combinations", {})) != set(provenance["combination_measurements"])
-    ):
-        raise ValueError("transfer measurement differs from the calibration sidecar")
-    if manifest["view_transfer_validation"].get(view) != measurement or view not in manifest["applicable_views"]:
-        manifest["view_transfer_validation"][view] = dict(measurement)
-        if view not in manifest["applicable_views"]:
-            manifest["applicable_views"].append(view)
-        header, payloads, _, sha, _ = _prepare_f32_tensors(tensors)
-        if sha != payload_hash or compute_transform_fingerprint(manifest) != manifest["transform_fingerprint"]:
-            raise ValueError("transfer metadata changed the fitted QMLA transforms")
-        _write_f32_safetensors_with_metadata(path, header, payloads, manifest)
-    validate_sidecar(path, strict=True)
-    return read_sidecar_manifest(path)
 
 
 def build_mc_qmla_section(sidecar_path_or_dir: Path | str) -> dict[str, Any]:
