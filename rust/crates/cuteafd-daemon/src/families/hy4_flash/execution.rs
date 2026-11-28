@@ -1872,7 +1872,6 @@ struct ActiveBatch {
     ctx_slot_counter: usize,
     context_gathered: bool,
     swa_pt_stride: usize,
-    all_single_row: bool,
     graphed: bool,
     can_defer_ffn: bool,
     ffn_fused_layer: Option<usize>,
@@ -3187,10 +3186,9 @@ impl<'a> Hy4Engine<'a> {
             && self.graphs_active()
             && !self.skip_routed_experts
             && self.dump_dir.is_none();
-        let all_single_row = members.len() == rows && rows <= self.decode_rows;
         let pt_stride = max_seq_end.div_ceil(PAGE_ROWS).max(1);
         let ctx_pt_stride = if self.context_split { pt_stride.div_ceil(2).max(1) } else { pt_stride };
-        let swa_pt_stride = if graphed && all_single_row {
+        let swa_pt_stride = if graphed {
             self.max_seq_pages
         } else {
             pt_stride
@@ -3204,7 +3202,7 @@ impl<'a> Hy4Engine<'a> {
         } else {
             [Vec::new(), Vec::new()]
         };
-        let swa_pt_slice_bytes: Vec<u8> = if graphed && all_single_row {
+        let swa_pt_slice_bytes: Vec<u8> = if graphed {
             let need_ints = if members.len() == 1 {
                 pt_stride
             } else {
@@ -3383,7 +3381,6 @@ impl<'a> Hy4Engine<'a> {
             ctx_slot_counter: 0,
             context_gathered,
             swa_pt_stride,
-            all_single_row,
             graphed,
             can_defer_ffn,
             ffn_fused_layer: None,
@@ -4221,18 +4218,12 @@ impl<'a> Hy4Engine<'a> {
         }
 
         // 2. Indexer query projection + RoPE when any row exceeds 2048 tokens.
+        // Runs eagerly (3 kernels) between eager group-pool and ContextExchange hops so
+        // Blackwell graph-entry/exit bubbles do not outweigh its launch savings.
         let need_score = batch.max_seq_end > CANDIDATE_TOPK;
         if need_score {
             for r in &self.ranks {
-                if batch.graphed {
-                    r.graphs.run(
-                        GraphKey::new(layer, rows, GraphSection::DsaIndexQ),
-                        &r.stream,
-                        || r.device.run(|| r.dsa_index_q(p, wave_slot, rows)),
-                    )?;
-                } else {
-                    r.device.run(|| r.dsa_index_q(p, wave_slot, rows))?;
-                }
+                r.device.run(|| r.dsa_index_q(p, wave_slot, rows))?;
             }
         }
 
@@ -4354,20 +4345,13 @@ impl<'a> Hy4Engine<'a> {
             }
 
             // (d) Dual h0 + h16 partials over each rank's parity-owned local pages (32 heads total/rank).
+            // Runs eagerly (4 kernels) between ContextExchange hops to avoid per-graph entry/exit bubbles.
             for rank in 0..2 {
                 let r = &self.ranks[rank];
                 let q_ptr = assembled_q[rank];
                 let kv_buf = kv_caches[rank];
                 let decode_attn = batch.decode_attention;
-                if batch.graphed {
-                    r.graphs.run(
-                        GraphKey::new(layer, rows, GraphSection::DsaPartial),
-                        &r.stream,
-                        || r.device.run(|| r.dsa_attn_context_partials(rank, q_ptr, kv_buf, wave_slot, c_rows, decode_attn)),
-                    )?;
-                } else {
-                    r.device.run(|| r.dsa_attn_context_partials(rank, q_ptr, kv_buf, wave_slot, c_rows, decode_attn))?;
-                }
+                r.device.run(|| r.dsa_attn_context_partials(rank, q_ptr, kv_buf, wave_slot, c_rows, decode_attn))?;
             }
 
             // (e) Partial exchange: push peer's 16-head partial + base-2 LSE, wait for our 16-head partial.
@@ -4415,32 +4399,18 @@ impl<'a> Hy4Engine<'a> {
                 }
             }
 
-            // (g) Combine GPU0-then-GPU1 partials with natural-log sink; fuse gate_uv + o_proj when graphed.
+            // (g) Combine GPU0-then-GPU1 partials with natural-log sink; stays eager (6 kernels total
+            // with gate_uv + o_proj) between ContextExchange::wait_partial and PeerExchange::push_signal.
             for rank in 0..2 {
                 let r = &self.ranks[rank];
                 let rp = recv_p[rank];
                 let rl = recv_l[rank];
-                if batch.graphed {
-                    r.graphs.run(
-                        GraphKey::new(layer, rows, GraphSection::DsaAttnOut),
-                        &r.stream,
-                        || {
-                            r.device.run(|| {
-                                r.dsa_context_combine(rank, p, rp, rl, 0, rows)?;
-                                r.dsa_context_gate_uv_o(p, layer, 16, rows)
-                            })
-                        },
-                    )?;
-                } else {
-                    r.device.run(|| r.dsa_context_combine(rank, p, rp, rl, chunk_start, c_rows))?;
-                }
+                r.device.run(|| r.dsa_context_combine(rank, p, rp, rl, chunk_start, c_rows))?;
             }
         }
 
-        if !batch.graphed {
-            for r in &self.ranks {
-                r.device.run(|| r.dsa_context_gate_uv_o(p, layer, 16, rows))?;
-            }
+        for r in &self.ranks {
+            r.device.run(|| r.dsa_context_gate_uv_o(p, layer, 16, rows))?;
         }
         Ok(())
     }
@@ -4528,7 +4498,6 @@ impl<'a> Hy4Engine<'a> {
                                      dsa_idx: usize,
                                      max_groups: usize,
                                      pt_stride: usize,
-                                     graphed: bool,
                                      skip_index_q: bool|
          -> Result<()> {
             let w = &r.waves[wave_slot];
@@ -4631,15 +4600,7 @@ impl<'a> Hy4Engine<'a> {
 
             if batch.max_seq_end > CANDIDATE_TOPK && max_groups > 0 {
                 if !skip_index_q {
-                    if graphed {
-                        r.graphs.run(
-                            GraphKey::new(layer, rows, GraphSection::DsaIndexQ),
-                            &r.stream,
-                            || r.device.run(|| r.dsa_index_q(&p, wave_slot, rows)),
-                        )?;
-                    } else {
-                        r.device.run(|| r.dsa_index_q(&p, wave_slot, rows))?;
-                    }
+                    r.device.run(|| r.dsa_index_q(&p, wave_slot, rows))?;
                 }
                 r.device.run(|| unsafe {
                     let tile_cap = (r.shared.idx_score_floats / max_groups).max(1);
@@ -4716,7 +4677,6 @@ impl<'a> Hy4Engine<'a> {
         let pt_stride = batch.pt_stride;
         let swa_pt_stride = batch.swa_pt_stride;
         let members_len = batch.members.len();
-        let all_single_row = batch.all_single_row;
         let decode_attention = batch.decode_attention;
         let routed_scale = self.cfg.routed_scaling_factor as f32;
         let skip_routed = self.skip_routed_experts;
@@ -4756,65 +4716,30 @@ impl<'a> Hy4Engine<'a> {
                     r.cache.swa_layer_bank(self.swa_index_of[&layer])?
                 };
                 if !is_sparse {
-                    if all_single_row {
-                        r.graphs.run(
-                            GraphKey::with_prev_ffn(layer, rows, GraphSection::SwaLocal, has_prev_ffn),
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    r.finish_prev_and_attn_pre(
-                                        0, 1, prev_ffn, prev_use_a, skip_routed, std::ptr::null_mut(),
-                                        routed_recv_offset, engram_slot, &p, layer, false, local_heads,
-                                        wave_slot, rows, use_a, kv_cache_buf,
-                                    )?;
-                                    r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention)?;
-                                    r.attn_out(&p, layer, false, 1, local_heads, rows)?;
-                                    r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
-                                    if is_dense {
-                                        r.dense_ffn(&p, 1, wave_slot, rows)?;
-                                    } else {
-                                        r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale)?;
-                                        r.local_exl3(layer, 1, rows, skip_routed)?;
-                                        r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)?;
-                                    }
-                                    Ok(())
-                                })
-                            },
-                        )?;
-                    } else {
-                        r.graphs.run(
-                            GraphKey::with_prev_ffn(layer, rows, GraphSection::SwaExtendPre, has_prev_ffn),
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    r.finish_prev_and_attn_pre(
-                                        0, 1, prev_ffn, prev_use_a, skip_routed, std::ptr::null_mut(),
-                                        routed_recv_offset, engram_slot, &p, layer, false, local_heads,
-                                        wave_slot, rows, use_a, kv_cache_buf,
-                                    )
-                                })
-                            },
-                        )?;
-                        r.device.run(|| r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention))?;
-                        r.graphs.run(
-                            GraphKey::new(layer, rows, GraphSection::SwaExtendPost),
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    r.attn_out(&p, layer, false, 1, local_heads, rows)?;
-                                    r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
-                                    if is_dense {
-                                        r.dense_ffn(&p, 1, wave_slot, rows)?;
-                                    } else {
-                                        r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale)?;
-                                        r.local_exl3(layer, 1, rows, skip_routed)?;
-                                        r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)?;
-                                    }
-                                    Ok(())
-                                })
-                            },
-                        )?;
-                    }
+                    r.graphs.run(
+                        GraphKey::swa(layer, rows, members_len, GraphSection::SwaLocal, has_prev_ffn),
+                        &r.stream,
+                        || {
+                            r.device.run(|| {
+                                r.finish_prev_and_attn_pre(
+                                    0, 1, prev_ffn, prev_use_a, skip_routed, std::ptr::null_mut(),
+                                    routed_recv_offset, engram_slot, &p, layer, false, local_heads,
+                                    wave_slot, rows, use_a, kv_cache_buf,
+                                )?;
+                                r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention)?;
+                                r.attn_out(&p, layer, false, 1, local_heads, rows)?;
+                                r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
+                                if is_dense {
+                                    r.dense_ffn(&p, 1, wave_slot, rows)?;
+                                } else {
+                                    r.moe_router_shared(&p, 1, wave_slot, rows, routed_scale)?;
+                                    r.local_exl3(layer, 1, rows, skip_routed)?;
+                                    r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)?;
+                                }
+                                Ok(())
+                            })
+                        },
+                    )?;
                 } else {
                     let dsa_idx = self.dsa_index_of[&layer];
                     r.graphs.run(
@@ -4831,7 +4756,7 @@ impl<'a> Hy4Engine<'a> {
                             })
                         },
                     )?;
-                    run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, true, false)?;
+                    run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, false)?;
                     r.graphs.run(
                         GraphKey::new(layer, rows, GraphSection::DsaLocalPost),
                         &r.stream,
@@ -4873,53 +4798,24 @@ impl<'a> Hy4Engine<'a> {
                     r.cache.swa_layer_bank(self.swa_index_of[&layer])?
                 };
                 if !is_sparse {
-                    if all_single_row {
-                        r.graphs.run(
-                            GraphKey::with_prev_ffn(layer, rows, GraphSection::SwaSpark, has_prev_ffn),
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    r.finish_prev_and_attn_pre(
-                                        0, 1, prev_ffn, prev_use_a, skip_routed, std::ptr::null_mut(),
-                                        routed_recv_offset, engram_slot, &p, layer, false, local_heads,
-                                        wave_slot, rows, use_a, kv_cache_buf,
-                                    )?;
-                                    r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention)?;
-                                    r.attn_out(&p, layer, false, 1, local_heads, rows)?;
-                                    r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
-                                    r.moe_router(&p, wave_slot, rows, routed_scale)?;
-                                    r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)
-                                })
-                            },
-                        )?;
-                    } else {
-                        r.graphs.run(
-                            GraphKey::with_prev_ffn(layer, rows, GraphSection::SwaExtendPre, has_prev_ffn),
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    r.finish_prev_and_attn_pre(
-                                        0, 1, prev_ffn, prev_use_a, skip_routed, std::ptr::null_mut(),
-                                        routed_recv_offset, engram_slot, &p, layer, false, local_heads,
-                                        wave_slot, rows, use_a, kv_cache_buf,
-                                    )
-                                })
-                            },
-                        )?;
-                        r.device.run(|| r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention))?;
-                        r.graphs.run(
-                            GraphKey::new(layer, rows, GraphSection::SwaExtendSpark),
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    r.attn_out(&p, layer, false, 1, local_heads, rows)?;
-                                    r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
-                                    r.moe_router(&p, wave_slot, rows, routed_scale)?;
-                                    r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)
-                                })
-                            },
-                        )?;
-                    }
+                    r.graphs.run(
+                        GraphKey::swa(layer, rows, members_len, GraphSection::SwaSpark, has_prev_ffn),
+                        &r.stream,
+                        || {
+                            r.device.run(|| {
+                                r.finish_prev_and_attn_pre(
+                                    0, 1, prev_ffn, prev_use_a, skip_routed, std::ptr::null_mut(),
+                                    routed_recv_offset, engram_slot, &p, layer, false, local_heads,
+                                    wave_slot, rows, use_a, kv_cache_buf,
+                                )?;
+                                r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention)?;
+                                r.attn_out(&p, layer, false, 1, local_heads, rows)?;
+                                r.post_attn_ihc(&p, wave_slot, rows, use_a)?;
+                                r.moe_router(&p, wave_slot, rows, routed_scale)?;
+                                r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)
+                            })
+                        },
+                    )?;
                 } else {
                     let dsa_idx = self.dsa_index_of[&layer];
                     let need_score = batch.max_seq_end > CANDIDATE_TOPK && max_groups > 0;
@@ -4946,7 +4842,7 @@ impl<'a> Hy4Engine<'a> {
                             })
                         },
                     )?;
-                    run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, true, true)?;
+                    run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, true)?;
                     r.graphs.run(
                         GraphKey::new(layer, rows, GraphSection::DsaSparkPost),
                         &r.stream,
@@ -4968,55 +4864,24 @@ impl<'a> Hy4Engine<'a> {
 
             // Case 2B: TP2 layer — rank-local attention sections, peer join outside capture.
             if !is_sparse {
-                if all_single_row {
-                    for (rank, r) in self.ranks.iter().enumerate() {
-                        let kv_cache_buf = r.cache.swa_layer_bank(self.swa_index_of[&layer])?;
-                        let ffn_recv = ffn_recv_ptrs[rank];
-                        r.graphs.run(
-                            GraphKey::with_prev_ffn(layer, rows, GraphSection::SwaAttn, has_prev_ffn),
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    r.finish_prev_and_attn_pre(
-                                        rank, gpus, prev_ffn, prev_use_a, skip_routed, ffn_recv,
-                                        routed_recv_offset, engram_slot, &p, layer, false, local_heads,
-                                        wave_slot, rows, use_a, kv_cache_buf,
-                                    )?;
-                                    r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention)?;
-                                    r.attn_out(&p, layer, false, gpus, local_heads, rows)
-                                })
-                            },
-                        )?;
-                    }
-                } else {
-                    for (rank, r) in self.ranks.iter().enumerate() {
-                        let kv_cache_buf = r.cache.swa_layer_bank(self.swa_index_of[&layer])?;
-                        let ffn_recv = ffn_recv_ptrs[rank];
-                        r.graphs.run(
-                            GraphKey::with_prev_ffn(layer, rows, GraphSection::SwaExtendPre, has_prev_ffn),
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    r.finish_prev_and_attn_pre(
-                                        rank, gpus, prev_ffn, prev_use_a, skip_routed, ffn_recv,
-                                        routed_recv_offset, engram_slot, &p, layer, false, local_heads,
-                                        wave_slot, rows, use_a, kv_cache_buf,
-                                    )
-                                })
-                            },
-                        )?;
-                    }
-                    for r in &self.ranks {
-                        let kv_cache_buf = r.cache.swa_layer_bank(self.swa_index_of[&layer])?;
-                        r.device.run(|| r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention))?;
-                    }
-                    for r in &self.ranks {
-                        r.graphs.run(
-                            GraphKey::new(layer, rows, GraphSection::SwaExtendPost),
-                            &r.stream,
-                            || r.device.run(|| r.attn_out(&p, layer, false, gpus, local_heads, rows)),
-                        )?;
-                    }
+                for (rank, r) in self.ranks.iter().enumerate() {
+                    let kv_cache_buf = r.cache.swa_layer_bank(self.swa_index_of[&layer])?;
+                    let ffn_recv = ffn_recv_ptrs[rank];
+                    r.graphs.run(
+                        GraphKey::swa(layer, rows, members_len, GraphSection::SwaAttn, has_prev_ffn),
+                        &r.stream,
+                        || {
+                            r.device.run(|| {
+                                r.finish_prev_and_attn_pre(
+                                    rank, gpus, prev_ffn, prev_use_a, skip_routed, ffn_recv,
+                                    routed_recv_offset, engram_slot, &p, layer, false, local_heads,
+                                    wave_slot, rows, use_a, kv_cache_buf,
+                                )?;
+                                r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention)?;
+                                r.attn_out(&p, layer, false, gpus, local_heads, rows)
+                            })
+                        },
+                    )?;
                 }
             } else {
                 let dsa_idx = self.dsa_index_of[&layer];
@@ -5043,20 +4908,14 @@ impl<'a> Hy4Engine<'a> {
                     self.run_dsa_context_split_body(layer, dsa_idx, &p, batch)?;
                 } else {
                     for r in &self.ranks {
-                        run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, true, false)?;
+                        run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, false)?;
                     }
                     for r in &self.ranks {
                         let kv_cache_buf = r.cache.dsa_kv_layer(dsa_idx)?;
-                        r.graphs.run(
-                            GraphKey::new(layer, rows, GraphSection::DsaAttnOut),
-                            &r.stream,
-                            || {
-                                r.device.run(|| {
-                                    r.dsa_attn(kv_cache_buf, wave_slot, rows, decode_attention)?;
-                                    r.attn_out(&p, layer, true, gpus, local_heads, rows)
-                                })
-                            },
-                        )?;
+                        r.device.run(|| {
+                            r.dsa_attn(kv_cache_buf, wave_slot, rows, decode_attention)?;
+                            r.attn_out(&p, layer, true, gpus, local_heads, rows)
+                        })?;
                     }
                 }
             }
@@ -5137,7 +4996,7 @@ impl<'a> Hy4Engine<'a> {
                 if is_sparse {
                     let dsa_idx = self.dsa_index_of[&layer];
                     r.device.run(|| r.dsa_index_wk(&p, wave_slot, rows))?;
-                    run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, false, false)?;
+                    run_dsa_indexer_eager(r, dsa_idx, max_groups, pt_stride, false)?;
                     r.device.run(|| r.dsa_attn(kv_cache_buf, wave_slot, rows, decode_attention))?;
                 } else {
                     r.device.run(|| r.swa_attn(kv_cache_buf, wave_slot, rows, members_len, swa_pt_stride, decode_attention))?;
@@ -5240,6 +5099,11 @@ impl<'a> Hy4Engine<'a> {
                                 r.moe_router_shared(&p, gpus, wave_slot, rows, routed_scale)?;
                             } else if rank == 0 {
                                 r.moe_router(&p, wave_slot, rows, routed_scale)?;
+                            } else {
+                                // TP2 Spark-routed rank 1 does not run the router or Spark send;
+                                // fuse its shared FFN into `SparkRouter` (matching GLM 5.3) so it
+                                // overlaps rank 0's router + Spark RTT in one graph executable.
+                                r.shared_ffn(&p, gpus, wave_slot, rows)?;
                             }
                             if rank == 0 {
                                 r.record_expert_usage_local(usage, count_usage, skip_routed, false, layer, usage_phase, rows)?;
@@ -5285,19 +5149,19 @@ impl<'a> Hy4Engine<'a> {
 
     /// Enqueue the shared FFN after the Spark request has been staged, before landing its reply.
     ///
-    /// On TP1 graphed decode, launches eagerly in the Spark RDMA round-trip shadow (matching GLM 5.3's
-    /// `moe_exchange`) to eliminate a separate per-layer executable while keeping full overlap.
+    /// On graphed decode (both TP1 and TP2), rank 0 launches eagerly in the Spark RDMA round-trip
+    /// shadow (matching GLM 5.3's `moe_exchange`) to eliminate a separate per-layer executable
+    /// while keeping full overlap. On TP2 graphed decode, rank 1 already fused its shared FFN
+    /// into `SparkRouter`, so only rank 0 runs here.
     fn run_spark_shared_ffn(&self, layer: usize, batch: &ActiveBatch) -> Result<()> {
         let p = format!("model.layers.{layer}");
         let rows = batch.rows;
         let gpus = self.ranks.len();
-        for r in &self.ranks {
-            let work = || r.device.run(|| r.shared_ffn(&p, gpus, batch.wave_slot, rows));
-            if batch.graphed && gpus == 2 {
-                r.graphs.run(GraphKey::new(layer, rows, GraphSection::SparkShared), &r.stream, work)?;
-            } else {
-                work()?;
+        for (rank, r) in self.ranks.iter().enumerate() {
+            if batch.graphed && rank == 1 {
+                continue;
             }
+            r.device.run(|| r.shared_ffn(&p, gpus, batch.wave_slot, rows))?;
         }
         Ok(())
     }
@@ -5865,7 +5729,7 @@ impl<'a> Hy4Engine<'a> {
                         .and_then(Option::as_mut)
                         .context("Hy4 send_experts without active unit")?;
                     self.engine.run_moe_frontend(layer, batch, false)?;
-                    if self.engine.ranks.len() == 2 && self.engine.prefill_waves > 1 {
+                    if self.engine.ranks.len() == 2 && !self.single_wave {
                         // Protect rank 1's PEER_SLOT_ATTN read before another wave starts attention(layer).
                         let exchange = self.engine.peer_exchange()?;
                         exchange.signal(1, DIRECT)?;
@@ -6782,7 +6646,7 @@ mod tests {
         let shared = hook.find("run_spark_shared_ffn(layer, batch)").unwrap();
         let prefetch = hook.find("prefetch_l2(layer)").unwrap();
         assert!(router < send && send < shared && shared < prefetch);
-        assert!(prod.contains("GraphSection::SparkShared"));
+        assert!(!prod.contains("GraphSection::SparkShared"));
         assert!(hook.contains("self.kind == ExpertV2SourceKind::Decode && self.single_unit"));
     }
 
@@ -6794,19 +6658,12 @@ mod tests {
         let tp1_spark = attn.split("// Case 2A: TP1 Spark-routed layer").nth(1).unwrap()
             .split("// Case 2B: TP2 layer").next().unwrap();
         assert!(tp1_spark.contains("GraphSection::SwaSpark"));
-        assert!(tp1_spark.contains("GraphSection::SwaExtendSpark"));
         assert!(tp1_spark.contains("GraphSection::DsaPreScored"));
         assert!(tp1_spark.contains("GraphSection::DsaSparkPost"));
         assert!(tp1_spark.contains("r.finish_prev_and_attn_pre("));
         assert!(tp1_spark.contains("batch.router_fused_layer = Some(layer)"));
         assert!(!tp1_spark.contains("GraphSection::SwaAttn"));
-        assert!(!tp1_spark.contains("GraphSection::DsaAttnOut"));
         assert!(!tp1_spark.contains("GraphSection::SparkRouter"));
-        assert!(!tp1_spark.contains("GraphSection::DsaIndexQ"));
-
-        let shared = prod.split("fn run_spark_shared_ffn(").nth(1).unwrap()
-            .split("fn finish_ffn_combine_and_post(").next().unwrap();
-        assert!(shared.contains("if batch.graphed && gpus == 2"));
 
         let finish = prod.split("fn finish_ffn_combine_and_post(").nth(1).unwrap()
             .split("fn run_layer_local_ffn(").next().unwrap();
@@ -6817,9 +6674,47 @@ mod tests {
             &[GraphSection::SwaSpark]
         );
         assert_eq!(
+            super::super::graphs::tp1_spark_layer_sections(false, false, false),
+            &[GraphSection::SwaSpark]
+        );
+        assert_eq!(
             super::super::graphs::tp1_spark_layer_sections(true, true, true),
             &[GraphSection::DsaPreScored, GraphSection::DsaSparkPost]
         );
+    }
+
+    #[test]
+    fn tp2_spark_decode_eliminates_redundant_graph_boundaries_and_single_wave_barrier() {
+        let prod = include_str!("execution.rs").split("#[cfg(test)]").next().unwrap();
+        let frontend = prod.split("fn run_moe_frontend(").nth(1).unwrap()
+            .split("fn run_spark_shared_ffn(").next().unwrap();
+        let graphed_frontend = frontend.split("if batch.graphed {").nth(1).unwrap()
+            .split("return Ok(());").next().unwrap();
+        assert!(graphed_frontend.contains("r.shared_ffn(&p, gpus, wave_slot, rows)?;"),
+            "TP2 graphed SparkRouter must fuse rank-1 shared_ffn");
+
+        let shared = prod.split("fn run_spark_shared_ffn(").nth(1).unwrap()
+            .split("fn finish_ffn_combine_and_post(").next().unwrap();
+        assert!(shared.contains("if batch.graphed && rank == 1"),
+            "TP2 graphed run_spark_shared_ffn must skip rank 1 after SparkRouter fusion");
+        assert!(!shared.contains("r.graphs.run("),
+            "rank-0 shared_ffn must launch eagerly in the Spark RDMA shadow");
+
+        let send = prod.split("fn send_experts(").nth(1).unwrap()
+            .split("fn land_experts(").next().unwrap();
+        assert!(send.contains("if self.engine.ranks.len() == 2 && !self.single_wave"),
+            "single-wave decode must not emit the multi-wave DIRECT PEER_SLOT_ATTN barrier");
+        assert!(!send.contains("self.engine.prefill_waves > 1"));
+
+        let ctx_body = prod.split("fn run_dsa_context_split_body(").nth(1).unwrap()
+            .split("fn run_layer_attention(").next().unwrap();
+        assert!(!ctx_body.contains("r.graphs.run("),
+            "short ContextSplit DSA hops stay eager between PeerExchange/ContextExchange boundaries");
+
+        let tp2_attn = prod.split("// Case 2B: TP2 layer").nth(1).unwrap()
+            .split("// Eager path").next().unwrap();
+        assert!(tp2_attn.contains("GraphKey::swa(layer, rows, members_len, GraphSection::SwaAttn, has_prev_ffn)"),
+            "TP2 SWA decode (single-row and multi-row verify) must capture swa_attn in one SwaAttn section");
     }
 
 }
