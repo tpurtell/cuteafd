@@ -294,18 +294,27 @@ impl HeadSequence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HeadPrecision { Bf16, F32 }
+pub(crate) enum HeadPrecision {
+    /// Producer emits BF16 partials; exchanged as BF16 and merged via `peer_add_bf16`.
+    Bf16,
+    /// Producer emits F32 partials; sender narrows once into `rounded` (BF16),
+    /// pushes `count * 2` bytes on the wire, and delivers both rank-ordered BF16
+    /// partials so the receiver accumulates in F32 and applies native egress once.
+    F32,
+}
 
 pub(crate) struct HeadProjection {
     pub partial: cuteafd_ffi::CuteafdDeviceBuffer,
-    /// BF16 merge destination; ignored for F32, where the family owns narrowing.
+    /// BF16 buffer: merge output for [`HeadPrecision::Bf16`], or sender wire
+    /// narrow staging for [`HeadPrecision::F32`].
     pub rounded: Option<cuteafd_ffi::CuteafdDeviceBuffer>,
 }
 
 pub(crate) enum HeadMerge {
     /// The shared add path has already rounded rank0 + rank1 exactly once.
     Bf16(cuteafd_ffi::CuteafdDeviceBuffer),
-    /// Both pointers are local, always ordered rank0 then rank1.
+    /// Both pointers are local BF16 wire partials narrowed from F32, always
+    /// ordered rank0 then rank1; receiver accumulates in F32 before egress.
     F32([*const c_void; 2]),
 }
 
@@ -319,6 +328,8 @@ trait HeadProtocol {
     fn device(&self, rank: usize) -> i32;
     fn capacity(&self) -> usize;
     fn validate_slot(&self, slot: usize) -> Result<()>;
+    fn narrow(&self, rank: usize, src_f32: cuteafd_ffi::CuteafdDeviceBuffer,
+        dst_bf16: cuteafd_ffi::CuteafdDeviceBuffer, count: usize) -> Result<()>;
     fn push(&self, rank: usize, slot: usize, values: *const c_void, bytes: usize) -> Result<()>;
     fn wait(&self, rank: usize, slot: usize) -> Result<()>;
     fn recv(&self, rank: usize, slot: usize) -> Result<*mut c_void>;
@@ -333,6 +344,10 @@ impl HeadProtocol for PeerExchange<'_> {
         self.recv(0, slot)?;
         self.recv(1, slot)?;
         Ok(())
+    }
+    fn narrow(&self, rank: usize, src_f32: cuteafd_ffi::CuteafdDeviceBuffer,
+        dst_bf16: cuteafd_ffi::CuteafdDeviceBuffer, count: usize) -> Result<()> {
+        self.narrow_partial(rank, src_f32, dst_bf16, count)
     }
     fn push(&self, rank: usize, slot: usize, values: *const c_void, bytes: usize) -> Result<()> {
         self.push(rank, slot, values, bytes)
@@ -367,9 +382,12 @@ fn head_partials_next_with(exchange: &impl HeadProtocol, sequence: &mut HeadSequ
 
 fn head_partials_with(exchange: &impl HeadProtocol, slot: usize, count: usize,
     precision: HeadPrecision, kernels: &mut impl HeadKernels) -> Result<()> {
-    let bytes = count.checked_mul(if precision == HeadPrecision::F32 { 4 } else { 2 })
+    let wire_bytes = count.checked_mul(2)
         .filter(|&bytes| bytes > 0 && bytes <= exchange.capacity())
         .ok_or_else(|| anyhow::anyhow!("head partial exceeds exchange capacity"))?;
+    let partial_bytes = count.checked_mul(if precision == HeadPrecision::Bf16 { 2 } else { 4 })
+        .filter(|&bytes| bytes > 0)
+        .ok_or_else(|| anyhow::anyhow!("head partial storage size overflow"))?;
     ensure!(slot != DIRECT, "head partial requires a receive slot");
     exchange.validate_slot(slot)?;
     exchange.require_live()?;
@@ -377,20 +395,29 @@ fn head_partials_with(exchange: &impl HeadProtocol, slot: usize, count: usize,
     for (rank, projection) in projected.iter().enumerate() {
         let valid = |buffer: cuteafd_ffi::CuteafdDeviceBuffer, bytes| !buffer.ptr.is_null()
             && buffer.device_id == exchange.device(rank) && buffer.bytes >= bytes;
-        ensure!(valid(projection.partial, bytes), "head partial storage/device mismatch");
-        if precision == HeadPrecision::Bf16 {
-            let out = projection.rounded.context("BF16 head merge needs rounded output")?;
-            ensure!(valid(out, bytes) && out.ptr != projection.partial.ptr,
-                "BF16 head merge storage/device mismatch");
-        }
+        ensure!(valid(projection.partial, partial_bytes), "head partial storage/device mismatch");
+        let out = projection.rounded.context("BF16 head wire/merge needs rounded buffer")?;
+        ensure!(valid(out, wire_bytes) && out.ptr != projection.partial.ptr,
+            "BF16 head wire/merge storage/device mismatch");
     }
     for (rank, projection) in projected.iter().enumerate() {
-        exchange.push(rank, slot, projection.partial.ptr, bytes)?;
+        let source = match precision {
+            HeadPrecision::F32 => {
+                let narrowed = projection.rounded.expect("validated BF16 wire buffer");
+                exchange.narrow(rank, projection.partial, narrowed, count)?;
+                narrowed.ptr
+            }
+            HeadPrecision::Bf16 => projection.partial.ptr,
+        };
+        exchange.push(rank, slot, source, wire_bytes)?;
     }
     for (rank, projection) in projected.iter().enumerate() {
         exchange.wait(rank, slot)?;
         let received = exchange.recv(rank, slot)?.cast_const();
-        let own = projection.partial.ptr.cast_const();
+        let own = match precision {
+            HeadPrecision::F32 => projection.rounded.expect("validated BF16 wire buffer").ptr.cast_const(),
+            HeadPrecision::Bf16 => projection.partial.ptr.cast_const(),
+        };
         let ordered = if rank == 0 { [own, received] } else { [received, own] };
         let values = match precision {
             HeadPrecision::F32 => HeadMerge::F32(ordered),
@@ -795,10 +822,18 @@ mod tests {
             Ok(())
         }
         fn values(&self, ptr: *const c_void) -> &[u32] {
-            match ptr as usize { 1 | 12 => &self.inputs[0], 2 | 11 => &self.inputs[1], _ => panic!("bad head pointer") }
+            match ptr as usize {
+                1 | 12 | 21 => &self.inputs[0],
+                2 | 11 | 22 => &self.inputs[1],
+                _ => panic!("bad head pointer"),
+            }
         }
         fn sum(&self, rank: usize, values: [*const c_void; 2], precision: HeadPrecision) {
-            assert_eq!(values.map(|p| p as usize), if rank == 0 { [1, 11] } else { [12, 2] });
+            let expected = match precision {
+                HeadPrecision::F32 => if rank == 0 { [21, 11] } else { [12, 22] },
+                HeadPrecision::Bf16 => if rank == 0 { [1, 11] } else { [12, 2] },
+            };
+            assert_eq!(values.map(|p| p as usize), expected);
             let narrow = |value: f32| {
                 let bits = value.to_bits();
                 if value.is_nan() { (bits >> 16) | 0x40 }
@@ -806,7 +841,10 @@ mod tests {
             };
             *self.outputs.borrow_mut().get_mut(rank).unwrap() = self.values(values[0]).iter()
                 .zip(self.values(values[1])).map(|(&a, &b)| {
-                    let f = |v| f32::from_bits(if precision == HeadPrecision::Bf16 { v << 16 } else { v });
+                    let f = |v| match precision {
+                        HeadPrecision::Bf16 => f32::from_bits(v << 16),
+                        HeadPrecision::F32 => f32::from_bits(narrow(f32::from_bits(v)) << 16),
+                    };
                     let sum = f(a) + f(b);
                     // Model a family's F32->BF16 boundary and F32 residual join.
                     let rounded = narrow(sum);
@@ -827,9 +865,17 @@ mod tests {
             ensure!(slot < 4, "invalid head slot");
             Ok(())
         }
-        fn push(&self, rank: usize, slot: usize, _: *const c_void, bytes: usize) -> Result<()> {
+        fn narrow(&self, rank: usize, src: cuteafd_ffi::CuteafdDeviceBuffer,
+            dst: cuteafd_ffi::CuteafdDeviceBuffer, count: usize) -> Result<()> {
+            self.call("narrow")?;
+            assert_eq!((src.ptr as usize, dst.ptr as usize, count), (1 + rank, 21 + rank, self.inputs[rank].len()));
+            Ok(())
+        }
+        fn push(&self, rank: usize, slot: usize, source: *const c_void, bytes: usize) -> Result<()> {
             self.call("push")?;
-            assert_eq!(bytes, self.inputs[rank].len() * if self.precision == HeadPrecision::F32 { 4 } else { 2 });
+            let expected_ptr = if self.precision == HeadPrecision::F32 { 21 + rank } else { 1 + rank };
+            assert_eq!(source as usize, expected_ptr);
+            assert_eq!(bytes, self.inputs[rank].len() * 2);
             self.memory.borrow_mut()[rank].push(HeadOp::Publish(slot));
             self.schedule.borrow_mut().push(rank, "head", slot, "head push"); Ok(())
         }
@@ -890,7 +936,11 @@ mod tests {
             }
             trace.run().unwrap();
             let calls = trace.calls.borrow();
-            assert_eq!(&calls[..5], ["live", "project", "project", "push", "push"]);
+            if precision == HeadPrecision::F32 {
+                assert_eq!(&calls[..7], ["live", "project", "project", "narrow", "push", "narrow", "push"]);
+            } else {
+                assert_eq!(&calls[..5], ["live", "project", "project", "push", "push"]);
+            }
             super::super::order::check(&trace.schedule.borrow()).unwrap();
             assert_eq!(trace.outputs.borrow()[0], trace.outputs.borrow()[1]);
         }

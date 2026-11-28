@@ -346,11 +346,17 @@ pub(crate) fn validate_slot_sizes(devices: [i32; 2], sizes: &[usize]) -> Result<
     Ok(())
 }
 
+struct PartialOps<'a> {
+    narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
+    bf16_f32_add: cuteafd_ffi::Bf16F32Add<'a>,
+}
+
 /// Both ends of the exchange between ranks 0 and 1.
 pub(crate) struct PeerExchange<'a> {
     library: &'a NativeLibrary,
     ranks: [RankDevice; 2],
     ends: [End<'a>; 2],
+    partial_ops: [Option<PartialOps<'a>>; 2],
     abort: Option<TerminalAbort<'a>>,
     decode_lane_bytes: usize,
     trace_name: Cell<&'static str>,
@@ -411,7 +417,7 @@ impl<'a> PeerExchange<'a> {
         validate_slot_sizes(ranks.map(|rank| rank.device), sizes)?;
         let diagnostics = cuteafd_loader::serving_capacity::peer_wait_diagnostics();
         let storage = cuteafd_loader::serving_capacity::PeerStorageLayout::new(slots, *sizes.iter().max().context("empty peer slots")?, diagnostics)?;
-        let end = |rank: usize| -> Result<End<'a>> {
+        let end = |rank: usize| -> Result<(End<'a>, Option<PartialOps<'a>>)> {
             on_device(library, ranks[rank].device, || {
                 library.cuda_enable_peer(ranks[1 - rank].device)?;
                 // Lazy native module loading may synchronize behind an unmatched
@@ -423,24 +429,36 @@ impl<'a> PeerExchange<'a> {
                     "TP2 native kernels loaded before peer waits");
                 library.peer_exchange_initialize()?;
                 if diagnostics { library.peer_diagnostic_initialize()?; }
+                let partial_ops = match (
+                    library.f32_bf16_narrow(),
+                    library.bf16_f32_add(),
+                ) {
+                    (Ok(narrow), Ok(bf16_f32_add)) => {
+                        Some(PartialOps { narrow, bf16_f32_add })
+                    }
+                    _ => None,
+                };
                 let zeroed = |bytes: usize| -> Result<DeviceAllocation<'a>> {
                     let allocation = DeviceAllocation::new(library, bytes.max(256), Tag::transport("shared/peer-split"))?;
                     library.cuda_zero_bytes(allocation.buffer, allocation.buffer.bytes)?;
                     Ok(allocation)
                 };
-                Ok(End {
+                Ok((End {
                     recv: sizes.iter()
                         .map(|&bytes| zeroed(bytes))
                         .collect::<Result<_>>()?,
                     control: zeroed(storage.control_bytes)?,
                     progress: if diagnostics { Some(zeroed(storage.progress_bytes)?) } else { None },
-                })
+                }, partial_ops))
             })
         };
+        let (end0, ops0) = end(0)?;
+        let (end1, ops1) = end(1)?;
         Ok(Self {
             library,
             ranks,
-            ends: [end(0)?, end(1)?],
+            ends: [end0, end1],
+            partial_ops: [ops0, ops1],
             abort: None,
             decode_lane_bytes,
             trace_name: Cell::new("unnamed"),
@@ -858,6 +876,157 @@ impl<'a> PeerExchange<'a> {
             self.library
                 .peer_add_bf16(a, b, out, count, self.ranks[rank].stream)
         })
+    }
+
+    fn partial_ops(&self, rank: usize) -> Result<&PartialOps<'a>> {
+        ensure!(rank < 2, "partial ops rank {rank}");
+        self.partial_ops[rank]
+            .as_ref()
+            .context("PeerExchange partial narrow/reduce kernels unavailable in native library")
+    }
+
+    pub fn bf16_f32_add(&self, rank: usize) -> Result<&cuteafd_ffi::Bf16F32Add<'a>> {
+        Ok(&self.partial_ops(rank)?.bf16_f32_add)
+    }
+
+    /// Narrow `count` F32 values into a disjoint BF16 buffer on `rank` and `stream`.
+    pub fn narrow_partial_on(
+        &self,
+        rank: usize,
+        src_f32: cuteafd_ffi::CuteafdDeviceBuffer,
+        dst_bf16: cuteafd_ffi::CuteafdDeviceBuffer,
+        count: usize,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        let ops = self.partial_ops(rank)?;
+        let src_bytes = count.checked_mul(4).filter(|&b| b > 0).context("invalid F32 partial count")?;
+        let dst_bytes = count.checked_mul(2).context("invalid BF16 partial count")?;
+        let device = self.device(rank);
+        ensure!(
+            !src_f32.ptr.is_null()
+                && !dst_bf16.ptr.is_null()
+                && src_f32.device_id == device
+                && dst_bf16.device_id == device
+                && src_f32.bytes >= src_bytes
+                && dst_bf16.bytes >= dst_bytes,
+            "narrow_partial buffer device or extent mismatch"
+        );
+        let (s0, d0) = (src_f32.ptr as usize, dst_bf16.ptr as usize);
+        let s1 = s0.checked_add(src_bytes).context("narrow_partial source overflow")?;
+        let d1 = d0.checked_add(dst_bytes).context("narrow_partial destination overflow")?;
+        ensure!(s1 <= d0 || d1 <= s0, "narrow_partial source and destination overlap");
+        // SAFETY: validated distinct same-device buffers with live extents ordered on `stream`.
+        self.on(rank, || unsafe { ops.narrow.launch(src_f32.ptr, dst_bf16.ptr, count, stream) })
+    }
+
+    /// [`Self::narrow_partial_on`] on `rank`'s exchange stream.
+    pub fn narrow_partial(
+        &self,
+        rank: usize,
+        src_f32: cuteafd_ffi::CuteafdDeviceBuffer,
+        dst_bf16: cuteafd_ffi::CuteafdDeviceBuffer,
+        count: usize,
+    ) -> Result<()> {
+        self.narrow_partial_on(rank, src_f32, dst_bf16, count, self.stream(rank))
+    }
+
+    /// Push `count` partial-sum elements on `from`'s exchange stream into the peer's `slot`.
+    /// Always narrows `src_f32` once into `narrow_bf16` and sends `count * 2` bytes on the wire.
+    pub fn push_partial(
+        &self,
+        from: usize,
+        slot: usize,
+        src_f32: cuteafd_ffi::CuteafdDeviceBuffer,
+        narrow_bf16: cuteafd_ffi::CuteafdDeviceBuffer,
+        count: usize,
+    ) -> Result<()> {
+        self.narrow_partial(from, src_f32, narrow_bf16, count)?;
+        self.push(from, slot, narrow_bf16.ptr, count.checked_mul(2).context("BF16 partial bytes overflow")?)
+    }
+
+    /// [`Self::push_partial`] targeting an explicit `destination` on the peer GPU.
+    pub fn push_partial_to(
+        &self,
+        from: usize,
+        slot: usize,
+        src_f32: cuteafd_ffi::CuteafdDeviceBuffer,
+        narrow_bf16: cuteafd_ffi::CuteafdDeviceBuffer,
+        destination: *mut c_void,
+        count: usize,
+    ) -> Result<()> {
+        self.narrow_partial(from, src_f32, narrow_bf16, count)?;
+        self.push_to(
+            from,
+            slot,
+            narrow_bf16.ptr,
+            destination,
+            count.checked_mul(2).context("BF16 partial bytes overflow")?,
+        )
+    }
+
+    /// Accumulate BF16 wire partials `local_bf16` and `peer_ptr` in physical rank
+    /// order (rank 0 then rank 1) into F32 `sum_f32` on `rank` and `stream`.
+    pub fn reduce_partial_on(
+        &self,
+        rank: usize,
+        local_bf16: cuteafd_ffi::CuteafdDeviceBuffer,
+        peer_ptr: *const c_void,
+        sum_f32: cuteafd_ffi::CuteafdDeviceBuffer,
+        count: usize,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        let ops = self.partial_ops(rank)?;
+        let bytes = count.checked_mul(2).filter(|&b| b > 0).context("invalid partial reduction count")?;
+        let sum_bytes = count.checked_mul(4).context("partial F32 sum overflow")?;
+        let device = self.device(rank);
+        ensure!(
+            !local_bf16.ptr.is_null()
+                && !peer_ptr.is_null()
+                && !sum_f32.ptr.is_null()
+                && local_bf16.device_id == device
+                && sum_f32.device_id == device
+                && local_bf16.bytes >= bytes
+                && sum_f32.bytes >= sum_bytes,
+            "reduce_partial buffer device or extent mismatch"
+        );
+        let peer = cuteafd_ffi::CuteafdDeviceBuffer {
+            ptr: peer_ptr.cast_mut(),
+            bytes,
+            device_id: device,
+            flags: 0,
+        };
+        let (rank0, rank1) = if rank == 0 { (local_bf16, peer) } else { (peer, local_bf16) };
+        // SAFETY: peer wait ordered `peer_ptr`; `sum_f32` is disjoint from inputs on `stream`.
+        self.on(rank, || unsafe { ops.bf16_f32_add.launch(rank0, rank1, sum_f32, count, stream) })
+    }
+
+    /// [`Self::reduce_partial_on`] followed by a single RNE narrow into `output_bf16`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reduce_partial_narrow_on(
+        &self,
+        rank: usize,
+        local_bf16: cuteafd_ffi::CuteafdDeviceBuffer,
+        peer_ptr: *const c_void,
+        sum_f32: cuteafd_ffi::CuteafdDeviceBuffer,
+        output_bf16: cuteafd_ffi::CuteafdDeviceBuffer,
+        count: usize,
+        stream: *mut c_void,
+    ) -> Result<()> {
+        self.reduce_partial_on(rank, local_bf16, peer_ptr, sum_f32, count, stream)?;
+        self.narrow_partial_on(rank, sum_f32, output_bf16, count, stream)
+    }
+
+    /// [`Self::reduce_partial_narrow_on`] on `rank`'s exchange stream.
+    pub fn reduce_partial_narrow(
+        &self,
+        rank: usize,
+        local_bf16: cuteafd_ffi::CuteafdDeviceBuffer,
+        peer_ptr: *const c_void,
+        sum_f32: cuteafd_ffi::CuteafdDeviceBuffer,
+        output_bf16: cuteafd_ffi::CuteafdDeviceBuffer,
+        count: usize,
+    ) -> Result<()> {
+        self.reduce_partial_narrow_on(rank, local_bf16, peer_ptr, sum_f32, output_bf16, count, self.stream(rank))
     }
 
     /// Queues on `at`'s stream: wait for the other GPU's next push on flag `slot`.

@@ -97,6 +97,26 @@ impl RankExchange for RankEnd<'_, '_> {
         self.view(from, local.bytes)
     }
 
+    fn swap_partial(&mut self, channel: Channel, local_f32: Buffer, narrow_bf16: Buffer, count: usize) -> Result<Buffer> {
+        let bytes = count.checked_mul(2).context("Muse TP2 partial extent")?;
+        let to = MusePeer::next(&self.peer.sent, self.rank, channel);
+        ensure!(bytes <= self.peer.sizes[to], "Muse TP2 {channel:?} partial swap past its slot");
+        self.peer.exchange.push_partial(self.rank, to, local_f32, narrow_bf16, count)?;
+        let from = MusePeer::next(&self.peer.received, self.rank, channel);
+        self.peer.exchange.wait(self.rank, from)?;
+        self.view(from, bytes)
+    }
+
+    fn reduce_partial_narrow(&self, local: Buffer, peer: Buffer, sum_f32: Buffer, output_bf16: Buffer,
+        count: usize) -> Result<()> {
+        self.peer.exchange.reduce_partial_narrow(self.rank, local, peer.ptr.cast_const(), sum_f32,
+            output_bf16, count)
+    }
+
+    fn bf16_f32_add(&self) -> Result<&cuteafd_ffi::Bf16F32Add<'_>> {
+        self.peer.exchange.bf16_f32_add(self.rank)
+    }
+
     fn send(&mut self, channel: Channel, source: Buffer, rows: usize, row_bytes: usize, pitch: usize) -> Result<()> {
         let to = MusePeer::next(&self.peer.sent, self.rank, channel);
         let bytes = rows.checked_mul(row_bytes).context("Muse TP2 send extent")?;

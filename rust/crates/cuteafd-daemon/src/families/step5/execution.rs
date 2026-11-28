@@ -736,7 +736,7 @@ impl<'e, 'a> MainExecution<'e, 'a> {
                 };
                 let ranks: [Box<dyn RtxExpertLayer + 'a>; 2] = weights.execution()?;
                 ensure!(ranks[0].layers() == ownership.onboarded_layers(), "Step-5 TP2 layers differ from the solved homes");
-                let exchange_dtype = match kind { Tp2Exchange::Exl3 => ExchangeDtype::F32, Tp2Exchange::Fp8 => ExchangeDtype::Bf16 };
+                let exchange_dtype = ExchangeDtype::Bf16;
                 let streams = std::array::from_fn(|rank| RankDevice { device: devices[rank].id, stream: stages[rank].stream.raw });
                 let pair = devices[0].run(|| Pair::new_with_wire(devices[0].library, streams, ranks, H, 8, unit, rows.min(64), lanes,
                     exchange_dtype, true))?;
@@ -1446,7 +1446,8 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
                 }
             })?;
         }
-        // Exchange the F32 partials: both ways for head split, to the owner for a whole layer.
+        // Exchange BF16 partials (EXL3 narrows F32 -> BF16 inside Pair::combine.partial):
+        // both ways for head split, to the owner for a whole layer.
         for from in 0..2 {
             let to = 1 - from;
             if source.is_some_and(|owner| owner != to) { continue; }
@@ -1464,7 +1465,7 @@ impl<'s, E: CopyEngine> Bindings<'s, '_, '_, '_, '_, E> {
             let Ffn::Routed(ffn) = &execution.layer(rank, layer)?.ffn else { anyhow::bail!("Step-5 TP2 routed receiver"); };
             let output = ffn.routed_output();
             self.step.compose(rank, ffn, |_, meta| meta.stream.device.run(|| {
-                // SAFETY: both partials are complete on this stream (own enqueue,
+                // SAFETY: both BF16 partials are complete on this stream (own enqueue,
                 // peer wait); the routed plane is this rank's admitted unit view.
                 unsafe { onboard.pair.combine.sum(rank0, rank1, output.ptr.cast(), meta.rows, H, meta.stream.raw) }
             }))?;
@@ -1711,14 +1712,15 @@ impl<E: CopyEngine> HeadKernels for Bindings<'_, '_, '_, '_, '_, E> {
         // heads() has queued both projections through the cache transaction.
         let layer = self.layer;
         let Attention::Sliding(owner) = &self.execution.layer(rank, layer)?.attention else { anyhow::bail!("Step-5 head split requires SWA"); };
-        Ok(HeadProjection { partial: owner.projection_partial()?, rounded: None })
+        Ok(HeadProjection { partial: owner.projection_partial()?, rounded: Some(owner.diagnostic_norm()) })
     }
     fn merge(&mut self, rank: usize, values: HeadMerge) -> Result<()> {
         let layer = self.layer;
         let Attention::Sliding(owner) = &self.execution.layer(rank, layer)?.attention else { anyhow::bail!("Step-5 head split requires SWA"); };
-        let HeadMerge::F32(values) = values else { anyhow::bail!("Step-5 head merge requires F32"); };
+        let HeadMerge::F32(values) = values else { anyhow::bail!("Step-5 head merge requires BF16-wire F32 partials"); };
+        let bf16_add = self.execution.exchange.peer()?.bf16_f32_add(rank)?;
         let capture = self.diagnostic.map(|directory| (directory, rank));
-        self.step.compose(rank, owner, |owner, meta| owner.merge_partial_capture_on(meta.rows, values, meta.stream, capture))
+        self.step.compose(rank, owner, |owner, meta| owner.merge_partial_capture_on(meta.rows, values, bf16_add, meta.stream, capture))
     }
 }
 

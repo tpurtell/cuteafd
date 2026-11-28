@@ -146,13 +146,15 @@ pub(crate) struct PeerUnits<'s, 'a> {
 }
 
 impl<'a> PeerUnits<'_, 'a> {
+    #[allow(clippy::too_many_arguments)]
     fn attention(&mut self, kernels: &Kernels<'a>, lead_graphs: Option<&mut DecodeGraphs<'a>>,
         lead: &super::owners::PackedLayerUnit<'_, 'a>, target: &TargetWeights<'_>,
         cfg: &Inkling2Config, layer: usize, unit: &Unit, members: &[super::owners::PackedMember]) -> Result<()> {
         use crate::shared::peer_split::DIRECT;
         let peer = &self.owners[unit.slot];
         let rows = unit.rows.len();
-        let bytes = rows * cfg.hidden * 4;
+        let count = rows * cfg.hidden;
+        let bytes = count * 4;
         let mode = if lead.unit.replaying() { Mode::Verify } else { Mode::Decode };
         let mut lead_graphs = lead_graphs;
         let input = layers::mix_attention_input(kernels, lead, target, cfg, layer, rows)?;
@@ -181,14 +183,16 @@ impl<'a> PeerUnits<'_, 'a> {
                 layers::project_heads(self.kernels, &peer_state, self.target, cfg, layer, rows)
             })
         })?;
-        self.exchange.push(1, 0, peer.buffer("branch")?.ptr, bytes)?;
+        // Single BF16 wire (all phases): narrow F32 output partial once into dead `projection_input` (BF16).
+        self.exchange.push_partial(1, 0, peer.buffer("branch")?, peer.buffer("projection_input")?, count)?;
         graphs::local(lead_graphs.as_deref_mut(), lead.stream(), layer, rows, Section::RankAttention, mode, || {
             layers::attend_heads(kernels, lead, target, cfg, layer, rows, input)?;
             layers::project_heads(kernels, lead, target, cfg, layer, rows)
         })?;
+        self.exchange.narrow_partial(0, lead.buffer("branch")?, lead.buffer("projection_input")?, count)?;
         self.exchange.wait(0, 0)?;
         let remote = cuteafd_ffi::CuteafdDeviceBuffer { ptr: self.exchange.recv(0, 0)?,
-            bytes, device_id: lead.stream().device.id, flags: 0 };
+            bytes: count * 2, device_id: lead.stream().device.id, flags: 0 };
         let reduced = kernels.reduce_heads(lead, layers::output_weight(target, layer)?, remote, rows, cfg.hidden)?;
         graphs::local(lead_graphs, lead.stream(), layer, rows, Section::AfterAttention, mode, || {
             layers::finish_attention(kernels, lead, target, cfg, layer, rows, reduced)?;

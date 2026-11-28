@@ -752,14 +752,11 @@ impl<'a> SwaLayer<'a> {
         self.ffn.as_ref().context("SWA diagnostic requires embedded dense FFN")
     }
 
-    /// Ordered rank0 + rank1 projection, one BF16 narrowing, then F32 residual.
-    /// The caller retains the exchange and invokes this on its cache stream.
-    pub fn merge_partial_on(&self, rows: usize, values: [*const std::ffi::c_void; 2],
-        stream: &Stream<'a>) -> Result<()> {
-        self.merge_partial_capture_on(rows, values, stream, None)
-    }
-
-    pub(super) fn merge_partial_capture_on(&self, rows: usize, values: [*const std::ffi::c_void; 2],
+    /// Ordered rank0 + rank1 BF16 wire partials accumulated in F32, one native
+    /// egress/narrowing into NORM, then F32 residual.
+    pub(super) fn merge_partial_capture_on(&self, rows: usize,
+        values: [*const std::ffi::c_void; 2],
+        bf16_add: &cuteafd_ffi::Bf16F32Add<'_>,
         stream: &Stream<'a>, capture: Option<(&std::path::Path, usize)>) -> Result<()> {
         ensure!(self.immutable.heads == 32 && (1..=self.admission.rows).contains(&rows)
             && values.iter().all(|value| !value.is_null())
@@ -767,10 +764,15 @@ impl<'a> SwaLayer<'a> {
             && std::ptr::eq(stream.device.library, self.stream.device.library),
             "SWA partial merge geometry/device mismatch");
         let p = |i: usize| self.planes[i].buffer.ptr;
-        // POST is scratch until the residual join; NORM is no longer read by
-        // attention and is large enough for the rounded hidden-width delta.
-        self.launch_on(stream, 11, &[values[0].cast_mut(), values[1].cast_mut(), p(POST)],
-            &[Scalar::I32(rows as i32)])?;
+        // POST is scratch until the residual join; NORM holds the narrowed local
+        // wire partial and is overwritten after F32 accumulation completes.
+        let buf = |ptr: *const std::ffi::c_void| CuteafdDeviceBuffer {
+            ptr: ptr.cast_mut(), bytes: rows * H * 2, device_id: stream.device.id, flags: 0,
+        };
+        // SAFETY: peer wait ordered both BF16 partials; POST is disjoint F32 scratch.
+        stream.device.run(|| unsafe {
+            bf16_add.launch(buf(values[0]), buf(values[1]), self.planes[POST].buffer, rows * H, stream.raw)
+        })?;
         if let Some((directory, rank)) = capture {
             stream.drain()?;
             super::golden::dump_plane(directory, &format!("rank{rank}-merged_o_f32"),

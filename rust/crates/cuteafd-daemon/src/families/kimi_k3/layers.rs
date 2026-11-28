@@ -811,10 +811,19 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
         for rank in 0..2 {
             #[cfg(test)]
             if rank == 1 && fault::take() { return self.inject_half_issued_failure(); }
-            let buffer=partials[rank].buffer();
-            ensure!(self.protocol.peer()?.slot_bytes()>=buffer.bytes,"Kimi peer slot shorter than typed partial");
             self.protocol.producers(self.lane,rank)?;
-            self.protocol.peer()?.push(rank,self.lane,buffer.ptr,buffer.bytes)?;
+            match partials[rank] {
+                super::device::CorePartial::NativeF32(buffer) => {
+                    let bytes = self.rows * 7168 * 2;
+                    ensure!(self.protocol.peer()?.slot_bytes() >= bytes, "Kimi peer slot shorter than typed partial");
+                    let narrow = self.local[rank].plane(if ffn { "ffn output" } else { "attention output" }, self.rows, 7168)?;
+                    self.protocol.peer()?.push_partial(rank, self.lane, buffer, narrow, self.rows * 7168)?;
+                }
+                super::device::CorePartial::K6Bf16(buffer) => {
+                    ensure!(self.protocol.peer()?.slot_bytes()>=buffer.bytes,"Kimi peer slot shorter than typed partial");
+                    self.protocol.peer()?.push(rank,self.lane,buffer.ptr,buffer.bytes)?;
+                }
+            }
         }
         Ok(())
     }
@@ -839,12 +848,17 @@ impl<'e, 'a, 's> Bindings<'e, 'a, 's> {
     }
     fn meet_core(&mut self,layer:usize,ffn:bool,destination:&str)->Result<()> {
         for rank in 0..2 {
-            self.protocol.peer()?.wait(rank,self.lane)?;
+            let exchange = self.protocol.peer()?;
+            exchange.wait(rank,self.lane)?;
             let partial=self.local[rank].core_partial(layer,ffn,self.rows)?;
-            let peer=partial.received(CuteafdDeviceBuffer{ptr:self.protocol.peer()?.recv(rank,self.lane)?,
-                bytes:partial.buffer().bytes,device_id:self.local[rank].stream().device.id,flags:0})?;
-            self.protocol.peer()?.on(rank,||self.local[rank].reduce_core(layer,ffn,self.rows,peer,destination,
-                self.protocol.peer()?.stream(rank)))?;
+            let peer_bytes = match partial {
+                super::device::CorePartial::NativeF32(_) => self.rows * 7168 * 2,
+                super::device::CorePartial::K6Bf16(buf) => buf.bytes,
+            };
+            let peer=partial.received(CuteafdDeviceBuffer{ptr:exchange.recv(rank,self.lane)?,
+                bytes:peer_bytes,device_id:self.local[rank].stream().device.id,flags:0})?;
+            exchange.on(rank,||self.local[rank].reduce_core(layer,ffn,self.rows,peer,exchange,destination,
+                exchange.stream(rank)))?;
             self.protocol.consumer(self.lane,rank)?;
         }
         Ok(())

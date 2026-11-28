@@ -29,6 +29,15 @@ pub(crate) trait PeerExchange {
     /// This rank's `local` to the peer's `channel` slot, then a wait for the
     /// peer's part of the same exchange; returns the received part's view.
     fn swap(&mut self, channel: Channel, local: Buffer) -> Result<Buffer>;
+    /// Partial-sum swap: narrows `local_f32` once into `narrow_bf16`, sends
+    /// `count * 2` BF16 bytes on the wire, waits, and returns the received BF16 view.
+    fn swap_partial(&mut self, channel: Channel, local_f32: Buffer, narrow_bf16: Buffer, count: usize) -> Result<Buffer>;
+    /// Rank-ordered F32 accumulation of BF16 `local` and `peer` into `sum_f32`
+    /// followed by one RNE narrow into `output_bf16`.
+    fn reduce_partial_narrow(&self, local: Buffer, peer: Buffer, sum_f32: Buffer, output_bf16: Buffer,
+        count: usize) -> Result<()>;
+    /// Bound BF16->F32 partial-sum kernel for K6 reduction before H128 egress.
+    fn bf16_f32_add(&self) -> Result<&cuteafd_ffi::Bf16F32Add<'_>>;
     /// One-way push of `rows` rows of `row_bytes` (source pitch `pitch`) from
     /// `source` into the peer's `channel` slot, packed.
     fn send(&mut self, channel: Channel, source: Buffer, rows: usize, row_bytes: usize, pitch: usize) -> Result<()>;
@@ -36,9 +45,8 @@ pub(crate) trait PeerExchange {
     fn receive(&mut self, channel: Channel, bytes: usize) -> Result<Buffer>;
 }
 
-/// The shared TP2 helpers a rank's o_proj reduction launches.
+/// The shared TP2 helper a rank's K6 post-egress narrowing launches.
 pub(crate) struct Tp2Ops<'a> {
-    pub add: cuteafd_ffi::F32Add<'a>,
     pub narrow: cuteafd_ffi::F32Bf16Narrow<'a>,
 }
 
@@ -321,23 +329,22 @@ impl RankDevice<'_, '_> {
         unsafe { self.programs.launch("residual_gate", &[residual, x, alpha, beta, out], &[rows_i32(rows)?], self.stream) }
     }
 
-    /// The K-split rule on a TP2 pair: this rank's F32 core retained in
-    /// `o_core`, swapped with the peer's on `channel`, both retained and
-    /// added in rank order in F32 (`o_reduced`), then the one egress into
-    /// `output`. Identical bits on both ranks.
+    /// The K-split rule on a TP2 pair: each rank narrows its F32 core once into
+    /// `output`, swaps BF16 partials on `channel`, accumulates in rank order in
+    /// F32 (`o_reduced`), applies the one H128/svh egress into `o_core`, and
+    /// narrows once into `output`. Identical bits on both ranks across all phases.
     fn k_split(&self, channel: Channel, rows: usize, input: Buffer, core: &crate::shared::dense_trellis::CoreWeights<'_>,
         output: Buffer, peer: &mut dyn PeerExchange) -> Result<()> {
-        let ops = self.tp2.context("Muse TP2 needs the shared F32 add helper")?;
+        let ops = self.tp2.context("Muse TP2 needs the shared narrow helper")?;
         let accumulator = self.core.core(rows, input, core, self.stream)?;
         let local = self.lane.rows("o_core", rows)?;
-        let row_bytes = self.cfg.hidden * 4;
-        self.copy_rows(local, row_bytes, accumulator, row_bytes, row_bytes, rows)?;
-        let received = peer.swap(channel, local)?;
-        let (rank0, rank1) = if self.rank == 0 { (local, received) } else { (received, local) };
-        // The add consumes local before H128 egress reuses it. Only the final
-        // post-egress value is narrowed, never either rank's partial sum.
-        self.core.reduced(&ops.add, rows, rank0, rank1, self.lane.rows("o_reduced", rows)?, core, local, self.stream)?;
-        crate::shared::dense_trellis::retain_partial(&ops.narrow, local, output, rows * self.cfg.hidden, self.stream)
+        let count = rows.checked_mul(self.cfg.hidden).context("Muse K-split reduction extent")?;
+        // `output` is dead until the post-egress narrow writes it; reuse as the BF16 wire buffer.
+        let received = peer.swap_partial(channel, accumulator, output, count)?;
+        let (rank0, rank1) = if self.rank == 0 { (output, received) } else { (received, output) };
+        self.core.reduced(peer.bf16_f32_add()?, rows, rank0, rank1,
+            self.lane.rows("o_reduced", rows)?, core, local, self.stream)?;
+        crate::shared::dense_trellis::retain_partial(&ops.narrow, local, output, count, self.stream)
     }
 
     fn native_k_split(&self, channel: Channel, rows: usize, input: Buffer, weight: &super::weights::NativeWeights<'_>,
@@ -346,17 +353,12 @@ impl RankDevice<'_, '_> {
         ensure!(weight.layout.ranks == 2 && weight.layout.rank == self.rank
             && weight.layout.split == CoreSplit::Input && weight.layout.shape[0] == self.cfg.hidden,
             "Muse native TP2 projection differs from admitted input split");
-        let ops = self.tp2.context("Muse native TP2 needs F32 add/narrow helpers")?;
         let local = self.lane.rows("o_core", rows)?;
         self.core.native(rows, input, weight, local, self.stream)?;
-        let received = peer.swap(channel, local)?;
-        let (rank0, rank1) = if self.rank == 0 { (local, received) } else { (received, local) };
         let reduced = self.lane.rows("o_reduced", rows)?;
         let count = rows.checked_mul(self.cfg.hidden).context("Muse native TP2 reduction extent")?;
-        // SAFETY: peer completion orders the received F32 rows; lane owners survive all queued work.
-        unsafe { ops.add.launch(rank0, rank1, reduced, count, self.stream)?; }
-        // Native partials are unrotated: no K6 H128 egress belongs between add and narrow.
-        crate::shared::dense_trellis::retain_partial(&ops.narrow, reduced, output, count, self.stream)
+        let received = peer.swap_partial(channel, local, output, count)?;
+        peer.reduce_partial_narrow(output, received, reduced, output, count)
     }
 
     /// `rows` rows of `width` bytes from `source` (pitch `source_pitch`) into
@@ -705,7 +707,9 @@ impl RankDevice<'_, '_> {
             ensure!(self.rank == 1 && wave.is_none(), "Muse rank {} lands without its wave", self.rank);
         }
         self.trace(step, layer, &[("combined", self.cfg.expert_hidden * 2)])?;
-        if self.ranks == 2 { self.moe_backend_split(layer, rows, peer.context("Muse TP2 needs the peer exchange")?)?; }
+        if self.ranks == 2 {
+            self.moe_backend_split(layer, rows, peer.context("Muse TP2 needs the peer exchange")?)?;
+        }
         let (moe, normed) = (lane.rows("moe", rows)?, lane.rows("normed", rows)?);
         let (residual, hidden) = (lane.rows("residual", rows)?, lane.rows("hidden", rows)?);
         self.segment(layer, step, super::graphs::Section::Residual, || {

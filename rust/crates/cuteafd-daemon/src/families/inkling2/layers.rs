@@ -294,19 +294,19 @@ impl<'a> Kernels<'a> {
 
     pub fn reduce_heads(&self, owner: &impl UnitBuffers<'a>, weight: ProjectionWeight<'_, '_>,
         remote: Buffer, rows: usize, hidden: usize) -> Result<Buffer> {
-        let local = owner.buffer("branch")?;
+        let local = owner.buffer("projection_input")?;
         let sum = owner.buffer("mlp")?;
         let stream = owner.stream().raw;
         if let ProjectionWeight::Trellis(w) = weight {
             let (projection, _) = self.trellis_parts(owner.stream(), w)?;
             // The incoming attention mix is dead before either W_O partial is published.
             let output = owner.buffer("mixed")?;
-            projection.reduced_f32(&self.add, rows, local, remote, sum, w, output, stream)?;
+            projection.reduced(&self.widen_add, rows, local, remote, sum, w, output, stream)?;
             Ok(output)
         } else {
-            // SAFETY: a matching peer wait publishes the retained remote partial.
-            // All three F32 planes are disjoint and the caller orders slot reuse.
-            unsafe { self.add.launch(local, remote, sum, rows * hidden, stream)?; }
+            // SAFETY: a matching peer wait publishes the retained remote BF16 partial;
+            // local BF16 partial and F32 sum are disjoint on this rank's stream.
+            unsafe { self.widen_add.launch(local, remote, sum, rows * hidden, stream)?; }
             Ok(sum)
         }
     }
