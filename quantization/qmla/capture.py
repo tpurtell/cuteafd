@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import mmap
 import os
 from pathlib import Path
 import struct
@@ -694,17 +695,14 @@ def _write_safetensors_streamed(path: Path, tensors: dict[str, torch.Tensor]) ->
         raise ValueError(f"refuse symlink capture path: {path}")
 
     header: dict[str, Any] = {}
-    ordered: list[tuple[str, bytes]] = []
     offset = 0
     for name in sorted(tensors):
-        tensor = tensors[name].detach().contiguous().cpu()
+        tensor = tensors[name]
         st_dtype = _TORCH_TO_ST_DTYPE.get(tensor.dtype)
         if st_dtype is None:
             raise ValueError(f"unsupported capture tensor dtype {tensor.dtype} for {name}")
-        raw = tensor.view(torch.uint8).numpy().tobytes()
-        end = offset + len(raw)
+        end = offset + tensor.numel() * tensor.element_size()
         header[name] = {"dtype": st_dtype, "shape": list(tensor.shape), "data_offsets": [offset, end]}
-        ordered.append((name, raw))
         offset = end
 
     encoded = _canonical_json(header).encode("utf-8")
@@ -714,7 +712,9 @@ def _write_safetensors_streamed(path: Path, tensors: dict[str, torch.Tensor]) ->
     with tmp.open("wb") as handle:
         handle.write(prefix)
         hasher.update(prefix)
-        for _, raw in ordered:
+        for name in header:
+            tensor = tensors[name].detach().cpu().contiguous()
+            raw = memoryview(tensor.reshape(-1).view(torch.uint8).numpy())
             handle.write(raw)
             hasher.update(raw)
         handle.flush()
@@ -731,26 +731,32 @@ def _read_safetensors_verified(path: Path, expected_bytes: int, expected_xxh3: s
     path = Path(path)
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"capture payload missing or symlink: {path}")
-    raw = path.read_bytes()
-    if len(raw) != expected_bytes:
-        raise ValueError(f"capture payload byte length {len(raw)} != expected {expected_bytes}")
+    with path.open("rb") as handle:
+        size = os.fstat(handle.fileno()).st_size
+        if size != expected_bytes or size < 8:
+            raise ValueError(f"capture payload byte length {size} != expected {expected_bytes}")
+        # Every tensor owns a reference to this private mapping. Clean pages can be
+        # evicted between layers and a tensor write cannot alter a published receipt.
+        raw = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_COPY)
     actual_xxh3 = xxhash.xxh3_128_hexdigest(raw)
     if actual_xxh3 != expected_xxh3:
         raise ValueError(f"capture payload XXH3-128 mismatch: {actual_xxh3} != {expected_xxh3}")
-    header_len = struct.unpack("<Q", raw[:8])[0]
-    header = json.loads(raw[8 : 8 + header_len].decode("utf-8"))
+    header_len = struct.unpack_from("<Q", raw)[0]
     base = 8 + header_len
+    header = json.loads(raw[8:base])
     result: dict[str, torch.Tensor] = {}
     for name, spec in header.items():
         if name == "__metadata__":
             continue
         dtype = _ST_DTYPE_TO_TORCH[spec["dtype"]]
         start, end = spec["data_offsets"]
-        buf = bytearray(raw[base + start : base + end])
-        if not buf:
-            result[name] = torch.empty(spec["shape"], dtype=dtype)
+        count = math.prod(spec["shape"])
+        if start < 0 or base + end > size or end - start != count * dtype.itemsize:
+            raise ValueError(f"invalid capture payload offsets for {name}")
+        if count:
+            result[name] = torch.frombuffer(raw, dtype=dtype, count=count, offset=base + start).reshape(spec["shape"])
         else:
-            result[name] = torch.frombuffer(buf, dtype=dtype).reshape(spec["shape"]).clone()
+            result[name] = torch.empty(spec["shape"], dtype=dtype)
     return result
 
 

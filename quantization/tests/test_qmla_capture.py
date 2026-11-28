@@ -167,8 +167,17 @@ def test_capture_bank_xxh3_roundtrip_and_corruption_fail_closed(tmp_path: Path):
         assert torch.equal(orig.k_rope, loaded.k_rope)
         assert torch.equal(orig.ref_output, loaded.ref_output)
 
-    # Corrupting a single payload byte must fail XXH3-128 verification.
+    # Large capture banks must stay file-backed, even after the loader closes its fd.
     payload_path = tmp_path / "layer-0000.safetensors"
+    if Path("/proc/self/maps").is_file():
+        address = reloaded.train[0].u.data_ptr()
+        ranges = [line.split()[0].split("-") for line in Path("/proc/self/maps").read_text().splitlines()
+                  if line.endswith(str(payload_path))]
+        assert any(int(lo, 16) <= address < int(hi, 16) for lo, hi in ranges)
+    reloaded.train[0].u.zero_()
+    assert torch.equal(load_layer_capture(tmp_path, layer.index).train[0].u, bank.train[0].u)
+
+    # Corrupting a single payload byte must fail XXH3-128 verification.
     blob = bytearray(payload_path.read_bytes())
     blob[-1] ^= 0xFF
     payload_path.write_bytes(bytes(blob))

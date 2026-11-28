@@ -696,9 +696,9 @@ def _stream_hy4_flash_captures(
                                      tuple(captures[:train_count]),
                                      tuple(captures[train_count:train_count + val_count]),
                                      tuple(captures[train_count + val_count:]), provenance)
-            bank.validate()
             save_layer_capture(capture_dir, bank)
-            banks[layer_idx] = bank
+            del bank, captures, cap
+            banks[layer_idx] = load_layer_capture(capture_dir, layer_idx)
         if mlp_args:
             routed = [None] * len(mlp_args)
             if model.config.mlp_layer_types[layer_idx] == "sparse":
