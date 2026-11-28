@@ -912,17 +912,24 @@ printf '%s\n' "$MODEL_ID" "$MODEL_REVISION" \
         check = check.split("  install -m 0644", 1)[0]
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
-            for name, body in (("good", "void cuteafd_v41_local_expert_info(void){}\nvoid cuteafd_v41_tp2_expert_info(void){}\n"),
-                               ("bad", "void cuteafd_v41_local_expert_info(void){}\n")):
+            both = "void cuteafd_v41_local_expert_info(void){}\nvoid cuteafd_v41_tp2_expert_info(void){}\n"
+            versions = out / "versions.map"
+            versions.write_text("V1 { global: cuteafd_*; local: *; };\n")
+            # "versioned": the real library's dynamic symbols carry name@@VERSION suffixes.
+            for name, body, extra in (("good", both, []), ("versioned", both, [f"-Wl,--version-script={versions}"]),
+                                      ("bad", "void cuteafd_v41_local_expert_info(void){}\n", [])):
                 src = out / f"{name}.c"
                 src.write_text(body)
                 lib_dir = out / name
                 lib_dir.mkdir()
-                subprocess.run(["cc", "-shared", "-fPIC", "-o", str(lib_dir / "libcuteafd_native.so"), str(src),
-                                "-Wl,--allow-shlib-undefined", "-Wl,--no-as-needed"], check=True)
+                subprocess.run(["cc", "-shared", "-fPIC", "-o", str(lib_dir / "libcuteafd_native.so"), str(src), *extra],
+                               check=True)
             good = subprocess.run(["bash", "-c", "set -euo pipefail\n" + check],
                                   env={**os.environ, "output_dir": str(out / "good")}, capture_output=True, text=True)
             self.assertEqual(good.returncode, 0, good.stderr)
+            versioned = subprocess.run(["bash", "-c", "set -euo pipefail\n" + check],
+                                       env={**os.environ, "output_dir": str(out / "versioned")}, capture_output=True, text=True)
+            self.assertEqual(versioned.returncode, 0, versioned.stderr)
             bad = subprocess.run(["bash", "-c", "set -euo pipefail\n" + check],
                                  env={**os.environ, "output_dir": str(out / "bad")}, capture_output=True, text=True)
             self.assertNotEqual(bad.returncode, 0)

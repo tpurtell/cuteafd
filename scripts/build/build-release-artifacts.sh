@@ -405,10 +405,11 @@ if [[ "$coordinator_aot" == ON ]]; then
   # Automatic RTX placement requires the full local-expert ABI in release images.
   # Read the dynamic symbol table instead of loading the library: exports run in
   # CPU-only containers with no CUDA driver, and loading pulls in libcuda.so.1.
-  nm -D --defined-only "$output_dir/libcuteafd_native.so" | awk '{print $NF}' |
+  # Strip symbol versions (name@@VER): the dynamic linker matches by bare name.
+  nm -D --defined-only "$output_dir/libcuteafd_native.so" | awk '{sub(/@.*/, "", $NF); print $NF}' |
     grep -qx 'cuteafd_v41_local_expert_info' ||
     { echo "release native library lacks cuteafd_v41_local_expert_info" >&2; exit 1; }
-  nm -D --defined-only "$output_dir/libcuteafd_native.so" | awk '{print $NF}' |
+  nm -D --defined-only "$output_dir/libcuteafd_native.so" | awk '{sub(/@.*/, "", $NF); print $NF}' |
     grep -qx 'cuteafd_v41_tp2_expert_info' ||
     { echo "release native library lacks cuteafd_v41_tp2_expert_info" >&2; exit 1; }
   install -m 0644 "$build_root/native/v41_fp8/v41_fp8.json" "$output_dir/V41_FP8_AOT.json"
