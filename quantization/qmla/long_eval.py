@@ -1,9 +1,8 @@
-"""Long-context (16K/32K) QMLA evaluation over full-length ``panel_corpus`` records."""
+"""Long-context (16K/32K) QMLA evaluation over full-length ``panel_corpus`` v3 records."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import json
 from pathlib import Path
 import resource
 import sys
@@ -17,7 +16,6 @@ from .fit import DEFAULT_PROTECTION_POLICY, FitConfig
 from .measurement import NATIVE_ROPE, _Scorer, _token_relative_squares, combo_key, layer_quantizes
 
 LONG_EVAL_SCHEMA = "cuteafd-qmla-long-eval-v1"
-DEFAULT_STAGED_LONG_CONTEXT_DIR = Path.home() / ".cache" / "cuteafd" / "builds" / "long-context-bank"
 LONG_CONTEXT_EVAL_SPLITS: tuple[str, ...] = ("heldout", "calibration")
 DEFAULT_POSITION_BUCKETS: tuple[tuple[str, int, int | None], ...] = (
     ("0-2k", 0, 2048), ("2k-4k", 2048, 4096), ("4k-8k", 4096, 8192),
@@ -53,17 +51,6 @@ class LongContextRecord:
     input_ids_sha256: str
 
 
-def has_prepared_long_context(corpus_dir: Path | str | None) -> bool:
-    """True when ``corpus_dir`` is a prepared ``panel_corpus`` dir carrying ``long_context``."""
-    if corpus_dir is None or not (Path(corpus_dir) / "manifest.json").is_file():
-        return False
-    try:
-        manifest = json.loads((Path(corpus_dir) / "manifest.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
-    return manifest.get("schema") == _panel_corpus().PREPARED_SCHEMA and "long_context" in manifest.get("components", {})
-
-
 def _summarize_records(records: Sequence[LongContextRecord], *, source_kind: str, source_path: Path,
                        dataset_repo: str | None, dataset_revision: str | None) -> dict[str, Any]:
     by_split: dict[str, dict[str, int]] = {}
@@ -84,38 +71,32 @@ def _summarize_records(records: Sequence[LongContextRecord], *, source_kind: str
     }
 
 
+def panel_snapshot_dir(panel_revision: str | None = None) -> Path:
+    """Local HF-cache snapshot of the pinned panel (default v3); never downloads."""
+    from huggingface_hub import snapshot_download
+
+    repo, rev, _ = _panel_corpus().resolve_panel_policy(
+        panel_revision=panel_revision, components=("long_context",), full=False)
+    return Path(snapshot_download(repo, revision=rev, repo_type="dataset", local_files_only=True))
+
+
 def load_long_context_records(
-    source_dir: Path | str, *, checkpoint_dir: Path | str | None = None,
-    tokenizer: Any = None, splits: Sequence[str] = LONG_CONTEXT_EVAL_SPLITS,
+    panel_dir: Path | str, *, checkpoint_dir: Path | str | None = None, tokenizer: Any = None,
+    chat_kwargs: Mapping[str, Any] | None = None, panel_revision: str | None = None,
+    splits: Sequence[str] = LONG_CONTEXT_EVAL_SPLITS,
 ) -> tuple[list[LongContextRecord], dict[str, Any]]:
-    """Load full-length 16K/32K ``long_context`` records from a prepared corpus or staged bank."""
-    pc, root = _panel_corpus(), Path(source_dir).expanduser().resolve()
-    if not root.is_dir():
-        raise ValueError(f"long-context source directory missing: {root}")
+    """Render full-length 16K/32K ``long_context`` records from an attested panel snapshot.
 
-    if has_prepared_long_context(root):
-        manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-        ds = manifest.get("dataset", {})
-        records = [
-            LongContextRecord(str(row["id"]), sp, str(row.get("length_class", "unknown")),
-                              torch.tensor(row["input_ids"], dtype=torch.int64), pc.ids_sha256(row["input_ids"]))
-            for sp in splits if sp in manifest.get("splits", {})
-            for row in pc.load_component_records(root, sp, components=("long_context",))[0]
-        ]
-        if not records:
-            raise ValueError(f"prepared corpus at {root} has no long_context records in {tuple(splits)}")
-        return records, _summarize_records(records, source_kind="prepared_panel_corpus", source_path=root,
-                                           dataset_repo=ds.get("repo_id"), dataset_revision=ds.get("revision"))
-
-    trace_dir = root / "raw_traces" if (root / "raw_traces").is_dir() else root
-    json_files = sorted(p for p in trace_dir.iterdir() if p.is_file() and p.suffix == ".json")
-    if not json_files:
-        raise ValueError(f"no prepared panel_corpus or staged raw_traces/*.json found under {root}")
+    ``panel_corpus.read_panel`` verifies the snapshot against its pin; each record is
+    rendered once with the checkpoint's own template (``long_context_mode="full"``).
+    """
+    pc, root = _panel_corpus(), Path(panel_dir).expanduser().resolve()
+    panel = pc.read_panel(root, panel_revision=panel_revision, components=("long_context",), full=False)
 
     max_ctx = pc.max_context_from_config(Path(checkpoint_dir).resolve()) if checkpoint_dir is not None else None
     if tokenizer is None:
         if checkpoint_dir is None:
-            raise ValueError(f"checkpoint_dir or tokenizer is required to render staged traces from {root}")
+            raise ValueError("checkpoint_dir or tokenizer is required to render long_context records")
         from transformers import PreTrainedTokenizerFast
         ckpt = Path(checkpoint_dir).resolve()
         tokenizer = PreTrainedTokenizerFast.from_pretrained(ckpt, local_files_only=True)
@@ -124,24 +105,22 @@ def load_long_context_records(
                               or hashlib.sha256(tokenizer.chat_template.encode()).hexdigest() != pc.sha256_file(tpl)):
             raise ValueError(f"native tokenizer at {ckpt} did not load pinned chat_template.jinja")
 
-    grouped: dict[str, list[LongContextRecord]] = {sp: [] for sp in splits}
-    seen: set[str] = set()
-    for path in json_files:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        sp = pc.validate_long_context_record(raw)["split"]
-        if sp not in grouped:
+    records: list[LongContextRecord] = []
+    for sp in splits:
+        rows = panel["long_context_rows"].get(sp) or []
+        if not rows:
             continue
-        ids, meta = pc.render_long_context_record(raw, tokenizer, max_context=max_ctx)
-        if meta["id"] in seen:
-            raise ValueError(f"duplicate staged long_context record id: {meta['id']!r}")
-        seen.add(meta["id"])
-        grouped[sp].append(LongContextRecord(str(meta["id"]), sp, str(meta["length_class"]),
-                                             torch.tensor(ids, dtype=torch.int64), str(meta["input_ids_sha256"])))
-    records = [rec for sp in splits for rec in grouped[sp]]
+        flat, offsets, report = pc.tokenize_long_context_rows(
+            rows, tokenizer, chat_kwargs=chat_kwargs, max_context=max_ctx, mode="full")
+        for entry, a, b in zip(report["records"], offsets[:-1], offsets[1:], strict=True):
+            records.append(LongContextRecord(str(entry["id"]), sp, str(entry["length_class"]),
+                                             torch.tensor(flat[a:b].tolist(), dtype=torch.int64),
+                                             str(entry["input_ids_sha256"])))
     if not records:
-        raise ValueError(f"staged bank at {root} produced no long_context records in {tuple(splits)}")
-    return records, _summarize_records(records, source_kind="staged_long_context_bank", source_path=root,
-                                       dataset_repo=pc.PANEL_REPO, dataset_revision=None)
+        raise ValueError(f"panel at {root} has no long_context records in {tuple(splits)}")
+    ds = panel["dataset"]
+    return records, _summarize_records(records, source_kind="panel_corpus_full", source_path=root,
+                                       dataset_repo=ds["repo_id"], dataset_revision=ds["revision"])
 
 
 @dataclass

@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "quantization"))
 sys.path.insert(0, str(ROOT / "scripts/lib"))
 
 import mc_manifest
+import panel_corpus as pc
 from hy4_flash.forward import Layer, Model, reference
 from hy4_flash.qmla_capture import Hy4FlashCaptureAdapter
 from hy4_flash.qmla_run import (
@@ -30,11 +31,9 @@ from hy4_flash.qmla_run import (
 from qmla.measurement import _token_relative_squares
 from qmla import (
     DEFAULT_PROTECTION_POLICY,
-    DEFAULT_QMLA_PANEL_REVISION,
     PROTECTION_SCOPE,
     QMLA_BASE_COMPONENTS,
     QMLA_KNOWN_COMPONENTS,
-    QMLA_PANEL_REPO,
     FitConfig,
     MlaLayerGeometry,
     apply_rope_pair_transform,
@@ -65,7 +64,30 @@ from qmla import (
 )
 
 
-def _synthetic_panel_provenance(*, include_long_context: bool = False, rev: str = DEFAULT_QMLA_PANEL_REVISION) -> dict:
+V3, V2 = pc.V3_PANEL, pc.V2_PANEL
+HUB = Path.home() / ".cache/huggingface/hub"
+HY4F_SNAPSHOT = HUB / "models--tencent--Hy4-flash/snapshots/d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959"
+
+
+def _require(path: Path) -> Path:
+    if not path.is_dir():
+        pytest.skip(f"cached snapshot not available locally: {path}")
+    return path
+
+
+def _prepare_hy4f(out: Path, panel: pc.PanelPin, **kw) -> Path:
+    """Prepare a real panel_corpus corpus from a cached panel with the Hy4-flash tokenizer."""
+    pytest.importorskip("transformers")
+    from hy4_flash import prepare_corpus as hy4_corpus
+
+    src = _require(HY4F_SNAPSHOT)
+    corpus = _require(HUB / f"datasets--{panel.repo_id.replace('/', '--')}/snapshots/{panel.revision}")
+    pc.prepare_panel_corpus(src, corpus, out, source_repo="tencent/Hy4-flash", source_revision=src.name,
+                            chat_kwargs=hy4_corpus.CHAT, panel_revision=panel.revision, **kw)
+    return out
+
+
+def _synthetic_panel_provenance(*, include_long_context: bool = True, rev: str = V3.revision) -> dict:
     comps = {
         "agentic": {"sequences": 4, "tokens": 600, "input_ids_sha256": "1" * 64},
         "exl3_standard": {"sequences": 2, "tokens": 300, "input_ids_sha256": "2" * 64},
@@ -73,7 +95,7 @@ def _synthetic_panel_provenance(*, include_long_context: bool = False, rev: str 
     if include_long_context:
         comps["long_context"] = {"sequences": 2, "tokens": 32768, "input_ids_sha256": "3" * 64}
     return {
-        "dataset_repo": QMLA_PANEL_REPO,
+        "dataset_repo": pc.panel_pin(rev).repo_id,
         "dataset_revision": rev,
         "components": comps,
         "input_ids_sha256": "4" * 64,
@@ -191,55 +213,64 @@ def _make_skewed_hy4_bank(
     return config, model, layer, adapter, bank
 
 
-def test_panel_resolution_defaults_to_two_components_and_supports_known_long_context(tmp_path: Path):
-    """Amended Correction 1: default runs on agentic + exl3_standard; long_context accepted by revision; unknown rejected."""
-    from safetensors.torch import save_file
-
-    # Default resolves immediately to the two existing components at 54683731eb01c7c2fa5b801a0888e029a0e1b1c7.
-    repo, rev, comps = resolve_qmla_panel()
-    assert repo == QMLA_PANEL_REPO
-    assert rev == "54683731eb01c7c2fa5b801a0888e029a0e1b1c7"
-    assert comps == ("agentic", "exl3_standard") == QMLA_BASE_COMPONENTS
-
-    # Adding known third component `long_context` with a new panel revision succeeds.
-    repo3, rev3, comps3 = resolve_qmla_panel(
-        panel_revision="e" * 40, components=("agentic", "exl3_standard", "long_context")
-    )
-    assert repo3 == QMLA_PANEL_REPO and rev3 == "e" * 40 and comps3 == QMLA_KNOWN_COMPONENTS
-    assert parse_components_arg("agentic,exl3_standard") == ("agentic", "exl3_standard")
-    assert parse_components_arg("agentic,exl3_standard,long_context") == QMLA_KNOWN_COMPONENTS
-
-    # Arbitrary unknown component names are rejected (no pluggable arbitrary list).
-    with pytest.raises(ValueError, match="unknown QMLA corpus component"):
-        resolve_qmla_panel(components=("agentic", "exl3_standard", "custom_arbitrary"))
+def test_panel_resolution_via_panel_corpus_defaults_to_v3_three_components():
+    """QMLA resolves through panel_corpus: default v3 with all three; full requires all three; v2 frozen."""
+    assert resolve_qmla_panel() == (V3.repo_id, V3.revision, QMLA_KNOWN_COMPONENTS)
+    assert resolve_qmla_panel(panel_revision=V2.revision) == (V2.repo_id, V2.revision, QMLA_BASE_COMPONENTS)
+    assert parse_components_arg("long_context,agentic,exl3_standard") == QMLA_KNOWN_COMPONENTS
+    # A pilot may run the two base components on v3; a full run may not.
+    assert resolve_qmla_panel(components=QMLA_BASE_COMPONENTS, full=False)[2] == QMLA_BASE_COMPONENTS
+    with pytest.raises(ValueError, match="full calibration requires all three"):
+        resolve_qmla_panel(components=QMLA_BASE_COMPONENTS, full=True)
+    with pytest.raises(ValueError, match="unknown panel component"):
+        resolve_qmla_panel(components=("agentic", "exl3_standard", "custom_arbitrary"), full=False)
     with pytest.raises(ValueError, match="requires base components"):
-        resolve_qmla_panel(components=("agentic",))
+        resolve_qmla_panel(components=("agentic", "long_context"), full=False)
+    with pytest.raises(ValueError, match="unknown panel revision"):
+        resolve_qmla_panel(panel_revision="e" * 40)
 
-    # Direct hy4_flash.prepare_corpus output directory (manifest.json + calibration.safetensors) loads directly.
-    prep_dir = tmp_path / "prepared_v2"
-    prep_dir.mkdir()
-    g = torch.Generator().manual_seed(77)
-    rows = [torch.randint(10, 1000, (12 + i,), generator=g, dtype=torch.int64) for i in range(4)]
-    offsets = [0]
-    for r in rows:
-        offsets.append(offsets[-1] + int(r.numel()))
-    save_file(
-        {"input_ids": torch.cat(rows), "offsets": torch.tensor(offsets, dtype=torch.int64)},
-        str(prep_dir / "calibration.safetensors"),
-    )
-    (prep_dir / "manifest.json").write_text(
-        json.dumps({
-            "dataset": {"repo_id": QMLA_PANEL_REPO, "revision": DEFAULT_QMLA_PANEL_REVISION},
-            "components": {"agentic": {"count": 2}, "exl3_standard": {"count": 2}},
-        }),
-        encoding="utf-8",
-    )
-    recs, prov = load_pinned_qmla_corpus(prep_dir)
-    assert len(recs) == 4
-    assert prov["dataset_revision"] == DEFAULT_QMLA_PANEL_REVISION
-    assert sorted(prov["components"].keys()) == ["agentic", "exl3_standard"]
-    assert prov["components"]["agentic"]["sequences"] == 2
-    assert prov["components"]["exl3_standard"]["sequences"] == 2
+    parser = build_parser()
+    base = ["--checkpoint", "/x", "--source-revision", "a" * 40, "--output", "/y"]
+    full = resolve_run_settings(parser.parse_args(base), (0, 1))
+    assert (full["panel_revision"], full["components"], full["full"]) == (V3.revision, QMLA_KNOWN_COMPONENTS, True)
+    with pytest.raises(ValueError, match="full calibration requires all three"):
+        resolve_run_settings(parser.parse_args(base + ["--components", "agentic,exl3_standard"]), (0, 1))
+    pilot = resolve_run_settings(parser.parse_args(base + ["--pilot", "--components", "agentic,exl3_standard"]), (0, 1))
+    assert (pilot["components"], pilot["full"]) == (QMLA_BASE_COMPONENTS, False)
+
+
+def test_load_pinned_qmla_corpus_from_real_v3_and_v2_panels(tmp_path: Path):
+    """Fitting loads v3 windowed long_context through panel_corpus.load_component_records; v2 still loads."""
+    prep3 = _prepare_hy4f(tmp_path / "v3", V3)
+    manifest = json.loads((prep3 / "manifest.json").read_text())
+    recs, prov = load_pinned_qmla_corpus(prep3)
+    assert (prov["dataset_repo"], prov["dataset_revision"]) == (V3.repo_id, V3.revision)
+    assert list(prov["components"]) == list(QMLA_KNOWN_COMPONENTS)
+    for comp in QMLA_KNOWN_COMPONENTS:
+        info = manifest["components"][comp]
+        assert (prov["components"][comp]["sequences"], prov["components"][comp]["tokens"]) == (info["count"], info["tokens"])
+        assert prov["components"][comp]["input_ids_sha256"] == info["input_ids_sha256"]
+    assert prov["components"]["long_context"]["mode"] == "windowed"
+    lc = [t for sid, t in recs if sid.startswith("lc-")]
+    assert len(lc) == manifest["components"]["long_context"]["count"] and max(t.numel() for t in lc) == 2048
+    assert all("/" not in sid for sid, _ in recs) and len({sid for sid, _ in recs}) == len(recs)
+    # Heldout long_context never enters the fitting stream.
+    hold_ids = {s["id"] for s in manifest["components"]["long_context"]["heldout"]["sources"]}
+    assert not any(sid.split(":")[0] in hold_ids for sid, _ in recs)
+
+    # A full-length (QMLA eval) corpus never loads for fitting.
+    full_dir = _prepare_hy4f(tmp_path / "v3-full", V3, long_context_mode="full")
+    with pytest.raises(ValueError, match="mode 'full' differs from requested 'windowed'"):
+        load_pinned_qmla_corpus(full_dir)
+
+    # Frozen two-component v2 corpora still load and verify under their own pin.
+    prep2 = _prepare_hy4f(tmp_path / "v2", V2)
+    recs2, prov2 = load_pinned_qmla_corpus(prep2, panel_revision=V2.revision)
+    assert (prov2["dataset_repo"], prov2["dataset_revision"]) == (V2.repo_id, V2.revision)
+    assert list(prov2["components"]) == list(QMLA_BASE_COMPONENTS)
+    assert prov2["components"]["agentic"]["input_ids_sha256"] == prov["components"]["agentic"]["input_ids_sha256"]
+    with pytest.raises(ValueError, match="contract differs"):
+        load_pinned_qmla_corpus(prep2)
 
 
 def test_quantizer_rne_pack_unpack_bit_exact_and_record_sizes():
@@ -427,8 +458,8 @@ def test_attention_error_weights_tokens_equally():
     torch.testing.assert_close(err, (gains[:, 0] - 1).square())
 
 
-def test_hy4_flash_two_component_default_single_file_sidecar_mc_section_and_incremental_publish(tmp_path: Path):
-    """End-to-end cassowary path: 2-component default (agentic+exl3_standard), sink4_local128, single mla_calibration.safetensors + cuteafd-mc.json['qmla']."""
+def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_publish(tmp_path: Path):
+    """End-to-end cassowary path: v3 three-component default, sink4_local128, single mla_calibration.safetensors + cuteafd-mc.json['qmla']."""
     _, _, _, _, bank0 = _make_skewed_hy4_bank(201, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=24, shared_seed=9)
     _, _, _, _, bank5 = _make_skewed_hy4_bank(205, layer_id=5, d_c=64, d_r=64, seqs=4, base_seq_len=24, shared_seed=9)
 
@@ -444,8 +475,8 @@ def test_hy4_flash_two_component_default_single_file_sidecar_mc_section_and_incr
     assert resolved["layers"] == (0, 5)
     assert resolved["modes"] == tuple(parse_qmla_mode(m) for m in DEFAULT_FULL_MODES)
     assert len(resolved["modes"]) == 9
-    assert resolved["panel_revision"] == DEFAULT_QMLA_PANEL_REVISION
-    assert resolved["components"] == ("agentic", "exl3_standard")
+    assert resolved["panel_revision"] == V3.revision
+    assert resolved["components"] == QMLA_KNOWN_COMPONENTS
     assert resolved["protection"] == "sink4_local128"
     assert (resolved["train_sequences"], resolved["val_sequences"], resolved["test_sequences"]) == (16, 4, 4)
     full = resolve_run_settings(
@@ -475,7 +506,7 @@ def test_hy4_flash_two_component_default_single_file_sidecar_mc_section_and_incr
         output_dir=run_out,
         source=source,
         modes=modes,
-        corpus_provenance=_synthetic_panel_provenance(include_long_context=False),
+        corpus_provenance=_synthetic_panel_provenance(),
         fit_config=FitConfig(steps=6, val_every=3, seed=0, protection="sink4_local128", sink_tokens=2, recent_tokens=6),
         transfer_banks={"k8-compact": {0: bank0, 5: bank5}},
     )
@@ -539,10 +570,11 @@ def test_hy4_flash_two_component_default_single_file_sidecar_mc_section_and_incr
     assert manifest["protection_policy"] == "sink4_local128"
     assert manifest["protection_scope"] == PROTECTION_SCOPE
     assert sorted(manifest["supported_modes"]) == sorted(["4:0", "2:0", "0:4", "4:4", "2:4"])
-    assert manifest["calibration_provenance"]["dataset_revision"] == DEFAULT_QMLA_PANEL_REVISION
+    assert manifest["calibration_provenance"]["dataset_revision"] == V3.revision
     assert sorted(manifest["calibration_provenance"]["components"].keys()) == [
         "agentic",
         "exl3_standard",
+        "long_context",
     ]
 
     re_read = read_sidecar_manifest(sidecar_dir)
@@ -620,26 +652,12 @@ def test_hy4_flash_two_component_default_single_file_sidecar_mc_section_and_incr
 def test_long_context_recalibration_and_offline_fake_api_non_mc_incremental_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """3-component recalibration (new panel revision + long_context) + non-MC single-file publish."""
-    from safetensors.torch import save_file
+    """3-component v3 recalibration provenance + non-MC single-file publish."""
     import hub_lfs
     from qmla import publish as qmla_publish
 
-    corpus_dir = tmp_path / "panel_v3"
-    corpus_dir.mkdir()
-    g = torch.Generator().manual_seed(313)
-    for comp in ("agentic", "exl3_standard", "long_context"):
-        s0 = torch.randint(10, 1000, (12,), generator=g, dtype=torch.int64)
-        s1 = torch.randint(10, 1000, (15,), generator=g, dtype=torch.int64)
-        save_file(
-            {"input_ids": torch.cat((s0, s1)), "offsets": torch.tensor([0, 12, 27], dtype=torch.int64)},
-            str(corpus_dir / f"{comp}.safetensors"),
-        )
-    recs, prov = load_pinned_qmla_corpus(
-        corpus_dir, panel_revision="e" * 40, components=("agentic", "exl3_standard", "long_context")
-    )
-    assert len(recs) == 6
-    assert prov["dataset_revision"] == "e" * 40
+    prov = _synthetic_panel_provenance()
+    assert prov["dataset_revision"] == V3.revision
     assert sorted(prov["components"].keys()) == ["agentic", "exl3_standard", "long_context"]
 
     _, _, _, _, bank0 = _make_skewed_hy4_bank(317, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=20)

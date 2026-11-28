@@ -42,13 +42,14 @@ Before capturing any activation:
 ---
 
 ## 2. Calibration corpus (pinned panel revision + fixed known component set, never Standard Fidelity)
-Calibration draws deterministically from a pinned revision of `wrldsuksgo2mars/agentic-quant-panel-v2` over the fixed known component set `{agentic, exl3_standard, long_context}` (no arbitrary pluggable component list; never use the held-out Standard Fidelity panel):
-1. **Default pilot & full calibration (`agentic` + `exl3_standard` at `54683731eb01c7c2fa5b801a0888e029a0e1b1c7`):**
-   - `agentic`: rendered with **this checkpoint's own** tokenizer and chat template (matching `quantization/hy4_flash/prepare_corpus.py` and `brief-template.md` §3).
+`quantization/panel_corpus.py` owns the panel pin, component order, renderer and loader (`brief-template.md` §3). QMLA resolves the panel through `panel_corpus.resolve_panel_policy` (full = not `--pilot`) and never pins its own revision. Never use the held-out Standard Fidelity panel.
+1. **Default (full) calibration: `wrldsuksgo2mars/agentic-quant-panel-v3@e3ac6ee6126f469e37ddf879a6cb2dccc10c6c99`, all three components in order:**
+   - `agentic`: rendered with **this checkpoint's own** tokenizer and chat template.
    - `exl3_standard`: packed with this checkpoint's tokenizer (`exl3-standard-pack-v1`).
-   - Runs directly on a `hy4_flash.prepare_corpus` output directory (`manifest.json` + `calibration.safetensors`) or per-component `<name>.safetensors` files — do **not** block on `long_context`.
-2. **Later recalibration with `long_context`:**
-   - Once the new dataset revision carrying `long_context` (16K/32K traces, ~128K tokens per length class, plus agentic traces and long articles) lands, pass `--panel-revision <NEW_40_CHAR_SHA> --components agentic,exl3_standard,long_context` to exercise DSA top-k selection past 2,048 tokens.
+   - `long_context`: 16K/32K multi-turn traces rendered once with the checkpoint's template, cut into 2,048-token windows (`long_context_mode="windowed"`); heldout records never enter fitting.
+   - `--corpus-dir` is a `panel_corpus.prepare_panel_corpus` output (`python quantization/panel_corpus.py ...`), loaded and verified through `panel_corpus.load_component_records`. A full run with fewer than all three components fails closed.
+2. **Pilot:** `--pilot` may pass a subset with `--components` (always including `agentic` and `exl3_standard`).
+3. **Past runs:** `wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7` (two components) stays pinned for frozen reproductions via `--panel-revision 54683731eb01c7c2fa5b801a0888e029a0e1b1c7`.
 - The exact `dataset_repo`, `dataset_revision`, and components used are recorded explicitly in `calibration_provenance`.
 
 ---
@@ -118,7 +119,7 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
   **Always evaluate and report 2:0.**
 - **Error measurement:** every reported number is measured on the **held-out test sequences only**, against matched baselines (RTN, fixed Hadamard, SmoothQuant†), with `sink4_local128` protection on.
 - **K8 transfer check (MC checkpoints):** replay **only the held-out test sequences** through `k8-compact`. Apply the shipped BF16-calibrated transforms, and compare each combination against **K8's own 0:0 output**. Reuse those K8 captures across all nine combinations. The training and val sequences run on BF16 only.
-- **Long-context evaluation (optional `--long-eval`, 16K and 32K):** fitting stays at the current calibration sequence lengths. Run `--long-eval` after a fit, or standalone against an existing sidecar (`--long-eval --sidecar <sidecar-dir>`), over full-length 16K/32K `long_context` records loaded via `quantization/panel_corpus.py` (`heldout` and `calibration` splits, or the staged bank `~/.cache/cuteafd/builds/long-context-bank/` until published). Evaluation streams forward-only through the same 128-row tiled `eval_attention_output` (`tiled_sink_attention` with per-query `sink4_local128` protection) and compact DSA `SparseSelection` masks, recording `long_context_eval` in `qmla-validation-report.json`: overall and position-bucketed `attn_rel_err` (`0-2k`, `2k-4k`, `4k-8k`, `8k-16k`, `16k-32k`, `32k+`) for the shipped single transform per path alongside RTN and Hadamard, plus DSA selection drift (on Hy4-flash, structurally zero intra-layer because `compressed_indexer` reads only `x` and `q_norm`, never quantized MLA latents; cross-layer drift is out of scope).
+- **Long-context evaluation (optional `--long-eval`, 16K and 32K):** fitting stays at the current calibration sequence lengths. Run `--long-eval` after a fit, or standalone against an existing sidecar (`--long-eval --sidecar <sidecar-dir>`), over full-length 16K/32K `long_context` records rendered from the pinned v3 snapshot in the local HF cache through `quantization/panel_corpus.py` (`long_context_mode="full"`, `heldout` then `calibration` splits, same chat kwargs as the corpus). Evaluation streams forward-only through the same 128-row tiled `eval_attention_output` (`tiled_sink_attention` with per-query `sink4_local128` protection) and compact DSA `SparseSelection` masks, recording `long_context_eval` in `qmla-validation-report.json`: overall and position-bucketed `attn_rel_err` (`0-2k`, `2k-4k`, `4k-8k`, `8k-16k`, `16k-32k`, `32k+`) for the shipped single transform per path alongside RTN and Hadamard, plus DSA selection drift (on Hy4-flash, structurally zero intra-layer because `compressed_indexer` reads only `x` and `q_norm`, never quantized MLA latents; cross-layer drift is out of scope).
 - **Reporting:**
   - fitting time per layer, path and bit width;
   - test error per combination for (a) every per-width fit and SmoothQuant init (the cross-table) and (b) the shipped single transforms;
@@ -206,6 +207,6 @@ Follow `docs/quantization/brief-template.md` §12:
 - **RoPE / NoPE convention:** `<interleaved | split_half | unrotated_pe | none>`, `mrope_section=<...>`, `shared_consumers=<...>`
 - **Target modes:** `<e.g. 8:8,4:8,4:4,2:4,4:0,0:4,8:0,0:8,2:0 or 8:0,4:0,2:0 for pure NoPE>`
 - **Protection policy:** `sink4_local128` (default on full-history MLA layers; SWA untouched)
-- **Pinned corpus panel:** `wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7` (`agentic`, `exl3_standard`; later recalibration adds `long_context` via `--panel-revision <NEW_SHA> --components agentic,exl3_standard,long_context`)
+- **Pinned corpus panel:** from `quantization/panel_corpus.py`: `wrldsuksgo2mars/agentic-quant-panel-v3@e3ac6ee6126f469e37ddf879a6cb2dccc10c6c99` (`agentic`, `exl3_standard`, `long_context`; v2 only for past runs)
 - **Pilot configuration:** `--pilot` (`--layers <subset>`, all nine modes, `--train-sequences 16 --val-sequences 4 --test-sequences 4 --steps 100`)
 - **Artifact status target:** `calibrated_unqualified` (promote to `runtime_qualified` after runtime qualification in #2909 Phases 3–5)

@@ -11,12 +11,11 @@ served at every calibrated width):
   ``__metadata__["cuteafd_qmla"]`` header (written for BOTH MC and non-MC checkpoints so
   every sidecar file is self-describing and cross-checked).
 
-Corpus provenance uses the pinned HF dataset ``wrldsuksgo2mars/agentic-quant-panel-v2``
-(default revision ``54683731eb01c7c2fa5b801a0888e029a0e1b1c7``) over the fixed known
-component set ``{"agentic", "exl3_standard", "long_context"}`` (no pluggable arbitrary
-component list). Pilot and full runs calibrate immediately on ``agentic`` +
-``exl3_standard``; a later recalibration adds ``long_context`` by passing a new
-``--panel-revision`` and including ``long_context``.
+Corpus provenance uses the panel pin owned by ``quantization/panel_corpus.py``
+(default ``wrldsuksgo2mars/agentic-quant-panel-v3``, all three components
+``agentic``, ``exl3_standard``, ``long_context``), resolved through
+``panel_corpus.resolve_panel_policy``: a full run requires every component of its
+panel, a pilot may use a subset that keeps the two base components.
 """
 from __future__ import annotations
 
@@ -29,6 +28,8 @@ import struct
 from typing import Any, Mapping, Sequence
 
 import torch
+
+import panel_corpus as pc
 
 from .capture import (
     CapturedLayerBank,
@@ -59,14 +60,10 @@ QMLA_METADATA_KEY = "cuteafd_qmla"
 VALID_ARTIFACT_STATUSES = frozenset({"calibrated_unqualified", "runtime_qualified"})
 PROTECTION_SCOPE = "full_history_mla_only"
 
-# Pinned panel contract (matches quantization/hy4_flash/prepare_corpus.py).
-# Pilot and full runs default to agentic + exl3_standard at DEFAULT_QMLA_PANEL_REVISION;
-# a later recalibration adds "long_context" by updating --panel-revision (no arbitrary component list).
-QMLA_PANEL_REPO = "wrldsuksgo2mars/agentic-quant-panel-v2"
-DEFAULT_QMLA_PANEL_REVISION = "54683731eb01c7c2fa5b801a0888e029a0e1b1c7"
-QMLA_BASE_COMPONENTS = ("agentic", "exl3_standard")
+# The panel pin (repo, revision, components) lives in quantization/panel_corpus.py.
+QMLA_BASE_COMPONENTS = pc.BASE_COMPONENTS
 QMLA_OPTIONAL_COMPONENT = "long_context"
-QMLA_KNOWN_COMPONENTS = ("agentic", "exl3_standard", "long_context")
+QMLA_KNOWN_COMPONENTS = pc.COMPONENT_ORDER
 
 CANONICAL_CONVENTIONS = {
     "vector_layout": "row",
@@ -124,31 +121,19 @@ def _sha256_bytes(data: bytes) -> str:
 
 def resolve_qmla_panel(
     *,
-    panel_revision: str = DEFAULT_QMLA_PANEL_REVISION,
-    components: Sequence[str] = QMLA_BASE_COMPONENTS,
+    panel_revision: str | None = None,
+    components: Sequence[str] | None = None,
+    full: bool = True,
 ) -> tuple[str, str, tuple[str, ...]]:
-    """Validate and resolve the pinned QMLA panel revision and fixed known components.
+    """Resolve ``(dataset_repo, dataset_revision, components)`` via ``panel_corpus.resolve_panel_policy``.
 
-    Always requires the two base components (``agentic``, ``exl3_standard``) and
-    optionally allows ``long_context`` (never arbitrary unknown component names).
-    Returns ``(dataset_repo, dataset_revision, canonical_components_tuple)``.
+    Defaults to the panel_corpus pin with all its components. ``full`` (not pilot)
+    requires every component of the panel; QMLA always requires the two base components.
     """
-    if not _is_hex(panel_revision, 40):
-        raise ValueError(f"panel_revision must be a 40-char lowercase commit SHA, got {panel_revision!r}")
-    seen: list[str] = []
-    for name in components:
-        if not isinstance(name, str) or name not in QMLA_KNOWN_COMPONENTS:
-            raise ValueError(
-                f"unknown QMLA corpus component {name!r}; allowed known components are {QMLA_KNOWN_COMPONENTS}"
-            )
-        if name not in seen:
-            seen.append(name)
-    if not set(QMLA_BASE_COMPONENTS) <= set(seen):
-        raise ValueError(
-            f"QMLA calibration requires base components {QMLA_BASE_COMPONENTS}; got {tuple(seen)}"
-        )
-    ordered = tuple(c for c in QMLA_KNOWN_COMPONENTS if c in seen)
-    return QMLA_PANEL_REPO, panel_revision, ordered
+    repo, rev, ordered = pc.resolve_panel_policy(panel_revision=panel_revision, components=components, full=full)
+    if not set(QMLA_BASE_COMPONENTS) <= set(ordered):
+        raise ValueError(f"QMLA calibration requires base components {QMLA_BASE_COMPONENTS}; got {ordered}")
+    return repo, rev, ordered
 
 
 def _validate_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:

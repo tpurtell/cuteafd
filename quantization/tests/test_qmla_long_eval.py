@@ -23,12 +23,10 @@ from hy4_flash.qmla_run import (
     calibrate_hy4_flash_from_banks,
     run_hy4_flash_long_eval,
 )
+import panel_corpus as pc
 from qmla import (
     DEFAULT_POSITION_BUCKETS,
-    DEFAULT_QMLA_PANEL_REVISION,
-    DEFAULT_STAGED_LONG_CONTEXT_DIR,
     LONG_EVAL_SCHEMA,
-    QMLA_PANEL_REPO,
     CapturedLayerParams,
     CapturedSequence,
     FitConfig,
@@ -186,10 +184,11 @@ def _synthetic_sparse_bank(seed: int, *, seq_len: int = 261, candidate_topk: int
     adapter = Hy4FlashCaptureAdapter(model)
     inputs = [(f"seq_{i:02d}", torch.randn(seq_len + (i % 5), hidden, generator=g), None) for i in range(6)]
     prov = {
-        "dataset_repo": QMLA_PANEL_REPO, "dataset_revision": DEFAULT_QMLA_PANEL_REVISION,
+        "dataset_repo": pc.V3_PANEL.repo_id, "dataset_revision": pc.V3_PANEL.revision,
         "components": {
             "agentic": {"sequences": 4, "tokens": 600, "input_ids_sha256": "1" * 64},
             "exl3_standard": {"sequences": 2, "tokens": 300, "input_ids_sha256": "2" * 64},
+            "long_context": {"sequences": 2, "tokens": 4096, "input_ids_sha256": "3" * 64},
         },
         "input_ids_sha256": "4" * 64,
     }
@@ -376,10 +375,11 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
     adapter = Hy4FlashCaptureAdapter(Model(reader), include_swa=False)
     cal_inputs = [(f"cal_{i:02d}", torch.randn(36 + (i % 3), hidden, generator=g), None) for i in range(4)]
     prov = {
-        "dataset_repo": QMLA_PANEL_REPO, "dataset_revision": DEFAULT_QMLA_PANEL_REVISION,
+        "dataset_repo": pc.V3_PANEL.repo_id, "dataset_revision": pc.V3_PANEL.revision,
         "components": {
             "agentic": {"sequences": 2, "tokens": 72, "input_ids_sha256": "1" * 64},
             "exl3_standard": {"sequences": 2, "tokens": 74, "input_ids_sha256": "2" * 64},
+            "long_context": {"sequences": 2, "tokens": 4096, "input_ids_sha256": "3" * 64},
         },
         "input_ids_sha256": "4" * 64,
     }
@@ -425,71 +425,52 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
     attach_long_context_eval(standalone_dir, long_eval, manifest=manifest)
     assert json.loads((standalone_dir / "qmla-validation-report.json").read_text())["long_context_eval"] == long_eval
 
-    from hy4_flash.qmla_run import _resolve_long_context_source
-    assert _resolve_long_context_source(tmp_path) == DEFAULT_STAGED_LONG_CONTEXT_DIR
-
     parser = build_parser()
     args = parser.parse_args(["--checkpoint", str(tmp_path), "--source-revision", "a" * 40,
                               "--output", str(standalone_dir), "--long-eval", "--sidecar", str(cal_res["sidecar_dir"])])
     assert args.long_eval is True and args.sidecar == Path(cal_res["sidecar_dir"])
 
 
-def test_load_long_context_records_prepared_and_staged(tmp_path: Path):
-    """Verify full-length loading from prepared panel_corpus dir and staged bank on disk."""
-    import panel_corpus
-    from safetensors.torch import save_file
+HUB = Path.home() / ".cache/huggingface/hub"
+HY4F_SNAPSHOT = HUB / "models--tencent--Hy4-flash/snapshots/d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959"
 
-    prep = tmp_path / "prepared"
-    prep.mkdir()
-    g = torch.Generator().manual_seed(709)
-    cal_ids = torch.randint(10, 500, (40,), generator=g, dtype=torch.int64).tolist()
-    hold_ids = torch.randint(10, 500, (45,), generator=g, dtype=torch.int64).tolist()
 
-    def _write_split(name: str, rec_id: str, lclass: str, ids: list[int]) -> dict:
-        path = prep / f"{name}.safetensors"
-        save_file({"input_ids": torch.tensor(ids, dtype=torch.int64), "offsets": torch.tensor([0, len(ids)], dtype=torch.int64)}, str(path))
-        stream = panel_corpus.canonical({"id": rec_id, "input_ids": ids}) + b"\n"
-        return {
-            "file": f"{name}.safetensors", "sha256": panel_corpus.sha256_file(path),
-            "count": 1, "tokens": len(ids), "shortest": len(ids), "longest": len(ids),
-            "token_stream_sha256": hashlib.sha256(stream).hexdigest(),
-            "records": [{"id": rec_id, "component": "long_context", "length_class": lclass,
-                         "tokens": len(ids), "input_ids_sha256": panel_corpus.ids_sha256(ids)}],
-        }
+def test_long_eval_records_full_length_from_v3_panel(tmp_path: Path):
+    """--long-eval renders full-length v3 long_context records through panel_corpus (no staged fallback)."""
+    pytest.importorskip("transformers")
+    from hy4_flash import prepare_corpus as hy4_corpus
+    from hy4_flash.qmla_run import LONG_EVAL_CHAT, load_long_eval_records
+    from qmla import panel_snapshot_dir
 
-    manifest = {
-        "schema": panel_corpus.PREPARED_SCHEMA, "status": "passed",
-        "dataset": {"repo_id": panel_corpus.PANEL_REPO, "revision": "e" * 40},
-        "component_order": ["long_context"], "calibration_mode": "subset",
-        "tokenizer": {"vocab_size": 1000, "max_context": 131072},
-        "components": {"long_context": {
-            "schema": panel_corpus.LONG_CONTEXT_SCHEMA, "count": 1, "tokens": len(cal_ids),
-            "input_ids_sha256": panel_corpus.component_input_ids_sha256([cal_ids]),
-            "heldout": {"count": 1, "tokens": len(hold_ids), "input_ids_sha256": panel_corpus.component_input_ids_sha256([hold_ids])},
-        }},
-        "splits": {
-            "calibration": _write_split("calibration", "lc-16k-cal-01", "16k", cal_ids),
-            "heldout": _write_split("heldout", "lc-32k-hold-01", "32k", hold_ids),
-        },
-    }
-    (prep / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    v3 = HUB / f"datasets--wrldsuksgo2mars--agentic-quant-panel-v3/snapshots/{pc.V3_PANEL.revision}"
+    if not v3.is_dir() or not HY4F_SNAPSHOT.is_dir():
+        pytest.skip("cached v3 panel or Hy4-flash snapshot not available locally")
+    assert panel_snapshot_dir().name == pc.V3_PANEL.revision
 
-    records, meta = load_long_context_records(prep)
-    assert meta["source_kind"] == "prepared_panel_corpus"
-    assert [(r.seq_id, r.split, r.length_class, int(r.input_ids.numel())) for r in records] == [
-        ("lc-32k-hold-01", "heldout", "32k", 45), ("lc-16k-cal-01", "calibration", "16k", 40),
-    ]
+    records, meta = load_long_eval_records(HY4F_SNAPSHOT, None)
+    assert meta["source_kind"] == "panel_corpus_full"
+    assert (meta["dataset_repo"], meta["dataset_revision"]) == (pc.V3_PANEL.repo_id, pc.V3_PANEL.revision)
+    assert [(k, meta["splits"][k]["sequences"]) for k in ("heldout", "calibration")] == [("heldout", 4), ("calibration", 12)]
+    assert {k: v["sequences"] for k, v in meta["length_classes"].items()} == {"16k": 10, "32k": 6}
+    assert [r.split for r in records] == ["heldout"] * 4 + ["calibration"] * 12
+    for r in records:
+        lo, hi = pc.LONG_CONTEXT_LENGTH_BOUNDS[r.length_class]
+        assert lo <= r.input_ids.numel() <= hi and r.input_ids_sha256 == pc.ids_sha256(r.input_ids.tolist())
 
-    # Also verify real on-disk staged records when present alongside tokenizer dependencies.
-    ckpt = Path("/mnt/sparknest/hf-home/hub/models--tencent--Hy4-flash/snapshots/d88c9dfd96ba4f2e6b92adba0b8e8f1c8696f959")
-    if (DEFAULT_STAGED_LONG_CONTEXT_DIR / "raw_traces").is_dir() and ckpt.is_dir():
-        try:
-            from transformers import PreTrainedTokenizerFast  # noqa: F401
-        except ImportError:
-            return
-        s_recs, s_meta = load_long_context_records(DEFAULT_STAGED_LONG_CONTEXT_DIR, checkpoint_dir=ckpt)
-        assert s_meta["source_kind"] == "staged_long_context_bank"
-        assert "heldout" in s_meta["splits"] and "calibration" in s_meta["splits"]
-        assert "16k" in s_meta["length_classes"] and "32k" in s_meta["length_classes"]
-        assert all(int(r.input_ids.numel()) >= 11_468 for r in s_recs)
-        assert any(int(r.input_ids.numel()) >= 22_937 for r in s_recs)
+    # Exactly the records a full-mode panel_corpus preparation stores (same renderer and chat kwargs).
+    chat = dict(hy4_corpus.CHAT)
+    assert {k: chat[k] for k in LONG_EVAL_CHAT} == LONG_EVAL_CHAT
+    out = tmp_path / "full"
+    pc.prepare_panel_corpus(HY4F_SNAPSHOT, v3, out, source_repo="tencent/Hy4-flash", source_revision=HY4F_SNAPSHOT.name,
+                            chat_kwargs=chat, components=("long_context",), full=False, long_context_mode="full")
+    for sp in ("heldout", "calibration"):
+        rows, _ = pc.load_component_records(out, sp, components=("long_context",), long_context_mode="full")
+        mine = [r for r in records if r.split == sp]
+        assert [r.seq_id for r in mine] == [w["id"] for w in rows]
+        assert all(r.input_ids.tolist() == w["input_ids"] for r, w in zip(mine, rows))
+
+    # A v2 snapshot has no long_context and fails closed.
+    v2 = HUB / f"datasets--wrldsuksgo2mars--agentic-quant-panel-v2/snapshots/{pc.V2_PANEL.revision}"
+    if v2.is_dir():
+        with pytest.raises(ValueError, match="not present in two-component"):
+            load_long_eval_records(HY4F_SNAPSHOT, pc.V2_PANEL.revision)

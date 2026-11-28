@@ -10,15 +10,13 @@ produces every reported attention error. The sidecar ships ONE content and ONE R
 transform per layer, chosen on ``val`` across every combination; the report also keeps
 the per-width fits' test errors and the full candidate cross-table for analysis.
 
-Corpus contract (amended Correction 1): defaults to the TWO existing components
-``agentic`` + ``exl3_standard`` from
-``wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7``
-(matching ``quantization/hy4_flash/prepare_corpus.py``), and accepts ``long_context``
-later via ``--panel-revision <NEW_SHA> --components agentic,exl3_standard,long_context``
-over the fixed known component set ``{agentic, exl3_standard, long_context}``
-(no arbitrary pluggable component list). Works directly on ``prepare_corpus.py`` output
-directories (``manifest.json`` + ``calibration.safetensors``) or per-component
-``<component>.safetensors`` files.
+Corpus contract: ``quantization/panel_corpus.py`` owns the panel pin. The default is
+``wrldsuksgo2mars/agentic-quant-panel-v3`` with all three components (``agentic``,
+``exl3_standard``, ``long_context``); a full run requires all three, a pilot may pass a
+subset with ``--components``. ``--corpus-dir`` is a ``panel_corpus.prepare_panel_corpus``
+output (windowed ``long_context``, 2,048-token windows), loaded and verified through
+``panel_corpus.load_component_records``. ``--long-eval`` renders full-length 16K/32K
+``long_context`` records from the pinned panel snapshot in the local HF cache.
 
 Protection default (Correction 2): ``--protection sink4_local128`` is enabled by
 default on full-history MLA layers only (Hy4-flash's 30 SWA-512 layers are untouched).
@@ -71,11 +69,10 @@ from qmla.fit import (
     save_fit_checkpoint,
 )
 from qmla.long_eval import (
-    DEFAULT_STAGED_LONG_CONTEXT_DIR,
     LongContextEvaluator,
     LongContextRecord,
-    has_prepared_long_context,
     load_long_context_records,
+    panel_snapshot_dir,
 )
 from qmla.measurement import (
     SELECTION_OBJECTIVE,
@@ -90,10 +87,8 @@ from qmla.measurement import (
     with_equivalence,
 )
 from qmla.quantizer import parse_qmla_mode
+import panel_corpus
 from qmla.sidecar import (
-    DEFAULT_QMLA_PANEL_REVISION,
-    QMLA_BASE_COMPONENTS,
-    QMLA_KNOWN_COMPONENTS,
     load_sidecar_transforms,
     resolve_qmla_panel,
     validate_sidecar,
@@ -101,6 +96,7 @@ from qmla.sidecar import (
 )
 
 from . import forward as hy4_forward
+from . import prepare_corpus as hy4_corpus
 from . import recipe as hy4_recipe
 from .qmla_capture import Hy4FlashCaptureAdapter
 
@@ -140,9 +136,9 @@ def parse_modes_arg(spec: str) -> tuple[tuple[int, int], ...]:
 
 
 def parse_components_arg(spec: str) -> tuple[str, ...]:
-    """Parse comma-separated component names strictly against QMLA_KNOWN_COMPONENTS."""
+    """Parse comma-separated component names into canonical panel order (full check is separate)."""
     raw = [part.strip() for part in spec.split(",") if part.strip()]
-    _, _, ordered = resolve_qmla_panel(components=raw)
+    _, _, ordered = resolve_qmla_panel(components=raw, full=False)
     return ordered
 
 
@@ -175,192 +171,34 @@ def parse_layers_arg(spec: str, available_layers: Sequence[int]) -> tuple[int, .
     return tuple(sorted(layers))
 
 
-def _load_one_component_file(
-    corpus_dir: Path,
-    comp_name: str,
-    *,
-    max_sequences: int | None = None,
-) -> tuple[list[tuple[str, torch.Tensor]], dict[str, Any]]:
-    from safetensors.torch import load_file
-
-    candidates = (
-        corpus_dir / f"{comp_name}.safetensors",
-        corpus_dir / comp_name / "calibration.safetensors",
-    )
-    st_path = next((p for p in candidates if p.is_file()), None)
-    if st_path is None:
-        raise ValueError(
-            f"pinned QMLA corpus component {comp_name!r} missing under {corpus_dir} "
-            f"(expected {comp_name}.safetensors or {comp_name}/calibration.safetensors)"
-        )
-
-    data = load_file(str(st_path))
-    if "input_ids" not in data or "offsets" not in data:
-        raise ValueError(f"corpus component {comp_name!r} must contain input_ids and offsets tensors")
-    ids = data["input_ids"].to(torch.int64).contiguous()
-    offsets = data["offsets"].to(torch.int64).contiguous().tolist()
-    if len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != int(ids.numel()):
-        raise ValueError(f"corpus component {comp_name!r} has malformed offsets")
-
-    records: list[tuple[str, torch.Tensor]] = []
-    hasher = hashlib.sha256()
-    limit = len(offsets) - 1 if max_sequences is None else min(len(offsets) - 1, max_sequences)
-    total_tokens = 0
-    for idx in range(limit):
-        seq = ids[offsets[idx] : offsets[idx + 1]]
-        if seq.numel() == 0:
-            continue
-        seq_id = f"{comp_name}:{idx:05d}"
-        records.append((seq_id, seq))
-        hasher.update(seq.numpy().tobytes())
-        total_tokens += int(seq.numel())
-    if not records:
-        raise ValueError(f"corpus component {comp_name!r} produced zero non-empty sequences")
-
-    return records, {
-        "sequences": len(records),
-        "tokens": total_tokens,
-        "input_ids_sha256": hasher.hexdigest(),
-    }
-
-
-def _load_prepared_combined_corpus(
-    corpus_dir: Path,
-    *,
-    dataset_repo: str,
-    dataset_revision: str,
-    component_names: Sequence[str],
-    max_sequences_per_component: int | None = None,
-) -> tuple[list[tuple[str, torch.Tensor]], dict[str, dict[str, Any]]]:
-    """Load directly from a ``hy4_flash.prepare_corpus`` output directory (manifest.json + calibration.safetensors)."""
-    from safetensors.torch import load_file
-
-    manifest_path = corpus_dir / "manifest.json"
-    cal_path = corpus_dir / "calibration.safetensors"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    ds = manifest.get("dataset", {})
-    if ds.get("repo_id") != dataset_repo or ds.get("revision") != dataset_revision:
-        raise ValueError(
-            f"prepared corpus dataset mismatch: found {ds.get('repo_id')}@{ds.get('revision')}, "
-            f"expected {dataset_repo}@{dataset_revision}"
-        )
-    manifest_comps = manifest.get("components", {})
-    for comp in component_names:
-        if comp not in manifest_comps:
-            raise ValueError(
-                f"prepared corpus manifest at {corpus_dir} does not contain requested component {comp!r} "
-                f"(present: {sorted(manifest_comps)})"
-            )
-
-    data = load_file(str(cal_path))
-    ids = data["input_ids"].to(torch.int64).contiguous()
-    offsets = data["offsets"].to(torch.int64).contiguous().tolist()
-    total_rows = len(offsets) - 1
-    if len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != int(ids.numel()):
-        raise ValueError(f"prepared corpus {cal_path} has malformed offsets")
-
-    # Component spans in prepare_corpus.py order: agentic, exl3_standard, optional long_context.
-    all_records: list[tuple[str, torch.Tensor]] = []
-    components_meta: dict[str, dict[str, Any]] = {}
-    cursor = 0
-    for comp in QMLA_KNOWN_COMPONENTS:
-        if comp not in manifest_comps:
-            continue
-        count = int(manifest_comps[comp]["count"])
-        end = cursor + count
-        if end > total_rows:
-            raise ValueError(f"prepared corpus component {comp!r} count exceeds calibration.safetensors rows")
-        if comp in component_names:
-            limit = count if max_sequences_per_component is None else min(count, max_sequences_per_component)
-            hasher = hashlib.sha256()
-            comp_seqs = 0
-            comp_tokens = 0
-            for local_idx in range(limit):
-                row_idx = cursor + local_idx
-                seq = ids[offsets[row_idx] : offsets[row_idx + 1]]
-                if seq.numel() == 0:
-                    continue
-                all_records.append((f"{comp}:{local_idx:05d}", seq))
-                hasher.update(seq.numpy().tobytes())
-                comp_seqs += 1
-                comp_tokens += int(seq.numel())
-            if comp_seqs == 0:
-                raise ValueError(f"prepared corpus component {comp!r} produced zero non-empty sequences")
-            components_meta[comp] = {
-                "sequences": comp_seqs,
-                "tokens": comp_tokens,
-                "input_ids_sha256": hasher.hexdigest(),
-            }
-        cursor = end
-
-    return all_records, components_meta
-
-
 def load_pinned_qmla_corpus(
     corpus_dir: Path | str,
     *,
-    panel_revision: str = DEFAULT_QMLA_PANEL_REVISION,
-    components: Sequence[str] = QMLA_BASE_COMPONENTS,
-    max_sequences_per_component: int | None = None,
+    panel_revision: str | None = None,
+    components: Sequence[str] | None = None,
+    full: bool = True,
 ) -> tuple[list[tuple[str, torch.Tensor]], dict[str, Any]]:
-    """Load requested known components from the pinned ``agentic-quant-panel-v2`` revision.
+    """Load a prepared ``panel_corpus`` calibration split through ``load_component_records``.
 
-    Defaults to ``agentic`` + ``exl3_standard`` at ``54683731eb01c7c2fa5b801a0888e029a0e1b1c7``
-    (does not fail closed on missing ``long_context``). Accepts ``long_context`` when passed
-    explicitly with the updated ``panel_revision``. Supports both ``hy4_flash.prepare_corpus``
-    directories (``manifest.json`` + ``calibration.safetensors``) and per-component
-    ``<component>.safetensors`` files.
+    The panel resolves through ``panel_corpus.resolve_panel_policy`` (default v3, all three
+    components; ``full`` requires every component). The prepared corpus must carry exactly
+    the pinned dataset identity; ``long_context`` arrives as 2,048-token windows.
     """
     dataset_repo, dataset_revision, component_names = resolve_qmla_panel(
-        panel_revision=panel_revision,
-        components=components,
+        panel_revision=panel_revision, components=components, full=full)
+    pin = panel_corpus.panel_pin(dataset_revision)
+    rows, prov = panel_corpus.load_component_records(
+        corpus_dir, "calibration", components=component_names, full=full, long_context_mode="windowed",
+        dataset=dict(repo_id=pin.repo_id, revision=pin.revision, sha256sums_sha256=pin.sha256sums_sha256),
     )
-    corpus_dir = Path(corpus_dir)
-    if not corpus_dir.is_dir():
-        raise ValueError(f"prepared QMLA corpus directory missing: {corpus_dir}")
-
-    has_per_component = all(
-        (corpus_dir / f"{c}.safetensors").is_file() or (corpus_dir / c / "calibration.safetensors").is_file()
-        for c in component_names
-    )
-    if has_per_component:
-        all_records: list[tuple[str, torch.Tensor]] = []
-        components_meta: dict[str, dict[str, Any]] = {}
-        for comp_name in component_names:
-            recs, meta = _load_one_component_file(
-                corpus_dir, comp_name, max_sequences=max_sequences_per_component
-            )
-            all_records.extend(recs)
-            components_meta[comp_name] = meta
-    elif (corpus_dir / "manifest.json").is_file() and (corpus_dir / "calibration.safetensors").is_file():
-        all_records, components_meta = _load_prepared_combined_corpus(
-            corpus_dir,
-            dataset_repo=dataset_repo,
-            dataset_revision=dataset_revision,
-            component_names=component_names,
-            max_sequences_per_component=max_sequences_per_component,
-        )
-    else:
-        # Delegate to per-component loader to report the exact missing component path.
-        all_records = []
-        components_meta = {}
-        for comp_name in component_names:
-            recs, meta = _load_one_component_file(
-                corpus_dir, comp_name, max_sequences=max_sequences_per_component
-            )
-            all_records.extend(recs)
-            components_meta[comp_name] = meta
-
-    combined_sha = hashlib.sha256(
-        "\n".join(f"{k}:{components_meta[k]['input_ids_sha256']}" for k in sorted(components_meta)).encode("utf-8")
-    ).hexdigest()
-    corpus_provenance = {
-        "dataset_repo": dataset_repo,
-        "dataset_revision": dataset_revision,
-        "components": components_meta,
-        "input_ids_sha256": combined_sha,
+    # Capture seq_ids may not contain "/" (exl3_standard/000, lc-16k-cal-01/w00).
+    records = [(row["id"].replace("/", ":"), torch.tensor(row["input_ids"], dtype=torch.int64)) for row in rows]
+    return records, {
+        "dataset_repo": prov["dataset_repo"],
+        "dataset_revision": prov["dataset_revision"],
+        "components": prov["components"],
+        "input_ids_sha256": prov["input_ids_sha256"],
     }
-    return all_records, corpus_provenance
 
 
 def split_identity(banks: Mapping[int, CapturedLayerBank]) -> dict[str, Any]:
@@ -668,17 +506,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--corpus-dir",
         type=Path,
         default=None,
-        help="Prepared corpus dir (hy4_flash.prepare_corpus output or per-component safetensors)",
+        help="Prepared panel_corpus dir (prepare_panel_corpus output, windowed long_context)",
     )
     parser.add_argument(
         "--panel-revision",
-        default=DEFAULT_QMLA_PANEL_REVISION,
-        help="Pinned 40-char revision of wrldsuksgo2mars/agentic-quant-panel-v2",
+        default=None,
+        help="Pinned panel revision from panel_corpus (default: agentic-quant-panel-v3)",
     )
     parser.add_argument(
         "--components",
-        default=",".join(QMLA_BASE_COMPONENTS),
-        help="Known panel components: agentic,exl3_standard (default) or agentic,exl3_standard,long_context",
+        default=None,
+        help="Panel components (default: all of the panel's; a full run requires all of them)",
     )
     parser.add_argument("--output", type=Path, required=True, help="Task output/work directory on root NVMe")
     parser.add_argument("--pilot", action="store_true",
@@ -725,7 +563,12 @@ def resolve_run_settings(args: argparse.Namespace, eligible_layers: Sequence[int
 
     layers = parse_layers_arg(args.layers or default_layers, eligible_layers)
     modes = parse_modes_arg(args.modes or default_modes)
-    components = parse_components_arg(args.components)
+    full = not args.pilot
+    _, panel_revision, components = resolve_qmla_panel(
+        panel_revision=args.panel_revision,
+        components=None if args.components is None else parse_components_arg(args.components),
+        full=full,
+    )
     train_n = default_train if args.train_sequences is None else int(args.train_sequences)
     val_n = default_val if args.val_sequences is None else int(args.val_sequences)
     test_n = default_test if args.test_sequences is None else int(args.test_sequences)
@@ -733,8 +576,9 @@ def resolve_run_settings(args: argparse.Namespace, eligible_layers: Sequence[int
     return {
         "layers": layers,
         "modes": modes,
-        "panel_revision": args.panel_revision,
+        "panel_revision": panel_revision,
         "components": components,
+        "full": full,
         "protection": args.protection,
         "train_sequences": train_n,
         "val_sequences": val_n,
@@ -991,11 +835,14 @@ def attach_long_context_eval(
     return report
 
 
-def _resolve_long_context_source(corpus_dir: Path | None) -> Path:
-    if has_prepared_long_context(corpus_dir):
-        assert corpus_dir is not None
-        return corpus_dir
-    return DEFAULT_STAGED_LONG_CONTEXT_DIR
+# Long-context evaluation renders with the same chat kwargs as the calibration corpus.
+LONG_EVAL_CHAT = {k: hy4_corpus.CHAT[k] for k in ("reasoning_effort", "date_string")}
+
+
+def load_long_eval_records(checkpoint: Path, panel_revision: str | None):
+    """Full-length v3 ``long_context`` records (heldout, then calibration) for ``--long-eval``."""
+    return load_long_context_records(panel_snapshot_dir(panel_revision), checkpoint_dir=checkpoint,
+                                     chat_kwargs=LONG_EVAL_CHAT, panel_revision=panel_revision)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1033,8 +880,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         long_layers = parse_layers_arg(args.layers, eligible) if args.layers else None
         long_modes = parse_modes_arg(args.modes) if args.modes else None
-        long_source = _resolve_long_context_source(args.corpus_dir)
-        long_records, long_corpus_meta = load_long_context_records(long_source, checkpoint_dir=checkpoint)
+        long_records, long_corpus_meta = load_long_eval_records(checkpoint, args.panel_revision)
         long_eval = run_hy4_flash_long_eval(
             adapter,
             sidecar_path=args.sidecar,
@@ -1076,6 +922,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.corpus_dir,
             panel_revision=resolved["panel_revision"],
             components=resolved["components"],
+            full=resolved["full"],
         )
     split_counts = {f"{name}_count": resolved[f"{name}_sequences"] for name in SPLIT_NAMES}
     if args.reuse_captures is not None:
@@ -1127,8 +974,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if args.long_eval:
         del banks
-        long_source = _resolve_long_context_source(args.corpus_dir)
-        long_records, long_corpus_meta = load_long_context_records(long_source, checkpoint_dir=checkpoint)
+        long_records, long_corpus_meta = load_long_eval_records(checkpoint, resolved["panel_revision"])
         long_eval = run_hy4_flash_long_eval(
             adapter,
             sidecar_path=result["sidecar_dir"],
