@@ -249,7 +249,20 @@ impl<'a> Programs<'a> {
     /// exporter manifest, rejecting any disagreement with the native table.
     /// Images built before the rename ship the manifest as DSV4_PROGRAMS.json;
     /// a missing PROGRAMS.json falls back to that name beside it.
-    pub fn with_manifest(mut self, path: &Path) -> Result<Self> {
+    pub fn with_manifest(self, path: &Path) -> Result<Self> {
+        self.with_manifest_resolving(path, None)
+    }
+
+    /// [`Self::with_manifest`] resolving card plans for an explicit runtime SM count
+    /// instead of the current device's: build-time checks run in CPU-only containers
+    /// with no GPU, and validate every card plan rather than the installed card's.
+    pub fn with_manifest_for_sms(self, path: &Path, sms: usize) -> Result<Self> {
+        self.with_manifest_resolving(path, Some(sms))
+    }
+
+    /// Card plans resolve for `sms`, or for the current device's SM count (queried only
+    /// when the manifest carries card plans).
+    fn with_manifest_resolving(mut self, path: &Path, sms: Option<usize>) -> Result<Self> {
         let fallback = path.with_file_name("DSV4_PROGRAMS.json");
         let path = if !path.exists() && path.file_name() == Some("PROGRAMS.json".as_ref()) && fallback.exists() {
             fallback.as_path()
@@ -259,8 +272,9 @@ impl<'a> Programs<'a> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let mut manifest: serde_json::Value = serde_json::from_str(&text)?;
         if manifest["programs"].as_array().is_some_and(|programs| programs.iter().any(|p| p.get("card_plans").is_some())) {
+            let sms = match sms { Some(sms) => sms, None => self.library.sm_count()? };
             cuteafd_core::coordinator_programs::select_card_plans(&mut manifest,
-                self.library.sm_count()?.try_into().context("runtime SM count exceeds u32")?)?;
+                sms.try_into().context("runtime SM count exceeds u32")?)?;
         }
         self.capacities = ProgramCapacities::from_manifest(&manifest)?;
         self.families = manifest.get("families").cloned().unwrap_or_default();
@@ -422,8 +436,15 @@ impl<'a> Programs<'a> {
     }
 
     pub fn spec(&self, name: &str) -> Result<&ProgramSpec> {
+        if self.card_specs.contains_key(name) {
+            return self.spec_for_sms(name, self.library.sm_count()?);
+        }
+        Ok(&self.programs.get(name).with_context(|| format!("no DeepSeek V4 program {name}"))?.1)
+    }
+
+    /// [`Self::spec`] for an explicit runtime SM count (no device query).
+    pub fn spec_for_sms(&self, name: &str, sms: usize) -> Result<&ProgramSpec> {
         if let Some(specs) = self.card_specs.get(name) {
-            let sms = self.library.sm_count()?;
             ensure!(sms > 0, "runtime SM count must be positive");
             return Ok(&specs[usize::from(sms >= 188)]);
         }

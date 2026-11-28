@@ -18,17 +18,28 @@ pub(crate) struct ProgramsCheckArgs {
     pub(crate) exlr8_family: Option<String>,
 }
 
+/// SM counts of the supported coordinator cards (RTX 5090, RTX PRO 6000): the two
+/// card plans a manifest may carry.
+const CARD_SM_COUNTS: [usize; 2] = [170, 188];
+
 pub(crate) fn run(args: ProgramsCheckArgs) -> Result<()> {
     // SAFETY: loading a native library runs its initializers; the build output is ours.
     let library = unsafe { NativeLibrary::load(&args.native_lib)? };
-    let programs = library.programs()?.with_manifest(&args.manifest)?;
+    // A build-time check runs with no GPU, and must hold for every supported card:
+    // resolve card plans for each card's SM count, never the (absent) current device.
+    for sms in CARD_SM_COUNTS {
+        let programs = library.programs()?.with_manifest_for_sms(&args.manifest, sms)?;
+        let names: BTreeSet<&str> = programs.names().collect();
+        if let Some(role) = &args.exlr8_role {
+            let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
+            validate_exlr8(&manifest, &names, role, args.exlr8_family.as_deref()
+                .context("EXLR8 requires explicit checkpoint family scope")?,
+                |name| Ok(programs.spec_for_sms(name, sms)?.clone()))?;
+        }
+    }
+    let programs = library.programs()?.with_manifest_for_sms(&args.manifest, CARD_SM_COUNTS[0])?;
     let names: BTreeSet<&str> = programs.names().collect();
     let exlr8 = expert_programs(names.iter().copied());
-    if let Some(role) = &args.exlr8_role {
-        let manifest: serde_json::Value = serde_json::from_slice(&std::fs::read(&args.manifest)?)?;
-        validate_exlr8(&manifest, &names, role, args.exlr8_family.as_deref()
-            .context("EXLR8 requires explicit checkpoint family scope")?, |name| Ok(programs.spec(name)?.clone()))?;
-    }
     println!("programs-check: {} programs ({} EXLR8: {}) validated against {}", names.len(), exlr8.len(),
         exlr8.iter().copied().collect::<Vec<_>>().join(","), args.manifest.display());
     Ok(())
