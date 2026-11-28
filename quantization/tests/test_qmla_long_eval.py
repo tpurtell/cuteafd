@@ -425,6 +425,9 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
     attach_long_context_eval(standalone_dir, long_eval, manifest=manifest)
     assert json.loads((standalone_dir / "qmla-validation-report.json").read_text())["long_context_eval"] == long_eval
 
+    from hy4_flash.qmla_run import _resolve_long_context_source
+    assert _resolve_long_context_source(tmp_path) == DEFAULT_STAGED_LONG_CONTEXT_DIR
+
     parser = build_parser()
     args = parser.parse_args(["--checkpoint", str(tmp_path), "--source-revision", "a" * 40,
                               "--output", str(standalone_dir), "--long-eval", "--sidecar", str(cal_res["sidecar_dir"])])

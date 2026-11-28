@@ -991,8 +991,9 @@ def attach_long_context_eval(
     return report
 
 
-def _resolve_long_context_source(corpus_dir: Path | None, *, standalone: bool) -> Path:
-    if corpus_dir is not None and (standalone or has_prepared_long_context(corpus_dir)):
+def _resolve_long_context_source(corpus_dir: Path | None) -> Path:
+    if has_prepared_long_context(corpus_dir):
+        assert corpus_dir is not None
         return corpus_dir
     return DEFAULT_STAGED_LONG_CONTEXT_DIR
 
@@ -1032,7 +1033,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         long_layers = parse_layers_arg(args.layers, eligible) if args.layers else None
         long_modes = parse_modes_arg(args.modes) if args.modes else None
-        long_source = _resolve_long_context_source(args.corpus_dir, standalone=True)
+        long_source = _resolve_long_context_source(args.corpus_dir)
         long_records, long_corpus_meta = load_long_context_records(long_source, checkpoint_dir=checkpoint)
         long_eval = run_hy4_flash_long_eval(
             adapter,
@@ -1126,7 +1127,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if args.long_eval:
         del banks
-        long_source = _resolve_long_context_source(args.corpus_dir, standalone=False)
+        long_source = _resolve_long_context_source(args.corpus_dir)
         long_records, long_corpus_meta = load_long_context_records(long_source, checkpoint_dir=checkpoint)
         long_eval = run_hy4_flash_long_eval(
             adapter,
