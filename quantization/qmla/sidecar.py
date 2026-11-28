@@ -22,6 +22,7 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import struct
@@ -37,7 +38,6 @@ from .capture import (
     _canonical_json,
     _fsync_dir,
     check_split_description,
-    eval_attention_output,
     eval_positional_qk,
 )
 from .fit import (
@@ -45,9 +45,10 @@ from .fit import (
     VALID_PROTECTION_POLICIES,
     ContentFitResult,
     RopeFitResult,
-    apply_content_forward,
+    _check_content_equivalence,
+    _content_native_output_error,
+    check_content_identity,
     apply_rope_pair_transform,
-    compensate_kv_b,
 )
 from .quantizer import CONTENT_NONZERO_BITS, EPS_SCALE, GROUP_SIZE, ROPE_NONZERO_BITS, parse_qmla_mode
 
@@ -67,9 +68,9 @@ QMLA_KNOWN_COMPONENTS = pc.COMPONENT_ORDER
 
 CANONICAL_CONVENTIONS = {
     "vector_layout": "row",
-    "content_basis_space": "unit_rms",
-    "content_forward_formula": "u @ R_C @ diag(s_C)",
-    "content_inverse_formula": "diag(1/s_C) @ R_C^T @ diag(gamma)",
+    "content_basis_space": "post_norm",
+    "content_forward_formula": "c @ R_C @ diag(s_C)",
+    "content_inverse_formula": "diag(1/s_C) @ R_C^T",
     "rope_angle_sign": "right_row_phi_plus_theta",
     "rope_forward_key_formula": "k_rope @ R_P(theta) @ diag(s_P_pair)",
     "rope_query_compensation_formula": "q_rope @ R_P(theta) @ diag(1/s_P_pair)",
@@ -520,6 +521,7 @@ def write_sidecar(
             },
         }
         if path == "content":
+            validation["equivalence_metric"] = "expanded_kv_rel_l2"
             validation["orth_max_err"] = float(max(r.orth_max_err for r in results))
         profiles[path] = {
             "bits": served[path],
@@ -601,6 +603,7 @@ def validate_sidecar(
     expected_source: Mapping[str, Any] | None = None,
     expected_geometries: Sequence[MlaLayerGeometry] | None = None,
     banks_by_layer: Mapping[int, CapturedLayerBank] | None = None,
+    device: torch.device | str = "cpu",
     orth_tol: float = 1e-5,
     equiv_tol: float = 1e-4,
     strict: bool = True,
@@ -631,9 +634,9 @@ def validate_sidecar(
     if manifest["protection_scope"] != PROTECTION_SCOPE:
         raise ValueError(f"invalid protection_scope: {manifest['protection_scope']!r}")
     if manifest["conventions"] != CANONICAL_CONVENTIONS:
-        raise ValueError("QMLA manifest conventions differ from canonical cuteafd-qmla-v1")
+        raise ValueError(f"QMLA manifest conventions differ from the {QMLA_SCHEMA} post_norm contract")
     if manifest["quantizer_recipe"] != CANONICAL_QUANTIZER_RECIPE:
-        raise ValueError("QMLA manifest quantizer_recipe differs from canonical cuteafd-qmla-v1")
+        raise ValueError(f"QMLA manifest quantizer_recipe differs from canonical {QMLA_SCHEMA}")
     if manifest["tensors_file"] != TENSORS_FILE:
         raise ValueError(f"unexpected QMLA tensors_file: {manifest['tensors_file']!r}")
     if int(manifest["tensors_payload_bytes"]) != actual_payload_bytes:
@@ -789,29 +792,31 @@ def validate_sidecar(
 
     # Optional quantization-off algebraic equivalence verification against captured banks.
     max_equiv_err = 0.0
+    identity_layers = []
+    native_output_errors = []
     if banks_by_layer is not None:
         with torch.no_grad():
             for lid, bank in banks_by_layer.items():
                 g = geom_by_layer[lid]
                 if content_prof is not None and lid in content_prof["layers"]:
-                    r_mat = tensors[f"content.layer_{lid}.r"]
-                    s_vec = tensors[f"content.layer_{lid}.s"]
-                    w_tilde = compensate_kv_b(bank.params.kv_b_weight, bank.params.kv_norm_weight, r_mat, s_vec)
-                    for seq in bank.val:
-                        pred = eval_attention_output(
-                            seq,
-                            bank.params,
-                            g,
-                            content_fn=lambda u: apply_content_forward(u, r_mat, s_vec),
-                            kv_b_override=w_tilde,
-                        )
-                        denom = float(seq.ref_output.float().norm().item()) or 1.0
-                        err = float((pred - seq.ref_output.float()).norm().item() / denom)
-                        max_equiv_err = max(max_equiv_err, err)
-                        if err > equiv_tol:
+                    r_mat = tensors[f"content.layer_{lid}.r"].to(device)
+                    s_vec = tensors[f"content.layer_{lid}.s"].to(device)
+                    params = bank.params.to(device)
+                    for saved in bank.val:
+                        seqs = (saved.to(device),)
+                        check_content_identity(seqs, params, g)
+                        err = _check_content_equivalence(seqs, params, g, r_mat, s_vec)
+                        if not math.isfinite(err) or err >= equiv_tol:
                             raise ValueError(
-                                f"content quantization-off equivalence failed at layer {lid}: {err:.3e} > {equiv_tol:.3e}"
+                                f"content quantization-off equivalence failed at layer {lid}: {err:.3e} "
+                                f"(requires <{equiv_tol:.3e})"
                             )
+                        max_equiv_err = max(max_equiv_err, err)
+                        drift = _content_native_output_error(seqs, params, g, r_mat, s_vec)
+                        if not math.isfinite(drift):
+                            raise ValueError(f"non-finite quantization-off attention drift at layer {lid}")
+                        native_output_errors.append(drift)
+                    identity_layers.append(lid)
                 if rope_prof is not None and lid in rope_prof["layers"]:
                     theta = tensors[f"rope.layer_{lid}.theta"]
                     s_vec = tensors[f"rope.layer_{lid}.s"]
@@ -850,6 +855,8 @@ def validate_sidecar(
         "supported_modes": list(manifest["supported_modes"]),
         "max_orth_err": max_orth_err,
         "max_equiv_err": max_equiv_err,
+        "content_identity_verified_layers": sorted(identity_layers),
+        "max_content_native_output_rel_err": max(native_output_errors, default=None),
     }
 
 

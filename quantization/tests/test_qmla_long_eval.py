@@ -81,14 +81,14 @@ def _eval_attention_output_dense_oracle(
     t, h, nope, vdim = seq.seq_len, geometry.heads, geometry.qk_nope_dim, geometry.v_head_dim
     dev = seq.u.device
 
-    u = seq.u.float()
-    latent = content_fn(u) if content_fn is not None else u * params.kv_norm_weight.float()
+    c = seq.u.float() * params.kv_norm_weight.float()
+    latent = content_fn(c) if content_fn is not None else c
     kv_b = (params.kv_b_weight if kv_b_override is None else kv_b_override).float()
     expanded = linear(latent, kv_b).reshape(t, h, nope + vdim)
     keys, values = expanded.split([nope, vdim], dim=-1)
     exact_keys = exact_values = None
     if protect and exact_content_fn is not None:
-        exact_kv = linear(exact_content_fn(u), kv_b).reshape_as(expanded)
+        exact_kv = linear(exact_content_fn(c), kv_b).reshape_as(expanded)
         exact_keys, exact_values = exact_kv.split([nope, vdim], dim=-1)
     elif protect and exact_rope_key_fn is not None:
         exact_keys = keys
@@ -164,7 +164,7 @@ def _synthetic_sparse_bank(seed: int, *, seq_len: int = 261, candidate_topk: int
         "self_attn.q_a_layernorm.weight": torch.ones(q_rank),
         "self_attn.q_b_proj.weight": rand(heads * (nope + d_r), q_rank),
         "self_attn.kv_a_proj_with_mqa.weight": kv_a,
-        "self_attn.kv_a_layernorm.weight": torch.ones(d_c),
+        "self_attn.kv_a_layernorm.weight": 1 + 0.1 * rand(d_c),
         "self_attn.kv_b_proj.weight": rand(heads * (nope + vdim), d_c),
         "self_attn.linear_gate.weight": rand(heads * vdim, hidden),
         "self_attn.o_proj.weight": rand(hidden, heads * vdim),
@@ -219,7 +219,7 @@ def test_tiled_and_compact_mask_match_dense_oracle_all_arms_and_tile_edges():
     qdq = lambda fn, bits, dt: (lambda x: qdq_asymmetric_group(fn(x), bits, scale_dtype=dt, ste=False))
     c_hooks = lambda r, s: {
         "content_fn": qdq(partial(apply_content_forward, r_c=r, s_c=s), 4, "BF16"),
-        "kv_b_override": compensate_kv_b(params.kv_b_weight, params.kv_norm_weight, r, s),
+        "kv_b_override": compensate_kv_b(params.kv_b_weight, r, s),
         "exact_content_fn": partial(apply_content_forward, r_c=r, s_c=s),
     }
     r_hooks = lambda th, sp: {
@@ -227,7 +227,7 @@ def test_tiled_and_compact_mask_match_dense_oracle_all_arms_and_tile_edges():
         "rope_key_fn": qdq(partial(apply_rope_pair_transform, theta=th, scale=sp, rope_kind=geom.rope_kind), 4, "F32"),
         "exact_rope_key_fn": partial(apply_rope_pair_transform, theta=th, scale=sp, rope_kind=geom.rope_kind),
     }
-    native_c = lambda u: u * params.kv_norm_weight.float()
+    native_c = lambda c: c
     arms = {
         "teacher": {},
         "rtn": {"content_fn": qdq(native_c, 4, "BF16"), "exact_content_fn": native_c,
@@ -334,7 +334,7 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
             "self_attn.q_a_proj.weight": rand(q_rank, hidden) * 0.2, "self_attn.q_a_layernorm.weight": torch.ones(q_rank),
             "self_attn.q_b_proj.weight": rand(h * (nope + d_r), q_rank) * 0.2,
             "self_attn.kv_a_proj_with_mqa.weight": rand(d_c + d_r, hidden) * 0.2,
-            "self_attn.kv_a_layernorm.weight": torch.ones(d_c), "self_attn.kv_b_proj.weight": rand(h * (nope + vdim), d_c) * 0.2,
+            "self_attn.kv_a_layernorm.weight": 1 + 0.1 * rand(d_c), "self_attn.kv_b_proj.weight": rand(h * (nope + vdim), d_c) * 0.2,
             "self_attn.linear_gate.weight": rand(h * vdim, hidden) * 0.2, "self_attn.o_proj.weight": rand(hidden, h * vdim) * 0.2,
             "self_attn.post_proj_norm.weight": torch.ones(hidden), "self_attn.learnable_sink_param": rand(h) * 0.1,
         }

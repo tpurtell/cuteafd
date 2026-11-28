@@ -202,6 +202,10 @@ def validate_qmla_advisory(qmla, *, strict=False):
              and isinstance(qmla["quantizer_recipe"], dict)
              and isinstance(qmla["unsupported_modes_reason"], dict),
              "invalid MC QMLA metadata sections")
+    _require(qmla["conventions"].get("content_basis_space") == "post_norm"
+             and qmla["conventions"].get("content_forward_formula") == "c @ R_C @ diag(s_C)"
+             and qmla["conventions"].get("content_inverse_formula") == "diag(1/s_C) @ R_C^T",
+             "unsupported MC QMLA content basis or compensation")
     geoms = qmla["geometry"]
     _require(isinstance(geoms, list) and bool(geoms) and all(isinstance(g, dict) for g in geoms),
              "MC QMLA requires non-empty geometry")

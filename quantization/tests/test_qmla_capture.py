@@ -226,8 +226,8 @@ def test_protected_replay_uses_each_query_prefix_for_content_and_rope():
     geometry = adapter.geometry_for(0)
     params = adapter.layer_params(layer)
 
-    def exact(u):
-        return u * params.kv_norm_weight
+    def exact(c):
+        return c
 
     def rounded(u):
         return exact(u).round()
@@ -331,3 +331,55 @@ def test_three_way_split_disjoint_deterministic_salt_versioned_and_refuses_reuse
     assert CAPTURE_SCHEMA == "cuteafd-qmla-capture-v2"
     with pytest.raises(ValueError, match="three-way"):
         load_layer_capture(tmp_path, 0)
+
+
+def test_content_transform_uses_rounded_cache_and_identity_matches_native_bytes():
+    from dataclasses import replace
+    import torch.nn.functional as F
+
+    from qmla.capture import CapturedLayerParams, CapturedSequence, cached_content
+    from qmla.fit import _check_content_equivalence, apply_content_forward, check_content_identity, compensate_kv_b
+
+    rng = torch.Generator().manual_seed(108)
+    rows, rank, heads, dim = 17, 8, 2, 4
+
+    def native(*shape):
+        return torch.randn(shape, generator=rng).bfloat16()
+
+    u, gamma = native(rows, rank), native(rank)
+    w, o = native(2 * heads * dim, rank), native(rank, heads * dim)
+    q = native(rows, heads, dim)
+    mask = torch.ones(rows, rows, dtype=torch.bool).tril()
+    c = u * gamma
+    assert not torch.equal(c.float(), u.float() * gamma.float())
+    k, v = F.linear(c, w).reshape(rows, heads, 2 * dim).chunk(2, dim=-1)
+    attended = F.scaled_dot_product_attention(
+        q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None], attn_mask=mask[None, None],
+    )[0].transpose(0, 1)
+    ref = F.linear(attended.reshape(rows, heads * dim), o).float()
+    geom = MlaLayerGeometry(layer_id=3, kv_source_layer=3, kind="dsa", heads=heads, kv_lora_rank=rank,
+                            qk_nope_dim=dim, qk_rope_dim=0, v_head_dim=dim, rope_kind="none")
+    params = CapturedLayerParams(gamma.float(), w.float(), o.float(), attention_arithmetic="bf16_sdpa")
+    seq = CapturedSequence("native", torch.arange(rows), u.float(), q.float(), None, None, mask, None, ref)
+    assert torch.equal(cached_content(seq.u, params), c.float())
+    rotation = torch.linalg.qr(torch.randn(rank, rank, generator=rng)).Q
+    scales = torch.exp(torch.randn(rank, generator=rng))
+    weight = compensate_kv_b(w, rotation, scales)
+    torch.testing.assert_close(weight, (w.float() @ rotation) / scales)
+    torch.testing.assert_close(F.linear(apply_content_forward(c, rotation, scales), weight), F.linear(c.float(), w.float()))
+    assert _check_content_equivalence([seq], params, geom, rotation, scales) < 1e-5
+    check_content_identity([seq], params, geom)
+    perturbed = ref.clone()
+    perturbed.view(torch.uint8).flatten()[0] ^= 1
+    with pytest.raises(ValueError, match="identity differs from native capture bytes"):
+        check_content_identity([replace(seq, ref_output=perturbed)], params, geom)
+
+
+@pytest.mark.parametrize("kind", [reference.SPARSE, reference.SLIDING])
+def test_identity_matches_hy4_capture_bytes(kind):
+    from qmla.fit import check_content_identity
+
+    _, model, layer, rng = _synthetic_hy4_layer(531, kind=kind)
+    adapter = Hy4FlashCaptureAdapter(model)
+    seq, _, _ = adapter.capture_sequence(torch.randn(140, 10, generator=rng), layer, seq_id="identity")
+    check_content_identity([seq], adapter.layer_params(layer), adapter.geometry_for(0))

@@ -16,13 +16,13 @@ import panel_corpus
 from qmla.capture import (SPLIT_NAMES, CapturedLayerBank, MlaLayerGeometry, _atomic_json,
                           check_split_description, describe_splits, sequence_sha256, split_train_val_test)
 from qmla.fit import (_require_unprotected_tokens, DEFAULT_PROTECTION_POLICY, VALID_PROTECTION_POLICIES,
-                      ContentFitResult, FitConfig, RopeFitResult, fit_config_digest, fit_content_layer,
+                      ContentFitResult, FitConfig, RopeFitResult, check_content_identity, fit_config_digest, fit_content_layer,
                       fit_rope_layer, load_fit_checkpoint, save_fit_checkpoint)
 from qmla.measurement import (SELECTION_OBJECTIVE, inverse_max_error, layer_candidates, layer_rows,
                               measure_candidates, measure_shipped, select_shipped, shipped_summary,
                               summarize_modes, with_equivalence)
 from qmla.quantizer import parse_qmla_mode
-from qmla.sidecar import resolve_qmla_panel, validate_sidecar, write_sidecar
+from qmla.sidecar import CANONICAL_CONVENTIONS, resolve_qmla_panel, validate_sidecar, write_sidecar
 
 
 PILOT_SPLITS = (16, 4, 4)
@@ -182,6 +182,7 @@ def calibrate_from_banks(
         fit_config,
         extra={
             "fit_semantics": "causal-protection-v3-three-way-split",
+            "conventions": CANONICAL_CONVENTIONS,
             "source": dict(source),
             "splits": splits,
             "seq_lens": {
@@ -206,6 +207,8 @@ def calibrate_from_banks(
             recent_tokens=fit_config.recent_tokens, split_name="test",
         )
         layer_start = time.monotonic()
+        if c_bits_list:
+            check_content_identity((seq.to(device) for seq in bank.val), bank.params.to(device), bank.geometry)
         details: dict[str, Any] = {}
         fits: dict[str, dict[int, ContentFitResult | RopeFitResult]] = {"content": {}, "rope": {}}
         for path, widths, fit_layer in (
@@ -351,6 +354,7 @@ def calibrate_from_banks(
         expected_source={"repo": source["repo"], "revision": source["revision"], "family": source["family"]},
         expected_geometries=geometries,
         banks_by_layer=banks,
+        device=device,
         equiv_tol=1e-5,
         strict=True,
     )
@@ -580,7 +584,6 @@ def attach_long_context_eval(
             "protection_policy": manifest["protection_policy"],
             "protection_scope": manifest["protection_scope"],
             "source": manifest["source"],
-        "measurement_reference": provenance["measurement_reference"],
             "supported_modes": list(manifest["supported_modes"]),
             "transform_fingerprint": manifest["transform_fingerprint"],
         }

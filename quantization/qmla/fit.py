@@ -5,13 +5,13 @@ with CuteAFD Adaptation A4: recent-token protection (``sink4_local128``) is enab
 default on full-history MLA layers during both calibration and serving (SWA untouched),
 with ``protection="none"`` available as the measured unprotected alternative:
 - Content path: Cayley-parameterized orthogonal R_C and log-space positive scale S_C
-  in weightless unit_rms coordinates (z_C = u R_C S_C, compensated consumer
-  W_kv_b_tilde = W_kv_b @ diag(gamma) @ R_C @ diag(1/S_C)), trained by post-o_proj
+  on the native cached latent (z_C = c R_C S_C, compensated consumer
+  W_kv_b_tilde = W_kv_b @ R_C @ diag(1/S_C)), trained by post-o_proj
   attention-output reconstruction L_C (Eq. 8). Supports shared-KV multi-consumer layers.
 - RoPE path: per-frequency-pair SO(2) angles theta_i and pair-tied positive scales s_i
   (Q'_P = Q_P R_P S_P^-1, K'_P = K_P R_P S_P), trained by causal positional-QK
   reconstruction L_P (Eq. 10).
-- Step-0 baselines: RTN (native c = u*gamma and unit_rms u), fixed Sylvester Hadamard
+- Step-0 baselines: RTN on the native cached latent, fixed Sylvester Hadamard
   (QuaRot-style / gr8 comparison), and 99.9th-percentile SmoothQuant-style alpha grid.
 - Sequential per-layer checkpointing with streamed XXH3-128 receipts for resume.
 """
@@ -33,6 +33,7 @@ from .capture import (
     MlaLayerGeometry,
     ROWS,
     causal_mask,
+    cached_content,
     _atomic_json,
     _read_safetensors_verified,
     _write_safetensors_streamed,
@@ -187,20 +188,18 @@ def cayley_orthogonal(skew_raw: torch.Tensor) -> torch.Tensor:
     return torch.linalg.solve(eye + a, eye - a)
 
 
-def apply_content_forward(u: torch.Tensor, r_c: torch.Tensor, s_c: torch.Tensor) -> torch.Tensor:
-    """Row-vector content transform z_C = u @ R_C @ diag(s_C)."""
-    return torch.matmul(u.float(), r_c.float()) * s_c.float()
+def apply_content_forward(c: torch.Tensor, r_c: torch.Tensor, s_c: torch.Tensor) -> torch.Tensor:
+    """Row-vector content transform z_C = c @ R_C @ diag(s_C)."""
+    return torch.matmul(c.float(), r_c.float()) * s_c.float()
 
 
 def compensate_kv_b(
     kv_b_weight: torch.Tensor,
-    kv_norm_weight: torch.Tensor,
     r_c: torch.Tensor,
     s_c: torch.Tensor,
 ) -> torch.Tensor:
-    """Compensate HF-layout kv_b_proj [out, d_c]: W_tilde = W_kv_b @ diag(gamma) @ R_C @ diag(1/s_C)."""
-    scaled = kv_b_weight.float() * kv_norm_weight.float().unsqueeze(0)
-    return torch.matmul(scaled, r_c.float()) * (1.0 / s_c.float()).unsqueeze(0)
+    """Compensate HF-layout kv_b_proj [out, d_c]: W_tilde = W_kv_b @ R_C @ diag(1/s_C)."""
+    return torch.matmul(kv_b_weight.float(), r_c.float()) * (1.0 / s_c.float()).unsqueeze(0)
 
 
 def apply_rope_pair_transform(
@@ -271,14 +270,14 @@ def content_output_loss(
     all_groups = [(params, geometry, seqs), *extra_consumers]
     losses: list[torch.Tensor] = []
     for c_params, c_geom, c_seqs in all_groups:
-        w_tilde = compensate_kv_b(c_params.kv_b_weight, c_params.kv_norm_weight, r_c, s_c)
+        w_tilde = compensate_kv_b(c_params.kv_b_weight, r_c, s_c)
 
-        def exact_content(u):
-            return apply_content_forward(u, r_c, s_c)
+        def exact_content(c):
+            return apply_content_forward(c, r_c, s_c)
 
-        def quantized_content(u):
+        def quantized_content(c):
             return qdq_asymmetric_group(
-                exact_content(u), bits, group_size=group_size, scale_dtype="BF16", eps=eps_scale, ste=ste
+                exact_content(c), bits, group_size=group_size, scale_dtype="BF16", eps=eps_scale, ste=ste
             )
 
         for seq in c_seqs:
@@ -372,14 +371,55 @@ def _relative_l2(pred: torch.Tensor, ref: torch.Tensor) -> float:
     return float((pred.float() - ref.float()).norm().item() / denom)
 
 
-def _check_content_equivalence(
+@torch.no_grad()
+def check_content_identity(seqs, params, geometry):
+    """Require the unquantized identity write and compensated read to reproduce native bytes."""
+    rank = geometry.kv_lora_rank
+    r_c = torch.eye(rank, device=params.kv_b_weight.device)
+    s_c = torch.ones(rank, device=params.kv_b_weight.device)
+    weight = compensate_kv_b(params.kv_b_weight, r_c, s_c)
+    for seq in seqs:
+        pred = eval_attention_output(
+            seq, params, geometry, content_fn=lambda c: apply_content_forward(c, r_c, s_c),
+            kv_b_override=weight,
+        )
+        ref = seq.ref_output
+        if pred.dtype != ref.dtype or not torch.equal(
+            pred.contiguous().view(torch.uint8), ref.contiguous().view(torch.uint8)
+        ):
+            raise ValueError(f"layer {geometry.layer_id} sequence {seq.seq_id}: "
+                             "quantization-off identity differs from native capture bytes "
+                             f"(relative L2 {_relative_l2(pred, ref):.8g})")
+
+
+@torch.no_grad()
+def _check_content_equivalence(seqs, params, geometry, r_c, s_c):
+    """Max per-sequence expanded K/V relative L2, before the checkpoint's native GEMM rounding."""
+    weight = params.kv_b_weight.float()
+    w_tilde = compensate_kv_b(weight, r_c, s_c)
+    maximum = 0.0
+    for seq in seqs:
+        sums = torch.zeros(2, dtype=torch.float64, device=weight.device)
+        for tile in seq.u.split(ROWS):
+            c = cached_content(tile, params)
+            native = torch.nn.functional.linear(c, weight)
+            transformed = torch.nn.functional.linear(apply_content_forward(c, r_c, s_c), w_tilde)
+            sums += torch.stack(((transformed - native).square().sum(), native.square().sum()))
+        error, norm = sums.tolist()
+        if not math.isfinite(error) or not math.isfinite(norm):
+            raise ValueError(f"nonfinite expanded K/V equivalence at layer {geometry.layer_id}")
+        maximum = max(maximum, math.sqrt(error / norm if norm else error))
+    return maximum
+
+
+def _content_native_output_error(
     seqs: Sequence[CapturedSequence],
     params: CapturedLayerParams,
     geometry: MlaLayerGeometry,
     r_c: torch.Tensor,
     s_c: torch.Tensor,
 ) -> float:
-    w_tilde = compensate_kv_b(params.kv_b_weight, params.kv_norm_weight, r_c, s_c)
+    w_tilde = compensate_kv_b(params.kv_b_weight, r_c, s_c)
     max_err = 0.0
     with torch.no_grad():
         for seq in seqs:
@@ -390,7 +430,10 @@ def _check_content_equivalence(
                 content_fn=lambda u: apply_content_forward(u, r_c, s_c),
                 kv_b_override=w_tilde,
             )
-            max_err = max(max_err, _relative_l2(pred, seq.ref_output))
+            err = _relative_l2(pred, seq.ref_output)
+            if not math.isfinite(err):
+                raise ValueError(f"nonfinite native output error at layer {geometry.layer_id}")
+            max_err = max(max_err, err)
     return max_err
 
 
@@ -464,27 +507,10 @@ def fit_content_layer(
         "recent_tokens": config.recent_tokens,
     }
 
-    # Step-0 baselines under the active protection policy: native RTN, unit_rms RTN, Hadamard, SmoothQuant alpha grid.
+    # Step-0 baselines under the active protection policy, all using the native cached latent.
     baselines: dict[str, float] = {}
     with torch.no_grad():
-        native_losses = []
-        for seq in val_seqs:
-            def native(u):
-                return u * params.kv_norm_weight.float()
-
-            def quantized_native(u):
-                return qdq_asymmetric_group(
-                    native(u), bits, group_size=config.group_size, scale_dtype="BF16", eps=config.eps_scale, ste=False
-                )
-
-            pred = eval_attention_output(
-                seq, params, geom, content_fn=quantized_native,
-                exact_content_fn=native if config.protection != "none" else None,
-                sink_tokens=config.sink_tokens, recent_tokens=config.recent_tokens,
-            )
-            native_losses.append(_normalized_output_mse(pred, seq.ref_output.float()))
-        baselines["rtn_native_val"] = float(torch.stack(native_losses).mean().item())
-        baselines["rtn_unit_rms_val"] = float(
+        baselines["rtn_native_val"] = float(
             content_output_loss(
                 val_seqs, params, geom, eye, ones, bits,
                 group_size=config.group_size, eps_scale=config.eps_scale, ste=False,
@@ -501,8 +527,8 @@ def fit_content_layer(
                 ).item()
             )
 
-        u_all = torch.cat([s.u.float() for s in train_seqs], dim=0)
-        a_j = _quantile_999(u_all)
+        c_all = torch.cat([cached_content(s.u, params) for s in train_seqs], dim=0)
+        a_j = _quantile_999(c_all)
         best_alpha = 0.0
         best_alpha_loss = float("inf")
         best_init_log_s = torch.zeros(d_c, device=dev, dtype=torch.float32)

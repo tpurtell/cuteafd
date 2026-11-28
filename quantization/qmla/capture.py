@@ -616,6 +616,17 @@ def native_masked_attention(query, keys, values, mask, scale, arithmetic):
     return out[0].transpose(0, 1)
 
 
+def cached_content(u: torch.Tensor, params: CapturedLayerParams) -> torch.Tensor:
+    """Recreate the checkpoint's cached weighted latent from the saved RMSNorm input.
+
+    BF16 adapters save u after its native cast. The product is rounded to BF16
+    before any transform, even when a capture serialized u as an FP32 tensor.
+    The FP32 reference adapters retain their native weighted FP32 product.
+    """
+    c = u.float() * params.kv_norm_weight.float()
+    return c.bfloat16().float() if params.attention_arithmetic.startswith("bf16_") else c
+
+
 def _native_bf16_output(seq, params, geom, latent, kv_b_override, exact_content_fn,
                         sink_tokens, recent_tokens):
     if geom.has_rope or geom.kind != "dsa" or seq.gate is not None or params.sink is not None:
@@ -624,24 +635,16 @@ def _native_bf16_output(seq, params, geom, latent, kv_b_override, exact_content_
     out_dim = geom.qk_nope_dim + geom.v_head_dim
     count = seq.seq_len
 
-    def expand(z):
-        if kv_b_override is None:
-            # Native RMSNorm returns the weighted product in the input dtype.
-            kv = F.linear(z.to(dtype), params.kv_b_weight.to(dtype))
-        else:
-            # Compensated weights and transformed coordinates are stored/evaluated in FP32.
-            kv = F.linear(z.float(), kv_b_override.float()).to(dtype)
+    def expand(z, weight):
+        kv = F.linear(z.to(dtype), weight.to(dtype))
         return kv.reshape(count, geom.heads, out_dim).split([geom.qk_nope_dim, geom.v_head_dim], dim=-1)
 
-    keys, values = expand(latent)
+    weight = params.kv_b_weight if kv_b_override is None else kv_b_override
+    keys, values = expand(latent, weight)
     query = seq.q_nope.to(dtype)
     protect = exact_content_fn is not None and (sink_tokens or recent_tokens)
     if protect:
-        # Protected slots carry the original native KV, including the RMSNorm product's
-        # BF16 rounding. Reprojecting compensated FP32 coordinates changes that rounding.
-        exact_latent = (seq.u.float() * params.kv_norm_weight.float()).to(dtype)
-        exact = F.linear(exact_latent, params.kv_b_weight.to(dtype)).reshape(count, geom.heads, out_dim)
-        exact_k, exact_v = exact.split([geom.qk_nope_dim, geom.v_head_dim], dim=-1)
+        exact_k, exact_v = expand(cached_content(seq.u, params), params.kv_b_weight)
     # Match the native prefill's shape and SDPA backend for ordinary calibration sequences.
     # Only long contexts or query-dependent selection of the exact/quantized KV require tiles.
     step = count if seq.sparse_selection is None and not protect else ROWS
@@ -649,19 +652,22 @@ def _native_bf16_output(seq, params, geom, latent, kv_b_override, exact_content_
     for start in range(0, count, step):
         stop = min(start + step, count)
         rows = torch.arange(start, stop, device=query.device)
-        slots = torch.arange(stop, device=query.device)
+        # Keep the native key reduction extent across query tiles. Shortening it
+        # at every causal boundary changes the SDPA accumulation order.
+        width = count
+        slots = torch.arange(width, device=query.device)
         if seq.allowed_mask is not None:
-            allowed = seq.allowed_mask[start:stop, :stop]
+            allowed = seq.allowed_mask[start:stop, :width]
         else:
             allowed = slots[None, :] <= rows[:, None]
             if seq.sparse_selection is not None:
-                allowed &= seq.sparse_selection.tile_mask(start, stop, 0, stop, rows)
-        key, value = keys[:stop], values[:stop]
+                allowed &= seq.sparse_selection.tile_mask(start, stop, 0, width, rows)
+        key, value = keys[:width], values[:width]
         if protect:
             # Put one exact or one quantized version of each key in the same softmax.
             # Only sink/recent regions can be selected from the exact copy in this tile.
             protected = (slots < sink_tokens) | ((rows[:, None] - slots) < recent_tokens)
-            exact_slots = slots[(slots < sink_tokens) | (slots >= start + 1 - recent_tokens)]
+            exact_slots = slots[(slots < stop) & ((slots < sink_tokens) | (slots >= start + 1 - recent_tokens))]
             key = torch.cat((key, exact_k[exact_slots]))
             value = torch.cat((value, exact_v[exact_slots]))
             allowed = torch.cat((allowed & ~protected, (allowed & protected)[:, exact_slots]), dim=1)
@@ -702,11 +708,8 @@ def eval_attention_output(
     vdim = geometry.v_head_dim
     scale = geometry.effective_scale
 
-    u = seq.u.float()
-    if content_fn is not None:
-        latent = content_fn(u)
-    else:
-        latent = u * params.kv_norm_weight.float()
+    c = cached_content(seq.u, params)
+    latent = content_fn(c) if content_fn is not None else c
 
     if params.attention_arithmetic.startswith("bf16_"):
         return _native_bf16_output(seq, params, geometry, latent, kv_b_override, exact_content_fn,
@@ -718,7 +721,7 @@ def eval_attention_output(
     exact_keys = None
     exact_values = None
     if protect and exact_content_fn is not None:
-        exact_kv = linear(exact_content_fn(u), kv_b).reshape_as(expanded)
+        exact_kv = linear(c, params.kv_b_weight.float()).reshape_as(expanded)
         exact_keys, exact_values = exact_kv.split([nope, vdim], dim=-1)
     elif protect and exact_rope_key_fn is not None:
         exact_keys = keys

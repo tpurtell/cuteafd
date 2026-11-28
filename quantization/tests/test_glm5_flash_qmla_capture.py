@@ -81,8 +81,29 @@ def test_glm_native_protection_uses_the_original_bf16_kv():
     params = adapter.layer_params(layer)
     quantized = eval_attention_output(
         seq, params, adapter.geometry_for(3), content_fn=torch.zeros_like,
-        kv_b_override=params.kv_b_weight * params.kv_norm_weight,
+        kv_b_override=params.kv_b_weight,
         exact_content_fn=lambda u: u,
         recent_tokens=32,
     )
     torch.testing.assert_close(quantized, native.float(), rtol=2e-5, atol=2e-5)
+
+
+def test_sparse_replay_keeps_native_key_width_in_every_query_tile(monkeypatch):
+    import qmla.capture as replay
+
+    cfg, layer = _layer(torch.bfloat16, "sdpa")
+    adapter = Glm5FlashCaptureAdapter(cfg)
+    length = 2 * replay.ROWS + 1
+    inputs = torch.randn(length, cfg.hidden_size).bfloat16()
+    with torch.no_grad():
+        seq, _ = adapter.capture_sequence(inputs, layer, seq_id="key-width", compact_mask=True)
+    widths = []
+    attention = replay.native_masked_attention
+
+    def record_width(query, keys, values, mask, scale, arithmetic):
+        widths.append((query.shape[0], keys.shape[0]))
+        return attention(query, keys, values, mask, scale, arithmetic)
+
+    monkeypatch.setattr(replay, "native_masked_attention", record_width)
+    eval_attention_output(seq, adapter.layer_params(layer), adapter.geometry_for(3))
+    assert widths == [(replay.ROWS, length), (replay.ROWS, length), (1, length)]

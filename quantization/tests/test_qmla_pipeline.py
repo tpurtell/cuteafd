@@ -515,6 +515,11 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
     assert not (sidecar_dir / "mla_calibration.json").exists()
     manifest = result["manifest"]
     assert manifest["artifact_status"] == "calibrated_unqualified"
+    assert manifest["conventions"]["content_basis_space"] == "post_norm"
+    assert manifest["conventions"]["content_inverse_formula"] == "diag(1/s_C) @ R_C^T"
+    assert manifest["profiles"]["content"]["validation"]["equivalence_metric"] == "expanded_kv_rel_l2"
+    assert result["validation"]["content_identity_verified_layers"] == [0, 5]
+    assert result["validation"]["max_content_native_output_rel_err"] >= 0
     assert manifest["applicable_views"] == ["original", "k8-compact"]
     report = result["report"]
     assert report["sidecar_bytes"] == (sidecar_dir / "mla_calibration.safetensors").stat().st_size
@@ -605,6 +610,11 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
     assert updated_mc["variants"] == mc_doc["variants"]
     mc_manifest.validate(updated_mc, root=mc_root)
     validate_sidecar(sidecar_dir, mc_manifest=updated_mc, strict=True)
+
+    legacy_mc = json.loads(json.dumps(updated_mc))
+    legacy_mc["qmla"]["conventions"]["content_basis_space"] = "unit_rms"
+    with pytest.raises(ValueError, match="unsupported MC QMLA content basis"):
+        mc_manifest.validate(legacy_mc, root=mc_root)
 
     bad_mc = json.loads(json.dumps(updated_mc))
     bad_mc["qmla"]["artifact_status"] = "runtime_qualified"
@@ -989,3 +999,14 @@ def test_sidecar_validates_mixed_fitted_and_smoothquant_shipped_profiles(tmp_pat
     _write_f32_safetensors_with_metadata(path, header, ordered, embedded)
     with pytest.raises(ValueError, match="content profile fingerprint mismatch"):
         validate_sidecar(tmp_path, strict=True)
+    # A reader must reject a self-consistent sidecar using the previous basis even in non-strict mode.
+    from qmla.sidecar import compute_transform_fingerprint
+
+    _, _, _, _, legacy, _, _ = _read_f32_safetensors_with_metadata(path)
+    legacy["profiles"] = manifest["profiles"]
+    legacy["conventions"].update(content_basis_space="unit_rms", content_forward_formula="u @ R_C @ diag(s_C)",
+                                 content_inverse_formula="diag(1/s_C) @ R_C^T @ diag(gamma)")
+    legacy["transform_fingerprint"] = compute_transform_fingerprint(legacy)
+    _write_f32_safetensors_with_metadata(path, header, ordered, legacy)
+    with pytest.raises(ValueError, match="post_norm contract"):
+        validate_sidecar(tmp_path, strict=False)

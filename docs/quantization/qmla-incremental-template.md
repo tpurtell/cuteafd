@@ -37,7 +37,7 @@ Before capturing any activation:
    - Multimodal RoPE axes (`mrope_section`, e.g. `[12, 10, 10]` on Hy4/Hy4-flash) and YaRN / LeRoPE / scalable-softmax parameters.
    - Cross-layer KV latent sharing (`kv_source_layers` + `shared_consumers`, e.g. Mistral Large 4 layer 35) so shared-KV consumers optimize one source `(R_C, S_C)` jointly.
    - Drafter cache ownership (target-KV-sharing DFly2 vs independent DFlash2 / `mtp_dspark`).
-3. Verify the family's `QmlaCaptureAdapter` reproduces the pinned reference attention forward (`eval_attention_output` vs reference `< 2e-5`) on synthetic/preflight prompts, including 3D M-RoPE positions (`T != H != W`) for VL models and sparse DSA top-k pruning past `index_topk`.
+3. Verify the family's `QmlaCaptureAdapter` reproduces the pinned reference attention forward on synthetic/preflight prompts, including 3D M-RoPE positions (`T != H != W`) for VL models and sparse DSA top-k pruning past `index_topk`. Require exact masks and reference relative L2 below `2e-5` for ordinary preflight prompts. For the 2,080-token layer-3 GLM Flash sparse case, tile queries across the full key dimension and compare both native and replay against the same FP64 sparse attention. Replay must be at least as close to FP64 as native, and its relative difference from native must be below 1% of the measured 8-bit error.
 
 ---
 
@@ -74,14 +74,14 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
 
 **Pilot gates (must pass before full run):**
 - `validate_sidecar` passes with `status == "passed"` and `protection_policy == "sink4_local128"`.
-- Every pilot layer satisfies orthogonality $\|R_C^\top R_C - I\|_\infty < 10^{-5}$, strictly positive finite scales, and quantization-off algebraic equivalence `< 1e-4` relative L2.
+- Every pilot layer satisfies orthogonality $\|R_C^\top R_C - I\|_\infty < 10^{-5}$, strictly positive finite scales, and quantization-off identity replay ($R_C=I$, $S_C=I$) byte-identical to captured native post-`o_proj` output. Require matched FP32 expanded K/V relative L2 below `1e-5` for learned content transforms. Record native attention-output drift separately.
 - Report the full test cross-table (every per-width fit and SmoothQuant init against every combination), the shipped transforms' test error per combination against RTN, fixed Hadamard and SmoothQuant†, and which candidate each layer shipped.
 - Wall time per layer and peak GPU/host RAM logged to forecast full-run ETA (Asia/Taipei).
 
 ---
 
 ## 4. Full calibration (streaming per-layer, resumable)
-Once the pilot passes, run all eligible MLA layers and target modes (reusing verified XXH3-128 captures with `--reuse-captures` whenever the layer captures already exist):
+Once the pilot passes, run all eligible MLA layers and target modes. Use `--reuse-captures` for verified XXH3-128 captures whose forward identity, splits and native operands match the run. Refit any transforms learned before the content basis changed.
 
 **Reference full command (Hy4-flash):**
 ```bash
@@ -107,7 +107,8 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
 ---
 
 ### Capture, fitting and validation contract (both templates)
-- **Primary forward.** Load the pinned MC checkpoint’s `original` view through the MC runtime. Use the core and all experts from that view, including the serialized K4 EXL3 experts alongside the BF16 core on Hy4-flash. The upstream BF16 repo in `cuteafd-mc.json["source"]` is provenance only. For a plain checkpoint, load its own weights. Use this forward’s own `0:0` outputs as the reference for fitting, validation and test.
+- **Primary forward.** Load the pinned MC checkpoint’s `original` view through the MC runtime. Use the core and all experts from that view, including the serialized K4 EXL3 experts alongside the BF16 core on Hy4-flash. The upstream BF16 repo in `cuteafd-mc.json["source"]` is provenance only. For a plain checkpoint, load its own weights. Record the source revision and view. Use this forward’s own `0:0` outputs as the reference for fitting, validation and test.
+- **Content coordinates:** fit and quantize the checkpoint's native weighted cache latent $c$ ($c=\mathrm{BF16}(u\Gamma)$ at a BF16 output boundary). Use $z_C=c R_C S_C$ on writes and $\widetilde W_{kv_b}=W_{kv_b} R_C S_C^{-1}$ in consumers, including target-sharing drafters. Every view applies the transform after weighted RMSNorm. This preserves the producer's rounding even for an identity rotation.
 - **Three disjoint splits:** `train` fits, `val` selects fit steps and the shipped transform, `test` produces every reported number (full 128 / 16 / 16, pilot 16 / 4 / 4). Split IDs and hashes are recorded in provenance and the fit identity, and a capture reused across a split change refuses.
 - **Capture once:** capture each sequence once, and reuse its activations across every bit width. Reuse requires the same checkpoint revision and the same executed view; discard captures from an upstream BF16 forward.
 - **Fit per path and width, independently, for analysis:** for each eligible full-history MLA layer, fit content at **2, 4 and 8 bits** and RoPE at **4 and 8 bits**. The two paths fit independently.
@@ -143,7 +144,7 @@ Before any publication step:
    - Single sidecar file `mla_calibration.safetensors` (no `mla_calibration.json`), self-describing `__metadata__["cuteafd_qmla"]`.
    - Schema (`cuteafd-qmla-v2`), canonical conventions & quantizer recipe, `artifact_status == "calibrated_unqualified"`, `protection_policy == "sink4_local128"`, `protection_scope == "full_history_mla_only"`.
    - `tensors_payload_sha256`, `tensors_payload_bytes`, exact F32 tensor inventory, `profile_fingerprint`, and `transform_fingerprint`.
-   - Orthogonality $\|R_C^\top R_C - I\|_\infty < 10^{-5}$, positive finite scales, and quantization-off numerical equivalence `< 1e-4`.
+   - Orthogonality $\|R_C^\top R_C - I\|_\infty < 10^{-5}$, positive finite scales, identity replay byte-identical to the captured output with quantization disabled, and learned-transform algebraic relative L2 below `1e-5` for expanded content K/V or RoPE positional QK. Check the stored content convention (`post_norm`) and fit identity before reuse.
 2. **Cross-view transfer (MC checkpoints):** the required check is the K8 transfer above: the held-out test sequences through `k8-compact`, each combination against K8's own 0:0. Other views (`k6-compact`, `fp8-compact`) are optional extra evidence on the same test slice. Record validated views in `applicable_views` and `view_transfer_validation`. Share one sidecar across views whenever transfer validates; create a view-scoped profile only if measured necessary.
 3. **MC manifest check (MC checkpoints):** Confirm `attach_qmla_to_mc` + `validate_sidecar(..., mc_manifest=updated_mc)` + `mc_manifest.validate` passes with `required_features` unchanged, `shared_inventory_sha256` identical, all view fingerprints identical, exact agreement between `cuteafd-mc.json["qmla"]` and `__metadata__["cuteafd_qmla"]` (plus whole-file `tensors_sha256`/`tensors_bytes`), and `mla_calibration.safetensors` absent from every view's `weight_map`.
 

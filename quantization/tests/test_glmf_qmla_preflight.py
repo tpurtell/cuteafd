@@ -32,3 +32,27 @@ def test_sparse_witness_requires_exact_native_mask_including_tail():
     assert stats["mask_matches"] and stats["pruned_rows"] == length - 1
     expected[-1, 0] = True
     assert not check_selection(seq, expected, True)["mask_matches"]
+
+
+def test_fp64_oracle_uses_native_operands_and_only_selected_keys():
+    from glm5_flash.qmla_preflight import fp64_reference
+    import math
+
+    generator = torch.Generator().manual_seed(53)
+    length, heads, width = 7, 2, 3
+    generate = lambda *shape: torch.randn(shape, generator=generator).bfloat16()
+    q = generate(length, heads * width)
+    kv = generate(length, heads * width * 2)
+    projection = generate(5, heads * width)
+    mask = torch.eye(length, dtype=torch.bool)
+    mask[2:, 0] = True
+    geometry = SimpleNamespace(heads=heads, qk_nope_dim=width, v_head_dim=width, effective_scale=width**-0.5)
+    result = fp64_reference(q, kv, mask, projection, geometry)
+    k, v = kv.double().reshape(length, heads, width * 2).chunk(2, dim=-1)
+    expected = []
+    for row in range(length):
+        visible = mask[row]
+        score = torch.einsum("hd,khd->kh", q[row].double().reshape(heads, width), k[visible]) / math.sqrt(width)
+        mixed = (score.softmax(0).unsqueeze(-1) * v[visible]).sum(0)
+        expected.append(projection.double() @ mixed.flatten())
+    torch.testing.assert_close(result, torch.stack(expected), rtol=1e-12, atol=1e-12)

@@ -262,6 +262,9 @@ def run_hy4_flash_long_eval(
     return result
 
 
+LONG_EVAL_CHAT = {k: hy4_corpus.CHAT[k] for k in ("reasoning_effort", "date_string")}
+
+
 def load_long_eval_records(checkpoint: Path, panel_revision: str | None):
     """Full-length v3 ``long_context`` records (heldout, then calibration) for ``--long-eval``."""
     return load_long_context_records(panel_snapshot_dir(panel_revision), checkpoint_dir=checkpoint,

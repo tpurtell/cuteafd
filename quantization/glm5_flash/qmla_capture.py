@@ -109,10 +109,10 @@ def _tiled_forward(x, attention):
     for start in range(0, count, ROWS):
         stop = min(start + ROWS, count)
         slots = torch.arange(start, stop, device=x.device)
-        allowed = selection.tile_mask(start, stop, 0, stop, slots)
-        allowed &= torch.arange(stop, device=x.device)[None, :] <= slots[:, None]
-        attended = native_masked_attention(query[start:stop], keys[0, :, :stop].transpose(0, 1),
-                                           values[0, :, :stop].transpose(0, 1), allowed,
+        allowed = selection.tile_mask(start, stop, 0, count, slots)
+        allowed &= torch.arange(count, device=x.device)[None, :] <= slots[:, None]
+        attended = native_masked_attention(query[start:stop], keys[0].transpose(0, 1),
+                                           values[0].transpose(0, 1), allowed,
                                            attention.scaling, f"bf16_{backend}")
         output.append(attended.reshape(stop - start, -1))
     out = attention.o_proj(torch.cat(output))

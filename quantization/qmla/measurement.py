@@ -16,7 +16,7 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
-from .capture import CapturedLayerBank, eval_attention_output
+from .capture import CapturedLayerBank, cached_content, eval_attention_output
 from .fit import (
     ContentFitResult,
     FitConfig,
@@ -73,7 +73,7 @@ class LayerCandidates:
 
 
 def _content_stats(bank: CapturedLayerBank, device) -> torch.Tensor:
-    return _quantile_999(torch.cat([seq.u.float() for seq in bank.train]).to(device))
+    return _quantile_999(torch.cat([cached_content(seq.u, bank.params) for seq in bank.train]).to(device))
 
 
 def _rope_stats(bank: CapturedLayerBank, device) -> torch.Tensor:
@@ -187,7 +187,7 @@ class _Scorer:
         params = self.params
         hooks: dict[str, Any] = {}
         if arm == "rtn":
-            exact = lambda u: u * params.kv_norm_weight.float()
+            exact = lambda c: c
         else:
             if arm == "hadamard":
                 if self.hadamard is None:
@@ -198,7 +198,7 @@ class _Scorer:
                 rotation, scale = result.r_c.to(self.device), result.s_c.to(self.device)
             exact = partial(apply_content_forward, r_c=rotation, s_c=scale)
             if key not in self._kv_b:
-                self._kv_b[key] = compensate_kv_b(params.kv_b_weight, params.kv_norm_weight, rotation, scale)
+                self._kv_b[key] = compensate_kv_b(params.kv_b_weight, rotation, scale)
             hooks["kv_b_override"] = self._kv_b[key]
         hooks["content_fn"] = _quantized(exact, bits, "BF16", self.config)
         if self.protection:
