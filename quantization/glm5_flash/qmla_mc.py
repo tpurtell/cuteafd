@@ -34,6 +34,7 @@ class GlmFlashMCSource(native.GlmFlashBF16Source):
         if manifest["exl3_codebook"] != {"name": "mul1", "multiplier": MUL1} or manifest["original_core_dtype"] != "BF16":
             raise ValueError("expected BF16 original core and EXL3 MUL1 declaration")
         self.variant = next(v for v in manifest["variants"] if v["name"] == view)
+        self.original_fingerprint = next(v["fingerprint"] for v in manifest["variants"] if v["name"] == "original")
         self.source = manifest["source"]
         self.document = json.loads((self.snapshot / self.variant["config"]).read_bytes())
         storage = self.document.pop("quantization_config")
