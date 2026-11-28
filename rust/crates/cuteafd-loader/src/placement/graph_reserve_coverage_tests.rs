@@ -205,7 +205,7 @@ fn reachable_resolver_inputs_never_yield_zero_with_graphs_on() {
                 }
                 // Step-5: traced and untraced (MC views, FP8, NVFP4) layouts.
                 use crate::serving_capacity::step5_graphs::{policy as step5, Step5GraphLayout::*};
-                for layout in [None, Some(Fp8Max), Some(Nvfp4Min), Some(Exl3Min), Some(Exl3Max)] {
+                for layout in [None, Some(Fp8Max), Some(Nvfp4Min), Some(Exl3Min), Some(Exl3Max), Some(Exl3McMin), Some(Exl3McMax)] {
                     assert!(step5(layout, ranks, rank).unwrap().bytes > 0, "Step-5 {layout:?} {ranks}x");
                 }
                 // V4.1: every lane count and row budget.
