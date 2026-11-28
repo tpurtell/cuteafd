@@ -103,6 +103,27 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
 
 ---
 
+### Capture, fitting and validation contract (both templates)
+- **Primary forward:** use the pinned upstream **BF16 source** (the MC `original` view, or the plain checkpoint) for capture and fitting.
+- **Capture once:** capture each training and validation sequence once, and reuse its activations across every bit width. Never re-run the forward per mode.
+- **Fit per path and width, independently:** for each eligible full-history MLA layer, fit content at **2, 4 and 8 bits** (`content.c2/c4/c8`) and RoPE at **4 and 8 bits** (`rope.r4/r8`). The two paths fit independently. All fitted transforms go in the one `mla_calibration.safetensors`.
+- **Validation combinations:** the pilot evaluates **4:4**. The full run evaluates **all nine**:
+  - **both paths active:** 8:8, 4:8, 4:4, 2:4;
+  - **single path:** 8:0, 4:0, 2:0, 0:8, 0:4. A 0 keeps that path's original cache format.
+
+  Combinations reuse fits: 2:0 and 2:4 share the same 2-bit content fit, and so on. **Always evaluate and report 2:0.**
+- **Error measurement:** every combination gets a measured attention-output error on the **same held-out validation sequences**, against matched baselines (RTN, fixed Hadamard, SmoothQuant†), with `sink4_local128` protection on.
+- **K8 transfer check (MC checkpoints):** replay **only the same 32 full-run validation sequences** through `k8-compact`. Apply the BF16-fitted transforms, and compare each combination against **K8's own 0:0 output**. Reuse those K8 captures across all nine combinations. The 128 training sequences run on BF16 only.
+- **Reporting:**
+  - fitting time per layer, path and bit width;
+  - validation error per combination;
+  - the total sidecar size, once.
+
+  **Keep every measured result in the report, including baseline misses.**
+- **Acceptance and publication:** mark each combination supported or unsupported by the acceptance bars: it must beat RTN and fixed Hadamard on held-out attention-output error, with equivalence and orthogonality within bounds. **A combination that misses its bars, 2:0 included, is reported and recorded as unsupported with its measured reason. It does not block publishing the combinations that pass.** `supported_modes` lists only passing combinations.
+
+---
+
 ## 5. Validation and cross-view transfer
 Before any publication step:
 1. Run `qmla.validate_sidecar(sidecar_dir, expected_source=..., expected_geometries=..., banks_by_layer=..., strict=True)` to verify:
@@ -110,7 +131,7 @@ Before any publication step:
    - Schema (`cuteafd-qmla-v1`), canonical conventions & quantizer recipe, `artifact_status == "calibrated_unqualified"`, `protection_policy == "sink4_local128"`, `protection_scope == "full_history_mla_only"`.
    - `tensors_payload_sha256`, `tensors_payload_bytes`, exact F32 tensor inventory, `profile_fingerprint`, and `transform_fingerprint`.
    - Orthogonality $\|R_C^\top R_C - I\|_\infty < 10^{-5}$, positive finite scales, and quantization-off numerical equivalence `< 1e-4`.
-2. **Cross-view transfer (MC checkpoints):** Validate the fitted sidecar on each available core view (`original`, `k8-compact`, `k6-compact`, `fp8-compact`) by checking quantization-off equivalence and quantized $\mathcal{L}_C/\mathcal{L}_P$ delta on the validation slice. Record validated views in `applicable_views` and `view_transfer_validation`. Share one sidecar across views whenever transfer validates; create a view-scoped profile only if measured necessary.
+2. **Cross-view transfer (MC checkpoints):** the required check is the K8 transfer above: the 32 validation sequences through `k8-compact`, each combination against K8's own 0:0. Other views (`k6-compact`, `fp8-compact`) are optional extra evidence on the same validation slice. Record validated views in `applicable_views` and `view_transfer_validation`. Share one sidecar across views whenever transfer validates; create a view-scoped profile only if measured necessary.
 3. **MC manifest check (MC checkpoints):** Confirm `attach_qmla_to_mc` + `validate_sidecar(..., mc_manifest=updated_mc)` + `mc_manifest.validate` passes with `required_features` unchanged, `shared_inventory_sha256` identical, all view fingerprints identical, exact agreement between `cuteafd-mc.json["qmla"]` and `__metadata__["cuteafd_qmla"]` (plus whole-file `tensors_sha256`/`tensors_bytes`), and `mla_calibration.safetensors` absent from every view's `weight_map`.
 
 ---
