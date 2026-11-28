@@ -31,7 +31,6 @@ import math
 from pathlib import Path
 import resource
 import subprocess
-import time
 import sys
 import time
 from typing import Any, Mapping, Sequence
@@ -668,7 +667,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
 
     teacher = args.teacher_checkpoint or checkpoint
-    if args.teacher_checkpoint is not None:
+    if args.checkpoint_kind == "mc":
+        if args.teacher_checkpoint is None:
+            from huggingface_hub import snapshot_download
+            teacher = Path(snapshot_download(args.base_repo, revision=args.base_revision, local_files_only=True))
         manifest = json.loads((checkpoint / "cuteafd-mc.json").read_text())
         if (checkpoint.name != args.source_revision or teacher.name != args.base_revision
                 or manifest["source"] != {"repo": args.base_repo, "revision": args.base_revision}):
@@ -683,9 +685,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("provide --corpus-dir PATH or --reuse-captures DIR")
 
     capture_dir = (args.reuse_captures or (args.output / "captures")).resolve()
+    teacher_identity = {
+        "target_revision": args.source_revision,
+        "teacher_revision": args.base_revision if args.checkpoint_kind == "mc" else args.source_revision,
+        "teacher_config_sha256": hashlib.sha256((teacher / "config.json").read_bytes()).hexdigest(),
+    }
     if args.reuse_captures is not None:
         banks = {lid: load_layer_capture(capture_dir, lid) for lid in resolved["layers"]}
         corpus_provenance = dict(banks[resolved["layers"][0]].provenance)
+        if any(corpus_provenance.get(key) != value for key, value in teacher_identity.items()):
+            raise ValueError("capture teacher or checkpoint identity differs from the requested run")
+        if (corpus_provenance["dataset_revision"] != resolved["panel_revision"]
+                or set(corpus_provenance["components"]) != set(resolved["components"])):
+            raise ValueError("capture panel revision or components differ from the requested run")
+        for bank in banks.values():
+            if (bank.provenance != corpus_provenance or len(bank.train) != resolved["train_sequences"]
+                    or len(bank.val) != resolved["val_sequences"]):
+                raise ValueError(f"capture provenance or split counts differ at layer {bank.geometry.layer_id}")
     else:
         assert args.corpus_dir is not None
         all_records, corpus_provenance = load_pinned_qmla_corpus(
@@ -693,6 +709,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             panel_revision=resolved["panel_revision"],
             components=resolved["components"],
         )
+        corpus_provenance.update(teacher_identity)
         banks = _stream_hy4_flash_captures(
             reader,
             adapter,
