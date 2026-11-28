@@ -408,7 +408,14 @@ if [[ "$coordinator_aot" == ON ]]; then
   # Strip symbol versions (name@@VER): the dynamic linker matches by bare name.
   nm -D --defined-only "$output_dir/libcuteafd_native.so" | awk '{sub(/@.*/, "", $NF); print $NF}' |
     grep -qx 'cuteafd_v41_local_expert_info' ||
-    { echo "release native library lacks cuteafd_v41_local_expert_info" >&2; exit 1; }
+    { echo "release native library lacks cuteafd_v41_local_expert_info" >&2
+      echo "nm -D v41 expert symbols:" >&2
+      nm -D "$output_dir/libcuteafd_native.so" 2>&1 | grep -iE 'v41_(local|tp2)_expert' | head -20 >&2 || true
+      echo "readelf v41 expert symbols:" >&2
+      readelf --dyn-syms --wide "$output_dir/libcuteafd_native.so" 2>&1 | grep -iE 'v41_(local|tp2)_expert' | head -20 >&2 || true
+      echo "nm -D total defined: $(nm -D --defined-only "$output_dir/libcuteafd_native.so" 2>&1 | wc -l)" >&2
+      ls -la "$output_dir/libcuteafd_native.so" "$build_root/native/libcuteafd_native.so" >&2 || true
+      exit 1; }
   nm -D --defined-only "$output_dir/libcuteafd_native.so" | awk '{sub(/@.*/, "", $NF); print $NF}' |
     grep -qx 'cuteafd_v41_tp2_expert_info' ||
     { echo "release native library lacks cuteafd_v41_tp2_expert_info" >&2; exit 1; }
