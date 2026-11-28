@@ -970,6 +970,12 @@ def test_kind_classification_v3_aliasing_loader_resolution_and_fail_closed(tmp_p
     cfg = FitConfig(steps=6, val_every=3, seed=0, sink_tokens=2, recent_tokens=6)
 
     fc0_full = fit_content_layer(bank0, 4, cfg, fit_mode="full")
+    # A 6-step fit can land within tolerance of identity on some hosts (maxq classified it
+    # scale_only), so pin a deterministic non-identity orthogonal rotation: this fixture tests
+    # classification and aliasing, not fit quality.
+    if classify_content_kind(fc0_full.r_c, fc0_full.s_c) != "full":
+        fc0_full = replace(fc0_full, r_c=sylvester_hadamard(d_c), s_c=torch.linspace(0.9, 1.1, d_c),
+                           orth_max_err=0.0, equiv_max_rel_err=1e-7)
     fc0_collapsed_id = replace(fc0_full, bits=8, r_c=eye + 2e-7, s_c=ones + 2e-7, best_step=0, orth_max_err=4e-7, equiv_max_rel_err=0.0)
     fc5_scale = fit_content_layer(bank5, 4, cfg, fit_mode="scale_only")
     if classify_content_kind(fc5_scale.r_c, fc5_scale.s_c) == "identity":
