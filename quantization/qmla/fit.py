@@ -598,7 +598,9 @@ def fit_content_layer(
 
         if step % config.val_every == 0 or step == config.steps:
             with torch.no_grad():
-                r_eval = cayley_orthogonal(skew_param)
+                # Score the FP32 rotation that will ship. A single-precision solve
+                # at production rank can lose orthogonality before the FP32 cast.
+                r_eval = cayley_orthogonal(skew_param.double()).to(skew_param.dtype)
                 s_eval = torch.exp(log_s_param.clamp(-config.log_scale_bound, config.log_scale_bound))
                 val_loss = float(
                     content_output_loss(
