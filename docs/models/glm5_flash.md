@@ -1,8 +1,8 @@
 # GLM 5.3 Flash
 
-Both MC checkpoints use K8 compact for v7 Release smoke. The two-RTX, zero-
-Spark cards are the bases for original, K6 compact and FP8 compact
-comparisons. The v6 EXLR8 card is retired; the checkpoint and configs remain
+The K4 MC and K4 MC MUL1 checkpoints use K8 compact for v7 Release smoke. Their
+two-RTX, zero-Spark cards are the bases for the original, K6 compact and FP8 compact
+[comparisons](../../scripts/bench/release-smoke-v7-mc-compact.json). The K3.25 MC comparison is retired (TJ 2026-11-28). The v6 EXLR8 card is retired; the checkpoint and configs remain
 supported.
 
 Automatic KV sizing uses the shared 2M-token target on every card, including

@@ -77,12 +77,12 @@
       "family": "glm5_flash",
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1",
       "1rtx": {
-        "status": "current",
-        "report": "benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-1rtx-2spark-glmf-mc-mul1-original-min"
+        "status": "pending",
+        "reason": "Pending v7 Release smoke (K8 compact)"
       },
       "2rtx": {
-        "status": "current",
-        "report": "benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-2rtx-glmf-mc-mul1-original-max"
+        "status": "pending",
+        "reason": "Pending v7 Release smoke (K8 compact)"
       }
     },
     {
@@ -232,26 +232,6 @@
   ],
   "mc_views": [
     {
-      "family": "kimi_k3",
-      "checkpoint": "wrldsuksgo2mars/Kimi-K3.1-Pro-EXL3-K2-MC",
-      "views": {
-        "k8-compact": "benchmarks/kimi_k3/2026-11-19-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-k8-compact-max",
-        "original": "benchmarks/kimi_k3/2026-11-19-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-original-max",
-        "k6-compact": "benchmarks/kimi_k3/2026-11-19-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-k6-compact-max",
-        "fp8-compact": "benchmarks/kimi_k3/2026-11-19-smoke-kimi-k3-1-pro-exl3-k2-mc-2rtx-6spark-kimi-k31-mc-fp8-compact-max"
-      }
-    },
-    {
-      "family": "glm5",
-      "checkpoint": "wrldsuksgo2mars/GLM-5.3-EXL3-K4-MC",
-      "views": {
-        "k8-compact": "benchmarks/glm5/2026-11-25-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-k8-compact-max",
-        "original": "benchmarks/glm5/2026-11-19-smoke-glm-5-3-exl3-k4-mc-2rtx-6spark-glm53-mc-original-max",
-        "k6-compact": null,
-        "fp8-compact": null
-      }
-    },
-    {
       "family": "glm5_flash",
       "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC",
       "views": {
@@ -263,42 +243,12 @@
     },
     {
       "family": "glm5_flash",
-      "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K3.25-MC",
+      "checkpoint": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1",
       "views": {
-        "k8-compact": "benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k3-25-mc-2rtx-glmf-k325-mc-k8-compact-max",
-        "original": "benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k3-25-mc-2rtx-glm53f-k325-mc-max",
-        "k6-compact": "benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k3-25-mc-2rtx-glmf-k325-mc-k6-compact-max",
-        "fp8-compact": "benchmarks/glm5_flash/2026-11-19-smoke-glm-5-3-flash-exl3-k3-25-mc-2rtx-glmf-k325-mc-fp8-compact-max"
-      }
-    },
-    {
-      "family": "muse_spark",
-      "checkpoint": "wrldsuksgo2mars/Muse-Spark-Open-EXL3-K4-MC",
-      "views": {
-        "k8-compact": "benchmarks/muse_spark/2026-11-19-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-mc-k8-compact-max",
-        "original": "benchmarks/muse_spark/2026-11-19-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-spark-exl3-k4-mc-max",
-        "k6-compact": "benchmarks/muse_spark/2026-11-19-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-mc-k6-compact-max",
-        "fp8-compact": "benchmarks/muse_spark/2026-11-19-smoke-muse-spark-open-exl3-k4-mc-2rtx-6spark-muse-mc-fp8-compact-max"
-      }
-    },
-    {
-      "family": "step5",
-      "checkpoint": "wrldsuksgo2mars/Step-5-Preview-EXL3-K4-MC",
-      "views": {
-        "k8-compact": "benchmarks/step5/2026-11-19-smoke-step-5-preview-exl3-k4-mc-2rtx-6spark-step5-mc-k8-compact-max",
-        "original": "benchmarks/step5/2026-11-19-smoke-step-5-preview-exl3-k4-mc-2rtx-6spark-step5-mc-original-max",
-        "k6-compact": "benchmarks/step5/2026-11-19-smoke-step-5-preview-exl3-k4-mc-2rtx-6spark-step5-mc-k6-compact-max",
-        "fp8-compact": "benchmarks/step5/2026-11-19-smoke-step-5-preview-exl3-k4-mc-2rtx-6spark-step5-mc-fp8-compact-max"
-      }
-    },
-    {
-      "family": "inkling2",
-      "checkpoint": "wrldsuksgo2mars/Inkling-2-Small-EXL3-K4-MC",
-      "views": {
-        "k8-compact": "benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-2rtx-6spark-inkling2-mc-k8-compact-max",
-        "original": "benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-2rtx-6spark-inkling2-exl3-max",
-        "k6-compact": "benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-2rtx-6spark-inkling2-mc-k6-compact-max",
-        "fp8-compact": "benchmarks/inkling2/2026-11-19-smoke-inkling-2-small-exl3-k4-mc-2rtx-6spark-inkling2-mc-fp8-compact-max"
+        "k8-compact": null,
+        "original": "benchmarks/glm5_flash/2026-11-25-smoke-glm-5-3-flash-exl3-k4-mc-mul1-2rtx-glmf-mc-mul1-original-max",
+        "k6-compact": null,
+        "fp8-compact": null
       }
     },
     {

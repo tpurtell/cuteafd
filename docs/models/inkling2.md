@@ -1,7 +1,7 @@
 # Inkling 2 Small
 
-The v7 release keeps the EXL3 K4 MC cards, using K8 compact on both layouts
-and comparing original, K6 compact and FP8 compact on the two-RTX layout.
+The v7 release keeps the EXL3 K4 MC cards, using K8 compact on both layouts.
+V7 drops the original, K6 compact and FP8 compact comparison (TJ 2026-11-28); its last cards stay pinned in the [comparison matrix](../../scripts/bench/release-smoke-v7-mc-compact.json)'s retired list.
 The native NVFP4 and MXFP8 cards are retired; their checkpoints and configs
 remain supported.
 

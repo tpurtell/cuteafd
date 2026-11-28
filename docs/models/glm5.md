@@ -1,8 +1,7 @@
 # GLM 5.3
 
 The v7 release cards use K8 compact on 1 RTX + 4 Sparks and 2 RTX + 6
-Sparks. Original, K6 compact and FP8 compact are compared on the same two-
-RTX layout. The v6 EXLR8 card is retired; the checkpoint and configs remain
+Sparks. V7 drops the original, K6 compact and FP8 compact comparison (TJ 2026-11-28); its last cards stay pinned in the [comparison matrix](../../scripts/bench/release-smoke-v7-mc-compact.json)'s retired list. The v6 EXLR8 card is retired; the checkpoint and configs remain
 supported.
 
 Automatic KV sizing uses the shared 2M-token target on every card, including
@@ -62,8 +61,7 @@ Selected metadata and fingerprints are immutable across planning and serving.
 
 The MC min/max configs above pin `MODEL_ID`, `MODEL_REVISION` and
 `CORE_VIEW=original`. The [v7 release smoke matrix](../../scripts/bench/release-smoke-v7.json)
-overrides the core view and keeps DFlash2 on both layouts. The three alternate
-views run through the [v7 comparison matrix](../../scripts/bench/release-smoke-v7-mc-compact.json).
+overrides the core view and keeps DFlash2 on both layouts.
 
 `fp8-compact` is an explicit, quality-affecting opt-in. Metadata-selected
 attention, dense/shared FFN and vocabulary-head matrices use native block FP8

@@ -799,6 +799,10 @@ V7_RETIREMENTS = {
 }
 HY4_MC = "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC"
 HY4_FULL_MC = "wrldsuksgo2mars/Hy4-EXL3-K4-MC"
+GLMF_MUL1 = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1"
+V7_MC = MC_CHECKPOINTS | {HY4_MC, HY4_FULL_MC, GLMF_MUL1}
+# TJ 2026-11-28: the v7 compact comparison set keeps only these four checkpoints.
+V7_COMPARED = {"wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC", GLMF_MUL1, HY4_MC, HY4_FULL_MC}
 
 
 def test_v7_release_cards_match_live_and_retired_inventory():
@@ -832,8 +836,8 @@ def test_v7_release_cards_match_live_and_retired_inventory():
             if key in entry["set"]:
                 assert (key, values[key]) not in endpoints
                 endpoints.add((key, values[key]))
-        if values["MODEL_ID"] in MC_CHECKPOINTS | {HY4_MC, HY4_FULL_MC}:
-            assert values["CORE_VIEW"] == "k8-compact"
+        if values["MODEL_ID"] in V7_MC:
+            assert values["CORE_VIEW"] == "k8-compact", entry["name"]
         identity = (entry["family"], values["MODEL_ID"], len(entry["gpus"]), len(entry["sparks"]))
         assert identity not in cards
         cards.add(identity)
@@ -857,7 +861,7 @@ def test_v7_release_cards_match_live_and_retired_inventory():
     assert hy4_full["1rtx"]["status"] == hy4_full["2rtx"]["status"] == "pending"
     # #2675 / #2782: the K8-compact v7 smoke cards are published, each on its own report.
     for row in published["cells"] + published["supplemental"]:
-        if row["checkpoint"] in MC_CHECKPOINTS | {HY4_MC, HY4_FULL_MC}:
+        if row["checkpoint"] in V7_MC:
             for key in ("1rtx", "2rtx"):
                 cell = row.get(key)
                 if cell and cell["status"] == "current":
@@ -891,9 +895,25 @@ def test_v7_comparisons_change_only_view_and_endpoints_from_the_k8_max():
             k: v for k, v in _effective(base, main).items() if k not in ignore}
         assert (*identity, view) not in compared
         compared.add((*identity, view))
-    assert compared == {(*identity, view) for identity in bases for view in compare}
-    assert {model for _, model in bases} == MC_CHECKPOINTS | {HY4_MC, HY4_FULL_MC}
-    assert {(study["family"], study["checkpoint"]) for study in published["mc_views"]} == set(bases)
+    kept = {identity for identity in bases if identity[1] in V7_COMPARED}
+    assert {model for _, model in kept} == V7_COMPARED
+    assert {model for _, model in bases} == V7_MC
+    assert compared == {(*identity, view) for identity in kept for view in compare}
+    # Retired comparisons keep their last card; none is still scheduled.
+    retired_names = set()
+    for entry in compact["retired"]:
+        assert set(entry) == {"name", "config", "report", "release", "release_note"}
+        assert entry["name"] not in names | retired_names
+        retired_names.add(entry["name"])
+        assert (ROOT / entry["config"]).is_file()
+        report = json.loads((ROOT / entry["report"] / "report.json").read_text())
+        assert report["profile"] == "smoke" and report.get("baseline")
+        assert_retired_release(entry, report)
+        settings = {s["name"]: s.get("value") for s in report["server"]["configuration"]["settings"]}
+        assert entry["name"].split("-mc-")[1].removesuffix("-max") == settings["core-view"]
+        assert keys(ROOT / entry["config"])["MODEL_ID"] not in V7_COMPARED
+    assert len(compact["retired"]) == 18
+    assert {(study["family"], study["checkpoint"]) for study in published["mc_views"]} == kept
     for study in published["mc_views"]:
         assert set(study["views"]) == compare | {"k8-compact"}
         row = next(row for row in published["cells"] if row["checkpoint"] == study["checkpoint"])
@@ -910,6 +930,9 @@ def test_v7_comparisons_change_only_view_and_endpoints_from_the_k8_max():
             assert {v for v, d in study["views"].items() if d} == {"k8-compact"}
         if study["checkpoint"] == HY4_FULL_MC:
             assert not any(study["views"].values())
+        if study["checkpoint"] == GLMF_MUL1:
+            # Its v7 K8 cards are pending; the earlier original-view max card is its original study.
+            assert {v for v, d in study["views"].items() if d} == {"original"}
 
 
 @pytest.mark.parametrize("path", starting_configs(), ids=lambda p: p.name)
@@ -1502,10 +1525,13 @@ def test_kimi_k31_mc_cards_keep_original_primary_and_k6_supplementary() -> None:
     # #2675: v7 main cards are K8 compact on both columns.
     assert row["1rtx"]["status"] == row["2rtx"]["status"] == "current"
     assert row["1rtx"]["report"].endswith("-kimi-k31-mc-k8-compact-min")
-    study, = [entry for entry in published["mc_views"] if entry["checkpoint"] == model]
-    assert study["views"]["k8-compact"] == row["2rtx"]["report"]
-    for view in ("k8-compact", "k6-compact", "fp8-compact"):
-        assert study["views"][view].endswith(f"-kimi-k31-mc-{view}-max")
+    assert row["2rtx"]["report"].endswith("-kimi-k31-mc-k8-compact-max")
+    # TJ 2026-11-28: the Kimi K3.1 comparison study is retired; its last cards stay pinned.
+    assert not [entry for entry in published["mc_views"] if entry["checkpoint"] == model]
+    v7_compact = json.loads((ROOT / V7_COMPACT).read_text())
+    retired = {entry["name"]: entry["report"] for entry in v7_compact["retired"]}
+    for view in ("k6-compact", "fp8-compact"):
+        assert retired[f"kimi-k31-mc-{view}-max"].endswith(f"-kimi-k31-mc-{view}-max")
     assert any(row["checkpoint"] == "wrldsuksgo2mars/Kimi-K3-EXL3-K2-Core-K6" for row in published["cells"])
 
 
