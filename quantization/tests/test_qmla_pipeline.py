@@ -28,6 +28,7 @@ from hy4_flash.qmla_run import (
     parse_modes_arg,
     resolve_run_settings,
 )
+from qmla.pipeline import resolve_split_counts
 from qmla.measurement import _token_relative_squares
 from qmla import (
     DEFAULT_FIT_BUDGET,
@@ -242,10 +243,11 @@ def test_panel_resolution_via_panel_corpus_defaults_to_v3_three_components():
 
     parser = build_parser()
     base = ["--checkpoint", "/x", "--source-revision", "a" * 40, "--output", "/y"]
+    # QMLA fits on the base components in every run; long_context is --long-eval only.
     full = resolve_run_settings(parser.parse_args(base), (0, 1))
-    assert (full["panel_revision"], full["components"], full["full"]) == (V3.revision, QMLA_KNOWN_COMPONENTS, True)
-    with pytest.raises(ValueError, match="full calibration requires all three"):
-        resolve_run_settings(parser.parse_args(base + ["--components", "agentic,exl3_standard"]), (0, 1))
+    assert (full["panel_revision"], full["components"], full["full"]) == (V3.revision, QMLA_BASE_COMPONENTS, True)
+    explicit = resolve_run_settings(parser.parse_args(base + ["--components", "agentic,exl3_standard"]), (0, 1))
+    assert explicit["components"] == QMLA_BASE_COMPONENTS
     pilot = resolve_run_settings(parser.parse_args(base + ["--pilot", "--components", "agentic,exl3_standard"]), (0, 1))
     assert (pilot["components"], pilot["full"]) == (QMLA_BASE_COMPONENTS, False)
 
@@ -487,14 +489,24 @@ def test_hy4_flash_v3_default_single_file_sidecar_mc_section_and_incremental_pub
     assert resolved["modes"] == tuple(parse_qmla_mode(m) for m in DEFAULT_FULL_MODES)
     assert len(resolved["modes"]) == 9
     assert resolved["panel_revision"] == V3.revision
-    assert resolved["components"] == QMLA_KNOWN_COMPONENTS
+    # QMLA fits on the base components; long_context feeds --long-eval only.
+    assert resolved["components"] == QMLA_BASE_COMPONENTS
     assert resolved["protection"] == "sink4_local128"
     assert (resolved["train_sequences"], resolved["val_sequences"], resolved["test_sequences"]) == (16, 4, 4)
     full = resolve_run_settings(
         parser.parse_args(["--checkpoint", str(tmp_path), "--source-revision", "a" * 40, "--output", str(tmp_path)]),
         (0, 1, 5),
     )
-    assert (full["train_sequences"], full["val_sequences"], full["test_sequences"]) == (128, 16, 16)
+    assert (full["train_sequences"], full["val_sequences"], full["test_sequences"]) == (None, None, None)
+    assert full["components"] == QMLA_BASE_COMPONENTS
+    # 60/30/10 of the base-component rows, test taking the remainder.
+    assert resolve_split_counts(full, 1676) == {"train_count": 1005, "val_count": 502, "test_count": 169}
+    assert resolve_split_counts(resolved, 1676) == {"train_count": 16, "val_count": 4, "test_count": 4}
+    with pytest.raises(ValueError, match="do not fit"):
+        resolve_split_counts(full, 3)
+    partial = {**full, "train_sequences": 10}
+    with pytest.raises(ValueError, match="or none"):
+        resolve_split_counts(partial, 1676)
     assert parse_layers_arg("all-dsa", (0, 1, 5)) == (0, 1, 5)
     assert parse_modes_arg("4:4,2:4,4:0") == ((4, 4), (2, 4), (4, 0))
 

@@ -75,10 +75,10 @@ def _hy4_long_eval_bytes_per_token(config: Any) -> int:
 
 
 from qmla.pipeline import (
-    _git_head_sha, attach_long_context_eval, build_run_parser, calibrate_from_banks, FULL_SPLITS, PILOT_SPLITS,
+    _git_head_sha, attach_long_context_eval, build_run_parser, calibrate_from_banks, PILOT_SPLITS,
     check_reused_captures, corpus_split_description, load_pinned_qmla_corpus,
     parse_components_arg, parse_layers_arg, parse_modes_arg, required_profile_bits,
-    resolve_settings, split_identity,
+    resolve_settings, resolve_split_counts, split_identity,
 )
 
 calibrate_hy4_flash_from_banks = calibrate_from_banks
@@ -411,7 +411,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             components=resolved["components"],
             full=resolved["full"],
         )
-    split_counts = {f"{name}_count": resolved[f"{name}_sequences"] for name in SPLIT_NAMES}
+    split_counts = resolve_split_counts(resolved, len(all_records)) if all_records is not None else {
+        f"{name}_count": resolved[f"{name}_sequences"] for name in SPLIT_NAMES}
     if args.reuse_captures is not None:
         banks = {lid: load_layer_capture(capture_dir, lid) for lid in resolved["layers"]}
         corpus_provenance = check_reused_captures(

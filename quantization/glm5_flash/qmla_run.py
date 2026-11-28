@@ -20,7 +20,7 @@ from qmla.long_eval import (
 )
 from qmla.pipeline import (_git_head_sha, attach_long_context_eval, build_run_parser, calibrate_from_banks,
                            check_reused_captures, corpus_split_description, load_pinned_qmla_corpus,
-                           parse_modes_arg, resolve_settings)
+                           parse_modes_arg, resolve_settings, resolve_split_counts)
 from qmla.sidecar import load_sidecar_transforms
 
 TARGET_REPO = "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1"
@@ -127,7 +127,7 @@ def stream_layers(source, adapter, layers, records, device, *, long_eval=None, p
 
 
 def capture_banks(source, adapter, records, settings, capture_dir, provenance, seed, device):
-    counts = {f"{name}_count": settings[f"{name}_sequences"] for name in SPLIT_NAMES}
+    counts = resolve_split_counts(settings, len(records))
     parts = split_train_val_test(records, **counts, key_fn=lambda row: row[0], seed=seed)
     provenance = {**provenance, "splits": corpus_split_description(records, seed=seed, **counts)}
     train_n, val_n = len(parts[0]), len(parts[1])
@@ -228,7 +228,7 @@ def main(argv=None):
                                             components=settings["components"], full=settings["full"])
     if args.reuse_captures:
         banks = {lid: load_layer_capture(args.reuse_captures, lid) for lid in settings["layers"]}
-        counts = {f"{k}_count": settings[f"{k}_sequences"] for k in SPLIT_NAMES}
+        counts = resolve_split_counts(settings, len(records))
         prov = check_reused_captures(banks, settings, capture_identity, seed=args.seed,
                                      expected_splits=corpus_split_description(records, seed=args.seed, **counts))
     else:

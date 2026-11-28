@@ -67,13 +67,16 @@ from qmla.measurement import (
 from qmla.quantizer import parse_qmla_mode
 from qmla.sidecar import (
     CANONICAL_CONVENTIONS,
+    QMLA_BASE_COMPONENTS,
     resolve_qmla_panel,
     validate_sidecar,
     write_sidecar,
 )
 
 PILOT_SPLITS = (16, 4, 4)
-FULL_SPLITS = (128, 16, 16)
+# Full runs split the base-component calibration rows (agentic + exl3_standard)
+# train/val/test = 60/30/10; long_context records feed long-eval only.
+FULL_SPLIT_FRACTIONS = (0.6, 0.3, 0.1)
 VALIDATION_REPORT_SCHEMA = "cuteafd-qmla-validation-report-v3"
 CANDIDATE_TABLE_SCHEMA = "cuteafd-qmla-candidate-table-v3"
 
@@ -858,7 +861,8 @@ def build_run_parser(
     parser.add_argument(
         "--pilot",
         action="store_true",
-        help="Family pilot layers and modes; 16/4/4 train/val/test sequences; 100 steps",
+        help="Family pilot layers and modes; 16/4/4 train/val/test sequences; 100 steps "
+             "(full runs split the base-component rows 60/30/10)",
     )
     parser.add_argument("--layers", default=None, help="Layer selection: 'all-dsa' or comma-separated IDs")
     parser.add_argument("--modes", default=None, help="Comma-separated QUANT_MLA modes (e.g. 4:4 or 8:8,4:8,4:4,2:4)")
@@ -910,15 +914,18 @@ def resolve_settings(
     else:
         default_layers = "all-dsa"
         default_modes = ",".join(full_modes)
-        (default_train, default_val, default_test), default_steps = FULL_SPLITS, 300
+        # None: resolve_split_counts sizes them from FULL_SPLIT_FRACTIONS once the rows are loaded.
+        (default_train, default_val, default_test), default_steps = (None, None, None), 300
 
     layers = parse_layers_arg(args.layers or default_layers, eligible_layers)
     modes = parse_modes_arg(args.modes or default_modes)
     full = not args.pilot
+    # QMLA fits on the base components only (agentic + exl3_standard); the panel's
+    # long_context records are evaluated separately by --long-eval at full length.
     _, panel_revision, components = resolve_qmla_panel(
         panel_revision=args.panel_revision,
-        components=None if args.components is None else parse_components_arg(args.components),
-        full=full,
+        components=QMLA_BASE_COMPONENTS if args.components is None else parse_components_arg(args.components),
+        full=False,
     )
     train_n = default_train if args.train_sequences is None else int(args.train_sequences)
     val_n = default_val if args.val_sequences is None else int(args.val_sequences)
@@ -936,6 +943,26 @@ def resolve_settings(
         "test_sequences": test_n,
         "steps": steps,
     }
+
+
+def resolve_split_counts(settings: Mapping[str, Any], n_records: int) -> dict[str, int]:
+    """``{train,val,test}_count`` for ``n_records`` calibration rows.
+
+    Explicit ``--*-sequences`` values win; otherwise full runs split
+    ``FULL_SPLIT_FRACTIONS`` (60/30/10) of the rows, test taking the remainder.
+    """
+    explicit = [settings[f"{name}_sequences"] for name in SPLIT_NAMES]
+    if all(value is not None for value in explicit):
+        counts = [int(value) for value in explicit]
+    else:
+        if any(value is not None for value in explicit):
+            raise ValueError("set all of --train/--val/--test-sequences, or none for the 60/30/10 split")
+        train = int(n_records * FULL_SPLIT_FRACTIONS[0])
+        val = int(n_records * FULL_SPLIT_FRACTIONS[1])
+        counts = [train, val, n_records - train - val]
+    if any(count <= 0 for count in counts) or sum(counts) > n_records:
+        raise ValueError(f"split counts {counts} do not fit {n_records} calibration rows")
+    return {f"{name}_count": count for name, count in zip(SPLIT_NAMES, counts)}
 
 
 def corpus_split_description(

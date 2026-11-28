@@ -44,11 +44,11 @@ Before capturing any activation:
 
 ## 2. Calibration corpus (pinned panel revision + fixed known component set, never Standard Fidelity)
 `quantization/panel_corpus.py` owns the panel pin, component order, renderer and loader (`brief-template.md` §3). QMLA resolves the panel through `panel_corpus.resolve_panel_policy` (full = not `--pilot`) and never pins its own revision. Never use the held-out Standard Fidelity panel.
-1. **Default (full) calibration: `wrldsuksgo2mars/agentic-quant-panel-v3@e3ac6ee6126f469e37ddf879a6cb2dccc10c6c99`, all three components in order:**
+1. **Fitting corpus: `wrldsuksgo2mars/agentic-quant-panel-v3@e3ac6ee6126f469e37ddf879a6cb2dccc10c6c99`, the two base components in order:**
    - `agentic`: rendered with **this checkpoint's own** tokenizer and chat template.
    - `exl3_standard`: packed with this checkpoint's tokenizer (`exl3-standard-pack-v1`).
-   - `long_context`: 16K/32K multi-turn traces rendered once with the checkpoint's template, cut into 2,048-token windows (`long_context_mode="windowed"`); heldout records never enter fitting.
-   - `--corpus-dir` is a `panel_corpus.prepare_panel_corpus` output (`python quantization/panel_corpus.py ...`), loaded and verified through `panel_corpus.load_component_records`. A full run with fewer than all three components fails closed.
+   - **`long_context` is not fitted on.** Its full-length 16K/32K records are the separate `--long-eval` set (section 5), so fitting and long-context evaluation never share data.
+   - `--corpus-dir` is a `panel_corpus.prepare_panel_corpus` output (`python quantization/panel_corpus.py ...`), loaded and verified through `panel_corpus.load_component_records`.
 2. **Pilot:** `--pilot` may pass a subset with `--components` (always including `agentic` and `exl3_standard`).
 3. **Past runs:** `wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7` (two components) stays pinned for frozen reproductions via `--panel-revision 54683731eb01c7c2fa5b801a0888e029a0e1b1c7`.
 - The exact `dataset_repo`, `dataset_revision`, and components used are recorded explicitly in `calibration_provenance`.
@@ -111,7 +111,7 @@ MIMALLOC_PURGE_DELAY=0 PYTHONPATH="$PWD/quantization:$PWD/third_party/transforme
 ### Capture, fitting and validation contract (both templates)
 - **Primary forward.** Load the pinned MC checkpoint’s `original` view through the MC runtime. Use the core and all experts from that view. The upstream BF16 repo in `cuteafd-mc.json["source"]` is provenance only. For a plain checkpoint, load its own weights. Record the source revision and view. Use this forward’s own `0:0` outputs as the reference for fitting, validation and test.
 - **Content coordinates:** fit and quantize the checkpoint's native weighted cache latent $c$ ($c=\mathrm{BF16}(u\Gamma)$ at a BF16 output boundary). Use $z_C=c R_C S_C$ (or $c \odot s_C$ for `scale_only`, or $c$ for `identity`) on writes and the matching inverse in consumers, including target-sharing drafters. Every view applies the transform after weighted RMSNorm.
-- **Three disjoint splits:** `train` fits, `val` selects fit steps and per-width transforms, `test` produces every reported number (full 128 / 16 / 16, pilot 16 / 4 / 4). Split IDs and hashes are recorded in provenance and the fit identity.
+- **Three disjoint splits:** `train` fits, `val` selects fit steps and per-width transforms, `test` produces every reported short-context number. A full run splits **all** base-component rows **60 / 30 / 10** (`FULL_SPLIT_FRACTIONS`; about 1,005 / 502 / 169 rows on the v3 panel); a pilot uses 16 / 4 / 4. Split IDs and hashes are recorded in provenance and the fit identity.
 - On PyTorch builds with mimalloc, set `MIMALLOC_PURGE_DELAY=0` before the Python process starts so freeing a capture returns its anonymous pages to the OS. With Docker, pass `-e MIMALLOC_PURGE_DELAY=0` to the container. Log `qmla.capture.layer_memory_bytes(device)` after releasing each layer. On GB10, use `system_total - system_available` to track unified memory pressure alongside process RSS and CUDA allocations.
 - **Capture once:** capture each sequence once on the MC `original` view and reuse its activations across every bit width.
 - **Fitting budget & candidate persistence (kept during the run, deleted after publish):**
