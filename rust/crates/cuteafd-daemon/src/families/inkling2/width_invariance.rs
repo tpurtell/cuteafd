@@ -465,7 +465,7 @@ pub(crate) fn run(args:&mut GoldenArgs)->Result<()>{
         prefill:PrefillShape{rows:args.prefill_rows as u64,waves:args.prefill_waves},decode_rows:args.decode_rows,sequences:args.max_sequences as u64,
         context_tokens:0,pool_tokens:args.pool_tokens,kv_format:args.kv_format,drafter:Some(args.draft_kv_cache),
         onboard:args.rtx_expert_layers.resolve(cfg.layers),prefix:&args.prefix,
-        resident_weights:crate::shared::memory::budget::resident_weight_limit(),expert_usage:false,vision:&vision})?;
+        resident_weights:crate::shared::memory::budget::resident_weight_limit(),expert_usage:false,vision:&vision,decode_graphs:true})?;
     ensure!(inputs.prefix_mark_slots>0,"width oracle has no admitted target mark");
     if args.wide_batch {
         return wide_batch_oracle(&mut execution, &inputs, &admitted, &tokens, args);

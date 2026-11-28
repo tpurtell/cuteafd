@@ -30,8 +30,9 @@ const CENSUS: &[(Layout, usize, WorkingSet)] = &[
     (Layout::DualContextSpark, 1, WorkingSet { w1: 158 << 20, step_growth: 40 << 20, capture_growth: 40 << 20 }),
 ];
 
-pub fn reserve_policy(layout: Option<Layout>, rank: usize) -> Result<Resolved, Error> {
-    graph_reserve::current_census(rank, layout, CENSUS)
+/// The exact census entry, else the Hy4 × ranks envelope; never 0 with graphs on.
+pub fn reserve_policy(layout: Option<Layout>, gpus: usize, rank: usize) -> Result<Resolved, Error> {
+    graph_reserve::current_census(rank, layout, CENSUS, graph_reserve::GraphFamily::Hy4, gpus)
 }
 
 #[cfg(test)]
@@ -66,5 +67,13 @@ mod tests {
         assert_eq!(graph_reserve::census_working_set(0, None, CENSUS), None);
         assert_eq!(graph_reserve::census_working_set(1, Some(Layout::SingleSpark), CENSUS), None);
         assert_eq!(graph_reserve::census_working_set(2, Some(Layout::DualContextSpark), CENSUS), None);
+        cuteafd_core::memory_policy::MemoryPolicy::default().scoped(|| {
+            for (gpus, sparks, attention) in [(1, 0, AttentionPlacement::Heads), (2, 6, AttentionPlacement::Heads)] {
+                for rank in 0..gpus {
+                    assert_eq!(reserve_policy(Layout::resolve(gpus, sparks, attention), gpus, rank).unwrap().bytes,
+                        graph_reserve::envelope_bytes(graph_reserve::GraphFamily::Hy4, gpus, rank));
+                }
+            }
+        });
     }
 }

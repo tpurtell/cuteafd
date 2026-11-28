@@ -8,6 +8,10 @@ pub enum Step5GraphLayout {
     #[serde(rename = "nvfp4-1rtx-4spark")] Nvfp4Min,
     #[serde(rename = "exl3-k4-core-k6-1rtx-3spark")] Exl3Min,
     #[serde(rename = "exl3-k4-core-k6-2rtx-6spark")] Exl3Max,
+    /// Any other EXL3 K4 core (the shipping K4-MC views) at 1 RTX + 3 Sparks /
+    /// 2 RTX + 6 Sparks: no trace inventory, sized by its working-set census.
+    #[serde(rename = "exl3-k4-mc-1rtx-3spark")] Exl3McMin,
+    #[serde(rename = "exl3-k4-mc-2rtx-6spark")] Exl3McMax,
 }
 impl Step5GraphLayout {
     pub fn resolve(catalog: &crate::OfficialV41Catalog,
@@ -36,11 +40,14 @@ impl Step5GraphLayout {
         match (tiers, k6_core, ranks, sparks) {
             ([4, 6], true, 1, 3) => Some(Self::Exl3Min),
             ([4, 6], true, 2, 6) => Some(Self::Exl3Max),
+            ([4, ..], false, 1, 3) => Some(Self::Exl3McMin),
+            ([4, ..], false, 2, 6) => Some(Self::Exl3McMax),
             _ => None,
         }
     }
     fn ranks(self) -> usize {
-        match self { Self::Fp8Max | Self::Exl3Max => 2, Self::Nvfp4Min | Self::Exl3Min => 1 }
+        match self { Self::Fp8Max | Self::Exl3Max | Self::Exl3McMax => 2,
+            Self::Nvfp4Min | Self::Exl3Min | Self::Exl3McMin => 1 }
     }
 }
 #[derive(Debug, Deserialize)]
@@ -101,9 +108,39 @@ pub fn prewarm(layout: Option<Step5GraphLayout>) -> Option<&'static Step5GraphTr
         list
     }).layouts.iter().find(|trace| trace.layout == layout)
 }
-pub fn reserve(layout: Option<Step5GraphLayout>, rank: usize) -> (u64, u64) {
+pub fn reserve(layout: Option<Step5GraphLayout>, rank: usize) -> Option<(u64, u64)> {
     prewarm(layout).and_then(|trace| trace.ranks.get(rank))
-        .map_or((0, 0), |data| (data.reserve_base_bytes, data.reserve_extra_bytes))
+        .map(|data| (data.reserve_base_bytes, data.reserve_extra_bytes))
+}
+
+/// Full-card working-set census of the shipping K4-MC original cards (cand
+/// acc0704eb6, 2026-11-28, MTP depth 3, `baseline` + C1/C16 + post-load C1,
+/// `GPU_GRAPH_RESERVE=4608MiB`, `GRAPH_PREWARM=off`, pressure-only donors, zero
+/// evictions; 48 live row counts at ~52 MiB/row on 1 RTX): W1 is the full-card
+/// charged high-water (the Hy4 #2803 rule), growth is half the observed margin.
+/// - 1 RTX + 3 Sparks: W1 2,506 MiB, growth 56 MiB -> soft/hard 3,008/3,120 MiB.
+/// - 2 RTX + 6 Sparks: W1 1,900/1,688 MiB, growth 44/40 MiB -> 2,280/2,368 and 2,026/2,106 MiB.
+const CENSUS: &[(Step5GraphLayout, usize, crate::placement::graph_reserve::WorkingSet)] = {
+    use crate::placement::graph_reserve::WorkingSet;
+    &[
+        (Step5GraphLayout::Exl3McMin, 0, WorkingSet { w1: 2506 << 20, step_growth: 56 << 20, capture_growth: 56 << 20 }),
+        (Step5GraphLayout::Exl3McMax, 0, WorkingSet { w1: 1900 << 20, step_growth: 44 << 20, capture_growth: 44 << 20 }),
+        (Step5GraphLayout::Exl3McMax, 1, WorkingSet { w1: 1688 << 20, step_growth: 40 << 20, capture_growth: 40 << 20 }),
+    ]
+};
+
+/// The measured working set, else the traced layout's arena plus the shared
+/// extra, else the Step-5 × ranks envelope.
+pub fn policy(layout: Option<Step5GraphLayout>, ranks: usize, rank: usize)
+    -> Result<crate::placement::graph_reserve::Resolved, crate::placement::graph_reserve::Error> {
+    use crate::placement::graph_reserve::{self, GraphFamily};
+    if let Some(measured) = graph_reserve::census_working_set(rank, layout, CENSUS) {
+        return graph_reserve::current_working_set(rank, measured);
+    }
+    match reserve(layout, rank) {
+        Some((base, tail)) => graph_reserve::current(rank, false, base, tail),
+        None => graph_reserve::current_envelope(GraphFamily::Step5, ranks, rank),
+    }
 }
 /// Select complete rows against all devices; never borrow an untraced layout.
 pub fn selected_rows(layout: Option<Step5GraphLayout>, max_rows: usize) -> anyhow::Result<Vec<(usize, bool)>> {
@@ -153,7 +190,9 @@ mod tests {
             assert_eq!(Step5GraphLayout::exl3_layout(&[4, 6], &core, 1, 4), None);
         }
         core.projections.get_mut("lm_head").unwrap().bits = 5;
-        assert_eq!(Step5GraphLayout::exl3_layout(&[4, 6], &core, 1, 3), None);
+        assert_eq!(Step5GraphLayout::exl3_layout(&[4, 6], &core, 1, 3), Some(Exl3McMin));
+        assert_eq!(Step5GraphLayout::exl3_layout(&[4, 6], &core, 2, 6), Some(Exl3McMax));
+        assert_eq!(Step5GraphLayout::exl3_layout(&[4], &CoreInventory::default(), 1, 3), Some(Exl3McMin));
         assert_eq!(Exl3Min.ranks(), 1);
         assert_eq!(Exl3Max.ranks(), 2);
     }
@@ -166,7 +205,7 @@ mod tests {
             ] {
                 let trace = prewarm(Some(layout)).unwrap();
                 for (rank, base) in bases.into_iter().enumerate() {
-                    assert_eq!(reserve(Some(layout), rank), (base, 2 << 20));
+                    assert_eq!(reserve(Some(layout), rank), Some((base, 2 << 20)));
                     assert_eq!(trace.ranks[rank].entries.len(), rows);
                 }
                 let selected = selected_rows(Some(layout), 64).unwrap();
@@ -174,16 +213,30 @@ mod tests {
                 assert_eq!(selected.iter().filter_map(|&(row, pin)| pin.then_some(row))
                     .collect::<Vec<_>>(), pins);
             }
+            for (layout, rank, soft, hard) in [(Step5GraphLayout::Exl3McMin, 0, 3008, 3120),
+                (Step5GraphLayout::Exl3McMax, 0, 2280, 2368), (Step5GraphLayout::Exl3McMax, 1, 2026, 2106)] {
+                assert!(prewarm(Some(layout)).is_none());
+                let charged = policy(Some(layout), layout.ranks(), rank).unwrap();
+                assert_eq!((charged.base_bytes, charged.bytes), (soft << 20, hard << 20), "{layout:?} rank {rank}");
+            }
             for layout in [Step5GraphLayout::Fp8Max, Step5GraphLayout::Nvfp4Min] {
                 assert!(prewarm(Some(layout)).is_none());
-                assert_eq!(reserve(Some(layout), 0), (0, 0));
+                assert_eq!(reserve(Some(layout), 0), None);
             }
         });
     }
     #[test]
-    fn untraced_layout_has_no_pins_no_charge_and_no_borrowed_rows() {
+    fn layout_without_trace_has_no_pins_or_rows_and_charges_the_envelope() {
+        use crate::placement::graph_reserve::{envelope_bytes, GraphFamily};
         assert!(prewarm(None).is_none());
-        assert_eq!(reserve(None, 0), (0, 0));
+        assert_eq!(reserve(None, 0), None);
         assert!(selected_rows(None, 4096).unwrap().is_empty());
+        cuteafd_core::memory_policy::MemoryPolicy::default().scoped(|| {
+            for ranks in [1, 2] {
+                for rank in 0..ranks {
+                    assert_eq!(policy(None, ranks, rank).unwrap().bytes, envelope_bytes(GraphFamily::Step5, ranks, rank));
+                }
+            }
+        });
     }
 }

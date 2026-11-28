@@ -69,6 +69,8 @@ pub struct FactsRequest<'a> {
     pub spark_ranks: usize,
     pub spark_bytes: u64,
     pub prefill: PrefillShape,
+    /// `--decode-graphs` (default on): off charges no graph reserve.
+    pub decode_graphs: bool,
     /// Admitted per-lane decode/verify row budget (`DECODE_ROWS`, 1..=128).
     pub decode_rows: u32,
     /// Explicit context, or 0 for the checkpoint's maximum.
@@ -360,7 +362,7 @@ pub fn gather_with_weights(request: &FactsRequest<'_>, weights: SelectedWeights)
             // The measured sample follows module loading: only what it has not seen.
             Coordinator::Measured { loaded_code, .. } => loaded_code.get(gpu).copied().unwrap_or(0),
         });
-        graph_reserve.push(crate::serving_capacity::inkling2_graphs::policy(gpu, gpus)
+        graph_reserve.push(crate::serving_capacity::inkling2_graphs::policy(gpu, gpus, request.decode_graphs)
             .map_err(|error| refused(format!("Inkling 2 graph reserve refused: {error}"), "Fix GPU_GRAPH_RESERVE."))?.bytes);
     }
     let mut budgets = (0..gpus).map(|gpu| request.coordinator.budget(gpu)).collect::<Vec<_>>();

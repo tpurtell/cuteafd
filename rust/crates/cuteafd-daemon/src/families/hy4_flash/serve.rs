@@ -223,6 +223,7 @@ fn publish_provenance(
         .map(|gpu| {
             cuteafd_loader::serving_capacity::hy4_graphs::reserve_policy_for(
                 graph_layout,
+                runtime.gpus.len(),
                 gpu,
                 args.dfly2 == Some(true) && args.tp2_dflash,
             )

@@ -30,9 +30,8 @@ impl<'a> Graphs<'a> {
     }
 
     pub(super) fn attach(&mut self, library: &'a cuteafd_ffi::NativeLibrary, device: i32,
-        rank: usize, layout: Option<Step5GraphLayout>, max_rows: usize) -> Result<()> {
-        let (base, tail) = step5_graphs::reserve(layout, rank);
-        let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
+        rank: usize, ranks: usize, layout: Option<Step5GraphLayout>, max_rows: usize) -> Result<()> {
+        let policy = step5_graphs::policy(layout, ranks, rank)?;
         self.pins = step5_graphs::selected_rows(layout, max_rows)?.into_iter()
             .filter_map(|(rows, pin)| pin.then_some(rows)).collect();
         self.bank.get_mut().attach_device(library, device, policy.bytes, Site {
@@ -42,8 +41,8 @@ impl<'a> Graphs<'a> {
         device::set_reserve_policy(device, policy)?;
         self.device = device;
         if step5_graphs::prewarm(layout).is_none() {
-            tracing::warn!(?layout, rank, reserve = policy.bytes,
-                "Step-5 untraced graph layout: no pins or measured base; using byte bootstrap estimate");
+            tracing::info!(?layout, rank, reserve = policy.bytes, source = policy.source,
+                "Step-5 graph layout has no trace inventory: lazy capture within the family × ranks envelope");
         }
         Ok(())
     }

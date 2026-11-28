@@ -1059,6 +1059,7 @@ mod tests {
                 cuteafd_loader::families::inkling2_mini::execution::DECODE_ROWS,
                 true,
             ),
+            true,
         )?;
         let mut graphs = DecodeGraphs::new_for_test(&stream, -270_101, policy)?;
 

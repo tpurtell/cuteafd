@@ -36,9 +36,9 @@ pub(crate) use cuteafd_loader::plan::exlr8::PrefillActivations as Exlr8PrefillAc
 pub(crate) struct EngineArgs {
     #[command(flatten)]
     pub(crate) attention: crate::cli::CoreViewArgs,
-    /// Enable GLM/ML4 decode graphs; off reserves no graph memory.
-    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
-    pub decode_graphs: String,
+    /// Enable GLM/ML4 decode graphs; false reserves no graph memory.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     /// Count executed expert routes; --expert-usage=false disables telemetry.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
         num_args = 0..=1, default_missing_value = "true", require_equals = true)]
@@ -1335,7 +1335,7 @@ impl Opened {
         let request = production_request(*serving_context, requested_pool,
             if args.skip_routed_experts { cuteafd_loader::placement::Onboard::Layers(0) } else { onboard },
             prefill, operation, crate::shared::memory::budget::resident_weight_limit(), cuteafd_core::spark_reply::requested());
-        let mut admitted = ProductionInput { decode_graphs: args.decode_graphs == "on", expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
+        let mut admitted = ProductionInput { decode_graphs: args.decode_graphs, expert_usage, cfg: &self.cfg, layers, context: args.max_context as u64,
             pool, attention, gpus: devices.len(), prefill,
             blas_head: crate::shared::target_head::TargetHead::configured().blas_head(!native
                 && !core.as_ref().is_some_and(|core| core.ranks[0].target_head.is_some() || core.ranks[0].fp8_head_scratch.is_some())), blas, target,
@@ -1883,8 +1883,7 @@ impl Opened {
         let graph_reserves = admitted.graphs.reserves().map_err(|e| anyhow::anyhow!("{e}"))?;
         let graph_bootstraps = admitted.graphs.bootstraps().to_vec();
         if engine.selection_dump.is_none() && engine.weights.layers.len() == self.cfg.layers
-            && graph_reserves.iter().any(|&bytes| bytes > 0)
-            && std::env::var("CUTEAFD_GLM_WARM_GRAPHS").map_or(true, |v| v != "0") {
+            && graph_reserves.iter().any(|&bytes| bytes > 0) {
             engine.configure_graph_cache(&admitted.graphs, &graph_reserves, &graph_bootstraps)?;
         }
         for rank in 0..admitted.graphs.ranks().len() {

@@ -945,9 +945,10 @@ impl<'e, 'a> Execution<'e, 'a> {
     pub(super) fn configure_graphs(&mut self, enabled: bool,
         layout: Option<cuteafd_loader::serving_capacity::step5_graphs::Step5GraphLayout>) -> Result<()> {
         if enabled {
-            for rank in 0..self.main.graphs.len() {
+            let ranks = self.main.graphs.len();
+            for rank in 0..ranks {
                 let device = self.main.device(rank)?;
-                self.main.graphs[rank].attach(device.library, device.id, rank, layout, self.main.rows)?;
+                self.main.graphs[rank].attach(device.library, device.id, rank, ranks, layout, self.main.rows)?;
             }
         }
         if enabled {

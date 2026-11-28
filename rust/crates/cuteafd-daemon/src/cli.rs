@@ -726,15 +726,10 @@ pub(crate) struct PlanArgs {
     /// Explicit MiMo drafter context arena for --layout.
     #[arg(long)]
     pub(crate) draft_context_slots: Option<u64>,
-    /// MiMo segmented decode graph storage (matches serving; on by default).
+    /// Coordinator decode/verify CUDA graphs for every family (matches serving's
+    /// `--decode-graphs`; on by default). Off charges no graph reserve.
     #[arg(long, default_value = "on", value_parser = ["on", "off"])]
-    pub(crate) mimo_decode_graphs: String,
-    /// Step-5 decode/verify layer sections (matches serving; on by default).
-    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
-    pub(crate) step5_decode_graphs: String,
-    /// Enable GLM/ML4 decode graphs; off reserves no graph memory.
-    #[arg(long, default_value = "on", value_parser = ["on", "off"])]
-    pub(crate) glm_decode_graphs: String,
+    pub(crate) decode_graphs: String,
     /// Physical coordinator SM count for memory-budget simulations.
     #[arg(long)]
     pub(crate) physical_sms: Option<u32>,
@@ -1521,8 +1516,8 @@ mod tests {
     fn mimo_graph_defaults_and_explicit_overrides_match_plan_and_serving() {
         for (plan_flags, serve_flags, expected) in [
             (vec![], vec![], true),
-            (vec!["--mimo-decode-graphs", "on"], vec!["--decode-graphs", "true"], true),
-            (vec!["--mimo-decode-graphs", "off"], vec!["--decode-graphs", "false"], false),
+            (vec!["--decode-graphs", "on"], vec!["--decode-graphs", "true"], true),
+            (vec!["--decode-graphs", "off"], vec!["--decode-graphs", "false"], false),
         ] {
             let Commands::Plan(plan) = Cli::try_parse_from(
                 ["cuteafd", "plan", "model"].into_iter().chain(plan_flags)).unwrap().command
@@ -1530,12 +1525,13 @@ mod tests {
             let Commands::ServeMimo(serve) = Cli::try_parse_from(
                 ["cuteafd", "serve-mimo", "--snapshot", "/model", "--native-lib", "/native.so"]
                     .into_iter().chain(serve_flags)).unwrap().command else { panic!("serve-mimo"); };
-            assert_eq!(plan.mimo_decode_graphs == "on", expected);
+            assert_eq!(plan.decode_graphs == "on", expected);
             assert_eq!(serve.engine.decode_graphs, expected);
         }
-        assert!(cuteafd_loader::plan::layout::LayoutOptions::default().mimo_decode_graphs);
-        for flags in [vec!["--mimo-decode-graphs"], vec!["--mimo-decode-graphs", "true"],
-            vec!["--mimo-decode-graphs", "false"], vec!["--mimo-decode-graphs", "auto"]] {
+        assert!(cuteafd_loader::plan::layout::LayoutOptions::default().decode_graphs);
+        for flags in [vec!["--decode-graphs"], vec!["--decode-graphs", "true"],
+            vec!["--decode-graphs", "false"], vec!["--decode-graphs", "auto"],
+            vec!["--mimo-decode-graphs", "on"], vec!["--step5-decode-graphs", "on"], vec!["--glm-decode-graphs", "on"]] {
             assert!(Cli::try_parse_from(["cuteafd", "plan", "model"].into_iter().chain(flags)).is_err());
         }
     }

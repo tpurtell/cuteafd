@@ -122,9 +122,7 @@ fn options(args: &PlanArgs) -> Result<PlanOptions, PlanError> {
                 draft_kv_cache: args.draft_kv_cache,
                 draft_context_window: args.draft_context_window,
                 draft_context_slots: args.draft_context_slots,
-                mimo_decode_graphs: args.mimo_decode_graphs == "on",
-                step5_decode_graphs: args.step5_decode_graphs == "on",
-                glm_decode_graphs: args.glm_decode_graphs == "on",
+                decode_graphs: args.decode_graphs == "on",
                 physical_sms: args.physical_sms,
                 mimo_draft_bf16: args.mimo_draft_bf16,
                 mimo_expert_manifest: args.mimo_expert_manifest.clone(),
@@ -362,6 +360,12 @@ fn resolve_config(args: &mut PlanArgs, cfg: &std::collections::BTreeMap<String, 
         args.draft_length = get("DRAFT_LENGTH").filter(|v| *v != "auto")
             .map(|v| v.parse().context("DRAFT_LENGTH")).transpose()?;
     }
+    if !args.explicit_settings.contains("decode_graphs") {
+        if let Some(value) = get("DECODE_GRAPHS") {
+            anyhow::ensure!(matches!(value.as_str(), "on" | "off"), "DECODE_GRAPHS must be on or off");
+            args.decode_graphs = value.clone();
+        }
+    }
     if !args.explicit_settings.contains("fp8_prefill") {
         if let Some(value) = get("FP8_PREFILL") { args.fp8_prefill = value.parse().map_err(anyhow::Error::msg)?; }
     }
@@ -414,12 +418,6 @@ fn resolve_family_config(args: &mut PlanArgs, family: &str, cfg: &std::collectio
     let glm = matches!(family, "glm5" | "mistral_large4");
     if glm {
         anyhow::ensure!(get("PREFILL_BATCH_TOKENS").is_none(), "unused configuration key: PREFILL_BATCH_TOKENS");
-        if !args.explicit_settings.contains("glm_decode_graphs") {
-            if let Some(value) = get("DECODE_GRAPHS") {
-                anyhow::ensure!(matches!(value.as_str(), "on" | "off"), "DECODE_GRAPHS must be on or off");
-                args.glm_decode_graphs = value.clone();
-            }
-        }
         if let Some(value) = get("MEDIA_CACHE_BYTES").filter(|_| args.media_cache_bytes.is_none()) {
             args.media_cache_bytes = Some(crate::shared::prefix::parse_bytes(value).map_err(anyhow::Error::msg)?);
         }
@@ -2231,9 +2229,7 @@ mod tests {
             expert_input: crate::families::mimo_v2::engine::ExpertInput::Fp8,
             draft_sequences: None,
             draft_context_slots: None,
-            mimo_decode_graphs: "on".into(),
-            step5_decode_graphs: "on".into(),
-            glm_decode_graphs: "on".into(),
+            decode_graphs: "on".into(),
             physical_sms: None,
             mimo_draft_bf16: false,
             glm5_draft_bf16: false,
@@ -2879,7 +2875,7 @@ mod tests {
             else if family != "qwen3_5" { cases.push(("PREFILL_ROWS", "1024", "--prefill-rows", "1024")); }
             if matches!(family, "glm5" | "mistral_large4") {
                 cases.extend([("PREFILL_SPAN_ROWS", "4096", "--prefill-span-rows", "4096"),
-                    ("DECODE_GRAPHS", "off", "--glm-decode-graphs", "off"),
+                    ("DECODE_GRAPHS", "off", "--decode-graphs", "off"),
                     ("MEDIA_CACHE_BYTES", "256MiB", "--media-cache-bytes", "256MiB")]);
                 let mut request = args(std::path::Path::new("/model"), 4, false);
                 let cfg = [("PREFILL_BATCH_TOKENS".into(), "1024".into())].into_iter().collect();

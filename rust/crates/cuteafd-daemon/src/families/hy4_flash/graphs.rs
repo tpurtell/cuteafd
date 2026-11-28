@@ -129,10 +129,11 @@ impl<'a> Hy4Graphs<'a> {
         library: &'a cuteafd_ffi::NativeLibrary,
         device: i32,
         rank: usize,
+        ranks: usize,
         layout: Option<Hy4GraphLayout>,
         tp2_dfly2: bool,
     ) -> Result<()> {
-        let policy = hy4_graphs::reserve_policy_for(layout, rank, tp2_dfly2)?;
+        let policy = hy4_graphs::reserve_policy_for(layout, ranks, rank, tp2_dfly2)?;
         self.bank.get_mut().attach_device(
             library,
             device,

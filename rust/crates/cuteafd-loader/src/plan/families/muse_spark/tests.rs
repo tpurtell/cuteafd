@@ -166,7 +166,7 @@ fn graph_reserve_matches_the_chosen_onboarding_candidate() {
             assert!(report.fits);
             assert_eq!(report.onboard_layers, Some(placement.onboard_layers));
             for gpu in 0..gpus {
-                let policy = crate::serving_capacity::muse_graphs::policy(gpus, placement.onboard_layers, gpu).unwrap();
+                let policy = crate::serving_capacity::muse_graphs::policy(gpus, placement.onboard_layers, gpu, true).unwrap();
                 let breakdown = crate::placement::reserve::breakdown(format!("gpu{gpu}"),
                     cuteafd_core::memory_policy::DeviceKind::Gpu, crate::placement::inventory::PRO_TOTAL_BYTES,
                     0, &placement.items[gpu]);
@@ -628,8 +628,10 @@ fn host_contract_admits_all_phases_and_preserves_host_refusal() {
             // table builder, four live streams per 2 MiB slab (#1561).
             let peak_live = 1 + crate::push_load::COPY_STREAMS as u64 + 1;
             let slabs = crate::placement::planner::cuda_stream_slab_bytes(peak_live).unwrap();
-            assert_eq!(row.opaque, slabs + tails + mappings,
-                "driver stream slabs, target arena tail and physical pinned mappings at {:?}", row.phase);
+            // The resident graph reserve (an untraced onboarding count charges the Muse x ranks envelope).
+            let graphs = crate::serving_capacity::muse_graphs::policy(2, placement.onboard_layers, gpu, true).unwrap().bytes;
+            assert_eq!(row.opaque, slabs + tails + mappings + graphs,
+                "driver stream slabs, target arena tail, physical pinned mappings and graph reserve at {:?}", row.phase);
         }
         let ready_mappings = pinned.iter().filter(|owner| owner.lifetime.contains(Phase::Ready, PhaseOrder::TARGET_THEN_DRAFT))
             .map(|owner| driver_page_table_bytes(owner.bytes)).sum::<u64>();
@@ -822,7 +824,13 @@ fn drafter_is_charged_on_the_head_gpu_and_must_match_the_target_head() {
     assert_eq!(tails(placed, 1) - tails(plain_placed, 1), tail);
     assert_eq!(expected.runtime, (16 * 8 * 4) as u64, "draft ids");
     assert_eq!(expected.head_scratch, (16 * 8 * (202_112 + 202_048) * 4) as u64);
-    assert!(placed.pool_tokens <= plain.solver_placement.as_ref().unwrap().pool_tokens);
+    // The drafter's charge displaces KV pages or routed-layer onboarding, never neither:
+    // with every onboarding count charging the same graph reserve, the solver may trade
+    // onboarded layers for pool once the drafter takes its bytes.
+    assert!(placed.onboard_layers <= plain_placed.onboard_layers);
+    if placed.onboard_layers == plain_placed.onboard_layers {
+        assert!(placed.pool_tokens <= plain_placed.pool_tokens);
+    }
     // One RTX cannot reach the pool cap: the exact drafter charge must displace KV pages.
     let mut single = with_layout(1, 6);
     single.layout.as_mut().unwrap().context_tokens = MIN_CARD_CONTEXT;

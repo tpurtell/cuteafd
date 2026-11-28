@@ -4283,7 +4283,7 @@ fn glm5_flash_selected_working_set_drives_plan_request_and_runtime_buffers() {
         let report = plan(dir.path(), &options).unwrap();
         assert!(report.placement_supported, "{}", render(&report));
         let opts = options.layout.as_ref().unwrap();
-        let input = glmf::GlmfInputs { target_pool_tokens: None,
+        let input = glmf::GlmfInputs { decode_graphs: true, target_pool_tokens: None,
             blas_head: crate::placement::planner::serving::BlasHead::TensorLt,
         resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, context: crate::placement::planner::Context::pinned(opts.context_tokens), attention: Default::default(), cfg: &cfg, layers: cfg.layers, local_tp2_exl3: false,
             gpus: opts.rtx_bytes.iter().map(|&total| (total, Baseline::Planned {

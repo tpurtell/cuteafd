@@ -29,6 +29,9 @@ use std::time::Instant;
 pub(crate) struct EngineArgs {
     #[arg(long, default_value = "bf16")]
     pub(crate) attention_precision: cuteafd_core::attention::AttentionPrecision,
+    /// Bounded rank-local decode/verify graph replay; off runs decode eagerly and charges no reserve.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     /// Checkpoint snapshot (coordinator weights, PLE table, config, tokenizer).
     #[arg(long)]
     pub snapshot: PathBuf,
@@ -755,6 +758,7 @@ impl Opened {
         let pages = pool_tokens.div_ceil(engine::PAGE_ROWS);
         let mut engine = engine::Qwen4Engine::new_with_decode_rows(&self.library, &programs, self.cfg.clone(), model, ple, std::rc::Rc::clone(&stream_owner),
             max_context, args.prefill_rows, pages, args.slots, decode_rows, args.kv_format, embedding)?;
+        engine.use_graphs = args.decode_graphs;
         engine.prefill_shape = prefill_shape;
         engine.attention_plan = attention_plan;
         engine.spark_bf16 = self.checkpoint.spark_input_is_bf16();

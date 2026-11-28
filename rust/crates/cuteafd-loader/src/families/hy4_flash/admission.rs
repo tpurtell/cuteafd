@@ -512,6 +512,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
                 );
                 let gr = crate::serving_capacity::hy4_graphs::reserve_policy_for(
                     graph_layout,
+                    gpus,
                     gpu,
                     request.dfly2 && request.tp2_dflash,
                 )
@@ -537,6 +538,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
                 code.push(loaded_code[gpu]);
                 let gr = crate::serving_capacity::hy4_graphs::reserve_policy_for(
                     graph_layout,
+                    gpus,
                     gpu,
                     request.dfly2 && request.tp2_dflash,
                 )

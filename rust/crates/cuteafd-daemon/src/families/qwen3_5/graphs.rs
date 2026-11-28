@@ -39,8 +39,7 @@ pub(super) struct Graphs<'a> {
 }
 
 impl<'a> Graphs<'a> {
-    pub(super) fn new(device: Device<'a>, variant: String) -> Result<Self> {
-        let enabled = qwen35_graphs::enabled();
+    pub(super) fn new(device: Device<'a>, variant: String, enabled: bool) -> Result<Self> {
         let reserve = qwen35_graphs::configured_reserve(&variant, enabled)?;
         let mut bank = GraphBank::new();
         bank.attach_device(device.library, device.id, reserve.bytes, Site {
@@ -51,8 +50,9 @@ impl<'a> Graphs<'a> {
         device::set_reserve_policy(device.id, reserve)?;
         tracing::warn!(%variant, reserve = reserve.bytes,
             "Dense Qwen graph cache uses uncalibrated byte basis");
-        if qwen35_graphs::layout(&variant).is_none() {
-            tracing::warn!(%variant, "Dense Qwen layout has no trace: bootstrap is unpinned");
+        if enabled && qwen35_graphs::layout(&variant).is_none() {
+            tracing::info!(%variant, reserve = reserve.bytes, source = reserve.source,
+                "Dense Qwen layout has no trace inventory: unpinned lazy capture within the family × ranks envelope");
         }
         Ok(Self { bank: RefCell::new(bank), variant,
             enabled,

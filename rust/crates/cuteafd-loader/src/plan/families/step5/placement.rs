@@ -167,7 +167,7 @@ pub(super) fn layout(
         peer_access: coordinators == 2,
     };
     let mut inputs = RuntimeInputs { vision: None, spark_owners: Vec::new(), spark_bytes: opts.spark_capacities(spark_ranks), graph_layout: crate::serving_capacity::step5_graphs::Step5GraphLayout::resolve(
-            &catalog, &contract, coordinators, spark_ranks), decode_graphs: opts.step5_decode_graphs, host: super::admission::HostInputs::from_contract(&contract, coordinators,
+            &catalog, &contract, coordinators, spark_ranks), decode_graphs: opts.decode_graphs, host: super::admission::HostInputs::from_contract(&contract, coordinators,
             crate::plan::layout::recipe_host_memory(opts)?, opts.host_cache_bytes, 8 << 30)?, resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)), spark_reply_formats: opts.spark_reply_formats,
                 kv_format: opts.step5_kv, bf16_target_head: opts.bf16_target_head,
         inventory,
@@ -228,7 +228,7 @@ pub(super) fn layout(
             .sum(),
     );
     let mut memory = MemoryLayout { devices: Vec::new(), pool_tokens: admitted.placement.pool_tokens,
-        waste: vec![], notes: vec![format!("Step-5: exact native allocation owners; decode graphs {}; {} native MTP stages; eager prefill; shared packed PE owner", opts.step5_decode_graphs, opts.native_mtp_layers),
+        waste: vec![], notes: vec![format!("Step-5: exact native allocation owners; decode graphs {}; {} native MTP stages; eager prefill; shared packed PE owner", opts.decode_graphs, opts.native_mtp_layers),
             "Offline CUDA/code baseline is estimated; serving must re-admit against pre-weight live samples and native export ABIs".into(),
             format!("{}; {sequences} sequences, request context {}, compiled extent {}",
                 if coordinators == 2 { "SWA head split, complete-cost contiguous CSA owners" } else { "Single-device SWA and CSA ownership" },

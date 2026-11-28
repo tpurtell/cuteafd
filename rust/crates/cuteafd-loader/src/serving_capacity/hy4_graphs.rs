@@ -37,15 +37,20 @@ impl Hy4GraphLayout {
 /// nodes than fused Spark segments, so auto now dominates zero (`max(76, 86) = 86 MiB`,
 /// resolving to 182 MiB soft / 190 MiB hard; shipping-card candidate peak is 164 MiB).
 /// Target verify width growth <= 24 MiB, draft growth <= 2 MiB, single capture <= 4 MiB.
-/// The TP2 Spark C1 census (116/108 MiB) and wider census (1130/1058 MiB)
-/// are intentionally not defaults: both graph reserves slowed matched decode
-/// versus eager. TP1 retains its C1-derived cap; the wider 1340 MiB working
-/// set also regressed throughput despite eliminating donor churn.
+/// TP2 + Sparks (`Exl3MaxSpark`) uses its full-card census (K8 compact, DFly2,
+/// 2x RTX + 4 Sparks, no onboarding, b652d62468, 2026-11-28: `baseline` + C1/C16 +
+/// post-load C1 under a 2 GiB reserve, prewarm and donors as shipped): W1
+/// 1,420 / 1,340 MiB, growth 28 / 26 MiB, resolving to 1,704/1,760 and 1,608/1,660 MiB
+/// soft/hard. The C1-only census (116/108 MiB, #2802) churned at C1 and C16. At the
+/// full-card reserve the timed bands are capture-free; replay still costs 2-3% at
+/// C1/C8 versus eager (#2922), ties at C16 and 32K C8.
 const CENSUS: &[(Hy4GraphLayout, usize, WorkingSet)] = &[
     (Hy4GraphLayout::Exl3Min, 0, WorkingSet { w1: 88 << 20, step_growth: 18 << 20, capture_growth: 4 << 20 }),
     (Hy4GraphLayout::Exl3Max, 0, WorkingSet { w1: 100 << 20, step_growth: 20 << 20, capture_growth: 4 << 20 }),
     (Hy4GraphLayout::Exl3Max, 1, WorkingSet { w1: 98 << 20, step_growth: 18 << 20, capture_growth: 4 << 20 }),
     (Hy4GraphLayout::Exl3MinSpark, 0, WorkingSet { w1: 86 << 20, step_growth: 26 << 20, capture_growth: 4 << 20 }),
+    (Hy4GraphLayout::Exl3MaxSpark, 0, WorkingSet { w1: 1420 << 20, step_growth: 28 << 20, capture_growth: 28 << 20 }),
+    (Hy4GraphLayout::Exl3MaxSpark, 1, WorkingSet { w1: 1340 << 20, step_growth: 26 << 20, capture_growth: 26 << 20 }),
 ];
 
 #[cfg(test)]
@@ -53,10 +58,10 @@ fn working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<WorkingSet
     graph_reserve::census_working_set(rank, layout, CENSUS)
 }
 
-/// Use identical inputs for admission, provenance, and runtime. Layouts
-/// without a qualified census default to eager; explicit reserves still work.
-pub fn reserve_policy(layout: Option<Hy4GraphLayout>, rank: usize) -> Result<Resolved, Error> {
-    graph_reserve::current_census(rank, layout, CENSUS)
+/// Use identical inputs for admission, provenance, and runtime. Any layout
+/// without a census charges the Hy4-flash × ranks envelope. Explicit reserves still work.
+pub fn reserve_policy(layout: Option<Hy4GraphLayout>, gpus: usize, rank: usize) -> Result<Resolved, Error> {
+    graph_reserve::current_census(rank, layout, CENSUS, graph_reserve::GraphFamily::Hy4Flash, gpus)
 }
 
 /// Short and 32K C1 physical graph-arena census for split DFly2 on `Exl3Max`
@@ -74,10 +79,11 @@ fn split_dfly2_working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Optio
 /// local TP2 rows. Preserve all layout fallbacks through the common table.
 pub fn reserve_policy_for(
     layout: Option<Hy4GraphLayout>,
+    gpus: usize,
     rank: usize,
     _tp2_dfly2: bool,
 ) -> Result<Resolved, Error> {
-    reserve_policy(layout, rank)
+    reserve_policy(layout, gpus, rank)
 }
 #[cfg(test)]
 mod tests {
@@ -91,6 +97,8 @@ mod tests {
             (Exl3Max, 0, 100, 20, 4, 196, 204),
             (Exl3Max, 1, 98, 18, 4, 194, 202),
             (Exl3MinSpark, 0, 86, 26, 4, 182, 190),
+            (Exl3MaxSpark, 0, 1420, 28, 28, 1704, 1760),
+            (Exl3MaxSpark, 1, 1340, 26, 26, 1608, 1660),
         ] {
             let census = working_set(Some(layout), rank).unwrap();
             assert_eq!(census.w1, w1 << 20);
@@ -108,14 +116,11 @@ mod tests {
         assert_eq!(working_set(Hy4GraphLayout::resolve(1, 0), 1), None);
         assert_eq!(working_set(Hy4GraphLayout::resolve(2, 0), 2), None);
         assert_eq!(working_set(Hy4GraphLayout::resolve(2, 6), 2), None);
-        for sparks in [1, 4, 6] {
-            for rank in [0, 1] {
-                assert_eq!(working_set(Hy4GraphLayout::resolve(2, sparks), rank), None);
-            }
-        }
         assert_eq!(working_set(Hy4GraphLayout::resolve(3, 0), 0), None);
         assert_eq!(working_set(Hy4GraphLayout::resolve(1, 1), 0),
                    working_set(Hy4GraphLayout::resolve(1, 4), 0));
+        assert_eq!(working_set(Hy4GraphLayout::resolve(2, 1), 1),
+                   working_set(Hy4GraphLayout::resolve(2, 6), 1));
     }
 
     #[test]
@@ -134,4 +139,20 @@ mod tests {
         assert_eq!(split_dfly2_working_set(Some(Hy4GraphLayout::Exl3Min), 0), None);
         assert_eq!(split_dfly2_working_set(Some(Hy4GraphLayout::Exl3MaxSpark), 0), None);
     }
+
+    #[test]
+    fn every_layout_charges_a_nonzero_default() {
+        cuteafd_core::memory_policy::MemoryPolicy::default().scoped(|| {
+            for gpus in [1, 2] {
+                for sparks in [0, 1, 4, 6] {
+                    for rank in 0..gpus {
+                        assert!(reserve_policy(Hy4GraphLayout::resolve(gpus, sparks), gpus, rank).unwrap().bytes > 0);
+                    }
+                }
+            }
+            assert_eq!(reserve_policy(Hy4GraphLayout::resolve(2, 4), 2, 0).unwrap().bytes, 1760 << 20);
+            assert_eq!(reserve_policy(Hy4GraphLayout::resolve(2, 4), 2, 1).unwrap().bytes, 1660 << 20);
+        });
+    }
+
 }

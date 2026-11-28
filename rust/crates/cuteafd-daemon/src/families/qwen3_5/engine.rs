@@ -94,7 +94,7 @@ mod hook_borrow_tests {
         // Startup compares independently loaded allocation owners to offline
         // native admission, including multislot marks and retained prefixes.
         let mut engine = DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg, None, None, 4,
-            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }), std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse()?, None, true)?;
+            Some(crate::shared::prefix::MarkRule { lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }), std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "bf16".into()).parse()?, None, true, false)?;
         assert!(engine.pool_tokens >= 262144);
         let tokens = (1..=9).collect::<Vec<_>>();
         engine.verify_check(&tokens)?;
@@ -143,9 +143,10 @@ impl<'a> DenseEngine<'a> {
     pub(crate) fn with_prefix(library: &'a NativeLibrary, programs: &'a Programs<'a>, checkpoint: &'a Checkpoint,
         cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
         prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
-        serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool, Option<u64>)>, verify_check: bool) -> Result<Self> {
+        serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool, Option<u64>)>, verify_check: bool,
+        decode_graphs: bool) -> Result<Self> {
         Self::with_owners(library, programs, checkpoint, cfg, requested_pool, drafter, slots, prefix,
-            kv_format, serving, verify_check, None)
+            kv_format, serving, verify_check, decode_graphs, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -153,7 +154,7 @@ impl<'a> DenseEngine<'a> {
         mut cfg: Qwen35Config, requested_pool: Option<u64>, drafter: Option<DrafterBytes>, slots: usize,
         prefix: Option<crate::shared::prefix::MarkRule>, kv_format: cuteafd_loader::families::qwen4::Qwen4KvCache,
         serving: Option<(&crate::shared::prefix::PrefixArgs, usize, bool, Option<u64>)>, verify_check: bool,
-        peer_programs: Option<(Device<'a>, &'a Programs<'a>)>) -> Result<Self> {
+        decode_graphs: bool, peer_programs: Option<(Device<'a>, &'a Programs<'a>)>) -> Result<Self> {
         ensure!((1..=cuteafd_core::concurrency::state_slots(cuteafd_core::concurrency::MAX_CONCURRENCY) as usize).contains(&slots), "dense state storage must be in 1..=64 slots");
         let reader = WeightReader { library, checkpoint };
         let format = super::weights::DenseFormat::detect(checkpoint)?;
@@ -222,7 +223,7 @@ impl<'a> DenseEngine<'a> {
             crate::shared::draft::report::Kind::Dspark
         } else { crate::shared::draft::report::Kind::Mtp });
         let facts = DenseFacts { target_pool: None, cfg: &cfg,
-            graph_variant: graph_variant.clone(), graphs_enabled: cuteafd_loader::serving_capacity::qwen35_graphs::enabled(), weights: &weight_bytes, target_arena: &target_arena, buffers: &buffers, slots,
+            graph_variant: graph_variant.clone(), graphs_enabled: decode_graphs, weights: &weight_bytes, target_arena: &target_arena, buffers: &buffers, slots,
             record_bytes: kv_format.record_bytes(cfg.kv_heads, cfg.head_dim) as u64, drafter,
             blas_head: crate::shared::target_head::TargetHead::configured().blas_head(true),
             serving: serving.map(|(_, _, device_sampling, _)| ServingFacts { capacity: HEAD_ROWS as u32, device_sampling }),
@@ -263,7 +264,7 @@ impl<'a> DenseEngine<'a> {
                 "graph_basis": "uncalibrated bytes, rank-local whole-layer segments"
             }
         }));
-        let graphs = graphs::Graphs::new(device, graph_variant)?;
+        let graphs = graphs::Graphs::new(device, graph_variant, decode_graphs)?;
         let pool_tokens = usize::try_from(admitted_plan.pool_tokens)?;
         tracing::info!(pool_tokens, kv_format = %kv_format, slots, prefix_marks,
             head_rows = buffers.head_rows, kv_bytes_per_token = cfg.full_kv_bytes_per_token(kv_format),
@@ -310,7 +311,7 @@ impl<'a> DenseEngine<'a> {
             let mut peer_cfg = cfg.clone();
             peer_cfg.attention = cfg.attention.iter().zip(&owners).filter_map(|(&kind, &owner)| (owner == 1).then_some(kind)).collect();
             let peer_buffers = NativeBuffers::new(&peer_cfg, admitted.scratch_bytes, slots, prefix_marks)?;
-            dual::make_peer(device, programs, &cfg, &admitted, &peer_buffers, &homes, &stream, &owners, slots)
+            dual::make_peer(device, programs, &cfg, &admitted, &peer_buffers, &homes, &stream, &owners, slots, decode_graphs)
         }).transpose()?;
         let prefix_arena = if prefix_bytes == 0 { None } else {
             Some(std::rc::Rc::new(Allocation::new(device, prefix_bytes, Tag::prefix("qwen35/prefix"))?))

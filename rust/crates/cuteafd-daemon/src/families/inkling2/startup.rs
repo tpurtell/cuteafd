@@ -29,6 +29,8 @@ pub(crate) struct Options<'a> {
     pub resident_weights: ResidentWeights,
     pub expert_usage: bool,
     pub vision: &'a crate::shared::vision::still::Options,
+    /// `--decode-graphs` (default on): off charges no graph reserve and never captures.
+    pub decode_graphs: bool,
 }
 
 /// Prepared owner facts, not readiness. No target/cache/transport allocation
@@ -139,7 +141,7 @@ pub(crate) fn prepare<'a>(library: &'a NativeLibrary, programs: &'a Programs<'a>
         kv_cache,sms:library.sm_count().unwrap_or(1) as usize}), checkpoint, catalog: &catalog, cfg, manifest_path: Some(options.manifest), manifest: Some(manifest),
         coordinator: Coordinator::Measured { samples, loaded_code: vec![0; gpus] }, attention: AttentionPlacement::Heads,
         spark_ranks: options.peers.len(), spark_bytes: cuteafd_loader::serving_capacity::spark_memory::runtime_bytes(&options.peers.iter().map(ToString::to_string).collect::<Vec<_>>())?.into_iter().max().unwrap_or(0),
-        prefill: options.prefill, decode_rows: options.decode_rows, context_tokens: options.context_tokens, pool_tokens: options.pool_tokens,
+        prefill: options.prefill, decode_graphs: options.decode_graphs, decode_rows: options.decode_rows, context_tokens: options.context_tokens, pool_tokens: options.pool_tokens,
         sequences: options.sequences, host, host_cache_bytes,
         prefix_entries: options.prefix.prefix_cache_entries as u64,
         prefix_mark_budget: options.prefix.prefix_cache_mark_mib as u64 * (1 << 20),
@@ -214,6 +216,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     use cuteafd_transport::{expert::{SparkWorld, EXPERT_PROTOCOL_V2_FLAG_V41_COMPACT_BF16},
         ExpertV2Dtype, SparkSessionShape, TcpTransportConfig};
     let phase = crate::shared::memory::load_timing::Split::start();
+    let decode_graphs = options.decode_graphs;
     let prepared = prepare(library, programs, checkpoint, cfg, Options { ..options })?;
     phase.log("inkling2 code and admission");
     cuteafd_bench::context::phase("Inkling code and admission");
@@ -339,7 +342,7 @@ pub(crate) fn whole<'a>(library: &'a Arc<NativeLibrary>, programs: &'a Programs<
     use super::graphs::DecodeGraphs;
     use cuteafd_loader::serving_capacity::inkling2_graphs;
     let attach = |rank, stream: &crate::shared::memory::device::Stream<'a>| {
-        let policy = inkling2_graphs::policy(rank, inputs.gpus)?;
+        let policy = inkling2_graphs::policy(rank, inputs.gpus, decode_graphs)?;
         ensure!(inputs.graph_reserve[rank] == policy.bytes, "Inkling graph cache disagrees with admission");
         DecodeGraphs::new(stream, rank, policy)
     };

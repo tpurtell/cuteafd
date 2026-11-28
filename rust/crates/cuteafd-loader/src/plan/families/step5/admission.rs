@@ -832,13 +832,13 @@ mod tests {
             // process-wide variables while other Rust tests are running.
             let name = format!("{}::graph_reserve_zero_is_eager_equivalent_and_explicit_charge_is_once_per_rank",
                 module_path!().split_once("::").unwrap().1);
-            for value in ["untraced", "gpu0=64MiB,gpu1=96MiB"] {
+            for value in ["0", "default", "gpu0=64MiB,gpu1=96MiB"] {
                 let mut child = std::process::Command::new(std::env::current_exe()?);
                 child.args(["--exact", &name, "--nocapture"]).env(CHILD, value)
                     .env_remove("CUTEAFD_GPU_GRAPH_RESERVE")
                     .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA")
                     .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP");
-                if value != "untraced" { child.env("CUTEAFD_GPU_GRAPH_RESERVE", value); }
+                if value != "default" { child.env("CUTEAFD_GPU_GRAPH_RESERVE", value); }
                 ensure!(child.status()?.success(), "Step-5 graph reserve child failed: {value}");
             }
             return Ok(());
@@ -850,12 +850,18 @@ mod tests {
             let graphs = run(&policy)?;
             // An asymmetric nonzero reserve can legitimately change the selected
             // CSA boundary; only zero reserve promises eager-equivalent placement.
-            if value == "untraced" {
+            if value == "0" {
                 assert_eq!(graphs.placement.pool_tokens, eager.placement.pool_tokens);
                 assert_eq!(graphs.placement.layers, eager.placement.layers);
             }
             for rank in 0..ranks {
-                let expected = if value == "untraced" { 0 } else { [64 << 20, 96 << 20][rank] };
+                // A layout without a trace charges the Step-5 × ranks envelope, never 0.
+                let expected = match value.as_str() {
+                    "0" => 0,
+                    "default" => crate::placement::graph_reserve::envelope_bytes(
+                        crate::placement::graph_reserve::GraphFamily::Step5, ranks, rank),
+                    _ => [64 << 20, 96 << 20][rank],
+                };
                 let owners = graphs.solved.facts.allowances.iter().filter(|owner|
                     owner.location == crate::placement::planner::Location::coordinator(rank as u8)
                         && crate::placement::graph_reserve::is_source(&owner.source)).collect::<Vec<_>>();

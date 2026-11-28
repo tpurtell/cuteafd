@@ -172,6 +172,7 @@ fn run(mut args: GoldenArgs) -> Result<()> {
             expert_usage: false,
             prewarm_graphs: false,
             vision: &vision,
+            decode_graphs: true,
         },
     )?;
 

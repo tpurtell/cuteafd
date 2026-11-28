@@ -190,7 +190,7 @@ pub(crate) struct EngineArgs {
     /// list for the checkpoint and layout inside one bounded reserve per device;
     /// any other shape captures on a miss or runs eagerly. On by default after
     /// clean adaptive mixed-content qualification; explicit false disables it.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, env = "CUTEAFD_MIMO_DECODE_GRAPHS")]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub decode_graphs: bool,
     /// Expert input rows sent to the Spark ranks: FP8 K32 wire rows, BF16
     /// (the ranks load the `fp8-mimo-bf16` package too), or BF16 for decode

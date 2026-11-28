@@ -200,7 +200,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
     let facts = shared::ProductionInput { kv_cache: opts.muse_kv, cfg, core: &model.core, projections, catalog, budgets, host, prefill,
          bf16_target_head: opts.bf16_target_head, slots, decode_rows: opts.decode_rows, mark_slots, context, pool,
         partial_bf16_max_rows: opts.muse_partial_bf16_max_rows, partial_reply_formats: opts.spark_reply_formats,
-        local, drafter, fixed, media };
+        local, drafter, fixed, media, decode_graphs: opts.decode_graphs };
     let prepared = match facts.prepare() {
         Ok(prepared) => prepared,
         Err(error) => {

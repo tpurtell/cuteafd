@@ -256,7 +256,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
         else { geometry.resolve(options.host_cache_bytes, cfg.max_context as u64,
             options.resolved_concurrency("qwen3_5"), host.0, chunk)
             .context("dense host prefix quota")? };
-    let facts = DenseFacts { target_pool: options.target_pool_tokens, graph_variant: crate::serving_capacity::qwen35_graphs::variant(cfg, fp8, options.dense_qwen_kv), graphs_enabled: crate::serving_capacity::qwen35_graphs::enabled(), cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots, record_bytes, drafter,
+    let facts = DenseFacts { target_pool: options.target_pool_tokens, graph_variant: crate::serving_capacity::qwen35_graphs::variant(cfg, fp8, options.dense_qwen_kv), graphs_enabled: options.decode_graphs, cfg, weights: &weights, target_arena: &target_arena, buffers: &buffers, slots, record_bytes, drafter,
         blas_head: options.bf16_target_head,
         // The shared scheduler's one selector holds `decode_rows` rows and
         // selects on the device by default.
@@ -295,7 +295,7 @@ fn native_layout(cfg: &crate::families::qwen3_5::Qwen35Config, input: &crate::pl
             plan.facts.allocations.iter().filter(|owner| owner.view.is_none()).count()),
     ];
     if ranks == 2 {
-        notes.push(format!("native whole-layer ranges: {}; shared residual boundary/return hops; memory capacity, not parallel attention compute; rank-local lazy graphs (untraced bootstrap)",
+        notes.push(format!("native whole-layer ranges: {}; shared residual boundary/return hops; memory capacity, not parallel attention compute; rank-local lazy graphs (family × ranks envelope reserve)",
             plan.decisions.attention.iter().enumerate().map(|(layer, mode)| format!("{layer}:{mode:?}")).collect::<Vec<_>>().join(",")));
     }
     let mut devices = (0..ranks).map(|rank| Ok(DeviceLayout { kind: DeviceKind::Rtx, index: rank as u32,

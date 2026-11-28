@@ -22,6 +22,10 @@ BASELINE_CAPTURES = {
 }
 
 
+
+DECODE_GRAPH_FAMILIES = {"glm5", "glm5_flash", "qwen4", "qwen3_5", "mimo_v2", "step5", "muse_spark",
+                         "inkling2", "inkling2_mini"}
+
 def release_entry(entry: dict) -> dict:
     """Apply all smoke overrides while keeping process fixtures portable."""
     entry = {**entry, "set": {**MATRIX["defaults"]["set"], **entry.get("set", {})}}
@@ -218,12 +222,6 @@ def test_deployment_preserves_release_container_commands(
                           "mimo_v2": "--swa-kv-cache"}[entry["family"]]
                 position = before["command"].index(anchor) + 2
                 before["command"][position:position] = ["--draft-kv-cache", draft_kv]
-            if entry["family"] == "mimo_v2":
-                # Preserve the effective default-on command and explicit opt-out.
-                position = before["command"].index("--swa-kv-cache") + 2
-                before["command"][position:position] = [
-                    "--decode-graphs", "false" if decode_graphs == "off" else "true",
-                ]
         # Other families have no resolved-config fingerprint today; adding a
         # fabricated one is a failure. V4.1's fingerprint now also covers the
         # shared executor's prefill waves, which reach serve-native.
@@ -336,6 +334,15 @@ def test_deployment_preserves_release_container_commands(
             assert samples and all(sample["bytes"] == 124211863552 and sample["boot_id"] == "fixture"
                                    for sample in samples)
             del after["command"][position:position + 2]
+        if old["host"] == "coordinator" and entry["family"] in DECODE_GRAPH_FAMILIES:
+            # One typed `--decode-graphs` engine flag (default on) for these families;
+            # historical captures carried it at family-specific positions or not at all.
+            position = after["command"].index("--decode-graphs")
+            assert after["command"][position + 1] == ("false" if decode_graphs == "off" else "true")
+            del after["command"][position:position + 2]
+            if "--decode-graphs" in before["command"]:
+                position = before["command"].index("--decode-graphs")
+                del before["command"][position:position + 2]
         assert after == before, (entry["name"], old["host"])
     assert all("--deployment" in plan for plan in current["plans"])
 

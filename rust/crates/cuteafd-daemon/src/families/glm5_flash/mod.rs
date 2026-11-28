@@ -63,6 +63,9 @@ use std::time::Instant;
 pub(crate) struct EngineArgs {
     #[command(flatten)]
     pub attention: crate::cli::CoreViewArgs,
+    /// Bounded rank-local decode/verify graph replay; off runs decode eagerly and charges no reserve.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     /// Packed prefill arithmetic policy. Unset: unrestricted serving, exact --packed-check.
     #[arg(long, value_enum)]
     pub prefill_packing: Option<crate::shared::prefill_packing::PackingMode>,
@@ -2109,7 +2112,7 @@ impl Opened {
         let (sequences, speculation) = args.serving_graph_policy.unwrap_or((16, args.draft.is_some()));
         let routed = self.cfg.dense.iter().filter(|dense| !**dense).count();
         let onboard = runtime_onboard(args, self.native, routed, experts.len());
-        let inputs = admission::GlmfInputs { target_pool_tokens: None,
+        let inputs = admission::GlmfInputs { decode_graphs: args.decode_graphs, target_pool_tokens: None,
             resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), context, attention, cfg: &self.cfg, layers, local_tp2_exl3: local_tp2_exl3 && core_charge.is_none(),
             gpus: inventory.gpus.iter().map(|gpu| (gpu.total_bytes, placement::Baseline::Measured {
                 free_bytes: gpu.free_bytes })).collect(),
@@ -2509,8 +2512,8 @@ impl Opened {
         }
         let tp2_layers = admitted_expert_layers(&self.cfg, &placement.layers,
             cuteafd_loader::placement::ExpertHome::RtxTp2, args.skip_experts)?;
-        ensure!(tp2_layers.is_empty() || engine::GlmfEngine::graphs_enabled(),
-            "GLM Flash TP2 experts require the decode graph cache; unset CUTEAFD_GLMF_GRAPHS=0 to enable it");
+        ensure!(tp2_layers.is_empty() || args.decode_graphs,
+            "GLM Flash TP2 experts require the decode graph cache; use --decode-graphs true");
         let tp2_devices = || -> Result<[crate::shared::memory::device::Device<'_>; 2]> {
             let peer = peer_stream.context("TP2 placement without peer device")?;
             Ok([crate::shared::memory::device::Device { library: &self.library, id: args.device },
@@ -2904,6 +2907,7 @@ impl Opened {
             max_context, args.prefill_rows, args.prefill_waves, args.prefill_span_rows, pages, args.slots, embedding, index_cache,
             args.kda_state, args.resolved_decode_rows(), records, context_mode, args.prefix_marks == prefix::PrefixMarks::Pool,
             &execution, step_experts)?;
+        engine.set_decode_graphs(args.decode_graphs);
         probe("engine")?;
         engine.admitted_host = admitted_host;
         engine.max_pool_tokens_no_onboard = placement.max_pool_tokens_no_onboard;

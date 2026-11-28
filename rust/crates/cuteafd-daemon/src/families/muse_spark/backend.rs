@@ -212,7 +212,7 @@ impl<'r, 'a> MuseBackend<'r, 'a> {
             return Ok(());
         };
         let bases = (0..self.ranks.len()).map(|rank|
-            cuteafd_loader::serving_capacity::muse_graphs::policy(self.ranks.len(), onboard_layers, rank)
+            cuteafd_loader::serving_capacity::muse_graphs::policy(self.ranks.len(), onboard_layers, rank, true)
                 .map(|policy| policy.base_bytes)).collect::<Result<Vec<_>, _>>()?;
         // Before the scheduler exists, page 0 and ring slot 0 are scratch. No
         // prefix, request or drafter context owns them; live admission overwrites

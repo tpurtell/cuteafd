@@ -739,11 +739,11 @@ mod tests {
         assert!(!args.decode_graphs);
         let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/m"]).unwrap();
         let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan dispatch") };
-        assert_eq!(args.step5_decode_graphs, "on");
-        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/m", "--step5-decode-graphs", "off"]).unwrap();
+        assert_eq!(args.decode_graphs, "on");
+        let cli = crate::cli::Cli::try_parse_from(["cuteafd", "plan", "/m", "--decode-graphs", "off"]).unwrap();
         let crate::cli::Commands::Plan(args) = cli.command else { panic!("plan dispatch") };
-        assert_eq!(args.step5_decode_graphs, "off");
-        assert!(cuteafd_loader::plan::layout::LayoutOptions::default().step5_decode_graphs);
+        assert_eq!(args.decode_graphs, "off");
+        assert!(cuteafd_loader::plan::layout::LayoutOptions::default().decode_graphs);
     }
 
     #[test]

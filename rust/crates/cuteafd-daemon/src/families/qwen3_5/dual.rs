@@ -89,7 +89,7 @@ impl<'a> DenseEngine<'a> {
 
 pub(super) fn make_peer<'a>(device: Device<'a>, programs: &'a Programs<'a>, cfg: &Qwen35Config,
     admitted: &DensePrograms, buffers: &NativeBuffers, homes: &LayerStateMap,
-    primary: &Stream<'a>, owners: &[u8], slots: usize) -> Result<Peer<'a>> {
+    primary: &Stream<'a>, owners: &[u8], slots: usize, decode_graphs: bool) -> Result<Peer<'a>> {
     device.run(|| {
         let stream = Stream::new(device)?;
         let allocations = buffers.planes.into_iter().map(|bytes|
@@ -115,7 +115,7 @@ pub(super) fn make_peer<'a>(device: Device<'a>, programs: &'a Programs<'a>, cfg:
             &hops, spec, HEAD_ROWS * cfg.hidden * 2))?;
         let variant = format!("{}-layers-rtx2-rank1", cuteafd_loader::serving_capacity::qwen35_graphs::variant(
             cfg, admitted.format.fp8(), admitted.kv_format));
-        let graphs = graphs::Graphs::new(device, variant)?;
+        let graphs = graphs::Graphs::new(device, variant, decode_graphs)?;
         Ok(Peer { stream, graphs, programs, planes, _planes: allocations, bank, prefix, mark, hops: link, boundary })
     })
 }

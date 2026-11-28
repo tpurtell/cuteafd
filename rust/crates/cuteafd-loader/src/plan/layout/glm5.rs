@@ -627,7 +627,7 @@ fn placement(report: &PlanReport, input: &crate::plan::PlanInput, options: &Layo
         crate::placement::reserve::gpu("glm5"), host, (8 << 30).max(host.0 / 10), &options.spark_capacities(spark_ranks))?;
     let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
-    let mut prepared = ProductionInput { decode_graphs: options.glm_decode_graphs, expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, pool,
+    let mut prepared = ProductionInput { decode_graphs: options.decode_graphs, expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, pool,
         attention, gpus, prefill,
         blas_head: if core.is_some_and(|core| core.ranks[0].target_head.is_some() || core.ranks[0].fp8_head_scratch.is_some()) { serving::BlasHead::Native }
             else { options.bf16_target_head }, blas: vec![], target, draft, scratch: scratch.unwrap_or_default(), context_scratch: context_programs,
@@ -786,7 +786,7 @@ pub(crate) fn native_layout_with_metadata(checkpoint: &Checkpoint, options: &Lay
     let operation = Operation::Serving;
     let request = production_request(crate::placement::planner::Context::resolve(context, (options.context_tokens > 0).then_some(options.context_tokens)), options.pool_tokens, onboard, prefill, operation,
         crate::placement::ResidentWeights(options.weight_budget_bytes), options.spark_reply_formats);
-    let mut prepared = ProductionInput { decode_graphs: options.glm_decode_graphs, expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, pool,
+    let mut prepared = ProductionInput { decode_graphs: options.decode_graphs, expert_usage: options.expert_usage, cfg: &cfg, layers: cfg.layers, context, pool,
         attention, gpus: gpu_count, prefill, blas_head: serving::BlasHead::Native, blas: vec![], target, draft, scratch, context_scratch: context_programs,
         exchange_element_bytes: if glm::local_exchange_f32()? { 4 } else { 2 }, peer_diagnostics: false,
         prefix_host: crate::families::glm5::host_prefix_enabled(gpu_count, attention,

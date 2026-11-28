@@ -64,6 +64,8 @@ pub(crate) struct Options<'a> {
     pub drafter: Option<shared::MuseDrafter>,
     pub media: Option<shared::MediaOptions>,
     pub host: shared::HostInput,
+    /// `--decode-graphs`: off charges no graph reserve.
+    pub decode_graphs: bool,
 }
 
 /// Measured admission: the same facts the planner states, with live baselines
@@ -105,7 +107,7 @@ pub(crate) fn admit(options: Options<'_>) -> Result<shared::AdmittedMuse> {
         bf16_target_head: crate::shared::target_head::TargetHead::configured().blas_head(true), slots: options.slots,
         decode_rows: options.decode_rows, mark_slots: options.mark_slots, context, pool,
         partial_bf16_max_rows: options.partial_bf16_max_rows, partial_reply_formats: options.partial_reply_formats,
-        local: options.local, drafter: options.drafter, fixed, media }.prepare()?;
+        local: options.local, drafter: options.drafter, fixed, media, decode_graphs: options.decode_graphs }.prepare()?;
     let request = shared::production_request(cuteafd_loader::placement::planner::Context::resolve(context, options.max_context), options.pool_tokens, options.onboard,
         cuteafd_loader::placement::planner::PrefillShape { rows: options.prefill.unit_rows, waves: options.prefill.waves },
         cuteafd_loader::placement::planner::Operation::Serving,
@@ -239,7 +241,7 @@ mod tests {
                     let graph = owners.reserve.iter().filter(|row| row.name == "graph reserve").collect::<Vec<_>>();
                     // The untraced bootstrap is empty; an explicit policy may charge a
                     // nonzero reserve, but never a second family-named owner or tail.
-                    let policy = cuteafd_loader::serving_capacity::muse_graphs::policy(2, report.onboard_layers.unwrap_or(0), rank)?;
+                    let policy = cuteafd_loader::serving_capacity::muse_graphs::policy(2, report.onboard_layers.unwrap_or(0), rank, true)?;
                     assert_eq!(graph.iter().map(|row| row.bytes).sum::<u64>(), policy.bytes);
                     assert!(graph.len() <= 1);
                     assert!(!owners.reserve.iter().any(|row| row.name != "graph reserve" && row.name.contains("graph")));
@@ -287,7 +289,7 @@ mod tests {
             let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
             let live = crate::commands::bench::assert_resolved_family_seam("muse_spark", &[], || {
                 crate::commands::bench::fixture_prefix().resolve_entries(16);
-                admit(Options { kv_cache: target_kv, host: shared::HostInput { total: 256 << 30, available: 256 << 30,
+                admit(Options { decode_graphs: true, kv_cache: target_kv, host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                 manifest: &preflight(&path, gpus)?,
@@ -377,7 +379,7 @@ mod tests {
             assert_eq!((report.prefill_unit_rows, report.prefill_waves), (Some(prefill.unit_rows), Some(prefill.waves)));
             let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
             let inventory = preflight(&path, gpus)?;
-            let live = admit(Options { kv_cache: Default::default(), host: shared::HostInput { total: 256 << 30, available: 256 << 30,
+            let live = admit(Options { decode_graphs: true, kv_cache: Default::default(), host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                 manifest: &inventory,
@@ -425,7 +427,7 @@ mod tests {
                 std::fs::remove_dir_all(image.join("share/exl3"))?;
                 let local = shared::local_workspace(input.expert_catalog()?, Some(&path), gpus, prefill.unit_rows)?;
                 assert!(matches!(local, shared::LocalPackage::Missing(_)));
-                let error = admit(Options { kv_cache: Default::default(), host: shared::HostInput { total: 256 << 30, available: 256 << 30,
+                let error = admit(Options { decode_graphs: true, kv_cache: Default::default(), host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                     reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                     media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
                     manifest: &inventory,
@@ -503,7 +505,7 @@ mod tests {
             cuteafd_loader::plan::Family::prefill_limits(&cuteafd_loader::plan::families::muse_spark::MUSE_SPARK),
             Default::default())?;
         let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
-        let built = admit(Options { kv_cache: Default::default(), host: shared::HostInput { total: 256 << 30, available: 256 << 30,
+        let built = admit(Options { decode_graphs: true, kv_cache: Default::default(), host: shared::HostInput { total: 256 << 30, available: 256 << 30,
                 reserve: 8 << 30, prefix_bytes: Some(0), prefix_entries: opts.mimo_prefix_entries,
                 media_bytes: opts.media_cache_bytes, device_sampling: true }, cfg: &cfg, core: &core, catalog: input.expert_catalog()?,
             manifest: &preflight(&path, gpus)?,
@@ -621,7 +623,7 @@ mod tests {
             Default::default(),
         )?;
         let arch = cuteafd_loader::placement::ArchContext::for_device("sm_120", total);
-        let live = admit(Options {
+        let live = admit(Options { decode_graphs: true,
             kv_cache: Default::default(),
             host: shared::HostInput {
                 total: 256 << 30, available: 256 << 30, reserve: 8 << 30,

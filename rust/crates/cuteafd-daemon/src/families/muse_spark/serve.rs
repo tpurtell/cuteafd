@@ -222,7 +222,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
         |_| Ok(()))?;
     crate::shared::inventory::startup_probe(&library, &device_ids, "muse-preweight", Default::default())?;
     let (host_total, host_available) = cuteafd_loader::formats::mapped_preload::host_memory()?;
-    let built = startup::admit(startup::Options { kv_cache: args.kv_cache, host: cuteafd_loader::placement::families::muse_spark::HostInput {
+    let built = startup::admit(startup::Options { decode_graphs: args.decode_graphs, kv_cache: args.kv_cache, host: cuteafd_loader::placement::families::muse_spark::HostInput {
         total: host_total, available: host_available, reserve: args.prefix.host_cache_headroom_bytes,
         prefix_bytes: match args.prefix.host_cache_bytes {
             crate::shared::prefix::budget::HostBudget::Auto => None,
@@ -275,7 +275,7 @@ pub(super) fn with_backend<T>(args: &ServeArgs, run: impl FnOnce(&super::backend
             Ok(format!("{:x}", digest.finalize()))
         };
         let policies = (0..gpus).map(|rank|
-            cuteafd_loader::serving_capacity::muse_graphs::policy(gpus, placement.onboard_layers, rank)).collect::<Result<Vec<_>, _>>()?;
+            cuteafd_loader::serving_capacity::muse_graphs::policy(gpus, placement.onboard_layers, rank, args.decode_graphs)).collect::<Result<Vec<_>, _>>()?;
         cuteafd_ffi::memory_ledger::fault::set_inputs(serde_json::json!({
             "memory_reconciliation_provenance": {
                 "schema_version": 1, "family": "muse_spark",

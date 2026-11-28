@@ -536,6 +536,9 @@ impl<'e, 'a> Backend<'a> for DenseBackend<'e, 'a> {
 pub(crate) struct ServeArgs {
     #[arg(long, default_value = "bf16")]
     pub(crate) attention_precision: cuteafd_core::attention::AttentionPrecision,
+    /// Bounded rank-local decode/verify graph replay; prefill and residual hops stay eager.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     #[arg(long)]
     pub snapshot: std::path::PathBuf,
     #[arg(long, env = "CUTEAFD_NATIVE_LIB")]
@@ -638,7 +641,7 @@ pub(crate) async fn run_serve(mut args: ServeArgs) -> Result<()> {
                 Some(engine_args.prefix.mark_rule(lanes)), engine_args.kv_cache,
                 Some((&engine_args.prefix, lanes,
                     engine_args.token_io.token_select == crate::shared::token_io::SelectPlacement::Device, engine_args.max_context)), false,
-                peer_device.zip(peer_programs.as_ref()))?);
+                engine_args.decode_graphs, peer_device.zip(peer_programs.as_ref()))?);
             engine.borrow_mut().warm_decode_graphs()?;
             let mut backend = DenseBackend::new(&engine, &library);
             backend.packing = engine_args.prefill_packing;
@@ -911,7 +914,7 @@ mod tests {
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
             Some(262144), Some(bytes), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, None, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, None, false, false)?);
         let draft = {
             let target = engine.borrow();
             let cfg = block_dspark::DsparkConfig::read(&draft_snapshot)?;
@@ -943,7 +946,7 @@ mod tests {
         let engine = RefCell::new(DenseEngine::with_prefix(&library, &programs, &checkpoint, cfg,
             Some(262144), Some(admission.bytes.clone()), 4, Some(crate::shared::prefix::MarkRule {
                 lanes: 4, entries: 4, budget_bytes: 1 << 30, host: false }),
-            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, None, false)?);
+            std::env::var("CUTEAFD_DENSE_TEST_KV_CACHE").unwrap_or_else(|_| "fp8".into()).parse()?, None, false, false)?);
         let mtp = Rc::new(MtpCache::load(&engine.borrow(), &reader, admission)?);
         let family = DensePrefix::with_mtp(&engine, mtp.clone())?;
         let mut backend = DenseBackend::new(&engine, &library);

@@ -493,27 +493,6 @@ if [[ "$graph_donor_cold_lag" =~ [1-9] ]]; then
   [[ "$graph_donor_always" == on ]] || release_die 'GRAPH_DONOR_COLD_LAG requires GRAPH_DONOR_ALWAYS=on when non-zero'
   graph_policy_args+=(--graph-donor-cold-lag "$graph_donor_cold_lag")
 fi
-if [[ "$family" == qwen3_5 ]]; then
-  case "$(get DECODE_GRAPHS on)" in
-    on) graph_census_args+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;
-    off) graph_census_args+=(-e CUTEAFD_QWEN35_GRAPHS=0) ;;
-    *) release_die "DECODE_GRAPHS must be on or off" ;;
-  esac
-fi
-if [[ "$family" == inkling2 ]]; then
-  case "$(get DECODE_GRAPHS on)" in
-    on) graph_census_args+=(-e CUTEAFD_INKLING2_GRAPHS=1) ;;
-    off) graph_census_args+=(-e CUTEAFD_INKLING2_GRAPHS=0) ;;
-    *) release_die "DECODE_GRAPHS must be on or off" ;;
-  esac
-fi
-if [[ "$family" == inkling2_mini ]]; then
-  case "$(get DECODE_GRAPHS on)" in
-    on) graph_census_args+=(-e CUTEAFD_INKLING2_MINI_GRAPHS=1) ;;
-    off) graph_census_args+=(-e CUTEAFD_INKLING2_MINI_GRAPHS=0) ;;
-    *) release_die "DECODE_GRAPHS must be on or off" ;;
-  esac
-fi
 if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == muse_spark || "$family" == step5 || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == inkling2_mini || "$family" == hy4_flash || "$family" == hy4 ]]; then
   local key graph_trace
   for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP; do
@@ -1957,14 +1936,17 @@ if [[ $family == mimo_v2 || $family == glm5 ]]; then
   [[ -z "$(get HTTP_QUEUE_DEPTH)" ]] || family_args+=(--http-queue-depth "$(get HTTP_QUEUE_DEPTH)")
   [[ -z "$(get HTTP_QUEUE_WAIT_MS)" ]] || family_args+=(--http-queue-wait-ms "$(get HTTP_QUEUE_WAIT_MS)")
 fi
-if [[ $family == glm5 ]]; then
-  glm_decode_graphs="$(get DECODE_GRAPHS)"
-  case "$glm_decode_graphs" in
-    "") ;;
-    on|off) family_args+=(--decode-graphs "$glm_decode_graphs") ;;
-    *) release_die "DECODE_GRAPHS must be on or off" ;;
-  esac
-fi
+# Coordinator decode/verify graphs: one typed engine flag, default on. The plan
+# below admits the same setting.
+decode_graphs="$(get DECODE_GRAPHS on)"
+case "$decode_graphs" in
+  on|off) ;;
+  *) release_die "DECODE_GRAPHS must be on or off" ;;
+esac
+case $family in
+  glm5|glm5_flash|qwen4|qwen3_5|mimo_v2|step5|muse_spark|inkling2|inkling2_mini)
+    if [[ $decode_graphs == on ]]; then family_args+=(--decode-graphs true); else family_args+=(--decode-graphs false); fi ;;
+esac
 if [[ ( $family == mimo_v2 || $family == qwen4 || $family == glm5_flash || $family == inkling2 || $family == inkling2_mini || $family == step5 || $family == kimi_k3 || $family == muse_spark || $family == minimax_m3 || $family == hy4_flash || $family == hy4 || $checkpoint_family == mistral_large4 ) && $vision != off ]]; then
   # Text-only frozen daemons can predate the optional media-cache flag.
   [[ -z "$(get MEDIA_CACHE_BYTES)" ]] || family_args+=(--media-cache-bytes "$(get MEDIA_CACHE_BYTES)")
@@ -1993,13 +1975,6 @@ if [[ $family == mimo_v2 ]]; then
   case "$mimo_swa_kv" in
     bf16|int8|fp8) family_args+=(--swa-kv-cache "$mimo_swa_kv") ;;
     *) release_die "SWA_KV_CACHE must be bf16, int8 or fp8" ;;
-  esac
-  # Keep serving and admission on the same explicit graph policy.
-  mimo_decode_graphs="$(get DECODE_GRAPHS on)"
-  case "$mimo_decode_graphs" in
-    on) family_args+=(--decode-graphs true) ;;
-    off) family_args+=(--decode-graphs false) ;;
-    *) echo "DECODE_GRAPHS must be on or off" >&2; exit 2 ;;
   esac
 fi
 if [[ "$family" == muse_spark ]]; then
@@ -2066,12 +2041,6 @@ fi
 # is auto (default: the planner picks the RTX-onboarded routed layers and marks)
 # or a fixed count, which admission must then fit.
 if [[ "$family" == step5 ]]; then
-  step5_decode_graphs="$(get DECODE_GRAPHS on)"
-  case "$step5_decode_graphs" in
-    on) family_args+=(--decode-graphs true) ;;
-    off) family_args+=(--decode-graphs false) ;;
-    *) release_die "DECODE_GRAPHS must be on or off" ;;
-  esac
   family_args+=(--kv-cache "$step5_kv_cache")
   # Pool-first EXL3 onboarding uses whole layers on one RTX or TP2 halves on
   # two. FP8 supports TP2 onboarding; NVFP4 is deprecated. Select auto, all or N.
@@ -2093,12 +2062,6 @@ fi
 # the partial-reply cutoff and wide format (the prefill unit shape comes from the
 # deployment plan, as for every units family).
 if [[ $family == muse_spark ]]; then
-  muse_decode_graphs="$(get DECODE_GRAPHS on)"
-  case "$muse_decode_graphs" in
-    on) family_args+=(--decode-graphs true) ;;
-    off) family_args+=(--decode-graphs false) ;;
-    *) echo "DECODE_GRAPHS must be on or off" >&2; exit 2 ;;
-  esac
   local_layers="$(get RTX_EXPERT_LAYERS auto)"
   family_args+=(--rtx-expert-layers "$local_layers")
   [[ -z "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)" ]] || family_args+=(--expert-partial-bf16-max-rows "$(get EXPERT_PARTIAL_BF16_MAX_ROWS)")
@@ -2544,7 +2507,6 @@ audio_encoder_hash=""
     plan_draft_args+=(--expert-input "${expert_input:-fp8}")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "${local_layers:-}" ]] || plan_draft_args+=(--rtx-expert-layers "$local_layers")
-    plan_draft_args+=(--mimo-decode-graphs "$mimo_decode_graphs")
     [[ -z "$(get PREFIX_CACHE_MARK_MIB)" ]] || plan_draft_args+=(--prefix-cache-mark-mib "$(get PREFIX_CACHE_MARK_MIB)")
     [[ -z "$(get DRAFT_CONTEXT_SLOTS)" ]] || plan_draft_args+=(--draft-context-slots "$(get DRAFT_CONTEXT_SLOTS)")
     [[ -z "$(get DRAFT_SEQUENCES)" ]] || plan_draft_args+=(--draft-sequences "$(get DRAFT_SEQUENCES)")
@@ -2601,7 +2563,6 @@ audio_encoder_hash=""
     plan_draft_args+=(--draft-kv-cache "$draft_kv_cache")
   fi
   if [[ "$family" == glm5 ]]; then
-    [[ -z "$glm_decode_graphs" ]] || plan_draft_args+=(--glm-decode-graphs "$glm_decode_graphs")
     [[ -z "$(get PREFILL_ROWS)" ]] || plan_draft_args+=(--prefill-rows "$(get PREFILL_ROWS)")
     [[ -z "$(get PREFILL_WAVES)" ]] || plan_draft_args+=(--prefill-waves "$(get PREFILL_WAVES)")
     [[ -z "$(get PREFILL_SPAN_ROWS)" ]] || plan_draft_args+=(--prefill-span-rows "$(get PREFILL_SPAN_ROWS)")
@@ -2640,9 +2601,9 @@ audio_encoder_hash=""
   if [[ "$family" == step5 ]]; then
     plan_mtp_depth=0
     [[ "$speculator" != mtp ]] || plan_mtp_depth="$(get SPECULATOR_DEPTH "$mtp_depth")"
-    plan_draft_args+=(--native-mtp-layers "$plan_mtp_depth" --kv-cache "$step5_kv_cache" --step5-decode-graphs "$step5_decode_graphs")
+    plan_draft_args+=(--native-mtp-layers "$plan_mtp_depth" --kv-cache "$step5_kv_cache")
   fi
-  plan_draft_args+=(--max-context-tokens "$(get MAX_CONTEXT_TOKENS auto)")
+  plan_draft_args+=(--decode-graphs "$decode_graphs" --max-context-tokens "$(get MAX_CONTEXT_TOKENS auto)")
   for pair in 'CONCURRENCY:--concurrency' 'PREFIX_CACHE_ENTRIES:--prefix-cache-entries' \
     'PREFILL_BATCH_TOKENS:--prefill-rows' \
     'RTX_EXPERT_LAYERS:--rtx-expert-layers'; do
@@ -2704,27 +2665,6 @@ audio_encoder_hash=""
   # it neither needs nor creates PROFILE_DIR (shared_profile_args owns that, and
   # it still runs after the Spark profile validation below).
   plan_profile_env=()
-  if [[ "$family" == qwen3_5 ]]; then
-    case "$(get DECODE_GRAPHS on)" in
-      on) plan_profile_env+=(-e CUTEAFD_QWEN35_GRAPHS=1) ;;
-      off) plan_profile_env+=(-e CUTEAFD_QWEN35_GRAPHS=0) ;;
-      *) release_die "DECODE_GRAPHS must be on or off" ;;
-    esac
-  fi
-  if [[ "$family" == inkling2 ]]; then
-    case "$(get DECODE_GRAPHS on)" in
-      on) plan_profile_env+=(-e CUTEAFD_INKLING2_GRAPHS=1) ;;
-      off) plan_profile_env+=(-e CUTEAFD_INKLING2_GRAPHS=0) ;;
-      *) release_die "DECODE_GRAPHS must be on or off" ;;
-    esac
-  fi
-  if [[ "$family" == inkling2_mini ]]; then
-    case "$(get DECODE_GRAPHS on)" in
-      on) plan_profile_env+=(-e CUTEAFD_INKLING2_MINI_GRAPHS=1) ;;
-      off) plan_profile_env+=(-e CUTEAFD_INKLING2_MINI_GRAPHS=0) ;;
-      *) release_die "DECODE_GRAPHS must be on or off" ;;
-    esac
-  fi
   if [[ "$family" == mimo_v2 || "$family" == kimi_k3 || "$family" == glm5 || "$family" == glm5_flash || "$family" == qwen4 || "$family" == deepseek_v4 || "$family" == deepseek_v41 || "$family" == qwen3_5 || "$family" == muse_spark || "$family" == step5 || "$family" == minimax_m3 || "$family" == inkling2 || "$family" == inkling2_mini || "$family" == hy4_flash || "$family" == hy4 ]]; then
     for key in GPU_GRAPH_RESERVE GPU_GRAPH_RESERVE_EXTRA GPU_GRAPH_RESERVE_EXTRA_CAP SPARK_GRAPH_RESERVE; do
       [[ "$family" != kimi_k3 || "$key" != SPARK_GRAPH_RESERVE ]] || continue
