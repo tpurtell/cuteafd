@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Shared three-component calibration corpus renderer, preparer, and loader.
 
-Single source of truth for ``wrldsuksgo2mars/agentic-quant-panel-v2`` across
-MC quantizations, QMLA calibrations, and other future quant pipelines.
+Single source of truth for the pinned calibration panels across MC
+quantizations, QMLA calibrations, and other future quant pipelines:
+``wrldsuksgo2mars/agentic-quant-panel-v3`` (all three components, the default
+for new runs) and ``wrldsuksgo2mars/agentic-quant-panel-v2`` (``agentic`` +
+``exl3_standard`` only, kept for frozen past runs). v3's ``agentic`` and
+``exl3_standard`` files are byte-identical to v2's.
 
 Canonical calibration stream order:
 1. ``agentic``: single-turn prompts rendered once with the checkpoint's own
@@ -16,9 +20,6 @@ Canonical calibration stream order:
    (the default): each rendered record is cut into consecutive 2,048-token
    windows, one unpadded window per batch, never packed across records. QMLA
    long-context evaluation uses ``full`` mode: one unpadded record per batch.
-
-Flipping to the three-component panel once published is one edit: set
-``THREE_COMPONENT_REVISION`` and ``THREE_COMPONENT_SHA256SUMS_SHA256`` below.
 """
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Literal, Mapping, NamedTuple, Sequence
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -41,20 +42,27 @@ if __package__ in (None, ""):
 from kimi_k3 import prepare_corpus as v1_panel
 from kimi_k3.uniform_k2.storage import atomic_json, checkpoint_io, fsync_directory
 
-PANEL_REPO = "wrldsuksgo2mars/agentic-quant-panel-v2"
-TWO_COMPONENT_REVISION = "54683731eb01c7c2fa5b801a0888e029a0e1b1c7"
-TWO_COMPONENT_SHA256SUMS_SHA256 = "23f07f7dbe7b8248a09891b6ae2475371f4653e499a9b8f930e267ff3d5c6d57"
-
-# Single edit point once the three-component revision is published:
-THREE_COMPONENT_REVISION: str | None = None
-THREE_COMPONENT_SHA256SUMS_SHA256: str | None = None
-
 COMPONENT_ORDER: tuple[str, ...] = ("agentic", "exl3_standard", "long_context")
 BASE_COMPONENTS: tuple[str, ...] = ("agentic", "exl3_standard")
+
+
+class PanelPin(NamedTuple):
+    repo_id: str
+    revision: str
+    sha256sums_sha256: str
+    components: tuple[str, ...]
+
+
+# Frozen past runs: two components only.
+V2_PANEL = PanelPin("wrldsuksgo2mars/agentic-quant-panel-v2", "54683731eb01c7c2fa5b801a0888e029a0e1b1c7",
+                    "23f07f7dbe7b8248a09891b6ae2475371f4653e499a9b8f930e267ff3d5c6d57", BASE_COMPONENTS)
+# New runs: all three components; a full run must use all three.
+V3_PANEL = PanelPin("wrldsuksgo2mars/agentic-quant-panel-v3", "e3ac6ee6126f469e37ddf879a6cb2dccc10c6c99",
+                    "c504793259a6ea0e323e6e4e95d347ecd585d79dc80f67529b4c4b325ea05a7f", COMPONENT_ORDER)
 SPLITS: tuple[str, ...] = ("calibration", "screening", "heldout")
 LONG_CONTEXT_SUBSETS: tuple[str, ...] = ("16k", "32k")
 LONG_CONTEXT_SPLITS: tuple[str, ...] = ("calibration", "heldout")
-LONG_CONTEXT_SCHEMA = "agentic-quant-panel-v2-long-context-v1"
+LONG_CONTEXT_SCHEMA = "agentic-quant-panel-v3-long-context-v1"
 EXL3_STANDARD_PACKER = "reproduction/pack_exl3_standard.py"
 EXL3_STANDARD_CONTRACT = "exl3-standard-pack-v1"
 PREPARED_SCHEMA = "cuteafd-panel-corpus-v3"
@@ -83,26 +91,26 @@ ids_sha256 = v1_panel.ids_sha256
 software_identity = v1_panel.software_identity
 
 
+def panel_pin(revision: str | None = None) -> PanelPin:
+    """Return the pin for ``revision`` (default: v3); unknown revisions fail closed."""
+    if revision is None:
+        return V3_PANEL
+    for pin in (V3_PANEL, V2_PANEL):
+        if revision == pin.revision:
+            return pin
+    raise ValueError(f"unknown panel revision {revision!r}; pinned: {V3_PANEL.revision} (v3), {V2_PANEL.revision} (v2)")
+
+
 def default_panel_revision() -> str:
-    return THREE_COMPONENT_REVISION or TWO_COMPONENT_REVISION
-
-
-def default_panel_sha256sums() -> str | None:
-    if THREE_COMPONENT_REVISION is None:
-        return TWO_COMPONENT_SHA256SUMS_SHA256
-    return THREE_COMPONENT_SHA256SUMS_SHA256
+    return V3_PANEL.revision
 
 
 def default_components() -> tuple[str, ...]:
-    return COMPONENT_ORDER if THREE_COMPONENT_REVISION is not None else BASE_COMPONENTS
+    return V3_PANEL.components
 
 
 def default_dataset() -> dict[str, Any]:
-    entry: dict[str, Any] = {"repo_id": PANEL_REPO, "revision": default_panel_revision()}
-    sums = default_panel_sha256sums()
-    if sums is not None:
-        entry["sha256sums_sha256"] = sums
-    return entry
+    return {"repo_id": V3_PANEL.repo_id, "revision": V3_PANEL.revision, "sha256sums_sha256": V3_PANEL.sha256sums_sha256}
 
 
 def resolve_panel_policy(
@@ -111,15 +119,14 @@ def resolve_panel_policy(
     components: Sequence[str] | None = None,
     full: bool = True,
 ) -> tuple[str, str, tuple[str, ...]]:
-    """Resolve ``(repo_id, revision, canonical_components)`` from the module pin."""
-    if THREE_COMPONENT_REVISION is not None and not _HEX40.match(THREE_COMPONENT_REVISION):
-        raise ValueError(f"THREE_COMPONENT_REVISION must be a 40-char SHA, got {THREE_COMPONENT_REVISION!r}")
-    rev = default_panel_revision() if panel_revision is None else panel_revision
-    if not isinstance(rev, str) or not _HEX40.match(rev):
-        raise ValueError(f"panel_revision must be a 40-char lowercase SHA, got {rev!r}")
+    """Resolve ``(repo_id, revision, canonical_components)`` from the panel pins (default v3)."""
+    if panel_revision is not None and (not isinstance(panel_revision, str) or not _HEX40.match(panel_revision)):
+        raise ValueError(f"panel_revision must be a 40-char lowercase SHA, got {panel_revision!r}")
+    pin = panel_pin(panel_revision)
+    rev = pin.revision
 
     if components is None:
-        ordered = BASE_COMPONENTS if rev == TWO_COMPONENT_REVISION else COMPONENT_ORDER
+        ordered = pin.components
     else:
         seen = []
         for name in components:
@@ -131,19 +138,15 @@ def resolve_panel_policy(
             raise ValueError("components must be nonempty")
         ordered = tuple(c for c in COMPONENT_ORDER if c in seen)
 
-    if "long_context" in ordered and rev == TWO_COMPONENT_REVISION:
-        raise ValueError(f"long_context is not present in two-component revision {TWO_COMPONENT_REVISION}")
+    if set(ordered) - set(pin.components):
+        raise ValueError(f"long_context is not present in two-component panel {pin.repo_id}@{rev}")
 
-    if full:
-        if THREE_COMPONENT_REVISION is not None:
-            if rev == TWO_COMPONENT_REVISION or ordered != COMPONENT_ORDER:
-                raise ValueError(
-                    f"full calibration requires all three components {COMPONENT_ORDER} once "
-                    f"{THREE_COMPONENT_REVISION} is published; got revision={rev} components={ordered}"
-                )
-        elif not set(BASE_COMPONENTS) <= set(ordered):
-            raise ValueError(f"full calibration requires at least {BASE_COMPONENTS}; got {ordered}")
-    return PANEL_REPO, rev, ordered
+    if full and not set(pin.components) <= set(ordered):
+        raise ValueError(
+            f"full calibration requires all {'three' if pin == V3_PANEL else 'two'} components "
+            f"{pin.components} of {pin.repo_id}@{rev}; got components={ordered}"
+        )
+    return pin.repo_id, rev, ordered
 
 
 def component_input_ids_sha256(sequences) -> str:
@@ -490,7 +493,7 @@ def read_long_context_component(root: Path, *, hashes: Mapping[str, str], agenti
     return by_split, lc_manifest
 
 
-def read_panel_v2(
+def read_panel(
     root: Path | str,
     *,
     panel_revision: str | None = None,
@@ -498,21 +501,16 @@ def read_panel_v2(
     components: Sequence[str] | None = None,
     full: bool = True,
 ) -> dict[str, Any]:
-    """Attest and load the pinned ``agentic-quant-panel-v2`` snapshot."""
+    """Attest and load a pinned panel snapshot (v3 by default, v2 for frozen past runs)."""
     root = Path(root)
     repo_id, rev, resolved = resolve_panel_policy(panel_revision=panel_revision, components=components, full=full)
     if root.name != rev:
-        raise ValueError(f"require the pinned v2 snapshot {rev}, got {root.name!r}")
+        raise ValueError(f"require the pinned {repo_id} snapshot {rev}, got {root.name!r}")
 
     sums_sha = sha256_file(root / "SHA256SUMS")
-    expected_sums = panel_sha256sums
-    if expected_sums is None:
-        if rev == TWO_COMPONENT_REVISION:
-            expected_sums = TWO_COMPONENT_SHA256SUMS_SHA256
-        elif THREE_COMPONENT_REVISION is not None and rev == THREE_COMPONENT_REVISION:
-            expected_sums = THREE_COMPONENT_SHA256SUMS_SHA256
-    if expected_sums is not None and sums_sha != expected_sums:
-        raise ValueError(f"panel SHA256SUMS digest mismatch for {rev}")
+    expected_sums = panel_pin(rev).sha256sums_sha256 if panel_sha256sums is None else panel_sha256sums
+    if sums_sha != expected_sums:
+        raise ValueError(f"panel SHA256SUMS digest mismatch for {repo_id}@{rev}")
 
     hashes = _read_sha256sums(root)
     base_names = (
@@ -524,7 +522,7 @@ def read_panel_v2(
     if any(name not in hashes for name in base_names):
         raise ValueError("panel SHA256SUMS missing expected base files")
     if any(hashes[name] != v1_panel.PAYLOAD_SHA256[name] for name in ("manifest.json", *(s + ".jsonl" for s in SPLITS))):
-        raise ValueError("v2 agentic provenance differs from the released v1 panel")
+        raise ValueError("panel agentic provenance differs from the released v1 panel")
 
     agentic_rows, agentic_prov = v1_panel.read_panel(root, payload_sha256={n: hashes[n] for n in base_names})
     lc_rows = lc_manifest = None
@@ -622,8 +620,8 @@ def prepare_panel_corpus(
             raise ValueError("native tokenizer did not load the pinned chat template")
 
     max_context = max_context_from_config(source)
-    panel = read_panel_v2(corpus, panel_revision=panel_revision, panel_sha256sums=panel_sha256sums,
-                          components=components, full=full)
+    panel = read_panel(corpus, panel_revision=panel_revision, panel_sha256sums=panel_sha256sums,
+                       components=components, full=full)
     active = panel["components"]
     contract_dict = dict(contract) if contract is not None else dict(
         renderer="native-chat-template", raw_calibration=EXL3_STANDARD_CONTRACT,
@@ -743,10 +741,11 @@ def _verify_components(records: list[dict[str, Any]], manifest: Mapping[str, Any
         raise ValueError(f"component_order {manifest['component_order']} disagrees with {present}")
 
     enforce_full = (manifest.get("calibration_mode") == "full") if full is None else full
-    if split == "calibration" and enforce_full and THREE_COMPONENT_REVISION is not None and tuple(present) != COMPONENT_ORDER:
+    frozen_v2 = manifest.get("dataset", {}).get("revision") == V2_PANEL.revision
+    if split == "calibration" and enforce_full and not frozen_v2 and tuple(present) != COMPONENT_ORDER:
         raise ValueError(
-            f"full calibration requires all three components {COMPONENT_ORDER} once "
-            f"{THREE_COMPONENT_REVISION} is published; prepared corpus has {tuple(present)}"
+            f"full calibration requires all three components {COMPONENT_ORDER} of "
+            f"{V3_PANEL.repo_id}@{V3_PANEL.revision}; prepared corpus has {tuple(present)}"
         )
     if require_components is not None:
         if set(require_components) - set(COMPONENT_ORDER):
