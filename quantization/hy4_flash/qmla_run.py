@@ -29,6 +29,7 @@ Outputs (Correction 3 — no separate ``mla_calibration.json``):
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import hashlib
 import json
 import math
@@ -770,7 +771,7 @@ def run_hy4_flash_long_eval(
     if embedding is None:
         embedding = model.reader.raw(hy4_forward.reference.OUTER_NAMES[0])
     active = [(rec, rec.input_ids.to(dev)) for rec in records]
-    states = [model.initial(tokens, embedding=embedding) for _, tokens in active]
+    states = deque(model.initial(tokens, embedding=embedding) for _, tokens in active)
 
     for layer_idx in range(max_layer + 1):
         layer_start = time.monotonic()
@@ -778,23 +779,30 @@ def run_hy4_flash_long_eval(
         is_target = layer_idx in target_set
         params = adapter.layer_params(layer) if is_target else None
         geom = adapter.geometry_for(layer_idx) if is_target else None
-        mlp_args = []
-        for (rec, tokens), state in zip(active, states, strict=True):
-            residual, attention_post, attn_in = model.attention_start(state, tokens, layer)
+        # Replace each HC state as it advances. The full long-context panel carries
+        # about 15 GiB of HC state per generation on Hy4-flash.
+        mlp_args = deque()
+        for rec, tokens in active:
+            residual, attention_post, attn_in = model.attention_start(states.popleft(), tokens, layer)
             if is_target:
                 assert params is not None and geom is not None
-                cap, attn_out, _ = adapter.capture_sequence(attn_in, layer, seq_id=rec.seq_id, compact_mask=True)
+                cap, attn_out, _ = adapter.capture_sequence(
+                    attn_in, layer, seq_id=rec.seq_id, compact_mask=True, capture_device=dev,
+                )
                 evaluator.evaluate_layer_sequence(cap, params, geom, split=rec.split, device=dev)
                 del cap
             else:
                 attn_out, _ = model.attention(attn_in, layer)
             if layer_idx < max_layer:
                 mlp_args.append(model.mlp_start(residual, attention_post, attn_out, layer))
+            del residual, attention_post, attn_in, attn_out
         if mlp_args:
             routed = [None] * len(mlp_args)
             if model.config.mlp_layer_types[layer_idx] == "sparse":
                 routed = _routed_forward(model, layer, [args[2] for args in mlp_args])
-            states = [model.mlp_finish(*args, layer, result) for args, result in zip(mlp_args, routed, strict=True)]
+            for result in routed:
+                states.append(model.mlp_finish(*mlp_args.popleft(), layer, result))
+            del routed, result
         evaluator.release_layer_cache()
         print(
             json.dumps({"phase": phase, "completed_layer": layer_idx, "evaluated": is_target,

@@ -140,6 +140,7 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
         project: Project = hy4_forward.native_projection,
         capture_tap: bool = False,
         compact_mask: bool = False,
+        capture_device: torch.device | str = "cpu",
     ) -> tuple[CapturedSequence, torch.Tensor, hy4_forward.AttentionTap | None]:
         """Run exact Hy4-flash attention and capture mode-agnostic MLA tensors.
 
@@ -258,15 +259,15 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
 
         captured = CapturedSequence(
             seq_id=seq_id,
-            positions=positions.detach().cpu(),
-            u=u.detach().float().cpu(),
-            q_nope=q_nope.detach().float().cpu(),
-            q_rope=q_rope.detach().float().cpu(),
-            k_rope=kr_rot.detach().float().cpu(),
-            allowed_mask=None if full_mask is None else full_mask.detach().cpu(),
-            gate=gate.detach().float().cpu(),
-            ref_output=ref_output.detach().float().cpu(),
-            sparse_selection=None if sparse_selection is None else sparse_selection.to("cpu"),
+            positions=positions.detach().to(capture_device),
+            u=u.detach().float().to(capture_device),
+            q_nope=q_nope.detach().float().to(capture_device),
+            q_rope=q_rope.detach().float().to(capture_device),
+            k_rope=kr_rot.detach().float().to(capture_device),
+            allowed_mask=None if full_mask is None else full_mask.detach().to(capture_device),
+            gate=gate.detach().float().to(capture_device),
+            ref_output=ref_output.detach().float().to(capture_device),
+            sparse_selection=None if sparse_selection is None else sparse_selection.to(capture_device),
         )
         captured.validate(geom)
         return captured, ref_output, tap
