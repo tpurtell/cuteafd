@@ -20,6 +20,7 @@ from qmla.capture import (
     CapturedSequence,
     MlaLayerGeometry,
     QmlaCaptureAdapter,
+    SparseSelection,
     causal_mask,
     describe_splits,
     sequence_sha256,
@@ -91,6 +92,13 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
     """Reference MLA capture adapter for Hy4-flash (copy/adapt for GLM 5.3 Flash)."""
 
     family_id = "hy4_flash"
+    dsa_indexer_depends_on_mla_latents = False
+    dsa_indexer_note = (
+        "Hy4-flash compressed_indexer computes scores solely from layer input x "
+        "(token_key_projection, head_weight_projection) and q_a_proj(x) (query_projection); "
+        "QMLA-quantized MLA content latent u and k_rope do not feed it and indexer keys stay native, "
+        "so intra-layer DSA top-k selection drift is structurally zero."
+    )
 
     def __init__(self, model: hy4_forward.Model, *, include_swa: bool = False):
         self.model = model
@@ -131,8 +139,14 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
         positions: torch.Tensor | None = None,
         project: Project = hy4_forward.native_projection,
         capture_tap: bool = False,
+        compact_mask: bool = False,
     ) -> tuple[CapturedSequence, torch.Tensor, hy4_forward.AttentionTap | None]:
-        """Run exact Hy4-flash attention and capture mode-agnostic MLA tensors."""
+        """Run exact Hy4-flash attention and capture mode-agnostic MLA tensors.
+
+        When ``compact_mask=True`` (used for 16K/32K long-context evaluation), skips
+        allocating the dense ``[T, T]`` boolean mask and records compact DSA group IDs in
+        ``CapturedSequence.sparse_selection`` instead.
+        """
         c = self.config
         w = layer.weights
         index = layer.index
@@ -174,7 +188,7 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
         keys = torch.cat((k_nope, kr_rot.unsqueeze(1).expand(-1, h, -1)), dim=-1)
         sink = w[p + "learnable_sink_param"]
 
-        # Stage 3: exact causal / SWA / compressed-indexer DSA mask and attention.
+        # Stage 3: exact causal / SWA / compressed-indexer DSA mask and attention (128-row tiles).
         indexed = kind == reference.SPARSE and seq_len > c.compressed_indexer_candidate_topk
         if indexed:
             rope_arg = positions if positions.ndim == 2 else None
@@ -184,7 +198,7 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
         rows = reference.ROWS
         attended_parts: list[torch.Tensor] = []
         group_parts: list[torch.Tensor] = []
-        full_mask = causal_mask(
+        full_mask = None if compact_mask else causal_mask(
             seq_len,
             device=device,
             sliding_window=c.sliding_window if kind == reference.SLIDING else None,
@@ -213,14 +227,23 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
                 selected = torch.zeros((rows, width + 1), dtype=torch.bool, device=device)
                 selected[: stop - start].scatter_(1, slots, True)
                 allowed &= selected[:, :width] | (query_id[:, None] < c.compressed_indexer_candidate_topk)
-                full_mask[start:stop, :stop] = allowed[: stop - start, :stop]
-                if capture_tap:
+                if full_mask is not None:
+                    full_mask[start:stop, :stop] = allowed[: stop - start, :stop]
+                if capture_tap or compact_mask:
                     valid = groups <= current_group[:, None]
                     group_parts.append(groups.masked_fill(~valid, -1).to(torch.int32))
             attended_parts.append(hy4_forward._with_sink(query, key_tile, val_tile, allowed, sink)[: stop - start])
 
         gated = torch.cat(attended_parts, dim=0).flatten(1) * gate
         ref_output = self.model.attention_finish(gated, layer, project)
+
+        sparse_selection = None
+        if compact_mask and indexed:
+            sparse_selection = SparseSelection(
+                groups=torch.cat(group_parts, dim=0),
+                compress_ratio=int(ratio),
+                candidate_topk=int(c.compressed_indexer_candidate_topk),
+            )
 
         tap = None
         if capture_tap:
@@ -240,9 +263,10 @@ class Hy4FlashCaptureAdapter(QmlaCaptureAdapter):
             q_nope=q_nope.detach().float().cpu(),
             q_rope=q_rope.detach().float().cpu(),
             k_rope=kr_rot.detach().float().cpu(),
-            allowed_mask=full_mask.detach().cpu(),
+            allowed_mask=None if full_mask is None else full_mask.detach().cpu(),
             gate=gate.detach().float().cpu(),
             ref_output=ref_output.detach().float().cpu(),
+            sparse_selection=None if sparse_selection is None else sparse_selection.to("cpu"),
         )
         captured.validate(geom)
         return captured, ref_output, tap

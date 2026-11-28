@@ -218,6 +218,74 @@ class MlaLayerGeometry:
 
 
 @dataclass(frozen=True)
+class SparseSelection:
+    """Compact per-query top-k DSA group selection (avoids O(T^2) boolean masks).
+
+    ``groups`` has shape ``[T, group_topk]`` (int32/int64). Each nonnegative group id ``g``
+    selects token slots ``[g * compress_ratio, (g + 1) * compress_ratio)`` clamped to the
+    sequence end. Queries with slot index ``< candidate_topk`` attend causally to all keys.
+    """
+
+    groups: torch.Tensor
+    compress_ratio: int
+    candidate_topk: int
+
+    @property
+    def seq_len(self) -> int:
+        return int(self.groups.shape[0])
+
+    @property
+    def group_topk(self) -> int:
+        return int(self.groups.shape[1])
+
+    def to(self, device: torch.device | str) -> "SparseSelection":
+        return SparseSelection(
+            groups=self.groups.to(device),
+            compress_ratio=self.compress_ratio,
+            candidate_topk=self.candidate_topk,
+        )
+
+    def validate(self, seq_len: int) -> None:
+        if self.groups.ndim != 2 or self.groups.shape[0] != seq_len or self.groups.shape[1] <= 0:
+            raise ValueError(
+                f"sparse_selection.groups must be [{seq_len}, k] with k > 0, got {tuple(self.groups.shape)}"
+            )
+        if self.groups.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"sparse_selection.groups must be int32 or int64, got {self.groups.dtype}")
+        if self.compress_ratio <= 0 or self.candidate_topk <= 0:
+            raise ValueError("sparse_selection compress_ratio and candidate_topk must be positive")
+
+    def tile_mask(
+        self,
+        start: int,
+        stop: int,
+        first: int,
+        width: int,
+        query_id: torch.Tensor,
+        *,
+        seq_len: int | None = None,
+    ) -> torch.Tensor:
+        """Return the [ROWS, width] boolean DSA mask expected by ``tiled_sink_attention``."""
+        t = self.seq_len if seq_len is None else int(seq_len)
+        dev = query_id.device
+        rows = int(query_id.shape[0])
+        if stop <= self.candidate_topk:
+            return torch.ones((rows, width), dtype=torch.bool, device=dev)
+        g = self.groups[start:stop].to(device=dev, dtype=torch.int64)
+        valid_g = g >= 0
+        ratio = int(self.compress_ratio)
+        offsets = torch.arange(ratio, device=dev, dtype=torch.int64)
+        slots = (g.clamp_min(0)[..., None] * ratio + offsets).flatten(1)
+        valid_slots = valid_g.unsqueeze(-1).expand(-1, -1, ratio).flatten(1)
+        local_slots = slots.clamp_max(t - 1) - first
+        in_range = valid_slots & (local_slots >= 0) & (local_slots < width)
+        scatter_idx = torch.where(in_range, local_slots.clamp(0, width), width)
+        selected = torch.zeros((rows, width + 1), dtype=torch.bool, device=dev)
+        selected[: stop - start].scatter_(1, scatter_idx, True)
+        return selected[:, :width] | (query_id[:, None] < self.candidate_topk)
+
+
+@dataclass(frozen=True)
 class CapturedSequence:
     """Mode-agnostic attention capture for one sequence at one MLA layer."""
 
@@ -230,6 +298,7 @@ class CapturedSequence:
     allowed_mask: torch.Tensor | None
     gate: torch.Tensor | None
     ref_output: torch.Tensor
+    sparse_selection: SparseSelection | None = None
 
     @property
     def seq_len(self) -> int:
@@ -249,6 +318,7 @@ class CapturedSequence:
             allowed_mask=_mv(self.allowed_mask),
             gate=_mv(self.gate),
             ref_output=self.ref_output.to(device),
+            sparse_selection=None if self.sparse_selection is None else self.sparse_selection.to(device),
         )
 
     def validate(self, geometry: MlaLayerGeometry) -> None:
@@ -285,6 +355,8 @@ class CapturedSequence:
                 raise ValueError(f"allowed_mask must be bool [{t}, {t}], got {self.allowed_mask.dtype} {tuple(self.allowed_mask.shape)}")
             if not bool(self.allowed_mask.any(dim=-1).all()):
                 raise ValueError("every query row must have at least one allowed key")
+        if self.sparse_selection is not None:
+            self.sparse_selection.validate(t)
         if self.gate is not None and self.gate.shape != (t, geometry.heads * geometry.v_head_dim):
             raise ValueError(f"gate shape {tuple(self.gate.shape)} disagrees with heads*v_head_dim")
         if self.ref_output.ndim != 2 or self.ref_output.shape[0] != t or self.ref_output.shape[1] <= 0:
@@ -541,8 +613,11 @@ def eval_attention_output(
 ) -> torch.Tensor:
     """Evaluate exact post-o_proj (and optional post_proj_norm) attention output in FP32.
 
-    With all hook arguments left as None, reproduces the full-precision teacher
-    attention output for any MLA family captured via ``CapturedSequence``.
+    Uses ``tiled_sink_attention`` (128-row query tiles over the full causal KV history,
+    with per-query sink/recent protection). Supports both dense ``allowed_mask`` and
+    compact ``sparse_selection`` group IDs so long sequences never materialize ``[T, T]``.
+    With all hook arguments left as None, reproduces the full-precision teacher output on
+    the exact same code path used by every quantized arm.
     """
     if sink_tokens < 0 or recent_tokens < 0:
         raise ValueError("sink_tokens and recent_tokens must be nonnegative")
@@ -586,15 +661,22 @@ def eval_attention_output(
             exact_kp = exact_rope_key_fn(seq.k_rope.float()) if exact_rope_key_fn is not None else kp
             exact_keys = torch.cat((exact_keys, exact_kp[:, None, :].expand(-1, h, -1)), dim=-1)
 
-    def tile_mask(start, stop, first, width, query_id):
-        allowed = seq.allowed_mask[start:stop, first:stop]
-        return F.pad(allowed, (0, width - (stop - first), 0, ROWS - (stop - start)))
+    tile_mask = None
+    if seq.allowed_mask is not None:
+        def tile_mask(start, stop, first, width, query_id):
+            allowed = seq.allowed_mask[start:stop, first:stop]
+            return F.pad(allowed, (0, width - (stop - first), 0, ROWS - (stop - start)))
+    elif seq.sparse_selection is not None:
+        sparse_sel = seq.sparse_selection
+
+        def tile_mask(start, stop, first, width, query_id):
+            return sparse_sel.tile_mask(start, stop, first, width, query_id, seq_len=t)
 
     gate = seq.gate.float().reshape_as(values) if seq.gate is not None else None
     sink = params.sink.float()[:, None, None] if params.sink is not None else None
     attended = tiled_sink_attention(
         query, keys, values, gate, sink, scale, sliding_window=geometry.sliding_window,
-        tile_mask=tile_mask if seq.allowed_mask is not None else None,
+        tile_mask=tile_mask,
         exact_keys=exact_keys, exact_values=exact_values, sink_tokens=sink_tokens, recent_tokens=recent_tokens,
     )
     out = linear(attended, params.o_proj_weight.float())

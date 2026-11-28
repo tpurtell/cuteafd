@@ -160,12 +160,17 @@ def _token_relative_squares(pred, ref):
 class _Scorer:
     """Score one layer's split under arbitrary content/RoPE arms at a given combination."""
 
-    def __init__(self, bank: CapturedLayerBank, split: str, config: FitConfig, device):
-        self.geom = bank.geometry
-        self.params = bank.params.to(device)
+    def __init__(self, bank: CapturedLayerBank | None, split: str | None, config: FitConfig, device,
+                 *, geom=None, params=None, seqs=()):
+        if bank is not None:
+            geom = bank.geometry
+            params = bank.params
+            seqs = bank.split(split)
+        self.geom = geom
+        self.params = params.to(device)
         self.device = device
         self.config = config
-        self.seqs = tuple(seq.to(device) for seq in bank.split(split))
+        self.seqs = tuple(seq.to(device) for seq in seqs)
         self.tokens = sum(seq.seq_len for seq in self.seqs)
         self.protection = (
             {"sink_tokens": config.sink_tokens, "recent_tokens": config.recent_tokens}

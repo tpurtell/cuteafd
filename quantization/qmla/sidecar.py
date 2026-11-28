@@ -868,6 +868,49 @@ def validate_sidecar(
     }
 
 
+def load_sidecar_transforms(
+    sidecar_path_or_dir: Path | str,
+    *,
+    expected_source: Mapping[str, Any] | None = None,
+    expected_geometries: Sequence[MlaLayerGeometry] | None = None,
+    strict: bool = True,
+) -> tuple[dict[str, Any], dict[int, tuple[torch.Tensor, torch.Tensor]], dict[int, tuple[torch.Tensor, torch.Tensor]]]:
+    """Validate a sidecar and return ``(manifest, content_by_layer, rope_by_layer)``.
+
+    ``content_by_layer[lid] = (r_c, s_c)`` and ``rope_by_layer[lid] = (theta, s_p)`` are F32
+    CPU tensors holding the shipped single transform per path.
+    """
+    tensors_path = _resolve_sidecar_path(sidecar_path_or_dir)
+    validate_sidecar(
+        tensors_path,
+        expected_source=expected_source,
+        expected_geometries=expected_geometries,
+        strict=strict,
+    )
+    file_sha256, file_bytes, _, _, embedded_manifest, tensors, _ = _read_f32_safetensors_with_metadata(tensors_path)
+    manifest = dict(embedded_manifest)
+    manifest["tensors_bytes"] = file_bytes
+    manifest["tensors_sha256"] = file_sha256
+
+    content_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    rope_by_layer: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    c_prof = manifest["profiles"].get("content")
+    if c_prof is not None:
+        for lid in c_prof["layers"]:
+            content_by_layer[int(lid)] = (
+                tensors[f"content.layer_{lid}.r"],
+                tensors[f"content.layer_{lid}.s"],
+            )
+    r_prof = manifest["profiles"].get("rope")
+    if r_prof is not None:
+        for lid in r_prof["layers"]:
+            rope_by_layer[int(lid)] = (
+                tensors[f"rope.layer_{lid}.theta"],
+                tensors[f"rope.layer_{lid}.s"],
+            )
+    return manifest, content_by_layer, rope_by_layer
+
+
 def build_mc_qmla_section(sidecar_path_or_dir: Path | str) -> dict[str, Any]:
     """Build the full embedded ``qmla`` section for ``cuteafd-mc.json`` (never in required_features)."""
     validate_sidecar(sidecar_path_or_dir, strict=True)

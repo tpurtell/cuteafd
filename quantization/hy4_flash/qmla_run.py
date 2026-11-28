@@ -70,6 +70,13 @@ from qmla.fit import (
     load_fit_checkpoint,
     save_fit_checkpoint,
 )
+from qmla.long_eval import (
+    DEFAULT_STAGED_LONG_CONTEXT_DIR,
+    LongContextEvaluator,
+    LongContextRecord,
+    has_prepared_long_context,
+    load_long_context_records,
+)
 from qmla.measurement import (
     SELECTION_OBJECTIVE,
     inverse_max_error,
@@ -87,6 +94,7 @@ from qmla.sidecar import (
     DEFAULT_QMLA_PANEL_REVISION,
     QMLA_BASE_COMPONENTS,
     QMLA_KNOWN_COMPONENTS,
+    load_sidecar_transforms,
     resolve_qmla_panel,
     validate_sidecar,
     write_sidecar,
@@ -690,6 +698,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--reuse-captures", type=Path, default=None, help="Reuse verified XXH3-128 layer captures")
+    parser.add_argument(
+        "--long-eval",
+        action="store_true",
+        help="Run 16K/32K long-context evaluation after fitting, or standalone with --sidecar",
+    )
+    parser.add_argument(
+        "--sidecar",
+        type=Path,
+        default=None,
+        help="Existing QMLA sidecar (mla_calibration.safetensors or directory) for standalone --long-eval",
+    )
     return parser
 
 
@@ -848,9 +867,142 @@ def _stream_hy4_flash_captures(
     return banks
 
 
+@torch.no_grad()
+def run_hy4_flash_long_eval(
+    adapter: Hy4FlashCaptureAdapter,
+    *,
+    sidecar_path: Path | str,
+    records: Sequence[LongContextRecord],
+    corpus_meta: Mapping[str, Any],
+    device: torch.device | str = "cpu",
+    layers: Sequence[int] | None = None,
+    modes: Sequence[tuple[int, int]] | None = None,
+    expected_source: Mapping[str, Any] | None = None,
+    embedding: torch.Tensor | None = None,
+) -> dict[str, Any]:
+    """Forward-only streaming long-context (16K/32K) evaluation against a shipped QMLA sidecar.
+
+    Streams one layer at a time matching ``_stream_hy4_flash_captures``, capturing compact DSA
+    group IDs (never ``[T, T]`` bool masks), evaluating shipped / RTN / Hadamard per sequence
+    at each target layer, and freeing every capture immediately after scoring.
+    """
+    if not records:
+        raise ValueError("run_hy4_flash_long_eval requires at least one LongContextRecord")
+    started = time.monotonic()
+    dev = torch.device(device)
+    model = adapter.model
+    manifest, content_by_layer, rope_by_layer = load_sidecar_transforms(
+        sidecar_path, expected_source=expected_source, strict=True,
+    )
+    sidecar_layers = sorted(set(content_by_layer) | set(rope_by_layer))
+    target_layers = tuple(sorted(sidecar_layers if layers is None else layers))
+    missing = [lid for lid in target_layers if lid not in set(sidecar_layers)]
+    if missing:
+        raise ValueError(f"sidecar is missing requested long-eval layers: {missing}")
+
+    if modes is None:
+        eval_modes = tuple(parse_qmla_mode(m) for m in manifest["supported_modes"])
+    else:
+        supported = set(manifest["supported_modes"])
+        eval_modes = tuple(modes)
+        unsupported = [f"{c}:{r}" for c, r in eval_modes if f"{c}:{r}" not in supported]
+        if unsupported:
+            raise ValueError(f"sidecar does not support requested long-eval modes: {unsupported}")
+
+    evaluator = LongContextEvaluator(
+        modes=eval_modes,
+        content_transforms=content_by_layer,
+        rope_transforms=rope_by_layer,
+        protection_policy=manifest["protection_policy"],
+        dsa_indexer_note=adapter.dsa_indexer_note,
+    )
+
+    max_layer = max(target_layers)
+    target_set = set(target_layers)
+    if embedding is None:
+        embedding = model.reader.raw(hy4_forward.reference.OUTER_NAMES[0])
+    active = [(rec, rec.input_ids.to(dev)) for rec in records]
+    states = [model.initial(tokens, embedding=embedding) for _, tokens in active]
+
+    for layer_idx in range(max_layer + 1):
+        layer_start = time.monotonic()
+        layer = model.load_layer(layer_idx)
+        is_target = layer_idx in target_set
+        params = adapter.layer_params(layer) if is_target else None
+        geom = adapter.geometry_for(layer_idx) if is_target else None
+        mlp_args = []
+        for (rec, tokens), state in zip(active, states, strict=True):
+            residual, attention_post, attn_in = model.attention_start(state, tokens, layer)
+            if is_target:
+                assert params is not None and geom is not None
+                cap, attn_out, _ = adapter.capture_sequence(attn_in, layer, seq_id=rec.seq_id, compact_mask=True)
+                evaluator.evaluate_layer_sequence(cap, params, geom, split=rec.split, device=dev)
+                del cap
+            else:
+                attn_out, _ = model.attention(attn_in, layer)
+            if layer_idx < max_layer:
+                mlp_args.append(model.mlp_start(residual, attention_post, attn_out, layer))
+        if mlp_args:
+            routed = [None] * len(mlp_args)
+            if model.config.mlp_layer_types[layer_idx] == "sparse":
+                routed = _routed_forward(model, layer, [args[2] for args in mlp_args])
+            states = [model.mlp_finish(*args, layer, result) for args, result in zip(mlp_args, routed, strict=True)]
+        evaluator.release_layer_cache()
+        print(
+            json.dumps({"phase": "long_eval", "completed_layer": layer_idx, "evaluated": is_target,
+                        "seconds": time.monotonic() - layer_start}),
+            flush=True,
+        )
+        del layer
+
+    return evaluator.finalize(
+        corpus_meta=corpus_meta,
+        transform_fingerprint=manifest["transform_fingerprint"],
+        wall_seconds=time.monotonic() - started,
+        device=dev,
+    )
+
+
+def attach_long_context_eval(
+    output_dir: Path | str,
+    long_eval_section: Mapping[str, Any],
+    *,
+    manifest: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Attach ``long_context_eval`` into ``<output>/qmla-validation-report.json`` atomically."""
+    output_dir = Path(output_dir).resolve()
+    report_path = output_dir / "qmla-validation-report.json"
+    if report_path.is_file():
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    else:
+        if manifest is None:
+            raise ValueError("manifest is required when creating a new qmla-validation-report.json")
+        report = {
+            "schema": "cuteafd-qmla-validation-report-v2",
+            "artifact_status": manifest["artifact_status"],
+            "protection_policy": manifest["protection_policy"],
+            "protection_scope": manifest["protection_scope"],
+            "source": manifest["source"],
+            "supported_modes": list(manifest["supported_modes"]),
+            "transform_fingerprint": manifest["transform_fingerprint"],
+        }
+    report["long_context_eval"] = dict(long_eval_section)
+    _atomic_json(report_path, report)
+    return report
+
+
+def _resolve_long_context_source(corpus_dir: Path | None, *, standalone: bool) -> Path:
+    if corpus_dir is not None and (standalone or has_prepared_long_context(corpus_dir)):
+        return corpus_dir
+    return DEFAULT_STAGED_LONG_CONTEXT_DIR
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.sidecar is not None and not args.long_eval:
+        parser.error("--sidecar requires --long-eval")
+
     checkpoint = args.checkpoint.resolve()
     config_bytes = (checkpoint / "config.json").read_bytes()
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
@@ -868,6 +1020,44 @@ def main(argv: Sequence[str] | None = None) -> int:
     model = hy4_forward.Model(reader)
     adapter = Hy4FlashCaptureAdapter(model, include_swa=False)
     eligible = tuple(g.layer_id for g in adapter.mla_geometries(include_swa=False))
+
+    # Standalone --long-eval against an existing --sidecar (no refitting).
+    if args.sidecar is not None:
+        sidecar_manifest, _, _ = load_sidecar_transforms(args.sidecar, strict=True)
+        expected_source = {
+            "repo": args.source_repo,
+            "revision": args.source_revision,
+            "family": "hy4_flash",
+            "config_sha256": config_sha256,
+        }
+        long_layers = parse_layers_arg(args.layers, eligible) if args.layers else None
+        long_modes = parse_modes_arg(args.modes) if args.modes else None
+        long_source = _resolve_long_context_source(args.corpus_dir, standalone=True)
+        long_records, long_corpus_meta = load_long_context_records(long_source, checkpoint_dir=checkpoint)
+        long_eval = run_hy4_flash_long_eval(
+            adapter,
+            sidecar_path=args.sidecar,
+            records=long_records,
+            corpus_meta=long_corpus_meta,
+            device=args.device,
+            layers=long_layers,
+            modes=long_modes,
+            expected_source=expected_source,
+        )
+        attach_long_context_eval(args.output, long_eval, manifest=sidecar_manifest)
+        print(
+            json.dumps({
+                "status": "passed",
+                "phase": "long_eval",
+                "layers_evaluated": long_eval["layers_evaluated"],
+                "combinations": sorted(long_eval["combinations"]),
+                "transform_fingerprint": long_eval["transform_fingerprint"],
+                "report": str(args.output.resolve() / "qmla-validation-report.json"),
+            }),
+            flush=True,
+        )
+        return 0
+
     resolved = resolve_run_settings(args, eligible)
 
     if args.corpus_dir is None and args.reuse_captures is None:
@@ -934,6 +1124,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=args.device,
         renderer_template_sha256=template_sha,
     )
+    if args.long_eval:
+        del banks
+        long_source = _resolve_long_context_source(args.corpus_dir, standalone=False)
+        long_records, long_corpus_meta = load_long_context_records(long_source, checkpoint_dir=checkpoint)
+        long_eval = run_hy4_flash_long_eval(
+            adapter,
+            sidecar_path=result["sidecar_dir"],
+            records=long_records,
+            corpus_meta=long_corpus_meta,
+            device=args.device,
+            layers=resolved["layers"],
+            modes=resolved["modes"],
+            expected_source={"repo": source["repo"], "revision": source["revision"], "family": "hy4_flash"},
+        )
+        attach_long_context_eval(args.output, long_eval, manifest=result["manifest"])
     print(
         json.dumps({
             "status": result["validation"]["status"],
@@ -943,6 +1148,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "supported_modes": result["manifest"]["supported_modes"],
             "transform_fingerprint": result["manifest"]["transform_fingerprint"],
             "sidecar_dir": result["sidecar_dir"],
+            "long_eval": bool(args.long_eval),
         }),
         flush=True,
     )
