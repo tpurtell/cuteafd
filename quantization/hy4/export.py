@@ -13,6 +13,16 @@ def verify_original_discovery(output, expected_mapping):
 def model_card(path, engram, *, k6_drafter_bits, selection, identity, view_bytes):
     dataset = identity["dataset"]
     components = identity["components"]
+    long_context = components.get("long_context")
+    lc_row = (
+        f"\n| Long-context traces | {long_context['tokens']:,} tokens ({long_context['count']:,} traces) |"
+        if long_context else ""
+    )
+    lc_prose = (
+        "Long-context multi-turn agentic traces and long-document QA exercised DSA selection beyond 2,048 tokens during calibration."
+        if long_context
+        else "The long-context witness exercised DSA selection beyond 2,048 tokens only in reference parity."
+    )
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rows = "\n".join(f"| {name} | {view_bytes[name] / 2**30:.2f} GiB |" for name in export.VIEWS)
@@ -50,7 +60,7 @@ at K8 or K6. The K8 view uses a K8 drafter, and the K6 view uses a K{k6_drafter_
 | Encoder | tpurtell/GPTQModel@{identity['code']['fork']} |
 | Calibration | {dataset['repo_id']}@{dataset['revision']} |
 | Chat prompts | {components['agentic']['tokens']:,} tokens, high reasoning effort |
-| ExLlamaV3 standard | {components['exl3_standard']['tokens']:,} tokens |
+| ExLlamaV3 standard | {components['exl3_standard']['tokens']:,} tokens |{lc_row}
 | Search | Seed {identity['seed']}, sigma {identity['sigma']} |
 | Coverage | All natural routes, then ranks 9–16 and identity padding to a floor of 1,024 |
 | Expert combine | Native top-8 routes, ordered FP32 sum |
@@ -58,8 +68,7 @@ at K8 or K6. The K8 view uses a K8 drafter, and the K6 view uses a K{k6_drafter_
 Calibration used token-budgeted real source code, worked mathematics, function-call
 schemas and multilingual text. One causal pass propagated serialized K8 core and K4
 expert reconstructions. K6 used the same Hessians. The five DFly2 layers use target
-KV and indexer selections from layers 61, 65, 69, 73 and 77. The long-context witness
-exercised DSA selection beyond 2,048 tokens only in reference parity.
+KV and indexer selections from layers 61, 65, 69, 73 and 77. {lc_prose}
 
 The per-module errors and coverage counts are in [per-module-errors.csv](per-module-errors.csv).
 Serving qualification is tracked in [CuteAFD #2550](https://github.com/tpurtell/cuteafd/issues/2550).

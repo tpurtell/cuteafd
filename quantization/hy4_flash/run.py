@@ -33,6 +33,7 @@ CODE = (
     "quantization/hy4_flash/run.py", "quantization/hy4_flash/storage.py",
     "quantization/hy4_flash/gates.py", "quantization/hy4_flash/recipe.py", "quantization/hy4_flash/forward.py",
     "quantization/hy4_family_source.py", "quantization/hy4_flash/source.py", "quantization/hy4_flash/prepare_corpus.py",
+    "quantization/panel_corpus.py",
     "quantization/hy4_flash/parity.py", "quantization/hy4_flash/engram.py",
     "quantization/hy4_flash/export.py", "quantization/core_export.py",
     "quantization/inkling2/numerical.py",
