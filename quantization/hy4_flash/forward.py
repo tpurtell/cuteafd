@@ -273,10 +273,13 @@ class Model:
         latent = layer.project("mlp.routed_expert_down_proj", inputs, project)
         return latent, ids, gamma
 
-    def expert(self, index, latent, layer, project=native_projection):
+    def routed_expert_weights(self, index, latent, layer):
         fused = layer.weights[reference.EXPERTS[0]][index].to(latent.device, dtype=latent.dtype)
         down = layer.weights[reference.EXPERTS[1]][index].to(latent.device, dtype=latent.dtype)
-        gate, up = fused.chunk(2, dim=0)
+        return (*fused.chunk(2, dim=0), down)
+
+    def expert(self, index, latent, layer, project=native_projection):
+        gate, up, down = self.routed_expert_weights(index, latent, layer)
         prefix = layer.prefix + f"mlp.experts.{index}."
         gate = project(prefix + "gate_proj", latent, gate)
         up = project(prefix + "up_proj", latent, up)

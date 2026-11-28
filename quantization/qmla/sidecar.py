@@ -896,6 +896,30 @@ def load_sidecar_transforms(
     return manifest, content_by_layer, rope_by_layer
 
 
+def attach_view_transfer(sidecar_path_or_dir: Path | str, view: str, measurement: Mapping[str, Any]) -> dict[str, Any]:
+    """Atomically add a measured transfer view while preserving the fitted payload and fingerprint."""
+    path = _resolve_sidecar_path(sidecar_path_or_dir)
+    validate_sidecar(path, strict=True)
+    _, _, payload_hash, _, manifest, tensors, _ = _read_f32_safetensors_with_metadata(path)
+    provenance = manifest["calibration_provenance"]
+    if (measurement.get("view") != view or measurement.get("reference") != f"{view} 0:0"
+            or measurement.get("split") != "test" or measurement.get("test_digest") != provenance["splits"]["test"]["digest"]
+            or measurement.get("source_revision") != manifest["source"]["revision"]
+            or measurement.get("transform_fingerprint") != manifest["transform_fingerprint"]
+            or set(measurement.get("combinations", {})) != set(provenance["combination_measurements"])):
+        raise ValueError("transfer measurement differs from the calibration sidecar")
+    if manifest["view_transfer_validation"].get(view) != measurement or view not in manifest["applicable_views"]:
+        manifest["view_transfer_validation"][view] = dict(measurement)
+        if view not in manifest["applicable_views"]:
+            manifest["applicable_views"].append(view)
+        header, payloads, _, sha, _ = _prepare_f32_tensors(tensors)
+        if sha != payload_hash or compute_transform_fingerprint(manifest) != manifest["transform_fingerprint"]:
+            raise ValueError("transfer metadata changed the fitted QMLA transforms")
+        _write_f32_safetensors_with_metadata(path, header, payloads, manifest)
+    validate_sidecar(path, strict=True)
+    return read_sidecar_manifest(path)
+
+
 def build_mc_qmla_section(sidecar_path_or_dir: Path | str) -> dict[str, Any]:
     """Build the full embedded ``qmla`` section for ``cuteafd-mc.json`` (never in required_features)."""
     validate_sidecar(sidecar_path_or_dir, strict=True)

@@ -723,6 +723,7 @@ def run_hy4_flash_long_eval(
     modes: Sequence[tuple[int, int]] | None = None,
     expected_source: Mapping[str, Any] | None = None,
     embedding: torch.Tensor | None = None,
+    phase: str = "long_eval",
 ) -> dict[str, Any]:
     """Forward-only streaming long-context (16K/32K) evaluation against a shipped QMLA sidecar.
 
@@ -793,7 +794,7 @@ def run_hy4_flash_long_eval(
             states = [model.mlp_finish(*args, layer, result) for args, result in zip(mlp_args, routed, strict=True)]
         evaluator.release_layer_cache()
         print(
-            json.dumps({"phase": "long_eval", "completed_layer": layer_idx, "evaluated": is_target,
+            json.dumps({"phase": phase, "completed_layer": layer_idx, "evaluated": is_target,
                         "seconds": time.monotonic() - layer_start}),
             flush=True,
         )
