@@ -207,8 +207,8 @@ class KimiStorageTest(unittest.TestCase):
             source, target = root / "source.safetensors", root / "out.safetensors"
             save_file(dict(weight=torch.arange(10, dtype=torch.int64)), str(source))
             read_header = storage.read_header
-            def truncate_after_header(path):
-                result = read_header(path)
+            def truncate_after_header(path, *, offset=0, length=None):
+                result = read_header(path, offset=offset, length=length)
                 with Path(path).open("r+b") as file:
                     file.truncate(result[1] + 1)
                 return result

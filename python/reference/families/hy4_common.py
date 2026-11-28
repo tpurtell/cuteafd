@@ -192,9 +192,13 @@ def mla_projections(x, w, c, h, nope, rope, vdim, cos, sin, *, qa_kva_eps=None, 
     return q0, q, k, v, gate, sink
 
 
-def tiled_sink_attention(q, k, v, gate, sink, scale, *, sliding_window=None, tile_mask=None):
+def tiled_sink_attention(q, k, v, gate, sink, scale, *, sliding_window=None, tile_mask=None,
+                         exact_keys=None, exact_values=None, sink_tokens=0, recent_tokens=0):
     seq_len = len(q)
     device = q.device
+    no_grad = not torch.is_grad_enabled()
+    k_ht = k.transpose(0, 1).contiguous() if no_grad else None
+    v_ht = v.transpose(0, 1).contiguous() if no_grad else None
     result = []
     for start in range(0, seq_len, ROWS):
         stop = min(start + ROWS, seq_len)
@@ -202,9 +206,18 @@ def tiled_sink_attention(q, k, v, gate, sink, scale, *, sliding_window=None, til
         width = start + ROWS - first
         num_valid = stop - first
         # Pad the tail to preserve causal row and key geometry across prefix extensions.
-        query = F.pad(q[start:stop].transpose(0, 1), (0, 0, 0, ROWS - (stop - start)))
-        keys = F.pad(k[first:stop].transpose(0, 1), (0, 0, 0, width - num_valid))
-        vals = F.pad(v[first:stop].transpose(0, 1), (0, 0, 0, width - num_valid))
+        q_pad = ROWS - (stop - start)
+        kv_pad = width - num_valid
+        q_slice = q[start:stop].transpose(0, 1)
+        query = F.pad(q_slice, (0, 0, 0, q_pad)) if q_pad else (q_slice.contiguous() if no_grad else q_slice)
+        if no_grad:
+            k_slice = k_ht[:, first:stop]
+            v_slice = v_ht[:, first:stop]
+            keys = F.pad(k_slice, (0, 0, 0, kv_pad)) if kv_pad else k_slice
+            vals = F.pad(v_slice, (0, 0, 0, kv_pad)) if kv_pad else v_slice
+        else:
+            keys = F.pad(k[first:stop].transpose(0, 1), (0, 0, 0, kv_pad))
+            vals = F.pad(v[first:stop].transpose(0, 1), (0, 0, 0, kv_pad))
         key_id = torch.arange(first, start + ROWS, device=device)
         query_id = torch.arange(start, start + ROWS, device=device)
         distance = query_id[:, None] - key_id
@@ -213,11 +226,75 @@ def tiled_sink_attention(q, k, v, gate, sink, scale, *, sliding_window=None, til
             allowed &= distance < sliding_window
         if tile_mask is not None:
             allowed &= tile_mask(start, stop, first, width, query_id)
-        score = (query @ keys.transpose(-1, -2)) * scale
-        score = score.masked_fill(~allowed, torch.finfo(score.dtype).min)
-        score = torch.cat((score, sink.expand(-1, ROWS, -1)), dim=-1)
-        probabilities = (score - score.max(dim=-1, keepdim=True).values).softmax(-1)[..., :-1]
-        result.append((probabilities @ vals).transpose(0, 1)[:stop - start] * gate[start:stop])
+        # Queries in this tile can only protect the sink and a band near the
+        # tile. Keep the second dot product bounded as the context grows.
+        score = query @ keys.transpose(-1, -2)
+        protected_regions = []
+        if exact_keys is not None:
+            sink_stop = min(stop, max(first, sink_tokens))
+            recent_start = max(sink_stop, start + 1 - recent_tokens)
+            regions = [(first, sink_stop), (recent_start, stop)] if recent_tokens else [(first, sink_stop)]
+            if no_grad:
+                for begin, end in regions:
+                    if begin >= end:
+                        continue
+                    span = slice(begin - first, end - first)
+                    protected = (key_id[span] < sink_tokens) | (distance[:, span] < recent_tokens)
+                    protected_regions.append((begin, end, span, protected))
+                    exact_score = query @ exact_keys[begin:end].permute(1, 2, 0)
+                    score[..., span] = torch.where(protected, exact_score, score[..., span])
+            else:
+                pieces = []
+                cursor = 0
+                for begin, end in regions:
+                    if begin >= end:
+                        continue
+                    span = slice(begin - first, end - first)
+                    protected = (key_id[span] < sink_tokens) | (distance[:, span] < recent_tokens)
+                    protected_regions.append((begin, end, span, protected))
+                    exact_score = query @ exact_keys[begin:end].permute(1, 2, 0)
+                    pieces.extend([score[..., cursor:span.start], torch.where(protected, exact_score, score[..., span])])
+                    cursor = span.stop
+                pieces.append(score[..., cursor:])
+                score = torch.cat(pieces, dim=-1)
+        if no_grad:
+            score.mul_(scale)
+            score.masked_fill_(~allowed, torch.finfo(score.dtype).min)
+        else:
+            score = score * scale
+            score = score.masked_fill(~allowed, torch.finfo(score.dtype).min)
+        if sink is not None:
+            score = torch.cat((score, sink.expand(-1, ROWS, -1)), dim=-1)
+        probabilities = (score - score.max(dim=-1, keepdim=True).values).softmax(-1)
+        del score
+        if sink is not None:
+            probabilities = probabilities[..., :-1]
+        if exact_values is None:
+            attended = probabilities @ vals
+        elif no_grad:
+            exact_terms = []
+            for begin, end, span, protected in protected_regions:
+                weights = probabilities[..., span].clone()
+                probabilities[..., span].masked_fill_(protected, 0.0)
+                exact_terms.append(weights.masked_fill(~protected, 0.0) @ exact_values[begin:end].transpose(0, 1))
+            attended = probabilities @ vals
+            for term in exact_terms:
+                attended.add_(term)
+        else:
+            # Each key contributes its own exact or quantized value with the
+            # probability from the single joint softmax above.
+            regular = probabilities.clone()
+            exact_terms = []
+            for begin, end, span, protected in protected_regions:
+                weights = probabilities[..., span]
+                regular[..., span] = weights.masked_fill(protected, 0.0)
+                exact_terms.append(weights.masked_fill(~protected, 0.0) @ exact_values[begin:end].transpose(0, 1))
+            attended = regular @ vals
+            for term in exact_terms:
+                attended = attended + term
+        del probabilities
+        output = attended.transpose(0, 1)[:stop - start]
+        result.append(output * gate[start:stop] if gate is not None else output)
     return torch.cat(result).reshape(seq_len, -1)
 
 

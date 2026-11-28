@@ -128,6 +128,13 @@ def _with_sink(query, key, value, allowed, sink):
 
 
 class Model:
+    attention_arithmetic = "f32_tiled"
+
+    @staticmethod
+    def cache_weighted_content(weighted):
+        """Return the content operand read by kv_b on this forward path."""
+        return weighted
+
     def __init__(self, reader):
         self.reader = reader
         self.config = reader.config
@@ -158,7 +165,7 @@ class Model:
         q = reference.norm(q, w[p + "q_a_layernorm.weight"], c.rms_norm_eps)
         kv, kr = layer.project(p + "kv_a_proj_with_mqa", inputs, project).split(
             [c.kv_lora_rank, rope], dim=-1)
-        kv = reference.norm(kv, w[p + "kv_a_layernorm.weight"], c.rms_norm_eps)
+        kv = self.cache_weighted_content(reference.norm(kv, w[p + "kv_a_layernorm.weight"], c.rms_norm_eps))
         gate = layer.project(p + "linear_gate", inputs, project).sigmoid()
         return AttentionFirst(q, kv, kr, gate)
 
@@ -187,6 +194,9 @@ class Model:
         expanded = layer.project(p + "kv_b_proj", kv, project)
         k, v = expanded.reshape(len(expanded), h, nope + vdim).split([nope, vdim], dim=-1)
         keys = torch.cat((k, kr.unsqueeze(1).expand(-1, h, -1)), dim=-1)
+        if not torch.is_grad_enabled():
+            v = v.contiguous()
+            del expanded, k
         return q, keys, v, kr, w[p + "learnable_sink_param"]
 
     def attention_output_inputs(self, inputs, first, layer, project=native_projection,
@@ -207,9 +217,11 @@ class Model:
             stop = min(start + rows, len(inputs))
             first_key = max(0, start + 1 - c.sliding_window) if kind == reference.SLIDING else 0
             width = start + rows - first_key
-            query = F.pad(q[start:stop], (0, 0, 0, 0, 0, rows - (stop - start)))
-            keys = F.pad(k[first_key:stop], (0, 0, 0, 0, 0, width - (stop - first_key)))
-            values = F.pad(v[first_key:stop], (0, 0, 0, 0, 0, width - (stop - first_key)))
+            q_pad = rows - (stop - start)
+            kv_pad = width - (stop - first_key)
+            query = F.pad(q[start:stop], (0, 0, 0, 0, 0, q_pad)) if q_pad else q[start:stop]
+            keys = F.pad(k[first_key:stop], (0, 0, 0, 0, 0, kv_pad)) if kv_pad else k[first_key:stop]
+            values = F.pad(v[first_key:stop], (0, 0, 0, 0, 0, kv_pad)) if kv_pad else v[first_key:stop]
             key_id = torch.arange(first_key, start + rows, device=inputs.device)
             query_id = torch.arange(start, start + rows, device=inputs.device)
             distance = query_id[:, None] - key_id
@@ -273,16 +285,24 @@ class Model:
         latent = layer.project("mlp.routed_expert_down_proj", inputs, project)
         return latent, ids, gamma
 
-    def expert(self, index, latent, layer, project=native_projection):
+    def routed_expert_weights(self, index, latent, layer):
         fused = layer.weights[reference.EXPERTS[0]][index].to(latent.device, dtype=latent.dtype)
         down = layer.weights[reference.EXPERTS[1]][index].to(latent.device, dtype=latent.dtype)
-        gate, up = fused.chunk(2, dim=0)
+        return (*fused.chunk(2, dim=0), down)
+
+    def expert_with_weights(self, index, latent, layer, weights, project=native_projection):
+        gate_w, up_w, down_w = weights
         prefix = layer.prefix + f"mlp.experts.{index}."
-        gate = project(prefix + "gate_proj", latent, gate)
-        up = project(prefix + "up_proj", latent, up)
+        gate = project(prefix + "gate_proj", latent, gate_w)
+        up = project(prefix + "up_proj", latent, up_w)
         limit = self.config.swiglu_limit
         activated = F.silu(gate.clamp_max(limit)) * up.clamp(-limit, limit)
-        return project(prefix + "down_proj", activated, down)
+        return project(prefix + "down_proj", activated, down_w)
+
+    def expert(self, index, latent, layer, project=native_projection):
+        return self.expert_with_weights(
+            index, latent, layer, self.routed_expert_weights(index, latent, layer), project=project
+        )
 
     @staticmethod
     def expert_rows(ids, gamma, expert):
