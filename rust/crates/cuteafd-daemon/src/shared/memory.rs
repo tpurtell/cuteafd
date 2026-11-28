@@ -272,7 +272,7 @@ impl<'a> BlockingWait<'a> {
         };
         // SAFETY: the event belongs to the current device, as does `stream`
         // (the caller's contract); it lives until this wait drops. Polls it
-        // for the first `BLOCK_SPIN` (10 ms: every per-layer decode wait
+        // for the first `BLOCK_SPIN` (50 ms: every per-layer decode wait
         // completes within that, and the wake-up of a blocking sync would be
         // on the critical path), then sleeps in the driver.
         unsafe {

@@ -1273,21 +1273,21 @@ fn link_teardown_and_reset_take_the_transport_back_from_the_exchange() {
 
 /// Block-mode pacing spins through the hybrid window: a decode wave (Kimi
 /// K3's 0.6-0.7 ms per-layer round) never sleeps, however early it is in its
-/// expected duration; only a wait past 10 ms sleeps, and only while early.
+/// expected duration; only a wait past 50 ms sleeps, and only while early.
 #[test]
 fn pacing_spins_through_the_hybrid_window_before_sleeping() {
     let window = cuteafd_transport::wait_policy::BLOCK_SPIN.as_secs_f64();
-    assert_eq!(window, 0.010);
+    assert_eq!(window, 0.050);
     // A Kimi layer round: early in its mean, but inside the window.
     assert!(!Pace::early(Some(700e-6), 100e-6));
     assert!(!Pace::early(Some(700e-6), 400e-6));
     // A long wave: still spins for the window, then sleeps while early.
-    assert!(!Pace::early(Some(0.050), 0.005));
-    assert!(Pace::early(Some(0.050), 0.012));
+    assert!(!Pace::early(Some(0.250), 0.025));
+    assert!(Pace::early(Some(0.250), 0.060));
     // Late in its expected duration: spins again.
-    assert!(!Pace::early(Some(0.050), 0.040));
+    assert!(!Pace::early(Some(0.250), 0.200));
     // No mean yet: never sleeps.
-    assert!(!Pace::early(None, 0.020));
+    assert!(!Pace::early(None, 0.080));
 }
 
 /// A CPU receive ring for the [`Native`] backend tests (#815): each rank holds

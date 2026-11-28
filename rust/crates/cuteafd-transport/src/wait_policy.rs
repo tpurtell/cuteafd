@@ -82,14 +82,20 @@ pub fn wait_policy() -> WaitPolicy { POLICY.get().copied().unwrap_or_default() }
 /// starts sleeping: the one hybrid spin window for every block-mode wait
 /// ([`Backoff`], [`spin_window`], the Spark exchange worker's pacing).
 ///
-/// 10 ms (TJ 2026-10-26), up from 250 us: every per-layer decode wait (a
-/// router, a Spark reply) ends within it, so decode never pays a sleep's
-/// wake-up; only prefill-length waits sleep, and an idle server still parks
-/// after [`WaitPolicy::idle_park`]. At 250 us Kimi K3 BF16 max, whose
-/// per-layer Spark round is 0.6-0.7 ms, slept in every per-layer wait: C8
-/// basic 0.913 and sweep 0.946 of spin, and the timed Spark compute for
-/// identical kernels grew 33.6 -> 38.9 ms (#731 comment 6415231320).
-pub const BLOCK_SPIN: Duration = Duration::from_millis(10);
+/// 50 ms (TJ 2026-11-28), up from 10 ms: the end-of-step token-landing wait
+/// must cover a whole decode step. Decode graphs finish host enqueue early,
+/// so on Hy4-flash 2x RTX + 4 Sparks C1 the host reached that wait with
+/// ~15 ms of GPU/Spark work left, spun the 10 ms window, then slept in
+/// `cudaEventSynchronize` on 46 of 50 steps and paid a late, cold wake-up
+/// (#2922). Every per-layer decode wait (a router, a Spark reply) still ends
+/// well inside the window, so decode never pays a wake-up; only
+/// prefill-length waits sleep, and an idle server still parks after
+/// [`WaitPolicy::idle_park`].
+///
+/// Earlier: 10 ms (TJ 2026-10-26), up from 250 us. At 250 us Kimi K3 BF16 max,
+/// whose per-layer Spark round is 0.6-0.7 ms, slept in every per-layer wait:
+/// C8 basic 0.913 and sweep 0.946 of spin (#731 comment 6415231320).
+pub const BLOCK_SPIN: Duration = Duration::from_millis(50);
 /// One sleep of a critical-path wait past [`BLOCK_SPIN`].
 pub const BLOCK_SLEEP: Duration = Duration::from_micros(20);
 
@@ -191,14 +197,17 @@ mod tests {
     }
 
     #[test]
-    fn block_spin_window_is_ten_ms_and_covers_a_kimi_layer_round() {
-        assert_eq!(BLOCK_SPIN, Duration::from_millis(10));
-        // Kimi K3's per-layer Spark round (0.6-0.7 ms) and V4.1's must spin.
+    fn block_spin_window_is_fifty_ms_and_covers_a_decode_step() {
+        assert_eq!(BLOCK_SPIN, Duration::from_millis(50));
+        // Kimi K3's per-layer Spark round (0.6-0.7 ms) and V4.1's must spin,
+        // and so must a whole decode step's token-landing wait (~15 ms on
+        // Hy4-flash 2x RTX + 4 Sparks C1, #2922).
         assert!(block_spins(Duration::ZERO));
         assert!(block_spins(Duration::from_micros(700)));
-        assert!(block_spins(Duration::from_micros(9_999)));
+        assert!(block_spins(Duration::from_millis(15)));
+        assert!(block_spins(Duration::from_micros(49_999)));
         assert!(!block_spins(BLOCK_SPIN));
-        assert!(!block_spins(Duration::from_millis(50)));
+        assert!(!block_spins(Duration::from_millis(100)));
         // Parking stays separate and unchanged.
         assert_eq!(WaitPolicy::default().idle_park, Duration::from_secs(30));
     }

@@ -494,7 +494,7 @@ const SLEEP: Duration = Duration::from_micros(20);
 /// running mean of the last waves), then spins: completion stays within a
 /// spin of the event, while the long middle of a long Spark round trip or GPU
 /// stage costs no CPU. A wait first spins through the hybrid window
-/// ([`BLOCK_SPIN`](cuteafd_transport::wait_policy::BLOCK_SPIN), 10 ms), so a
+/// ([`BLOCK_SPIN`](cuteafd_transport::wait_policy::BLOCK_SPIN), 50 ms), so a
 /// decode wave (a per-layer round well under that) never sleeps.
 const SLEEP_SHARE: f64 = 0.7;
 /// Weight of the newest wave in the running means.
