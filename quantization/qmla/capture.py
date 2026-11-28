@@ -383,6 +383,7 @@ class CapturedLayerParams:
     o_proj_weight: torch.Tensor
     sink: torch.Tensor | None = None
     post_proj_norm_weight: torch.Tensor | None = None
+    attention_arithmetic: str = "f32_tiled"
 
     def to(self, device: torch.device | str) -> "CapturedLayerParams":
         def _mv(t: torch.Tensor | None) -> torch.Tensor | None:
@@ -394,10 +395,13 @@ class CapturedLayerParams:
             o_proj_weight=self.o_proj_weight.to(device),
             sink=_mv(self.sink),
             post_proj_norm_weight=_mv(self.post_proj_norm_weight),
+            attention_arithmetic=self.attention_arithmetic,
         )
 
     def validate(self, geometry: MlaLayerGeometry) -> None:
         geometry.validate()
+        if self.attention_arithmetic not in ("f32_tiled", "bf16_eager", "bf16_sdpa"):
+            raise ValueError(f"unsupported attention arithmetic {self.attention_arithmetic!r}")
         if self.kv_norm_weight.shape != (geometry.kv_lora_rank,):
             raise ValueError(f"kv_norm_weight shape {tuple(self.kv_norm_weight.shape)} != ({geometry.kv_lora_rank},)")
         expected_kv_b = (geometry.heads * (geometry.qk_nope_dim + geometry.v_head_dim), geometry.kv_lora_rank)
@@ -598,6 +602,71 @@ def eval_positional_qk(
     return z_p, mask
 
 
+def native_masked_attention(query, keys, values, mask, scale, arithmetic):
+    """Unbatched [T,H,D] attention with the native BF16 teacher's rounding boundaries."""
+    q, k, v = (x.transpose(0, 1).unsqueeze(0) for x in (query, keys, values))
+    if arithmetic == "bf16_sdpa":
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask[None, None], scale=scale)
+    elif arithmetic == "bf16_eager":
+        scores = (q @ k.transpose(-1, -2)) * scale
+        probs = scores.masked_fill(~mask, torch.finfo(q.dtype).min).softmax(-1, dtype=torch.float32).to(q.dtype)
+        out = probs @ v
+    else:
+        raise ValueError(f"unsupported native attention arithmetic: {arithmetic}")
+    return out[0].transpose(0, 1)
+
+
+def _native_bf16_output(seq, params, geom, latent, kv_b_override, exact_content_fn,
+                        sink_tokens, recent_tokens):
+    if geom.has_rope or geom.kind != "dsa" or seq.gate is not None or params.sink is not None:
+        raise ValueError("native BF16 arithmetic currently supports ungated NoPE DSA")
+    dtype = torch.bfloat16
+    out_dim = geom.qk_nope_dim + geom.v_head_dim
+    count = seq.seq_len
+
+    def expand(z):
+        if kv_b_override is None:
+            # Native RMSNorm returns the weighted product in the input dtype.
+            kv = F.linear(z.to(dtype), params.kv_b_weight.to(dtype))
+        else:
+            # Compensated weights and transformed coordinates are stored/evaluated in FP32.
+            kv = F.linear(z.float(), kv_b_override.float()).to(dtype)
+        return kv.reshape(count, geom.heads, out_dim).split([geom.qk_nope_dim, geom.v_head_dim], dim=-1)
+
+    keys, values = expand(latent)
+    query = seq.q_nope.to(dtype)
+    protect = exact_content_fn is not None and (sink_tokens or recent_tokens)
+    if protect:
+        exact_k, exact_v = expand(exact_content_fn(seq.u.float()))
+    # Match the native prefill's shape and SDPA backend for ordinary calibration sequences.
+    # Only long contexts or query-dependent selection of the exact/quantized KV require tiles.
+    step = count if seq.sparse_selection is None and not protect else ROWS
+    pieces = []
+    for start in range(0, count, step):
+        stop = min(start + step, count)
+        rows = torch.arange(start, stop, device=query.device)
+        slots = torch.arange(stop, device=query.device)
+        if seq.allowed_mask is not None:
+            allowed = seq.allowed_mask[start:stop, :stop]
+        else:
+            allowed = slots[None, :] <= rows[:, None]
+            if seq.sparse_selection is not None:
+                allowed &= seq.sparse_selection.tile_mask(start, stop, 0, stop, rows)
+        key, value = keys[:stop], values[:stop]
+        if protect:
+            # Put one exact or one quantized version of each key in the same softmax.
+            # Only sink/recent regions can be selected from the exact copy in this tile.
+            protected = (slots < sink_tokens) | ((rows[:, None] - slots) < recent_tokens)
+            exact_slots = slots[(slots < sink_tokens) | (slots >= start + 1 - recent_tokens)]
+            key = torch.cat((key, exact_k[exact_slots]))
+            value = torch.cat((value, exact_v[exact_slots]))
+            allowed = torch.cat((allowed & ~protected, (allowed & protected)[:, exact_slots]), dim=1)
+        pieces.append(native_masked_attention(query[start:stop], key, value, allowed, geom.effective_scale,
+                                              params.attention_arithmetic))
+    attended = torch.cat(pieces).reshape(count, geom.heads * geom.v_head_dim)
+    return F.linear(attended, params.o_proj_weight.to(dtype)).float()
+
+
 def eval_attention_output(
     seq: CapturedSequence,
     params: CapturedLayerParams,
@@ -634,6 +703,10 @@ def eval_attention_output(
         latent = content_fn(u)
     else:
         latent = u * params.kv_norm_weight.float()
+
+    if params.attention_arithmetic.startswith("bf16_"):
+        return _native_bf16_output(seq, params, geometry, latent, kv_b_override, exact_content_fn,
+                                   sink_tokens, recent_tokens)
 
     kv_b = (params.kv_b_weight if kv_b_override is None else kv_b_override).float()
     expanded = linear(latent, kv_b).reshape(t, h, nope + vdim)
@@ -808,6 +881,7 @@ def save_layer_capture(directory: Path | str, bank: CapturedLayerBank) -> dict[s
         "schema": CAPTURE_SCHEMA,
         "geometry": bank.geometry.to_dict(),
         "provenance": bank.provenance,
+        "attention_arithmetic": bank.params.attention_arithmetic,
         "has_sink": bank.params.sink is not None,
         "has_post_proj_norm": bank.params.post_proj_norm_weight is not None,
         "splits": split_meta,
@@ -835,6 +909,7 @@ def load_layer_capture(directory: Path | str, layer_id: int) -> CapturedLayerBan
         directory / payload["file"], int(payload["bytes"]), str(payload["xxh3_128"])
     )
     params = CapturedLayerParams(
+        attention_arithmetic=manifest.get("attention_arithmetic", "f32_tiled"),
         kv_norm_weight=tensors["params.kv_norm_weight"],
         kv_b_weight=tensors["params.kv_b_weight"],
         o_proj_weight=tensors["params.o_proj_weight"],
