@@ -112,6 +112,10 @@ class MlaLayerGeometry:
     sliding_window: int | None = None
     shared_consumers: tuple[int, ...] = ()
 
+    def __post_init__(self) -> None:
+        if not self.shared_consumers:
+            object.__setattr__(self, "shared_consumers", (self.layer_id,))
+
     @property
     def effective_scale(self) -> float:
         if self.attention_scale is not None:

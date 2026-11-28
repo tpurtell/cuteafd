@@ -1,10 +1,16 @@
-"""Shared family-agnostic QuantMLA (QMLA) calibration package.
+"""Shared family-agnostic QuantMLA (QMLA) calibration package (#2909).
 
-Phase 0 (mode-agnostic) provides the capture interface, layer geometry
-descriptors, exact full-precision attention/positional-QK evaluators,
-deterministic train/val splitting, and sequential XXH3-128 capture storage.
-Fit routines, quantizers, sidecar writers/validators, and incremental
-publication land after Phase 0 design confirmation (#2909).
+Provides:
+- ``capture``: mode-agnostic MLA geometry, capture adapter protocol, exact FP32
+  reference evaluators, deterministic train/val split, XXH3-128 capture storage.
+- ``quantizer``: QuantMLA per-token asymmetric affine group-64 quantizer,
+  bit-exact INT2/INT4/INT8 pack/unpack oracle, record sizing, Hadamard baseline.
+- ``fit``: function-aligned content (L_C) and RoPE (L_P) optimizers, step-0
+  baselines (RTN / Hadamard / SmoothQuant alpha-grid), XXH3-128 fit checkpoints.
+- ``sidecar``: ``cuteafd-qmla-v1`` sidecar writer, fail-closed validator,
+  pluggable ``CorpusComponentSpec``, and advisory ``cuteafd-mc.json`` builder.
+- ``publish``: same-repo incremental HF revision planner and HTTP LFS publisher
+  (zero weight shard re-upload).
 """
 from __future__ import annotations
 
@@ -24,20 +30,132 @@ from .capture import (
     split_train_val,
     unit_rms_norm,
 )
+from .fit import (
+    ALPHA_INIT_GRID,
+    FIT_CHECKPOINT_SCHEMA,
+    ContentFitResult,
+    FitConfig,
+    RopeFitResult,
+    apply_content_forward,
+    apply_rope_pair_transform,
+    cayley_orthogonal,
+    compensate_kv_b,
+    content_output_loss,
+    fit_config_digest,
+    fit_content_layer,
+    fit_rope_layer,
+    load_fit_checkpoint,
+    rope_qk_loss,
+    save_fit_checkpoint,
+)
+from .publish import (
+    ALLOWED_INCREMENTAL_FILES,
+    INCREMENTAL_PLAN_SCHEMA,
+    plan_incremental_revision,
+    publish_incremental_revision,
+)
+from .quantizer import (
+    CONTENT_NONZERO_BITS,
+    EPS_SCALE,
+    GROUP_SIZE,
+    ROPE_NONZERO_BITS,
+    VALID_CONTENT_BITS,
+    VALID_ROPE_BITS,
+    pack_content_row,
+    pack_joint_record,
+    pack_rope_row,
+    pack_unsigned_codes,
+    parse_qmla_mode,
+    qdq_asymmetric_group,
+    quantize_params_asymmetric,
+    record_bytes_for_mode,
+    sylvester_hadamard,
+    unpack_content_row,
+    unpack_joint_record,
+    unpack_rope_row,
+    unpack_unsigned_codes,
+)
+from .sidecar import (
+    CANONICAL_CONVENTIONS,
+    CANONICAL_QUANTIZER_RECIPE,
+    MANIFEST_FILE,
+    QMLA_SCHEMA,
+    TENSORS_FILE,
+    VALID_ARTIFACT_STATUSES,
+    CorpusComponentSpec,
+    attach_qmla_advisory_to_mc,
+    build_mc_qmla_advisory,
+    compute_transform_fingerprint,
+    derive_supported_modes,
+    validate_sidecar,
+    write_sidecar,
+)
 
 __all__ = [
+    "ALLOWED_INCREMENTAL_FILES",
+    "ALPHA_INIT_GRID",
+    "CANONICAL_CONVENTIONS",
+    "CANONICAL_QUANTIZER_RECIPE",
     "CAPTURE_SCHEMA",
+    "CONTENT_NONZERO_BITS",
     "CapturedLayerBank",
     "CapturedLayerParams",
     "CapturedSequence",
+    "ContentFitResult",
+    "CorpusComponentSpec",
+    "EPS_SCALE",
+    "FIT_CHECKPOINT_SCHEMA",
+    "FitConfig",
+    "GROUP_SIZE",
+    "INCREMENTAL_PLAN_SCHEMA",
+    "MANIFEST_FILE",
     "MlaLayerGeometry",
+    "QMLA_SCHEMA",
     "QmlaCaptureAdapter",
+    "ROPE_NONZERO_BITS",
+    "RopeFitResult",
+    "TENSORS_FILE",
+    "VALID_ARTIFACT_STATUSES",
+    "VALID_CONTENT_BITS",
+    "VALID_ROPE_BITS",
+    "apply_content_forward",
+    "apply_rope_pair_transform",
+    "attach_qmla_advisory_to_mc",
+    "build_mc_qmla_advisory",
     "causal_mask",
+    "cayley_orthogonal",
+    "compensate_kv_b",
+    "compute_transform_fingerprint",
+    "content_output_loss",
+    "derive_supported_modes",
     "eval_attention_output",
     "eval_positional_qk",
+    "fit_config_digest",
+    "fit_content_layer",
+    "fit_rope_layer",
+    "load_fit_checkpoint",
     "load_layer_capture",
+    "pack_content_row",
+    "pack_joint_record",
+    "pack_rope_row",
+    "pack_unsigned_codes",
+    "parse_qmla_mode",
+    "plan_incremental_revision",
+    "publish_incremental_revision",
+    "qdq_asymmetric_group",
+    "quantize_params_asymmetric",
+    "record_bytes_for_mode",
     "rms_norm",
+    "rope_qk_loss",
+    "save_fit_checkpoint",
     "save_layer_capture",
     "split_train_val",
+    "sylvester_hadamard",
     "unit_rms_norm",
+    "unpack_content_row",
+    "unpack_joint_record",
+    "unpack_rope_row",
+    "unpack_unsigned_codes",
+    "validate_sidecar",
+    "write_sidecar",
 ]

@@ -135,10 +135,44 @@ def _read(root, name):
     return data
 
 
+QMLA_SCHEMA = "cuteafd-qmla-v1"
+QMLA_MANIFEST_FILE = "mla_calibration.json"
+QMLA_TENSORS_FILE = "mla_calibration.safetensors"
+QMLA_STATUSES = frozenset({"calibrated_unqualified", "runtime_qualified"})
+
+
+def validate_qmla_advisory(qmla, *, strict=False):
+    """Validate optional advisory QMLA sidecar metadata (never in required_features)."""
+    _fields(
+        qmla,
+        ("schema", "manifest", "manifest_sha256", "tensors", "tensors_sha256",
+         "transform_fingerprint", "artifact_status"),
+        strict=strict,
+    )
+    _require(qmla["schema"] == QMLA_SCHEMA, "unsupported MC advisory QMLA schema")
+    _require(
+        qmla["manifest"] == QMLA_MANIFEST_FILE and qmla["tensors"] == QMLA_TENSORS_FILE,
+        "noncanonical MC advisory QMLA sidecar filenames",
+    )
+    _require(
+        all(_digest(qmla[k]) for k in ("manifest_sha256", "tensors_sha256", "transform_fingerprint")),
+        "invalid MC advisory QMLA digest",
+    )
+    _require(qmla["artifact_status"] in QMLA_STATUSES, "invalid MC advisory QMLA artifact_status")
+    return qmla
+
+
+def _check_qmla_index(qmla, weights):
+    if qmla is None:
+        return
+    shards = set(weights.values())
+    _require(QMLA_TENSORS_FILE not in shards, "QMLA sidecar safetensors leaked into standard view index")
+
+
 def validate(manifest, root=None, view=None):
     """Validate schema and optionally selected (or all) view metadata on disk."""
     _fields(manifest, ("schema", "source", "original_core_dtype", "shared_inventory_sha256", "variants"),
-            optional=("required_features", "engram_fp8", "exl3_codebook"))
+            optional=("required_features", "engram_fp8", "exl3_codebook", "qmla"))
     if "exl3_codebook" in manifest:
         declaration = manifest["exl3_codebook"]
         _fields(declaration, ("name", "multiplier"))
@@ -146,6 +180,7 @@ def validate(manifest, root=None, view=None):
                                  {"name": "mul1", "multiplier": 0x83DCD12D}),
                  "invalid MC EXL3 codebook declaration")
     engram = validate_engram_fp8(manifest["engram_fp8"]) if "engram_fp8" in manifest else None
+    qmla = validate_qmla_advisory(manifest["qmla"], strict=True) if "qmla" in manifest else None
     _require(manifest["schema"] == SCHEMA, "unsupported MC schema")
     features = manifest.get("required_features", [])
     _require(isinstance(features, list) and all(isinstance(f, str) for f in features),
@@ -184,6 +219,7 @@ def validate(manifest, root=None, view=None):
             weights = json.loads(contents[index])["weight_map"]
             _require(shared_inventory_digest(weights, core) == shared, "MC shared inventory digest mismatch")
             _check_engram_index(engram, weights, core)
+            _check_qmla_index(qmla, weights)
     _require("original" in names, "MC requires original view")
     if view is not None:
         _require(("original" if view == "fp8-compact" else view) in names, f"CORE_VIEW={view} is absent")
@@ -191,7 +227,7 @@ def validate(manifest, root=None, view=None):
 
 
 def build(root, *, source_repo, source_revision, core_tensors, original_core_dtype="BF16",
-          required_features=None, engram_fp8=None, exl3_codebook=None):
+          required_features=None, engram_fp8=None, exl3_codebook=None, qmla=None):
     """Build discovery metadata from sealed view files and their core name lists.
 
     Does not write or publish anything. `core_tensors` maps variant names to all
@@ -219,6 +255,8 @@ def build(root, *, source_repo, source_revision, core_tensors, original_core_dty
         manifest["exl3_codebook"] = exl3_codebook
     if engram_fp8 is not None:
         manifest["engram_fp8"] = engram_fp8
+    if qmla is not None:
+        manifest["qmla"] = qmla
     validate(manifest, root)
     _require(len(json.dumps(manifest).encode()) <= MAX_JSON_BYTES, "MC manifest exceeds metadata limit")
     return manifest
