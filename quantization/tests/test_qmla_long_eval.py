@@ -88,7 +88,7 @@ def _eval_attention_output_dense_oracle(
     keys, values = expanded.split([nope, vdim], dim=-1)
     exact_keys = exact_values = None
     if protect and exact_content_fn is not None:
-        exact_kv = linear(exact_content_fn(c), kv_b).reshape_as(expanded)
+        exact_kv = linear(c, params.kv_b_weight.float()).reshape_as(expanded)
         exact_keys, exact_values = exact_kv.split([nope, vdim], dim=-1)
     elif protect and exact_rope_key_fn is not None:
         exact_keys = keys
