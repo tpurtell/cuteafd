@@ -90,7 +90,8 @@ const MIB: u64 = 1 << 20;
 /// - GLM 5.3 / ML4 `glm_working_set` (ML4 1x is the scaled 88/78 entry).
 /// - GLM Flash `glmf_graphs::working_set`: 1x; 2x split DFlash (both ranks 94 MiB W1).
 /// - Qwen4 `qwen_working_set`; Hy4-flash `hy4_graphs` census (1x max of local and
-///   Spark onboarding; 2x local TP2); Hy4 `hy4::graph_reserve` full-card census.
+///   Spark onboarding; 2x max of local TP2 and TP2 + Sparks); Hy4 `hy4::graph_reserve`
+///   full-card census.
 /// - Inkling 2 lag-8 working sets plus margin; Inkling 2 Mini at its measured
 ///   boot-C64 speculating key space (128 keys).
 pub const ENVELOPES: &[(GraphFamily, usize, &[u64])] = &[
@@ -118,20 +119,13 @@ pub const ENVELOPES: &[(GraphFamily, usize, &[u64])] = &[
     (GraphFamily::Qwen4, 1, &[134 * MIB]),
     (GraphFamily::Qwen4, 2, &[116 * MIB, 120 * MIB]),
     (GraphFamily::Hy4Flash, 1, &[192 * MIB]),
-    (GraphFamily::Hy4Flash, 2, &[204 * MIB, 202 * MIB]),
+    (GraphFamily::Hy4Flash, 2, &[220 * MIB, 208 * MIB]),
     (GraphFamily::Hy4, 1, &[324 * MIB]),
     (GraphFamily::Hy4, 2, &[344 * MIB, 334 * MIB]),
     (GraphFamily::Inkling2, 1, &[398 * MIB]),
     (GraphFamily::Inkling2, 2, &[454 * MIB, 240 * MIB]),
     (GraphFamily::Inkling2Mini, 1, &[1_238 * MIB]),
 ];
-
-/// Layouts whose default is eager decode by measurement, not by a missing
-/// census: `(family, coordinator ranks, Sparks attached)`. Hy4-flash 2x RTX +
-/// Sparks measured slower with either C1 (116/108 MiB) or wide (1130/1058 MiB)
-/// graph reserves than eager (`hy4_graphs::CENSUS`), so its default reserve is 0;
-/// an explicit `GPU_GRAPH_RESERVE` still enables capture.
-pub const EAGER_DEFAULTS: &[(GraphFamily, usize, bool)] = &[(GraphFamily::Hy4Flash, 2, true)];
 
 /// The envelope for `rank` of a `ranks`-GPU layout: the same rank count's row,
 /// else the largest value of the family's other rows (Qwen 3.5 2x borrows 1x;
@@ -172,13 +166,6 @@ pub fn current_envelope(family: GraphFamily, ranks: usize, rank: usize) -> Resul
     let extra = read("GPU_GRAPH_RESERVE_EXTRA")?;
     let cap = read("GPU_GRAPH_RESERVE_EXTRA_CAP")?;
     resolve_envelope(text.as_deref(), extra.as_deref(), cap.as_deref(), rank, envelope_bytes(family, ranks, rank))
-}
-
-/// A measured-eager default (`EAGER_DEFAULTS`): 0 unless the operator sets a reserve.
-pub fn current_eager(rank: usize) -> Result<Resolved, Error> {
-    let mut policy = current(rank, false, 0, 0)?;
-    if policy.bytes == 0 { policy.source = "eager by measurement"; }
-    Ok(policy)
 }
 
 /// The graphs-off policy: nothing charged, no device cache.

@@ -1,5 +1,5 @@
 //! Every launchable (family, coordinator ranks) resolves a nonzero decode-graph
-//! reserve with graphs on, or is a documented eager-by-measurement layout; and
+//! reserve with graphs on; and
 //! each family × ranks envelope equals the maximum of that family's checked-in
 //! measured charges, so the fallback table cannot drift from its sources.
 use super::*;
@@ -43,8 +43,7 @@ fn launchable() -> BTreeSet<(String, usize, bool)> {
         let family = cell["family"].as_str().unwrap();
         for (column, ranks) in [("1rtx", 1), ("2rtx", 2)] {
             if matches!(cell[column]["status"].as_str(), Some("current" | "pending")) {
-                // Matrix cells do not record Spark counts; the eager exception is
-                // keyed by Sparks, so treat a cell as both attachments.
+                // Matrix cells do not record Spark counts; cover both attachments.
                 out.insert((family.to_string(), ranks, true));
                 out.insert((family.to_string(), ranks, false));
             }
@@ -76,12 +75,11 @@ fn family_of_name(family: GraphFamily) -> &'static str {
 }
 
 #[test]
-fn every_launchable_family_rank_count_has_an_envelope_row_or_a_documented_eager_exception() {
+fn every_launchable_family_rank_count_has_an_envelope_row() {
     let launchable = launchable();
     assert!(launchable.len() > 20, "launch inventory unexpectedly small: {launchable:?}");
     for (name, ranks, sparks) in launchable {
         let family = family_of(&name).unwrap_or_else(|| panic!("matrix family {name} has no graph family"));
-        if EAGER_DEFAULTS.contains(&(family, ranks, sparks)) { continue }
         let row = ENVELOPES.iter().find(|(f, r, _)| *f == family && *r == ranks)
             .map(|(_, _, bytes)| *bytes)
             // Only Qwen 3.5 2x documents borrowing the 1x row.
@@ -223,8 +221,7 @@ fn reachable_resolver_inputs_never_yield_zero_with_graphs_on() {
                         assert!(crate::families::hy4::graph_reserve::reserve_policy(layout, ranks, rank).unwrap().bytes > 0);
                     }
                     let layout = Hy4GraphLayout::resolve(ranks, sparks);
-                    let bytes = crate::serving_capacity::hy4_graphs::reserve_policy(layout, ranks, rank).unwrap().bytes;
-                    assert_eq!(bytes == 0, EAGER_DEFAULTS.contains(&(GraphFamily::Hy4Flash, ranks, sparks > 0)),
+                    assert!(crate::serving_capacity::hy4_graphs::reserve_policy(layout, ranks, rank).unwrap().bytes > 0,
                         "Hy4-flash {ranks}x + {sparks} Sparks");
                 }
                 assert!(crate::serving_capacity::inkling2_graphs::policy(rank, ranks, true).unwrap().bytes > 0);
