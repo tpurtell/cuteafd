@@ -398,13 +398,14 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
     manifest, c_tf, r_tf = load_sidecar_transforms(cal_res["sidecar_dir"], strict=True)
     assert set(c_tf) == {0, 2} and set(r_tf) == {0, 2}
 
+    # Expose quantized history beyond the deployed four sinks and 128 recent keys.
     long_records = [
-        LongContextRecord("lc-hold-01", "heldout", "16k", torch.randint(0, vocab, (48,), generator=g, dtype=torch.int64), "5" * 64),
-        LongContextRecord("lc-cal-01", "calibration", "32k", torch.randint(0, vocab, (52,), generator=g, dtype=torch.int64), "6" * 64),
+        LongContextRecord("lc-hold-01", "heldout", "16k", torch.randint(0, vocab, (192,), generator=g, dtype=torch.int64), "5" * 64),
+        LongContextRecord("lc-cal-01", "calibration", "32k", torch.randint(0, vocab, (224,), generator=g, dtype=torch.int64), "6" * 64),
     ]
     long_eval = run_hy4_flash_long_eval(
         adapter, sidecar_path=cal_res["sidecar_dir"], records=long_records,
-        corpus_meta={"source_kind": "prepared_panel_corpus", "sequences": 2, "tokens": 100}, device="cpu",
+        corpus_meta={"source_kind": "prepared_panel_corpus", "sequences": 2, "tokens": 416}, device="cpu",
         expected_source={"repo": source["repo"], "revision": source["revision"], "family": "hy4_flash"},
     )
     assert long_eval["schema"] == LONG_EVAL_SCHEMA
@@ -413,8 +414,9 @@ def test_streaming_long_eval_end_to_end_and_cli_flags(tmp_path: Path):
     assert long_eval["dsa_selection_drift"]["sparse_layers"] == [0, 2]
     assert set(long_eval["combinations"]) == {"4:4", "4:0", "0:4"}
     for mkey, row in long_eval["combinations"].items():
-        assert row["layer_tokens"] == 200 and set(row["by_split"]) == {"heldout", "calibration"}
+        assert row["layer_tokens"] == 832 and set(row["by_split"]) == {"heldout", "calibration"}
         assert set(row["per_layer"]) == {"0", "2"}
+        assert row["rtn_attn_rel_err"] > 0
         assert row["ratio_to_rtn"] == pytest.approx(row["attn_rel_err"] / row["rtn_attn_rel_err"])
         if mkey == "0:4":
             assert row["hadamard_attn_rel_err"] == pytest.approx(row["rtn_attn_rel_err"])
