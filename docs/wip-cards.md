@@ -161,6 +161,9 @@ and arms for cleanup. Source worktrees are retained for inspection.
   and `CUTEAFD_CLIENT_OUT` exported, and a failing client fails the card.
   `--client-timeout` (default 3600 s, at most 7200 s with any precheck) bounds
   it. It excludes `--exact-state` and `--cold-window`, and `--dry-run` prints the hook.
+  Greedy byte-exactness: `--client 'scripts/bench/greedy-exactness.py client scripts/bench/fixtures/spec-lossless-set-v1.json'`
+  (levels 1,4,10; `--levels` overrides) writes `greedy.json`; `greedy-exactness.py compare A.json B.json`
+  diffs two arms per level and prompt, reports cross-level matches, and exits nonzero on any mismatch.
 - `--sweep-passes N` (default 1) repeats the measurement N times against one
   server launch, for graph-cache convergence: pass 1 captures shapes for the
   first time, later passes should show no new captures. The client sweep
