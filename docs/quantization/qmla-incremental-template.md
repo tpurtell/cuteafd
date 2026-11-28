@@ -120,7 +120,13 @@ PYTHONPATH="$PWD/quantization:$PWD/third_party/transformers/src" \
   - the total sidecar size, once.
 
   **Keep every measured result in the report, including baseline misses.**
-- **Acceptance and publication:** mark each combination supported or unsupported by the acceptance bars: it must beat RTN and fixed Hadamard on held-out attention-output error, with equivalence and orthogonality within bounds. **A combination that misses its bars, 2:0 included, is reported and recorded as unsupported with its measured reason. It does not block publishing the combinations that pass.** `supported_modes` lists only passing combinations.
+- **Every fitted combination is supported. There's no acceptance gate.** `supported_modes` lists every combination with a fitted profile; only structural limits are unsupported (INT2 RoPE; RoPE modes on pure-NoPE models). The quality cutoff for what to recommend is decided later, from the metrics below.
+- **One summary error number per combination, recorded in `qmla-validation-report.json` and the manifest's per-combination entry:** `attn_rel_err`, the mean over layers and held-out tokens of ‖o_q − o_ref‖² / ‖o_ref‖², where o is the post-`o_proj` attention output, o_ref is the 0:0 output of the same view, and o_q is the quantized output with protection on. Report it:
+  - per combination, alongside the same metric for RTN and fixed Hadamard, plus the ratio to RTN;
+  - for the K8 transfer, as the same metric against K8's own 0:0;
+  - per layer, as supporting detail.
+
+  It's scale-free (relative to the reference output), comparable across families and widths, and directly what attention consumes.
 
 ---
 

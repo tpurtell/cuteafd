@@ -222,7 +222,7 @@ These rules come from past runs: Inkling 2, Kimi K3/K3.1, GLM 5.3/Flash, ML4, Mu
   - pilot 4:4, full run all nine combinations including 2:0;
   - K8 transfer on the 32 validation sequences against K8's own 0:0;
   - every result reported;
-  - a missing combination (2:0 included) is unsupported and doesn't block the passing ones.
+  - every fitted combination is supported, with no acceptance gate. Each gets one summary number, `attn_rel_err` (mean relative attention-output error against that view's 0:0), alongside the RTN and Hadamard baselines, so a recommendation cutoff can be set later.
 - **Modes and profiles:** Fit each required bit width independently (`content.c8`, `c4`, `c2` under post-`o_proj` attention-output MSE $\mathcal{L}_C$; `rope.r8`, `r4` under causal positional-QK MSE $\mathcal{L}_P$; never INT2 RoPE). Compare step-0 RTN, fixed Sylvester Hadamard, and SmoothQuant† $\alpha$-search baselines under the active protection policy. Never assume one transform set fits every width.
 - **Pilot first:** Run a short pilot (`--pilot` or explicit `--layers`, `--modes 4:4` / `4:0`, small train/val counts) and check validation loss vs RTN/Hadamard, orthogonality ($\|R_C^\top R_C - I\|_\infty < 10^{-5}$), and quantization-off equivalence ($< 10^{-4}$) before running all layers and modes.
 - **Outputs and MC packaging (single sidecar file, no `mla_calibration.json`):**
