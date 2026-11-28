@@ -102,7 +102,9 @@ def test_installed_mc_view_dispatches_its_core_and_shared_k4_experts(monkeypatch
     monkeypatch.setattr(reader, "load", lambda name, **kw: torch.empty(reader.descriptor(name)["shape"], device="meta"))
     monkeypatch.setattr(reader, "raw", lambda name: torch.empty(reader.descriptor(name)["shape"], device="meta"))
     model = MCModel(reader)
+    assert reader.maps  # The real packed reads above opened these shards.
     layer = model.load_layer(1)
+    assert not reader.maps  # Mocked weights did not open any new maps.
     if view == "original":
         assert calls == {}
         assert "self_attn.kv_b_proj.weight" in layer.weights

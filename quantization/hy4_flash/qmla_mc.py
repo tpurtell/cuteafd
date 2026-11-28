@@ -49,6 +49,9 @@ class MCReader(forward.reference.Checkpoint):
         ).float()
 
     def load_layer(self, index):
+        # Release the previous layer's shard mappings. Any still-live tensor
+        # (e.g. the global embedding) retains its own mapped storage.
+        self.close()
         prefix = f"model.layers.{index}."
         weights = {}
         for name, (shape, _dtype) in forward.reference.tensor_contract(self.config, index).items():
