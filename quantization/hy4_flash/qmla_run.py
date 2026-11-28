@@ -99,6 +99,7 @@ from . import forward as hy4_forward
 from . import prepare_corpus as hy4_corpus
 from . import recipe as hy4_recipe
 from .qmla_capture import Hy4FlashCaptureAdapter
+from .qmla_mc import MCModel, MCReader
 
 DEFAULT_PILOT_LAYERS = (0, 21, 41)
 DEFAULT_FULL_MODES = ("8:8", "4:8", "4:4", "2:4", "8:0", "4:0", "2:0", "0:8", "0:4")
@@ -395,6 +396,9 @@ def calibrate_hy4_flash_from_banks(
         "input_ids_sha256": corpus_provenance["input_ids_sha256"],
         "renderer_template_sha256": renderer_template_sha256,
         "thinking_mode": thinking_mode,
+        "measurement_reference": f"{source['calibrated_view']} 0:0",
+        **{k: corpus_provenance[k] for k in ("forward_view_fingerprint", "forward_revision", "forward_config_sha256")
+           if k in corpus_provenance},
         "measurement_split": "test",
         "combination_measurements": {key: shipped_summary(row) for key, row in combinations.items()},
         "optimizer": "adamw",
@@ -459,6 +463,7 @@ def calibrate_hy4_flash_from_banks(
         "protection_policy": manifest["protection_policy"],
         "protection_scope": manifest["protection_scope"],
         "source": manifest["source"],
+        "measurement_reference": provenance["measurement_reference"],
         "layers_calibrated": ordered_layers,
         "splits": {name: splits[name]["count"] for name in SPLIT_NAMES},
         "measurement_split": "test",
@@ -494,14 +499,12 @@ def calibrate_hy4_flash_from_banks(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True, help="Local HF snapshot directory")
-    parser.add_argument("--teacher-checkpoint", type=Path,
-                        help="Pinned BF16 source for an incremental MC calibration")
     parser.add_argument("--source-repo", default=hy4_recipe.TARGET_REPO, help="Target/source HF repo id")
     parser.add_argument("--source-revision", required=True, help="Pinned 40-char immutable source revision")
     parser.add_argument("--base-repo", default=hy4_recipe.BASE_REPO)
     parser.add_argument("--base-revision", default=hy4_recipe.BASE_REVISION)
     parser.add_argument("--checkpoint-kind", choices=("mc", "plain"), default="mc")
-    parser.add_argument("--view", default="original", help="Core view used for forward capture")
+    parser.add_argument("--view", choices=("original",), default="original", help="Checkpoint view used for fitting")
     parser.add_argument(
         "--corpus-dir",
         type=Path,
@@ -619,16 +622,16 @@ def corpus_split_description(
 def check_reused_captures(
     banks: Mapping[int, CapturedLayerBank],
     resolved: Mapping[str, Any],
-    teacher_identity: Mapping[str, Any],
+    forward_identity: Mapping[str, Any],
     *,
     seed: int,
     expected_splits: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Refuse reused captures whose teacher, panel, seed, split counts or split membership differ."""
+    """Refuse reused captures whose forward source, panel, seed, split counts or split membership differ."""
     first = banks[min(banks)]
     corpus_provenance = dict(first.provenance)
-    if any(corpus_provenance.get(key) != value for key, value in teacher_identity.items()):
-        raise ValueError("capture teacher or checkpoint identity differs from the requested run")
+    if any(corpus_provenance.get(key) != value for key, value in forward_identity.items()):
+        raise ValueError("capture forward or checkpoint identity differs from the requested run")
     if (corpus_provenance["dataset_revision"] != resolved["panel_revision"]
             or set(corpus_provenance["components"]) != set(resolved["components"])):
         raise ValueError("capture panel revision or components differ from the requested run")
@@ -800,12 +803,15 @@ def run_hy4_flash_long_eval(
         )
         del layer
 
-    return evaluator.finalize(
+    result = evaluator.finalize(
         corpus_meta=corpus_meta,
         transform_fingerprint=manifest["transform_fingerprint"],
         wall_seconds=time.monotonic() - started,
         device=dev,
     )
+    view = getattr(model.reader, "variant", {"name": "original"})
+    result["reference"] = f"{view['name']} 0:0"
+    return result
 
 
 def attach_long_context_eval(
@@ -857,23 +863,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     config_bytes = (checkpoint / "config.json").read_bytes()
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
 
-    teacher = args.teacher_checkpoint or checkpoint
+    forward_identity = {
+        "target_revision": args.source_revision,
+        "forward_revision": args.source_revision,
+        "forward_config_sha256": config_sha256,
+        "measurement_reference": f"{args.view} 0:0",
+    }
     if args.checkpoint_kind == "mc":
-        if args.teacher_checkpoint is None:
-            from huggingface_hub import snapshot_download
-            teacher = Path(snapshot_download(args.base_repo, revision=args.base_revision, local_files_only=True))
-        manifest = json.loads((checkpoint / "cuteafd-mc.json").read_text())
-        if (checkpoint.name != args.source_revision or teacher.name != args.base_revision
-                or manifest["source"] != {"repo": args.base_repo, "revision": args.base_revision}):
-            raise ValueError("BF16 teacher or MC source differs from the pinned calibration identities")
-    reader = hy4_forward.Reader(teacher, device=args.device)
-    model = hy4_forward.Model(reader)
+        reader = MCReader(checkpoint, args.device, view=args.view)
+        if (checkpoint.name != args.source_revision
+                or reader.source != {"repo": args.base_repo, "revision": args.base_revision}):
+            raise ValueError("MC snapshot or upstream source identity differs from the calibration request")
+        model = MCModel(reader)
+        forward_identity["forward_view_fingerprint"] = reader.variant["fingerprint"]
+    else:
+        reader = hy4_forward.Reader(checkpoint, device=args.device)
+        model = hy4_forward.Model(reader)
     adapter = Hy4FlashCaptureAdapter(model, include_swa=False)
     eligible = tuple(g.layer_id for g in adapter.mla_geometries(include_swa=False))
 
     # Standalone --long-eval against an existing --sidecar (no refitting).
     if args.sidecar is not None:
         sidecar_manifest, _, _ = load_sidecar_transforms(args.sidecar, strict=True)
+        if (args.checkpoint_kind == "mc" and sidecar_manifest["calibration_provenance"].get("forward_view_fingerprint")
+                != forward_identity["forward_view_fingerprint"]):
+            raise ValueError("sidecar was not fitted on this MC original view")
         expected_source = {
             "repo": args.source_repo,
             "revision": args.source_revision,
@@ -913,11 +927,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("provide --corpus-dir PATH or --reuse-captures DIR")
 
     capture_dir = (args.reuse_captures or (args.output / "captures")).resolve()
-    teacher_identity = {
-        "target_revision": args.source_revision,
-        "teacher_revision": args.base_revision if args.checkpoint_kind == "mc" else args.source_revision,
-        "teacher_config_sha256": hashlib.sha256((teacher / "config.json").read_bytes()).hexdigest(),
-    }
     all_records = None
     if args.corpus_dir is not None:
         all_records, corpus_provenance = load_pinned_qmla_corpus(
@@ -930,14 +939,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.reuse_captures is not None:
         banks = {lid: load_layer_capture(capture_dir, lid) for lid in resolved["layers"]}
         corpus_provenance = check_reused_captures(
-            banks, resolved, teacher_identity, seed=args.seed,
+            banks, resolved, forward_identity, seed=args.seed,
             expected_splits=None if all_records is None else corpus_split_description(
                 all_records, seed=args.seed, **split_counts
             ),
         )
     else:
         assert all_records is not None
-        corpus_provenance.update(teacher_identity)
+        corpus_provenance.update(forward_identity)
         banks = _stream_hy4_flash_captures(
             reader,
             adapter,
