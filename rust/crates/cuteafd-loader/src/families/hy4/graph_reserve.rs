@@ -31,7 +31,9 @@ const CENSUS: &[(Layout, usize, WorkingSet)] = &[
 ];
 
 /// The exact census entry, else the Hy4 × ranks envelope; never 0 with graphs on.
-pub fn reserve_policy(layout: Option<Layout>, gpus: usize, rank: usize) -> Result<Resolved, Error> {
+/// `decode_graphs = false` yields `graph_reserve::disabled(rank)`.
+pub fn reserve_policy(layout: Option<Layout>, gpus: usize, rank: usize, decode_graphs: bool) -> Result<Resolved, Error> {
+    if !decode_graphs { return Ok(graph_reserve::disabled(rank)); }
     graph_reserve::current_census(rank, layout, CENSUS, graph_reserve::GraphFamily::Hy4, gpus)
 }
 
@@ -70,7 +72,7 @@ mod tests {
         cuteafd_core::memory_policy::MemoryPolicy::default().scoped(|| {
             for (gpus, sparks, attention) in [(1, 0, AttentionPlacement::Heads), (2, 6, AttentionPlacement::Heads)] {
                 for rank in 0..gpus {
-                    assert_eq!(reserve_policy(Layout::resolve(gpus, sparks, attention), gpus, rank).unwrap().bytes,
+                    assert_eq!(reserve_policy(Layout::resolve(gpus, sparks, attention), gpus, rank, true).unwrap().bytes,
                         graph_reserve::envelope_bytes(graph_reserve::GraphFamily::Hy4, gpus, rank));
                 }
             }

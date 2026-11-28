@@ -39,6 +39,9 @@ use std::{
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    /// Bounded rank-local decode/verify CUDA graph replay; false runs decode eagerly and charges no reserve.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     #[command(flatten)]
     pub attention: crate::cli::CoreViewArgs,
     #[arg(long)]
@@ -226,6 +229,7 @@ fn publish_provenance(
                 runtime.gpus.len(),
                 gpu,
                 args.dfly2 == Some(true) && args.tp2_dflash,
+                args.decode_graphs,
             )
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -250,7 +254,7 @@ fn publish_provenance(
             "onboard_layers": admitted.onboard,
             "prefill": admitted.solved.decisions.prefill,
             "kv_cache": format!("{:?}", args.kv_format),
-            "decode_graphs": graph_layout.is_some(),
+            "decode_graphs": args.decode_graphs && graph_layout.is_some(),
             "graph_basis": {
                 "basis": "bytes",
                 "layout": format!("{graph_layout:?}"),
@@ -581,6 +585,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 prefix_mark_budget: worker_args.prefix.prefix_cache_mark_mib as u64 * (1 << 20),
                 prefix_slots: None,
                 replies,
+                decode_graphs: worker_args.decode_graphs,
                 expert_usage,
                 resident_weight_limit,
                 vision: worker_args.media.vision,
@@ -806,7 +811,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 gpus,
                 worker_args.peers.len(),
             );
-            engine.configure_graphs(graph_layout)?;
+            engine.configure_graphs(graph_layout, worker_args.decode_graphs)?;
 
             // Register and reconcile every retained target arena, cache, scratch, wave, and head owner.
             let coord_devices = CoordinatorDevices::new(&device_ids)?;

@@ -1160,3 +1160,53 @@ fn k31_qualified_cores_charge_index_records_once_and_unlock_serve() -> Result<()
     assert!(k6_report.wip_launchable());
     Ok(())
 }
+
+#[test]
+fn kimi_decode_graphs_on_matches_default_and_off_matches_zero_reserve_plan() {
+    const CHILD: &str = "CUTEAFD_TEST_KIMI_DECODE_GRAPHS_CHILD";
+    if let Ok(mode) = std::env::var(CHILD) {
+        let dir = snapshot(true);
+        let manifest = installed_inventory(dir.path(), false);
+        let input = testing::BudgetedPlanInput::open(dir.path()).unwrap();
+        let mut options = with_layout(6, None);
+        options.layout.as_mut().unwrap().workspace_manifest = Some(manifest);
+        options.layout.as_mut().unwrap().decode_graphs = mode != "off";
+        let report = input.plan(&options).unwrap();
+        assert!(report.placement_supported, "{:?}", report.hints);
+        let memory = report.memory_layout.unwrap();
+        let reserves: Vec<u64> = memory.devices.iter()
+            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+            .map(|d| d.items.iter().filter(|i| i.group.starts_with("graph reserve")).map(|i| i.bytes).sum())
+            .collect();
+        if mode == "on" {
+            let expected: Vec<u64> = crate::families::kimi_k3::allocation::graph_reserve_policies(
+                crate::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 2, true).unwrap()
+                .into_iter().map(|p| p.bytes).collect();
+            assert_eq!(reserves, expected);
+            assert!(reserves.iter().all(|&b| b > 0));
+        } else {
+            assert_eq!(reserves, vec![0, 0]);
+        }
+        println!("LAYOUT={}", serde_json::to_string(&memory).unwrap());
+        return;
+    }
+    let run = |mode: &str, reserve_env: Option<&str>| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["plan::families::kimi::tests::kimi_decode_graphs_on_matches_default_and_off_matches_zero_reserve_plan", "--exact", "--nocapture"])
+            .env(CHILD, mode)
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP");
+        if let Some(value) = reserve_env { cmd.env("CUTEAFD_GPU_GRAPH_RESERVE", value); }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{mode} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().lines()
+            .find_map(|line| line.strip_prefix("LAYOUT=").map(str::to_owned))
+            .expect("child layout output")
+    };
+    let on_layout = run("on", None);
+    let off_layout = run("off", None);
+    let zero_reserve_layout = run("zero_reserve", Some("0"));
+    assert_ne!(on_layout, off_layout);
+    assert_eq!(off_layout, zero_reserve_layout, "Kimi K3 decode_graphs=off must match GPU_GRAPH_RESERVE=0 plan");
+}

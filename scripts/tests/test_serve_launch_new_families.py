@@ -1457,3 +1457,39 @@ def test_missing_pcm_audio_refuses_planned_startup(tmp_path):
     assert result.returncode == 2, result.stderr
     assert 'this build lacks PCM audio AOT; rebuild with CUTEAFD_WIP_AUDIO_AOT=ON or set AUDIO=off' in result.stderr
     assert 'serve-muse --snapshot' not in result.stderr
+
+
+@pytest.mark.parametrize("family,cmd,model,config,keys,sparks,extra_args,deploy", [
+    ("kimi_k3", "serve-kimi", "wrldsuksgo2mars/Kimi-K3-EXL3-K2", KIMI, KIMI_KEYS, 6, ("--wip", "k3"), {}),
+    ("minimax_m3", "serve-minimax", "MiniMaxAI/MiniMax-M3.1-Flash",
+     {"model_type": "minimax_m3_vl", "text_config": {"num_hidden_layers": 60, "moe_layer_freq": [0] * 3 + [1] * 57}},
+     "SPARK_COUNT=3\nRTX_GPUS=1\nSPECULATOR=off\nVISION=off\nAUDIO=off\n" + _hosts(3), 3, ("--wip", "minimax"), {}),
+    ("hy4", "serve-hy4", "wrldsuksgo2mars/Hy4-EXL3-K4-MC",
+     {"model_type": "hy_v4_vl", "text_config": {"model_type": "hy_v4_vl_text", "num_hidden_layers": 78, "mlp_layer_types": ["dense"] + ["sparse"] * 77}},
+     "SPARK_COUNT=4\nRTX_GPUS=1\nEXPERT_BACKEND=spark\nSPECULATOR=off\nVISION=off\nAUDIO=off\nCORE_VIEW=k8-compact\n" + _hosts(4), 4, ("--wip", "hy4"),
+     {"prefill_unit_rows": 2048, "prefill_waves": 1}),
+    ("hy4_flash", "serve-hy4f", "wrldsuksgo2mars/Hy4-flash-EXL3-K4-MC",
+     {"model_type": "hy_v4_flash", "num_hidden_layers": 42, "mlp_layer_types": ["dense"] + ["sparse"] * 41},
+     "SPARK_COUNT=0\nRTX_GPUS=1\nEXPERT_BACKEND=local\nSPECULATOR=off\nVISION=off\nAUDIO=off\nCORE_VIEW=original\n", 0, ("--wip", "hy4f"),
+     {"prefill_unit_rows": 2048, "prefill_waves": 1}),
+], ids=["kimi_k3", "minimax_m3", "hy4", "hy4_flash"])
+@pytest.mark.parametrize("setting,plan_val,serve_val", [
+    (None, "on", "true"),
+    ("on", "on", "true"),
+    ("off", "off", "false"),
+])
+def test_newly_wired_families_forward_decode_graphs_to_plan_and_serve(
+    tmp_path: Path, family: str, cmd: str, model: str, config: dict, keys: str,
+    sparks: int, extra_args: tuple[str, ...], deploy: dict, setting: str | None, plan_val: str, serve_val: str,
+) -> None:
+    full_keys = keys + (f"DECODE_GRAPHS={setting}\n" if setting is not None else "")
+    gpus = (0, 1) if "RTX_GPUS=2" in keys else (0,)
+    result = _family_launch_result(
+        tmp_path, config, model, full_keys, physical_gpus=gpus, extra_args=extra_args,
+        encoder_plan={**PLANNED, "spark_ranks": sparks}, deployment_overrides=deploy or None,
+    )
+    assert result.returncode == 0, result.stderr
+    plan = _line(result, "cuteafd plan")
+    serve = _line(result, f"{cmd} --snapshot")
+    assert _flag(plan, "--decode-graphs") == plan_val
+    assert _flag(serve, "--decode-graphs") == serve_val

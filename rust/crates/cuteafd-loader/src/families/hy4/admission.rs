@@ -91,6 +91,7 @@ pub struct FactsRequest<'a> {
     pub host_cache_bytes: Option<u64>,
     pub prefix_entries: u64,
     pub replies: cuteafd_core::spark_reply::SparkReplyFormats,
+    pub decode_graphs: bool,
     pub expert_usage: bool,
     pub resident_weight_limit: Option<ResidentWeights>,
     /// Bundled 40-layer ViT placement policy (`VISION`), replicas and host feature cache.
@@ -479,7 +480,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
                     )
                     .bytes,
                 );
-                let gr = super::graph_reserve::reserve_policy(graph_layout, gpus, gpu)
+                let gr = super::graph_reserve::reserve_policy(graph_layout, gpus, gpu, request.decode_graphs)
                     .map_err(|error| {
                         refused(
                             format!("Hy4 graph reserve refused: {error}"),
@@ -500,7 +501,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
             for (gpu, &(total, logical, free)) in samples.iter().enumerate() {
                 budgets.push(hy4::measured_budget(gpu as u8, total, logical, free));
                 code.push(loaded_code[gpu]);
-                let gr = super::graph_reserve::reserve_policy(graph_layout, gpus, gpu)
+                let gr = super::graph_reserve::reserve_policy(graph_layout, gpus, gpu, request.decode_graphs)
                     .map_err(|error| {
                         refused(
                             format!("Hy4 graph reserve refused: {error}"),

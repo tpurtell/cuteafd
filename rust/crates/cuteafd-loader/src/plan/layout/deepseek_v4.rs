@@ -359,6 +359,7 @@ fn v4_inputs(report: &PlanReport, input: &super::super::PlanInput, options: &Lay
             .with_resident_weights(crate::placement::ResidentWeights(options.drafter_bytes)));
     }
     let inputs = v4::V4Inputs { target_pool: options.target_pool_tokens,
+        decode_graphs: options.decode_graphs,
         expert_usage: options.expert_usage,
         resident_weight_limit: Some(crate::placement::ResidentWeights(options.weight_budget_bytes)), spark_reply_format: options.resolved_spark_reply_format(false), serving_context: crate::placement::planner::Context::resolve(shape.context_tokens, (options.context_tokens > 0).then_some(options.context_tokens)), cfg: cfg.clone(),
         weights,

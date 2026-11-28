@@ -8,6 +8,9 @@ use cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT;
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    /// Bounded decode/verify CUDA graph replay; false runs decode eagerly and charges no reserve.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     #[command(flatten)] pub media: crate::shared::vision::still::Options,
     #[command(flatten)]
     pub(crate) attention: crate::cli::CoreViewArgs,
@@ -149,6 +152,7 @@ pub(super) fn startup_options<'a, const RANKS: usize>(args: &'a ServeArgs,
         pool_tokens: args.pool_tokens.filter(|&tokens| tokens > 0),
         // A selection dump reads back inside the step: serve without startup graphs.
         graphs: crate::shared::selection_dump::shared("kimi_k3")?.is_none(),
+        decode_graphs: args.decode_graphs,
         ffn_mode: cuteafd_ffi::KimiFfnMode::default(), hosted_layers: None, draft, verify_rows: 0,
         decode_rows: args.resolved_decode_rows()?, prefix: Some(&args.prefix),
         #[cfg(test)] prove_serve_admission: false,

@@ -2392,16 +2392,21 @@ impl<'a> Hy4Engine<'a> {
         for (r, &policy) in self.ranks.iter_mut().zip(policies) {
             r.graphs.attach(r.device.library, r.device.id, policy)?;
         }
-        let streams: Vec<(i32, *mut std::ffi::c_void)> = self
-            .ranks
-            .iter()
-            .map(|r| (r.device.id, r.stream.raw))
-            .collect();
-        *self.graph_cycles.borrow_mut() = Some(graph_device::EventCycles::new(
-            self.ranks[0].device.library,
-            &streams,
-        )?);
-        self.graphs_enabled.set(true);
+        let enabled = policies.iter().any(|policy| policy.bytes > 0);
+        if enabled {
+            let streams: Vec<(i32, *mut std::ffi::c_void)> = self
+                .ranks
+                .iter()
+                .map(|r| (r.device.id, r.stream.raw))
+                .collect();
+            *self.graph_cycles.borrow_mut() = Some(graph_device::EventCycles::new(
+                self.ranks[0].device.library,
+                &streams,
+            )?);
+        } else {
+            *self.graph_cycles.borrow_mut() = None;
+        }
+        self.graphs_enabled.set(enabled);
         Ok(())
     }
 

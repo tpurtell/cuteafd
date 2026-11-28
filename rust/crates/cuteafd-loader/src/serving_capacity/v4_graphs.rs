@@ -145,14 +145,18 @@ pub fn v4_traced(gpus: usize, sparks: bool) -> Result<bool, String> {
 /// Per-rank graph reserve: the prewarm arena plus its tail, further widened by
 /// the shared capture-headroom policy. A bare `GPU_GRAPH_RESERVE` replaces this
 /// on every coordinator device, and `gpuN=` selectors override individual ranks.
-pub fn v4_reserves(gpus: usize, sparks: bool) -> Result<Vec<u64>, String> {
-    Ok(v4_reserve_policies(gpus, sparks)?.into_iter().map(|reserve| reserve.bytes).collect())
+/// `decode_graphs = false` charges nothing (`graph_reserve::disabled(rank)`).
+pub fn v4_reserves(gpus: usize, sparks: bool, decode_graphs: bool) -> Result<Vec<u64>, String> {
+    Ok(v4_reserve_policies(gpus, sparks, decode_graphs)?.into_iter().map(|reserve| reserve.bytes).collect())
 }
 
 /// The same reserves with where each number came from, for startup logs.
-pub fn v4_reserve_policies(gpus: usize, sparks: bool)
+pub fn v4_reserve_policies(gpus: usize, sparks: bool, decode_graphs: bool)
     -> Result<Vec<crate::placement::graph_reserve::Resolved>, String> {
     let layout = v4_layout(gpus, sparks)?;
+    if !decode_graphs {
+        return Ok((0..layout.ranks()).map(crate::placement::graph_reserve::disabled).collect());
+    }
     let entry = layout_entry(layout);
     let (base, extra) = (entry.reserve_base_bytes, entry.reserve_extra_bytes);
     if base.len() != layout.ranks() || extra.len() != layout.ranks() {
@@ -238,7 +242,7 @@ mod tests {
         assert!(entry.entries.is_empty());
         assert!(v4_prewarm(1, false).unwrap().is_empty());
         assert!(v4_pinned(1, false).unwrap().is_empty());
-        assert!(v4_reserves(3, true).is_err());
+        assert!(v4_reserves(3, true, true).is_err());
         assert!(v4_bootstraps(0, true).is_err());
         assert!(v4_pinned(3, false).is_err());
     }

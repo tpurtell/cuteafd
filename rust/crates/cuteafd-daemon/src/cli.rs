@@ -1537,6 +1537,44 @@ mod tests {
     }
 
     #[test]
+    fn six_newly_wired_families_parse_typed_decode_graphs_flag_default_on() {
+        for (plan_flags, serve_flags, expected) in [
+            (vec![], vec![], true),
+            (vec!["--decode-graphs", "on"], vec!["--decode-graphs", "true"], true),
+            (vec!["--decode-graphs", "off"], vec!["--decode-graphs", "false"], false),
+        ] {
+            let Commands::Plan(plan) = Cli::try_parse_from(
+                ["cuteafd", "plan", "model"].into_iter().chain(plan_flags)).unwrap().command
+                else { panic!("plan"); };
+            assert_eq!(plan.decode_graphs == "on", expected);
+            let Commands::ServeDsv4(v4) = Cli::try_parse_from(
+                ["cuteafd", "serve-dsv4", "--snapshot", "/model", "--native-lib", "/native.so"]
+                    .into_iter().chain(serve_flags.iter().copied())).unwrap().command else { panic!("serve-dsv4"); };
+            let Commands::ServeNative(v41) = Cli::try_parse_from(
+                ["cuteafd", "serve-native", "--snapshot", "/model", "--native-lib", "/native.so"]
+                    .into_iter().chain(serve_flags.iter().copied())).unwrap().command else { panic!("serve-native"); };
+            let Commands::ServeKimi(kimi) = Cli::try_parse_from(
+                ["cuteafd", "serve-kimi", "--snapshot", "/model", "--native-lib", "/native.so"]
+                    .into_iter().chain(serve_flags.iter().copied())).unwrap().command else { panic!("serve-kimi"); };
+            let Commands::ServeMinimax(minimax) = Cli::try_parse_from(
+                ["cuteafd", "serve-minimax", "--snapshot", "/model", "--native-lib", "/native.so"]
+                    .into_iter().chain(serve_flags.iter().copied())).unwrap().command else { panic!("serve-minimax"); };
+            let Commands::ServeHy4(hy4) = Cli::try_parse_from(
+                ["cuteafd", "serve-hy4", "--snapshot", "/model", "--native-lib", "/native.so"]
+                    .into_iter().chain(serve_flags.iter().copied())).unwrap().command else { panic!("serve-hy4"); };
+            let Commands::ServeHy4f(hy4f) = Cli::try_parse_from(
+                ["cuteafd", "serve-hy4f", "--snapshot", "/model", "--native-lib", "/native.so"]
+                    .into_iter().chain(serve_flags.iter().copied())).unwrap().command else { panic!("serve-hy4f"); };
+            assert_eq!(v4.engine.decode_graphs, expected);
+            assert_eq!(v41.decode_graphs, expected);
+            assert_eq!(kimi.decode_graphs, expected);
+            assert_eq!(minimax.decode_graphs, expected);
+            assert_eq!(hy4.decode_graphs, expected);
+            assert_eq!(hy4f.decode_graphs, expected);
+        }
+    }
+
+    #[test]
     fn decode_lane_cli_keeps_family_defaults_and_rejects_invalid_counts() {
         for (value, expected) in [("1", 1), ("2", 2)] {
             let Commands::Plan(args) = Cli::try_parse_from([
@@ -1658,6 +1696,9 @@ pub(crate) struct NativeServeArgs {
     /// Shared MLA quality tier, independent of KV storage.
     #[arg(long, default_value = "bf16")]
     pub attention_precision: cuteafd_core::attention::AttentionPrecision,
+    /// Bounded decode/verify CUDA graph replay; false runs decode eagerly and charges no reserve.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     /// Count executed backbone expert routes by phase (disable with =false).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
         default_missing_value = "true", require_equals = true)]

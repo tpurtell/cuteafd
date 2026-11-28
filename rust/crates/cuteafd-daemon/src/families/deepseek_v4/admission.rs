@@ -278,6 +278,7 @@ pub(crate) fn inputs(args: &EngineArgs, inputs: &Inputs<'_>) -> Result<v4::V4Inp
     } else { (Vec::new(), [0; 2]) };
     let spark_ranks = if args.skip_routed_experts { 0 } else { args.peers.split(',').filter(|p| !p.is_empty()).count() };
     Ok(v4::V4Inputs { target_pool: None,
+        decode_graphs: args.decode_graphs,
         expert_usage: args.expert_usage_enabled()?,
         resident_weight_limit: Some(crate::shared::memory::budget::resident_weight_limit()), spark_reply_format: cuteafd_core::SparkReplyFormat::resolve(cuteafd_core::spark_reply::requested().prefill, false), serving_context: cuteafd_loader::placement::planner::Context::resolve(inputs.max_context as u64, (args.max_context > 0).then_some(args.max_context as u64)), cfg: cache_cfg, weights, cache_stages: inputs.cache_stages,
         gpus: baselines, spark_ranks,

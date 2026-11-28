@@ -186,7 +186,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
                 && gpus == 2 { 48 } else { 96 };
             let mut demands = allocation::baseline_demands_for_ranks_rows(cfg, manifest, rows, shape, context as usize,
                 usize::try_from(slots)?, verify, &model.core, matches!(attention, AttentionPlacement::Heads | AttentionPlacement::Context),
-                ranks, gpus, opts.resolved_spark_reply_format(false), attention_heads, decode_rows)?;
+                ranks, gpus, opts.resolved_spark_reply_format(false), attention_heads, decode_rows, opts.decode_graphs)?;
             let mut lane = allocation::NativeLaneLayout::for_ranks_with_decode_rows(cfg, rows, unit, context as usize,
                 allocation::NativeScratch::from_manifest_for_config_rows(manifest, cfg, gpus, decode_rows)?, gpus, decode_rows)?;
             if cfg.dsa.is_some() {

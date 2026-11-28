@@ -1246,7 +1246,7 @@ fn v41_default_decode_lanes_follows_rtx_count() {
     assert!(render(&min_default).contains("decode     1 lane(s), 128 verify rows"));
     assert_eq!(lane_bytes(&min_default, "lane 1 "), 0);
     assert_eq!(graph_bytes(&min_default, 0),
-        crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 1, 128).unwrap().bytes);
+        crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 1, 128, true).unwrap().bytes);
 
     // Explicit DECODE_LANES=2 override works on 1×RTX and scales reserve & lane owners up.
     let min_two = plan(1, Some(2), 16);
@@ -1254,7 +1254,7 @@ fn v41_default_decode_lanes_follows_rtx_count() {
     assert_eq!(min_two.decode_lanes, 2);
     assert!(lane_bytes(&min_two, "lane 1 ") > 0);
     assert_eq!(graph_bytes(&min_two, 0),
-        crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 2, 64).unwrap().bytes);
+        crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 2, 64, true).unwrap().bytes);
     assert!(graph_bytes(&min_two, 0) < graph_bytes(&min_default, 0));
 
     // 2×RTX defaults to 2 lanes (64 verify rows), charges lane-1 owners, and uses 2-lane graph reserve.
@@ -1266,7 +1266,7 @@ fn v41_default_decode_lanes_follows_rtx_count() {
     assert!(lane_bytes(&max_default, "lane 1 ") > 0);
     for gpu in [0usize, 1] {
         assert_eq!(graph_bytes(&max_default, gpu),
-            crate::placement::families::deepseek_v41::admission::graph_allowance(2, gpu, 2, 64).unwrap().bytes);
+            crate::placement::families::deepseek_v41::admission::graph_allowance(2, gpu, 2, 64, true).unwrap().bytes);
     }
 
     // Explicit DECODE_LANES=1 override works on 2×RTX; C1 always resolves to 1 lane on both layouts.
@@ -1321,7 +1321,7 @@ fn v41_decode_rows_admits_wider_lanes_and_refuses_over_cap() {
                 let graph = report.memory_layout.as_ref().unwrap().devices[rank].items.iter()
                     .find(|item| item.group.starts_with("graph reserve")).unwrap();
                 assert_eq!(graph.bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(
-                    gpus, rank, report.decode_lanes, report.decode_rows).unwrap().bytes);
+                    gpus, rank, report.decode_lanes, report.decode_rows, true).unwrap().bytes);
             }
         }
         assert!(lane0(&r128) > lane0(&r64), "gpus={gpus}: 128 rows must cost more decode-lane bytes");
@@ -5347,7 +5347,7 @@ fn v41_graph_reserve_is_one_card_size_independent_arena() {
         assert!(report.executable(), "{}", render(&report));
         let memory = report.memory_layout.unwrap();
         let graph = memory.devices[0].items.iter().find(|item| item.group.starts_with("graph reserve")).unwrap();
-        assert_eq!(graph.bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, report.decode_lanes, report.decode_rows).unwrap().bytes);
+        assert_eq!(graph.bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, report.decode_lanes, report.decode_rows, true).unwrap().bytes);
     }
 }
 
@@ -5365,7 +5365,7 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     assert_eq!(automatic.devices[0].capacity_bytes, crate::placement::inventory::PRO_TOTAL_BYTES);
     // The graph arena is one configured owner; automatic admission does not
     // grow it.
-    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, auto_lanes, auto_rows).unwrap().bytes);
+    assert_eq!(automatic.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, auto_lanes, auto_rows, true).unwrap().bytes);
     assert_eq!(automatic.devices[0].by_category().get(&Category::Prefix).copied().unwrap_or(0), 0);
     let state = automatic.devices[0].items.iter().find(|i| i.group == "window state, table headers and compressor carry").unwrap().bytes;
     let cache = crate::serving_capacity::deepseek_v41_cache_geometry(&crate::read_json_file::<Value>(&dir.path().join("config.json")).unwrap(), 1).unwrap();
@@ -5377,7 +5377,7 @@ fn v41_auto_layout_honors_occupancy_and_disabled_prefix_arenas() {
     let explicit_rows = explicit_report.decode_rows;
     let explicit = explicit_report.memory_layout.unwrap();
     assert_eq!(explicit.devices[0].capacity_bytes, crate::placement::inventory::PRO_TOTAL_BYTES);
-    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, explicit_lanes, explicit_rows).unwrap().bytes);
+    assert_eq!(explicit.devices[0].items.iter().find(|i| i.group.starts_with("graph reserve")).unwrap().bytes, crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, explicit_lanes, explicit_rows, true).unwrap().bytes);
 }
 
 #[test]
@@ -5630,7 +5630,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     // original E4M3-relative and graph-relative headroom, not a real-card claim.
     let source = 129280 * 5120 * 2;
     let head_delta = Fp8Head::configured().resident(source).0 - Fp8Head::All.resident(source).0;
-    let graph_reserve = crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 1, 64).unwrap().bytes;
+    let graph_reserve = crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, 1, 64, true).unwrap().bytes;
     let layout = layout::LayoutOptions { host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
         rtx_bytes: vec![32 << 30], workspace_manifest: v41_workspace(dir.path()), pool_tokens: Some(0), context_tokens: 1 << 20,
         drafter_bytes: (4 << 30) - head_delta + 1_048_576_000 - graph_reserve, prefill_rows: 0, ..Default::default() };
@@ -5666,7 +5666,7 @@ fn v41_prefill_reserve_is_the_largest_that_fits_never_shrunk_for_kv() {
     assert!(modules >= 34 << 20);
     let blas = bytes("cuBLAS handles:") + bytes("BLAS device initialization");
     assert_eq!(blas, 66 << 20);
-    assert_eq!(bytes("graph reserve"), crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, compact.decode_lanes, 64).unwrap().bytes);
+    assert_eq!(bytes("graph reserve"), crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, compact.decode_lanes, 64, true).unwrap().bytes);
     assert_eq!(bytes("native LoadedCode estimate"), 0);
     let retired = (2u64 << 30) + arch.cublas_bytes - modules - blas;
     eprintln!("V4.1 synthetic 31 GiB: selected modules {modules}, named BLAS {blas}, retired mixed allowance delta {retired} B; one graph reserve");
@@ -7371,4 +7371,122 @@ fn partially_available_mixed_codebook_snapshot_fails_closed_for_kimi_and_muse() 
         "{:?}", muse_report.config_error
     );
     assert!(!muse_report.fits && !muse_report.executable());
+}
+
+#[test]
+fn v4_decode_graphs_on_matches_default_and_off_matches_zero_reserve_plan() {
+    const CHILD: &str = "CUTEAFD_TEST_V4_DECODE_GRAPHS_CHILD";
+    let dir = v4_snapshot();
+    let base_opts = |decode_graphs: bool| PlanOptions {
+        attention_placement: Some(crate::placement::AttentionPlacement::Heads),
+        layout: Some(layout::LayoutOptions {
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
+            host_cache_bytes: Some(0),
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES; 2],
+            onboard: Some(crate::placement::OnboardSetting::Layers(1)),
+            context_tokens: 262_144,
+            pool_tokens: Some(262_144),
+            prefill_rows: 256,
+            decode_graphs,
+            ..Default::default()
+        }),
+        ..sparks(4)
+    };
+    if let Ok(mode) = std::env::var(CHILD) {
+        let on = mode != "off";
+        let report = plan(dir.path(), &base_opts(on)).unwrap();
+        assert!(report.placement_supported, "{}", render(&report));
+        let memory = report.memory_layout.unwrap();
+        let reserves: Vec<u64> = memory.devices.iter()
+            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+            .map(|d| d.items.iter().filter(|i| i.group.starts_with("graph reserve")).map(|i| i.bytes).sum())
+            .collect();
+        if mode == "on" {
+            let expected = crate::serving_capacity::v4_graphs::v4_reserves(2, true, true).unwrap();
+            assert_eq!(reserves, expected);
+            assert!(reserves.iter().all(|&b| b > 0));
+        } else {
+            assert_eq!(reserves, vec![0, 0]);
+        }
+        println!("LAYOUT={}", serde_json::to_string(&memory).unwrap());
+        return;
+    }
+    let run = |mode: &str, reserve_env: Option<&str>| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["plan::tests::v4_decode_graphs_on_matches_default_and_off_matches_zero_reserve_plan", "--exact", "--nocapture"])
+            .env(CHILD, mode)
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP");
+        if let Some(value) = reserve_env { cmd.env("CUTEAFD_GPU_GRAPH_RESERVE", value); }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{mode} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().lines()
+            .find_map(|line| line.strip_prefix("LAYOUT=").map(str::to_owned))
+            .expect("child layout output")
+    };
+    let on_layout = run("on", None);
+    let off_layout = run("off", None);
+    let zero_reserve_layout = run("zero_reserve", Some("0"));
+    assert_ne!(on_layout, off_layout);
+    assert_eq!(off_layout, zero_reserve_layout, "V4 decode_graphs=off must match GPU_GRAPH_RESERVE=0 plan");
+}
+
+#[test]
+fn v41_decode_graphs_on_matches_default_and_off_matches_zero_reserve_plan() {
+    const CHILD: &str = "CUTEAFD_TEST_V41_DECODE_GRAPHS_CHILD";
+    let dir = strict_v41_snapshot(false);
+    let base_opts = |decode_graphs: bool| PlanOptions {
+        layout: Some(layout::LayoutOptions {
+            host_memory: Some(crate::plan::testing::SimulatedHost::raptor().host_ram),
+            rtx_bytes: vec![crate::placement::inventory::PRO_TOTAL_BYTES],
+            prefill_rows: 256,
+            onboard: Some(crate::placement::OnboardSetting::Layers(0)),
+            context_tokens: 262_144,
+            pool_tokens: Some(262_144),
+            workspace_manifest: v41_workspace(dir.path()),
+            decode_graphs,
+            ..Default::default()
+        }),
+        ..sparks(4)
+    };
+    if let Ok(mode) = std::env::var(CHILD) {
+        let on = mode != "off";
+        let report = plan(dir.path(), &base_opts(on)).unwrap();
+        assert!(report.executable(), "{}", render(&report));
+        let lanes = report.decode_lanes;
+        let rows = report.decode_rows;
+        let memory = report.memory_layout.unwrap();
+        let reserve: u64 = memory.devices[0].items.iter()
+            .filter(|i| i.group.starts_with("graph reserve"))
+            .map(|i| i.bytes).sum();
+        if mode == "on" {
+            let expected = crate::placement::families::deepseek_v41::admission::graph_allowance(1, 0, lanes, rows, true).unwrap().bytes;
+            assert_eq!(reserve, expected);
+            assert!(reserve > 0);
+        } else {
+            assert_eq!(reserve, 0);
+        }
+        println!("LAYOUT={}", serde_json::to_string(&memory).unwrap());
+        return;
+    }
+    let run = |mode: &str, reserve_env: Option<&str>| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["plan::tests::v41_decode_graphs_on_matches_default_and_off_matches_zero_reserve_plan", "--exact", "--nocapture"])
+            .env(CHILD, mode)
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP");
+        if let Some(value) = reserve_env { cmd.env("CUTEAFD_GPU_GRAPH_RESERVE", value); }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{mode} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().lines()
+            .find_map(|line| line.strip_prefix("LAYOUT=").map(str::to_owned))
+            .expect("child layout output")
+    };
+    let on_layout = run("on", None);
+    let off_layout = run("off", None);
+    let zero_reserve_layout = run("zero_reserve", Some("0"));
+    assert_ne!(on_layout, off_layout);
+    assert_eq!(off_layout, zero_reserve_layout, "V4.1 decode_graphs=off must match GPU_GRAPH_RESERVE=0 plan");
 }

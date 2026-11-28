@@ -694,7 +694,7 @@ mod tests {
         for ranks in [1, 2] {
             for gpu in 0..ranks {
                 for lanes in [1u8, 2] {
-                    let owner = admission::graph_allowance(ranks, gpu, lanes, 64).unwrap();
+                    let owner = admission::graph_allowance(ranks, gpu, lanes, 64, true).unwrap();
                     assert_eq!(owner.location, Location::coordinator(gpu as u8));
                     assert_eq!(owner.lifetime, Lifetime { first: Phase::Ready, last: Phase::Growth });
                     assert_eq!(owner.source, format!("graph reserve: v41.graphs.{gpu}"));
@@ -702,8 +702,8 @@ mod tests {
                     assert_eq!(owner.bytes, crate::placement::graph_reserve::resolve_working_set(None, None, None, gpu, measured).unwrap().bytes);
                     assert_eq!(owner.basis, Basis::Calibrated);
                 }
-                assert!(admission::graph_allowance(ranks, gpu, 2, 64).unwrap().bytes
-                    > admission::graph_allowance(ranks, gpu, 1, 64).unwrap().bytes);
+                assert!(admission::graph_allowance(ranks, gpu, 2, 64, true).unwrap().bytes
+                    > admission::graph_allowance(ranks, gpu, 1, 64, true).unwrap().bytes);
             }
         }
     }

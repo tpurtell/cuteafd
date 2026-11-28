@@ -549,3 +549,58 @@ fn hy4_compact_core_trellis_side_is_output_on_tp1_and_input_on_tp2() {
         assert_eq!(tp2[1].core[stem].side, TrellisSide::Input, "TP2 rank 1 {stem}");
     }
 }
+
+#[test]
+fn hy4_decode_graphs_on_matches_default_and_off_matches_zero_reserve_plan() {
+    const CHILD: &str = "CUTEAFD_TEST_HY4_DECODE_GRAPHS_CHILD";
+    if let Ok(mode) = std::env::var(CHILD) {
+        let (dir, manifest) = concurrency_matrix_snapshot();
+        let selected = crate::plan::checkpoint::CheckpointView::select(dir.path(), crate::plan::checkpoint::CoreView::Original).unwrap();
+        let input = PlanInput::open_view(&selected).unwrap();
+        let mut host = crate::plan::testing::SimulatedHost::raptor();
+        host.gpu_count = 1;
+        let mut layout = host.layout();
+        layout.workspace_manifest = Some(manifest);
+        layout.decode_graphs = mode != "off";
+        let mut opts = PlanOptions::default();
+        opts.placement = crate::plan::ExpertPlacement::from_spark_ranks(4);
+        opts.vision = crate::plan::MediaMode::Off;
+        opts.layout = Some(layout);
+        let report = input.plan(&opts).unwrap();
+        assert!(report.placement_supported, "{:?}", report.hints);
+        let memory = report.memory_layout.unwrap();
+        let reserve: u64 = memory.devices.iter()
+            .filter(|d| d.kind == cuteafd_core::memory_layout::DeviceKind::Rtx)
+            .flat_map(|d| d.items.iter().filter(|i| i.group.starts_with("graph reserve")).map(|i| i.bytes))
+            .sum();
+        if mode == "on" {
+            let glayout = crate::families::hy4::graph_reserve::Layout::resolve(1, 4, AttentionPlacement::Heads);
+            let expected = crate::families::hy4::graph_reserve::reserve_policy(glayout, 1, 0, true).unwrap().bytes;
+            assert_eq!(reserve, expected);
+            assert!(reserve > 0);
+        } else {
+            assert_eq!(reserve, 0);
+        }
+        println!("LAYOUT={}", serde_json::to_string(&memory).unwrap());
+        return;
+    }
+    let run = |mode: &str, reserve_env: Option<&str>| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["plan::families::hy4::tests::hy4_decode_graphs_on_matches_default_and_off_matches_zero_reserve_plan", "--exact", "--nocapture"])
+            .env(CHILD, mode)
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP");
+        if let Some(value) = reserve_env { cmd.env("CUTEAFD_GPU_GRAPH_RESERVE", value); }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{mode} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().lines()
+            .find_map(|line| line.strip_prefix("LAYOUT=").map(str::to_owned))
+            .expect("child layout output")
+    };
+    let on_layout = run("on", None);
+    let off_layout = run("off", None);
+    let zero_reserve_layout = run("zero_reserve", Some("0"));
+    assert_ne!(on_layout, off_layout);
+    assert_eq!(off_layout, zero_reserve_layout, "Hy4 decode_graphs=off must match GPU_GRAPH_RESERVE=0 plan");
+}

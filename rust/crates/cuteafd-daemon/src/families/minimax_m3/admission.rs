@@ -263,7 +263,7 @@ mod tests {
             context_tokens: 1 << 20, pool_tokens: Some(1 << 20), sequences: 16,
             host: (512 << 30, 480 << 30), host_cache_bytes: Some(0), prefix_entries: 0, drafter:None,
             replies: Default::default(), head: serving::BlasHead::Gemm,
-            expert_usage: false, resident_weight_limit: ResidentWeights(80 << 30) };
+            decode_graphs: true, expert_usage: false, resident_weight_limit: ResidentWeights(80 << 30) };
         let error = serve_admission::admit(request(65), &[], Onboard::Layers(0)).unwrap_err();
         let refused = error.downcast_ref::<cuteafd_loader::families::minimax_m3::admission::Refused>()
             .expect("prefill alignment must fail before measured-device facts or heads admission");

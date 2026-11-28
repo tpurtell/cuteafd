@@ -39,6 +39,9 @@ use std::{
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    /// Bounded rank-local decode/verify CUDA graph replay; false runs decode eagerly and charges no reserve.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     #[command(flatten)]
     pub attention: crate::cli::CoreViewArgs,
     #[arg(long)]
@@ -258,6 +261,7 @@ fn publish_provenance(
             "onboard_layers": admitted.onboard,
             "prefill": admitted.solved.decisions.prefill,
             "kv_cache": format!("{:?}", args.kv_format),
+            "decode_graphs": args.decode_graphs,
             "graph_basis": {
                 "basis": "bytes",
                 "reserve_policy": graph_policies
@@ -611,6 +615,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 host_cache_bytes,
                 prefix_entries: worker_args.prefix.prefix_cache_entries as u64,
                 replies,
+                decode_graphs: worker_args.decode_graphs,
                 expert_usage,
                 resident_weight_limit,
                 vision: worker_args.media.vision,
@@ -640,7 +645,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 gpus, worker_args.peers.len(), attention_placement,
             );
             let graph_policies: Vec<_> = (0..gpus)
-                .map(|rank| graph_reserve::reserve_policy(graph_layout, gpus, rank))
+                .map(|rank| graph_reserve::reserve_policy(graph_layout, gpus, rank, worker_args.decode_graphs))
                 .collect::<std::result::Result<_, _>>()?;
             ensure!(
                 graph_policies.iter().map(|policy| policy.bytes).eq(inputs.graph_reserve.iter().copied()),

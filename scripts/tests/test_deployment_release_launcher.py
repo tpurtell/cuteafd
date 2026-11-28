@@ -24,7 +24,8 @@ BASELINE_CAPTURES = {
 
 
 DECODE_GRAPH_FAMILIES = {"glm5", "glm5_flash", "qwen4", "qwen3_5", "mimo_v2", "step5", "muse_spark",
-                         "inkling2", "inkling2_mini"}
+                         "inkling2", "inkling2_mini", "deepseek_v4", "deepseek_v41", "kimi_k3",
+                         "minimax_m3", "hy4", "hy4_flash"}
 
 def release_entry(entry: dict) -> dict:
     """Apply all smoke overrides while keeping process fixtures portable."""
@@ -288,6 +289,15 @@ def test_deployment_preserves_release_container_commands(
             for flag in ("--kda-output-shard", "--kda-prefill-expanded"):
                 if flag in before["command"]:
                     before["command"].remove(flag)
+        if old["host"] == "coordinator" and entry["family"] in DECODE_GRAPH_FAMILIES:
+            # One typed `--decode-graphs` engine flag (default on) for these families;
+            # historical captures carried it at family-specific positions or not at all.
+            position = after["command"].index("--decode-graphs")
+            assert after["command"][position + 1] == ("false" if decode_graphs == "off" else "true")
+            del after["command"][position:position + 2]
+            if "--decode-graphs" in before["command"]:
+                position = before["command"].index("--decode-graphs")
+                del before["command"][position:position + 2]
         if old["host"] == "coordinator" and "--coordinator-weight-budget-gib" not in before["command"]:
             # Serve admits resident weights against the planner's budget; historical
             # captures predate passing it and fell back to the 80 GiB default.
@@ -334,15 +344,6 @@ def test_deployment_preserves_release_container_commands(
             assert samples and all(sample["bytes"] == 124211863552 and sample["boot_id"] == "fixture"
                                    for sample in samples)
             del after["command"][position:position + 2]
-        if old["host"] == "coordinator" and entry["family"] in DECODE_GRAPH_FAMILIES:
-            # One typed `--decode-graphs` engine flag (default on) for these families;
-            # historical captures carried it at family-specific positions or not at all.
-            position = after["command"].index("--decode-graphs")
-            assert after["command"][position + 1] == ("false" if decode_graphs == "off" else "true")
-            del after["command"][position:position + 2]
-            if "--decode-graphs" in before["command"]:
-                position = before["command"].index("--decode-graphs")
-                del before["command"][position:position + 2]
         assert after == before, (entry["name"], old["host"])
     assert all("--deployment" in plan for plan in current["plans"])
 
@@ -601,3 +602,22 @@ def test_decode_rows_refuse_invalid_or_unsupported_before_serving(card, decode_r
     entry["set"]["DECODE_ROWS"] = decode_rows
     with pytest.raises(RuntimeError, match="DECODE_ROWS|unsupported DECODE_ROWS|supports DECODE_ROWS"):
         capture(ROOT, "decode-rows-refuse-" + card + "-" + decode_rows, release_entry=entry)
+
+
+@pytest.mark.parametrize("card", ["v41-flash-min", "v41-flash-max", "v4-flash-max"])
+@pytest.mark.parametrize("setting,plan_val,serve_val", [
+    (None, "on", "true"),
+    ("on", "on", "true"),
+    ("off", "off", "false"),
+])
+def test_v4_and_v41_decode_graphs_forward_to_plan_and_serve(card, setting, plan_val, serve_val):
+    entry = release_entry(next(e for e in ENTRIES if e["name"] == card))
+    if setting is not None:
+        entry["set"]["DECODE_GRAPHS"] = setting
+    result = capture(ROOT, f"decode-graphs-{card}-{setting or 'default'}", release_entry=entry)
+    assert result["plans"]
+    for plan in result["plans"]:
+        assert plan[plan.index("--decode-graphs") + 1] == plan_val
+    command = parse_run(result["containers"][0]["argv"])["command"]
+    assert command.count("--decode-graphs") == 1
+    assert command[command.index("--decode-graphs") + 1] == serve_val

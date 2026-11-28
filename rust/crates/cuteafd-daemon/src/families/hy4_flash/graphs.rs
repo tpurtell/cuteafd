@@ -12,7 +12,6 @@ use crate::shared::{
     memory::device::Stream,
 };
 use anyhow::Result;
-use cuteafd_loader::serving_capacity::hy4_graphs::{self, Hy4GraphLayout};
 use std::{
     cell::{Cell, RefCell},
     collections::HashSet,
@@ -117,12 +116,8 @@ impl<'a> Hy4Graphs<'a> {
         &mut self,
         library: &'a cuteafd_ffi::NativeLibrary,
         device: i32,
-        rank: usize,
-        ranks: usize,
-        layout: Option<Hy4GraphLayout>,
-        tp2_dfly2: bool,
+        policy: cuteafd_loader::placement::graph_reserve::Resolved,
     ) -> Result<()> {
-        let policy = hy4_graphs::reserve_policy_for(layout, ranks, rank, tp2_dfly2)?;
         self.bank.get_mut().attach_device(
             library,
             device,
@@ -362,5 +357,40 @@ mod tests {
             tp1_spark_layer_sections(true, true, true),
             &[Section::DsaPreScored, Section::DsaSparkPost]
         );
+    }
+
+    #[test]
+    fn decode_graphs_off_resolves_zero_reserve_and_selects_eager_route() {
+        use cuteafd_loader::placement::graph_reserve::disabled;
+        use cuteafd_loader::serving_capacity::hy4_graphs::{reserve_policy_for, Hy4GraphLayout};
+        for (gpus, sparks, tp2_dfly2) in [(1, 0, false), (2, 0, false), (2, 0, true), (1, 1, false), (1, 4, false)] {
+            let layout = Hy4GraphLayout::resolve(gpus, sparks);
+            let policies: Vec<_> = (0..gpus)
+                .map(|rank| reserve_policy_for(layout, gpus, rank, tp2_dfly2, false).unwrap())
+                .collect();
+            assert!(policies.iter().enumerate().all(|(rank, p)| *p == disabled(rank)));
+            assert!(!policies.iter().any(|p| p.bytes > 0), "configure_graphs disables graphs_enabled and EventCycles");
+            for (rank, policy) in policies.iter().enumerate() {
+                let mut bank: GraphBank<Key, ()> = GraphBank::with_family("hy4_flash");
+                let device = -2610 - (gpus as i32) * 20 - (sparks as i32) * 2 - (tp2_dfly2 as i32) - rank as i32;
+                bank.attach_device_for_test(device, policy.bytes, Site {
+                    name: "hy4_flash.section",
+                    cycle: Cycle::Decode,
+                    preference: Preference::Adaptive,
+                    bootstrap: 2 << 20,
+                    basis: Basis::Bytes,
+                    spans_devices: false,
+                }).unwrap();
+                for cycle in [Cycle::Decode, Cycle::Verify] {
+                    bank.cache_cycle(cycle);
+                    for section in [Section::SwaLocal, Section::SwaSpark, Section::SwaAttn,
+                        Section::DsaPre, Section::DsaSparkPost, Section::FfnFrontend, Section::Tail] {
+                        assert!(bank.cache_ticket(&Key::new(0, 1, section), false, None).is_none());
+                    }
+                    bank.cache_tick();
+                    assert!(!bank.cache_needs_boundary());
+                }
+            }
+        }
     }
 }

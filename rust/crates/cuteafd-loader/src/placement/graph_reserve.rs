@@ -47,7 +47,9 @@ pub fn v41_working_set(ranks: usize, rank: usize, lanes: u8, decode_rows: u32) -
 
 /// Resolve V4.1's reserve through the shared `current_working_set` rule for
 /// measured layouts, or the family × ranks envelope for any other rank count.
-pub fn v41_current(ranks: usize, rank: usize, lanes: u8, decode_rows: u32) -> Result<Resolved, Error> {
+/// `decode_graphs = false` yields `disabled(rank)`.
+pub fn v41_current(ranks: usize, rank: usize, lanes: u8, decode_rows: u32, decode_graphs: bool) -> Result<Resolved, Error> {
+    if !decode_graphs { return Ok(disabled(rank)); }
     match v41_working_set(ranks, rank, lanes, decode_rows) {
         Some(measured) => current_working_set(rank, measured),
         None => current_envelope(GraphFamily::V41, ranks, rank),

@@ -412,7 +412,7 @@ mod tests {
         for ranks in [1, 2] {
             for rank in 0..ranks {
                 for lanes in [1u8, 2] {
-                    let owner = cuteafd_loader::placement::families::deepseek_v41::admission::graph_allowance(ranks, rank, lanes, 64).unwrap();
+                    let owner = cuteafd_loader::placement::families::deepseek_v41::admission::graph_allowance(ranks, rank, lanes, 64, true).unwrap();
                     let items = [Item { category: Category::Runtime, group: owner.source.clone(),
                         format: String::new(), bytes: owner.bytes, basis: Basis::Calibrated,
                         lifetime: ItemLifetime::PostReadyReserve }];

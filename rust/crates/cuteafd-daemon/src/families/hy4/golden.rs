@@ -490,7 +490,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
         use cuteafd_loader::families::hy4::graph_reserve;
         let layout = graph_reserve::Layout::resolve(devices.len(), args.peers.len(), attention);
         let policies: Vec<_> = (0..devices.len())
-            .map(|rank| graph_reserve::reserve_policy(layout, devices.len(), rank))
+            .map(|rank| graph_reserve::reserve_policy(layout, devices.len(), rank, true))
             .collect::<std::result::Result<_, _>>()?;
         engine.configure_graphs(&policies)?;
     }

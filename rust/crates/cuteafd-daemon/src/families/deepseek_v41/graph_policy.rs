@@ -113,13 +113,14 @@ fn site_name(name: &'static str) -> &'static str {
 /// Whether this layout keeps any spanning site in its startup prewarm.
 pub(crate) fn spanning_layout(ranks: usize) -> bool { ranks > 1 }
 
-pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize, lanes: u8,
+pub(crate) fn attach(library: &cuteafd_ffi::NativeLibrary, ranks: usize, lanes: u8, decode_graphs: bool,
     mut visit: impl FnMut(&mut crate::shared::decode_graph::device::GraphVisitor<'_>) -> Result<()>) -> Result<()> {
     use crate::shared::decode_graph::device::{Basis, Cycle, Preference, Site};
     tracing::warn!("V4.1 graph cache uses byte estimates: SM120 node rates are not calibrated");
     set_layout(ranks);
     visit(&mut |device, name, spans, bank| {
-        let policy = cuteafd_loader::placement::graph_reserve::v41_current(ranks, device as usize, lanes, max_decode_rows())
+        let policy = cuteafd_loader::placement::graph_reserve::v41_current(
+            ranks, device as usize, lanes, max_decode_rows(), decode_graphs)
             .map_err(anyhow::Error::msg)?;
         bank.attach(library, device, policy.bytes, Site { name: site_name(name), cycle: Cycle::Other,
             preference: Preference::Adaptive, bootstrap: 2 << 20, basis: Basis::Bytes,
@@ -232,6 +233,42 @@ mod tests {
         assert!(large_shape_captured(96, 128, Some(2048)));
         assert!(!large_shape_captured(129, 128, Some(2048)));
         assert!(large_shape_captured(1982, default_decode, None));
+    }
+
+    #[test]
+    fn decode_graphs_off_resolves_zero_reserve_and_runs_sites_eagerly() {
+        use crate::shared::decode_graph::{
+            device::{Basis, Cycle, Preference, Site},
+            GraphBank,
+        };
+        use cuteafd_loader::placement::graph_reserve::{disabled, v41_current};
+        for (ranks, lanes, rows) in [(1usize, 1u8, 64u32), (1, 1, 128), (2, 2, 64), (2, 2, 128)] {
+            for rank in 0..ranks {
+                let policy = v41_current(ranks, rank, lanes, rows, false).unwrap();
+                assert_eq!(policy, disabled(rank));
+                assert_eq!(policy.bytes, 0);
+                let device = -4200 - (ranks as i32) * 100 - (lanes as i32) * 20 - (rows as i32 / 64) * 4 - rank as i32;
+                for name in ["window", "compressor", "target_head", "sparse_attention",
+                    "v41.attention.query", "v41.backbone.shared", "dspark_chain"] {
+                    let mut bank = GraphBank::<u32, ()>::with_family("deepseek_v41");
+                    bank.attach_device_for_test(device, policy.bytes, Site {
+                        name: site_name(name),
+                        cycle: Cycle::Other,
+                        preference: Preference::Adaptive,
+                        bootstrap: 2 << 20,
+                        basis: Basis::Bytes,
+                        spans_devices: spanning::spans(name, false),
+                    }).unwrap();
+                    for cycle in [Cycle::Decode, Cycle::Verify] {
+                        bank.cache_cycle(cycle);
+                        assert!(bank.cache_ticket(&rows, false, None).is_none(), "{name} should run eagerly");
+                        assert!(bank.cached_launch(&rows).is_none());
+                        bank.cache_tick();
+                        assert!(!bank.cache_needs_boundary());
+                    }
+                }
+            }
+        }
     }
 
 }

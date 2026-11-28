@@ -85,6 +85,8 @@ pub(crate) struct Options<'a, const RANKS: usize = 2> {
     pub context: cuteafd_loader::placement::planner::Context,
     pub pool_tokens: Option<u64>,
     pub graphs: bool,
+    /// `--decode-graphs` (default on): off charges no graph reserve and runs decode eagerly.
+    pub decode_graphs: bool,
     pub ffn_mode: cuteafd_ffi::KimiFfnMode,
     pub hosted_layers: Option<Vec<usize>>,
     pub draft: Option<super::draft::Options>,
@@ -303,11 +305,17 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
     } else { super::graphs::owned_inventory(cfg, 1, unit, options.slots, verify_rows) }).transpose()?;
     // One configured arena per physical device: admission owns it, and the
     // startup capture boundary measures inside it.
-    let reserve_demands = if graph_set.is_some() {
-        cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(graph_core, RANKS)?
+    let graph_policies = if graph_set.is_some() {
+        cuteafd_loader::families::kimi_k3::allocation::graph_reserve_policies(graph_core, RANKS, options.decode_graphs)?
     } else { Vec::new() };
+    let reserve_demands: Vec<_> = graph_policies.iter().enumerate().map(|(rank, reserve)| {
+        tracing::info!(rank, reserve = reserve.bytes, source = %reserve.source, "Kimi GPU_GRAPH_RESERVE");
+        Demand::new(rank as u8, cuteafd_core::memory_layout::Category::Runtime,
+            cuteafd_loader::families::kimi_k3::allocation::GRAPH_RESERVE, reserve.bytes,
+            cuteafd_core::memory_layout::Basis::Estimated)
+    }).collect();
     let reserves: [u64; RANKS] = std::array::from_fn(|rank|
-        reserve_demands.get(rank).map_or(0, |demand| demand.bytes));
+        graph_policies.get(rank).map_or(0, |policy| policy.bytes));
     let mut fixed = if RANKS == 2 { exchange_demands(unit, diagnostics)? } else { vec![] };
     if core.native_attention_split(RANKS) {
         for rank in 0..RANKS {
@@ -402,6 +410,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
                     options.attention, options.max_context, options.slots),
                 "devices": inventory.gpus, "spark_world": spark_ranks,
                 "onboard_layers": admitted.placement.onboard_layers,
+                "decode_graphs": options.decode_graphs,
                 "graph_basis": "uncalibrated Kimi byte fallback"
             }
         }));
@@ -505,11 +514,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         // stays eager and unselected replayable geometry can capture lazily.
         let prewarm = super::graphs::prewarm_keys_with_limit(cfg, &set.keys,
             cuteafd_loader::serving_capacity::kimi_prewarm::kimi_layout(graph_core, RANKS), options.slots, unit, decode_rows);
-        let policies = (0..RANKS).map(|rank| {
-            let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(graph_core, RANKS, rank);
-            cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)
-        }).collect::<std::result::Result<Vec<_>, _>>()?;
-        let bases = policies.iter().map(|policy| policy.base_bytes).collect::<Vec<_>>();
+        let bases = graph_policies.iter().map(|policy| policy.base_bytes).collect::<Vec<_>>();
         let bootstraps = (0..RANKS).map(|rank|
             cuteafd_loader::serving_capacity::kimi_prewarm::kimi_bootstrap(RANKS, rank)).collect::<Vec<_>>();
         let prewarm = super::graphs::fit_prewarm(prewarm,
@@ -522,7 +527,7 @@ pub(crate) fn load<'a, const RANKS: usize>(library: &'a Arc<cuteafd_ffi::NativeL
         // and always prewarm (#2303).
         let warmup = {
             let _startup = crate::shared::decode_graph::sites::startup(true);
-            engine.warm_graphs(&prewarm, &reserves)?
+            engine.warm_graphs(&prewarm, &graph_policies)?
         };
         let captured = warmup.captured;
         let capture_elapsed_ms = capture_started.elapsed().as_millis() as u64;
@@ -836,7 +841,7 @@ mod tests {
             unit_rows: Some(4096),
             lane_layouts: vec![[lane]],
             fixed: vec![cuteafd_loader::families::kimi_k3::allocation::code_demand(0, pending, 1)?],
-            startup: cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(KimiCoreFormat::Bf16, 1)?,
+            startup: cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(KimiCoreFormat::Bf16, 1, true)?,
             pool_bounded: vec![],
             rtx: None,
             spark_budget: None,

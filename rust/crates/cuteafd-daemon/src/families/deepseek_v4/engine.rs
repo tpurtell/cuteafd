@@ -2552,6 +2552,47 @@ mod coverage_tests {
         assert_eq!(segments(super::GraphKey { previous: 0, ..tail }, 0, true, false, false), vec![(0, "head")]);
     }
 
+    #[test]
+    fn decode_graphs_off_resolves_zero_reserve_and_selects_eager_segment_route() {
+        use crate::shared::decode_graph::{
+            device::{Basis, Cycle, Preference, Site},
+            GraphBank,
+        };
+        use cuteafd_loader::placement::graph_reserve;
+        use cuteafd_loader::serving_capacity::v4_graphs::{v4_reserve_policies, v4_reserves};
+        for (gpus, sparks) in [(1, false), (1, true), (2, false), (2, true)] {
+            let reserves = v4_reserves(gpus, sparks, false).unwrap();
+            let policies = v4_reserve_policies(gpus, sparks, false).unwrap();
+            assert_eq!(reserves, vec![0; gpus]);
+            assert!(!reserves.iter().any(|&bytes| bytes > 0));
+            for rank in 0..gpus {
+                assert_eq!(policies[rank], graph_reserve::disabled(rank));
+                let mut bank = GraphBank::<super::GraphKey, ()>::with_family("deepseek_v4");
+                let device = -4100 - (gpus as i32) * 10 - (sparks as i32) * 2 - rank as i32;
+                bank.attach_device_for_test(device, reserves[rank], Site {
+                    name: "deepseek_v4.segment",
+                    cycle: Cycle::Decode,
+                    preference: Preference::Adaptive,
+                    bootstrap: 2 << 20,
+                    basis: Basis::Bytes,
+                    spans_devices: gpus > 1,
+                }).unwrap();
+                for cycle in [Cycle::Decode, Cycle::Verify] {
+                    bank.cache_cycle(cycle);
+                    let key = super::GraphKey {
+                        layer: 0, rows: 16, chunked: true, attention: "c4",
+                        table_width: 8, table_stride: 8, previous: 0,
+                        tp2_broadcast: false, exchange_f32: false,
+                    };
+                    assert!(bank.cache_ticket(&key, false, None).is_none());
+                    assert!(bank.cached_launch(&key).is_none());
+                    bank.cache_tick();
+                    assert!(!bank.cache_needs_boundary());
+                }
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]

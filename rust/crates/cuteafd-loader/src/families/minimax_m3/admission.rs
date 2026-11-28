@@ -83,6 +83,7 @@ pub struct FactsRequest<'a> {
     pub drafter: Option<crate::formats::block_dspark::NativeDsparkLayout>,
     pub replies: cuteafd_core::spark_reply::SparkReplyFormats,
     pub head: serving::BlasHead,
+    pub decode_graphs: bool,
     pub expert_usage: bool,
     pub resident_weight_limit: ResidentWeights,
 }
@@ -224,11 +225,14 @@ fn measured_graph_base(gpus: usize, sequences: u64, rank: usize,
 }
 
 /// The measured C16 base plus the shared extra, else the MiniMax × ranks
-/// envelope (other concurrencies, wires and placements), never 0.
-pub(crate) fn graph_policy(gpus: usize, sequences: u64, rank: usize,
-    attention: crate::placement::AttentionPlacement, wire: Option<super::execution::WirePrecision>)
+/// envelope (other concurrencies, wires and placements), never 0 with graphs on.
+/// `decode_graphs = false` yields `graph_reserve::disabled(rank)`.
+pub fn graph_policy(gpus: usize, sequences: u64, rank: usize,
+    attention: crate::placement::AttentionPlacement, wire: Option<super::execution::WirePrecision>,
+    decode_graphs: bool)
     -> Result<crate::placement::graph_reserve::Resolved, crate::placement::graph_reserve::Error> {
     use crate::placement::graph_reserve::{self, GraphFamily};
+    if !decode_graphs { return Ok(graph_reserve::disabled(rank)); }
     match measured_graph_base(gpus, sequences, rank, attention, wire) {
         Some((base, tail)) => graph_reserve::current(rank, false, base, tail),
         None => graph_reserve::current_envelope(GraphFamily::MiniMax, gpus, rank),
@@ -298,7 +302,7 @@ mod graph_tests {
                     (2, AttentionPlacement::Heads, None), (2, AttentionPlacement::Layers, Some(WirePrecision::F32)),
                     (2, AttentionPlacement::Layers, Some(WirePrecision::Bf16))] {
                     for rank in 0..gpus {
-                        let policy = graph_policy(gpus, sequences, rank, attention, wire).unwrap();
+                        let policy = graph_policy(gpus, sequences, rank, attention, wire, true).unwrap();
                         assert!(policy.bytes > 0, "C{sequences} {gpus}x {attention:?} {wire:?}");
                         if sequences != 16 { assert_eq!(policy.bytes, envelope_bytes(GraphFamily::MiniMax, gpus, rank)); }
                     }
@@ -413,7 +417,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<MiniMaxInputs, Refused> {
         // at 5b7dd075a (#1856). Each rank charges its own measured graph owner.
         // Other rank/concurrency shapes borrow neither these bases nor pins; they
         // charge the family × ranks envelope.
-        graph_reserve.push(graph_policy(gpus, request.sequences, gpu, attention, request.split_wire)
+        graph_reserve.push(graph_policy(gpus, request.sequences, gpu, attention, request.split_wire, request.decode_graphs)
             .map_err(|error| refused(format!("MiniMax graph reserve refused: {error}"), "Fix GPU_GRAPH_RESERVE."))?.bytes);
     }
     let measured_context = match &request.coordinator {

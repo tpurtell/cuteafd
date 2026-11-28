@@ -639,6 +639,38 @@ mod tests {
     }
 
     #[test]
+    fn decode_graphs_off_empties_prewarm_and_runs_attention_ffn_context_eagerly() {
+        use crate::shared::decode_graph::device::Miss;
+        use cuteafd_loader::families::kimi_k3::allocation::graph_reserve_policies;
+        use cuteafd_loader::placement::graph_reserve::disabled;
+        use cuteafd_loader::serving_capacity::kimi_prewarm::{kimi_bootstrap, kimi_layout, KimiCoreFormat};
+        for (core, ranks) in [(KimiCoreFormat::K6, 2), (KimiCoreFormat::McK8, 1), (KimiCoreFormat::McK8, 2)] {
+            let policies = graph_reserve_policies(core, ranks, false).unwrap();
+            assert_eq!(policies.len(), ranks);
+            for (rank, policy) in policies.iter().enumerate() {
+                assert_eq!(*policy, disabled(rank));
+            }
+            let bases: Vec<u64> = policies.iter().map(|p| p.base_bytes).collect();
+            let bootstraps: Vec<u64> = (0..ranks).map(|rank| kimi_bootstrap(ranks, rank)).collect();
+            let candidates = vec![
+                Key { lane: 0, rank: 0, rows: 1, op: Op::Ffn(0) },
+                Key { lane: 0, rank: 0, rows: 1, op: Op::Attention { layer: 0, speculative: false } },
+                Key { lane: 0, rank: 0, rows: 1, op: Op::Context { layer: 0, speculative: false } },
+            ];
+            assert!(fit_prewarm(candidates.clone(), kimi_layout(core, ranks), &bases, &bootstraps).is_empty());
+            for rank in 0..ranks {
+                let mut graphs = Graphs::new();
+                let device = -950 - (ranks as i32) * 10 - (core as i32) * 2 - rank as i32;
+                graphs.attach_for_test(device, ranks, rank, policies[rank].bytes, ranks == 2).unwrap();
+                assert!(graphs.attached());
+                for key in &candidates {
+                    assert!(matches!(graphs.bank_mut(key.op).cache_miss(key, true, None), Miss::Eager));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sealed_tp2_local_misses_capture_but_context_banks_and_layouts_stay_eager() {
         use crate::shared::decode_graph::device::{Miss, seal_cross_device_capture_on_this_thread};
         struct Unseal;

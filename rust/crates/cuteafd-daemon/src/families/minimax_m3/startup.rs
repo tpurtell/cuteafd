@@ -36,6 +36,7 @@ pub(crate) struct Options<'a> {
     pub pool_tokens: Option<u64>,
     pub onboard: Onboard,
     pub prefix: &'a PrefixArgs,
+    pub decode_graphs: bool,
     pub expert_usage: bool,
     pub usage_reader: Reader,
     pub resident_weights: ResidentWeights,
@@ -210,7 +211,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
             options.prefill.waves as usize,library.sm_count()? as usize,options.prefix.prefix_cache_entries,
             options.prefix.prefix_cache_mark_mib as u64 * (1 << 20),options.prefix.host_cache_bytes.enabled(), decode_cap as usize)?) } else { None }, replies,
         head: crate::shared::target_head::TargetHead::configured().blas_head(true),
-        expert_usage: usage_enabled, resident_weight_limit: options.resident_weights }, &samples, options.onboard)?;
+        decode_graphs: options.decode_graphs, expert_usage: usage_enabled, resident_weight_limit: options.resident_weights }, &samples, options.onboard)?;
     cuteafd_bench::context::ResolvedSettings::placement(&admitted.placement).publish();
     cuteafd_bench::context::set_resolved("max-context-tokens", &admitted.solved.served_context().to_string());
     publish_deployment(options.device, options.split_device, options.peers);
@@ -309,7 +310,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     }
     let execution = ServingPrefill::new(cfg, dispatchers, bindings, 1)?;
     let prewarm = crate::shared::memory::load_timing::Split::start();
-    owners.prewarm(cfg)?;
+    if inputs.graph_reserve.iter().any(|&bytes| bytes > 0) { owners.prewarm(cfg)?; }
     prewarm.log("MiniMax graph prewarm");
     let quota = inputs.host_prefix.quota_bytes;
     let host_prefix = (quota > 0).then(|| options.prefix.host_config_for(owners.storage.prefix.layout(),
@@ -319,7 +320,7 @@ pub(crate) fn load<'a>(library: &'a Arc<cuteafd_ffi::NativeLibrary>, programs: &
     drop(native);
     crate::shared::memory_report::release_load_staging(library)?;
     publish_provenance(options.native_lib, options.manifest_path, &runtime, &admitted,
-        options.peers.len(), options.sequences)?;
+        options.peers.len(), options.sequences, options.decode_graphs)?;
     Ok(Loaded { media, execution, owners, inputs, admitted,
         admission_free: samples.iter().map(|sample| sample.free).collect(), host_prefix })
 }
@@ -333,7 +334,7 @@ fn publish_deployment(device: i32, peer: Option<i32>, peers: &[SocketAddr]) {
 }
 
 fn publish_provenance(native_lib: &Path, manifest: &Path, runtime: &RuntimeInventory,
-    admitted: &AdmittedMiniMax, spark_world: usize, sequences: u64) -> Result<()> {
+    admitted: &AdmittedMiniMax, spark_world: usize, sequences: u64, decode_graphs: bool) -> Result<()> {
     use sha2::{Digest, Sha256};
     let hash = |path: &Path| -> Result<String> {
         let mut file = std::fs::File::open(path)?;
@@ -351,7 +352,8 @@ fn publish_provenance(native_lib: &Path, manifest: &Path, runtime: &RuntimeInven
                 runtime.gpus.len(), if runtime.gpus.len() == 2 { "split-fp32" } else { "whole" },
                 admitted.solved.served_context(), sequences),
             "devices": runtime.gpus, "spark_world": spark_world,
-            "onboard_layers": admitted.onboard, "graph_basis": "uncalibrated MiniMax byte fallback"
+            "onboard_layers": admitted.onboard, "decode_graphs": decode_graphs,
+            "graph_basis": "uncalibrated MiniMax byte fallback"
         }
     }));
     Ok(())
