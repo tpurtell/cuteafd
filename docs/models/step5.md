@@ -8,8 +8,7 @@ See [memory policy](../options.md#memory-and-pools).
 
 Step-5-Preview serves text from its standard Hugging Face checkpoint headers.
 The v7 MC cards use K8 compact on one RTX PRO 6000 plus three Sparks and
-two RTX plus six Sparks. Original, K6 compact and FP8 compact are compared
-on the same two-RTX layout. Official FP8 and NVFP4 remain supported; NVFP4 experts
+two RTX plus six Sparks. V7 drops the original, K6 compact and FP8 compact comparison (TJ 2026-11-28); its last cards stay pinned in the [comparison matrix](../../scripts/bench/release-smoke-v7-mc-compact.json)'s retired list. Official FP8 and NVFP4 remain supported; NVFP4 experts
 use the checkpoint's calibrated W4A4 math, including decode.
 
 ## EXL3 K4 MC

@@ -1,8 +1,8 @@
 # Kimi K3
 
 The v7 card set keeps K3 Core-K6 on 2 RTX + 6 Sparks. K3.1 MC uses K8
-compact on both its one- and two-RTX cards (6 Sparks each); original, K6
-compact and FP8 compact are compared on the two-RTX layout.
+compact on both its one- and two-RTX cards (6 Sparks each). The
+v7 drops the original, K6 compact and FP8 compact comparison (TJ 2026-11-28); its last cards stay pinned in the [comparison matrix](../../scripts/bench/release-smoke-v7-mc-compact.json)'s retired list.
 
 Automatic KV sizing uses the shared 2M-token target on every card, including
 32 GB / RTX 5090. Placement and expert onboarding are fixed at that target;

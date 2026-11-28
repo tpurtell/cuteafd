@@ -410,7 +410,7 @@
         "SPARK_1_HOST": "REPLACE-ME-spark-1",
         "SPARK_1_LANE_A": "192.0.2.2",
         "EXPERT_BACKEND": "spark",
-        "CORE_VIEW": "original"
+        "CORE_VIEW": "k8-compact"
       }
     },
     {
@@ -432,7 +432,7 @@
         "SPECULATOR": "dflash2",
         "MODEL_ID": "wrldsuksgo2mars/GLM-5.3-Flash-EXL3-K4-MC-MUL1",
         "MODEL_REVISION": "1bca67feffab2747e0e489e571185bc06336ee26",
-        "CORE_VIEW": "original"
+        "CORE_VIEW": "k8-compact"
       }
     },
     {
