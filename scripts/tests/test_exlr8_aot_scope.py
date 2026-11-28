@@ -101,9 +101,11 @@ def test_wip_passes_the_switch_to_both_legs_and_seals_only_when_on():
     assert "wip_exlr8_env=()\n" in wip and 'wip_exlr8_env=(-e CUTEAFD_WIP_EXLR8_AOT=ON -e' in wip
     finalize = (ROOT / 'scripts/build/finalize-wip-slot.sh').read_text()
     assert 'if [[ "${CUTEAFD_WIP_EXLR8_AOT:-OFF}" == ON ]]; then' in finalize
-    assert 'programs-check --native-lib' in finalize and '--exlr8-role' in finalize
+    assert 'scripts/build/programs-check.sh' in finalize
     # The check runs after the bounded source read and before the slot is staged.
-    assert finalize.index('sha256sum -c ARTIFACT_SHA256SUMS') < finalize.index('programs-check') < finalize.index('mkdir -p "$incoming')
+    assert finalize.index('sha256sum -c ARTIFACT_SHA256SUMS') < finalize.index('programs-check.sh') < finalize.index('mkdir -p "$incoming')
+    helper = (ROOT / 'scripts/build/programs-check.sh').read_text()
+    assert 'programs-check --native-lib' in helper and '--exlr8-role' in helper
 
 
 def build_key_lines(env):

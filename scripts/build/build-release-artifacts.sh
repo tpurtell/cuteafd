@@ -464,9 +464,9 @@ fi
 # EXLR8 images: the engine's fail-closed loader validates the built table and
 # its manifest, and the role's EXLR8 programs must all be present.
 if [[ "${CUTEAFD_RELEASE_EXLR8_AOT:-OFF}" == ON ]]; then
-  "$output_dir/cuteafd" programs-check --native-lib "$output_dir/libcuteafd_native.so" \
-    --manifest "$output_dir/PROGRAMS.json" --exlr8-role "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)" \
-    --exlr8-family "${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}"
+  "$source_dir/scripts/build/programs-check.sh" "$output_dir/cuteafd" "$output_dir/libcuteafd_native.so" \
+    "$output_dir/PROGRAMS.json" "$([[ "$role" == coordinator ]] && echo coordinator || echo spark)" \
+    "${CUTEAFD_RELEASE_EXLR8_FAMILIES:-}"
 fi
 test -s "$output_dir/V41_EXPERT_TP_AOT.json"
 test -s "$output_dir/THIRD_PARTY_NOTICES.md"
