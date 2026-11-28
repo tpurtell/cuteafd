@@ -88,6 +88,7 @@ pub struct FactsRequest<'a> {
     pub prefix_mark_budget: u64,
     pub prefix_slots: Option<u64>,
     pub replies: cuteafd_core::spark_reply::SparkReplyFormats,
+    pub decode_graphs: bool,
     pub expert_usage: bool,
     pub resident_weight_limit: Option<ResidentWeights>,
     /// Bundled ViT placement policy (`VISION`), replicas and host feature cache.
@@ -515,6 +516,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
                     gpus,
                     gpu,
                     request.dfly2 && request.tp2_dflash,
+                    request.decode_graphs,
                 )
                     .map_err(|error| {
                         refused(
@@ -541,6 +543,7 @@ pub fn gather(request: &FactsRequest<'_>) -> Result<Hy4Inputs, Refused> {
                     gpus,
                     gpu,
                     request.dfly2 && request.tp2_dflash,
+                    request.decode_graphs,
                 )
                     .map_err(|error| {
                         refused(

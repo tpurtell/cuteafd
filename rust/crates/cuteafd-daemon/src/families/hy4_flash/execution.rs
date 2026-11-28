@@ -2514,15 +2514,26 @@ impl<'a> Hy4Engine<'a> {
     pub(crate) fn configure_graphs(
         &mut self,
         layout: Option<cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout>,
+        decode_graphs: bool,
     ) -> Result<()> {
         let tp2_dfly2 = self.draft.as_ref().is_some_and(|d| d.tp() == 2);
         let ranks = self.ranks.len();
-        for (rank, r) in self.ranks.iter_mut().enumerate() {
-            r.graphs.attach(r.device.library, r.device.id, rank, ranks, layout, tp2_dfly2)?;
+        let policies: Vec<_> = (0..ranks)
+            .map(|rank| cuteafd_loader::serving_capacity::hy4_graphs::reserve_policy_for(
+                layout, ranks, rank, tp2_dfly2, decode_graphs,
+            ))
+            .collect::<std::result::Result<_, _>>()?;
+        for (r, &policy) in self.ranks.iter_mut().zip(&policies) {
+            r.graphs.attach(r.device.library, r.device.id, policy)?;
         }
-        let streams = self.ranks.iter().map(|r| (r.device.id, r.stream.raw)).collect::<Vec<_>>();
-        *self.graph_cycles.borrow_mut() = Some(graph_device::EventCycles::new(self.library(), &streams)?);
-        self.graphs_enabled.set(true);
+        let enabled = policies.iter().any(|policy| policy.bytes > 0);
+        if enabled {
+            let streams = self.ranks.iter().map(|r| (r.device.id, r.stream.raw)).collect::<Vec<_>>();
+            *self.graph_cycles.borrow_mut() = Some(graph_device::EventCycles::new(self.library(), &streams)?);
+        } else {
+            *self.graph_cycles.borrow_mut() = None;
+        }
+        self.graphs_enabled.set(enabled);
         Ok(())
     }
 

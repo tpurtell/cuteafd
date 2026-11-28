@@ -1151,7 +1151,7 @@ fn load_target<'a, const RANKS: usize>(args: &GoldenArgs, library: &'a Arc<cutea
         rows: usize::try_from(prefill.span_rows)?, waves: usize::try_from(prefill.waves)?,
         prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
         context: cuteafd_loader::placement::planner::Context::pinned(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT as u64), slots, marks: 1, max_context: cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT,
-        pool_tokens: Some(1_048_576), graphs, draft: None, ffn_mode: args.ffn_mode(),
+        pool_tokens: Some(1_048_576), graphs, decode_graphs: graphs, draft: None, ffn_mode: args.ffn_mode(),
         hosted_layers: args.hosted(cfg)?, verify_rows: verify, decode_rows, prefix: None,
         #[cfg(test)] prove_serve_admission: false,
     })
@@ -1891,7 +1891,7 @@ mod tests {
             requested_pool: Some(1_048_576), state_slots: slots, prefix_marks: marks, rows, lanes: 1, waves: 2, unit_rows: None,
             lane_layouts: vec![std::array::from_fn(|_| super::super::device::LaneLayout::new(&cfg, rows, (rows).min(4096),
                 1048576, native_scratch).unwrap())], fixed,
-            startup: cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 2)?,
+            startup: cuteafd_loader::families::kimi_k3::allocation::graph_reserve_demands(cuteafd_loader::serving_capacity::kimi_prewarm::KimiCoreFormat::Bf16, 2, true)?,
             pool_bounded: vec![], rtx: Some(rtx), spark_budget: Some(spark.clone()), draft: None, verify_rows: 0, prefix: None })?;
         let onboard = admitted.placement.onboard_layers;
         assert!(onboard >= spark.minimum_rtx_layers()?);

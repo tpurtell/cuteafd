@@ -312,7 +312,8 @@ pub fn prepare(inputs: &V4Inputs) -> Result<PreparedV4<'_>, Refusal> {
     // The graph arena is charged once, before KV sizing; the cache captures
     // lazily inside it and runs eagerly when it is full.
     let sparks = inputs.spark_ranks > 0;
-    let graph_reserves = crate::serving_capacity::v4_graphs::v4_reserves(inputs.gpus.len(), sparks)
+    let graph_reserves = crate::serving_capacity::v4_graphs::v4_reserves(
+        inputs.gpus.len(), sparks, inputs.decode_graphs)
         .map_err(invalid)?;
     let graph_bootstraps = crate::serving_capacity::v4_graphs::v4_bootstraps(inputs.gpus.len(), sparks)
         .map_err(invalid)?;

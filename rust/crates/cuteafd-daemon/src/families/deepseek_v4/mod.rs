@@ -26,6 +26,9 @@ pub(crate) struct EngineArgs {
     /// Shared MLA QK/PV operand precision, independent of KV storage.
     #[arg(long, default_value = "bf16")]
     pub attention_precision: cuteafd_core::attention::AttentionPrecision,
+    /// Bounded decode/verify CUDA graph replay; false runs decode eagerly and charges no reserve.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     /// Count executed backbone expert routes by phase (disable with =false).
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1,
         default_missing_value = "true", require_equals = true)]
@@ -826,7 +829,7 @@ pub(crate) fn with_engine<T>(
         // remote: onboarding captures graphs either way.
         engine.configure_graph_cache(&graphs.reserves, &graphs.bootstraps, !peers.is_empty())?;
         for (rank, policy) in cuteafd_loader::serving_capacity::v4_graphs::v4_reserve_policies(
-                graphs.reserves.len(), !peers.is_empty()).map_err(anyhow::Error::msg)?.iter().enumerate() {
+                graphs.reserves.len(), !peers.is_empty(), args.decode_graphs).map_err(anyhow::Error::msg)?.iter().enumerate() {
             tracing::info!(rank, reserve = policy.bytes, source = policy.source,
                 base = policy.base_bytes, base_source = policy.base_source,
                 extra = policy.extra_bytes, extra_source = policy.extra_source,

@@ -337,4 +337,40 @@ mod tests {
         assert_ne!(full_4k, full_8k);
         assert_ne!(shared, Key { prev_ffn: false, ..shared });
     }
+
+    #[test]
+    fn decode_graphs_off_resolves_zero_reserve_and_selects_eager_route() {
+        use cuteafd_loader::families::hy4::graph_reserve::{reserve_policy, Layout};
+        use cuteafd_loader::placement::{graph_reserve::disabled, AttentionPlacement};
+        for (gpus, sparks, attention) in [(1, 4, AttentionPlacement::Heads), (2, 6, AttentionPlacement::Context)] {
+            let layout = Layout::resolve(gpus, sparks, attention);
+            let policies: Vec<_> = (0..gpus)
+                .map(|rank| reserve_policy(layout, gpus, rank, false).unwrap())
+                .collect();
+            assert!(policies.iter().enumerate().all(|(rank, p)| *p == disabled(rank)));
+            assert!(!policies.iter().any(|p| p.bytes > 0), "configure_graphs disables graphs_enabled and EventCycles");
+            for (rank, policy) in policies.iter().enumerate() {
+                let mut bank: GraphBank<Key, ()> = GraphBank::with_family("hy4");
+                let device = -2560 - (gpus as i32) * 10 - rank as i32;
+                bank.attach_device_for_test(device, policy.bytes, Site {
+                    name: "hy4.section",
+                    cycle: Cycle::Decode,
+                    preference: Preference::Adaptive,
+                    bootstrap: 2 << 20,
+                    basis: Basis::Bytes,
+                    spans_devices: false,
+                }).unwrap();
+                for cycle in [Cycle::Decode, Cycle::Verify] {
+                    bank.cache_cycle(cycle);
+                    for section in [Section::DsaFullPre, Section::DsaSharedPre, Section::DsaSpark,
+                        Section::DsaPartial, Section::DsaLocalPost, Section::DsaAttnOut,
+                        Section::FfnFrontend, Section::SparkRouter, Section::SparkShared, Section::FfnFinish, Section::Tail] {
+                        assert!(bank.cache_ticket(&Key::new(0, 1, section), false, None).is_none());
+                    }
+                    bank.cache_tick();
+                    assert!(!bank.cache_needs_boundary());
+                }
+            }
+        }
+    }
 }

@@ -633,7 +633,7 @@ pub(super) fn resolve_with_owners(
     // or replaces the configured reserve.
     let mut allowances = Vec::new();
     for gpu in 0..memory.len() {
-        allowances.push(admission::graph_allowance(memory.len(), gpu, args.resolved_decode_lanes(), args.resolved_decode_rows())?);
+        allowances.push(admission::graph_allowance(memory.len(), gpu, args.resolved_decode_lanes(), args.resolved_decode_rows(), args.decode_graphs)?);
     }
     let mut retained = owners.iter().map(Owner::from_demand).collect::<Vec<_>>();
     for (gpu, &bytes) in deferred.iter().enumerate().filter(|(_, &bytes)| bytes > 0) {
@@ -787,6 +787,7 @@ pub(super) fn publish_provenance(args: &crate::cli::NativeServeArgs,
                 "spark_world": args.peers.len()},
             "devices": inventory.gpus, "onboard_layers": admitted.solved.decisions.onboard_layers,
             "prefill": admitted.solved.decisions.prefill,
+            "decode_graphs": args.decode_graphs,
             "graph_basis": "layout/rank measured step growth, split by estimate within shared steps"
         }
     }));
@@ -1617,7 +1618,7 @@ mod admission_tests {
     /// shared `current_working_set` rule and `GPU_GRAPH_RESERVE`, so a test
     /// cannot invent a third graph budget.
     fn graph_reserve_bytes(ranks: usize, rank: usize, lanes: u8, decode_rows: u32) -> Result<usize> {
-        Ok(cuteafd_loader::placement::graph_reserve::v41_current(ranks, rank, lanes, decode_rows)
+        Ok(cuteafd_loader::placement::graph_reserve::v41_current(ranks, rank, lanes, decode_rows, true)
             .map_err(anyhow::Error::msg)?.bytes as usize)
     }
 

@@ -8,6 +8,9 @@ use std::{net::SocketAddr, sync::Arc};
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct ServeArgs {
+    /// Bounded decode/verify CUDA graph replay; false runs decode eagerly and charges no reserve.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    pub decode_graphs: bool,
     #[command(flatten)] pub media: crate::shared::vision::still::Options,
     #[command(flatten)] pub(crate) attention: crate::cli::CoreViewArgs,
     #[arg(long)] pub snapshot: std::path::PathBuf,
@@ -151,7 +154,7 @@ pub(crate) async fn run(mut args: ServeArgs) -> Result<()> {
                 sequences: concurrency as u64, context_tokens: worker_args.max_context.unwrap_or(0) as u64,
                 pool_tokens: worker_args.pool_tokens.filter(|&tokens| tokens > 0),
                 onboard: worker_args.rtx_expert_layers.resolve(cfg.moe.iter().filter(|&&moe| moe).count()),
-                prefix: &worker_args.prefix, expert_usage: worker_args.expert_usage,
+                prefix: &worker_args.prefix, decode_graphs: worker_args.decode_graphs, expert_usage: worker_args.expert_usage,
                 usage_reader: worker_args.expert_usage_reader.clone(),
                 resident_weights: crate::shared::memory::budget::resident_weight_limit(),draft:worker_args.dspark })?;
             if loaded.owners.storage.draft_prefix.is_some() {

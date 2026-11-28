@@ -95,7 +95,7 @@ pub(super) fn layout(model: &Model, input: &crate::plan::PlanInput, report: &mut
         manifest: manifest.clone(), attention: Some(attention), split_wire: opts.minimax_split_wire, physical_devices: &physical_devices, coordinator: Coordinator::Planned { cards: cards.clone() }, spark_ranks: ranks,
         spark_bytes, prefill: shape, decode_rows: opts.decode_rows, context_tokens: opts.context_tokens, pool_tokens: opts.pool_tokens, sequences,
         host, host_cache_bytes: opts.host_cache_bytes, prefix_entries: opts.prefix_entries("minimax_m3"), drafter,
-        replies: opts.spark_reply_formats, head: opts.bf16_target_head, expert_usage: opts.expert_usage,
+        replies: opts.spark_reply_formats, head: opts.bf16_target_head, decode_graphs: opts.decode_graphs, expert_usage: opts.expert_usage,
         resident_weight_limit: ResidentWeights(opts.weight_budget_bytes) };
     let mut inputs = match gather(&request) {
         Ok(inputs) => inputs,

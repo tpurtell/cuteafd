@@ -687,7 +687,7 @@ mod tests {
                 decode_rows: args.decode_rows.as_option().unwrap_or(64),
                 sequences: 4, context_tokens: 0, pool_tokens: None,
                 onboard: args.rtx_expert_layers.resolve(cfg.moe.iter().filter(|&&moe| moe).count()),
-                prefix: &args.prefix, expert_usage: args.expert_usage,
+                prefix: &args.prefix, decode_graphs: args.decode_graphs, expert_usage: args.expert_usage,
                 usage_reader: args.expert_usage_reader.clone(),
                 resident_weights: crate::shared::memory::budget::resident_weight_limit(), draft: true,
             })?;

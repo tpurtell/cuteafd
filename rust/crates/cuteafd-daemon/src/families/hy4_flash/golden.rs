@@ -422,7 +422,7 @@ pub(crate) async fn run_golden(args: GoldenArgs) -> Result<()> {
     engine.dump_dir = args.dump_dir.clone();
     if args.decode_graphs {
         let layout = cuteafd_loader::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(devices.len(), args.peers.len());
-        engine.configure_graphs(layout)?;
+        engine.configure_graphs(layout, true)?;
     }
 
     if args.verify_waves {

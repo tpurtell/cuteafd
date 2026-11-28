@@ -663,7 +663,7 @@ mod tests {
                     native_lib: &native, manifest: &manifest, peers: vec![], rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Auto,
                     rows: 256, waves: 1, prefill_rows: Some(256), slots: 2, marks: 2, max_context: 8192,
                     context: cuteafd_loader::placement::planner::Context::pinned(8192), pool_tokens: Some(8192),
-                    graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 0, decode_rows: 64, prefix: None,
+                    graphs: true, decode_graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 0, decode_rows: 64, prefix: None,
                     prove_serve_admission: false,
                 })?;
             let engine = loaded.engine;

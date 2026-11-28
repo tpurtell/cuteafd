@@ -306,7 +306,7 @@ fn with_engine(k31: bool, view: cuteafd_loader::plan::checkpoint::CoreView,
                 native_lib: &native, manifest: &manifest, peers: vec![], rtx_expert_layers: cuteafd_loader::placement::OnboardSetting::Auto,
                 rows: 256, waves: 1, prefill_rows: Some(256), slots: 4, marks: 0, max_context: CONTEXT,
                 context: cuteafd_loader::placement::planner::Context::pinned(CONTEXT as u64), pool_tokens: Some(4 * CONTEXT as u64),
-                graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 8, decode_rows: 64, prefix: None,
+                graphs: true, decode_graphs: true, ffn_mode: Default::default(), hosted_layers: None, draft: None, verify_rows: 8, decode_rows: 64, prefix: None,
                 prove_serve_admission: false,
             })?;
         println!("K31_MULTIROW_LAYOUT view={label} layers=4 routed=skipped ranks=2 attention=Context context={CONTEXT} context_graphs=on optional_kda_ffn_graphs=off");

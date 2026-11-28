@@ -390,4 +390,36 @@ mod tests {
         assert!(!bank.cache_needs_boundary());
         Ok(())
     }
+
+    #[test]
+    fn decode_graphs_off_resolves_zero_reserve_skips_prewarm_and_runs_eagerly() -> Result<()> {
+        use cuteafd_loader::families::minimax_m3::{admission::graph_policy, execution::WirePrecision};
+        use cuteafd_loader::placement::{graph_reserve::disabled, AttentionPlacement};
+        for (gpus, attention, wire) in [
+            (1, AttentionPlacement::Heads, None),
+            (2, AttentionPlacement::Heads, None),
+            (2, AttentionPlacement::Layers, Some(WirePrecision::F32)),
+        ] {
+            let policies: Vec<_> = (0..gpus)
+                .map(|rank| graph_policy(gpus, 16, rank, attention, wire, false))
+                .collect::<std::result::Result<_, _>>()?;
+            assert!(policies.iter().enumerate().all(|(rank, policy)| *policy == disabled(rank)));
+            assert!(!policies.iter().any(|policy| policy.bytes > 0), "startup skips prewarm when reserve is zero");
+            for (rank, policy) in policies.iter().enumerate() {
+                let config = Config { reserve: policy.bytes, bootstrap: 2 << 20, basis: Basis::Bytes, spans_devices: gpus > 1 };
+                let mut bank = GraphBank::<Key, ()>::with_family("minimax_m3");
+                let device = -1960 - (gpus as i32) * 10 - (wire.is_some() as i32) * 4 - rank as i32;
+                bank.attach_device_for_test(device, config.reserve, config.site())?;
+                let keys = bootstrap_keys(rank, 64, &[(0, Op::Attention), (0, Op::Ffn), (0, Op::Router), (0, Op::JoinRouted)])?;
+                for cycle in [Cycle::Decode, Cycle::Verify] {
+                    bank.cache_cycle(cycle);
+                    for key in &keys { assert!(bank.cache_ticket(key, false, None).is_none()); }
+                    bank.cache_tick();
+                }
+                assert_eq!(bank.len(), 0);
+                assert!(!bank.cache_needs_boundary());
+            }
+        }
+        Ok(())
+    }
 }

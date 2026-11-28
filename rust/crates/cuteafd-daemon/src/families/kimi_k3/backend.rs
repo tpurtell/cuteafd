@@ -691,7 +691,7 @@ mod tests {
                 waves: usize::try_from(prefill.waves)?, prefill_rows: Some(usize::try_from(prefill.unit_rows)?),
                 context: cuteafd_loader::placement::planner::Context::resolve(args.max_context.unwrap_or(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT) as u64, args.max_context.map(|n| n as u64)), slots: usize::from(args.max_sequences), marks: 1,
                 max_context: args.max_context.unwrap_or(cuteafd_loader::families::kimi_k3::COMPILED_CONTEXT),
-                pool_tokens: args.pool_tokens, graphs: true, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
+                pool_tokens: args.pool_tokens, graphs: true, decode_graphs: args.decode_graphs, ffn_mode: cuteafd_ffi::KimiFfnMode::default(),
                 hosted_layers: None, draft: Some(super::super::draft::Options {
                     snapshot: args.draft.clone().context("native packing gate requires --draft")?,
                     fp8: args.draft_fp8, tp2_dflash: args.tp2_dflash, cache_format: args.kv_cache, context_window: args.draft_length.draft_context_window, draft_kv_cache: args.draft_kv_cache }), verify_rows: 0, decode_rows: 64, prefix: Some(&args.prefix),

@@ -146,6 +146,7 @@ pub(super) fn layout(
         host_cache_bytes: opts.host_cache_bytes,
         prefix_entries: opts.prefix_entries("hy4"),
         replies: opts.spark_reply_formats,
+        decode_graphs: opts.decode_graphs,
         expert_usage: opts.expert_usage,
         resident_weight_limit: Some(ResidentWeights(opts.weight_budget_bytes)),
         vision: report.vision,

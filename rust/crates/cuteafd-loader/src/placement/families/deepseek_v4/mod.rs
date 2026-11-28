@@ -32,6 +32,7 @@ const fn gib(hundredths: u64) -> u64 { hundredths * (1 << 30) / 100 }
 #[derive(Debug, Clone)]
 pub struct V4Inputs {
     pub target_pool: Option<u64>,
+    pub decode_graphs: bool,
     pub expert_usage: bool,
     pub resident_weight_limit: Option<ResidentWeights>,
     pub spark_reply_format: cuteafd_core::SparkReplyFormat,
@@ -343,7 +344,7 @@ mod default_tests {
             cfg.n_heads = heads;
             cfg.index_topk = topk;
             for gpus in [1, 2] {
-                let mut input = V4Inputs { target_pool: None,
+                let mut input = V4Inputs { target_pool: None, decode_graphs: true,
                     expert_usage: false, resident_weight_limit: None,
                     spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16, serving_context: crate::placement::planner::Context::pinned(262_144),
                     cfg: cfg.clone(), weights: test_weights(gpus),
@@ -414,7 +415,7 @@ mod default_tests {
     }
 
     fn plan_inputs(cfg: &DeepseekV4Config) -> V4Inputs {
-        V4Inputs { target_pool: None,
+        V4Inputs { target_pool: None, decode_graphs: true,
             expert_usage: false, resident_weight_limit: None, spark_reply_format: cuteafd_core::SparkReplyFormat::Bf16,
             serving_context: crate::placement::planner::Context::pinned(262_144), cfg: cfg.clone(),
             weights: test_weights(2),

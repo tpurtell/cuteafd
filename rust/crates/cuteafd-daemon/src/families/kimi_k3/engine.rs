@@ -582,8 +582,11 @@ impl<'a> Engine<'a> {
 
     /// Prewarm the pinned geometry on every lane and measure the startup arena
     /// once. `reserves` is one bounded graph reserve per physical rank.
-    pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key], reserves: &[u64]) -> Result<GraphWarmup> {
-        ensure!(reserves.len() == self.exchange_streams.len(), "Kimi graph reserve per physical rank");
+    pub(crate) fn warm_graphs(&self, keys: &[super::graphs::Key],
+        policies: &[cuteafd_loader::placement::graph_reserve::Resolved]) -> Result<GraphWarmup> {
+        ensure!(policies.len() == self.exchange_streams.len(),
+            "Kimi graph reserve per physical rank");
+        let reserves: Vec<u64> = policies.iter().map(|policy| policy.bytes).collect();
         // No route for this family has calibrated node/executable coefficients,
         // so the whole device selects capture from measured bytes.
         tracing::warn!("Kimi graph cache uses per-site byte estimates: no calibrated node rates for this route");
@@ -612,9 +615,7 @@ impl<'a> Engine<'a> {
         for (rank, stream) in self.exchange_streams.iter().enumerate() {
             controllers.push(crate::shared::decode_graph::device::device_cache(stream.device.library,
                 stream.device.id, reserves[rank], crate::shared::decode_graph::device::Basis::Bytes)?);
-            let (base, tail) = cuteafd_loader::placement::graph_reserve::kimi_default(lanes.local[0][0].graph_core(), reserves.len(), rank);
-            let policy = cuteafd_loader::placement::graph_reserve::current(rank, false, base, tail)?;
-            crate::shared::decode_graph::device::set_reserve_policy(stream.device.id, policy)?;
+            crate::shared::decode_graph::device::set_reserve_policy(stream.device.id, policies[rank])?;
             crate::shared::decode_graph::device::observe_device(stream.device.library, stream.device.id)?;
         }
         let mut captured = 0;

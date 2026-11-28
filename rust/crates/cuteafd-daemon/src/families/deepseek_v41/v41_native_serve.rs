@@ -773,7 +773,7 @@ fn worker(
         if let Some(draft) = &mut draft { draft.visit_graph_banks(f)?; }
         Ok(())
     };
-    super::graph_policy::attach(&lib, 1, lanes, &mut visit)?;
+    super::graph_policy::attach(&lib, 1, lanes, args.decode_graphs, &mut visit)?;
     unsafe { // SAFETY: V4.1 graph owners borrow persistent engine storage only.
         crate::shared::decode_graph::device::observe_completed(&lib, &mut visit) }?;
     drop(visit);

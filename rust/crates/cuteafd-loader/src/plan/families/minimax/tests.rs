@@ -1983,7 +1983,7 @@ fn heads_gather_uses_sliced_targets_mount_sources_and_replicated_host_prefix_pag
         context_tokens: 1 << 20, pool_tokens: Some(1 << 20), sequences: 16,
         host: (512 << 30, 480 << 30), host_cache_bytes: Some(1 << 30), prefix_entries: 64, drafter:None,
         replies: Default::default(), head: crate::placement::planner::serving::BlasHead::Gemm,
-        expert_usage: false, resident_weight_limit: ResidentWeights(80 << 30) };
+        decode_graphs: true, expert_usage: false, resident_weight_limit: ResidentWeights(80 << 30) };
     let heads = gather(&request).unwrap();
     assert!(heads.heads() && heads.owners.is_empty());
     assert_eq!(heads.targets, expected.targets);
@@ -2095,7 +2095,7 @@ fn explicit_and_auto_heads_public_layouts_are_executable() {
             prefill: crate::placement::planner::PrefillShape { rows: 1024, waves: 3 }, decode_rows: 64, context_tokens: 32768,
             pool_tokens: Some(32768), sequences: 16, host: (512 << 30, 480 << 30), host_cache_bytes: Some(0),
             prefix_entries: 64, drafter: None, replies: Default::default(),
-            head: crate::placement::planner::serving::BlasHead::Gemm, expert_usage: false,
+            head: crate::placement::planner::serving::BlasHead::Gemm, decode_graphs: true, expert_usage: false,
             resident_weight_limit: crate::placement::ResidentWeights(80 << 30) }).unwrap();
         let request = crate::placement::families::minimax_m3::request(runtime.context, Some(32768),
             crate::placement::Onboard::Layers(0), runtime.prefill, crate::placement::planner::Operation::Serving,
@@ -2354,4 +2354,66 @@ fn prepared_pool_growth_retains_onboarding_and_policy_after_scope_exit() {
         pinned.pool = crate::placement::planner::Pin::Exact(default.solved.pool_tokens);
         assert_eq!(explicit.admit(pinned).unwrap().solved.pool_tokens, default.solved.pool_tokens);
     }
+}
+
+#[test]
+fn minimax_decode_graphs_on_matches_default_and_off_matches_zero_reserve_plan() {
+    use crate::families::minimax_m3::admission::{gather, Coordinator, FactsRequest};
+    use crate::placement::{AttentionPlacement, CoordinatorCard, ResidentWeights};
+    const CHILD: &str = "CUTEAFD_TEST_MINIMAX_DECODE_GRAPHS_CHILD";
+    if let Ok(mode) = std::env::var(CHILD) {
+        let (dir, expected) = heads_recipe_fixture_with_experts(128);
+        let checkpoint = Checkpoint::open(dir.path()).unwrap();
+        let cfg = MiniMaxM3Config::from_hf(&checkpoint.config).unwrap();
+        let catalog = crate::read_expert_catalog(dir.path()).unwrap();
+        let manifest_path = dir.path().join("PROGRAMS.json");
+        std::fs::write(&manifest_path, expected.manifest.to_string()).unwrap();
+        let request = FactsRequest {
+            target_pool_tokens: None, vision: crate::plan::MediaMode::Off, vision_replicas: 1,
+            media_cache_bytes: None, spark_rank_bytes: Vec::new(), checkpoint: &checkpoint, cfg: &cfg,
+            catalog: &catalog, manifest_path: &manifest_path, manifest: expected.manifest.clone(),
+            coordinator: Coordinator::Planned { cards: vec![CoordinatorCard { physical_bytes: 96 << 30, logical_bytes: 96 << 30 }; 2] },
+            attention: Some(AttentionPlacement::Heads), split_wire: None, physical_devices: &[0, 1],
+            spark_ranks: 6, spark_bytes: 100 << 30, prefill: expected.prefill, decode_rows: 64,
+            context_tokens: 1 << 20, pool_tokens: None, sequences: 16,
+            host: (512 << 30, 480 << 30), host_cache_bytes: Some(1 << 30), prefix_entries: 64,
+            drafter: None, replies: Default::default(), head: crate::placement::planner::serving::BlasHead::Gemm,
+            decode_graphs: mode != "off", expert_usage: false, resident_weight_limit: ResidentWeights(80 << 30),
+        };
+        let inputs = gather(&request).unwrap();
+        if mode == "on" {
+            let expected_reserves: Vec<u64> = (0..2).map(|rank|
+                crate::families::minimax_m3::admission::graph_policy(2, 16, rank, AttentionPlacement::Heads, None, true).unwrap().bytes
+            ).collect();
+            assert_eq!(inputs.graph_reserve, expected_reserves);
+            assert!(inputs.graph_reserve.iter().all(|&b| b > 0));
+        } else {
+            assert_eq!(inputs.graph_reserve, vec![0, 0]);
+        }
+        let admitted = inputs.admit(crate::placement::families::minimax_m3::request(
+            inputs.context, None, crate::placement::Onboard::Auto, inputs.prefill,
+            crate::placement::planner::Operation::Serving, None, Default::default(),
+        )).unwrap();
+        println!("ADMITTED={} {:?}", admitted.solved.pool_tokens, admitted.placement.items);
+        return;
+    }
+    let run = |mode: &str, reserve_env: Option<&str>| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["plan::families::minimax::tests::minimax_decode_graphs_on_matches_default_and_off_matches_zero_reserve_plan", "--exact", "--nocapture"])
+            .env(CHILD, mode)
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA")
+            .env_remove("CUTEAFD_GPU_GRAPH_RESERVE_EXTRA_CAP");
+        if let Some(value) = reserve_env { cmd.env("CUTEAFD_GPU_GRAPH_RESERVE", value); }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{mode} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().lines()
+            .find_map(|line| line.strip_prefix("ADMITTED=").map(str::to_owned))
+            .expect("child admitted output")
+    };
+    let on_admitted = run("on", None);
+    let off_admitted = run("off", None);
+    let zero_reserve_admitted = run("zero_reserve", Some("0"));
+    assert_ne!(on_admitted, off_admitted);
+    assert_eq!(off_admitted, zero_reserve_admitted, "MiniMax decode_graphs=off must match GPU_GRAPH_RESERVE=0 plan");
 }

@@ -60,7 +60,9 @@ fn working_set(layout: Option<Hy4GraphLayout>, rank: usize) -> Option<WorkingSet
 
 /// Use identical inputs for admission, provenance, and runtime. Any layout
 /// without a census charges the Hy4-flash × ranks envelope. Explicit reserves still work.
-pub fn reserve_policy(layout: Option<Hy4GraphLayout>, gpus: usize, rank: usize) -> Result<Resolved, Error> {
+/// `decode_graphs = false` yields `graph_reserve::disabled(rank)`.
+pub fn reserve_policy(layout: Option<Hy4GraphLayout>, gpus: usize, rank: usize, decode_graphs: bool) -> Result<Resolved, Error> {
+    if !decode_graphs { return Ok(graph_reserve::disabled(rank)); }
     graph_reserve::current_census(rank, layout, CENSUS, graph_reserve::GraphFamily::Hy4Flash, gpus)
 }
 
@@ -82,8 +84,9 @@ pub fn reserve_policy_for(
     gpus: usize,
     rank: usize,
     _tp2_dfly2: bool,
+    decode_graphs: bool,
 ) -> Result<Resolved, Error> {
-    reserve_policy(layout, gpus, rank)
+    reserve_policy(layout, gpus, rank, decode_graphs)
 }
 #[cfg(test)]
 mod tests {
@@ -146,12 +149,12 @@ mod tests {
             for gpus in [1, 2] {
                 for sparks in [0, 1, 4, 6] {
                     for rank in 0..gpus {
-                        assert!(reserve_policy(Hy4GraphLayout::resolve(gpus, sparks), gpus, rank).unwrap().bytes > 0);
+                        assert!(reserve_policy(Hy4GraphLayout::resolve(gpus, sparks), gpus, rank, true).unwrap().bytes > 0);
                     }
                 }
             }
-            assert_eq!(reserve_policy(Hy4GraphLayout::resolve(2, 4), 2, 0).unwrap().bytes, 1760 << 20);
-            assert_eq!(reserve_policy(Hy4GraphLayout::resolve(2, 4), 2, 1).unwrap().bytes, 1660 << 20);
+            assert_eq!(reserve_policy(Hy4GraphLayout::resolve(2, 4), 2, 0, true).unwrap().bytes, 1760 << 20);
+            assert_eq!(reserve_policy(Hy4GraphLayout::resolve(2, 4), 2, 1, true).unwrap().bytes, 1660 << 20);
         });
     }
 

@@ -152,18 +152,18 @@ fn measured_maxima() -> Vec<(GraphFamily, usize, Vec<u64>)> {
         push(Qwen4, (0..ranks).map(|rank| working(crate::serving_capacity::qwen_graphs::qwen_working_set(key, rank).unwrap())).collect());
         for sparks in [0, 1, 4] {
             let layout = crate::serving_capacity::hy4_graphs::Hy4GraphLayout::resolve(ranks, sparks);
-            let values = (0..ranks).map(|rank| crate::serving_capacity::hy4_graphs::reserve_policy(layout, ranks, rank).unwrap())
+            let values = (0..ranks).map(|rank| crate::serving_capacity::hy4_graphs::reserve_policy(layout, ranks, rank, true).unwrap())
                 .filter(|policy| policy.source == "working-set reserve").map(|policy| policy.bytes).collect::<Vec<_>>();
             if values.len() == ranks { push(Hy4Flash, values); }
         }
         let attention = if ranks == 1 { AttentionPlacement::Heads } else { AttentionPlacement::Context };
         let layout = crate::families::hy4::graph_reserve::Layout::resolve(ranks, if ranks == 1 { 4 } else { 6 }, attention);
-        push(Hy4, (0..ranks).map(|rank| crate::families::hy4::graph_reserve::reserve_policy(layout, ranks, rank).unwrap().bytes).collect());
+        push(Hy4, (0..ranks).map(|rank| crate::families::hy4::graph_reserve::reserve_policy(layout, ranks, rank, true).unwrap().bytes).collect());
         push(Inkling2, (0..ranks).map(|rank| crate::serving_capacity::inkling2_graphs::policy(rank, ranks, true).unwrap().bytes).collect());
     }
     for (gpus, attention, wire) in [(1, AttentionPlacement::Heads, None), (2, AttentionPlacement::Heads, None),
         (2, AttentionPlacement::Layers, Some(crate::families::minimax_m3::execution::WirePrecision::F32))] {
-        push(MiniMax, (0..gpus).map(|rank| crate::families::minimax_m3::admission::graph_policy(gpus, 16, rank, attention, wire)
+        push(MiniMax, (0..gpus).map(|rank| crate::families::minimax_m3::admission::graph_policy(gpus, 16, rank, attention, wire, true)
             .unwrap().bytes).collect());
     }
     use crate::serving_capacity::inkling2_mini_graphs::{policy, KeySpace};
@@ -211,29 +211,37 @@ fn reachable_resolver_inputs_never_yield_zero_with_graphs_on() {
                 // V4.1: every lane count and row budget.
                 for lanes in [1, 2] {
                     for rows in [1, 64, 96, 128, 192, 256] {
-                        assert!(v41_current(ranks, rank, lanes, rows).unwrap().bytes > 0);
+                        assert!(v41_current(ranks, rank, lanes, rows, true).unwrap().bytes > 0);
                     }
                 }
                 // Hy4: every Spark count and attention placement.
                 for sparks in 0..=8 {
                     for attention in [AttentionPlacement::Heads, AttentionPlacement::Context, AttentionPlacement::Layers] {
                         let layout = crate::families::hy4::graph_reserve::Layout::resolve(ranks, sparks, attention);
-                        assert!(crate::families::hy4::graph_reserve::reserve_policy(layout, ranks, rank).unwrap().bytes > 0);
+                        assert!(crate::families::hy4::graph_reserve::reserve_policy(layout, ranks, rank, true).unwrap().bytes > 0);
                     }
                     let layout = Hy4GraphLayout::resolve(ranks, sparks);
-                    assert!(crate::serving_capacity::hy4_graphs::reserve_policy(layout, ranks, rank).unwrap().bytes > 0,
+                    assert!(crate::serving_capacity::hy4_graphs::reserve_policy(layout, ranks, rank, true).unwrap().bytes > 0,
                         "Hy4-flash {ranks}x + {sparks} Sparks");
                 }
                 assert!(crate::serving_capacity::inkling2_graphs::policy(rank, ranks, true).unwrap().bytes > 0);
                 // V4: every shape, traced or provisional.
                 for sparks in [false, true] {
-                    assert!(crate::serving_capacity::v4_graphs::v4_reserves(ranks, sparks).unwrap()[rank] > 0);
+                    assert!(crate::serving_capacity::v4_graphs::v4_reserves(ranks, sparks, true).unwrap()[rank] > 0);
                 }
                 // Kimi K3: every core view, traced or bootstrap.
                 use crate::serving_capacity::kimi_prewarm::KimiCoreFormat::*;
                 for core in [Bf16, K6, Trellis, McOriginal, McK6, McK8, McFp8] {
-                    let (base, tail) = kimi_default(core, ranks, rank);
-                    assert!(current(rank, false, base, tail).unwrap().bytes > 0, "Kimi {core:?} {ranks}x");
+                    let policies = crate::families::kimi_k3::allocation::graph_reserve_policies(core, ranks, true).unwrap();
+                    assert!(policies[rank].bytes > 0, "Kimi {core:?} {ranks}x");
+                }
+                // MiniMax: 1x Heads, 2x Heads and 2x Layers.
+                assert!(crate::families::minimax_m3::admission::graph_policy(ranks, 16, rank, AttentionPlacement::Heads, None, true).unwrap().bytes > 0);
+                if ranks == 2 {
+                    assert!(crate::families::minimax_m3::admission::graph_policy(
+                        2, 16, rank, AttentionPlacement::Layers,
+                        Some(crate::families::minimax_m3::execution::WirePrecision::F32), true
+                    ).unwrap().bytes > 0);
                 }
                 // MiMo: both checkpoints, with and without Sparks.
                 for config in [crate::plan::testing::mimo_flash_mopd_config(), crate::plan::testing::mimo_pro_config()] {
@@ -267,6 +275,137 @@ fn reachable_resolver_inputs_never_yield_zero_with_graphs_on() {
                 for draft in [false, true] {
                     assert!(policy(0, KeySpace::for_config(sequences, rows, draft), true).unwrap().bytes > 0);
                 }
+            }
+        }
+    });
+}
+
+#[test]
+fn six_newly_wired_families_shipping_cards_match_pre_change_reserves_on_and_zero_off() {
+    use crate::serving_capacity::{hy4_graphs::Hy4GraphLayout, kimi_prewarm::KimiCoreFormat};
+    let matrix: Value = serde_json::from_slice(&std::fs::read(format!("{ROOT}/benchmarks/current-matrix.json")).unwrap()).unwrap();
+    let smoke: Value = serde_json::from_slice(&std::fs::read(format!("{ROOT}/scripts/bench/release-smoke-v7.json")).unwrap()).unwrap();
+    let targets = ["deepseek_v4", "deepseek_v41", "kimi_k3", "minimax_m3", "hy4", "hy4_flash"];
+    let mut matrix_cells = BTreeSet::new();
+    for cell in matrix["cells"].as_array().unwrap() {
+        let family = cell["family"].as_str().unwrap();
+        if !targets.contains(&family) { continue; }
+        for (column, ranks) in [("1rtx", 1usize), ("2rtx", 2)] {
+            if matches!(cell[column]["status"].as_str(), Some("current" | "pending")) {
+                matrix_cells.insert((family.to_string(), ranks));
+            }
+        }
+    }
+    let mut smoke_cards = BTreeSet::new();
+    for entry in smoke["entries"].as_array().unwrap() {
+        let family = entry["family"].as_str().unwrap();
+        if !targets.contains(&family) { continue; }
+        let ranks = entry["gpus"].as_array().unwrap().len();
+        let sparks = entry["sparks"].as_array().unwrap().len();
+        smoke_cards.insert((family.to_string(), ranks, sparks));
+    }
+    for family in targets {
+        assert!(matrix_cells.iter().any(|(f, _)| f == family), "missing {family} in current-matrix.json");
+        assert!(smoke_cards.iter().any(|(f, _, _)| f == family), "missing {family} in release-smoke-v7.json");
+    }
+
+    cuteafd_core::memory_policy::MemoryPolicy::default().scoped(|| {
+        // 1. DeepSeek V4: shipping 2x + 6 Sparks (plus 1x/local coverage).
+        assert!(smoke_cards.contains(&("deepseek_v4".into(), 2, 6)));
+        let v4_list = crate::serving_capacity::v4_graphs::v4_prewarm_list();
+        for (gpus, sparks) in [(2, true), (1, true), (2, false)] {
+            let layout = crate::serving_capacity::v4_graphs::v4_layout(gpus, sparks).unwrap();
+            let entry = &v4_list.layouts[layout.key()];
+            let on = crate::serving_capacity::v4_graphs::v4_reserve_policies(gpus, sparks, true).unwrap();
+            let off = crate::serving_capacity::v4_graphs::v4_reserve_policies(gpus, sparks, false).unwrap();
+            let on_bytes = crate::serving_capacity::v4_graphs::v4_reserves(gpus, sparks, true).unwrap();
+            let off_bytes = crate::serving_capacity::v4_graphs::v4_reserves(gpus, sparks, false).unwrap();
+            for rank in 0..gpus {
+                let expected = resolve(None, rank, false, entry.reserve_base_bytes[rank], entry.reserve_extra_bytes[rank]).unwrap();
+                assert_eq!(on[rank], expected, "V4 {gpus}x sparks={sparks} rank {rank}");
+                assert_eq!(on_bytes[rank], expected.bytes);
+                assert!(on[rank].bytes > 0);
+                assert_eq!(off[rank], disabled(rank));
+                assert_eq!(off_bytes[rank], 0);
+            }
+        }
+
+        // 2. DeepSeek V4.1: shipping 1x + 3 Sparks and 2x + 6 Sparks.
+        assert!(smoke_cards.contains(&("deepseek_v41".into(), 1, 3)));
+        assert!(smoke_cards.contains(&("deepseek_v41".into(), 2, 6)));
+        for (ranks, lanes, rows) in [(1, 1, 64), (1, 1, 128), (2, 1, 64), (2, 2, 64), (2, 2, 128)] {
+            for rank in 0..ranks {
+                let on = v41_current(ranks, rank, lanes, rows, true).unwrap();
+                let expected = resolve_working_set(None, None, None, rank, v41_working_set(ranks, rank, lanes, rows).unwrap()).unwrap();
+                assert_eq!(on, expected, "V4.1 {ranks}x lanes={lanes} rows={rows} rank {rank}");
+                assert!(on.bytes > 0);
+                let off = v41_current(ranks, rank, lanes, rows, false).unwrap();
+                assert_eq!(off, disabled(rank));
+                let owner_on = crate::placement::families::deepseek_v41::admission::graph_allowance(ranks, rank, lanes, rows, true).unwrap();
+                let owner_off = crate::placement::families::deepseek_v41::admission::graph_allowance(ranks, rank, lanes, rows, false).unwrap();
+                assert_eq!(owner_on.bytes, expected.bytes);
+                assert_eq!(owner_off.bytes, 0);
+            }
+        }
+
+        // 3. Kimi K3: shipping K6 2x + 6 Sparks, K3.1 MC 1x + 6 Sparks and 2x + 6 Sparks.
+        assert!(smoke_cards.contains(&("kimi_k3".into(), 1, 6)));
+        assert!(smoke_cards.contains(&("kimi_k3".into(), 2, 6)));
+        for (core, ranks) in [(KimiCoreFormat::K6, 2), (KimiCoreFormat::McK8, 1), (KimiCoreFormat::McK8, 2), (KimiCoreFormat::McOriginal, 2)] {
+            let on = crate::families::kimi_k3::allocation::graph_reserve_policies(core, ranks, true).unwrap();
+            let off = crate::families::kimi_k3::allocation::graph_reserve_policies(core, ranks, false).unwrap();
+            let demands_off = crate::families::kimi_k3::allocation::graph_reserve_demands(core, ranks, false).unwrap();
+            for rank in 0..ranks {
+                let (base, tail) = kimi_default(core, ranks, rank);
+                let expected = resolve(None, rank, false, base, tail).unwrap();
+                assert_eq!(on[rank], expected, "Kimi {core:?} {ranks}x rank {rank}");
+                assert!(on[rank].bytes > 0);
+                assert_eq!(off[rank], disabled(rank));
+                assert_eq!(demands_off[rank].bytes, 0);
+            }
+        }
+
+        // 4. MiniMax M3.1: shipping 1x + 3 Sparks and 2x + 6 Sparks.
+        assert!(smoke_cards.contains(&("minimax_m3".into(), 1, 3)));
+        assert!(smoke_cards.contains(&("minimax_m3".into(), 2, 6)));
+        for (gpus, attention, wire) in [
+            (1, AttentionPlacement::Heads, None),
+            (2, AttentionPlacement::Heads, None),
+            (2, AttentionPlacement::Layers, Some(crate::families::minimax_m3::execution::WirePrecision::F32)),
+        ] {
+            for rank in 0..gpus {
+                let on = crate::families::minimax_m3::admission::graph_policy(gpus, 16, rank, attention, wire, true).unwrap();
+                assert!(on.bytes > 0);
+                assert_eq!(on.bytes, envelope_bytes(GraphFamily::MiniMax, gpus, rank));
+                let off = crate::families::minimax_m3::admission::graph_policy(gpus, 16, rank, attention, wire, false).unwrap();
+                assert_eq!(off, disabled(rank));
+            }
+        }
+
+        // 5. Hy4: shipping 1x + 4 Sparks and 2x + 6 Sparks.
+        assert!(smoke_cards.contains(&("hy4".into(), 1, 4)));
+        assert!(smoke_cards.contains(&("hy4".into(), 2, 6)));
+        for (gpus, sparks, attention) in [(1, 4, AttentionPlacement::Heads), (2, 6, AttentionPlacement::Context)] {
+            let layout = crate::families::hy4::graph_reserve::Layout::resolve(gpus, sparks, attention);
+            for rank in 0..gpus {
+                let on = crate::families::hy4::graph_reserve::reserve_policy(layout, gpus, rank, true).unwrap();
+                assert!(on.bytes > 0);
+                assert_eq!(on.bytes, envelope_bytes(GraphFamily::Hy4, gpus, rank));
+                let off = crate::families::hy4::graph_reserve::reserve_policy(layout, gpus, rank, false).unwrap();
+                assert_eq!(off, disabled(rank));
+            }
+        }
+
+        // 6. Hy4-flash: shipping 1x+0, 2x+0, 1x+1, 1x+4.
+        assert!(smoke_cards.contains(&("hy4_flash".into(), 1, 0)));
+        assert!(smoke_cards.contains(&("hy4_flash".into(), 2, 0)));
+        for (gpus, sparks, tp2_dfly2) in [(1, 0, false), (2, 0, false), (2, 0, true), (1, 1, false), (1, 4, false)] {
+            let layout = Hy4GraphLayout::resolve(gpus, sparks);
+            for rank in 0..gpus {
+                let on = crate::serving_capacity::hy4_graphs::reserve_policy_for(layout, gpus, rank, tp2_dfly2, true).unwrap();
+                assert!(on.bytes > 0, "Hy4-flash {gpus}x+{sparks} tp2_dfly2={tp2_dfly2} rank {rank}");
+                let off = crate::serving_capacity::hy4_graphs::reserve_policy_for(layout, gpus, rank, tp2_dfly2, false).unwrap();
+                assert_eq!(off, disabled(rank));
             }
         }
     });

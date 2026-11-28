@@ -588,17 +588,29 @@ pub fn graph_demand(set: &GraphSet, rank: usize) -> Demand {
     demand
 }
 
+/// Resolved per-rank graph reserve policy for Kimi K3. Both admission and
+/// runtime startup call this single resolver; `decode_graphs = false` yields
+/// `graph_reserve::disabled(rank)`.
+pub fn graph_reserve_policies(core: crate::serving_capacity::kimi_prewarm::KimiCoreFormat, ranks: usize, decode_graphs: bool)
+    -> Result<Vec<crate::placement::graph_reserve::Resolved>, crate::placement::graph_reserve::Error> {
+    (0..ranks).map(|rank| {
+        if !decode_graphs {
+            return Ok(crate::placement::graph_reserve::disabled(rank));
+        }
+        let (base, extra) = crate::placement::graph_reserve::kimi_default(core, ranks, rank);
+        crate::placement::graph_reserve::current(rank, false, base, extra)
+    }).collect()
+}
+
 /// The configured graph arena, one Demand per physical rank. Admission owns
 /// the whole reserve before KV sizing; the bounded device cache grows into it
 /// lazily and evicts, rather than re-planning memory, when it is full.
-pub fn graph_reserve_demands(core: crate::serving_capacity::kimi_prewarm::KimiCoreFormat, ranks: usize) -> anyhow::Result<Vec<Demand>> {
-    (0..ranks).map(|rank| {
-        let (base, extra) = crate::placement::graph_reserve::kimi_default(core, ranks, rank);
-        let reserve = crate::placement::graph_reserve::current(rank, false, base, extra)?;
+pub fn graph_reserve_demands(core: crate::serving_capacity::kimi_prewarm::KimiCoreFormat, ranks: usize, decode_graphs: bool) -> anyhow::Result<Vec<Demand>> {
+    Ok(graph_reserve_policies(core, ranks, decode_graphs)?.into_iter().enumerate().map(|(rank, reserve)| {
         tracing::info!(rank, reserve = reserve.bytes, source = %reserve.source,
             "Kimi GPU_GRAPH_RESERVE");
-        Ok(Demand::new(rank as u8, Category::Runtime, GRAPH_RESERVE, reserve.bytes, Basis::Estimated))
-    }).collect()
+        Demand::new(rank as u8, Category::Runtime, GRAPH_RESERVE, reserve.bytes, Basis::Estimated)
+    }).collect())
 }
 
 pub fn kda_demands(cfg: &KimiK3Config, slots: usize, marks: usize, lanes: usize,
@@ -764,14 +776,15 @@ pub fn baseline_demands_for_ranks(cfg: &KimiK3Config, manifest: &serde_json::Val
     core: &super::core::CoreInventory, heads: bool, spark_ranks: usize, physical_ranks: usize,
     format: cuteafd_core::SparkReplyFormat, attention_heads: usize) -> Result<Vec<Demand>> {
     baseline_demands_for_ranks_rows(cfg, manifest, rows, shape, context, slots, verify, core, heads,
-        spark_ranks, physical_ranks, format, attention_heads, 64)
+        spark_ranks, physical_ranks, format, attention_heads, 64, true)
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn baseline_demands_for_ranks_rows(cfg: &KimiK3Config, manifest: &serde_json::Value,
     rows: usize, shape: crate::serving_capacity::PrefillShape, context: usize, slots: usize, verify: usize,
     core: &super::core::CoreInventory, heads: bool, spark_ranks: usize, physical_ranks: usize,
-    format: cuteafd_core::SparkReplyFormat, attention_heads: usize, decode_rows: usize) -> Result<Vec<Demand>> {
+    format: cuteafd_core::SparkReplyFormat, attention_heads: usize, decode_rows: usize,
+    decode_graphs: bool) -> Result<Vec<Demand>> {
     ensure!(matches!(physical_ranks, 1 | 2), "Kimi baseline physical owner count");
     let shape = shape.validate()?;
     let unit = usize::try_from(shape.unit_rows)?;
@@ -791,7 +804,7 @@ pub fn baseline_demands_for_ranks_rows(cfg: &KimiK3Config, manifest: &serde_json
         |rank, layer| physical_ranks == 1 || cfg.attention[layer] == KimiAttention::Kda
             || heads || rank == usize::from(owners[layer]))?;
     let mut demands = vec![spark_demand_on(shape, 0, spark_ranks, (physical_ranks - 1) as u8, format)?];
-    demands.extend(graph_reserve_demands(crate::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(core), physical_ranks)?);
+    demands.extend(graph_reserve_demands(crate::serving_capacity::kimi_prewarm::KimiCoreFormat::from_inventory(core), physical_ranks, decode_graphs)?);
     for rank in 0..physical_ranks {
         demands.push(Demand::new(rank as u8, Category::Workspace, "Kimi lane 0 native operands",
             layout.bytes()? as u64, Basis::Exact));
