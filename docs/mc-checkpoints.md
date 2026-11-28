@@ -121,6 +121,14 @@ Decode multiplies in F32 and casts to BF16. The exporter compares every row
 bitwise with the pinned stock BF16 lookup expression, including signed zero.
 All standard indexes use the original BF16 tables.
 
+Calibration corpus provenance is not duplicated in `cuteafd-mc.json` (which stays
+strictly discovery/view metadata); it lives in each view's `quantize_config*.json`
+under `provenance` (`dataset`: `{repo_id, revision, sha256sums_sha256}`,
+`components`: per-component `{count, tokens, input_ids_sha256, token_stream_sha256}`
+over `agentic`, `exl3_standard`, and `long_context`, plus `corpus_manifest_sha256`)
+and in the model card's recipe table. Single source of truth for the panel pin is
+`quantization/panel_corpus.py`.
+
 Unknown schema versions or variant names, duplicate variants/tensor names,
 invalid hashes, unsafe filenames and incomplete views still fail closed. Core bits
 are exactly 16, 8 and 6 respectively. FP8-origin declarations fail before any
