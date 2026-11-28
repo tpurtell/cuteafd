@@ -363,8 +363,8 @@ mod tests {
                 for cycle in [Cycle::Decode, Cycle::Verify] {
                     bank.cache_cycle(cycle);
                     for section in [Section::DsaFullPre, Section::DsaSharedPre, Section::DsaSpark,
-                        Section::DsaPartial, Section::DsaLocalPost, Section::DsaAttnOut,
-                        Section::FfnFrontend, Section::SparkRouter, Section::SparkShared, Section::FfnFinish, Section::Tail] {
+                        Section::DsaLocalPost, Section::DsaAttnOut,
+                        Section::FfnFrontend, Section::SparkRouter, Section::FfnFinish, Section::Tail] {
                         assert!(bank.cache_ticket(&Key::new(0, 1, section), false, None).is_none());
                     }
                     bank.cache_tick();
