@@ -33,7 +33,20 @@ import _export_cache as cache  # noqa: E402
 BOOTSTRAP = ROOT / "python/tools/lib/export_cache_site"
 
 
-def normalized(argument: str, roots: cache.Roots) -> str:
+def normalized(argument: str, roots: cache.Roots, *, previous: str = "") -> str:
+    # A kache compiler shim lives in a per-build directory outside roots.build;
+    # resolve it (and plain --cxx symlinks) to the real compiler executable so
+    # release, WIP and plain builds share one invocation key.
+    if argument.startswith("--cxx="):
+        value = argument[len("--cxx="):]
+        target = cache.resolve_compiler_shim(value) or (os.path.realpath(value) if os.path.exists(value) else value)
+        argument = "--cxx=" + target
+    else:
+        target = cache.resolve_compiler_shim(argument)
+        if target is not None:
+            argument = target
+        elif previous == "--cxx" and os.path.exists(argument):
+            argument = os.path.realpath(argument)
     for path, label in ((roots.build, "<build>"), (roots.sparkinfer, "<sparkinfer>"), (roots.source, "<source>")):
         if path is not None:
             argument = argument.replace(str(path), label)
@@ -118,7 +131,8 @@ def run(args) -> int:
     roots = cache.Roots(ROOT, Path(args.build_dir))
     identity = {"schema": cache.SCHEMA, "layer": "invocation", "toolchain": toolchain,
                 "outputs": [normalized(path, roots) for path in args.output],
-                "argv": [normalized(argument, roots) for argument in command]}
+                "argv": [normalized(argument, roots, previous=command[index - 1] if index else "")
+                         for index, argument in enumerate(command)]}
     identity_key = cache.stable(identity)
     label = Path(next((part for part in command if part.endswith(".py")), command[0])).name
     started = time.monotonic()

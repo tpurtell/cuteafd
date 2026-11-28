@@ -1514,7 +1514,7 @@ def test_routed_core_policy_is_the_packages_source_policy(tmp_path, monkeypatch,
     assert package.core_variants(role, weights, build_kind) == expected
     assert compare_sm.routed_core_variants(package, role, weights) == expected
     source = Path(package.__file__).read_text()
-    assert 'for core in core_variants(args.role, g.weights, os.environ.get("CUTEAFD_BUILD_KIND", "development"))' in source
+    assert 'for core in core_variants(args.role, g.weights,' in source
     # A source comparison must follow a changed policy, not a cached candidate list.
     path = tmp_path / "package.py"
     path.write_text("def core_variants(role):\n    return (True,) if role == 'spark' else (False, True)\n")

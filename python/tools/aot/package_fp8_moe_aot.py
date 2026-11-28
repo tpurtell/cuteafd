@@ -662,6 +662,8 @@ def build(args: argparse.Namespace) -> None:
         compiled_widths = {}
         for layout in layouts:
             tp, g = layout_geometry(base, layout)
+            # Only Spark non-NVFP4 packages add release compressed-reply core variants;
+            # skip reading CUTEAFD_BUILD_KIND otherwise so WIP and release share one entry.
             # TP is inspection metadata; kernels, routes and scratch use slice.
             # Preserve a distinct bridge (and its TP info word) per destination.
             compile_key = (g.slice, g.kind, wire, *(("nvfp4",) if nvfp4_input else ()), tuple(capacities), g.hidden, g.experts, g.top_k,
@@ -669,7 +671,9 @@ def build(args: argparse.Namespace) -> None:
                            *activation_params(g.activation, g.weights, getattr(g, "swiglu_alpha", None),
                                               getattr(g, "swiglu_beta", None), g.swiglu_limit), ABI_VERSION,
                            _pinned_sparkinfer.REVISION, props.major, props.minor, props.multi_processor_count,
-                           os.environ.get("CUTEAFD_BUILD_KIND", "development"))
+                           list(core_variants(args.role, g.weights,
+                                              os.environ.get("CUTEAFD_BUILD_KIND", "development")
+                                              if args.role == "spark" and g.weights != "nvfp4" else "development")))
             identity = hashlib.sha256(json.dumps(compile_key).encode()).hexdigest()[:20]
             reused = compiled_widths.get(compile_key)
             raw = args.build_dir / args.geometry / f"width{g.slice}-{identity}"
@@ -685,7 +689,9 @@ def build(args: argparse.Namespace) -> None:
             if args.role == "spark":
                 exports += [(SEGMENT_MAX_ROWS, form, True) for form in segmented_forms(g, wire, nvfp4_a4_fused())]
             exports = [(c, f, s, core) for c, f, s in exports
-                       for core in core_variants(args.role, g.weights, os.environ.get("CUTEAFD_BUILD_KIND", "development"))]
+                       for core in core_variants(args.role, g.weights,
+                                                 os.environ.get("CUTEAFD_BUILD_KIND", "development")
+                                                 if args.role == "spark" and g.weights != "nvfp4" else "development")]
             for capacity, form, segmented, core_only in ([] if reused else exports):
                 stem = (f"fp8moe_{args.geometry}_w{g.slice}_m{capacity}"
                         f"{'' if form == 'auto' else '_' + form}{'_segments' if segmented else ''}{'_core' if core_only else ''}")

@@ -54,9 +54,13 @@ CUTEAFD_EXPORT_WORKER_RAM_MIB CUTEAFD_EXPORT_CONTEXT_SPACING_S CUTEAFD_EXPORT_GP
 CUTEAFD_EXPORT_CACHE CUTEAFD_EXPORT_CACHE_READS CUTEAFD_EXPORT_CACHE_SOURCE_ROOT
 CUTEAFD_EXPORT_CACHE_BUILD_DIR CUTEAFD_EXPORT_CACHE_STATS CUTEAFD_EXPORT_CACHE_REQUIRE_HIT CUTEAFD_EXPORT_CACHE_OUTPUTS CUTEAFD_EXPORT_CACHE_TRACE
 CUTEAFD_EXPORT_IMAGE_ID CUTEAFD_SOURCE_ROOT CUTEAFD_SPARKINFER_SOURCE_DIR CUTEAFD_SPARKINFER_LOCK_FILE
+CUTEAFD_BUILD_CACHES
 B12X_COMPILE_DISK_CACHE B12X_COMPILE_MEMORY_CACHE B12X_COMPILE_CACHE_DIR B12X_LOG_CUTE_COMPILES
-B12X_PRINT_COMPILE_PROGRESS TRITON_CACHE_DIR CUTE_DSL_CACHE_DIR
+B12X_PRINT_COMPILE_PROGRESS B12X_ROCE_CACHE_DIR TRITON_CACHE_DIR CUTE_DSL_CACHE_DIR
 """.split())
+# Driver scope/root switches and compiler-cache plumbing never change AOT kernel codegen;
+# CUTEAFD_RELEASE_BUILD_ROOT and CUTEAFD_KACHE_{SHIM,WARNING}_DIR embed per-build temp paths.
+NEUTRAL_ENV_PREFIXES = ("CUTEAFD_WIP_", "CUTEAFD_RELEASE_", "CUTEAFD_KACHE", "CUTEAFD_SCCACHE")
 RECORDED_ENV_PREFIXES = ("CUTEAFD_", "B12X_", "CUTE_", "CUTLASS_", "TRITON_", "NVCC_", "PTXAS_")
 # Read in C by the toolchain, never through os.environ: part of every identity.
 STATIC_ENV_PREFIXES = ("CUTE_DSL_", "CUTLASS_", "NVCC_", "PTXAS_", "TRITON_", "CUDA_")
@@ -110,6 +114,30 @@ def static_environment(environ=os.environ) -> dict:
     return {name: value for name, value in sorted(environ.items())
             if name.startswith(STATIC_ENV_PREFIXES) and name not in STATIC_ENV_NEUTRAL
             and name not in PLACEMENT_ENV}
+
+
+def resolve_compiler_shim(path: str) -> str | None:
+    """If path is a kache compiler shim (compiler-cache.sh), return its wrapped compiler path."""
+    shim_dir = os.environ.get("CUTEAFD_KACHE_SHIM_DIR")
+    if not shim_dir or not path:
+        return None
+    try:
+        resolved = os.path.realpath(path)
+        shim_root = os.path.realpath(shim_dir)
+    except (TypeError, ValueError, OSError):
+        return None
+    if os.path.dirname(resolved) != shim_root or os.path.basename(resolved) not in ("cc", "c++"):
+        return None
+    try:
+        import shlex
+        for line in Path(resolved).read_text().splitlines():
+            if line.startswith("exec "):
+                parts = shlex.split(line)
+                if len(parts) >= 3 and parts[1].endswith("compiler-cache.sh"):
+                    return os.path.realpath(parts[2])
+    except (OSError, ValueError):
+        return None
+    return None
 
 
 def toolchain_identity() -> dict | None:
@@ -449,7 +477,8 @@ class Recorder:
     def note_env(self, name, value) -> None:
         if name in self.env_written:
             return  # this process set it: an effect of the export, not an input
-        if name.startswith(RECORDED_ENV_PREFIXES) and name not in PLACEMENT_ENV and not name.startswith("CUTEAFD_WIP_"):
+        if (name.startswith(RECORDED_ENV_PREFIXES) and name not in PLACEMENT_ENV
+                and not name.startswith(NEUTRAL_ENV_PREFIXES)):
             self._observe("env|" + name, lambda: value)
 
     def note_child(self, executable, argv, environment=None) -> None:
@@ -1113,7 +1142,12 @@ class Executed:
 # entries key it. An exported program does not embed it: the fork files it
 # compiled from are keyed by content (and lock verification proves the tree is
 # the locked one), so one kernel edit re-exports only the programs that read it.
-PROGRAM_NEUTRAL_CHECKS = frozenset({"file|src:third_party/sparkinfer.lock.json"})
+# CUTEAFD_BUILD_KIND selects which programs an invocation exports, never how any
+# single program compiles, so WIP and release share identical per-program entries.
+PROGRAM_NEUTRAL_CHECKS = frozenset({
+    "file|src:third_party/sparkinfer.lock.json",
+    "env|CUTEAFD_BUILD_KIND",
+})
 
 
 class ProgramCache:

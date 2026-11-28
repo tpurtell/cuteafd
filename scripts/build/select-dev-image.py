@@ -56,12 +56,19 @@ def write_manifest(path, manifest):
     path.write_text(json.dumps(manifest, indent=2) + '\n')
 
 
+def local_candidates(arch, toolchain_hash):
+    role = 'cuteafd-coordinator-dev' if arch == 'amd64' else 'cuteafd-spark-expert-dev'
+    return (f'{role}:tc-{toolchain_hash}', f'cuteafd-dev-local:tc-{toolchain_hash}-{arch}')
+
+
 def select(source, arch, engine_commit, output, mode='registry'):
     toolchain_hash = _toolchain.identity(source)
     base = _toolchain.BASE + _toolchain.BASE_DIGESTS[arch]
     reference = f'{REGISTRY}:tc-{toolchain_hash}-{arch}'
     obj = None
     pulled_digest = None
+    local_reference = None
+    rejected_registry_id = None
     reason = 'CUTEAFD_RELEASE_DEV_IMAGE_SOURCE=build'
     if mode == 'registry':
         try:
@@ -80,7 +87,25 @@ def select(source, arch, engine_commit, output, mode='registry'):
             pulled_digest = registry_digest(obj)
         except ImageError as error:
             reason = str(error)
+            if obj is not None:
+                rejected_registry_id = obj.get('Id')
             obj = None
+    if obj is None and mode == 'registry':
+        # Reuse an already-built, verified local toolchain image (matching the
+        # exact tc-hash, base digest and arch) instead of rebuilding a new image
+        # ID on every release run, so WIP and release share one export-cache key.
+        for candidate in local_candidates(arch, toolchain_hash):
+            try:
+                found = inspect(candidate)
+                if rejected_registry_id and found.get('Id') == rejected_registry_id:
+                    continue
+                verify(found, arch, toolchain_hash, base)
+            except ImageError:
+                continue
+            obj = found
+            local_reference = candidate
+            print(f'dev image fallback on {arch}: {reason}; reusing verified local {candidate}', file=sys.stderr)
+            break
     if obj is None:
         # A private tag: the shared default (cuteafd-*-dev) moves only through
         # build-dev-images.sh, so a release fallback never retags it under running
@@ -95,9 +120,12 @@ def select(source, arch, engine_commit, output, mode='registry'):
         obj = inspect(local_tag)
         verify(obj, arch, toolchain_hash, base)
     manifest = dict(schema='cuteafd.release-dev-image-reuse/2',
-                    source='registry' if pulled_digest else 'build', architecture=arch,
+                    source='registry' if pulled_digest else ('local' if local_reference else 'build'),
+                    architecture=arch,
                     image_id=obj['Id'], registry_reference=reference if pulled_digest else None,
                     registry_digest=pulled_digest, toolchain_hash=toolchain_hash, base_digest=base)
+    if local_reference:
+        manifest['local_reference'] = local_reference
     if not pulled_digest:
         manifest['fallback_reason'] = reason
     write_manifest(output, manifest)

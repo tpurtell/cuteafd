@@ -18,15 +18,19 @@ from __future__ import annotations
 
 import sys as _sys
 from pathlib import Path as _Path
-_sys.path[:0] = [str(_Path(__file__).resolve().parents[1] / _d) for _d in ("lib",)]  # sibling tool dirs
+_sys.path[:0] = [str(_Path(__file__).resolve().parent), *(str(_Path(__file__).resolve().parents[1] / _d) for _d in ("lib",))]  # sibling tool dirs
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import dataclasses
 import functools
+import gc
 import hashlib
 import json
+import multiprocessing
 import os
 import re
+import signal
 import time
 from pathlib import Path
 
@@ -2159,92 +2163,62 @@ def dense_family_scopes(families, exlr8_family):
     return k6, native
 
 
-def main() -> None:
-    setup_started = time.monotonic()
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--geometry", default="flash",
-                        help="comma-separated geometries in one table: flash, pro (DeepSeek V4; flash2 / pro2: one GPU of "
-                             "its two-GPU head split), glm (GLM 5.x), "
-                             "glm2 (GLM 5.x, one GPU of a two-GPU head split), mimo (MiMo V2 Flash), mimop (MiMo V2.6 Pro), "
-                             "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), mimof/mimof2 (V2.6 Flash MOPD), "
-                             "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
-                             "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
-                             "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank), "
-                             "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
-                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), minimax (vendor MXFP8 A8), "
-                             "inkling2 (Inkling 2 Small biased-sink GQA attention), "
-                             "glm_stage/glm2_stage (full/TP2 GLM primitive boundaries), "
-                             "glmf_stage/glmf2_stage (full/TP2 GLM Flash primitive boundaries), "
-                             "dense_trellis_k6 (native K6 core projections), "
-                             "native_attention (block-128 FP8 projection stages)")
-    parser.add_argument("--dense-trellis-families",
-                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4,inkling2 "
-                             "(defaults: K6 kimik3; EXLR8 --exlr8-family; no checkpoint reads)")
-    parser.add_argument("--native-expert-families", default="v41,dsv4f,dsv4p",
-                        help="native_experts segment packages: v41,dsv4f,dsv4p")
-    parser.add_argument("--expert-partial-width", type=int, default=4096)
-    parser.add_argument("--expert-partial-topk", type=int, default=8)
-    parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
-                        help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
-                             "family programs), spark = routed K1 serving and grouping, all = every program")
-    parser.add_argument("--exlr8-family",
-                        help="explicit comma-separated EXLR8 checkpoint families: glm,glmf")
-    parser.add_argument("--decode-rows", type=int, default=64)
-    parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,
-                        help="with glmf: also the decode and verify programs at this many rows (serve "
-                             "--decode-rows 128), new stems after every other program; 0 exports none")
-    parser.add_argument("--prefill-rows", type=int, default=4096)
-    parser.add_argument("--max-context", type=int, default=DEFAULT_MAX_CONTEXT)
-    parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")
-    parser.add_argument("--context-split-only", action="store_true",
-                        help="export K1 primitives for flash/pro/glm/glmf/kimik3, no engine wiring")
-    parser.add_argument("--context-split", choices=("off", "on", "only"), default="off",
-                        help="token-split attention primitives for flash/pro/glm/glmf/kimik3: on appends them after "
-                             "every other program (existing stems unchanged); only exports nothing else")
-    parser.add_argument("--capability", type=int, choices=(120, 121),
-                        help="target CUDA compute capability (default: 121 for --exlr8-role spark, else 120)")
-    args = parser.parse_args()
-    if args.context_split_only:
-        args.context_split = "only"
-    args.context_split_only = args.context_split == "only"
+VALID_GEOMETRIES = frozenset((
+    "flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
+    "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38",
+    "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply",
+    "native_experts", "exlr8", "exlr8_dense", "minimax", "inkling2", "inkling2_mini",
+    "hy4f", "hy4f2", "hy4", "hy42", "glm_stage", "glm2_stage", "glmf_stage",
+    "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention",
+))
+
+
+def program_stem(family: str, suffix: str, op: str) -> str:
+    stem = (suffix if family == "kimi_split" else
+            f"exlr8_dense_{suffix}" if family == "minimax" and op in ("dense_mxfp8", "dense_mxfp8_quant")
+            else f"{family}_{suffix}")
+    return stem
+
+
+def program_identity(family: str, suffix: str, op: str, params: dict, label: str,
+                     plan_sms, capacity: int, device: list[int], diagnostic: bool, recipe) -> dict:
+    """Per-program cache identity: only what determines the compiled object.
+
+    Build kind selects which programs are exported, never how any single program
+    compiles, so WIP and release share one cache entry per program.
+    """
+    return {
+        "exporter": "export_b12x_dsv4_aot.py",
+        "family": family,
+        "suffix": suffix,
+        "op": op,
+        "params": params,
+        "label": label,
+        "plan_sms": plan_sms,
+        "capacity": capacity,
+        "device": device,
+        "diagnostic": diagnostic,
+        "recipe": recipe,
+    }
+
+
+def build_worklist(args, props):
+    """Build the deterministic manifest header and program worklist for args/props."""
+    import torch
+    from b12x.integration.cuteafd import (
+        FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_FLASH, MIMO_V26_PRO, PRO, QWEN35_9B, QWEN38_27B, QWEN38_FLASH_NEXT,
+    )
 
     geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
     exlr8_families = tuple(args.exlr8_family.split(",")) if args.exlr8_family else ()
-    if "exlr8" in geometries and (not exlr8_families or set(exlr8_families) - {"glm", "glmf"}
-            or len(set(exlr8_families)) != len(exlr8_families)):
-        raise SystemExit("EXLR8 requires explicit --exlr8-family glm and/or glmf")
-    from b12x._lib.aot_target import describe_target
-
-    target_capability = args.capability if args.capability is not None else (
-        121 if args.exlr8_role == "spark" else 120
-    )
-    describe_target(target_capability)
-    import torch
-    from b12x.integration.cuteafd import (
-        FLASH, GLM53, GLM53_FLASH, MIMO_V2_FLASH, MIMO_V26_FLASH, MIMO_V26_PRO, PRO, QWEN35_9B, QWEN38_27B, QWEN38_FLASH_NEXT, exportable_compilation,
-        validate_exported_header,
-    )
-
     try:
         dense_families, native_families = dense_family_scopes(args.dense_trellis_families, args.exlr8_family)
     except ValueError as error:
         raise SystemExit(str(error)) from error
-    if not geometries or any(name not in ("flash", "flash2", "pro", "pro2", "glm", "glm2", "mimo", "mimo2", "mimop",
-                                          "mimop2", "mimof", "mimof2", "glmf", "glmf2", "qwen4", "qwen35", "qwen38", "step5", "step52", "muse", "muse2", "ml4", "expert_partial", "expert_reply", "native_experts", "exlr8", "exlr8_dense", "minimax", "inkling2", "inkling2_mini", "hy4f", "hy4f2", "hy4", "hy42", "glm_stage", "glm2_stage", "glmf_stage", "glmf2_stage", "dense_trellis_k6", "kimi_split", "kimik3", "kimik31", "native_attention") for name in geometries):
-        raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
-                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, inkling2, inkling2_mini, hy4f, hy4f2, hy4, hy42, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
-    if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
-        raise SystemExit("--context-split-only takes flash, pro, glm, glmf and/or kimik3")
     kimi_kda = None
     if any(name in geometries for name in ("kimik3", "kimik31")):
         from b12x.integration.cuteafd import KDAGeometry
         kimi_kda = KDAGeometry(hidden=7168, kda_heads=96).head_split(2)
-    props = torch.cuda.get_device_properties(0)
-    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and any(g not in ("exlr8", "expert_partial", "expert_reply", "native_experts") for g in geometries)):
-        raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
-    output = args.output_dir
-    output.mkdir(parents=True, exist_ok=True)
     selected = set(args.only.split(",")) if args.only else None
     manifest = {
         "schema": 1,
@@ -2256,7 +2230,6 @@ def main() -> None:
         "capability": [props.major, props.minor],
         "programs": [],
     }
-    entries, includes = [], []
     work = []
     for name in geometries:
         if name == "native_experts":
@@ -2693,15 +2666,227 @@ def main() -> None:
                 fp32_partials=flash and params["route"] == "decode",
                 plan_capacity_rows=params.get("plan_capacity_rows"), precision="bf16")
         work.append((family, f"{suffix}_bf16", op, {**params, "attention_precision": "bf16"}, compile_))
+    return manifest, work
+
+
+_WORKER_STATE: dict = {}
+
+
+def init_program_worker(args, target_capability: int, output_dir: str, enable_program_cache: bool) -> None:
+    """Initialize one spawned CPU worker with the deterministic worklist and its own ProgramCache."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.setsid()
+    from b12x._lib.aot_target import describe_target
+    import torch
+
+    describe_target(target_capability)
+    props = torch.cuda.get_device_properties(0)
+    _, work = build_worklist(args, props)
+    output = Path(output_dir)
+    program_cache = (_export_cache.ProgramCache(output)
+                     if enable_program_cache and _export_cache else None)
+    if program_cache is not None:
+        program_cache.start()
+    _WORKER_STATE.clear()
+    _WORKER_STATE.update(
+        work=work,
+        output=output,
+        program_cache=program_cache,
+        diagnostic=args.only is not None,
+    )
+
+
+def compile_program_task(payload: tuple) -> dict:
+    """Compile one independent program inside a bounded export slot."""
+    work_index, stem, sms, label, capacity, identity, cacheable = payload
+    from _export_jobs import export_slot
+    from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
+    import torch
+
+    thunk = _WORKER_STATE["work"][work_index][4]
+    output = _WORKER_STATE["output"]
+    program_cache = _WORKER_STATE["program_cache"]
+    diagnostic = _WORKER_STATE["diagnostic"]
+
+    with export_slot():
+        def construct():
+            with exportable_compilation():
+                program = thunk() if sms is None else thunk(sm_count=sms)
+            # Include scratch callbacks in the measured dependency set.
+            return program, program.scratch_bytes(capacity)
+        with (program_cache.scope() if program_cache is not None else contextlib.nullcontext()) as scope:
+            program, plan_scratch = construct()
+            # The serving-table gate precedes writing any object.
+            validate_table_residency(stem, program.geometry, diagnostic=diagnostic)
+            program.export_to_c(str(output), label, "cuteafd_" + label)
+            checked = validate_exported_header(program, output / f"{label}.h", "cuteafd_" + label)
+        geometry = json.loads(json.dumps(dict(program.geometry)))
+        program_abi = json.loads(json.dumps(program.abi))
+        abi_for_check = {**program_abi, "scalars": [tuple(item) for item in program_abi["scalars"]]}
+        validate_table_residency(stem, geometry, diagnostic=diagnostic)
+        kinds, _ = native_scalar_abi(stem, geometry, abi_for_check["scalars"])
+        if checked["argument_count"] != len(abi_for_check["pointers"]) + len(kinds) + 1:
+            raise ValueError(f"{label}: header argument count disagrees with the ABI")
+        cache_outcome = None
+        if cacheable and program_cache is not None:
+            metadata = {"geometry": geometry, "scratch": plan_scratch, "checked": checked, "abi": abi_for_check}
+            before_misses, before_uncacheable = program_cache.misses, program_cache.uncacheable
+            program_cache.store_program(identity, scope, [f"{label}.o", f"{label}.h"], metadata)
+            if program_cache.misses > before_misses:
+                cache_outcome = "miss"
+            elif program_cache.uncacheable > before_uncacheable:
+                cache_outcome = "uncacheable"
+        object_sha256 = hashlib.sha256((output / f"{label}.o").read_bytes()).hexdigest()
+        del program
+        gc.collect()
+        if torch.cuda.is_initialized():
+            raise RuntimeError("offline dsv4 AOT export worker initialized CUDA")
+    return {
+        "geometry": geometry,
+        "scratch": plan_scratch,
+        "abi": program_abi,
+        "checked": checked,
+        "object_sha256": object_sha256,
+        "cache_outcome": cache_outcome,
+    }
+
+
+def _compile_program_tasks(payloads: list[tuple], jobs: int, args, target_capability: int,
+                           output: Path, enable_program_cache: bool) -> list[dict]:
+    """Observe worker failures immediately; return compiled results in exact input order."""
+    context = multiprocessing.get_context("spawn")
+    workers = max(1, min(jobs, len(payloads)))
+    pool = ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=context,
+        initializer=init_program_worker,
+        initargs=(args, target_capability, str(output), enable_program_cache),
+    )
+    owned: set[int] = set()
+    try:
+        futures = {}
+        for index, payload in enumerate(payloads):
+            futures[pool.submit(compile_program_task, payload)] = index
+            owned.update(process.pid for process in (pool._processes or {}).values())
+        results: list[dict | None] = [None] * len(payloads)
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+        return results
+    except BaseException:
+        # Join and terminate every worker process group so ptxas/mlir never outlive a failure.
+        processes = list((pool._processes or {}).values())
+        groups = sorted(owned | {process.pid for process in processes})
+        for session in groups:
+            try:
+                os.killpg(session, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        for process in processes:
+            process.terminate()
+        for process in processes:
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+                process.join()
+        for group in groups:
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--geometry", default="flash",
+                        help="comma-separated geometries in one table: flash, pro (DeepSeek V4; flash2 / pro2: one GPU of "
+                             "its two-GPU head split), glm (GLM 5.x), "
+                             "glm2 (GLM 5.x, one GPU of a two-GPU head split), mimo (MiMo V2 Flash), mimop (MiMo V2.6 Pro), "
+                             "mimop2 (V2.6 Pro, one GPU of a two-GPU head split), mimof/mimof2 (V2.6 Flash MOPD), "
+                             "glmf (GLM 5.3 Flash), glmf2 (GLM 5.3 Flash, one GPU of a two-GPU head split), "
+                             "qwen4 (Qwen 3.8 Flash Next), qwen35 (Qwen 3.5 9B), qwen38 (Qwen 3.8 27B), "
+                             "kimik3 (Kimi K3 KDA, 48 heads per TP2 rank), "
+                             "step5/step52 (Step-5 full/two-GPU head split), exlr8 (the fork's EXLR8 programs "
+                             "for --exlr8-role, after every other family), exlr8_dense (shared native dense operands), minimax (vendor MXFP8 A8), "
+                             "inkling2 (Inkling 2 Small biased-sink GQA attention), "
+                             "glm_stage/glm2_stage (full/TP2 GLM primitive boundaries), "
+                             "glmf_stage/glmf2_stage (full/TP2 GLM Flash primitive boundaries), "
+                             "dense_trellis_k6 (native K6 core projections), "
+                             "native_attention (block-128 FP8 projection stages)")
+    parser.add_argument("--dense-trellis-families",
+                        help="architecture tables for dense_trellis_k6 and exlr8_dense: kimik3,glm,glmf,step5,muse,ml4,inkling2 "
+                             "(defaults: K6 kimik3; EXLR8 --exlr8-family; no checkpoint reads)")
+    parser.add_argument("--native-expert-families", default="v41,dsv4f,dsv4p",
+                        help="native_experts segment packages: v41,dsv4f,dsv4p")
+    parser.add_argument("--expert-partial-width", type=int, default=4096)
+    parser.add_argument("--expert-partial-topk", type=int, default=8)
+    parser.add_argument("--exlr8-role", choices=("all", "coordinator", "spark"), default="all",
+                        help="with exlr8: coordinator = shared-expert K1/grouping and rotated glue (beside the "
+                             "family programs), spark = routed K1 serving and grouping, all = every program")
+    parser.add_argument("--exlr8-family",
+                        help="explicit comma-separated EXLR8 checkpoint families: glm,glmf")
+    parser.add_argument("--decode-rows", type=int, default=64)
+    parser.add_argument("--glmf-wide-decode-rows", type=int, default=128,
+                        help="with glmf: also the decode and verify programs at this many rows (serve "
+                             "--decode-rows 128), new stems after every other program; 0 exports none")
+    parser.add_argument("--prefill-rows", type=int, default=4096)
+    parser.add_argument("--max-context", type=int, default=DEFAULT_MAX_CONTEXT)
+    parser.add_argument("--only", help="comma-separated stem suffixes (diagnostics)")
+    parser.add_argument("--context-split-only", action="store_true",
+                        help="export K1 primitives for flash/pro/glm/glmf/kimik3, no engine wiring")
+    parser.add_argument("--context-split", choices=("off", "on", "only"), default="off",
+                        help="token-split attention primitives for flash/pro/glm/glmf/kimik3: on appends them after "
+                             "every other program (existing stems unchanged); only exports nothing else")
+    parser.add_argument("--capability", type=int, choices=(120, 121),
+                        help="target CUDA compute capability (default: 121 for --exlr8-role spark, else 120)")
+    args = parser.parse_args(argv)
+    if args.context_split_only:
+        args.context_split = "only"
+    args.context_split_only = args.context_split == "only"
+    return args
+
+
+def main() -> None:
+    setup_started = time.monotonic()
+    args = parse_args()
+
+    geometries = [name.strip() for name in args.geometry.split(",") if name.strip()]
+    exlr8_families = tuple(args.exlr8_family.split(",")) if args.exlr8_family else ()
+    if "exlr8" in geometries and (not exlr8_families or set(exlr8_families) - {"glm", "glmf"}
+            or len(set(exlr8_families)) != len(exlr8_families)):
+        raise SystemExit("EXLR8 requires explicit --exlr8-family glm and/or glmf")
+    if not geometries or any(name not in VALID_GEOMETRIES for name in geometries):
+        raise SystemExit("--geometry takes flash, flash2, pro, pro2, glm, glm2, mimo, mimo2, mimop, mimop2, mimof, mimof2, "
+                         "glmf, glmf2, qwen4, qwen35, qwen38, step5, step52, muse, muse2, ml4, expert_partial, exlr8, exlr8_dense, minimax, inkling2, inkling2_mini, hy4f, hy4f2, hy4, hy42, glm_stage, glm2_stage, glmf_stage, glmf2_stage, dense_trellis_k6, kimi_split, kimik3, kimik31 and/or native_attention")
+    if args.context_split_only and any(name not in ("flash", "pro", "glm", "glmf", "kimik3") for name in geometries):
+        raise SystemExit("--context-split-only takes flash, pro, glm, glmf and/or kimik3")
+    from b12x._lib.aot_target import describe_target
+
+    target_capability = args.capability if args.capability is not None else (
+        121 if args.exlr8_role == "spark" else 120
+    )
+    describe_target(target_capability)
+    import torch
+    from b12x.integration.cuteafd import exportable_compilation, validate_exported_header
+
+    props = torch.cuda.get_device_properties(0)
+    if (props.major, props.minor) not in ((12, 0), (12, 1)) or (props.minor != 0 and not args.context_split_only and any(g not in ("exlr8", "expert_partial", "expert_reply", "native_experts") for g in geometries)):
+        raise SystemExit("coordinator programs export on SM120 (K1 primitives also on SM121)")
+    output = args.output_dir
+    output.mkdir(parents=True, exist_ok=True)
+    selected = set(args.only.split(",")) if args.only else None
+    manifest, work = build_worklist(args, props)
+    entries, includes = [], []
     print(f"program worklist setup: {time.monotonic() - setup_started:.6f} seconds", flush=True)
     if globals().get("_catalog_only"):
         catalog = []
         for family, suffix, op, params, _ in work:
             if selected is not None and suffix not in selected:
                 continue
-            stem = (suffix if family == "kimi_split" else
-                    f"exlr8_dense_{suffix}" if family == "minimax" and op in ("dense_mxfp8", "dense_mxfp8_quant")
-                    else f"{family}_{suffix}")
+            stem = program_stem(family, suffix, op)
             sms = (170, 188) if props.minor == 0 and op == "sparse_mla" and params.get("route") == "decode" else (None,)
             catalog.append({"name": stem, "labels": [stem if n is None else f"{stem}_sm{n}" for n in sms]})
         (output / "program-catalog.json").write_text(json.dumps({"manifest": manifest, "programs": catalog}, indent=2) + "\n")
@@ -2713,23 +2898,29 @@ def main() -> None:
                      if _export_cache and not globals().get("_disable_program_cache") else None)
     if program_cache is not None:
         program_cache.start()
-    for family, suffix, op, params, thunk in work:
+    object_selection = globals().get("_selected_object_labels")
+    records = globals().get("_program_records")
+    record_construction = globals().get("_record_construction")
+    device = [props.major, props.minor, props.multi_processor_count]
+    diagnostic = selected is not None
+
+    # Expand the ordered worklist and satisfy cache hits in the parent before
+    # deciding whether to spawn parallel workers for misses.
+    program_specs = []
+    misses = []
+    cached_count = 0
+    for work_index, (family, suffix, op, params, thunk) in enumerate(work):
         if selected is not None and suffix not in selected:
             continue
-        stem = (suffix if family == "kimi_split" else
-                f"exlr8_dense_{suffix}" if family == "minimax" and op in ("dense_mxfp8", "dense_mxfp8_quant")
-                else f"{family}_{suffix}")
-        object_selection = globals().get("_selected_object_labels")
+        stem = program_stem(family, suffix, op)
         if object_selection is not None and not any(label == stem or label.startswith(stem + "_sm")
-                                                   for label in object_selection):
+                                                    for label in object_selection):
             continue
         # Card-specific split/merge plans retain their numerics and matching
         # scratch layouts. Native load selects once, before graph capture.
         plan_sms = (170, 188) if props.minor == 0 and op == "sparse_mla" and params.get("route") == "decode" else (None,)
-        plans, scratch, modules = [], {}, []
         capacity = int(params.get("max_rows", args.prefill_rows))
-        abi = None
-        minimum_sms = 0
+        plan_specs = []
         for sms in plan_sms:
             label = stem if sms is None else f"{stem}_sm{sms}"
             if object_selection is not None and label not in object_selection:
@@ -2741,16 +2932,63 @@ def main() -> None:
             except _export_cache.Unidentifiable as error:
                 recipe = None
                 program_cache.unidentified.append(f"{label}: {error}")
-            identity = {"exporter": "export_b12x_dsv4_aot.py", "family": family, "suffix": suffix, "op": op,
-                        "params": params, "label": label, "plan_sms": sms, "capacity": capacity,
-                        "device": [props.major, props.minor, props.multi_processor_count],
-                        "diagnostic": selected is not None, "recipe": recipe,
-                        "build_kind": os.environ.get("CUTEAFD_BUILD_KIND", "development")}
+            identity = program_identity(family, suffix, op, params, label, sms, capacity, device, diagnostic, recipe)
             cacheable = program_cache is not None and object_selection is None and recipe is not None
             reused = program_cache.lookup(identity) if cacheable else None
-            records = globals().get("_program_records")
             if reused is not None and records is not None and records.active and "ir_record" not in reused:
                 reused = None  # stored without an IR record: a records worker compiles it
+            plan_spec = {
+                "work_index": work_index, "stem": stem, "sms": sms, "label": label,
+                "capacity": capacity, "thunk": thunk, "identity": identity,
+                "cacheable": cacheable, "reused": reused, "compiled": None,
+            }
+            if reused is not None:
+                cached_count += 1
+            else:
+                misses.append(plan_spec)
+            plan_specs.append(plan_spec)
+        program_specs.append((family, suffix, op, params, stem, plan_sms, capacity, plan_specs))
+
+    in_process_hooks = record_construction is not None or records is not None or object_selection is not None
+    from _export_jobs import export_jobs
+    miss_labels = [spec["label"] for spec in misses]
+    unique_labels = len(miss_labels) == len(set(miss_labels))
+    jobs = (min(export_jobs(), len(misses))
+            if __name__ == "__main__" and not in_process_hooks and unique_labels and len(misses) > 1
+            else 1)
+
+    if jobs > 1:
+        print(f"dsv4 programs: {len(misses)} exports to compile, {jobs} workers ({cached_count} cached)", flush=True)
+        payloads = [
+            (spec["work_index"], spec["stem"], spec["sms"], spec["label"],
+             spec["capacity"], spec["identity"], spec["cacheable"])
+            for spec in misses
+        ]
+        compiled_results = _compile_program_tasks(
+            payloads, jobs, args, target_capability, output, program_cache is not None,
+        )
+        for spec, compiled in zip(misses, compiled_results):
+            spec["compiled"] = compiled
+            if program_cache is not None:
+                if program_cache.recorder is not None:
+                    for filename in (f"{spec['label']}.o", f"{spec['label']}.h"):
+                        program_cache.recorder.guarded(program_cache.recorder.note_write, output / filename)
+                if compiled["cache_outcome"] == "miss":
+                    program_cache.misses += 1
+                elif compiled["cache_outcome"] == "uncacheable":
+                    program_cache.uncacheable += 1
+
+    # Assemble manifests, headers and C tables in exact deterministic worklist order.
+    for family, suffix, op, params, stem, plan_sms, capacity, plan_specs in program_specs:
+        plans, scratch, modules = [], {}, []
+        abi = None
+        minimum_sms = 0
+        for spec in plan_specs:
+            sms = spec["sms"]
+            label = spec["label"]
+            reused = spec["reused"]
+            compiled = spec["compiled"]
+            scope = None
             if reused is not None:
                 geometry, plan_scratch, program_abi, checked = (
                     reused["geometry"], reused["scratch"], reused["abi"], reused["checked"])
@@ -2758,22 +2996,30 @@ def main() -> None:
                     records.restore_plan(label, geometry, program_abi)
                     if records.active:
                         records.restore(output, label, reused["ir_record"])
+                object_sha256 = hashlib.sha256((output / f"{label}.o").read_bytes()).hexdigest()
+            elif compiled is not None:
+                geometry, plan_scratch, program_abi, checked, object_sha256 = (
+                    compiled["geometry"], compiled["scratch"], compiled["abi"],
+                    compiled["checked"], compiled["object_sha256"],
+                )
             else:
+                thunk = spec["thunk"]
                 def construct():
                     with exportable_compilation():
                         program = thunk() if sms is None else thunk(sm_count=sms)
                     # Include scratch callbacks in the measured dependency set.
                     return program, program.scratch_bytes(capacity)
                 with (program_cache.scope() if program_cache is not None else contextlib.nullcontext()) as scope:
-                    program, plan_scratch = globals().get("_record_construction", lambda fn: fn())(construct)
+                    program, plan_scratch = (record_construction or (lambda fn: fn()))(construct)
                     # The serving-table gate precedes writing any object.
-                    validate_table_residency(stem, program.geometry, diagnostic=selected is not None)
+                    validate_table_residency(stem, program.geometry, diagnostic=diagnostic)
                     program.export_to_c(str(output), label, "cuteafd_" + label)
                     checked = validate_exported_header(program, output / f"{label}.h", "cuteafd_" + label)
                 # The JSON form, as a reused program carries it, so plans compare alike.
                 geometry, program_abi = json.loads(json.dumps(dict(program.geometry))), json.loads(json.dumps(program.abi))
+                object_sha256 = hashlib.sha256((output / f"{label}.o").read_bytes()).hexdigest()
             program_abi = {**program_abi, "scalars": [tuple(item) for item in program_abi["scalars"]]}
-            validate_table_residency(stem, geometry, diagnostic=selected is not None)
+            validate_table_residency(stem, geometry, diagnostic=diagnostic)
             minimum_sms = max(minimum_sms, program_minimum_sms(stem, geometry))
             if abi is not None and program_abi != abi:
                 raise ValueError(f"{stem}: card plans disagree on their ABI")
@@ -2781,17 +3027,17 @@ def main() -> None:
             kinds, public_scalars = native_scalar_abi(stem, geometry, abi["scalars"])
             if checked["argument_count"] != len(abi["pointers"]) + len(kinds) + 1:
                 raise ValueError(f"{label}: header argument count disagrees with the ABI")
-            if reused is None and cacheable:
+            if reused is None and compiled is None and spec["cacheable"]:
                 metadata = {"geometry": geometry, "scratch": plan_scratch, "checked": checked, "abi": abi}
                 ir_record = records.record(output, label) if records is not None and records.active else None
                 if ir_record is not None:
                     metadata["ir_record"] = ir_record
-                program_cache.store_program(identity, scope, [f"{label}.o", f"{label}.h"], metadata)
+                program_cache.store_program(spec["identity"], scope, [f"{label}.o", f"{label}.h"], metadata)
             for key, size in plan_scratch.items():
                 scratch[key] = max(scratch.get(key, 0), size)
             plans.append({"sm_count": sms, "label": label, "geometry": dict(geometry),
                           "scratch_bytes_at_capacity": plan_scratch, "entry": checked["symbol"],
-                          "object_sha256": hashlib.sha256((output / f"{label}.o").read_bytes()).hexdigest()})
+                          "object_sha256": object_sha256})
             includes.append(f'#include "{label}.h"')
             modules.append(f'_mlir_cuteafd_{label}_cuda_init, _mlir_cuteafd_{label}_cuda_load_to_device, {checked["symbol"]}')
         manifest["programs"].append({
