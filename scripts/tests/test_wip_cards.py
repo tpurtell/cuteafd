@@ -20,6 +20,8 @@ OBSERVER_GPU_UUIDS = cards.observer_gpu_uuids
 
 REAL_LISTENING_PORTS = cards.listening_ports
 REAL_CHECK_LAUNCHER_SUBMODULES = cards.check_launcher_submodules
+REAL_SLOT_LAUNCHER = cards.slot_launcher
+REAL_PREFLIGHT_DEPLOYMENT = cards.preflight_deployment
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +39,9 @@ def no_stop_handlers(monkeypatch, tmp_path):
     # Nor inspect the launcher checkouts' submodules: most tests name placeholder
     # repos. test_uninitialized_arm_submodule_refuses_before_any_lock runs the real check.
     monkeypatch.setattr(cards, 'check_launcher_submodules', lambda *args: None)
+    # Nor read sealed slots' source stamps: placeholder arms serve through --repo.
+    # test_each_slot_arm_validates_against_its_own_launcher runs the real resolution.
+    monkeypatch.setattr(cards, 'slot_launcher', lambda name, arm, repo, task, dry: (str(repo), cards.git_head(repo)))
     monkeypatch.delenv('CUTEAFD_HW_LOCKS_HELD', raising=False)
     monkeypatch.delenv('CUTEAFD_HW_GATE_TICKETS', raising=False)
     cards.bench_panels.cache_clear()
@@ -698,6 +703,50 @@ def test_matched_pair_ignores_the_follow_up_prompt_and_still_gates_the_rest(tmp_
     cards.validate_matched_pairs(rows, ['base', 'candidate'])
     assert all(row['status'] == 'failed' for row in rows)
     assert all((Path(row['state']) / 'exit').read_text() == '81\n' for row in rows)
+
+
+def test_matched_pair_with_a_crashed_arm_is_unverifiable_not_a_failure_of_the_other(tmp_path):
+    # #2914: dev was expected to crash before any benchmark prompt; the candidate
+    # completed and passed. Its own result stands and the pairing is reported as
+    # unverifiable, never as a mismatch that fails the healthy arm with exit 81.
+    prompts = [(48, '1111111111111111'), (437, '2222222222222222')]
+    healthy = _matched_row(tmp_path / 'candidate', 'candidate', _coordinator_log(prompts, 439))
+    healthy['simulated'] = True
+    (tmp_path / 'candidate' / 'exit').write_text('0\n')
+    crashed_dir = tmp_path / 'dev'
+    crashed_dir.mkdir()
+    (crashed_dir / 'exit').write_text('101\n')
+    crashed = dict(card='c', arm='dev', repeat=1, nonce_seed='seed', first_prompt_token_hash=None, prompt_token_hashes=[],
+                   state=str(crashed_dir), status='failed', exit_code=101, error='./run.sh exited 101', simulated=True)
+    rows = [crashed, healthy]
+    cards.write_summary(tmp_path, rows, {'dev': {}, 'candidate': {}})
+    assert healthy['status'] == 'pass' and 'exit_code' not in healthy
+    assert (tmp_path / 'candidate' / 'exit').read_text() == '0\n'
+    assert healthy['matched_pair'] == dict(status='unverifiable', reason='dev produced no prompt token hashes')
+    assert json.loads((tmp_path / 'candidate' / 'result.json').read_text())['status'] == 'pass'
+    # The crashed arm keeps its own failure, not a pair-mismatch stamp.
+    assert crashed['exit_code'] == 101 and (crashed_dir / 'exit').read_text() == '101\n'
+    assert 'mismatched prompt token hashes' not in json.dumps(crashed)
+    summary = json.loads((tmp_path / 'summary.json').read_text())
+    assert summary['unverifiable_pairs'] == [dict(card='c', arm='candidate', repeat=1, reason='dev produced no prompt token hashes')]
+    text = (tmp_path / 'summary.md').read_text()
+    assert '1 of 2 jobs passed.' in text
+    assert 'Matched pairs unverifiable' in text and 'c/candidate/r1 (dev produced no prompt token hashes)' in text
+    # Once a resumed dev produces matching hashes the mark clears.
+    resumed = _matched_row(tmp_path / 'dev-resumed', 'dev', _coordinator_log(prompts, 439))
+    cards.validate_matched_pairs([resumed, healthy], ['dev', 'candidate'])
+    assert 'matched_pair' not in healthy and healthy['status'] == 'pass'
+    # With a third arm, the two arms that produced hashes are still compared.
+    third = [crashed, _matched_row(tmp_path / 'b3', 'b', _coordinator_log(prompts, 439)),
+             _matched_row(tmp_path / 'c3', 'c', _coordinator_log(prompts[:1], 439))]
+    cards.validate_matched_pairs(third, ['dev', 'b', 'c'])
+    assert [row['status'] for row in third] == ['failed', 'failed', 'failed'] and crashed['exit_code'] == 101
+    assert third[1]['exit_code'] == third[2]['exit_code'] == 81
+    # Both arms with hashes that differ still fail the pair.
+    other = _matched_row(tmp_path / 'dev2', 'dev', _coordinator_log(prompts[:1] + [(437, '3333333333333333')], 439))
+    pair = [other, _matched_row(tmp_path / 'candidate2', 'candidate', _coordinator_log(prompts, 439))]
+    cards.validate_matched_pairs(pair, ['dev', 'candidate'])
+    assert all(row['status'] == 'failed' and row['exit_code'] == 81 and 'matched_pair' not in row for row in pair)
 
 
 def test_matched_pair_ignores_extra_arm_local_prompts_and_still_gates_shared_prompts(tmp_path):
@@ -2702,6 +2751,84 @@ def test_uninitialized_arm_submodule_refuses_before_any_lock(entry, tmp_path, mo
     assert cards.submodule_problems(good) == [f'third_party/sparkinfer is at {pinned[:12]}, not 000000000000 pinned by sparkinfer.lock.json']
 
 
+def _launcher_fixture(tmp_path):
+    """A source repository whose dev commit's launcher rejects L2_PREFETCH and whose
+    candidate commit (on a branch) accepts it, with a minimal checkout helper in
+    place of wip-source-checkout.sh. Returns (repo, dev_commit, candidate_commit)."""
+    repo = tmp_path / 'source'
+    def launcher(accepts):
+        run_sh = repo / 'run.sh'
+        run_sh.write_text('#!/bin/sh\n'
+                          + ('' if accepts else 'case "$*" in *L2_PREFETCH=*) echo "L2_PREFETCH is unsupported" >&2; exit 2;; esac\n')
+                          + 'echo \'{"spark_roles": [], "speculator": "dspark"}\'\n')
+        run_sh.chmod(0o755)
+    repo.mkdir()
+    _git(repo, 'init', '-q', '-b', 'dev')
+    helper = repo / 'scripts/build/wip-source-checkout.sh'
+    helper.parent.mkdir(parents=True)
+    helper.write_text('#!/bin/sh\nset -e\ngit -C "$1" worktree add -q --detach "$3" "$2"\n')
+    launcher(accepts=False)
+    _git(repo, 'add', '-A')
+    _git(repo, 'commit', '-qm', 'dev launcher')
+    dev = _git(repo, 'rev-parse', 'HEAD')
+    _git(repo, 'checkout', '-qb', 'candidate')
+    launcher(accepts=True)
+    _git(repo, 'commit', '-qam', 'candidate launcher accepts L2_PREFETCH')
+    candidate = _git(repo, 'rev-parse', 'HEAD')
+    _git(repo, 'checkout', '-q', 'dev')
+    return repo, dev, candidate
+
+
+def _stamped_slot(home, instance, slot, stamp):
+    workspace = home / '.cache/cuteafd/builds' / ('wip-' + instance) / 'slots' / slot / 'coordinator/workspace'
+    workspace.mkdir(parents=True)
+    if stamp is not None:
+        (workspace / '.cuteafd-source-revision').write_text(stamp + '\n')
+
+
+def test_each_slot_arm_validates_against_its_own_launcher(entry, tmp_path, monkeypatch):
+    # #2831: the candidate's launcher accepts a key dev's rejects. Each WIP slot arm
+    # resolves the launcher of the commit its slot records, so dev's refusal never
+    # reaches the candidate and the candidate's launcher never serves dev's binary.
+    monkeypatch.setattr(cards, 'slot_launcher', REAL_SLOT_LAUNCHER)
+    monkeypatch.setattr(cards, 'preflight_deployment', REAL_PREFLIGHT_DEPLOYMENT)
+    repo, dev, candidate = _launcher_fixture(tmp_path)
+    home = tmp_path / 'home'
+    monkeypatch.setattr(Path, 'home', lambda: home)
+    monkeypatch.setattr(cards, 'REPO', repo)
+    _stamped_slot(home, 'ab-base', 'base', dev)
+    _stamped_slot(home, 'ab-cand', 'cand', candidate)
+    arms = cards.resolve_launchers(cards.arms_from(['base=ab-base:base', 'cand=ab-cand:cand']), [], {}, repo,
+                                   tmp_path, 'per-arm', False)
+    # dev's slot serves through the checkout wip-cards runs from, which sits at its commit;
+    # the candidate's through its own checkout, never the global one.
+    assert arms['base'] == {**arms['base'], 'repo': str(repo), 'repo_commit': dev}
+    own = home / '.cache/cuteafd/builds/per-arm' / ('launcher-' + candidate[:12])
+    assert arms['cand'] == {**arms['cand'], 'repo': str(own), 'repo_commit': candidate}
+    assert _git(own, 'rev-parse', 'HEAD') == candidate
+    for name, accepted in (('base', False), ('cand', True)):
+        job = make(entry, tmp_path / name, arm=name, instance=arms[name]['instance'])
+        job['entry']['set']['L2_PREFETCH'] = 'auto'
+        if accepted:
+            assert cards.preflight_deployment(job, arms[name])['speculator'] == 'dspark'
+        else:
+            with pytest.raises(ValueError, match='L2_PREFETCH is unsupported'):
+                cards.preflight_deployment(job, arms[name])
+    # A rerun (--resume) reuses the candidate's launcher checkout.
+    again = cards.resolve_launchers(cards.arms_from(['cand=ab-cand:cand']), [], {}, repo, tmp_path, 'per-arm', False)
+    assert again['cand']['repo'] == str(own)
+    # A slot that records no source, or a dirty one, refuses instead of using the global launcher.
+    _stamped_slot(home, 'ab-none', 'none', None)
+    with pytest.raises(ValueError, match=r'none: WIP slot ab-none:none records no source revision.*--arm-repo none=PATH'):
+        cards.resolve_launchers(cards.arms_from(['none=ab-none:none']), [], {}, repo, tmp_path, 'per-arm', False)
+    _stamped_slot(home, 'ab-dirty', 'dirty', candidate + ' dirty')
+    with pytest.raises(ValueError, match='not a clean commit'):
+        cards.resolve_launchers(cards.arms_from(['dirty=ab-dirty:dirty']), [], {}, repo, tmp_path, 'per-arm', False)
+    # --arm-repo still overrides a slot, with or without a recorded source.
+    pinned = cards.resolve_launchers(cards.arms_from(['none=ab-none:none']), [f'none={own}'], {}, repo, tmp_path, 'per-arm', False)
+    assert pinned['none']['repo'] == str(own) and pinned['none']['repo_commit'] == candidate
+
+
 def test_per_arm_repo_preflight_refusals(tmp_path, monkeypatch):
     arms = lambda: cards.arms_from(['a=a:s', 'b=b:s2'])
     no_run, plain = tmp_path / 'no-run', tmp_path / 'plain'
@@ -3243,7 +3370,7 @@ def test_771_missing_borrowed_binary_real_cli(entry, tmp_path):
     result = subprocess.run([sys.executable, str(ROOT / 'scripts/bench/wip-cards.py'),
         '--task', 'fabric-missing-binary', '--state', str(tmp_path / 'state'),
         '--kit', str(_kit(tmp_path, entry)), '--cards', entry['name'], '--matrix',
-        '--arm', 'candidate=fabric-owned:gate', '--repo', str(ROOT),
+        '--arm', 'candidate=fabric-owned:gate', '--arm-repo', f'candidate={ROOT}',
         '--binary', str(tmp_path / 'missing-cuteafd'), '--preflight-only'], capture_output=True, text=True, timeout=30)
     assert result.returncode == 2
     assert 'is neither a file nor on PATH' in result.stderr
