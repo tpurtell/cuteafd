@@ -41,13 +41,15 @@ Before capturing any activation:
 
 ---
 
-## 2. Calibration corpus (single pinned 3-component revision, never Standard Fidelity)
-Calibration draws deterministically from **one pinned revision** of `wrldsuksgo2mars/agentic-quant-panel-v2` containing all **three** fixed components (never use the held-out Standard Fidelity panel):
-1. `agentic`: rendered with **this checkpoint's own** tokenizer and chat template (matching `quantization/hy4_flash/prepare_corpus.py` and `brief-template.md` §3).
-2. `exl3_standard`: packed with this checkpoint's tokenizer (`exl3-standard-pack-v1`).
-3. `QMLA_LONG_CONTEXT_COMPONENT`: the third long-context bank (16K/32K traces, ~128K tokens per length class, plus agentic traces and long articles) in that same pinned dataset revision, exercising DSA top-k selection past 2,048 tokens.
-
-**Fail-closed pin constants:** `QMLA_PANEL_REVISION` and `QMLA_LONG_CONTEXT_COMPONENT` live as one clearly named constant pair in `quantization/qmla/sidecar.py`. Until both are filled in once the new dataset revision lands on HF, `load_pinned_qmla_corpus()` and the CLI driver **fail closed** with an explicit error naming the missing constants rather than silently calibrating on only two components. All three components and the single `dataset_revision` are recorded in `calibration_provenance`.
+## 2. Calibration corpus (pinned panel revision + fixed known component set, never Standard Fidelity)
+Calibration draws deterministically from a pinned revision of `wrldsuksgo2mars/agentic-quant-panel-v2` over the fixed known component set `{agentic, exl3_standard, long_context}` (no arbitrary pluggable component list; never use the held-out Standard Fidelity panel):
+1. **Default pilot & full calibration (`agentic` + `exl3_standard` at `54683731eb01c7c2fa5b801a0888e029a0e1b1c7`):**
+   - `agentic`: rendered with **this checkpoint's own** tokenizer and chat template (matching `quantization/hy4_flash/prepare_corpus.py` and `brief-template.md` §3).
+   - `exl3_standard`: packed with this checkpoint's tokenizer (`exl3-standard-pack-v1`).
+   - Runs directly on a `hy4_flash.prepare_corpus` output directory (`manifest.json` + `calibration.safetensors`) or per-component `<name>.safetensors` files — do **not** block on `long_context`.
+2. **Later recalibration with `long_context`:**
+   - Once the new dataset revision carrying `long_context` (16K/32K traces, ~128K tokens per length class, plus agentic traces and long articles) lands, pass `--panel-revision <NEW_40_CHAR_SHA> --components agentic,exl3_standard,long_context` to exercise DSA top-k selection past 2,048 tokens.
+- The exact `dataset_repo`, `dataset_revision`, and components used are recorded explicitly in `calibration_provenance`.
 
 ---
 
@@ -171,6 +173,6 @@ Follow `docs/quantization/brief-template.md` §12:
 - **RoPE / NoPE convention:** `<interleaved | split_half | unrotated_pe | none>`, `mrope_section=<...>`, `shared_consumers=<...>`
 - **Target modes:** `<e.g. 8:8,4:8,4:4,2:4,4:0,0:4,8:0,0:8,2:0 or 8:0,4:0,2:0 for pure NoPE>`
 - **Protection policy:** `sink4_local128` (default on full-history MLA layers; SWA untouched)
-- **Pinned 3-component corpus:** `wrldsuksgo2mars/agentic-quant-panel-v2@<QMLA_PANEL_REVISION>` (`agentic`, `exl3_standard`, `<QMLA_LONG_CONTEXT_COMPONENT>`)
+- **Pinned corpus panel:** `wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7` (`agentic`, `exl3_standard`; later recalibration adds `long_context` via `--panel-revision <NEW_SHA> --components agentic,exl3_standard,long_context`)
 - **Pilot configuration:** `--layers <subset> --modes <one-mode> --protection sink4_local128 --train-sequences 16 --val-sequences 4 --steps 100`
 - **Artifact status target:** `calibrated_unqualified` (promote to `runtime_qualified` after runtime qualification in #2909 Phases 3–5)

@@ -20,20 +20,20 @@ from hy4_flash.qmla_run import (
     build_parser,
     calibrate_hy4_flash_from_banks,
     load_pinned_qmla_corpus,
+    parse_components_arg,
     parse_layers_arg,
     parse_modes_arg,
     resolve_run_settings,
 )
 from qmla import (
     DEFAULT_PROTECTION_POLICY,
+    DEFAULT_QMLA_PANEL_REVISION,
     PROTECTION_SCOPE,
-    QMLA_METADATA_KEY,
+    QMLA_BASE_COMPONENTS,
+    QMLA_KNOWN_COMPONENTS,
     QMLA_PANEL_REPO,
-    QMLA_PANEL_REVISION,
-    QMLA_LONG_CONTEXT_COMPONENT,
     FitConfig,
     MlaLayerGeometry,
-    apply_content_forward,
     apply_rope_pair_transform,
     attach_qmla_to_mc,
     content_output_loss,
@@ -52,8 +52,7 @@ from qmla import (
     qdq_asymmetric_group,
     read_sidecar_manifest,
     record_bytes_for_mode,
-    require_pinned_qmla_panel,
-    rope_qk_loss,
+    resolve_qmla_panel,
     save_fit_checkpoint,
     sylvester_hadamard,
     unpack_content_row,
@@ -63,15 +62,17 @@ from qmla import (
 )
 
 
-def _synthetic_3comp_provenance(long_ctx_name: str = "long_context") -> dict:
+def _synthetic_panel_provenance(*, include_long_context: bool = False, rev: str = DEFAULT_QMLA_PANEL_REVISION) -> dict:
+    comps = {
+        "agentic": {"sequences": 4, "tokens": 600, "input_ids_sha256": "1" * 64},
+        "exl3_standard": {"sequences": 2, "tokens": 300, "input_ids_sha256": "2" * 64},
+    }
+    if include_long_context:
+        comps["long_context"] = {"sequences": 2, "tokens": 32768, "input_ids_sha256": "3" * 64}
     return {
         "dataset_repo": QMLA_PANEL_REPO,
-        "dataset_revision": "a" * 40,
-        "components": {
-            "agentic": {"sequences": 4, "tokens": 600, "input_ids_sha256": "1" * 64},
-            "exl3_standard": {"sequences": 2, "tokens": 300, "input_ids_sha256": "2" * 64},
-            long_ctx_name: {"sequences": 2, "tokens": 32768, "input_ids_sha256": "3" * 64},
-        },
+        "dataset_revision": rev,
+        "components": comps,
         "input_ids_sha256": "4" * 64,
     }
 
@@ -143,19 +144,60 @@ def _make_skewed_hy4_bank(
         train_count=seqs - 2,
         val_count=2,
         seed=seed,
-        provenance=_synthetic_3comp_provenance(),
+        provenance=_synthetic_panel_provenance(),
     )
     return config, model, layer, adapter, bank
 
 
-def test_pinned_three_component_panel_fails_closed_until_set(tmp_path: Path):
-    """Correction 1: production fails closed clearly while QMLA_PANEL_REVISION / QMLA_LONG_CONTEXT_COMPONENT are unset."""
-    assert QMLA_PANEL_REVISION is None
-    assert QMLA_LONG_CONTEXT_COMPONENT is None
-    with pytest.raises(ValueError, match="QMLA_PANEL_REVISION.*QMLA_LONG_CONTEXT_COMPONENT"):
-        require_pinned_qmla_panel()
-    with pytest.raises(ValueError, match="QMLA_PANEL_REVISION"):
-        load_pinned_qmla_corpus(tmp_path)
+def test_panel_resolution_defaults_to_two_components_and_supports_known_long_context(tmp_path: Path):
+    """Amended Correction 1: default runs on agentic + exl3_standard; long_context accepted by revision; unknown rejected."""
+    from safetensors.torch import save_file
+
+    # Default resolves immediately to the two existing components at 54683731eb01c7c2fa5b801a0888e029a0e1b1c7.
+    repo, rev, comps = resolve_qmla_panel()
+    assert repo == QMLA_PANEL_REPO
+    assert rev == "54683731eb01c7c2fa5b801a0888e029a0e1b1c7"
+    assert comps == ("agentic", "exl3_standard") == QMLA_BASE_COMPONENTS
+
+    # Adding known third component `long_context` with a new panel revision succeeds.
+    repo3, rev3, comps3 = resolve_qmla_panel(
+        panel_revision="e" * 40, components=("agentic", "exl3_standard", "long_context")
+    )
+    assert repo3 == QMLA_PANEL_REPO and rev3 == "e" * 40 and comps3 == QMLA_KNOWN_COMPONENTS
+    assert parse_components_arg("agentic,exl3_standard") == ("agentic", "exl3_standard")
+    assert parse_components_arg("agentic,exl3_standard,long_context") == QMLA_KNOWN_COMPONENTS
+
+    # Arbitrary unknown component names are rejected (no pluggable arbitrary list).
+    with pytest.raises(ValueError, match="unknown QMLA corpus component"):
+        resolve_qmla_panel(components=("agentic", "exl3_standard", "custom_arbitrary"))
+    with pytest.raises(ValueError, match="requires base components"):
+        resolve_qmla_panel(components=("agentic",))
+
+    # Direct hy4_flash.prepare_corpus output directory (manifest.json + calibration.safetensors) loads directly.
+    prep_dir = tmp_path / "prepared_v2"
+    prep_dir.mkdir()
+    g = torch.Generator().manual_seed(77)
+    rows = [torch.randint(10, 1000, (12 + i,), generator=g, dtype=torch.int64) for i in range(4)]
+    offsets = [0]
+    for r in rows:
+        offsets.append(offsets[-1] + int(r.numel()))
+    save_file(
+        {"input_ids": torch.cat(rows), "offsets": torch.tensor(offsets, dtype=torch.int64)},
+        str(prep_dir / "calibration.safetensors"),
+    )
+    (prep_dir / "manifest.json").write_text(
+        json.dumps({
+            "dataset": {"repo_id": QMLA_PANEL_REPO, "revision": DEFAULT_QMLA_PANEL_REVISION},
+            "components": {"agentic": {"count": 2}, "exl3_standard": {"count": 2}},
+        }),
+        encoding="utf-8",
+    )
+    recs, prov = load_pinned_qmla_corpus(prep_dir)
+    assert len(recs) == 4
+    assert prov["dataset_revision"] == DEFAULT_QMLA_PANEL_REVISION
+    assert sorted(prov["components"].keys()) == ["agentic", "exl3_standard"]
+    assert prov["components"]["agentic"]["sequences"] == 2
+    assert prov["components"]["exl3_standard"]["sequences"] == 2
 
 
 def test_quantizer_rne_pack_unpack_bit_exact_and_record_sizes():
@@ -187,7 +229,6 @@ def test_quantizer_rne_pack_unpack_bit_exact_and_record_sizes():
         assert torch.equal(uc, qdq_asymmetric_group(content, c_bits, scale_dtype="BF16", ste=False))
         assert torch.equal(ur, qdq_asymmetric_group(rope, r_bits, scale_dtype="F32", ste=False))
 
-    # Full record size table verification (16-byte aligned).
     assert record_bytes_for_mode(0, 0, base_kv_cache="bf16") == 1152
     assert record_bytes_for_mode(0, 0, base_kv_cache="fp8") == 656
     assert record_bytes_for_mode(4, 0, d_r=64) == 416
@@ -253,22 +294,17 @@ def test_rope_pair_transform_commutes_with_3d_interleaved_mrope_and_split_half()
 
 def test_default_sink4_local128_protection_fit_and_none_alternative(tmp_path: Path):
     """Correction 2: sink4_local128 is default in calibration, keeps P_T exact, fails closed on 100%-covered short seqs."""
-    # Canonical (4, 128) mask check on T=148: exact 4 sink + 128 recent = 132 protected, 16 quantized.
     m = protection_mask(148)
     assert m is not None
     assert int(m.sum().item()) == 132
     assert bool(m[:4].all()) and bool(m[20:].all()) and not bool(m[4:20].any())
     assert protection_mask(148, protection="none") is None
-
-    # Default FitConfig uses sink4_local128 (4, 128).
     assert FitConfig().protection == DEFAULT_PROTECTION_POLICY == "sink4_local128"
 
-    # Fail closed if sequences are too short for sink4_local128 (0 unprotected tokens).
     _, _, _, _, short_bank = _make_skewed_hy4_bank(99, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=16)
     with pytest.raises(ValueError, match="covers 100%"):
         fit_content_layer(short_bank, bits=4, config=FitConfig(steps=2, val_every=2))
 
-    # Real canonical (4, 128) protection on sequences with T >= 144 (> 132): protected tokens have 0 loss, middle quantized.
     _, _, _, _, long_bank = _make_skewed_hy4_bank(101, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=148)
     eye = torch.eye(64)
     ones = torch.ones(64)
@@ -304,7 +340,6 @@ def test_default_sink4_local128_protection_fit_and_none_alternative(tmp_path: Pa
     assert res_r.equiv_max_rel_err < 1e-4
     assert res_r.best_val_loss < res_r.baselines["rtn_val"]
 
-    # Measured unprotected alternative ("none") also works cleanly on short banks.
     cfg_none = FitConfig(
         steps=20,
         val_every=10,
@@ -319,7 +354,6 @@ def test_default_sink4_local128_protection_fit_and_none_alternative(tmp_path: Pa
     assert res_none.protection_calibrated == "none"
     assert res_none.best_val_loss < res_none.baselines["rtn_native_val"]
 
-    # Shared-KV multi-consumer content loss (Mistral Large 4 pattern) evaluates cleanly.
     _, _, _, _, bank_consumer = _make_skewed_hy4_bank(103, layer_id=3, d_c=64, d_r=64, seqs=4, base_seq_len=16)
     joint_loss = content_output_loss(
         short_bank.val,
@@ -334,7 +368,6 @@ def test_default_sink4_local128_protection_fit_and_none_alternative(tmp_path: Pa
     )
     assert torch.isfinite(joint_loss) and float(joint_loss.item()) >= 0.0
 
-    # Fit checkpoint XXH3-128 save/resume preserves protection_calibrated and fails closed on stale identity.
     id_key = fit_config_digest(cfg_prot, extra={"layer": 0})
     save_fit_checkpoint(tmp_path, res_c, identity_key=id_key)
     reloaded = load_fit_checkpoint(tmp_path, kind="content", bits=2, layer_id=0, identity_key=id_key)
@@ -344,12 +377,11 @@ def test_default_sink4_local128_protection_fit_and_none_alternative(tmp_path: Pa
         load_fit_checkpoint(tmp_path, kind="content", bits=2, layer_id=0, identity_key="stale-identity")
 
 
-def test_hy4_flash_single_file_sidecar_mc_embedded_section_and_incremental_publish(tmp_path: Path):
-    """Corrections 1, 2, 3 end-to-end: single mla_calibration.safetensors, full cuteafd-mc.json['qmla'], no mla_calibration.json."""
+def test_hy4_flash_two_component_default_single_file_sidecar_mc_section_and_incremental_publish(tmp_path: Path):
+    """End-to-end cassowary path: 2-component default (agentic+exl3_standard), sink4_local128, single mla_calibration.safetensors + cuteafd-mc.json['qmla']."""
     _, _, _, _, bank0 = _make_skewed_hy4_bank(201, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=24)
     _, _, _, _, bank5 = _make_skewed_hy4_bank(205, layer_id=5, d_c=64, d_r=64, seqs=4, base_seq_len=24)
 
-    # CLI pilot vs full flag resolution (default protection=sink4_local128; --corpus-dir, no --corpus-component).
     parser = build_parser()
     pilot_args = parser.parse_args([
         "--checkpoint", str(tmp_path),
@@ -361,6 +393,8 @@ def test_hy4_flash_single_file_sidecar_mc_embedded_section_and_incremental_publi
     resolved = resolve_run_settings(pilot_args, (0, 1, 5, 9, 21, 41))
     assert resolved["layers"] == (0, 5)
     assert resolved["modes"] == ((4, 4),)
+    assert resolved["panel_revision"] == DEFAULT_QMLA_PANEL_REVISION
+    assert resolved["components"] == ("agentic", "exl3_standard")
     assert resolved["protection"] == "sink4_local128"
     assert resolved["train_sequences"] == 16 and resolved["val_sequences"] == 4
     assert parse_layers_arg("all-dsa", (0, 1, 5)) == (0, 1, 5)
@@ -384,28 +418,25 @@ def test_hy4_flash_single_file_sidecar_mc_embedded_section_and_incremental_publi
         output_dir=run_out,
         source=source,
         modes=((4, 4), (2, 4)),
-        corpus_provenance=_synthetic_3comp_provenance("long_context_16k_32k"),
+        corpus_provenance=_synthetic_panel_provenance(include_long_context=False),
         fit_config=FitConfig(steps=6, val_every=3, seed=0, protection="sink4_local128", sink_tokens=2, recent_tokens=6),
     )
     sidecar_dir = Path(result["sidecar_dir"])
-    # Correction 3: ONLY mla_calibration.safetensors is written; NO mla_calibration.json!
     assert (sidecar_dir / "mla_calibration.safetensors").is_file()
     assert not (sidecar_dir / "mla_calibration.json").exists()
     assert result["manifest"]["artifact_status"] == "calibrated_unqualified"
     assert result["manifest"]["protection_policy"] == "sink4_local128"
     assert result["manifest"]["protection_scope"] == PROTECTION_SCOPE
     assert sorted(result["manifest"]["supported_modes"]) == sorted(["4:0", "2:0", "0:4", "4:4", "2:4"])
+    assert result["manifest"]["calibration_provenance"]["dataset_revision"] == DEFAULT_QMLA_PANEL_REVISION
     assert sorted(result["manifest"]["calibration_provenance"]["components"].keys()) == [
         "agentic",
         "exl3_standard",
-        "long_context_16k_32k",
     ]
 
-    # Self-describing metadata matches read_sidecar_manifest.
     re_read = read_sidecar_manifest(sidecar_dir)
     assert re_read == result["manifest"]
 
-    # Embed full qmla section in cuteafd-mc.json; mc_manifest.validate AND validate_sidecar both pass.
     mc_root = tmp_path / "mc"
     mc_root.mkdir()
     index_orig = {"weight_map": {"shared.w": "model-00001.safetensors", "core.w": "core-orig.safetensors"}}
@@ -432,13 +463,11 @@ def test_hy4_flash_single_file_sidecar_mc_embedded_section_and_incremental_publi
     mc_manifest.validate(updated_mc, root=mc_root)
     validate_sidecar(sidecar_dir, mc_manifest=updated_mc, strict=True)
 
-    # Tampering cuteafd-mc.json["qmla"] must fail cross-check closed.
     bad_mc = json.loads(json.dumps(updated_mc))
     bad_mc["qmla"]["artifact_status"] = "runtime_qualified"
     with pytest.raises(ValueError, match="disagrees with mla_calibration.safetensors"):
         validate_sidecar(sidecar_dir, mc_manifest=bad_mc, strict=True)
 
-    # Same-repo incremental publish plan + dry-run (MC repo): rewrites cuteafd-mc.json + adds mla_calibration.safetensors.
     remote_tree = {
         "model-00001.safetensors": {"bytes": 4_000_000_000, "blob": "9" * 64},
         "core-orig.safetensors": {"bytes": 2_000_000_000, "blob": "8" * 64},
@@ -469,7 +498,6 @@ def test_hy4_flash_single_file_sidecar_mc_embedded_section_and_incremental_publi
     assert dry_receipt["reuploaded_shard_bytes"] == 0
     assert dry_receipt["preserved_shards_count"] == 2
 
-    # Tampering with mla_calibration.safetensors payload fails validation closed.
     st_path = sidecar_dir / "mla_calibration.safetensors"
     corrupted = bytearray(st_path.read_bytes())
     corrupted[-1] ^= 0x01
@@ -478,16 +506,15 @@ def test_hy4_flash_single_file_sidecar_mc_embedded_section_and_incremental_publi
         validate_sidecar(sidecar_dir, strict=True)
 
 
-def test_pinned_corpus_loader_and_offline_fake_api_non_mc_incremental_publish(
+def test_long_context_recalibration_and_offline_fake_api_non_mc_incremental_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """Non-MC repo adds ONLY mla_calibration.safetensors (no cuteafd-mc.json, no mla_calibration.json)."""
+    """3-component recalibration (new panel revision + long_context) + non-MC single-file publish."""
     from safetensors.torch import save_file
     import hub_lfs
     from qmla import publish as qmla_publish
 
-    # 1. Pinned 3-component corpus loader (with explicit pin override for CPU test; missing component fails closed).
-    corpus_dir = tmp_path / "panel"
+    corpus_dir = tmp_path / "panel_v3"
     corpus_dir.mkdir()
     g = torch.Generator().manual_seed(313)
     for comp in ("agentic", "exl3_standard", "long_context"):
@@ -498,14 +525,12 @@ def test_pinned_corpus_loader_and_offline_fake_api_non_mc_incremental_publish(
             str(corpus_dir / f"{comp}.safetensors"),
         )
     recs, prov = load_pinned_qmla_corpus(
-        corpus_dir, panel_revision="e" * 40, long_context_component="long_context"
+        corpus_dir, panel_revision="e" * 40, components=("agentic", "exl3_standard", "long_context")
     )
     assert len(recs) == 6
+    assert prov["dataset_revision"] == "e" * 40
     assert sorted(prov["components"].keys()) == ["agentic", "exl3_standard", "long_context"]
-    with pytest.raises(ValueError, match="missing"):
-        load_pinned_qmla_corpus(corpus_dir, panel_revision="e" * 40, long_context_component="absent_bank")
 
-    # 2. Build a real sidecar for a plain/non-MC checkpoint.
     _, _, _, _, bank0 = _make_skewed_hy4_bank(317, layer_id=0, d_c=64, d_r=64, seqs=4, base_seq_len=20)
     parent_sha = "1" * 40
     new_sha = "2" * 40
@@ -530,7 +555,6 @@ def test_pinned_corpus_loader_and_offline_fake_api_non_mc_incremental_publish(
     )
     sidecar_dir = Path(res["sidecar_dir"])
 
-    # 3. Offline fake HfApi for non-MC repo: uploads ONLY mla_calibration.safetensors.
     initial_tree = {
         "model-00001.safetensors": {"bytes": 5_000_000_000, "blob": "a" * 64},
         "config.json": {"bytes": 400, "blob": "b" * 40},
@@ -580,14 +604,13 @@ def test_pinned_corpus_loader_and_offline_fake_api_non_mc_incremental_publish(
     assert "cuteafd-mc.json" not in fake_api.trees[new_sha]
     assert fake_api.trees[new_sha]["model-00001.safetensors"] == initial_tree["model-00001.safetensors"]
 
-    # Guard against moved remote head.
     moved_api = _FakeApi("f" * 40)
     with pytest.raises(ValueError, match="head moved"):
         publish_incremental_revision(plan, api=moved_api, state_root=tmp_path / "pub_moved", dry_run=False)
 
 
-def test_pure_nope_sidecar_disallows_nonzero_rope_modes_and_rejects_2_component_provenance(tmp_path: Path):
-    """GLM 5.3 Flash pattern: pure NoPE (qk_rope_dim=0) emits C:0 only and rejects 2-component provenance."""
+def test_pure_nope_sidecar_disallows_nonzero_rope_modes_and_rejects_unknown_components(tmp_path: Path):
+    """GLM 5.3 Flash pattern: pure NoPE (qk_rope_dim=0) emits C:0 only and rejects arbitrary component names."""
     from qmla import CapturedLayerBank, CapturedLayerParams, CapturedSequence, write_sidecar
 
     g = torch.Generator().manual_seed(409)
@@ -621,7 +644,7 @@ def test_pure_nope_sidecar_disallows_nonzero_rope_modes_and_rejects_2_component_
         params=params,
         train=tuple(_seq(f"tr_{i}", 20) for i in range(4)),
         val=tuple(_seq(f"va_{i}", 20) for i in range(2)),
-        provenance=_synthetic_3comp_provenance(),
+        provenance=_synthetic_panel_provenance(),
     )
     res_c4 = fit_content_layer(
         bank,
@@ -629,7 +652,7 @@ def test_pure_nope_sidecar_disallows_nonzero_rope_modes_and_rejects_2_component_
         config=FitConfig(steps=6, val_every=3, seed=0, protection="sink4_local128", sink_tokens=2, recent_tokens=4),
     )
     base_prov = {
-        **_synthetic_3comp_provenance(),
+        **_synthetic_panel_provenance(include_long_context=False),
         "train_sequences": 4,
         "val_sequences": 2,
         "optimizer": "adamw",
@@ -646,17 +669,17 @@ def test_pure_nope_sidecar_disallows_nonzero_rope_modes_and_rejects_2_component_
         "checkpoint_kind": "mc",
         "calibrated_view": "original",
     }
-    # Reject 2-component provenance (must fail closed).
-    two_comp_prov = json.loads(json.dumps(base_prov))
-    del two_comp_prov["components"]["long_context"]
-    with pytest.raises(ValueError, match="exactly 3 components"):
+    # Reject arbitrary unknown component names (no pluggable arbitrary list).
+    bad_prov = json.loads(json.dumps(base_prov))
+    bad_prov["components"]["arbitrary_extra"] = {"sequences": 1, "tokens": 100, "input_ids_sha256": "9" * 64}
+    with pytest.raises(ValueError, match="unknown entries"):
         write_sidecar(
             tmp_path / "bad",
             source=source,
             geometries=[geom],
             content_profiles={4: [res_c4]},
             rope_profiles={},
-            provenance=two_comp_prov,
+            provenance=bad_prov,
         )
 
     manifest = write_sidecar(

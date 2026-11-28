@@ -10,11 +10,12 @@ checkpoint root is ``mla_calibration.safetensors`` (F32 per-path/per-width profi
   ``__metadata__["cuteafd_qmla"]`` header (written for BOTH MC and non-MC checkpoints so
   every sidecar file is self-describing and cross-checked).
 
-Corpus provenance uses ONE pinned 3-component revision of
-``wrldsuksgo2mars/agentic-quant-panel-v2`` (``agentic``, ``exl3_standard``, and the third
-long-context bank). ``QMLA_PANEL_REVISION`` and ``QMLA_LONG_CONTEXT_COMPONENT`` are the
-single clearly named constant pair to fill in when the long-context bank lands; production
-calibration fails closed until both are set.
+Corpus provenance uses the pinned HF dataset ``wrldsuksgo2mars/agentic-quant-panel-v2``
+(default revision ``54683731eb01c7c2fa5b801a0888e029a0e1b1c7``) over the fixed known
+component set ``{"agentic", "exl3_standard", "long_context"}`` (no pluggable arbitrary
+component list). Pilot and full runs calibrate immediately on ``agentic`` +
+``exl3_standard``; a later recalibration adds ``long_context`` by passing a new
+``--panel-revision`` and including ``long_context``.
 """
 from __future__ import annotations
 
@@ -53,13 +54,14 @@ QMLA_METADATA_KEY = "cuteafd_qmla"
 VALID_ARTIFACT_STATUSES = frozenset({"calibrated_unqualified", "runtime_qualified"})
 PROTECTION_SCOPE = "full_history_mla_only"
 
-# Single pinned 3-component panel contract (matches quantization/hy4_flash/prepare_corpus.py).
-# Fill in this ONE constant pair when the long-context bank lands in a new revision of
-# wrldsuksgo2mars/agentic-quant-panel-v2; production calibration fails closed until both are set.
+# Pinned panel contract (matches quantization/hy4_flash/prepare_corpus.py).
+# Pilot and full runs default to agentic + exl3_standard at DEFAULT_QMLA_PANEL_REVISION;
+# a later recalibration adds "long_context" by updating --panel-revision (no arbitrary component list).
 QMLA_PANEL_REPO = "wrldsuksgo2mars/agentic-quant-panel-v2"
+DEFAULT_QMLA_PANEL_REVISION = "54683731eb01c7c2fa5b801a0888e029a0e1b1c7"
 QMLA_BASE_COMPONENTS = ("agentic", "exl3_standard")
-QMLA_PANEL_REVISION: str | None = None
-QMLA_LONG_CONTEXT_COMPONENT: str | None = None
+QMLA_OPTIONAL_COMPONENT = "long_context"
+QMLA_KNOWN_COMPONENTS = ("agentic", "exl3_standard", "long_context")
 
 CANONICAL_CONVENTIONS = {
     "vector_layout": "row",
@@ -115,36 +117,33 @@ def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def require_pinned_qmla_panel(
+def resolve_qmla_panel(
     *,
-    panel_revision: str | None = None,
-    long_context_component: str | None = None,
-) -> tuple[str, str, tuple[str, str, str]]:
-    """Fail closed until ``QMLA_PANEL_REVISION`` and ``QMLA_LONG_CONTEXT_COMPONENT`` are filled in.
+    panel_revision: str = DEFAULT_QMLA_PANEL_REVISION,
+    components: Sequence[str] = QMLA_BASE_COMPONENTS,
+) -> tuple[str, str, tuple[str, ...]]:
+    """Validate and resolve the pinned QMLA panel revision and fixed known components.
 
-    Returns ``(dataset_repo, dataset_revision, (agentic, exl3_standard, long_context_component))``.
+    Always requires the two base components (``agentic``, ``exl3_standard``) and
+    optionally allows ``long_context`` (never arbitrary unknown component names).
+    Returns ``(dataset_repo, dataset_revision, canonical_components_tuple)``.
     """
-    rev = QMLA_PANEL_REVISION if panel_revision is None else panel_revision
-    third = QMLA_LONG_CONTEXT_COMPONENT if long_context_component is None else long_context_component
-    missing: list[str] = []
-    if not rev:
-        missing.append("QMLA_PANEL_REVISION")
-    if not third:
-        missing.append("QMLA_LONG_CONTEXT_COMPONENT")
-    if missing:
+    if not _is_hex(panel_revision, 40):
+        raise ValueError(f"panel_revision must be a 40-char lowercase commit SHA, got {panel_revision!r}")
+    seen: list[str] = []
+    for name in components:
+        if not isinstance(name, str) or name not in QMLA_KNOWN_COMPONENTS:
+            raise ValueError(
+                f"unknown QMLA corpus component {name!r}; allowed known components are {QMLA_KNOWN_COMPONENTS}"
+            )
+        if name not in seen:
+            seen.append(name)
+    if not set(QMLA_BASE_COMPONENTS) <= set(seen):
         raise ValueError(
-            f"QMLA 3-component calibration panel is not pinned yet ({', '.join(missing)} unset in "
-            f"quantization/qmla/sidecar.py for {QMLA_PANEL_REPO}); fill in both constants once the "
-            "long-context bank lands rather than calibrating on only two components"
+            f"QMLA calibration requires base components {QMLA_BASE_COMPONENTS}; got {tuple(seen)}"
         )
-    if not _is_hex(rev, 40):
-        raise ValueError(f"QMLA_PANEL_REVISION must be a 40-char lowercase commit SHA, got {rev!r}")
-    if not isinstance(third, str) or any(c in third for c in "\0\n\r/\\") or third in QMLA_BASE_COMPONENTS:
-        raise ValueError(
-            f"QMLA_LONG_CONTEXT_COMPONENT must be a valid component name distinct from {QMLA_BASE_COMPONENTS}, "
-            f"got {third!r}"
-        )
-    return QMLA_PANEL_REPO, rev, (QMLA_BASE_COMPONENTS[0], QMLA_BASE_COMPONENTS[1], third)
+    ordered = tuple(c for c in QMLA_KNOWN_COMPONENTS if c in seen)
+    return QMLA_PANEL_REPO, panel_revision, ordered
 
 
 def _validate_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:
@@ -158,17 +157,24 @@ def _validate_provenance(provenance: Mapping[str, Any]) -> dict[str, Any]:
 
     components = prov.get("components")
     if not isinstance(components, Mapping):
-        raise ValueError("calibration_provenance.components must be a 3-entry dict (agentic, exl3_standard, long-context)")
-    keys = set(components.keys())
-    if len(keys) != 3 or not set(QMLA_BASE_COMPONENTS) < keys:
         raise ValueError(
-            "calibration_provenance.components must contain exactly 3 components "
-            f"('agentic', 'exl3_standard', and the pinned long-context component); got {sorted(keys)}"
+            "calibration_provenance.components must be a dict over known components "
+            f"{QMLA_KNOWN_COMPONENTS}"
+        )
+    keys = set(components.keys())
+    unknown = keys - set(QMLA_KNOWN_COMPONENTS)
+    if unknown:
+        raise ValueError(
+            f"calibration_provenance.components has unknown entries {sorted(unknown)}; "
+            f"allowed known components are {QMLA_KNOWN_COMPONENTS}"
+        )
+    if not set(QMLA_BASE_COMPONENTS) <= keys:
+        raise ValueError(
+            f"calibration_provenance.components must include base components {QMLA_BASE_COMPONENTS}; "
+            f"got {sorted(keys)}"
         )
     validated_components: dict[str, dict[str, Any]] = {}
     for comp_name in sorted(keys):
-        if not isinstance(comp_name, str) or not comp_name or any(c in comp_name for c in "\0\n\r/\\"):
-            raise ValueError(f"invalid corpus component name: {comp_name!r}")
         row = components[comp_name]
         if not isinstance(row, Mapping):
             raise ValueError(f"corpus component {comp_name!r} entry must be an object")

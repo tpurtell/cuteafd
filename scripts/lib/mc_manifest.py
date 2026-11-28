@@ -227,9 +227,9 @@ def validate_qmla_advisory(qmla, *, strict=False):
              and _digest(prov.get("input_ids_sha256")),
              "invalid MC QMLA calibration_provenance")
     comps = prov.get("components")
-    _require(isinstance(comps, dict) and len(comps) == 3
-             and {"agentic", "exl3_standard"} < set(comps.keys()),
-             "MC QMLA calibration_provenance.components requires all 3 pinned components")
+    _require(isinstance(comps, dict)
+             and {"agentic", "exl3_standard"} <= set(comps.keys()) <= {"agentic", "exl3_standard", "long_context"},
+             "MC QMLA calibration_provenance.components must use {agentic, exl3_standard} (+ optional long_context)")
     for row in comps.values():
         _require(isinstance(row, dict)
                  and type(row.get("sequences")) is int and row["sequences"] > 0

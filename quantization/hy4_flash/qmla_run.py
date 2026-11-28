@@ -4,11 +4,15 @@ Supports both short pilot runs (``--pilot`` or explicit ``--layers``, ``--modes`
 ``--train-sequences``, ``--val-sequences``, ``--steps``) and full 12-DSA-layer
 calibration over all principal modes.
 
-Corpus contract (Correction 1): uses ONE pinned 3-component revision of
-``wrldsuksgo2mars/agentic-quant-panel-v2`` (``agentic``, ``exl3_standard``, and
-``QMLA_LONG_CONTEXT_COMPONENT``). Production CLI fails closed via
-``require_pinned_qmla_panel()`` until ``QMLA_PANEL_REVISION`` and
-``QMLA_LONG_CONTEXT_COMPONENT`` are filled in.
+Corpus contract (amended Correction 1): defaults to the TWO existing components
+``agentic`` + ``exl3_standard`` from
+``wrldsuksgo2mars/agentic-quant-panel-v2@54683731eb01c7c2fa5b801a0888e029a0e1b1c7``
+(matching ``quantization/hy4_flash/prepare_corpus.py``), and accepts ``long_context``
+later via ``--panel-revision <NEW_SHA> --components agentic,exl3_standard,long_context``
+over the fixed known component set ``{agentic, exl3_standard, long_context}``
+(no arbitrary pluggable component list). Works directly on ``prepare_corpus.py`` output
+directories (``manifest.json`` + ``calibration.safetensors``) or per-component
+``<component>.safetensors`` files.
 
 Protection default (Correction 2): ``--protection sink4_local128`` is enabled by
 default on full-history MLA layers only (Hy4-flash's 30 SWA-512 layers are untouched).
@@ -53,7 +57,10 @@ from qmla.fit import (
 )
 from qmla.quantizer import parse_qmla_mode
 from qmla.sidecar import (
-    require_pinned_qmla_panel,
+    DEFAULT_QMLA_PANEL_REVISION,
+    QMLA_BASE_COMPONENTS,
+    QMLA_KNOWN_COMPONENTS,
+    resolve_qmla_panel,
     validate_sidecar,
     write_sidecar,
 )
@@ -92,6 +99,13 @@ def parse_modes_arg(spec: str) -> tuple[tuple[int, int], ...]:
         if (c_bits, r_bits) not in parsed:
             parsed.append((c_bits, r_bits))
     return tuple(parsed)
+
+
+def parse_components_arg(spec: str) -> tuple[str, ...]:
+    """Parse comma-separated component names strictly against QMLA_KNOWN_COMPONENTS."""
+    raw = [part.strip() for part in spec.split(",") if part.strip()]
+    _, _, ordered = resolve_qmla_panel(components=raw)
+    return ordered
 
 
 def required_profile_bits(modes: Sequence[tuple[int, int]]) -> tuple[tuple[int, ...], tuple[int, ...]]:
@@ -172,35 +186,132 @@ def _load_one_component_file(
     }
 
 
+def _load_prepared_combined_corpus(
+    corpus_dir: Path,
+    *,
+    dataset_repo: str,
+    dataset_revision: str,
+    component_names: Sequence[str],
+    max_sequences_per_component: int | None = None,
+) -> tuple[list[tuple[str, torch.Tensor]], dict[str, dict[str, Any]]]:
+    """Load directly from a ``hy4_flash.prepare_corpus`` output directory (manifest.json + calibration.safetensors)."""
+    from safetensors.torch import load_file
+
+    manifest_path = corpus_dir / "manifest.json"
+    cal_path = corpus_dir / "calibration.safetensors"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    ds = manifest.get("dataset", {})
+    if ds.get("repo_id") != dataset_repo or ds.get("revision") != dataset_revision:
+        raise ValueError(
+            f"prepared corpus dataset mismatch: found {ds.get('repo_id')}@{ds.get('revision')}, "
+            f"expected {dataset_repo}@{dataset_revision}"
+        )
+    manifest_comps = manifest.get("components", {})
+    for comp in component_names:
+        if comp not in manifest_comps:
+            raise ValueError(
+                f"prepared corpus manifest at {corpus_dir} does not contain requested component {comp!r} "
+                f"(present: {sorted(manifest_comps)})"
+            )
+
+    data = load_file(str(cal_path))
+    ids = data["input_ids"].to(torch.int64).contiguous()
+    offsets = data["offsets"].to(torch.int64).contiguous().tolist()
+    total_rows = len(offsets) - 1
+    if len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != int(ids.numel()):
+        raise ValueError(f"prepared corpus {cal_path} has malformed offsets")
+
+    # Component spans in prepare_corpus.py order: agentic, exl3_standard, optional long_context.
+    all_records: list[tuple[str, torch.Tensor]] = []
+    components_meta: dict[str, dict[str, Any]] = {}
+    cursor = 0
+    for comp in QMLA_KNOWN_COMPONENTS:
+        if comp not in manifest_comps:
+            continue
+        count = int(manifest_comps[comp]["count"])
+        end = cursor + count
+        if end > total_rows:
+            raise ValueError(f"prepared corpus component {comp!r} count exceeds calibration.safetensors rows")
+        if comp in component_names:
+            limit = count if max_sequences_per_component is None else min(count, max_sequences_per_component)
+            hasher = hashlib.sha256()
+            comp_seqs = 0
+            comp_tokens = 0
+            for local_idx in range(limit):
+                row_idx = cursor + local_idx
+                seq = ids[offsets[row_idx] : offsets[row_idx + 1]]
+                if seq.numel() == 0:
+                    continue
+                all_records.append((f"{comp}:{local_idx:05d}", seq))
+                hasher.update(seq.numpy().tobytes())
+                comp_seqs += 1
+                comp_tokens += int(seq.numel())
+            if comp_seqs == 0:
+                raise ValueError(f"prepared corpus component {comp!r} produced zero non-empty sequences")
+            components_meta[comp] = {
+                "sequences": comp_seqs,
+                "tokens": comp_tokens,
+                "input_ids_sha256": hasher.hexdigest(),
+            }
+        cursor = end
+
+    return all_records, components_meta
+
+
 def load_pinned_qmla_corpus(
     corpus_dir: Path | str,
     *,
-    panel_revision: str | None = None,
-    long_context_component: str | None = None,
+    panel_revision: str = DEFAULT_QMLA_PANEL_REVISION,
+    components: Sequence[str] = QMLA_BASE_COMPONENTS,
     max_sequences_per_component: int | None = None,
 ) -> tuple[list[tuple[str, torch.Tensor]], dict[str, Any]]:
-    """Load all three components from the single pinned revision of ``agentic-quant-panel-v2``.
+    """Load requested known components from the pinned ``agentic-quant-panel-v2`` revision.
 
-    Fails closed via ``require_pinned_qmla_panel()`` if ``QMLA_PANEL_REVISION`` or
-    ``QMLA_LONG_CONTEXT_COMPONENT`` are not filled in yet, or if any of the 3 component
-    token files is absent from ``corpus_dir``.
+    Defaults to ``agentic`` + ``exl3_standard`` at ``54683731eb01c7c2fa5b801a0888e029a0e1b1c7``
+    (does not fail closed on missing ``long_context``). Accepts ``long_context`` when passed
+    explicitly with the updated ``panel_revision``. Supports both ``hy4_flash.prepare_corpus``
+    directories (``manifest.json`` + ``calibration.safetensors``) and per-component
+    ``<component>.safetensors`` files.
     """
-    dataset_repo, dataset_revision, component_names = require_pinned_qmla_panel(
+    dataset_repo, dataset_revision, component_names = resolve_qmla_panel(
         panel_revision=panel_revision,
-        long_context_component=long_context_component,
+        components=components,
     )
     corpus_dir = Path(corpus_dir)
     if not corpus_dir.is_dir():
         raise ValueError(f"prepared QMLA corpus directory missing: {corpus_dir}")
 
-    all_records: list[tuple[str, torch.Tensor]] = []
-    components_meta: dict[str, dict[str, Any]] = {}
-    for comp_name in component_names:
-        recs, meta = _load_one_component_file(
-            corpus_dir, comp_name, max_sequences=max_sequences_per_component
+    has_per_component = all(
+        (corpus_dir / f"{c}.safetensors").is_file() or (corpus_dir / c / "calibration.safetensors").is_file()
+        for c in component_names
+    )
+    if has_per_component:
+        all_records: list[tuple[str, torch.Tensor]] = []
+        components_meta: dict[str, dict[str, Any]] = {}
+        for comp_name in component_names:
+            recs, meta = _load_one_component_file(
+                corpus_dir, comp_name, max_sequences=max_sequences_per_component
+            )
+            all_records.extend(recs)
+            components_meta[comp_name] = meta
+    elif (corpus_dir / "manifest.json").is_file() and (corpus_dir / "calibration.safetensors").is_file():
+        all_records, components_meta = _load_prepared_combined_corpus(
+            corpus_dir,
+            dataset_repo=dataset_repo,
+            dataset_revision=dataset_revision,
+            component_names=component_names,
+            max_sequences_per_component=max_sequences_per_component,
         )
-        all_records.extend(recs)
-        components_meta[comp_name] = meta
+    else:
+        # Delegate to per-component loader to report the exact missing component path.
+        all_records = []
+        components_meta = {}
+        for comp_name in component_names:
+            recs, meta = _load_one_component_file(
+                corpus_dir, comp_name, max_sequences=max_sequences_per_component
+            )
+            all_records.extend(recs)
+            components_meta[comp_name] = meta
 
     combined_sha = hashlib.sha256(
         "\n".join(f"{k}:{components_meta[k]['input_ids_sha256']}" for k in sorted(components_meta)).encode("utf-8")
@@ -366,7 +477,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--corpus-dir",
         type=Path,
         default=None,
-        help="Prepared 3-component corpus dir for pinned wrldsuksgo2mars/agentic-quant-panel-v2 revision",
+        help="Prepared corpus dir (hy4_flash.prepare_corpus output or per-component safetensors)",
+    )
+    parser.add_argument(
+        "--panel-revision",
+        default=DEFAULT_QMLA_PANEL_REVISION,
+        help="Pinned 40-char revision of wrldsuksgo2mars/agentic-quant-panel-v2",
+    )
+    parser.add_argument(
+        "--components",
+        default=",".join(QMLA_BASE_COMPONENTS),
+        help="Known panel components: agentic,exl3_standard (default) or agentic,exl3_standard,long_context",
     )
     parser.add_argument("--output", type=Path, required=True, help="Task output/work directory on root NVMe")
     parser.add_argument("--pilot", action="store_true", help="Short pilot preset (layers 0,21,41; mode 4:4; 16/4 seqs; 100 steps)")
@@ -400,12 +521,15 @@ def resolve_run_settings(args: argparse.Namespace, eligible_layers: Sequence[int
 
     layers = parse_layers_arg(args.layers or default_layers, eligible_layers)
     modes = parse_modes_arg(args.modes or default_modes)
+    components = parse_components_arg(args.components)
     train_n = default_train if args.train_sequences is None else int(args.train_sequences)
     val_n = default_val if args.val_sequences is None else int(args.val_sequences)
     steps = default_steps if args.steps is None else int(args.steps)
     return {
         "layers": layers,
         "modes": modes,
+        "panel_revision": args.panel_revision,
+        "components": components,
         "protection": args.protection,
         "train_sequences": train_n,
         "val_sequences": val_n,
@@ -491,7 +615,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     resolved = resolve_run_settings(args, eligible)
 
     if args.corpus_dir is None and args.reuse_captures is None:
-        parser.error("provide --corpus-dir PATH (3-component pinned panel) or --reuse-captures DIR")
+        parser.error("provide --corpus-dir PATH or --reuse-captures DIR")
 
     capture_dir = (args.reuse_captures or (args.output / "captures")).resolve()
     if args.reuse_captures is not None:
@@ -499,7 +623,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         corpus_provenance = dict(banks[resolved["layers"][0]].provenance)
     else:
         assert args.corpus_dir is not None
-        all_records, corpus_provenance = load_pinned_qmla_corpus(args.corpus_dir)
+        all_records, corpus_provenance = load_pinned_qmla_corpus(
+            args.corpus_dir,
+            panel_revision=resolved["panel_revision"],
+            components=resolved["components"],
+        )
         banks = _stream_hy4_flash_captures(
             reader,
             adapter,
