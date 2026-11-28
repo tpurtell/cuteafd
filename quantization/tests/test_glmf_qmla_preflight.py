@@ -1,7 +1,11 @@
+from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from glm5_flash.qmla_preflight import check_selection, select_witnesses
 from qmla.capture import SparseSelection
