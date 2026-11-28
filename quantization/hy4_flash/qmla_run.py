@@ -30,6 +30,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 from typing import Any, Mapping, Sequence
 
 import torch
@@ -467,6 +468,8 @@ def calibrate_hy4_flash_from_banks(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True, help="Local HF snapshot directory")
+    parser.add_argument("--teacher-checkpoint", type=Path,
+                        help="Pinned BF16 source for an incremental MC calibration")
     parser.add_argument("--source-repo", default=hy4_recipe.TARGET_REPO, help="Target/source HF repo id")
     parser.add_argument("--source-revision", required=True, help="Pinned 40-char immutable source revision")
     parser.add_argument("--base-repo", default=hy4_recipe.BASE_REPO)
@@ -537,6 +540,17 @@ def resolve_run_settings(args: argparse.Namespace, eligible_layers: Sequence[int
     }
 
 
+def _routed_forward(model, layer, inputs):
+    """Read each expert once for all sequences; keep the reference's expert-ID sum order."""
+    latent, ids, gamma = model.moe_route(torch.cat(inputs), layer)
+    routed = torch.zeros_like(latent)
+    for expert in ids.unique(sorted=True).tolist():
+        rows, weights = model.expert_rows(ids, gamma, expert)
+        routed[rows] += model.expert(expert, latent[rows], layer) * weights[:, None]
+    return routed.split([len(x) for x in inputs])
+
+
+@torch.no_grad()
 def _stream_hy4_flash_captures(
     reader: hy4_forward.Reader,
     adapter: Hy4FlashCaptureAdapter,
@@ -561,42 +575,37 @@ def _stream_hy4_flash_captures(
         token_records, train_count=train_count, val_count=val_count, key_fn=lambda r: r[0], seed=seed
     )
     active = [*train_items, *val_items]
+    active = [(sid, tokens.to(reader.device)) for sid, tokens in active]
     states = [model.initial(tokens, embedding=embedding) for _, tokens in active]
-    banks: dict[int, CapturedLayerBank] = {}
-
+    banks = {}
     for layer_idx in range(max_layer + 1):
+        started = time.monotonic()
         layer = model.load_layer(layer_idx)
-        next_states: list[torch.Tensor] = []
-        captured_inputs: list[tuple[str, torch.Tensor, torch.Tensor | None]] = []
-
+        captures, mlp_args = [], []
         for (seq_id, tokens), state in zip(active, states, strict=True):
             residual, attention_post, attn_in = model.attention_start(state, tokens, layer)
             if layer_idx in target_set:
-                captured_inputs.append((seq_id, attn_in.detach().cpu(), None))
-            attn_out, _ = model.attention(attn_in, layer)
+                cap, attn_out, _ = adapter.capture_sequence(attn_in, layer, seq_id=seq_id)
+                captures.append(cap)
+            else:
+                attn_out, _ = model.attention(attn_in, layer)
             if layer_idx < max_layer:
-                st, post, mlp_in = model.mlp_start(residual, attention_post, attn_out, layer)
-                routed = None
-                if model.config.mlp_layer_types[layer_idx] == "sparse":
-                    latent, ids, gamma = model.moe_route(mlp_in, layer)
-                    routed = torch.zeros_like(latent)
-                    for expert in ids.unique().tolist():
-                        rows, weights = model.expert_rows(ids, gamma, expert)
-                        routed[rows] += model.expert(expert, latent[rows], layer) * weights[:, None]
-                next_states.append(model.mlp_finish(st, post, mlp_in, layer, routed))
+                mlp_args.append(model.mlp_start(residual, attention_post, attn_out, layer))
 
         if layer_idx in target_set:
-            bank = adapter.capture_layer(
-                layer,
-                captured_inputs,
-                train_count=train_count,
-                val_count=val_count,
-                seed=seed,
-                provenance=provenance,
-            )
+            bank = CapturedLayerBank(adapter.geometry_for(layer_idx), adapter.layer_params(layer),
+                                     tuple(captures[:train_count]), tuple(captures[train_count:]), provenance)
+            bank.validate()
             save_layer_capture(capture_dir, bank)
             banks[layer_idx] = bank
-        states = next_states
+        if mlp_args:
+            routed = [None] * len(mlp_args)
+            if model.config.mlp_layer_types[layer_idx] == "sparse":
+                routed = _routed_forward(model, layer, [args[2] for args in mlp_args])
+            states = [model.mlp_finish(*args, layer, result)
+                      for args, result in zip(mlp_args, routed, strict=True)]
+        print(json.dumps({"phase": "capture", "completed_layer": layer_idx,
+                          "seconds": time.monotonic() - started}), flush=True)
         del layer
     return banks
 
@@ -608,7 +617,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     config_bytes = (checkpoint / "config.json").read_bytes()
     config_sha256 = hashlib.sha256(config_bytes).hexdigest()
 
-    reader = hy4_forward.Reader(checkpoint, device=args.device)
+    teacher = args.teacher_checkpoint or checkpoint
+    if args.teacher_checkpoint is not None:
+        manifest = json.loads((checkpoint / "cuteafd-mc.json").read_text())
+        if (checkpoint.name != args.source_revision or teacher.name != args.base_revision
+                or manifest["source"] != {"repo": args.base_repo, "revision": args.base_revision}):
+            raise ValueError("BF16 teacher or MC source differs from the pinned calibration identities")
+    reader = hy4_forward.Reader(teacher, device=args.device)
     model = hy4_forward.Model(reader)
     adapter = Hy4FlashCaptureAdapter(model, include_swa=False)
     eligible = tuple(g.layer_id for g in adapter.mla_geometries(include_swa=False))
