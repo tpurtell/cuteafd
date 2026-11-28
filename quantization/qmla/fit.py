@@ -31,6 +31,8 @@ from .capture import (
     CapturedLayerParams,
     CapturedSequence,
     MlaLayerGeometry,
+    ROWS,
+    causal_mask,
     _atomic_json,
     _read_safetensors_verified,
     _write_safetensors_streamed,
@@ -244,19 +246,6 @@ def _normalized_output_mse(pred: torch.Tensor, ref: torch.Tensor) -> torch.Tenso
     return num / denom
 
 
-def _normalized_qk_mse(
-    pred: torch.Tensor,
-    ref: torch.Tensor,
-    mask: torch.Tensor,
-) -> torch.Tensor:
-    m = mask.unsqueeze(0)
-    diff = (pred - ref).masked_fill(~m, 0.0)
-    ref_m = ref.masked_fill(~m, 0.0)
-    num = diff.pow(2).sum()
-    denom = ref_m.pow(2).sum().clamp_min(1e-8)
-    return num / denom
-
-
 def content_output_loss(
     seqs: Sequence[CapturedSequence],
     params: CapturedLayerParams,
@@ -275,34 +264,26 @@ def content_output_loss(
     extra_consumers: Sequence[tuple[CapturedLayerParams, MlaLayerGeometry, Sequence[CapturedSequence]]] = (),
 ) -> torch.Tensor:
     """Mean normalized attention-output reconstruction loss L_C (QuantMLA Eq. 8 + A4 protection)."""
+    if protection not in VALID_PROTECTION_POLICIES:
+        raise ValueError(f"unsupported protection policy: {protection!r}")
     all_groups = [(params, geometry, seqs), *extra_consumers]
     losses: list[torch.Tensor] = []
     for c_params, c_geom, c_seqs in all_groups:
         w_tilde = compensate_kv_b(c_params.kv_b_weight, c_params.kv_norm_weight, r_c, s_c)
 
-        for seq in c_seqs:
-            prot_mask = protection_mask(
-                seq.seq_len,
-                protection=protection,
-                sink_tokens=sink_tokens,
-                recent_tokens=recent_tokens,
-                device=seq.u.device,
+        def exact_content(u):
+            return apply_content_forward(u, r_c, s_c)
+
+        def quantized_content(u):
+            return qdq_asymmetric_group(
+                exact_content(u), bits, group_size=group_size, scale_dtype="BF16", eps=eps_scale, ste=ste
             )
 
-            def _content_fn(u: torch.Tensor, _mask: torch.Tensor | None = prot_mask) -> torch.Tensor:
-                z = apply_content_forward(u, r_c, s_c)
-                if quantize:
-                    z_q = qdq_asymmetric_group(
-                        z, bits, group_size=group_size, scale_dtype="BF16", eps=eps_scale, ste=ste
-                    )
-                    if _mask is not None:
-                        z = torch.where(_mask.unsqueeze(-1), z, z_q)
-                    else:
-                        z = z_q
-                return z
-
+        for seq in c_seqs:
             pred = eval_attention_output(
-                seq, c_params, c_geom, content_fn=_content_fn, kv_b_override=w_tilde
+                seq, c_params, c_geom, content_fn=quantized_content if quantize else exact_content,
+                kv_b_override=w_tilde, exact_content_fn=exact_content if quantize and protection != "none" else None,
+                sink_tokens=sink_tokens, recent_tokens=recent_tokens,
             )
             losses.append(_normalized_output_mse(pred, seq.ref_output.float()))
     return torch.stack(losses).mean()
@@ -324,36 +305,40 @@ def rope_qk_loss(
     recent_tokens: int = DEFAULT_RECENT_TOKENS,
 ) -> torch.Tensor:
     """Mean normalized causal positional-QK reconstruction loss L_P (QuantMLA Eq. 10 + A4 protection)."""
+    if protection not in VALID_PROTECTION_POLICIES:
+        raise ValueError(f"unsupported protection policy: {protection!r}")
     losses: list[torch.Tensor] = []
 
     def _q_fn(qp: torch.Tensor) -> torch.Tensor:
         return apply_rope_pair_transform(qp, theta, s_p, rope_kind=geometry.rope_kind, inverse_scale=True)
 
     for seq in seqs:
-        assert seq.k_rope is not None
-        prot_mask = protection_mask(
-            seq.seq_len,
-            protection=protection,
-            sink_tokens=sink_tokens,
-            recent_tokens=recent_tokens,
-            device=seq.k_rope.device,
-        )
-
-        def _k_fn(kp: torch.Tensor, _mask: torch.Tensor | None = prot_mask) -> torch.Tensor:
-            kt = apply_rope_pair_transform(kp, theta, s_p, rope_kind=geometry.rope_kind, inverse_scale=False)
-            if quantize:
-                kt_q = qdq_asymmetric_group(
-                    kt, bits, group_size=group_size, scale_dtype="F32", eps=eps_scale, ste=ste
-                )
-                if _mask is not None:
-                    kt = torch.where(_mask.unsqueeze(-1), kt, kt_q)
-                else:
-                    kt = kt_q
-            return kt
-
-        ref_z, mask = eval_positional_qk(seq, geometry)
-        pred_z, _ = eval_positional_qk(seq, geometry, rope_query_fn=_q_fn, rope_key_fn=_k_fn)
-        losses.append(_normalized_qk_mse(pred_z, ref_z, mask))
+        if seq.k_rope is None or seq.q_rope is None:
+            raise ValueError("missing q_rope/k_rope for RoPE layer")
+        q, k = seq.q_rope.float().transpose(0, 1), seq.k_rope.float()
+        qt = _q_fn(q)
+        kt = apply_rope_pair_transform(k, theta, s_p, rope_kind=geometry.rope_kind, inverse_scale=False)
+        kq = qdq_asymmetric_group(
+            kt, bits, group_size=group_size, scale_dtype="F32", eps=eps_scale, ste=ste
+        ) if quantize else kt
+        protect = quantize and protection != "none" and geometry.kind != "swa"
+        mask = seq.allowed_mask
+        if mask is None:
+            mask = causal_mask(seq.seq_len, device=k.device, sliding_window=geometry.sliding_window)
+        errors, norms = [], []
+        indices = torch.arange(seq.seq_len, device=k.device)
+        for start in range(0, seq.seq_len, ROWS):
+            stop = min(start + ROWS, seq.seq_len)
+            ref = q[:, start:stop] @ k[:stop].T
+            pred = qt[:, start:stop] @ kq[:stop].T
+            if protect:
+                distance = indices[start:stop, None] - indices[:stop]
+                exact = (indices[:stop] < sink_tokens) | (distance < recent_tokens)
+                pred = torch.where(exact, qt[:, start:stop] @ kt[:stop].T, pred)
+            allowed = mask[start:stop, :stop]
+            errors.append((pred - ref).masked_fill(~allowed, 0.0).square().sum())
+            norms.append(ref.masked_fill(~allowed, 0.0).square().sum())
+        losses.append(torch.stack(errors).sum() / torch.stack(norms).sum().clamp_min(1e-8))
     return torch.stack(losses).mean()
 
 
@@ -482,22 +467,19 @@ def fit_content_layer(
     with torch.no_grad():
         native_losses = []
         for seq in val_seqs:
-            pm = protection_mask(
-                seq.seq_len,
-                protection=config.protection,
-                sink_tokens=config.sink_tokens,
-                recent_tokens=config.recent_tokens,
-                device=dev,
-            )
+            def native(u):
+                return u * params.kv_norm_weight.float()
 
-            def _native_fn(u: torch.Tensor, _mask: torch.Tensor | None = pm) -> torch.Tensor:
-                c = u * params.kv_norm_weight.float()
-                c_q = qdq_asymmetric_group(
-                    c, bits, group_size=config.group_size, scale_dtype="BF16", eps=config.eps_scale, ste=False
+            def quantized_native(u):
+                return qdq_asymmetric_group(
+                    native(u), bits, group_size=config.group_size, scale_dtype="BF16", eps=config.eps_scale, ste=False
                 )
-                return torch.where(_mask.unsqueeze(-1), c, c_q) if _mask is not None else c_q
 
-            pred = eval_attention_output(seq, params, geom, content_fn=_native_fn)
+            pred = eval_attention_output(
+                seq, params, geom, content_fn=quantized_native,
+                exact_content_fn=native if config.protection != "none" else None,
+                sink_tokens=config.sink_tokens, recent_tokens=config.recent_tokens,
+            )
             native_losses.append(_normalized_output_mse(pred, seq.ref_output.float()))
         baselines["rtn_native_val"] = float(torch.stack(native_losses).mean().item())
         baselines["rtn_unit_rms_val"] = float(

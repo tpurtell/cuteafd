@@ -204,3 +204,33 @@ def test_hy4_flash_geometry_filtering_and_nope_validation():
             layer_id=3, kv_source_layer=3, kind="dsa", heads=64,
             kv_lora_rank=512, qk_nope_dim=256, qk_rope_dim=64, v_head_dim=256, rope_kind="none",
         ).validate()
+
+
+def test_protected_replay_uses_each_query_prefix_for_content_and_rope():
+    _, model, layer, rng = _synthetic_hy4_layer(67, kind=reference.SPARSE)
+    adapter = Hy4FlashCaptureAdapter(model)
+    seq, _, _ = adapter.capture_sequence(torch.randn(140, 10, generator=rng), layer, seq_id="prefix")
+    geometry = adapter.geometry_for(0)
+    params = adapter.layer_params(layer)
+
+    def exact(u):
+        return u * params.kv_norm_weight
+
+    def rounded(u):
+        return exact(u).round()
+
+    def rope(k):
+        return k.round()
+
+    pred = eval_attention_output(
+        seq, params, geometry, content_fn=rounded, rope_key_fn=rope, exact_content_fn=exact,
+        exact_rope_key_fn=lambda k: k, sink_tokens=4, recent_tokens=8,
+    )
+    index = torch.arange(seq.seq_len)
+    for row in (0, 11, 12, 46, 127, 128, 139):
+        keep = ((index < 4) | (row - index < 8))[:, None]
+        oracle = eval_attention_output(
+            seq, params, geometry, content_fn=lambda u: torch.where(keep, exact(u), rounded(u)),
+            rope_key_fn=lambda k: torch.where(keep, k, rope(k)),
+        )
+        torch.testing.assert_close(pred[row], oracle[row], atol=2e-5, rtol=2e-5)

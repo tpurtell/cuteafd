@@ -435,12 +435,19 @@ def eval_attention_output(
     kv_b_override: torch.Tensor | None = None,
     rope_query_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
     rope_key_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    exact_content_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    exact_rope_key_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    sink_tokens: int = 0,
+    recent_tokens: int = 0,
 ) -> torch.Tensor:
     """Evaluate exact post-o_proj (and optional post_proj_norm) attention output in FP32.
 
     With all hook arguments left as None, reproduces the full-precision teacher
     attention output for any MLA family captured via ``CapturedSequence``.
     """
+    if sink_tokens < 0 or recent_tokens < 0:
+        raise ValueError("sink_tokens and recent_tokens must be nonnegative")
+    protect = geometry.kind != "swa" and (sink_tokens or recent_tokens)
     t = seq.seq_len
     h = geometry.heads
     nope = geometry.qk_nope_dim
@@ -456,6 +463,14 @@ def eval_attention_output(
     kv_b = (params.kv_b_weight if kv_b_override is None else kv_b_override).float()
     expanded = linear(latent, kv_b).reshape(t, h, nope + vdim)
     keys, values = expanded.split([nope, vdim], dim=-1)
+    exact_keys = None
+    exact_values = None
+    if protect and exact_content_fn is not None:
+        exact_kv = linear(exact_content_fn(u), kv_b).reshape_as(expanded)
+        exact_keys, exact_values = exact_kv.split([nope, vdim], dim=-1)
+    elif protect and exact_rope_key_fn is not None:
+        exact_keys = keys
+
     query = seq.q_nope.float()
     if geometry.has_rope:
         if seq.q_rope is None or seq.k_rope is None:
@@ -468,6 +483,9 @@ def eval_attention_output(
             kp = rope_key_fn(kp)
         query = torch.cat((query, qp), dim=-1)
         keys = torch.cat((keys, kp[:, None, :].expand(-1, h, -1)), dim=-1)
+        if exact_keys is not None:
+            exact_kp = exact_rope_key_fn(seq.k_rope.float()) if exact_rope_key_fn is not None else kp
+            exact_keys = torch.cat((exact_keys, exact_kp[:, None, :].expand(-1, h, -1)), dim=-1)
 
     def tile_mask(start, stop, first, width, query_id):
         allowed = seq.allowed_mask[start:stop, first:stop]
@@ -478,6 +496,7 @@ def eval_attention_output(
     attended = tiled_sink_attention(
         query, keys, values, gate, sink, scale, sliding_window=geometry.sliding_window,
         tile_mask=tile_mask if seq.allowed_mask is not None else None,
+        exact_keys=exact_keys, exact_values=exact_values, sink_tokens=sink_tokens, recent_tokens=recent_tokens,
     )
     out = linear(attended, params.o_proj_weight.float())
     if params.post_proj_norm_weight is not None:

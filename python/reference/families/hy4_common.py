@@ -192,7 +192,8 @@ def mla_projections(x, w, c, h, nope, rope, vdim, cos, sin, *, qa_kva_eps=None, 
     return q0, q, k, v, gate, sink
 
 
-def tiled_sink_attention(q, k, v, gate, sink, scale, *, sliding_window=None, tile_mask=None):
+def tiled_sink_attention(q, k, v, gate, sink, scale, *, sliding_window=None, tile_mask=None,
+                         exact_keys=None, exact_values=None, sink_tokens=0, recent_tokens=0):
     seq_len = len(q)
     device = q.device
     result = []
@@ -213,14 +214,49 @@ def tiled_sink_attention(q, k, v, gate, sink, scale, *, sliding_window=None, til
             allowed &= distance < sliding_window
         if tile_mask is not None:
             allowed &= tile_mask(start, stop, first, width, query_id)
-        score = (query @ keys.transpose(-1, -2)) * scale
+        # Queries in this tile can only protect the sink and a band near the
+        # tile. Keep the second dot product bounded as the context grows.
+        score = query @ keys.transpose(-1, -2)
+        protected_regions = []
+        if exact_keys is not None:
+            sink_stop = min(stop, max(first, sink_tokens))
+            recent_start = max(sink_stop, start + 1 - recent_tokens)
+            regions = [(first, sink_stop), (recent_start, stop)] if recent_tokens else [(first, sink_stop)]
+            pieces = []
+            cursor = 0
+            for begin, end in regions:
+                if begin >= end:
+                    continue
+                span = slice(begin - first, end - first)
+                protected = (key_id[span] < sink_tokens) | (distance[:, span] < recent_tokens)
+                protected_regions.append((begin, end, span, protected))
+                exact_score = query @ exact_keys[begin:end].permute(1, 2, 0)
+                pieces.extend([score[..., cursor:span.start], torch.where(protected, exact_score, score[..., span])])
+                cursor = span.stop
+            pieces.append(score[..., cursor:])
+            score = torch.cat(pieces, dim=-1)
+        score = score * scale
         score = score.masked_fill(~allowed, torch.finfo(score.dtype).min)
         if sink is not None:
             score = torch.cat((score, sink.expand(-1, ROWS, -1)), dim=-1)
         probabilities = (score - score.max(dim=-1, keepdim=True).values).softmax(-1)
         if sink is not None:
             probabilities = probabilities[..., :-1]
-        output = (probabilities @ vals).transpose(0, 1)[:stop - start]
+        if exact_values is None:
+            attended = probabilities @ vals
+        else:
+            # Each key contributes its own exact or quantized value with the
+            # probability from the single joint softmax above.
+            regular = probabilities.clone()
+            exact_terms = []
+            for begin, end, span, protected in protected_regions:
+                weights = probabilities[..., span]
+                regular[..., span] = weights.masked_fill(protected, 0.0)
+                exact_terms.append(weights.masked_fill(~protected, 0.0) @ exact_values[begin:end].transpose(0, 1))
+            attended = regular @ vals
+            for term in exact_terms:
+                attended = attended + term
+        output = attended.transpose(0, 1)[:stop - start]
         result.append(output * gate[start:stop] if gate is not None else output)
     return torch.cat(result).reshape(seq_len, -1)
 
