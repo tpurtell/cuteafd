@@ -15,10 +15,18 @@ import math
 import os
 from pathlib import Path
 import struct
+import sys
 from typing import Any, Callable, Sequence
 
 import torch
 import xxhash
+import torch.nn.functional as F
+
+REFERENCE = Path(__file__).resolve().parents[2] / "python" / "reference"
+if str(REFERENCE) not in sys.path:
+    sys.path.insert(0, str(REFERENCE))
+from families.hy4_common import tiled_sink_attention
+from shape_invariant import ROWS, linear
 
 CAPTURE_SCHEMA = "cuteafd-qmla-capture-v1"
 VALID_ATTENTION_KINDS = frozenset({"dsa", "swa", "full"})
@@ -446,11 +454,9 @@ def eval_attention_output(
         latent = u * params.kv_norm_weight.float()
 
     kv_b = (params.kv_b_weight if kv_b_override is None else kv_b_override).float()
-    expanded = torch.matmul(latent, kv_b.transpose(0, 1)).reshape(t, h, nope + vdim)
-    k_nope, v = expanded.split([nope, vdim], dim=-1)
-
-    q_nope = seq.q_nope.float()
-    scores = torch.matmul(q_nope.transpose(0, 1), k_nope.permute(1, 2, 0))
+    expanded = linear(latent, kv_b).reshape(t, h, nope + vdim)
+    keys, values = expanded.split([nope, vdim], dim=-1)
+    query = seq.q_nope.float()
     if geometry.has_rope:
         if seq.q_rope is None or seq.k_rope is None:
             raise ValueError("missing q_rope/k_rope for RoPE layer")
@@ -460,25 +466,20 @@ def eval_attention_output(
             qp = rope_query_fn(qp)
         if rope_key_fn is not None:
             kp = rope_key_fn(kp)
-        scores = scores + torch.matmul(qp.transpose(0, 1), kp.transpose(0, 1).unsqueeze(0))
+        query = torch.cat((query, qp), dim=-1)
+        keys = torch.cat((keys, kp[:, None, :].expand(-1, h, -1)), dim=-1)
 
-    mask = (
-        seq.allowed_mask
-        if seq.allowed_mask is not None
-        else causal_mask(t, device=u.device, sliding_window=geometry.sliding_window)
+    def tile_mask(start, stop, first, width, query_id):
+        allowed = seq.allowed_mask[start:stop, first:stop]
+        return F.pad(allowed, (0, width - (stop - first), 0, ROWS - (stop - start)))
+
+    gate = seq.gate.float().reshape_as(values) if seq.gate is not None else None
+    sink = params.sink.float()[:, None, None] if params.sink is not None else None
+    attended = tiled_sink_attention(
+        query, keys, values, gate, sink, scale, sliding_window=geometry.sliding_window,
+        tile_mask=tile_mask if seq.allowed_mask is not None else None,
     )
-    scores = (scores * scale).masked_fill(~mask.unsqueeze(0), torch.finfo(scores.dtype).min)
-    if params.sink is not None:
-        sink = params.sink.float()[:, None, None].expand(-1, t, -1)
-        scores_aug = torch.cat((scores, sink), dim=-1)
-        probs = (scores_aug - scores_aug.max(dim=-1, keepdim=True).values).softmax(dim=-1)[..., :-1]
-    else:
-        probs = (scores - scores.max(dim=-1, keepdim=True).values).softmax(dim=-1)
-
-    attended = torch.matmul(probs, v.transpose(0, 1)).transpose(0, 1).reshape(t, h * vdim)
-    if seq.gate is not None:
-        attended = attended * seq.gate.float()
-    out = torch.matmul(attended, params.o_proj_weight.float().transpose(0, 1))
+    out = linear(attended, params.o_proj_weight.float())
     if params.post_proj_norm_weight is not None:
         out = rms_norm(out, params.post_proj_norm_weight.float(), geometry.rms_norm_eps)
     return out

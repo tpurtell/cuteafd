@@ -215,9 +215,13 @@ def tiled_sink_attention(q, k, v, gate, sink, scale, *, sliding_window=None, til
             allowed &= tile_mask(start, stop, first, width, query_id)
         score = (query @ keys.transpose(-1, -2)) * scale
         score = score.masked_fill(~allowed, torch.finfo(score.dtype).min)
-        score = torch.cat((score, sink.expand(-1, ROWS, -1)), dim=-1)
-        probabilities = (score - score.max(dim=-1, keepdim=True).values).softmax(-1)[..., :-1]
-        result.append((probabilities @ vals).transpose(0, 1)[:stop - start] * gate[start:stop])
+        if sink is not None:
+            score = torch.cat((score, sink.expand(-1, ROWS, -1)), dim=-1)
+        probabilities = (score - score.max(dim=-1, keepdim=True).values).softmax(-1)
+        if sink is not None:
+            probabilities = probabilities[..., :-1]
+        output = (probabilities @ vals).transpose(0, 1)[:stop - start]
+        result.append(output * gate[start:stop] if gate is not None else output)
     return torch.cat(result).reshape(seq_len, -1)
 
 
