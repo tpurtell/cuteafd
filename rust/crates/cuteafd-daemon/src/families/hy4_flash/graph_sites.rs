@@ -7,13 +7,14 @@ use crate::shared::decode_graph::sites::{Scope, Table};
 pub(super) const SITES: &Table = &[(
     "hy4_flash.section",
     Scope::Local,
-    "execution.rs: rank-local decode sections (including TP1 Spark-routed SwaSpark, \
-     SwaExtendSpark, DsaPreScored, DsaSparkPost, Tail, and ContextSplit DsaPartial / \
-     DsaAttnOut combine+gate_uv+o_proj) captured on each rank's exclusive stream; \
-     Engram H2D/PeerExchange, DSA indexer pending D2D/pool/score/topk/merge_owned, \
-     TP2 PeerExchange & ContextExchange push/wait, Spark waves send/land/reduce and \
-     TP1 shared_ffn overlap, DFly2 metadata and dual recall gathers, and TP2 \
-     head_handoff stay outside capture",
+    "execution.rs: rank-local decode sections (SwaLocal, SwaSpark, SwaAttn [including \
+     multi-row verify], DsaPre, DsaPreScored, DsaLocalPost, DsaSparkPost, FfnFrontend, \
+     TP2 SparkRouter [fusing rank-1 shared_ffn], FfnFinish, Tail, and Draft*) captured \
+     on each rank's exclusive stream; Engram H2D/PeerExchange, DSA indexer pending \
+     D2D/pool/query/score/topk/merge_owned, TP2 PeerExchange & ContextExchange \
+     push/wait and short ContextSplit partial/combine hops, Spark waves \
+     send/land/reduce and rank-0 shared_ffn RDMA-shadow overlap, DFly2 metadata and \
+     dual recall gathers, and TP2 head_handoff stay outside capture",
 )];
 
 pub(super) fn spans(name: &str, declared: bool) -> bool {
